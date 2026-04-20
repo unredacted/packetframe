@@ -104,6 +104,7 @@ fn handle_ipv4(ctx: &XdpContext, eth: *mut EthHdr) -> Result<u32, ()> {
 
     let src_bytes = unsafe { (*ip).src_addr };
     let dst_bytes = unsafe { (*ip).dst_addr };
+    let proto = unsafe { (*ip).proto };
 
     let src_key = Key::new(32, src_bytes);
     let dst_key = Key::new(32, dst_bytes);
@@ -122,11 +123,18 @@ fn handle_ipv4(ctx: &XdpContext, eth: *mut EthHdr) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
+    // L4 ports for the FIB lookup (SPEC.md §4.4 step 7). Required for
+    // ECMP routes with L4-hash policy — without sport/dport we'd always
+    // hash to the same next-hop and diverge from the kernel slow path.
+    let (sport, dport) = l4_ports(ctx, EthHdr::LEN + Ipv4Hdr::LEN, proto);
+
     // FIB lookup. SPEC.md §4.4 step 8: flags=0 — honors ip-rule policy,
     // uses ingress semantics.
     let mut fib: bpf_fib_lookup = unsafe { mem::zeroed() };
     fib.family = AF_INET;
-    fib.l4_protocol = unsafe { (*ip).proto as u8 };
+    fib.l4_protocol = proto as u8;
+    fib.sport = sport;
+    fib.dport = dport;
     fib.ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     fib.__bindgen_anon_1.tot_len = u16::from_be_bytes(unsafe { (*ip).tot_len });
     // `tos` is at offset 1 of the IPv4 header and sits in __bindgen_anon_2
@@ -188,9 +196,13 @@ fn handle_ipv6(ctx: &XdpContext, eth: *mut EthHdr) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
+    let (sport, dport) = l4_ports(ctx, EthHdr::LEN + Ipv6Hdr::LEN, next);
+
     let mut fib: bpf_fib_lookup = unsafe { mem::zeroed() };
     fib.family = AF_INET6;
     fib.l4_protocol = next as u8;
+    fib.sport = sport;
+    fib.dport = dport;
     fib.ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     fib.__bindgen_anon_1.tot_len =
         u16::from_be_bytes(unsafe { (*ip).payload_len }) + Ipv6Hdr::LEN as u16;
@@ -325,6 +337,36 @@ fn ptr_mut_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
         return Err(());
     }
     Ok((start + offset) as *mut T)
+}
+
+/// Read sport and dport from the L4 header at `offset` in the packet.
+/// Returns the raw network-byte-order bytes as `u16`s — matches what
+/// the kernel's `bpf_fib_lookup` expects for its `__be16` sport/dport
+/// fields. Returns `(0, 0)` for non-port protocols (ICMP, ICMPv6) or
+/// when the L4 header would run past the end of data.
+///
+/// SPEC.md §4.4 step 7: populating these matters for ECMP correctness —
+/// routes with L4-hash policy would otherwise collapse to a single
+/// next-hop and diverge from the kernel slow path.
+#[inline(always)]
+fn l4_ports(ctx: &XdpContext, offset: usize, proto: IpProto) -> (u16, u16) {
+    if !matches!(proto, IpProto::Tcp | IpProto::Udp) {
+        return (0, 0);
+    }
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + offset + 4 > end {
+        return (0, 0);
+    }
+    // Read two big-endian u16s as raw packet bytes. The kernel stores
+    // `__be16` — on LE hosts (what BPF targets) a direct pointer cast
+    // of the raw bytes matches that representation.
+    unsafe {
+        let p = (start + offset) as *const u8;
+        let sport = core::ptr::read_unaligned(p as *const u16);
+        let dport = core::ptr::read_unaligned(p.add(2) as *const u16);
+        (sport, dport)
+    }
 }
 
 /// Helper: [u8; 16] → [u32; 4] in network byte order (each 4-byte group
