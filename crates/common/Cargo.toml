@@ -1,0 +1,19 @@
+[package]
+name = "packetframe-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types, config parser, Module trait, and capability probes for PacketFrame"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+libc.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]

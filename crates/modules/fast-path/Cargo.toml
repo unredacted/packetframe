@@ -1,0 +1,16 @@
+[package]
+name = "packetframe-fast-path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PacketFrame fast-path module (stub in v0.0.1; full MVP lands in v0.1)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+packetframe-common.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

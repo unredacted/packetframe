@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  cross-build:
+    name: cross-build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install --locked cross
+
+      - name: cross build --release
+        run: cross build --release --workspace --target ${{ matrix.target }}

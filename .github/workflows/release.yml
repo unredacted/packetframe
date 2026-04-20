@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install --locked cross
+
+      - name: Build release
+        run: cross build --release --workspace --target ${{ matrix.target }}
+
+      - name: Stage tarball contents
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STEM="packetframe-${VERSION}-${{ matrix.target }}"
+          STAGE="dist/${STEM}"
+          mkdir -p "${STAGE}/conf"
+          cp "target/${{ matrix.target }}/release/packetframe" "${STAGE}/"
+          cp conf/example.conf "${STAGE}/conf/"
+          cp LICENSE README.md VERSION "${STAGE}/"
+          ( cd dist && tar czf "${STEM}.tar.gz" "${STEM}" )
+          ( cd dist && sha256sum "${STEM}.tar.gz" > "${STEM}.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Combine SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+
+      - name: Import GPG signing key
+        if: ${{ env.PACKETFRAME_GPG_KEY != '' }}
+        env:
+          PACKETFRAME_GPG_KEY: ${{ secrets.PACKETFRAME_GPG_KEY }}
+        run: |
+          echo "${PACKETFRAME_GPG_KEY}" | gpg --batch --import
+
+      - name: Sign SHA256SUMS
+        if: ${{ env.PACKETFRAME_GPG_KEY != '' }}
+        env:
+          PACKETFRAME_GPG_KEY: ${{ secrets.PACKETFRAME_GPG_KEY }}
+          PACKETFRAME_GPG_KEY_ID: ${{ secrets.PACKETFRAME_GPG_KEY_ID }}
+        run: |
+          cd dist
+          gpg --batch --yes --detach-sign --armor \
+            --local-user "${PACKETFRAME_GPG_KEY_ID}" \
+            --output SHA256SUMS.asc \
+            SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
