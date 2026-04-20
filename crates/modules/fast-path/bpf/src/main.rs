@@ -80,8 +80,13 @@ fn handle_ipv4(ctx: &XdpContext, eth: *mut EthHdr) -> Result<u32, ()> {
 
     // IHL check — packets with IPv4 options (IHL > 5) go to the kernel
     // slow path. SPEC.md §4.4 step 4.
-    let ihl = unsafe { (*ip).ihl() };
-    if ihl != 5 {
+    //
+    // `Ipv4Hdr::ihl()` returns the header length in *bytes* (IHL * 4)
+    // rather than the raw IHL field — which is a footgun if you're
+    // reading SPEC §4.4 and typing `ihl != 5`. A standard IPv4 header
+    // with no options is 20 bytes; anything larger means options.
+    let ihl_bytes = unsafe { (*ip).ihl() };
+    if ihl_bytes != 20 {
         bump_stat(StatIdx::PassComplexHeader);
         return Ok(xdp_action::XDP_PASS);
     }
