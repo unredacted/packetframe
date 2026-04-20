@@ -14,10 +14,18 @@ path = "src/lib.rs"
 [dependencies]
 packetframe-common.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
 
-# aya (userspace) is Linux-only (uses netlink, SYS_bpf, etc.) so the
-# dev-dep is cfg-gated — matches how the probe code in `crates/common`
-# handles platform. macOS dev loops still `cargo test` cleanly.
+# aya (userspace) is Linux-only (uses netlink, SYS_bpf, etc.); the
+# loader implementation is cfg-gated accordingly. Non-Linux builds
+# (macOS dev) compile without aya and have `load`/`attach` return
+# NotImplemented.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 aya.workspace = true

@@ -52,23 +52,25 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
 #[inline(always)]
 fn try_fast_path(ctx: &XdpContext) -> Result<u32, ()> {
     let eth: *mut EthHdr = ptr_mut_at(ctx, 0)?;
-    // `ether_type` is a `#[repr(u16)]` EtherType. SPEC.md §3.5 keeps us
-    // on stable kernel UAPI; this crate's enum maps to the same raw u16
-    // the kernel writes (little-endian host reading network-order bytes).
+    // `ether_type` is a raw `u16` (packed into the EthHdr struct in
+    // network byte order). `EtherType` is an enum that gives named
+    // discriminants matching what an LE host reads from the network
+    // bytes (Ipv4 = 0x0008, Ipv6 = 0xDD86, Ieee8021q = 0x0081). Cast
+    // to u16 for comparison — SPEC.md §3.5 keeps us on stable kernel
+    // UAPI only; no CO-RE.
     let ether = unsafe { (*eth).ether_type };
 
-    match ether {
-        EtherType::Ipv4 => handle_ipv4(ctx, eth),
-        EtherType::Ipv6 => handle_ipv6(ctx, eth),
-        EtherType::Ieee8021q | EtherType::Ieee8021ad => {
-            // Tagged traffic — PR #5 handles VLAN push/pop/rewrite.
-            bump_stat(StatIdx::PassNotIp);
-            Ok(xdp_action::XDP_PASS)
-        }
-        _ => {
-            bump_stat(StatIdx::PassNotIp);
-            Ok(xdp_action::XDP_PASS)
-        }
+    if ether == EtherType::Ipv4 as u16 {
+        handle_ipv4(ctx, eth)
+    } else if ether == EtherType::Ipv6 as u16 {
+        handle_ipv6(ctx, eth)
+    } else if ether == EtherType::Ieee8021q as u16 || ether == EtherType::Ieee8021ad as u16 {
+        // Tagged traffic — PR #5 handles VLAN push/pop/rewrite.
+        bump_stat(StatIdx::PassNotIp);
+        Ok(xdp_action::XDP_PASS)
+    } else {
+        bump_stat(StatIdx::PassNotIp);
+        Ok(xdp_action::XDP_PASS)
     }
 }
 
@@ -210,10 +212,10 @@ fn handle_ipv6(ctx: &XdpContext, eth: *mut EthHdr) -> Result<u32, ()> {
     fib.__bindgen_anon_2.flowinfo = u32::from_be_bytes(unsafe { (*ip).vcf });
 
     // IPv6 addresses are 4 × u32 in the struct; copy from byte arrays.
-    unsafe {
-        fib.__bindgen_anon_3.ipv6_src = bytes_to_u32x4(&src_bytes);
-        fib.__bindgen_anon_4.ipv6_dst = bytes_to_u32x4(&dst_bytes);
-    }
+    // Safe to access the bindgen unions directly — writing any variant
+    // is legal Rust (reads across variants would be the UB we'd avoid).
+    fib.__bindgen_anon_3.ipv6_src = bytes_to_u32x4(&src_bytes);
+    fib.__bindgen_anon_4.ipv6_dst = bytes_to_u32x4(&dst_bytes);
 
     let ret = unsafe {
         fib_lookup_helper(

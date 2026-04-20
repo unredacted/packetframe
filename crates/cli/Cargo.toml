@@ -17,9 +17,13 @@ packetframe-fast-path = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true
+thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+signal-hook.workspace = true
 
 [features]
 default = ["fast-path"]

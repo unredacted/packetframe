@@ -21,6 +21,12 @@ jobs:
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    env:
+      # Refuse to stub-fallback on BPF build failure. Without this, a
+      # broken BPF build silently produces an empty ELF and every
+      # verifier/attach integration test early-returns "BPF stub in
+      # effect" + reports `ok`, masking real regressions.
+      PACKETFRAME_BPF_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -68,13 +74,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-      - name: cargo test (BPF verifier, sudo)
-        # The verifier-pass integration test loads the fast-path ELF
-        # into the kernel, which requires CAP_BPF + CAP_NET_ADMIN. Run
-        # under sudo so the kernel accepts the `bpf(BPF_PROG_LOAD)`
-        # call. `-E` preserves cargo's environment (CARGO_TARGET_DIR
-        # etc.) so this test reuses the prior step's build.
-        run: sudo -E $(which cargo) test -p packetframe-fast-path --test verifier -- --ignored --nocapture
+      - name: cargo test (BPF verifier + attach, sudo)
+        # Integration tests that load the BPF ELF into the kernel or
+        # attach it to an interface need CAP_BPF + CAP_NET_ADMIN. Run
+        # them all under sudo; `-E` preserves the cargo env so they
+        # reuse the prior step's build. All such tests are marked
+        # `#[ignore]` so the non-sudo `cargo test` above skips them.
+        run: sudo -E $(which cargo) test -p packetframe-fast-path --tests -- --ignored --nocapture
 
   cross-build:
     name: cross-build ${{ matrix.target }}
