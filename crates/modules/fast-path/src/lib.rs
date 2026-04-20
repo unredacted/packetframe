@@ -1,21 +1,33 @@
 //! PacketFrame fast-path module.
 //!
-//! v0.0.1 shipped a stub. This crate now embeds the BPF ELF produced by
-//! `bpf/` via [`build.rs`](../build.rs) and `include_bytes!` (SPEC.md §3.6).
-//! The userspace [`Module`] lifecycle (load/attach/detach via aya) lands in
-//! PR #4 — this PR just adds the BPF program itself and the maps/counter
-//! type definitions needed to test it.
-//!
-//! When the BPF toolchain (nightly + `bpf-linker` + `bpfel-unknown-none`)
-//! is unavailable at build time (e.g. macOS dev laptops per the PR #3
-//! plan), the build falls back to an empty ELF and
-//! [`FAST_PATH_BPF_AVAILABLE`] is `false`; `cfg(packetframe_bpf_built)`
-//! is unset so tests that need the real object can be `#[cfg_attr]`-ignored.
+//! Embeds the BPF ELF produced by `bpf/` via [`build.rs`](../build.rs)
+//! (SPEC.md §3.6) and exposes it as a [`Module`] whose lifecycle methods
+//! drive aya's loader: `load` opens the ELF and populates the cfg /
+//! allowlist maps, `attach` XDP-attaches to every configured interface
+//! with the trial-attach fallback behavior from SPEC.md §2.3, `detach`
+//! tears everything down. The real logic lives in [`linux_impl`] and
+//! is cfg-gated to `target_os = "linux"` so macOS dev loops still
+//! compile — non-Linux builds return [`ModuleError::NotImplemented`]
+//! from every lifecycle method.
 
 use packetframe_common::module::{
     Attachment, HealthCtx, HookType, HookUse, LoaderCtx, MetricsWriter, Module, ModuleConfig,
     ModuleError, ModuleResult,
 };
+
+pub mod registry;
+
+#[cfg(target_os = "linux")]
+pub mod linux_impl;
+
+#[cfg(target_os = "linux")]
+pub use linux_impl::{trial_attach_native, TrialResult};
+
+pub const MODULE_NAME: &str = "fast-path";
+
+/// Priority the fast-path module claims in the 1000-1999 forwarding range
+/// per SPEC.md §3.2. Not consulted in v0.0.1 (single-module MVP, see §3.4).
+pub const FAST_PATH_PRIORITY: u16 = 1000;
 
 /// The compiled fast-path BPF ELF, staged by `build.rs` and embedded at
 /// crate-compile time. Empty (zero bytes) when the BPF toolchain isn't
@@ -27,21 +39,48 @@ pub const FAST_PATH_BPF: &[u8] = include_bytes!(env!("FAST_PATH_BPF_OBJ"));
 /// Const-evaluable so tests can early-return or be `cfg`-gated on it.
 pub const FAST_PATH_BPF_AVAILABLE: bool = !FAST_PATH_BPF.is_empty();
 
-pub const MODULE_NAME: &str = "fast-path";
-
-/// Priority the fast-path module claims in the 1000-1999 forwarding range
-/// per SPEC.md §3.2. Not consulted in v0.0.1 (single-module MVP, see §3.4).
-pub const FAST_PATH_PRIORITY: u16 = 1000;
-
+/// Fast-path module handle. `Default` and `new` produce an unloaded
+/// instance; call [`Module::load`] to bring it online.
 #[derive(Default)]
 pub struct FastPathModule {
-    // Populated in v0.1 when `load` starts placing BPF objects and
-    // attachments in here.
+    #[cfg(target_os = "linux")]
+    state: Option<linux_impl::ActiveState>,
 }
 
 impl FastPathModule {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot of the current attach set for status reporting.
+    /// Non-Linux always returns an empty list (no attach occurred).
+    #[cfg(target_os = "linux")]
+    pub fn links(&self) -> Vec<(String, u32, packetframe_common::config::AttachMode)> {
+        self.state
+            .as_ref()
+            .map(linux_impl::snapshot_links)
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn links(&self) -> Vec<(String, u32, packetframe_common::config::AttachMode)> {
+        Vec::new()
+    }
+
+    /// Per-CPU-aggregated stats snapshot, indexed by `StatIdx`
+    /// discriminants (SPEC.md §4.6). Returns all-zeros when unloaded
+    /// or on non-Linux.
+    #[cfg(target_os = "linux")]
+    pub fn stats(&self) -> ModuleResult<Vec<u64>> {
+        match &self.state {
+            Some(s) => linux_impl::snapshot_stats(s),
+            None => Ok(vec![0u64; 19]),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn stats(&self) -> ModuleResult<Vec<u64>> {
+        Ok(vec![0u64; 19])
     }
 }
 
@@ -57,27 +96,66 @@ impl Module for FastPathModule {
         }]
     }
 
-    fn load(&mut self, _cfg: &ModuleConfig<'_>, _ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
-        Err(ModuleError::not_implemented(MODULE_NAME))
+    #[cfg(target_os = "linux")]
+    fn load(&mut self, cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
+        self.state = Some(linux_impl::load(cfg, ctx)?);
+        Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn load(&mut self, _cfg: &ModuleConfig<'_>, _ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
+        Err(ModuleError::other(
+            MODULE_NAME,
+            "fast-path loader is Linux-only; this build was cross-compiled for a non-Linux target",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn attach(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach called before load"))?;
+        linux_impl::attach(state, cfg)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn attach(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
     fn reconfigure(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+        // SPEC.md §4.5 calls for delta-only reconfigure. Full
+        // implementation (stale-entry purge, LPM delta vs. current)
+        // lands in PR #6 with the SIGHUP reconcile flow.
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
+    #[cfg(target_os = "linux")]
     fn detach(&mut self) -> ModuleResult<()> {
+        if let Some(mut state) = self.state.take() {
+            linux_impl::detach(&mut state)?;
+            // Dropping `state` drops the `Ebpf`, which unloads the
+            // program and maps. PR #6 adds pin cleanup when pinning
+            // exists.
+            drop(state);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detach(&mut self) -> ModuleResult<()> {
+        // Nothing to tear down; no-op is the honest answer on a stub.
         Ok(())
     }
 
     fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+        // Prometheus textfile emission lands in PR #6. No-op here.
         Ok(())
     }
 
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<()> {
+        // Circuit breaker evaluation lands in PR #6. No-op here.
         Ok(())
     }
 }
@@ -102,10 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_methods_are_not_implemented_stubs() {
+    fn lifecycle_stubs_safe_to_call() {
         let mut m = FastPathModule::new();
-        // detach/sample_metrics/health_check must succeed even on a
-        // not-loaded module — they're called during teardown paths.
+        // detach on an unloaded module must succeed — teardown paths
+        // call it unconditionally.
         assert!(m.detach().is_ok());
         let mut buf = String::new();
         let mut w = MetricsWriter::new(&mut buf, "fast-path");
@@ -115,9 +193,6 @@ mod tests {
 
     #[test]
     fn bpf_elf_embedded_when_built() {
-        // When the toolchain is available (CI), expect a non-empty ELF
-        // starting with the 4-byte ELF magic. When not (local dev on
-        // macOS without rustup), expect the empty stub.
         if FAST_PATH_BPF_AVAILABLE {
             assert!(FAST_PATH_BPF.len() >= 4, "BPF object suspiciously small");
             assert_eq!(

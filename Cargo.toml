@@ -38,6 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 libc = "0.2"
 flate2 = "1.0"
+signal-hook = "0.4"
 
 # aya stack — userspace + BPF + build integration. Pinned tight per
 # SPEC.md §7.1: aya has had breaking API changes across minor versions.
