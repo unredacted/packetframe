@@ -1,18 +1,22 @@
 //! PacketFrame fast-path BPF program.
 //!
-//! v0.0.x scaffolding: a trivial XDP program that always returns
-//! `XDP_PASS`. The real §4.4 logic (parse → LPM → `bpf_fib_lookup` →
-//! redirect) lands incrementally on the PR #3 branch once this scaffold
-//! proves the toolchain (nightly + `bpfel-unknown-none` + `bpf-linker`)
-//! builds end-to-end in CI.
+//! Incremental state: map definitions + `rx_total` counter on every
+//! packet, but still always returns `XDP_PASS`. The §4.4 parse /
+//! allowlist / FIB / redirect logic lands in the next commit on this
+//! branch.
 
 #![no_std]
 #![no_main]
 
 use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
 
+mod maps;
+
+use maps::{bump_stat, StatIdx};
+
 #[xdp]
 pub fn fast_path(_ctx: XdpContext) -> u32 {
+    bump_stat(StatIdx::RxTotal);
     xdp_action::XDP_PASS
 }
 
