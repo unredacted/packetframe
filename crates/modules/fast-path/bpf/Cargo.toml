@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 aya-ebpf = "=0.1.1"
-network-types = "=0.0.6"
+network-types = "=0.1.0"
 
 [profile.release]
 # BPF programs typically only pass the verifier in release mode — dev-mode
