@@ -38,6 +38,15 @@ const AF_INET6: u8 = 10;
 /// 802.1Q TPID. What we write back on push / rewrite.
 const TPID_8021Q: u16 = 0x8100;
 
+/// Sentinel u16 representing "no VLAN" in the VID-passing API below.
+/// 802.1Q reserves VID 0 for priority-only tagging, so `vid == 0`
+/// means absent from the fast-path's perspective. Using a single u16
+/// instead of `Option<u16>` keeps the value in one register across
+/// function-call boundaries — the verifier chokes on Option<u16>
+/// because the inner-value register is uninitialized on the None
+/// branch, failing with `Rn !read_ok` after argument spills.
+const VLAN_NONE: u16 = 0;
+
 /// One 802.1Q tag. 4 bytes: TPID (next header after eth src/dst) is
 /// already known = 0x8100, then the TCI (PCP:3 | DEI:1 | VID:12), then
 /// the inner ethertype. Laid out packed since the tag sits directly
@@ -77,12 +86,15 @@ fn try_fast_path(ctx: &XdpContext) -> Result<u32, ()> {
     {
         let vlan: *const VlanTag = ptr_at(ctx, EthHdr::LEN)?;
         let tci = u16::from_be_bytes(unsafe { (*vlan).tci });
-        // Low 12 bits are the VID.
+        // Low 12 bits are the VID. Legal VIDs are 1..4094; 0 and 4095
+        // are reserved. A VID of 0 here would collide with VLAN_NONE,
+        // so treat it as absent (matches 802.1Q's "priority-only" tag
+        // semantics — we don't fast-path those either).
         let vid = tci & 0x0fff;
         let inner = unsafe { (*vlan).inner_ether_type };
-        (inner, EthHdr::LEN + VLAN_HDR_LEN, Some(vid))
+        (inner, EthHdr::LEN + VLAN_HDR_LEN, vid)
     } else {
-        (outer_ether, EthHdr::LEN, None)
+        (outer_ether, EthHdr::LEN, VLAN_NONE)
     };
 
     if inner_ether == EtherType::Ipv4 as u16 {
@@ -100,7 +112,7 @@ fn handle_ipv4(
     ctx: &XdpContext,
     eth: *mut EthHdr,
     ip_offset: usize,
-    ingress_vid: Option<u16>,
+    ingress_vid: u16,
 ) -> Result<u32, ()> {
     let ip: *mut Ipv4Hdr = ptr_mut_at(ctx, ip_offset)?;
 
@@ -176,7 +188,7 @@ fn handle_ipv6(
     ctx: &XdpContext,
     eth: *mut EthHdr,
     ip_offset: usize,
-    ingress_vid: Option<u16>,
+    ingress_vid: u16,
 ) -> Result<u32, ()> {
     let ip: *mut Ipv6Hdr = ptr_mut_at(ctx, ip_offset)?;
 
@@ -249,7 +261,7 @@ fn dispatch_fib(
     ip: *mut u8,
     is_v4: bool,
     fib: &bpf_fib_lookup,
-    ingress_vid: Option<u16>,
+    ingress_vid: u16,
 ) -> Result<u32, ()> {
     match ret {
         BPF_FIB_LKUP_RET_SUCCESS => {
@@ -258,8 +270,8 @@ fn dispatch_fib(
             // to the physical parent and push/rewrite to the recorded
             // VID. Otherwise the target is physical/untagged.
             let (egress_ifindex, egress_vid) = match unsafe { VLAN_RESOLVE.get(&fib.ifindex) } {
-                Some(vi) => (vi.phys_ifindex, Some(vi.vid)),
-                None => (fib.ifindex, None),
+                Some(vi) => (vi.phys_ifindex, vi.vid),
+                None => (fib.ifindex, VLAN_NONE),
             };
 
             // TTL/hop_limit + csum first — IP header's position in
@@ -326,20 +338,19 @@ fn dispatch_fib(
 
 // --- VLAN choreography ----------------------------------------------------
 
-/// §4.7's four-case matrix. Returns Err(()) on any packet-manipulation
-/// failure (bounds check, `bpf_xdp_adjust_head` failure).
+/// §4.7's four-case matrix, keyed on VLAN_NONE-sentinel u16s rather
+/// than Option<u16> (the verifier rejects the Option-argument spill).
+/// Returns Err(()) on any packet-manipulation failure.
 #[inline(always)]
-fn apply_vlan_egress(
-    ctx: &XdpContext,
-    ingress_vid: Option<u16>,
-    egress_vid: Option<u16>,
-) -> Result<(), ()> {
-    match (ingress_vid, egress_vid) {
-        (None, None) => Ok(()),
-        (Some(iv), Some(ev)) if iv == ev => Ok(()),
-        (None, Some(v)) => vlan_push(ctx, v),
-        (Some(_), None) => vlan_pop(ctx),
-        (Some(_), Some(v)) => vlan_rewrite(ctx, v),
+fn apply_vlan_egress(ctx: &XdpContext, ingress_vid: u16, egress_vid: u16) -> Result<(), ()> {
+    let ingress_present = ingress_vid != VLAN_NONE;
+    let egress_present = egress_vid != VLAN_NONE;
+    match (ingress_present, egress_present) {
+        (false, false) => Ok(()),
+        (true, true) if ingress_vid == egress_vid => Ok(()),
+        (false, true) => vlan_push(ctx, egress_vid),
+        (true, false) => vlan_pop(ctx),
+        (true, true) => vlan_rewrite(ctx, egress_vid),
     }
 }
 
