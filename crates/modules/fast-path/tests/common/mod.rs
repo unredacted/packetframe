@@ -171,9 +171,9 @@ impl Harness {
 // --- Raw bpf(BPF_PROG_TEST_RUN) ----------------------------------------
 
 /// `bpf(BPF_PROG_TEST_RUN, ...)` struct layout. Matches the kernel's
-/// `union bpf_attr` `test` variant through kernel 6.1.
+/// `union bpf_attr` `test` variant through kernel 6.1. 76 meaningful
+/// bytes + 4 bytes of trailing padding to hit 8-byte alignment.
 #[repr(C)]
-#[derive(Default)]
 struct TestRunAttr {
     prog_fd: u32,
     retval: u32,
@@ -199,15 +199,20 @@ fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
     // output with headroom so the kernel doesn't truncate.
     let mut data_out = vec![0u8; packet.len() + 256];
 
-    let mut attr = TestRunAttr {
-        prog_fd: prog_fd as u32,
-        data_size_in: packet.len() as u32,
-        data_size_out: data_out.len() as u32,
-        data_in: packet.as_ptr() as u64,
-        data_out: data_out.as_mut_ptr() as u64,
-        repeat: 1,
-        ..Default::default()
-    };
+    // `mem::zeroed` over a struct-literal init: the kernel's CHECK_ATTR
+    // macro validates that bytes past `batch_size` (the last field of
+    // the TEST_RUN variant) are zero. A `#[derive(Default)]` init only
+    // zeros named fields — the 4 bytes of trailing padding we carry to
+    // hit 8-byte alignment stay uninitialized and land as garbage in
+    // the attr buffer → kernel 6.0+ returns EINVAL with no log. Zeroing
+    // the whole buffer first is the fix.
+    let mut attr: TestRunAttr = unsafe { std::mem::zeroed() };
+    attr.prog_fd = prog_fd as u32;
+    attr.data_size_in = packet.len() as u32;
+    attr.data_size_out = data_out.len() as u32;
+    attr.data_in = packet.as_ptr() as u64;
+    attr.data_out = data_out.as_mut_ptr() as u64;
+    attr.repeat = 1;
 
     let ret = unsafe {
         libc::syscall(
