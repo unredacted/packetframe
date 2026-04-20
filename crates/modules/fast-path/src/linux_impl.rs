@@ -21,9 +21,10 @@ use tracing::{info, warn};
 
 use crate::{FAST_PATH_BPF, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 
-/// Layout mirror of `FpCfg` in `bpf/src/maps.rs` (PR #3). Shared layout
-/// is enforced at runtime via a `size_of` check before first write.
-/// Bytes-for-bytes match the BPF-side struct.
+/// Layout mirror of `FpCfg` in `bpf/src/maps.rs` (PR #3). `#[repr(C)]`
+/// with all-bit-patterns-valid primitive fields, so `aya::Pod` is safe
+/// to impl — the marker tells aya the struct is safe to byte-copy into
+/// the kernel's map buffer. Bytes-for-bytes match the BPF-side struct.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct FpCfg {
@@ -32,6 +33,13 @@ pub struct FpCfg {
     pub _reserved: [u8; 2],
     pub version: u32,
 }
+
+// SAFETY: FpCfg is repr(C), contains only primitive integer types and
+// a fixed-size byte array — every bit pattern is a valid FpCfg. No
+// padding that could leak uninitialized memory (u8/u8/[u8;2]/u32 packs
+// exactly into 8 bytes on every target). Aya uses this to byte-copy
+// the struct into the kernel's array value slot.
+unsafe impl aya::Pod for FpCfg {}
 
 const FP_CFG_VERSION_V1: u32 = 0;
 
