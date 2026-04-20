@@ -1,0 +1,45 @@
+# Build output
+/target
+
+# Local spec — not uploaded to the remote
+/SPEC.md
+
+# Rust / Cargo
+**/*.rs.bk
+*.pdb
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.ropeproject/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs / crash dumps
+*.log
+**/core.*
+
+# Local plan scratch from the session (kept out of the repo)
+/plans/

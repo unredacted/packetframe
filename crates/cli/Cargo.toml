@@ -1,0 +1,26 @@
+[package]
+name = "packetframe-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PacketFrame CLI binary"
+
+[[bin]]
+name = "packetframe"
+path = "src/main.rs"
+
+[dependencies]
+packetframe-common.workspace = true
+packetframe-fast-path = { workspace = true, optional = true }
+
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = ["fast-path"]
+fast-path = ["dep:packetframe-fast-path"]
