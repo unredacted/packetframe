@@ -22,7 +22,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust (stable + nightly for BPF)
         # `bpfel-unknown-none` is a tier-3 target with no prebuilt
@@ -38,7 +38,7 @@ jobs:
           rustup toolchain install ${{ env.RUST_NIGHTLY }} \
             --profile minimal --component rust-src,llvm-tools-preview
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -87,7 +87,7 @@ jobs:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust (stable + target)
         run: |
@@ -95,7 +95,7 @@ jobs:
           rustup default ${{ env.RUST_STABLE }}
           rustup target add ${{ matrix.target }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
