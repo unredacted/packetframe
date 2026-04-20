@@ -16,7 +16,7 @@
 
 mod common;
 
-use common::{xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx};
+use common::{insert_vlan_tag, xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx};
 
 fn rx_total_delta(before: u64, h: &Harness) -> u64 {
     h.stat(StatIdx::RxTotal) - before
@@ -338,4 +338,155 @@ fn every_packet_bumps_rx_total() {
     h.add_allow_v4("10.0.0.0/8");
     h.run(&p);
     assert_eq!(h.stat(StatIdx::RxTotal), before + 3);
+}
+
+// ========== VLAN ingress parse (SPEC §4.4 step 2, §4.7) ==================
+//
+// `bpf_prog_test_run` can't exercise the §4.7 egress push/pop/rewrite
+// directly because that path sits behind a `bpf_fib_lookup` SUCCESS
+// which needs real routes configured — that's netns-integration-test
+// territory, deferred. What the tests below *do* cover:
+//
+// - Tagged packets are recognized as 802.1Q and the inner ethertype
+//   decides IPv4 vs IPv6 handling.
+// - The ingress VID is threaded through all the way to the dispatch
+//   layer (asserted indirectly via the matched counters + dry-run
+//   short-circuit, which fires AFTER the tagged ingress parse).
+// - Tagged packets with malformed / unsupported inner fall through to
+//   the same pass_not_ip / pass_complex_header buckets as untagged.
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn vlan_tagged_ipv4_src_match_dry_run_bumps_matched_v4() {
+    let mut h = Harness::new();
+    h.add_allow_v4("10.0.0.0/8");
+    h.set_dry_run(true);
+
+    let base = Ipv4TcpBuilder {
+        src_ip: [10, 1, 2, 3],
+        dst_ip: [192, 0, 2, 1],
+        ..Default::default()
+    }
+    .build();
+    let tagged = insert_vlan_tag(&base, 1337);
+
+    let before_matched = h.stat(StatIdx::MatchedV4);
+    let before_src = h.stat(StatIdx::MatchedSrcOnly);
+    let before_dry = h.stat(StatIdx::FwdDryRun);
+    let (verdict, _) = h.run(&tagged);
+    // If ingress VLAN parse failed, we'd see pass_not_ip or err_parse
+    // instead; matched_v4 wouldn't bump.
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::MatchedV4), before_matched + 1);
+    assert_eq!(h.stat(StatIdx::MatchedSrcOnly), before_src + 1);
+    assert_eq!(h.stat(StatIdx::FwdDryRun), before_dry + 1);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn vlan_tagged_ipv6_dst_match_dry_run_bumps_matched_v6() {
+    let mut h = Harness::new();
+    h.add_allow_v6("2001:db8::/32");
+    h.set_dry_run(true);
+
+    let base = Ipv6TcpBuilder {
+        src_ip: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        dst_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        ..Default::default()
+    }
+    .build();
+    let tagged = insert_vlan_tag(&base, 66);
+
+    let before_v6 = h.stat(StatIdx::MatchedV6);
+    let before_dst = h.stat(StatIdx::MatchedDstOnly);
+    let (verdict, _) = h.run(&tagged);
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::MatchedV6), before_v6 + 1);
+    assert_eq!(h.stat(StatIdx::MatchedDstOnly), before_dst + 1);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn vlan_tagged_ipv4_with_options_routes_to_complex_header() {
+    let mut h = Harness::new();
+    h.add_allow_v4("10.0.0.0/8");
+
+    let base = Ipv4TcpBuilder {
+        ihl: 6, // IPv4 options — routed to pass_complex_header
+        ..Default::default()
+    }
+    .build();
+    let tagged = insert_vlan_tag(&base, 1);
+
+    let before = h.stat(StatIdx::PassComplexHeader);
+    let (verdict, _) = h.run(&tagged);
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::PassComplexHeader), before + 1);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn vlan_tagged_ipv4_fragment_routes_to_pass_fragment() {
+    let mut h = Harness::new();
+    h.add_allow_v4("10.0.0.0/8");
+
+    let base = Ipv4TcpBuilder {
+        frag_flags: 0x2000, // MF set
+        ..Default::default()
+    }
+    .build();
+    let tagged = insert_vlan_tag(&base, 99);
+
+    let before = h.stat(StatIdx::PassFragment);
+    let (verdict, _) = h.run(&tagged);
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::PassFragment), before + 1);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn vlan_tagged_non_ip_inner_passes_with_pass_not_ip() {
+    let h = Harness::new();
+
+    // Tagged ARP — inner ethertype after VLAN tag is 0x0806 (not v4/v6).
+    let mut base = vec![0u8; 64];
+    base[0..6].copy_from_slice(&[0xff; 6]);
+    base[6..12].copy_from_slice(&[0xaa, 0, 0, 0, 0, 1]);
+    base[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+    let tagged = insert_vlan_tag(&base, 42);
+
+    let before = h.stat(StatIdx::PassNotIp);
+    let (verdict, _) = h.run(&tagged);
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::PassNotIp), before + 1);
+}
+
+// ========== Jumbo frames (SPEC §11.5) =====================================
+//
+// Reference EFG has 9182-byte MTU on VLAN trunks. Test with a 4K-class
+// TCP payload — XDP_PACKET_HEADROOM (256) + 4K body + slab tailroom
+// fits comfortably under the kernel's ~4096-byte `max_data_sz` cap for
+// test_run without LIVE_FRAMES. A true 9K frame needs LIVE_FRAMES mode
+// (5.18+) which is netns-integration-test territory. This fixture
+// proves the parse/allowlist/dry-run path doesn't choke on jumbo-ish
+// sizes.
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn ipv4_jumbo_payload_src_match_dry_run() {
+    let mut h = Harness::new();
+    h.add_allow_v4("10.0.0.0/8");
+    h.set_dry_run(true);
+
+    let pkt = Ipv4TcpBuilder {
+        src_ip: [10, 9, 9, 9],
+        payload: vec![0xaa; 3600], // 3.6K body under the test_run cap
+        ..Default::default()
+    }
+    .build();
+
+    let before = h.stat(StatIdx::MatchedV4);
+    let (verdict, _) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::MatchedV4), before + 1);
 }

@@ -282,6 +282,19 @@ impl Default for Ipv4TcpBuilder {
     }
 }
 
+/// Wrap a base Ethernet+IP packet with one 802.1Q tag inserted
+/// between the MAC pair and the inner ethertype. `vid` is the 12-bit
+/// VLAN ID; PCP/DEI are left zero.
+pub fn insert_vlan_tag(base: &[u8], vid: u16) -> Vec<u8> {
+    assert!(base.len() >= 14, "base packet must have Ethernet header");
+    let mut out = Vec::with_capacity(base.len() + 4);
+    out.extend_from_slice(&base[0..12]); // MAC pair
+    out.extend_from_slice(&[0x81, 0x00]); // 802.1Q TPID
+    out.extend_from_slice(&(vid & 0x0fff).to_be_bytes()); // TCI
+    out.extend_from_slice(&base[12..]); // inner ethertype + rest
+    out
+}
+
 impl Ipv4TcpBuilder {
     pub fn build(&self) -> Vec<u8> {
         let ip_header_len = (self.ihl as usize) * 4;
