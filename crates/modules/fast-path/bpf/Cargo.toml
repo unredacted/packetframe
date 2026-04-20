@@ -9,10 +9,15 @@ edition = "2021"
 rust-version = "1.95"
 license = "GPL-3.0-or-later"
 publish = false
-# Deliberately not a workspace member — this crate targets
-# `bpfel-unknown-none` on nightly Rust. See the comment in the root
-# Cargo.toml's `[workspace].exclude`. The userspace `fast-path` crate's
-# `build.rs` invokes a nested `cargo` against this crate.
+
+# An empty `[workspace]` table makes this crate its own workspace root
+# so a nested `cargo build` (invoked from our parent's build.rs) does
+# not walk up and find the outer workspace. Without this, cargo errors
+# "current package believes it's in a workspace when it's not" — the
+# outer `workspace.exclude` list alone is not sufficient when cargo is
+# invoked from within the excluded directory. See the companion note
+# in the root Cargo.toml's `[workspace].exclude`.
+[workspace]
 
 [[bin]]
 name = "fast-path"

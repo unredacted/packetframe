@@ -39,9 +39,20 @@ fn main() {
         println!("cargo::rerun-if-changed={}", bpf_dir.join(rel).display());
     }
     println!("cargo::rerun-if-env-changed=PACKETFRAME_SKIP_BPF_BUILD");
+    println!("cargo::rerun-if-env-changed=PACKETFRAME_BPF_REQUIRED");
 
-    // Explicit opt-out for debugging/local work.
-    if std::env::var("PACKETFRAME_SKIP_BPF_BUILD").is_ok() {
+    let bpf_required = std::env::var("PACKETFRAME_BPF_REQUIRED").is_ok();
+    let bpf_skip = std::env::var("PACKETFRAME_SKIP_BPF_BUILD").is_ok();
+
+    if bpf_required && bpf_skip {
+        panic!(
+            "PACKETFRAME_BPF_REQUIRED=1 and PACKETFRAME_SKIP_BPF_BUILD=1 are mutually exclusive"
+        );
+    }
+
+    // Explicit opt-out for debugging/local work (or for cross-build CI
+    // jobs that only exercise userspace cross-compilation).
+    if bpf_skip {
         println!("cargo::warning=PACKETFRAME_SKIP_BPF_BUILD set; writing empty stub BPF ELF");
         write_stub(&obj_out);
         println!("cargo::rustc-env=FAST_PATH_BPF_OBJ={}", obj_out.display());
@@ -52,41 +63,81 @@ fn main() {
     // bpfel-unknown-none target; `.cargo/config.toml` sets `linker =
     // bpf-linker`. If rustup is installed this works; if not, cargo
     // will fail and we fall through to the stub path.
-    let status = Command::new("cargo")
+    //
+    // Capture stderr + stdout so we can re-emit the real cargo error
+    // as cargo:warning lines on failure — otherwise the outer cargo
+    // swallows this build.rs process's output and users see only our
+    // opaque "BPF build failed (exit N)" warning, which is useless
+    // for diagnosing toolchain or compile errors in the BPF crate.
+    let output = Command::new("cargo")
         .current_dir(&bpf_dir)
         .args(["build", "--release", "--bin", "fast-path"])
-        .status();
+        .output();
 
     let built_elf = bpf_dir.join("target/bpfel-unknown-none/release/fast-path");
 
-    match status {
-        Ok(s) if s.success() && built_elf.exists() => {
+    match output {
+        Ok(out) if out.status.success() && built_elf.exists() => {
             std::fs::copy(&built_elf, &obj_out).expect("stage BPF ELF into OUT_DIR");
             println!("cargo::rustc-cfg=packetframe_bpf_built");
         }
-        Ok(s) if s.success() => {
-            println!(
-                "cargo::warning=BPF build reported success but ELF not found at {}; using stub",
+        Ok(out) if out.status.success() => {
+            forward_output(&out.stdout, &out.stderr);
+            let msg = format!(
+                "BPF build reported success but ELF not found at {}",
                 built_elf.display()
             );
-            write_stub(&obj_out);
+            fail_or_stub(&obj_out, bpf_required, &msg);
         }
-        Ok(s) => {
-            println!(
-                "cargo::warning=BPF build failed (exit {}); using empty stub ELF. Install rustup + nightly + bpf-linker for local BPF builds; CI does this automatically.",
-                s.code().unwrap_or(-1)
+        Ok(out) => {
+            forward_output(&out.stdout, &out.stderr);
+            let msg = format!(
+                "BPF build failed (exit {}) — see cargo:warning lines above for the real error, or run `(cd crates/modules/fast-path/bpf && cargo build --release)` directly",
+                out.status.code().unwrap_or(-1)
             );
-            write_stub(&obj_out);
+            fail_or_stub(&obj_out, bpf_required, &msg);
         }
         Err(e) => {
-            println!(
-                "cargo::warning=could not invoke cargo for BPF build ({e}); using empty stub ELF"
-            );
-            write_stub(&obj_out);
+            let msg = format!("could not invoke cargo for BPF build ({e})");
+            fail_or_stub(&obj_out, bpf_required, &msg);
         }
     }
 
     println!("cargo::rustc-env=FAST_PATH_BPF_OBJ={}", obj_out.display());
+}
+
+/// When PACKETFRAME_BPF_REQUIRED is set (CI), panic so the whole build
+/// fails loudly instead of quietly writing a stub ELF that makes every
+/// downstream test vacuously "pass" by early-returning on
+/// `FAST_PATH_BPF_AVAILABLE == false`. Otherwise, stub and continue
+/// (local dev on macOS without rustup, etc.).
+fn fail_or_stub(obj_out: &std::path::Path, required: bool, msg: &str) {
+    if required {
+        panic!(
+            "PACKETFRAME_BPF_REQUIRED is set but {msg}. Refusing to stub the ELF — that would make every BPF-dependent test a silent no-op."
+        );
+    }
+    println!(
+        "cargo::warning={msg}; using empty stub ELF. Install rustup + nightly + bpf-linker for local BPF builds; CI does this automatically."
+    );
+    write_stub(obj_out);
+}
+
+/// Re-emit the nested cargo's stdout + stderr as `cargo:warning` lines
+/// so the outer cargo shows them. Each source line becomes a separate
+/// warning — cargo prints one warning per line anyway, and this way
+/// the user doesn't have to `cargo build -vv` to diagnose a BPF build
+/// failure.
+fn forward_output(stdout: &[u8], stderr: &[u8]) {
+    let emit = |label: &str, bytes: &[u8]| {
+        for line in String::from_utf8_lossy(bytes).lines() {
+            if !line.trim().is_empty() {
+                println!("cargo::warning=[bpf {label}] {line}");
+            }
+        }
+    };
+    emit("stdout", stdout);
+    emit("stderr", stderr);
 }
 
 fn write_stub(path: &std::path::Path) {
