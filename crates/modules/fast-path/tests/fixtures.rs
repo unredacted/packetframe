@@ -339,4 +339,3 @@ fn every_packet_bumps_rx_total() {
     h.run(&p);
     assert_eq!(h.stat(StatIdx::RxTotal), before + 3);
 }
-
