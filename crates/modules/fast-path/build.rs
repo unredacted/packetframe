@@ -106,7 +106,21 @@ fn main() {
                 Some(built) if built.exists() => {
                     std::fs::copy(&built, &obj_out).expect("stage BPF ELF into OUT_DIR");
                     println!("cargo::rustc-cfg=packetframe_bpf_built");
-                    println!("cargo::warning=BPF ELF built from {}", built.display());
+                    // Debug: dump the first 16 bytes + size. ELF magic
+                    // is 7f 45 4c 46 ("..ELF"); anything else is not a
+                    // parseable ELF and aya will reject it.
+                    if let Ok(bytes) = std::fs::read(&built) {
+                        let head: Vec<String> =
+                            bytes.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                        println!(
+                            "cargo::warning=BPF ELF built from {} ({} bytes); first 16: {}",
+                            built.display(),
+                            bytes.len(),
+                            head.join(" ")
+                        );
+                    } else {
+                        println!("cargo::warning=BPF ELF built from {}", built.display());
+                    }
                 }
                 Some(built) => {
                     forward_output(&[], &out.stderr);
