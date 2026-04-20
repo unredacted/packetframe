@@ -17,6 +17,10 @@ exclude = [
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
+# MSRV. Deliberately behind the rust-toolchain.toml pin (which is the
+# latest stable) so a contributor with a slightly older toolchain still
+# builds. CI always runs against the latest stable — see
+# `.github/workflows/ci.yml` `RUST_STABLE`.
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/unredacted/packetframe"

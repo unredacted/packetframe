@@ -11,8 +11,8 @@ env:
   # Pins for tools the Rust project itself publishes — GitHub runners
   # come with rustup pre-installed, so we manage toolchains and targets
   # via direct `rustup` commands rather than a third-party action.
-  RUST_STABLE: "1.85.0"
-  RUST_NIGHTLY: "nightly-2026-03-15"
+  RUST_STABLE: "1.95.0"
+  RUST_NIGHTLY: "nightly-2026-04-14"
   # bpf-linker pin — bump via reviewed PR. SPEC.md §7.1 calls out pinning
   # the BPF toolchain tight because aya/bpf-linker versions move together.
   BPF_LINKER_VERSION: "0.10.3"

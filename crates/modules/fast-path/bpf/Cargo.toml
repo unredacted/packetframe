@@ -2,7 +2,11 @@
 name = "packetframe-fast-path-bpf"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.85"
+# Applies to the stable toolchain; the BPF crate itself uses nightly
+# (pinned via rust-toolchain.toml in this directory), but this field
+# documents the minimum stable Rust the crate is expected to compile on
+# if nightly is unavailable and a maintainer wants to experiment.
+rust-version = "1.95"
 license = "GPL-3.0-or-later"
 publish = false
 # Deliberately not a workspace member — this crate targets
