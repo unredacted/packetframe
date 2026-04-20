@@ -509,7 +509,12 @@ fn probe_bpffs(path: &Path) -> Capability {
         );
     }
 
-    let f_type: i64 = statfs.f_type as i64;
+    // `statfs.f_type` varies by platform/libc: `i64` on glibc Linux x86_64,
+    // `u32` on macOS, `u64` on some musl configs. Normalize to `i64` for
+    // the comparison; clippy will call this unnecessary on whichever
+    // platform already has `i64` — the cast is still correct on every other.
+    #[allow(clippy::unnecessary_cast)]
+    let f_type = statfs.f_type as i64;
     if f_type == BPF_FS_MAGIC {
         Capability::pass(
             "bpffs",

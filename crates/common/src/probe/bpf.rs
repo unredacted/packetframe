@@ -194,7 +194,13 @@ impl Default for ProgLoadAttr {
 /// # Safety
 /// Caller must provide an `attr` pointer valid for `size` bytes and matching
 /// the command's expected layout.
+//
+// `libc::c_long` is `i64` on 64-bit Linux and `i32` on 32-bit. The
+// `as i64` on the return value is a no-op on 64-bit (what we release
+// for) but a widening cast on 32-bit; suppress the no-op-cast lint
+// rather than diverge the two paths.
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)]
 pub unsafe fn bpf_syscall(cmd: u32, attr: *const u8, size: u32) -> io::Result<i64> {
     let ret = unsafe { libc::syscall(libc::SYS_bpf, cmd as libc::c_long, attr, size) };
     if ret < 0 {
