@@ -17,7 +17,7 @@
 //!   the PR #3 plan: CI-only BPF builds).
 //! - Requires CAP_BPF + CAP_NET_ADMIN; CI runs it under `sudo`.
 
-use packetframe_fast_path::{FAST_PATH_BPF, FAST_PATH_BPF_AVAILABLE};
+use packetframe_fast_path::{aligned_bpf_copy, FAST_PATH_BPF_AVAILABLE};
 
 /// Loading a BPF program calls `bpf(BPF_PROG_LOAD)` which requires
 /// CAP_BPF + CAP_NET_ADMIN. Default `cargo test` has neither; CI runs
@@ -31,8 +31,8 @@ fn fast_path_passes_verifier() {
         return;
     }
 
-    let mut bpf =
-        aya::Ebpf::load(FAST_PATH_BPF).expect("load BPF ELF (ensure test runs as root/CAP_BPF)");
+    let bytes = aligned_bpf_copy();
+    let mut bpf = aya::Ebpf::load(&bytes).expect("load BPF ELF (ensure test runs as root/CAP_BPF)");
 
     let prog: &mut aya::programs::Xdp = bpf
         .program_mut("fast_path")

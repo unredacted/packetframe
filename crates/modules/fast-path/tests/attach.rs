@@ -15,7 +15,7 @@
 
 use std::process::Command;
 
-use packetframe_fast_path::{FAST_PATH_BPF, FAST_PATH_BPF_AVAILABLE};
+use packetframe_fast_path::{aligned_bpf_copy, FAST_PATH_BPF_AVAILABLE};
 
 const PEER_A: &str = "pf-veth0";
 const PEER_B: &str = "pf-veth1";
@@ -64,7 +64,8 @@ fn attach_detach_roundtrip_on_veth() {
         idx
     };
 
-    let mut bpf = aya::Ebpf::load(FAST_PATH_BPF).expect("aya::Ebpf::load");
+    let bytes = aligned_bpf_copy();
+    let mut bpf = aya::Ebpf::load(&bytes).expect("aya::Ebpf::load");
     let prog: &mut aya::programs::Xdp = bpf
         .program_mut("fast_path")
         .expect("fast_path program present")

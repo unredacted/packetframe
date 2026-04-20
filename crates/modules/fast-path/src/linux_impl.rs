@@ -19,7 +19,7 @@ use packetframe_common::{
 };
 use tracing::{info, warn};
 
-use crate::{FAST_PATH_BPF, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
+use crate::{aligned_bpf_copy, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs` (PR #3). `#[repr(C)]`
 /// with all-bit-patterns-valid primitive fields, so `aya::Pod` is safe
@@ -74,8 +74,11 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 
     // aya doesn't expose an `Ebpf::load_with_options` that'd let us
     // skip BTF lookup; on the reference EFG (§2.2) BTF is absent but
-    // aya handles that path internally.
-    let mut ebpf = Ebpf::load(FAST_PATH_BPF)
+    // aya handles that path internally. Use an aligned copy — the
+    // embedded `include_bytes!` slice is 1-byte-aligned which the
+    // object crate's ELF parser rejects.
+    let bytes = aligned_bpf_copy();
+    let mut ebpf = Ebpf::load(&bytes)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("aya::Ebpf::load failed: {e}")))?;
 
     populate_cfg(&mut ebpf, cfg)?;
@@ -363,7 +366,8 @@ pub fn trial_attach_native(iface: &str) -> TrialResult {
         Ok(i) => i,
         Err(e) => return TrialResult::NoSuchInterface(e.to_string()),
     };
-    let mut ebpf = match Ebpf::load(FAST_PATH_BPF) {
+    let bytes = aligned_bpf_copy();
+    let mut ebpf = match Ebpf::load(&bytes) {
         Ok(e) => e,
         Err(e) => return TrialResult::LoadFailed(e.to_string()),
     };

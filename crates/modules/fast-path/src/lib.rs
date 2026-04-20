@@ -32,7 +32,24 @@ pub const FAST_PATH_PRIORITY: u16 = 1000;
 /// The compiled fast-path BPF ELF, staged by `build.rs` and embedded at
 /// crate-compile time. Empty (zero bytes) when the BPF toolchain isn't
 /// available — see [`FAST_PATH_BPF_AVAILABLE`].
+///
+/// Note: `include_bytes!` returns a 1-byte-aligned slice. Passing it
+/// directly to `aya::Ebpf::load` fails with "Invalid ELF header size
+/// or alignment" because the `object` crate's ELF parser does
+/// unaligned u32/u64 reads into the header. Callers must copy to an
+/// aligned buffer — use [`FastPathModule::new`] + `Module::load`,
+/// which handles this internally, or call [`aligned_bpf_copy`] to
+/// get a heap-allocated 16-byte-aligned `Vec<u8>` suitable for
+/// `aya::Ebpf::load`.
 pub const FAST_PATH_BPF: &[u8] = include_bytes!(env!("FAST_PATH_BPF_OBJ"));
+
+/// Allocate an aligned `Vec<u8>` containing a copy of [`FAST_PATH_BPF`].
+/// The system allocator aligns to at least 16 bytes on 64-bit
+/// platforms, which is enough for the `object` crate to parse the
+/// ELF header without trapping on misaligned access.
+pub fn aligned_bpf_copy() -> Vec<u8> {
+    FAST_PATH_BPF.to_vec()
+}
 
 /// `true` when `build.rs` produced a real BPF ELF; `false` when the build
 /// fell back to an empty stub (CI-only BPF builds per the PR #3 plan).
