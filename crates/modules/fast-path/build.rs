@@ -69,8 +69,24 @@ fn main() {
     // swallows this build.rs process's output and users see only our
     // opaque "BPF build failed (exit N)" warning, which is useless
     // for diagnosing toolchain or compile errors in the BPF crate.
+    //
+    // Clear outer-cargo/rustup env vars before spawning so rustup
+    // fresh-resolves the toolchain from `bpf/rust-toolchain.toml`.
+    // Without this, `CARGO` and `RUSTUP_TOOLCHAIN` inherit from the
+    // outer stable build, and cargo links against a precompiled
+    // `core` that doesn't exist for `bpfel-unknown-none` (symptom:
+    // `error[E0463]: can't find crate for 'core'`) because `build-std`
+    // only activates under nightly.
     let output = Command::new("cargo")
         .current_dir(&bpf_dir)
+        .env_remove("CARGO")
+        .env_remove("RUSTC")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_MANIFEST_DIR")
         .args(["build", "--release", "--bin", "fast-path"])
         .output();
 
