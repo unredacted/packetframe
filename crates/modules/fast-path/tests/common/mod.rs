@@ -20,7 +20,7 @@
 #![cfg(target_os = "linux")]
 #![allow(dead_code)] // Used from multiple integration-test files; unused warnings fire per-file.
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 
 use aya::{
     maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, PerCpuArray},

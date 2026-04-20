@@ -27,7 +27,7 @@ fn rx_total_delta(before: u64, h: &Harness) -> u64 {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn arp_passes_with_pass_not_ip() {
-    let mut h = Harness::new();
+    let h = Harness::new();
 
     // ARP (ethertype 0x0806) — plausibly-shaped but not IP.
     let mut pkt = vec![0u8; 64];
