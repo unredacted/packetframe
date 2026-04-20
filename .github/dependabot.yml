@@ -1,0 +1,39 @@
+version: 2
+
+# SPEC.md §7.1 requires version drifts to surface as reviewable PRs
+# rather than silent ecosystem movement. Dependabot covers all three
+# package ecosystems in this repo: the workspace cargo graph, the
+# non-workspace BPF cargo graph, and the github-actions used by CI.
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Batch patch/minor ecosystem churn (serde, anyhow, clap etc.)
+      # into one weekly PR. Major bumps land as individual PRs.
+      userspace-minor:
+        update-types: ["patch", "minor"]
+        exclude-patterns:
+          - "aya*"
+    ignore:
+      # aya stack is pinned tight per SPEC.md §7.1. Still gets updates
+      # proposed — they just go through as individual PRs (no grouping).
+      - dependency-name: "aya"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "cargo"
+    directory: "/crates/modules/fast-path/bpf"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        update-types: ["patch", "minor", "major"]

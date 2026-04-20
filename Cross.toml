@@ -1,0 +1,12 @@
+# `cross` config. `cross` runs cargo inside a docker container; env vars
+# from the host don't propagate unless listed here.
+#
+# PACKETFRAME_SKIP_BPF_BUILD gates the nested BPF build in
+# `crates/modules/fast-path/build.rs`. Cross-build jobs in CI set it so
+# userspace-cross smoke tests don't need the BPF toolchain inside the
+# container (BPF bytecode is architecture-independent; the `check` job
+# builds it once against the host).
+[build.env]
+passthrough = [
+    "PACKETFRAME_SKIP_BPF_BUILD",
+]

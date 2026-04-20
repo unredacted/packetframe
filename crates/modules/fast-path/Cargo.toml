@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PacketFrame fast-path module (stub in v0.0.1; full MVP lands in v0.1)"
+description = "PacketFrame fast-path module (BPF object via build.rs; loader wiring lands in PR #4)"
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -14,3 +15,9 @@ path = "src/lib.rs"
 packetframe-common.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+# aya (userspace) is Linux-only (uses netlink, SYS_bpf, etc.) so the
+# dev-dep is cfg-gated — matches how the probe code in `crates/common`
+# handles platform. macOS dev loops still `cargo test` cleanly.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya.workspace = true

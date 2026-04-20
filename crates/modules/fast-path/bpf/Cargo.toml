@@ -1,0 +1,40 @@
+[package]
+name = "packetframe-fast-path-bpf"
+version = "0.0.1"
+edition = "2021"
+# Applies to the stable toolchain; the BPF crate itself uses nightly
+# (pinned via rust-toolchain.toml in this directory), but this field
+# documents the minimum stable Rust the crate is expected to compile on
+# if nightly is unavailable and a maintainer wants to experiment.
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+# Deliberately not a workspace member — this crate targets
+# `bpfel-unknown-none` on nightly Rust. See the comment in the root
+# Cargo.toml's `[workspace].exclude`. The userspace `fast-path` crate's
+# `build.rs` invokes a nested `cargo` against this crate.
+
+[[bin]]
+name = "fast-path"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "=0.1.1"
+network-types = "=0.1.0"
+
+[profile.release]
+# BPF programs typically only pass the verifier in release mode — dev-mode
+# debuginfo and lack of optimization produce instruction sequences the
+# verifier rejects as too long / loopy.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+overflow-checks = false
+
+[profile.dev]
+opt-level = 3
+panic = "abort"
+debug = false
+overflow-checks = false
