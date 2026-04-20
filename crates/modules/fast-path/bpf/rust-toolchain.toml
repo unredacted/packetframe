@@ -2,6 +2,11 @@
 # aya-ebpf requires nightly for the `bpfel-unknown-none` target plus
 # `build-std` support for `core`. Pin a specific nightly; bump via a
 # reviewed PR rather than `nightly` unqualified.
+#
+# `bpfel-unknown-none` is a tier-3 target with no precompiled `rust-std`
+# — we build `core` from source via `[unstable] build-std = ["core"]`
+# in `.cargo/config.toml`, which only needs `rust-src`. Do NOT list
+# `targets = ["bpfel-unknown-none"]` here; rustup would try to download
+# a nonexistent `rust-std` component.
 channel = "nightly-2026-03-15"
 components = ["rust-src", "llvm-tools-preview"]
-targets = ["bpfel-unknown-none"]

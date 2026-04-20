@@ -24,11 +24,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install nightly + bpfel-unknown-none (for BPF crate)
+      - name: Install nightly for BPF crate
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-03-15
-          targets: bpfel-unknown-none
+          # `bpfel-unknown-none` is a tier-3 target with no prebuilt
+          # `rust-std`; we build `core` from source via `build-std`
+          # (configured in `crates/modules/fast-path/bpf/.cargo/config.toml`),
+          # which only needs `rust-src`. Listing `targets:` here would
+          # try to download a non-existent std.
           components: rust-src, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
