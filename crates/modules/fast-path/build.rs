@@ -77,6 +77,10 @@ fn main() {
     // `core` that doesn't exist for `bpfel-unknown-none` (symptom:
     // `error[E0463]: can't find crate for 'core'`) because `build-std`
     // only activates under nightly.
+    // Build with `--message-format=json` so we can parse cargo's
+    // structured output and locate the compiler-artifact filename.
+    // That's more robust than hardcoding the target/ path — cargo and
+    // bpf-linker have both moved artifact locations across versions.
     let output = Command::new("cargo")
         .current_dir(&bpf_dir)
         .env_remove("CARGO")
@@ -87,26 +91,44 @@ fn main() {
         .env_remove("CARGO_BUILD_TARGET")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_MANIFEST_DIR")
-        .args(["build", "--release", "--bin", "fast-path"])
+        .args([
+            "build",
+            "--release",
+            "--bin",
+            "fast-path",
+            "--message-format=json",
+        ])
         .output();
 
-    let built_elf = bpf_dir.join("target/bpfel-unknown-none/release/fast-path");
-
     match output {
-        Ok(out) if out.status.success() && built_elf.exists() => {
-            std::fs::copy(&built_elf, &obj_out).expect("stage BPF ELF into OUT_DIR");
-            println!("cargo::rustc-cfg=packetframe_bpf_built");
-        }
         Ok(out) if out.status.success() => {
-            forward_output(&out.stdout, &out.stderr);
-            let msg = format!(
-                "BPF build reported success but ELF not found at {}",
-                built_elf.display()
-            );
-            fail_or_stub(&obj_out, bpf_required, &msg);
+            match find_artifact(&out.stdout) {
+                Some(built) if built.exists() => {
+                    std::fs::copy(&built, &obj_out).expect("stage BPF ELF into OUT_DIR");
+                    println!("cargo::rustc-cfg=packetframe_bpf_built");
+                    println!("cargo::warning=BPF ELF built from {}", built.display());
+                }
+                Some(built) => {
+                    forward_output(&[], &out.stderr);
+                    let msg = format!(
+                        "BPF build succeeded but artifact at {} does not exist",
+                        built.display()
+                    );
+                    fail_or_stub(&obj_out, bpf_required, &msg);
+                }
+                None => {
+                    // stdout is cargo JSON messages with --message-format=json;
+                    // only stderr is human-readable and worth forwarding.
+                    forward_output(&[], &out.stderr);
+                    let msg = "BPF build succeeded but no compiler-artifact JSON message for `fast-path` bin was emitted";
+                    fail_or_stub(&obj_out, bpf_required, msg);
+                }
+            }
         }
         Ok(out) => {
-            forward_output(&out.stdout, &out.stderr);
+            // stdout is cargo JSON messages with --message-format=json;
+            // only stderr is human-readable and worth forwarding.
+            forward_output(&[], &out.stderr);
             let msg = format!(
                 "BPF build failed (exit {}) — see cargo:warning lines above for the real error, or run `(cd crates/modules/fast-path/bpf && cargo build --release)` directly",
                 out.status.code().unwrap_or(-1)
@@ -120,6 +142,31 @@ fn main() {
     }
 
     println!("cargo::rustc-env=FAST_PATH_BPF_OBJ={}", obj_out.display());
+}
+
+/// Parse cargo's JSON message stream to find the artifact path for
+/// the fast-path binary. Looks for `"reason":"compiler-artifact"`
+/// lines naming `"fast-path"` and returns the first path inside the
+/// `"filenames":["..."]` array.
+fn find_artifact(stdout: &[u8]) -> Option<PathBuf> {
+    const MARKER: &str = "\"filenames\":[\"";
+    for line in String::from_utf8_lossy(stdout).lines() {
+        if !line.contains("\"reason\":\"compiler-artifact\"") {
+            continue;
+        }
+        if !line.contains("\"name\":\"fast-path\"") {
+            continue;
+        }
+        let Some(start) = line.find(MARKER) else {
+            continue;
+        };
+        let rest = &line[start + MARKER.len()..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        return Some(PathBuf::from(&rest[..end]));
+    }
+    None
 }
 
 /// When PACKETFRAME_BPF_REQUIRED is set (CI), panic so the whole build
