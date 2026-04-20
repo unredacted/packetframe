@@ -15,3 +15,9 @@ path = "src/lib.rs"
 packetframe-common.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+# aya (userspace) is Linux-only (uses netlink, SYS_bpf, etc.) so the
+# dev-dep is cfg-gated — matches how the probe code in `crates/common`
+# handles platform. macOS dev loops still `cargo test` cleanly.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya.workspace = true
