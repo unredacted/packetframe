@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PacketFrame fast-path module (stub in v0.0.1; full MVP lands in v0.1)"
+description = "PacketFrame fast-path module (BPF object via build.rs; loader wiring lands in PR #4)"
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"

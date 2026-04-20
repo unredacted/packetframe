@@ -5,6 +5,14 @@ members = [
     "crates/cli",
     "crates/modules/fast-path",
 ]
+# The BPF crate lives at `crates/modules/fast-path/bpf/` and is deliberately
+# excluded from the workspace. It targets `bpfel-unknown-none` and needs a
+# pinned nightly toolchain; pulling it into the workspace would force the
+# rest of the tree onto nightly and break host cargo commands. `build.rs`
+# in `crates/modules/fast-path/` invokes a nested cargo to build it.
+exclude = [
+    "crates/modules/fast-path/bpf",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -26,6 +34,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 libc = "0.2"
 flate2 = "1.0"
+
+# aya stack — userspace + BPF + build integration. Pinned tight per
+# SPEC.md §7.1: aya has had breaking API changes across minor versions.
+# Bump via reviewed PR rather than caret ranges.
+aya = "=0.13.1"
+aya-log = "=0.2.1"
+aya-build = "=0.1.2"
 
 [profile.release]
 lto = "thin"

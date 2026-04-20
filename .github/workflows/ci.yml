@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
+  # bpf-linker pin — bump via reviewed PR. SPEC.md §7.1 calls out pinning
+  # the BPF toolchain tight because aya/bpf-linker versions move together.
+  BPF_LINKER_VERSION: "0.9.13"
 
 jobs:
   check:
@@ -16,12 +19,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain (matches rust-toolchain.toml)
+      - name: Install stable toolchain (workspace)
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      - name: Install nightly + bpfel-unknown-none (for BPF crate)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          targets: bpfel-unknown-none
+          components: rust-src, llvm-tools-preview
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache from cross-build jobs so the BPF toolchain
+          # downloads don't pollute cross caches.
+          key: check-bpf
+
+      - name: Install bpf-linker
+        run: cargo install --locked bpf-linker --version ${{ env.BPF_LINKER_VERSION }}
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -35,6 +52,13 @@ jobs:
   cross-build:
     name: cross-build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    # Cross-build jobs are userspace-only smoke tests for each release
+    # target triple. BPF bytecode is architecture-independent (it's BPF,
+    # not native machine code), so building it four times inside `cross`
+    # containers would be wasted work. The `check` job above builds it
+    # once; these jobs stub it out via PACKETFRAME_SKIP_BPF_BUILD=1.
+    env:
+      PACKETFRAME_SKIP_BPF_BUILD: "1"
     strategy:
       fail-fast: false
       matrix:

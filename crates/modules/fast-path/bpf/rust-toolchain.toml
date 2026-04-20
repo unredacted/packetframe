@@ -1,0 +1,7 @@
+[toolchain]
+# aya-ebpf requires nightly for the `bpfel-unknown-none` target plus
+# `build-std` support for `core`. Pin a specific nightly; bump via a
+# reviewed PR rather than `nightly` unqualified.
+channel = "nightly-2026-03-15"
+components = ["rust-src", "llvm-tools-preview"]
+targets = ["bpfel-unknown-none"]
