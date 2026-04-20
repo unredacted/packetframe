@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 use aya::{
-    maps::{lpm_trie::Key as LpmKey, xdp::DevMapHash, Array, LpmTrie},
+    maps::{lpm_trie::Key as LpmKey, xdp::DevMapHash, Array, HashMap as AyaHashMap, LpmTrie},
     programs::{xdp::XdpFlags, Xdp},
     Ebpf,
 };
@@ -42,6 +42,21 @@ pub struct FpCfg {
 unsafe impl aya::Pod for FpCfg {}
 
 const FP_CFG_VERSION_V1: u32 = 0;
+
+/// Layout mirror of `VlanResolve` in `bpf/src/maps.rs`. Hash-map value
+/// that tells the BPF program "this subif ifindex really egresses on
+/// phys_ifindex with a VID". `#[repr(C)]` + u32/u16/u16 packs to 8
+/// bytes; every bit pattern is valid.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct VlanResolve {
+    pub phys_ifindex: u32,
+    pub vid: u16,
+    pub _pad: u16,
+}
+
+// SAFETY: repr(C), all primitive fields, every bit pattern valid.
+unsafe impl aya::Pod for VlanResolve {}
 
 /// All state required to keep the attached program alive.
 /// `Drop` on `Ebpf` unloads the program + maps, which is what we want
@@ -249,6 +264,8 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         })?;
     }
 
+    populate_vlan_resolve(state)?;
+
     // Build Attachment records for the pin registry. `pinned_path` is
     // advisory in v0.1 — actual bpffs pinning lands with reconcile in
     // PR #6 — but we populate the shape so the registry survives
@@ -316,6 +333,96 @@ fn try_attach_with_fallback(
             }
         },
     }
+}
+
+/// Populate `vlan_resolve` from `/proc/net/vlan/config`. Each VLAN
+/// subinterface maps its ifindex → (physical parent ifindex, VID) so
+/// the BPF program can push/pop/rewrite per SPEC §4.7 when the FIB
+/// resolves to a subif. Missing `/proc/net/vlan/config` (no 8021q
+/// kernel module loaded) is not an error — we just insert nothing.
+fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
+    let entries = match read_vlan_config() {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("/proc/net/vlan/config missing — no VLAN subifs to resolve");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!("read /proc/net/vlan/config: {e}"),
+            ));
+        }
+    };
+
+    if entries.is_empty() {
+        info!("/proc/net/vlan/config empty — no VLAN subifs configured");
+        return Ok(());
+    }
+
+    let map = state
+        .ebpf
+        .map_mut("VLAN_RESOLVE")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "VLAN_RESOLVE map missing from ELF"))?;
+    let mut hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("VLAN_RESOLVE try_from: {e}")))?;
+
+    for (subif_name, vid, parent_name) in entries {
+        let subif_idx = if_nametoindex(&subif_name)?;
+        let phys_idx = if_nametoindex(&parent_name)?;
+        let value = VlanResolve {
+            phys_ifindex: phys_idx,
+            vid,
+            _pad: 0,
+        };
+        hm.insert(subif_idx, value, 0).map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("VLAN_RESOLVE insert {subif_name}: {e}"),
+            )
+        })?;
+        info!(
+            subif = %subif_name,
+            subif_idx,
+            parent = %parent_name,
+            phys_idx,
+            vid,
+            "vlan_resolve populated"
+        );
+    }
+    Ok(())
+}
+
+/// Parse `/proc/net/vlan/config`. Format (from Linux net/8021q):
+///
+/// ```text
+/// VLAN Dev name    | VLAN ID
+/// Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD
+/// eth0.1337        | 1337  | eth0
+/// ```
+///
+/// Skip the two header lines, split each subsequent line on `|`, trim
+/// whitespace, and return `(subif_name, vid, parent_name)` tuples.
+fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> {
+    let content = std::fs::read_to_string("/proc/net/vlan/config")?;
+    let mut out = Vec::new();
+    for line in content.lines().skip(2) {
+        let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let subif = parts[0].to_string();
+        let vid: u16 = match parts[1].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let parent = parts[2].to_string();
+        if subif.is_empty() || parent.is_empty() {
+            continue;
+        }
+        out.push((subif, vid, parent));
+    }
+    Ok(out)
 }
 
 pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
