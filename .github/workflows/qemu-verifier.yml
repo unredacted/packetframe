@@ -123,10 +123,18 @@ jobs:
           # Pass the installed vmlinuz path (not the .deb). virtme-ng
           # discovers matching modules at /lib/modules/$VER on the host
           # and packages them into its generated initramfs.
+          # virtme-init resets PATH inside the guest. Source the
+          # runner's cargo env (rustup-provided) before running tests.
           virtme-ng \
             --run "${KERNEL_IMG}" \
             --pwd \
             --memory 1024 \
             --disable-kvm \
             --verbose \
-            -- bash -c 'set -eux; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture'
+            -- bash -c '
+              set -eux
+              source "${HOME}/.cargo/env" || export PATH="/home/runner/.cargo/bin:${PATH}"
+              uname -a
+              which cargo
+              cargo test -p packetframe-fast-path --tests -- --ignored --nocapture
+            '
