@@ -1,0 +1,35 @@
+[package]
+name = "packetframe-probe-bpf"
+version = "0.0.1"
+edition = "2021"
+# See crates/modules/fast-path/bpf/Cargo.toml for the rationale behind
+# this field — documents the stable MSRV even though the BPF build runs
+# on nightly (pinned in ./rust-toolchain.toml).
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Nested workspace root. See the note in
+# `crates/modules/fast-path/bpf/Cargo.toml`.
+[workspace]
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "=0.1.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+overflow-checks = false
+
+[profile.dev]
+opt-level = 3
+panic = "abort"
+debug = false
+overflow-checks = false

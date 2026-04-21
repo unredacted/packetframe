@@ -13,18 +13,21 @@ mod feasibility;
 mod loader;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod metrics;
+#[cfg(feature = "probe")]
+mod probe;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use packetframe_common::config::Config;
 use tracing_subscriber::EnvFilter;
 
 /// Exit codes per SPEC.md §7.3.
-const EXIT_OK: u8 = 0;
-const EXIT_STARTUP_ERROR: u8 = 1;
-const EXIT_RUNTIME_ERROR: u8 = 2;
+pub(crate) const EXIT_OK: u8 = 0;
+pub(crate) const EXIT_STARTUP_ERROR: u8 = 1;
+pub(crate) const EXIT_RUNTIME_ERROR: u8 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -93,6 +96,65 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+
+    /// Attach a diagnostic XDP program, dump the first 16 bytes of a
+    /// sample of incoming packets, detach. Built to answer "what does
+    /// this driver hand to XDP?" — see SPEC.md §11.1(c) for the
+    /// rvu-nicpf native-delivery investigation that motivated it.
+    #[cfg(feature = "probe")]
+    Probe {
+        /// Interface to probe.
+        #[arg(long)]
+        iface: String,
+        /// How long to sample. Accepts `30s`, `1m`, `500ms`, or a
+        /// bare number of seconds. Default 10s keeps the tool quick
+        /// to run while typically capturing a representative sample
+        /// on live traffic.
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        duration: Duration,
+        /// Attach mode. `auto` = native, fall back to generic;
+        /// `native` = driver XDP; `generic` = SKB XDP. Comparing
+        /// `native` vs `generic` output on the same iface is the
+        /// standard way to confirm a driver-specific non-conformance.
+        #[arg(long, default_value = "auto", value_parser = parse_mode)]
+        mode: packetframe_probe::AttachMode,
+    },
+}
+
+#[cfg(feature = "probe")]
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    // Unit suffixes: `ms`, `s`, `m` — parsed in longest-match order so
+    // `ms` wins over `s`. Bare integers are treated as seconds, which
+    // matches the feel of most "how long" CLI flags.
+    if let Some(num) = s.strip_suffix("ms") {
+        num.parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|e| format!("bad millisecond count in `{s}`: {e}"))
+    } else if let Some(num) = s.strip_suffix('s') {
+        num.parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| format!("bad second count in `{s}`: {e}"))
+    } else if let Some(num) = s.strip_suffix('m') {
+        num.parse::<u64>()
+            .map(|m| Duration::from_secs(m * 60))
+            .map_err(|e| format!("bad minute count in `{s}`: {e}"))
+    } else {
+        s.parse::<u64>().map(Duration::from_secs).map_err(|e| {
+            format!("expected `<n>s`, `<n>ms`, `<n>m`, or a bare second count; got `{s}`: {e}")
+        })
+    }
+}
+
+#[cfg(feature = "probe")]
+fn parse_mode(s: &str) -> Result<packetframe_probe::AttachMode, String> {
+    match s {
+        "auto" => Ok(packetframe_probe::AttachMode::Auto),
+        "native" => Ok(packetframe_probe::AttachMode::Native),
+        "generic" => Ok(packetframe_probe::AttachMode::Generic),
+        other => Err(format!(
+            "expected one of `auto`, `native`, `generic`; got `{other}`"
+        )),
+    }
 }
 
 fn main() -> ExitCode {
@@ -134,6 +196,12 @@ fn main() -> ExitCode {
         },
         Command::Reconfigure { .. } => not_implemented("reconfigure"),
         Command::Map { .. } => not_implemented("map"),
+        #[cfg(feature = "probe")]
+        Command::Probe {
+            iface,
+            duration,
+            mode,
+        } => probe::run(iface, mode, duration),
     }
 }
 

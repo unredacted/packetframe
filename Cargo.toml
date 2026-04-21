@@ -4,14 +4,16 @@ members = [
     "crates/common",
     "crates/cli",
     "crates/modules/fast-path",
+    "crates/modules/probe",
 ]
-# The BPF crate lives at `crates/modules/fast-path/bpf/` and is deliberately
-# excluded from the workspace. It targets `bpfel-unknown-none` and needs a
-# pinned nightly toolchain; pulling it into the workspace would force the
-# rest of the tree onto nightly and break host cargo commands. `build.rs`
-# in `crates/modules/fast-path/` invokes a nested cargo to build it.
+# BPF crates live at `crates/modules/*/bpf/` and are deliberately
+# excluded from the workspace. They target `bpfel-unknown-none` and
+# need a pinned nightly toolchain; pulling them into the workspace
+# would force the rest of the tree onto nightly and break host cargo
+# commands. Each parent crate's `build.rs` invokes a nested cargo.
 exclude = [
     "crates/modules/fast-path/bpf",
+    "crates/modules/probe/bpf",
 ]
 
 [workspace.package]
@@ -28,6 +30,7 @@ repository = "https://github.com/unredacted/packetframe"
 [workspace.dependencies]
 packetframe-common = { path = "crates/common" }
 packetframe-fast-path = { path = "crates/modules/fast-path" }
+packetframe-probe = { path = "crates/modules/probe" }
 
 anyhow = "1.0"
 thiserror = "2.0"

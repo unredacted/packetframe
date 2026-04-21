@@ -1,0 +1,6 @@
+[toolchain]
+# Matched to crates/modules/fast-path/bpf/rust-toolchain.toml — keep the
+# two in sync. Rationale in that file's comments (`bpfel-unknown-none`
+# tier-3 target, `build-std` for core, don't list `targets`).
+channel = "nightly-2026-04-14"
+components = ["rust-src", "llvm-tools-preview"]

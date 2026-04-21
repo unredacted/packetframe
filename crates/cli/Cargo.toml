@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 packetframe-common.workspace = true
 packetframe-fast-path = { workspace = true, optional = true }
+packetframe-probe = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true
@@ -27,5 +28,6 @@ libc.workspace = true
 signal-hook.workspace = true
 
 [features]
-default = ["fast-path"]
+default = ["fast-path", "probe"]
 fast-path = ["dep:packetframe-fast-path"]
+probe = ["dep:packetframe-probe"]

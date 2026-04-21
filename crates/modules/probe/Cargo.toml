@@ -1,0 +1,27 @@
+[package]
+name = "packetframe-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PacketFrame XDP probe — diagnostic BPF program for inspecting raw ingress frames per driver (SPEC.md §11.1(c))"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+packetframe-common.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+# aya is Linux-only. The probe's userspace path compiles out entirely
+# on non-Linux — the CLI subcommand returns an error on macOS dev.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya.workspace = true
