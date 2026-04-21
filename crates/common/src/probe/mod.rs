@@ -131,16 +131,8 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     let mut caps = vec![
         probe_kconfig(),
         probe_bpf_syscall_available(),
-        // prog_type.* and helper.* are advisory: the raw `bpf_prog_load`
-        // dance we do here is fragile across kernel versions (newer
-        // kernels reject minimally-populated bpf_attr with EINVAL even
-        // when real prog loads via aya succeed). The authoritative
-        // check is the per-interface trial-attach in `xdp.attach.*`
-        // (graduates from Deferred when `--config` supplies ifaces),
-        // which does a real aya-mediated load through the kernel
-        // verifier. If those pass, helpers and prog types are present.
-        probe_prog_type("prog_type.xdp", BPF_PROG_TYPE_XDP, false),
-        probe_prog_type("prog_type.sched_cls", BPF_PROG_TYPE_SCHED_CLS, false),
+        probe_prog_type("prog_type.xdp", BPF_PROG_TYPE_XDP, true),
+        probe_prog_type("prog_type.sched_cls", BPF_PROG_TYPE_SCHED_CLS, true),
         probe_map_hash(),
         probe_map_array(),
         probe_map_percpu_array(),
@@ -152,7 +144,7 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     caps.extend(
         helper_probes
             .iter()
-            .map(|(name, id)| probe_helper(name, *id, false)),
+            .map(|(name, id)| probe_helper(name, *id, true)),
     );
 
     caps.push(probe_bpffs(bpffs_root));
