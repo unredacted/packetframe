@@ -152,9 +152,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         crate::metrics::MetricsExporter::start(path.clone(), config.global.bpffs_root.clone())
     });
 
-    tracing::info!("fast-path running — SIGTERM/SIGINT to exit without detaching (§8.5)");
+    tracing::info!("fast-path running — SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
-    wait_for_termination().map_err(RunError::Runtime)?;
+    drive_signal_loop(config_path, &mut modules).map_err(RunError::Runtime)?;
 
     // Stop the exporter first so its final write completes before
     // we drop any module state. The pin-backed STATS map would let
@@ -175,8 +175,13 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Drive the signal loop: SIGHUP → re-parse + reconfigure every
+/// loaded module; SIGTERM/SIGINT → return so the caller can drop.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
-fn wait_for_termination() -> Result<(), String> {
+fn drive_signal_loop(
+    config_path: &Path,
+    modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+) -> Result<(), String> {
     use signal_hook::{
         consts::{SIGHUP, SIGINT, SIGTERM},
         iterator::Signals,
@@ -187,14 +192,8 @@ fn wait_for_termination() -> Result<(), String> {
 
     for sig in signals.forever() {
         match sig {
-            SIGHUP => {
-                // SPEC.md §8.4 / §4.5: delta-only reconcile lives in PR #6.
-                tracing::warn!("SIGHUP received; reconfigure flow not implemented in this release");
-            }
+            SIGHUP => reconfigure_from_signal(config_path, modules),
             SIGTERM | SIGINT => {
-                // SPEC.md §7.3 / §8.5: exit without detach. Pin-based
-                // program persistence requires PR #6; until then, exit
-                // *does* implicitly detach.
                 tracing::info!(signal = sig, "termination requested");
                 return Ok(());
             }
@@ -202,6 +201,45 @@ fn wait_for_termination() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// SIGHUP handler. Re-parses the config from `config_path` and calls
+/// `Module::reconfigure` on each loaded module. Parse failures and
+/// per-module reconfigure errors are logged and swallowed — a bad
+/// SIGHUP never kills the running data plane.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn reconfigure_from_signal(
+    config_path: &Path,
+    modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+) {
+    use packetframe_common::module::ModuleConfig;
+
+    tracing::info!(config = %config_path.display(), "SIGHUP received; reconfiguring");
+
+    let new_config = match Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "SIGHUP config parse failed; keeping current config");
+            return;
+        }
+    };
+
+    for (name, module) in modules.iter_mut() {
+        let section = match new_config.modules.iter().find(|m| &m.name == name) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    module = %name,
+                    "module removed from config; reconfigure skipped (attach-set changes require restart)"
+                );
+                continue;
+            }
+        };
+        let mcfg = ModuleConfig::new(section, &new_config.global);
+        if let Err(e) = module.reconfigure(&mcfg) {
+            tracing::warn!(module = %name, error = %e, "reconfigure failed");
+        }
+    }
 }
 
 pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {

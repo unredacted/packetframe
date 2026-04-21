@@ -23,6 +23,9 @@ pub mod registry;
 pub mod linux_impl;
 
 #[cfg(target_os = "linux")]
+pub mod reconcile;
+
+#[cfg(target_os = "linux")]
 pub use linux_impl::{stats_from_pin, trial_attach_native, TrialResult};
 
 pub const MODULE_NAME: &str = "fast-path";
@@ -143,10 +146,17 @@ impl Module for FastPathModule {
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
+    #[cfg(target_os = "linux")]
+    fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "reconfigure called before load"))?;
+        reconcile::reconcile(state, cfg)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn reconfigure(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
-        // SPEC.md §4.5 calls for delta-only reconfigure. Full
-        // implementation (stale-entry purge, LPM delta vs. current)
-        // lands in PR #6 with the SIGHUP reconcile flow.
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 

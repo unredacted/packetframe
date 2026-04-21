@@ -542,7 +542,7 @@ fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
 ///
 /// Skip the two header lines, split each subsequent line on `|`, trim
 /// whitespace, and return `(subif_name, vid, parent_name)` tuples.
-fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> {
+pub(crate) fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> {
     let content = std::fs::read_to_string("/proc/net/vlan/config")?;
     let mut out = Vec::new();
     for line in content.lines().skip(2) {
@@ -584,7 +584,7 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
 }
 
 /// Wrap `libc::if_nametoindex`. Returns a clear error on failure.
-fn if_nametoindex(name: &str) -> ModuleResult<u32> {
+pub(crate) fn if_nametoindex(name: &str) -> ModuleResult<u32> {
     let c = CString::new(name).map_err(|_| {
         ModuleError::other(MODULE_NAME, format!("interface name `{name}` has NUL byte"))
     })?;
