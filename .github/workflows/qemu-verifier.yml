@@ -99,7 +99,10 @@ jobs:
           KVER=$(ls /tmp/kstage/lib/modules/ | grep -- '-generic$' | tail -1)
           test -n "${KVER}"
           sudo depmod -a "${KVER}"
-          test -e "/boot/vmlinuz-${KVER}"
+          # Canonical ships vmlinuz as 0600 root; virtme-ng runs as the
+          # non-root job user and can't read it otherwise.
+          sudo chmod 0644 "/boot/vmlinuz-${KVER}"
+          test -r "/boot/vmlinuz-${KVER}"
           test -d "/lib/modules/${KVER}"
           # Sanity: host toolchain still links.
           test -e /lib/x86_64-linux-gnu/libm.so.6
