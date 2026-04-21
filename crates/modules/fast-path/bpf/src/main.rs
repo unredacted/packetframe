@@ -274,6 +274,20 @@ fn dispatch_fib(
                 None => (fib.ifindex, VLAN_NONE),
             };
 
+            // Defensive devmap pre-check (§4.4 step 9d) — **before any
+            // packet mutation**. A prior version rewrote L2 + ran VLAN
+            // choreography first, then decided to XDP_PASS when the
+            // egress ifindex wasn't in REDIRECT_DEVMAP. That handed the
+            // kernel a mangled packet (wrong MACs, TTL decremented, maybe
+            // pushed/popped tag) and silently black-holed forwarded
+            // traffic. Confirmed outage cause on the reference EFG
+            // 2026-04-21. If we can't redirect, we must leave the
+            // packet pristine.
+            if REDIRECT_DEVMAP.get(egress_ifindex).is_none() {
+                bump_stat(StatIdx::PassNotInDevmap);
+                return Ok(xdp_action::XDP_PASS);
+            }
+
             // TTL/hop_limit + csum first — IP header's position in
             // memory doesn't change with adjust_head, only its offset
             // from `data` does.
@@ -297,13 +311,6 @@ fn dispatch_fib(
                 return Ok(xdp_action::XDP_ABORTED);
             }
 
-            // Defensive devmap pre-check (§4.4 step 9d). `egress_ifindex`
-            // is the *actual* physical port we redirect to, which may
-            // differ from `fib.ifindex` when we resolved a subif.
-            if REDIRECT_DEVMAP.get(egress_ifindex).is_none() {
-                bump_stat(StatIdx::PassNotInDevmap);
-                return Ok(xdp_action::XDP_PASS);
-            }
             match REDIRECT_DEVMAP.redirect(egress_ifindex, 0) {
                 Ok(_) => {
                     bump_stat(StatIdx::FwdOk);
