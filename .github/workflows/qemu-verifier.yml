@@ -1,0 +1,136 @@
+name: QEMU verifier
+
+# SPEC.md §10.2: run the sudo-gated integration tests under two kernel
+# versions — 5.15 (EFG-parity) and 6.6 LTS (≥5.18 for
+# BPF_PROG_TEST_RUN_XDP_LIVE; the host CI job already covers whichever
+# kernel ubuntu-latest runners ship with, so this matrix targets
+# explicit EFG-parity + a modern LTS).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # Pin versions so adding a matrix dimension doesn't drift toolchains.
+  RUST_STABLE: "1.95.0"
+  RUST_NIGHTLY: "nightly-2026-04-14"
+  BPF_LINKER_VERSION: "0.10.3"
+
+jobs:
+  qemu:
+    name: qemu (kernel ${{ matrix.kernel_tag }})
+    runs-on: ubuntu-latest
+    env:
+      PACKETFRAME_BPF_REQUIRED: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        # Canonical's mainline PPA hosts rebuilds of upstream releases.
+        # We discover the actual .deb URL at runtime (build timestamps
+        # vary per version) from the directory listing.
+        kernel_tag: ["v5.15", "v6.6"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable + nightly (for BPF)
+        run: |
+          rustup install ${RUST_STABLE} --profile minimal
+          rustup default ${RUST_STABLE}
+          rustup install ${RUST_NIGHTLY} --profile minimal
+          rustup component add --toolchain ${RUST_NIGHTLY} rust-src llvm-tools-preview
+
+      - name: Cache cargo + BPF target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            crates/modules/fast-path/bpf/target/
+          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-
+            ${{ runner.os }}-cargo-qemu-
+            ${{ runner.os }}-cargo-check-
+
+      - name: Install bpf-linker
+        run: |
+          if ! command -v bpf-linker >/dev/null 2>&1 || \
+             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${BPF_LINKER_VERSION}" ]; then
+            cargo install --locked --force bpf-linker --version ${BPF_LINKER_VERSION}
+          fi
+
+      - name: Install QEMU + virtme-ng
+        run: |
+          set -eux
+          sudo apt-get update
+          # virtme-ng is the maintained fork (classic virtme-run uses
+          # -watchdog which QEMU 8.x dropped). Its `--run <deb>` accepts
+          # a pre-built kernel package directly.
+          sudo apt-get install -y qemu-system-x86 virtme-ng busybox-static
+          virtme-ng --version || true
+
+      - name: Fetch + install kernel + modules
+        run: |
+          set -eux
+          BASE="https://kernel.ubuntu.com/mainline/${{ matrix.kernel_tag }}/amd64/"
+          IMG_DEB=$(curl -fsSL "${BASE}" \
+            | grep -oE 'linux-image-unsigned-[0-9][^"]*generic_[^"]*_amd64\.deb' \
+            | sort -u | head -1)
+          MOD_DEB=$(curl -fsSL "${BASE}" \
+            | grep -oE 'linux-modules-[0-9][^"]*generic_[^"]*_amd64\.deb' \
+            | sort -u | head -1)
+          test -n "${IMG_DEB}" && test -n "${MOD_DEB}"
+          curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${IMG_DEB}"
+          curl -fsSL --retry 3 -o /tmp/modules.deb "${BASE}${MOD_DEB}"
+          # Stage then cp (direct dpkg-deb -x to / clobbered /lib perms
+          # on a previous iteration — see commit history).
+          sudo rm -rf /tmp/kstage
+          sudo mkdir -p /tmp/kstage
+          sudo dpkg-deb -x /tmp/kernel.deb /tmp/kstage
+          sudo dpkg-deb -x /tmp/modules.deb /tmp/kstage
+          sudo cp -a /tmp/kstage/boot/. /boot/
+          sudo cp -a /tmp/kstage/lib/modules/. /lib/modules/
+          KVER=$(ls /tmp/kstage/lib/modules/ | grep -- '-generic$' | tail -1)
+          test -n "${KVER}"
+          sudo depmod -a "${KVER}"
+          # Canonical ships vmlinuz as 0600 root; virtme-ng runs as the
+          # non-root job user and can't read it otherwise.
+          sudo chmod 0644 "/boot/vmlinuz-${KVER}"
+          test -r "/boot/vmlinuz-${KVER}"
+          test -d "/lib/modules/${KVER}"
+          # Sanity: host toolchain still links.
+          test -e /lib/x86_64-linux-gnu/libm.so.6
+          echo "KVER=${KVER}" >> "${GITHUB_ENV}"
+          echo "KERNEL_IMG=/boot/vmlinuz-${KVER}" >> "${GITHUB_ENV}"
+
+      - name: Build integration tests
+        run: |
+          # Build so the test binaries are ready to exec inside the VM.
+          # `--no-run` produces the ELFs without executing them on the
+          # host kernel.
+          cargo test -p packetframe-fast-path --tests --no-run
+
+      - name: Run integration tests in QEMU
+        timeout-minutes: 10
+        run: |
+          set -eux
+          # Pass the installed vmlinuz path (not the .deb). virtme-ng
+          # discovers matching modules at /lib/modules/$VER on the host
+          # and packages them into its generated initramfs.
+          # virtme-init starts the script with HOME=/ and `/` is RO
+          # (only the listed overlay paths are writable). Point
+          # HOME/CARGO_HOME/RUSTUP_HOME at the /home overlay so rustup
+          # can write its state without going read-only.
+          virtme-ng \
+            --run "${KERNEL_IMG}" \
+            --pwd \
+            --memory 1024 \
+            --disable-kvm \
+            --verbose \
+            -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture'
