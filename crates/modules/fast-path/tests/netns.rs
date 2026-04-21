@@ -109,6 +109,31 @@ impl NetnsGuard {
             .status();
 
         run(&["ip", "netns", "add", &names.netns]);
+
+        // Sysctls first — `default.*` is a template for ifaces created
+        // after the set, so this needs to run before `ip link add`.
+        //
+        // `ip_forward=1`: mainline kernels boot with forwarding off,
+        // which makes `bpf_fib_lookup` return `FWD_DISABLED` (our
+        // `err_fib_other` branch) instead of `SUCCESS`. Ubuntu hosts
+        // typically enable forwarding via systemd-networkd or sysctl
+        // drop-ins, which is why the same test passes on GHA runners
+        // but fails on virtme-ng'd mainline kernels.
+        //
+        // `rp_filter=0`: loose reverse-path checking. Default on many
+        // distros is strict (`1`) or loose (`2`); `0` avoids any
+        // doubt about 10.77.0.2 being reachable via both veth endpoints
+        // in the same /24.
+        ns_run(&names.netns, &["sysctl", "-wq", "net.ipv4.ip_forward=1"]);
+        ns_run(
+            &names.netns,
+            &["sysctl", "-wq", "net.ipv4.conf.all.rp_filter=0"],
+        );
+        ns_run(
+            &names.netns,
+            &["sysctl", "-wq", "net.ipv4.conf.default.rp_filter=0"],
+        );
+
         ns_run(
             &names.netns,
             &[
@@ -492,10 +517,7 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
     }
     .build();
 
-    let rx_before = bpf_stat(&bpf, StatIdx::RxTotal);
-    let matched_before = bpf_stat(&bpf, StatIdx::MatchedV4);
-    let miss_before = bpf_stat(&bpf, StatIdx::PassNotInDevmap);
-    let fwd_ok_before = bpf_stat(&bpf, StatIdx::FwdOk);
+    let before = snapshot_all_stats(&bpf);
 
     send_frame(&inject_fd, ifindex_b, &frame);
 
@@ -523,28 +545,35 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
         let _ = prog.detach(link_id);
     }
 
+    let after = snapshot_all_stats(&bpf);
+    let deltas = delta_labels(&before, &after);
+    // The full delta set goes into every assertion message so a CI
+    // failure tells us *which* path the packet actually took without
+    // another push-and-wait cycle.
+    let dump = format!("delta: {deltas:?}");
+
     // Counter assertions first — if these fail, the byte-equality
     // assertion is academic.
     assert_eq!(
-        bpf_stat(&bpf, StatIdx::RxTotal) - rx_before,
+        after[StatIdx::RxTotal as usize] - before[StatIdx::RxTotal as usize],
         1,
-        "expected exactly one rx_total increment"
+        "expected exactly one rx_total increment — {dump}"
     );
     assert_eq!(
-        bpf_stat(&bpf, StatIdx::MatchedV4) - matched_before,
+        after[StatIdx::MatchedV4 as usize] - before[StatIdx::MatchedV4 as usize],
         1,
-        "packet should have matched the IPv4 allowlist"
+        "packet should have matched the IPv4 allowlist — {dump}"
     );
     assert_eq!(
-        bpf_stat(&bpf, StatIdx::PassNotInDevmap) - miss_before,
+        after[StatIdx::PassNotInDevmap as usize] - before[StatIdx::PassNotInDevmap as usize],
         1,
         "FIB egress (dummy) is not in REDIRECT_DEVMAP; \
-         pass_not_in_devmap should bump"
+         pass_not_in_devmap should bump — {dump}"
     );
     assert_eq!(
-        bpf_stat(&bpf, StatIdx::FwdOk) - fwd_ok_before,
+        after[StatIdx::FwdOk as usize] - before[StatIdx::FwdOk as usize],
         0,
-        "no redirect should have happened"
+        "no redirect should have happened — {dump}"
     );
 
     // §11.13 invariant: the frame the kernel slow path received must
@@ -564,10 +593,62 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
     );
 }
 
-fn bpf_stat(bpf: &Ebpf, idx: StatIdx) -> u64 {
+/// Snapshot every counter in the STATS map, indexed by `StatIdx`
+/// discriminant. Length matches `common::STATS_COUNT`. Aggregates
+/// across CPUs via per-CPU sum.
+fn snapshot_all_stats(bpf: &Ebpf) -> Vec<u64> {
     use aya::maps::PerCpuArray;
     let map = bpf.map("STATS").expect("STATS map");
     let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map).expect("PerCpuArray::try_from");
-    let per_cpu = stats.get(&(idx as u32), 0).expect("STATS get");
-    per_cpu.iter().copied().sum()
+    (0..common::STATS_COUNT)
+        .map(|i| {
+            stats
+                .get(&i, 0)
+                .expect("STATS get")
+                .iter()
+                .copied()
+                .sum::<u64>()
+        })
+        .collect()
+}
+
+/// Produce a vec of `(name, delta)` for every counter whose value
+/// changed between snapshots. Names match the `StatIdx` enum variants
+/// so the output is readable in CI failure logs.
+fn delta_labels(before: &[u64], after: &[u64]) -> Vec<(&'static str, u64)> {
+    const NAMES: &[&str] = &[
+        "rx_total",
+        "matched_v4",
+        "matched_v6",
+        "matched_src_only",
+        "matched_dst_only",
+        "matched_both",
+        "fwd_ok",
+        "fwd_dry_run",
+        "pass_fragment",
+        "pass_low_ttl",
+        "pass_no_neigh",
+        "pass_not_ip",
+        "pass_frag_needed",
+        "drop_unreachable",
+        "err_parse",
+        "err_fib_other",
+        "err_vlan",
+        "pass_not_in_devmap",
+        "pass_complex_header",
+    ];
+    before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .filter_map(
+            |(i, (b, a))| {
+                if a > b {
+                    Some((NAMES[i], a - b))
+                } else {
+                    None
+                }
+            },
+        )
+        .collect()
 }
