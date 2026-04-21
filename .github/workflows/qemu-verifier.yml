@@ -75,22 +75,36 @@ jobs:
           sudo apt-get install -y qemu-system-x86 virtme-ng busybox-static
           virtme-ng --version || true
 
-      - name: Fetch kernel package
+      - name: Fetch + install kernel + modules
         run: |
           set -eux
-          # Discover the .deb URL from the PPA directory listing —
-          # Canonical's mainline builds have timestamped filenames that
-          # change per revision, so hardcoding the URL is brittle.
           BASE="https://kernel.ubuntu.com/mainline/${{ matrix.kernel_tag }}/amd64/"
-          DEB=$(curl -fsSL "${BASE}" \
+          IMG_DEB=$(curl -fsSL "${BASE}" \
             | grep -oE 'linux-image-unsigned-[0-9][^"]*generic_[^"]*_amd64\.deb' \
-            | sort -u \
-            | head -1)
-          test -n "${DEB}"
-          echo "Fetching ${BASE}${DEB}"
-          curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${DEB}"
-          ls -la /tmp/kernel.deb
-          echo "KERNEL_DEB=/tmp/kernel.deb" >> "${GITHUB_ENV}"
+            | sort -u | head -1)
+          MOD_DEB=$(curl -fsSL "${BASE}" \
+            | grep -oE 'linux-modules-[0-9][^"]*generic_[^"]*_amd64\.deb' \
+            | sort -u | head -1)
+          test -n "${IMG_DEB}" && test -n "${MOD_DEB}"
+          curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${IMG_DEB}"
+          curl -fsSL --retry 3 -o /tmp/modules.deb "${BASE}${MOD_DEB}"
+          # Stage then cp (direct dpkg-deb -x to / clobbered /lib perms
+          # on a previous iteration — see commit history).
+          sudo rm -rf /tmp/kstage
+          sudo mkdir -p /tmp/kstage
+          sudo dpkg-deb -x /tmp/kernel.deb /tmp/kstage
+          sudo dpkg-deb -x /tmp/modules.deb /tmp/kstage
+          sudo cp -a /tmp/kstage/boot/. /boot/
+          sudo cp -a /tmp/kstage/lib/modules/. /lib/modules/
+          KVER=$(ls /tmp/kstage/lib/modules/ | grep -- '-generic$' | tail -1)
+          test -n "${KVER}"
+          sudo depmod -a "${KVER}"
+          test -e "/boot/vmlinuz-${KVER}"
+          test -d "/lib/modules/${KVER}"
+          # Sanity: host toolchain still links.
+          test -e /lib/x86_64-linux-gnu/libm.so.6
+          echo "KVER=${KVER}" >> "${GITHUB_ENV}"
+          echo "KERNEL_IMG=/boot/vmlinuz-${KVER}" >> "${GITHUB_ENV}"
 
       - name: Build integration tests
         run: |
@@ -100,17 +114,16 @@ jobs:
           cargo test -p packetframe-fast-path --tests --no-run
 
       - name: Run integration tests in QEMU
-        timeout-minutes: 15
+        timeout-minutes: 10
         run: |
           set -eux
-          # virtme-ng `--run <deb>` accepts a Debian/Ubuntu kernel .deb
-          # directly. Host / is mounted R/W in the guest via 9p, so
-          # cargo resolves the same paths inside as outside. `--pwd`
-          # preserves cwd. GHA runners may not expose /dev/kvm, so
-          # force TCG via --disable-kvm.
+          # Pass the installed vmlinuz path (not the .deb). virtme-ng
+          # discovers matching modules at /lib/modules/$VER on the host
+          # and packages them into its generated initramfs.
           virtme-ng \
-            --run "${KERNEL_DEB}" \
+            --run "${KERNEL_IMG}" \
             --pwd \
             --memory 1024 \
             --disable-kvm \
+            --verbose \
             -- bash -c 'set -eux; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture'
