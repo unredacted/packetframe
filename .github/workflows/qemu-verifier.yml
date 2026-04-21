@@ -21,21 +21,17 @@ env:
 
 jobs:
   qemu:
-    name: qemu (kernel ${{ matrix.kernel_label }})
+    name: qemu (kernel ${{ matrix.kernel_tag }})
     runs-on: ubuntu-latest
     env:
       PACKETFRAME_BPF_REQUIRED: "1"
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - kernel_label: "5.15"
-            # Canonical mainline PPA — rebuild of upstream v5.15 for
-            # Ubuntu. First 5.15.0 mainline build.
-            kernel_url: https://kernel.ubuntu.com/mainline/v5.15/amd64/linux-image-unsigned-5.15.0-051500-generic_5.15.0-051500.202110312130_amd64.deb
-          - kernel_label: "6.6"
-            # 6.6 LTS — first mainline 6.6.0 build.
-            kernel_url: https://kernel.ubuntu.com/mainline/v6.6/amd64/linux-image-unsigned-6.6.0-060600-generic_6.6.0-060600.202310291843_amd64.deb
+        # Canonical's mainline PPA hosts rebuilds of upstream releases.
+        # We discover the actual .deb URL at runtime (build timestamps
+        # vary per version) from the directory listing.
+        kernel_tag: ["v5.15", "v6.6"]
     steps:
       - uses: actions/checkout@v6
 
@@ -56,9 +52,9 @@ jobs:
             ~/.cargo/git/db/
             target/
             crates/modules/fast-path/bpf/target/
-          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_label }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_label }}-
+            ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-
             ${{ runner.os }}-cargo-qemu-
             ${{ runner.os }}-cargo-check-
 
@@ -85,11 +81,22 @@ jobs:
       - name: Fetch kernel image
         run: |
           set -eux
-          curl -fsSL --retry 3 -o /tmp/kernel.deb '${{ matrix.kernel_url }}'
+          # Discover the .deb URL from the PPA directory listing —
+          # Canonical's mainline builds have timestamped filenames that
+          # change per revision, so hardcoding the URL is brittle.
+          BASE="https://kernel.ubuntu.com/mainline/${{ matrix.kernel_tag }}/amd64/"
+          DEB=$(curl -fsSL "${BASE}" \
+            | grep -oE 'linux-image-unsigned-[0-9][^"]*generic_[^"]*_amd64\.deb' \
+            | sort -u \
+            | head -1)
+          test -n "${DEB}"
+          echo "Fetching ${BASE}${DEB}"
+          curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${DEB}"
           dpkg-deb -x /tmp/kernel.deb /tmp/kernel-root
           KERNEL=$(find /tmp/kernel-root -name 'vmlinuz-*' | head -1)
           test -n "${KERNEL}"
           ls -la "${KERNEL}"
+          file "${KERNEL}"
           echo "KERNEL_PATH=${KERNEL}" >> "${GITHUB_ENV}"
 
       - name: Build integration tests
@@ -102,15 +109,22 @@ jobs:
       - name: Run integration tests in QEMU
         timeout-minutes: 15
         run: |
+          set -eux
+          # virtme-ng CLI reminder for future edits:
+          #   virtme-ng --help     # lists options
+          #   -r <vmlinuz|deb>     # kernel to boot
+          #   --memory <MB>        # VM memory
+          #   --pwd                # preserve cwd
+          #   --                   # everything after is the command
+          #
           # virtme-ng makes the host filesystem available R/W inside the
-          # guest and runs as root. `--pwd` preserves the working
-          # directory so cargo paths resolve. The guest inherits the
-          # host env, so `PACKETFRAME_BPF_REQUIRED` and the rustup
-          # toolchain discovery carry over.
-          virtme-ng --kimg "${KERNEL_PATH}" --memory 1024 --pwd -- bash -c '
+          # guest and runs as root, so `cargo test -- --ignored` (which
+          # needs CAP_BPF + CAP_NET_ADMIN to load/attach) works without
+          # `sudo`. Host env forwards in — `PACKETFRAME_BPF_REQUIRED`
+          # and the rustup toolchain discovery carry over.
+          virtme-ng --help | head -40 || true
+          virtme-ng -r "${KERNEL_PATH}" --memory 1024 --pwd -- bash -c '
             set -eux
             uname -a
-            # --ignored runs the sudo-gated suite that attaches real BPF
-            # programs. virtme-ng already has CAP_* so no sudo needed.
             cargo test -p packetframe-fast-path --tests -- --ignored --nocapture
           '
