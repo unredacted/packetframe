@@ -9,6 +9,8 @@
 
 mod feasibility;
 mod loader;
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+mod metrics;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

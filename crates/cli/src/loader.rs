@@ -45,6 +45,18 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
 
+    // Fail fast if metrics-textfile can't be written — the exporter
+    // would retry silently every 15s otherwise.
+    if let Some(path) = &config.global.metrics_textfile {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.exists() {
+            return Err(RunError::Startup(format!(
+                "metrics-textfile parent dir {} does not exist",
+                parent.display()
+            )));
+        }
+    }
+
     // Feasibility gate: refuse to attach if any required capability is
     // missing. The per-interface trial-attach probe (§2.3) runs here
     // too — if a specific iface can't receive an XDP program at all,
@@ -134,9 +146,23 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
     }
 
+    // Start the metrics exporter once STATS is pinned (which happens
+    // in the attach loop above).
+    let metrics_exporter = config.global.metrics_textfile.as_ref().map(|path| {
+        crate::metrics::MetricsExporter::start(path.clone(), config.global.bpffs_root.clone())
+    });
+
     tracing::info!("fast-path running — SIGTERM/SIGINT to exit without detaching (§8.5)");
 
     wait_for_termination().map_err(RunError::Runtime)?;
+
+    // Stop the exporter first so its final write completes before
+    // we drop any module state. The pin-backed STATS map would let
+    // the exporter keep reading across the module drop, but running
+    // shutdown ordering explicitly keeps logs tidy.
+    if let Some(m) = metrics_exporter {
+        m.shutdown();
+    }
 
     // SPEC.md §7.3 / §8.5: SIGTERM/SIGINT must exit *without* detaching.
     // Dropping `modules` closes our userspace FDs (program, maps,
