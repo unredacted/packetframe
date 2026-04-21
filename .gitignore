@@ -43,3 +43,4 @@ $RECYCLE.BIN/
 
 # Local plan scratch from the session (kept out of the repo)
 /plans/
+.claude/

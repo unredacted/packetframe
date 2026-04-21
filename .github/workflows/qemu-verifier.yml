@@ -65,18 +65,17 @@ jobs:
             cargo install --locked --force bpf-linker --version ${BPF_LINKER_VERSION}
           fi
 
-      - name: Install QEMU + virtme-ng
+      - name: Install QEMU + virtme
         run: |
           set -eux
           sudo apt-get update
-          # virtme-ng is available in Ubuntu 24.04; fall back to pip
-          # (--break-system-packages needed on 24.04's externally-managed
-          # Python) if apt doesn't have it yet.
-          if ! sudo apt-get install -y qemu-system-x86 virtme-ng busybox-static; then
-            sudo apt-get install -y qemu-system-x86 busybox-static python3-pip
-            sudo pip3 install --break-system-packages virtme-ng
-          fi
-          virtme-ng --help >/dev/null
+          # virtme-ng's `--run` takes a kernel *build directory*, not a
+          # pre-built vmlinuz path. Classic `virtme-run` has the stable
+          # `--kimg <path>` flag that accepts a raw vmlinuz; install that
+          # via pip (Ubuntu 24.04 dropped the `virtme` apt package).
+          sudo apt-get install -y qemu-system-x86 busybox-static python3-pip python3-virtualenv
+          sudo pip3 install --break-system-packages virtme
+          which virtme-run
 
       - name: Fetch kernel image
         run: |
@@ -110,21 +109,19 @@ jobs:
         timeout-minutes: 15
         run: |
           set -eux
-          # virtme-ng CLI reminder for future edits:
-          #   virtme-ng --help     # lists options
-          #   -r <vmlinuz|deb>     # kernel to boot
-          #   --memory <MB>        # VM memory
-          #   --pwd                # preserve cwd
-          #   --                   # everything after is the command
+          # virtme-run boots the target kernel via QEMU with the host
+          # rootfs mounted 9p. `--script-sh` runs a shell command and
+          # exits; stdout/stderr are forwarded. `--pwd` preserves the
+          # repo path so cargo resolves normally.
           #
-          # virtme-ng makes the host filesystem available R/W inside the
-          # guest and runs as root, so `cargo test -- --ignored` (which
-          # needs CAP_BPF + CAP_NET_ADMIN to load/attach) works without
-          # `sudo`. Host env forwards in — `PACKETFRAME_BPF_REQUIRED`
-          # and the rustup toolchain discovery carry over.
-          virtme-ng --help | head -40 || true
-          virtme-ng -r "${KERNEL_PATH}" --memory 1024 --pwd -- bash -c '
-            set -eux
-            uname -a
-            cargo test -p packetframe-fast-path --tests -- --ignored --nocapture
-          '
+          # `--force-initramfs` makes virtme build an initramfs rather
+          # than rely on the host's (the kernel .deb we downloaded has
+          # no matching initrd). `--qemu-opts` forces TCG because GHA
+          # runners may not expose /dev/kvm.
+          virtme-run \
+            --kimg "${KERNEL_PATH}" \
+            --memory 1024M \
+            --pwd \
+            --force-initramfs \
+            --qemu-opts -machine accel=tcg \
+            --script-sh 'set -eux; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture'
