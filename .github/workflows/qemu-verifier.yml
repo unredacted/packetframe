@@ -77,7 +77,7 @@ jobs:
           sudo pip3 install --break-system-packages virtme
           which virtme-run
 
-      - name: Fetch kernel image
+      - name: Fetch + install kernel image
         run: |
           set -eux
           # Discover the .deb URL from the PPA directory listing —
@@ -91,12 +91,23 @@ jobs:
           test -n "${DEB}"
           echo "Fetching ${BASE}${DEB}"
           curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${DEB}"
-          dpkg-deb -x /tmp/kernel.deb /tmp/kernel-root
-          KERNEL=$(find /tmp/kernel-root -name 'vmlinuz-*' | head -1)
-          test -n "${KERNEL}"
-          ls -la "${KERNEL}"
-          file "${KERNEL}"
-          echo "KERNEL_PATH=${KERNEL}" >> "${GITHUB_ENV}"
+          # Also grab modules — virtme-run's `--installed-kernel` needs
+          # /lib/modules/$VER/ populated.
+          MODS_DEB=$(curl -fsSL "${BASE}" \
+            | grep -oE 'linux-modules-[0-9][^"]*generic_[^"]*_amd64\.deb' \
+            | sort -u \
+            | head -1)
+          test -n "${MODS_DEB}"
+          echo "Fetching ${BASE}${MODS_DEB}"
+          curl -fsSL --retry 3 -o /tmp/modules.deb "${BASE}${MODS_DEB}"
+          # Install into host paths virtme-run will look at.
+          sudo dpkg-deb -x /tmp/kernel.deb /
+          sudo dpkg-deb -x /tmp/modules.deb /
+          KVER=$(ls /lib/modules/ | grep -- '-generic$' | tail -1)
+          test -n "${KVER}"
+          sudo depmod -a "${KVER}"
+          ls -la "/boot/vmlinuz-${KVER}"
+          echo "KVER=${KVER}" >> "${GITHUB_ENV}"
 
       - name: Build integration tests
         run: |
@@ -109,19 +120,15 @@ jobs:
         timeout-minutes: 15
         run: |
           set -eux
-          # virtme-run boots the target kernel via QEMU with the host
-          # rootfs mounted 9p. `--script-sh` runs a shell command and
-          # exits; stdout/stderr are forwarded. `--pwd` preserves the
-          # repo path so cargo resolves normally.
+          # virtme-run boots the target kernel via QEMU and mounts the
+          # host / as the guest root via 9p. --installed-kernel expects
+          # the kernel + modules to live under /boot and /lib/modules/
+          # on the host — we installed them in the previous step.
+          # --script-sh runs a command and exits; stdout is forwarded.
           #
-          # `--force-initramfs` makes virtme build an initramfs rather
-          # than rely on the host's (the kernel .deb we downloaded has
-          # no matching initrd). `--qemu-opts` forces TCG because GHA
-          # runners may not expose /dev/kvm.
+          # --qemu-opts must come last (argparse REMAINDER).
+          WORKSPACE="$(pwd)"
           virtme-run \
-            --kimg "${KERNEL_PATH}" \
-            --memory 1024M \
-            --pwd \
-            --force-initramfs \
-            --qemu-opts -machine accel=tcg \
-            --script-sh 'set -eux; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture'
+            --installed-kernel "${KVER}" \
+            --script-sh "set -eux; cd '${WORKSPACE}'; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture" \
+            --qemu-opts -m 1024M -machine accel=tcg
