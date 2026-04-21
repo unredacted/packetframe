@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 
 use aya::{
     maps::{lpm_trie::Key as LpmKey, xdp::DevMapHash, Array, HashMap as AyaHashMap, LpmTrie},
-    programs::{xdp::XdpFlags, Xdp},
+    programs::{
+        links::{FdLink, PinnedLink},
+        xdp::XdpFlags,
+        Xdp,
+    },
     Ebpf,
 };
 use packetframe_common::{
@@ -19,7 +23,7 @@ use packetframe_common::{
 };
 use tracing::{info, warn};
 
-use crate::{aligned_bpf_copy, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
+use crate::{aligned_bpf_copy, pin, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs` (PR #3). `#[repr(C)]`
 /// with all-bit-patterns-valid primitive fields, so `aya::Pod` is safe
@@ -59,10 +63,13 @@ pub struct VlanResolve {
 unsafe impl aya::Pod for VlanResolve {}
 
 /// All state required to keep the attached program alive.
-/// `Drop` on `Ebpf` unloads the program + maps, which is what we want
-/// for a clean detach. SPEC.md §8.5 note: the loader can crash and the
-/// kernel will keep the program attached via pinning — pinning lands
-/// later in this PR; until then, a crash detaches.
+///
+/// After `attach`, the XDP program, every §4.5 map, and each per-iface
+/// link is pinned under `<bpffs-root>/fast-path/`. Dropping
+/// `ActiveState` closes our userspace FDs but the bpffs inodes hold
+/// the kernel references — SPEC.md §8.5 "exit without detach" works as
+/// soon as pinning is in place. `Module::detach` unlinks the pins,
+/// which is when the kernel actually tears everything down.
 pub struct ActiveState {
     pub ebpf: Ebpf,
     pub links: Vec<LinkRecord>,
@@ -71,12 +78,15 @@ pub struct ActiveState {
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
-/// `Auto` mode so `status` can report it.
+/// `Auto` mode so `status` can report it. `pinned_link` owns the
+/// PinnedLink returned from `FdLink::pin` — dropping it closes the
+/// userspace FD without unlinking the bpffs inode, so the kernel-side
+/// attach survives process exit.
 pub struct LinkRecord {
     pub iface: String,
     pub ifindex: u32,
     pub effective_mode: AttachMode,
-    pub link_id: aya::programs::xdp::XdpLinkId,
+    pub pinned_link: PinnedLink,
 }
 
 pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveState> {
@@ -86,6 +96,26 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
             "no BPF ELF embedded in the binary — build with rustup + nightly + bpf-linker (see CLAUDE.md)",
         ));
     }
+
+    // Refuse startup when pins from a prior invocation survive.
+    // SPEC.md §8.5 "exit without detach" leaves pins in bpffs after
+    // SIGTERM; v0.1 does not adopt those — operator must run
+    // `packetframe detach --all` first. Full adoption (zero-disruption
+    // restart) is deferred.
+    if pin::has_existing_pins(ctx.bpffs_root) {
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            format!(
+                "existing pins under {} from a prior invocation — \
+                 run `packetframe detach --all` before restarting \
+                 (v0.1 does not yet adopt in-place)",
+                pin::module_root(ctx.bpffs_root).display()
+            ),
+        ));
+    }
+
+    pin::ensure_dirs(ctx.bpffs_root)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("create bpffs pin dirs: {e}")))?;
 
     // aya doesn't expose an `Ebpf::load_with_options` that'd let us
     // skip BTF lookup; on the reference EFG (§2.2) BTF is absent but
@@ -232,14 +262,17 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
 
     // Attach each interface with trial-attach per §2.3: Auto → try
     // native first, fall back to generic on error; explicit Native or
-    // Generic uses the requested mode directly (no fallback).
+    // Generic uses the requested mode directly (no fallback). Each
+    // attach pins its link under `<bpffs-root>/fast-path/links/<iface>`
+    // so the kernel attach survives process exit (§8.5).
     for (iface, mode, ifindex) in &attach_dirs {
-        let (effective_mode, link_id) = try_attach_with_fallback(prog, *ifindex, iface, *mode)?;
+        let (effective_mode, pinned_link) =
+            try_attach_with_fallback(prog, *ifindex, iface, *mode, &state.bpffs_root)?;
         state.links.push(LinkRecord {
             iface: iface.clone(),
             ifindex: *ifindex,
             effective_mode,
-            link_id,
+            pinned_link,
         });
         info!(iface, ifindex, ?effective_mode, "fast-path attached");
     }
@@ -266,11 +299,17 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
 
     populate_vlan_resolve(state)?;
 
-    // Build Attachment records for the pin registry. `pinned_path` is
-    // advisory in v0.1 — actual bpffs pinning lands with reconcile in
-    // PR #6 — but we populate the shape so the registry survives
-    // incremental upgrades.
-    let pin_root = state.bpffs_root.join(MODULE_NAME);
+    // Pin program + every §4.5 map so `packetframe status` can read
+    // counters from a separate process and `packetframe detach` can
+    // find what to tear down. Pinning happens after population so a
+    // partial-load failure (above) doesn't leave half-initialized maps
+    // in bpffs.
+    pin_program_and_maps(state)?;
+
+    // Build Attachment records for the pin registry. `pinned_path`
+    // points at the real link pin — when `packetframe detach` runs,
+    // it unlinks this path, which is how the kernel-side attach tears
+    // down.
     Ok(state
         .links
         .iter()
@@ -282,57 +321,157 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 AttachMode::Auto => HookType::NativeXdp, // already resolved
             },
             prog_id,
-            pinned_path: pin_root.join(format!("prog-{}", l.iface)),
+            pinned_path: pin::link_path(&state.bpffs_root, &l.iface),
         })
         .collect())
+}
+
+/// Pin the fast-path program and every §4.5 map under the module's
+/// bpffs pin root. Called at the end of `attach` so partial failure
+/// in link attach doesn't leak pins.
+fn pin_program_and_maps(state: &mut ActiveState) -> ModuleResult<()> {
+    let prog_path = pin::program_path(&state.bpffs_root);
+    {
+        let prog: &mut Xdp = state
+            .ebpf
+            .program_mut(pin::PROGRAM_NAME)
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "fast_path program missing for pin"))?
+            .try_into()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("pin: program not XDP: {e}")))?;
+        prog.pin(&prog_path).map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("pin program at {}: {e}", prog_path.display()),
+            )
+        })?;
+    }
+
+    for name in pin::MAP_NAMES {
+        let map = state.ebpf.map(name).ok_or_else(|| {
+            ModuleError::other(MODULE_NAME, format!("map {name} missing for pin"))
+        })?;
+        let path = pin::map_path(&state.bpffs_root, name);
+        map.pin(&path).map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("pin map {name} at {}: {e}", path.display()),
+            )
+        })?;
+    }
+
+    info!(
+        pin_root = %pin::module_root(&state.bpffs_root).display(),
+        "program + maps pinned"
+    );
+    Ok(())
 }
 
 /// §2.3: per-interface trial-attach. `Native` and `Generic` are explicit
 /// (no fallback); `Auto` tries native first, falls back to generic on
 /// any error. The spec calls out that `bpftool feature probe` is
-/// unreliable — we find out what works by actually trying.
+/// unreliable — we find out what works by actually trying. Each
+/// successful attach immediately pins its link under
+/// `<bpffs-root>/fast-path/links/<iface>` so the kernel attach
+/// survives process exit (§8.5).
 fn try_attach_with_fallback(
     prog: &mut Xdp,
     ifindex: u32,
     iface: &str,
     mode: AttachMode,
-) -> ModuleResult<(AttachMode, aya::programs::xdp::XdpLinkId)> {
+    bpffs_root: &Path,
+) -> ModuleResult<(AttachMode, PinnedLink)> {
     match mode {
-        AttachMode::Native => prog
-            .attach_to_if_index(ifindex, XdpFlags::DRV_MODE)
-            .map(|id| (AttachMode::Native, id))
-            .map_err(|e| {
-                ModuleError::other(
-                    MODULE_NAME,
-                    format!("native XDP attach to {iface} failed: {e}"),
-                )
-            }),
-        AttachMode::Generic => prog
-            .attach_to_if_index(ifindex, XdpFlags::SKB_MODE)
-            .map(|id| (AttachMode::Generic, id))
-            .map_err(|e| {
-                ModuleError::other(
-                    MODULE_NAME,
-                    format!("generic XDP attach to {iface} failed: {e}"),
-                )
-            }),
-        AttachMode::Auto => match prog.attach_to_if_index(ifindex, XdpFlags::DRV_MODE) {
-            Ok(id) => Ok((AttachMode::Native, id)),
-            Err(native_err) => {
-                warn!(iface, %native_err, "native XDP attach failed; falling back to generic");
-                prog.attach_to_if_index(ifindex, XdpFlags::SKB_MODE)
-                    .map(|id| (AttachMode::Generic, id))
-                    .map_err(|generic_err| {
-                        ModuleError::other(
-                            MODULE_NAME,
-                            format!(
-                                "auto XDP attach to {iface}: native failed ({native_err}), generic failed ({generic_err})"
-                            ),
-                        )
-                    })
+        AttachMode::Native => attach_and_pin(
+            prog,
+            ifindex,
+            iface,
+            XdpFlags::DRV_MODE,
+            bpffs_root,
+            "native",
+        )
+        .map(|p| (AttachMode::Native, p)),
+        AttachMode::Generic => attach_and_pin(
+            prog,
+            ifindex,
+            iface,
+            XdpFlags::SKB_MODE,
+            bpffs_root,
+            "generic",
+        )
+        .map(|p| (AttachMode::Generic, p)),
+        AttachMode::Auto => {
+            match attach_and_pin(
+                prog,
+                ifindex,
+                iface,
+                XdpFlags::DRV_MODE,
+                bpffs_root,
+                "native",
+            ) {
+                Ok(p) => Ok((AttachMode::Native, p)),
+                Err(native_err) => {
+                    warn!(iface, %native_err, "native XDP attach failed; falling back to generic");
+                    attach_and_pin(prog, ifindex, iface, XdpFlags::SKB_MODE, bpffs_root, "generic")
+                        .map(|p| (AttachMode::Generic, p))
+                        .map_err(|generic_err| {
+                            ModuleError::other(
+                                MODULE_NAME,
+                                format!(
+                                    "auto XDP attach to {iface}: native failed ({native_err}), generic failed ({generic_err})"
+                                ),
+                            )
+                        })
+                }
             }
-        },
+        }
     }
+}
+
+/// Attach + `take_link` + pin in one go. The returned `PinnedLink`
+/// holds both the bpffs path and the FD; dropping it closes the FD
+/// without removing the pin (see `pin::remove_all` for teardown).
+///
+/// `mode_label` is only used for error message clarity — "native"
+/// vs "generic".
+fn attach_and_pin(
+    prog: &mut Xdp,
+    ifindex: u32,
+    iface: &str,
+    flags: XdpFlags,
+    bpffs_root: &Path,
+    mode_label: &str,
+) -> ModuleResult<PinnedLink> {
+    let link_id = prog.attach_to_if_index(ifindex, flags).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("{mode_label} XDP attach to {iface} failed: {e}"),
+        )
+    })?;
+    let owned_link = prog.take_link(link_id).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("take_link after {mode_label} attach to {iface}: {e}"),
+        )
+    })?;
+    let fd_link: FdLink = owned_link.try_into().map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            // SPEC.md requires kernel ≥5.15; ≥5.9 gives us bpf_link_create
+            // + FdLink. On older kernels aya returns an NlLink which can't
+            // pin — that path is reachable only if someone runs on a
+            // kernel the probe missed.
+            format!(
+                "XDP link for {iface} is netlink-backed (kernel too old for bpf_link_create?): {e}",
+            ),
+        )
+    })?;
+    let pin_path = pin::link_path(bpffs_root, iface);
+    fd_link.pin(&pin_path).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("pin link for {iface} at {}: {e}", pin_path.display()),
+        )
+    })
 }
 
 /// Populate `vlan_resolve` from `/proc/net/vlan/config`. Each VLAN
@@ -426,21 +565,21 @@ fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> {
 }
 
 pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
-    // Drain links in reverse attach order so the last-attached
-    // interface is detached first — no practical consequence here but
-    // it matches typical lifecycle expectations.
+    // Drop every PinnedLink first: this closes our userspace FDs but
+    // the kernel keeps the attach alive via the bpffs inodes. Drain
+    // in reverse attach order — no practical consequence here, matches
+    // typical lifecycle expectations.
     while let Some(link) = state.links.pop() {
-        if let Some(prog) = state
-            .ebpf
-            .program_mut("fast_path")
-            .and_then(|p| <&mut Xdp>::try_from(p).ok())
-        {
-            if let Err(e) = prog.detach(link.link_id) {
-                warn!(iface = %link.iface, error = %e, "detach link failed; continuing");
-            }
-        }
-        info!(iface = %link.iface, "fast-path detached");
+        info!(iface = %link.iface, "fast-path detaching");
+        drop(link);
     }
+
+    // Unlink every pin under the module's pin root. Removing link
+    // pins triggers the kernel-side detach; removing map + program
+    // pins is housekeeping.
+    pin::remove_all(&state.bpffs_root)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
+    info!("fast-path pins removed; kernel detached");
     Ok(())
 }
 
@@ -544,6 +683,29 @@ pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
         ModuleError::other(MODULE_NAME, format!("STATS PerCpuArray::try_from: {e}"))
     })?;
 
+    read_stats(&stats)
+}
+
+/// Read STATS directly from the bpffs pin — no live module required.
+/// Used by `packetframe status` when the loader isn't running.
+pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
+    use aya::maps::{MapData, PerCpuArray};
+
+    let pin_path = pin::map_path(bpffs_root, "STATS");
+    let map_data = MapData::from_pin(&pin_path).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("open STATS pin at {}: {e}", pin_path.display()),
+        )
+    })?;
+    let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map_data)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("STATS PerCpuArray: {e}")))?;
+    read_stats(&stats)
+}
+
+fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
+    stats: &aya::maps::PerCpuArray<T, u64>,
+) -> ModuleResult<Vec<u64>> {
     let mut out = vec![0u64; 19];
     for (idx, slot) in out.iter_mut().enumerate() {
         let values = stats

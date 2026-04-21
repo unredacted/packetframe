@@ -134,22 +134,17 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
     }
 
-    tracing::info!(
-        "fast-path running — SIGTERM/SIGINT to exit; detach on exit pending pin support (PR #6)"
-    );
+    tracing::info!("fast-path running — SIGTERM/SIGINT to exit without detaching (§8.5)");
 
     wait_for_termination().map_err(RunError::Runtime)?;
 
     // SPEC.md §7.3 / §8.5: SIGTERM/SIGINT must exit *without* detaching.
-    // In v0.1 there's no bpffs pinning yet, so dropping the `Ebpf`
-    // inside `modules` necessarily tears down the attach (the
-    // kernel-side `bpf_link` closes when its FD does). PR #6 will
-    // make this a true no-op-on-exit by pinning programs + maps
-    // before the drop. For now we deliberately *do not* call
-    // `Module::detach` here; the drop path is the same end state,
-    // and leaving it implicit keeps the exit intent aligned with
-    // what pinning will later honor.
-    tracing::info!("termination signal received; exiting (no explicit detach, per §8.5)");
+    // Dropping `modules` closes our userspace FDs (program, maps,
+    // links); the bpffs pins installed at attach time hold the kernel
+    // references, so the XDP attachment survives process exit. An
+    // explicit `Module::detach` tears the pins down — we deliberately
+    // don't call it here.
+    tracing::info!("termination signal received; exiting (pins hold the attach per §8.5)");
     drop(modules);
     Ok(())
 }
@@ -184,21 +179,21 @@ fn wait_for_termination() -> Result<(), String> {
 }
 
 pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
-    let state_dir = match config {
+    let (bpffs_root, state_dir) = match config {
         Some(p) => {
-            Config::from_file(p)
-                .map_err(|e| format!("config parse: {e}"))?
-                .global
-                .state_dir
+            let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
+            (c.global.bpffs_root, c.global.state_dir)
         }
-        None => PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
+        None => (
+            PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
+            PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
+        ),
     };
 
-    if all {
-        tracing::warn!(
-            "`--all` requires bpffs pin sweep (PR #6); for now, honoring the pin registry only"
-        );
-    }
+    // v0.1 has one module (fast-path), so `--all` and the default case
+    // behave identically — both tear down every pin under the module's
+    // pin root. `--all` becomes meaningful once a second module ships.
+    let _ = all;
 
     #[cfg(feature = "fast-path")]
     {
@@ -208,7 +203,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
                 tracing::info!(
                     module = %file.module,
                     count = file.attachments.len(),
-                    "pin registry found"
+                    "pin registry found; tearing down"
                 );
                 for a in &file.attachments {
                     tracing::info!(
@@ -218,17 +213,25 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
                         "registered attachment"
                     );
                 }
-                tracing::warn!(
-                    "in-kernel detach without an active loader requires bpffs pinning (SPEC.md §8.5 + pinning support in PR #6); removing registry file only"
-                );
-                packetframe_fast_path::registry::remove(&state_dir)
-                    .map_err(|e| format!("registry remove: {e}"))?;
             }
             Ok(None) => {
-                tracing::info!("no pin registry found — nothing to detach");
+                tracing::info!("no pin registry found — sweeping bpffs pin root anyway");
             }
             Err(e) => return Err(format!("registry read: {e}")),
         }
+
+        // Unlink every pin under `<bpffs-root>/fast-path/`. Removing
+        // link pins triggers the kernel-side XDP detach (§8.5); the
+        // map and program pins are housekeeping.
+        packetframe_fast_path::pin::remove_all(&bpffs_root)
+            .map_err(|e| format!("remove pins under {}: {e}", bpffs_root.display()))?;
+        tracing::info!(
+            pin_root = %packetframe_fast_path::pin::module_root(&bpffs_root).display(),
+            "pins removed; kernel detached"
+        );
+
+        packetframe_fast_path::registry::remove(&state_dir)
+            .map_err(|e| format!("registry remove: {e}"))?;
     }
 
     Ok(())
@@ -265,10 +268,56 @@ pub fn status(config_path: &Path) -> Result<(), String> {
             }
             Err(e) => return Err(format!("registry read: {e}")),
         }
+
+        // Live counter readback from the pinned STATS map. Works
+        // whether or not the loader is running — the pin survives
+        // process exit (§8.5).
+        #[cfg(target_os = "linux")]
+        print_stats(&config.global.bpffs_root);
     }
 
-    eprintln!("note: live counter readback requires bpffs-pinned stats (PR #6)");
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn print_stats(bpffs_root: &Path) {
+    // §4.6 counter names, indexed by `StatIdx` discriminants. Order
+    // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
+    const NAMES: [&str; 19] = [
+        "rx_total",
+        "matched_v4",
+        "matched_v6",
+        "matched_src_only",
+        "matched_dst_only",
+        "matched_both",
+        "fwd_ok",
+        "fwd_dry_run",
+        "pass_fragment",
+        "pass_low_ttl",
+        "pass_no_neigh",
+        "pass_not_ip",
+        "pass_frag_needed",
+        "drop_unreachable",
+        "err_parse",
+        "err_fib_other",
+        "err_vlan",
+        "pass_not_in_devmap",
+        "pass_complex_header",
+    ];
+
+    match packetframe_fast_path::stats_from_pin(bpffs_root) {
+        Ok(values) => {
+            println!();
+            println!("counters (from {}):", bpffs_root.display());
+            let name_w = NAMES.iter().map(|n| n.len()).max().unwrap_or(20);
+            for (name, value) in NAMES.iter().zip(values.iter()) {
+                println!("  {name:<name_w$}  {value}");
+            }
+        }
+        Err(e) => {
+            eprintln!("note: STATS pin unavailable ({e}); loader may not be attached");
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]

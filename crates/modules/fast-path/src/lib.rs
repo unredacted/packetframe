@@ -15,13 +15,14 @@ use packetframe_common::module::{
     ModuleError, ModuleResult,
 };
 
+pub mod pin;
 pub mod registry;
 
 #[cfg(target_os = "linux")]
 pub mod linux_impl;
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::{trial_attach_native, TrialResult};
+pub use linux_impl::{stats_from_pin, trial_attach_native, TrialResult};
 
 pub const MODULE_NAME: &str = "fast-path";
 
