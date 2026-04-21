@@ -39,7 +39,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let v4 = reconcile_allow_v4(state, cfg)?;
     let v6 = reconcile_allow_v6(state, cfg)?;
     let vlan = reconcile_vlan_resolve(state)?;
-    let devmap_purged = purge_stale_devmap(state)?;
+    let devmap = reconcile_devmap(state)?;
 
     info!(
         v4_added = v4.added,
@@ -48,7 +48,8 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         v6_removed = v6.removed,
         vlan_added = vlan.added,
         vlan_removed = vlan.removed,
-        devmap_purged = devmap_purged.removed,
+        devmap_added = devmap.added,
+        devmap_removed = devmap.removed,
         "SIGHUP reconcile applied"
     );
     Ok(())
@@ -237,11 +238,19 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
     Ok(delta)
 }
 
-/// Purge REDIRECT_DEVMAP entries whose ifindex no longer resolves via
-/// `if_indextoname` — an iface that disappeared between attach and
-/// reconcile. Covers the "stale devmap after hot-unplug" case called
-/// out in the SPEC §4.5 reconcile note.
-fn purge_stale_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
+/// Reconcile REDIRECT_DEVMAP against the current `/sys/class/net`
+/// enumeration of viable Ethernet-type redirect targets. Adds any new
+/// ifaces that came up since the last reconcile, purges any whose
+/// ifindex no longer resolves via `if_indextoname`. Covers both the
+/// new-iface-hot-plug case and the stale-iface-hot-unplug case.
+fn reconcile_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
+    use std::collections::HashSet;
+
+    let desired: HashSet<u32> = crate::linux_impl::enumerate_redirect_targets()
+        .into_iter()
+        .map(|(_, ifindex)| ifindex)
+        .collect();
+
     let map = state
         .ebpf
         .map_mut("REDIRECT_DEVMAP")
@@ -249,16 +258,27 @@ fn purge_stale_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
     let mut devmap: DevMapHash<_> = DevMapHash::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("REDIRECT_DEVMAP try_from: {e}")))?;
 
-    let stale: Vec<u32> = devmap
-        .keys()
-        .filter_map(Result::ok)
-        .filter(|ifindex| !ifindex_exists(*ifindex))
-        .collect();
+    let current: HashSet<u32> = devmap.keys().filter_map(Result::ok).collect();
 
     let mut delta = DeltaCount::default();
-    for ifindex in stale {
-        // DevMapHash::remove takes u32 by value, not by reference.
-        match devmap.remove(ifindex) {
+    for ifindex in desired.difference(&current) {
+        // DevMapHash value is an ifindex u32; for simple forward-to-self
+        // the value equals the key.
+        match devmap.insert(*ifindex, *ifindex, None, 0) {
+            Ok(()) => {
+                delta.added += 1;
+                info!(ifindex, "REDIRECT_DEVMAP added (iface came up)");
+            }
+            Err(e) => warn!(ifindex, error = %e, "REDIRECT_DEVMAP insert failed"),
+        }
+    }
+    for ifindex in current.difference(&desired) {
+        // Only purge ifaces that the kernel no longer knows about;
+        // an iface in `current` but down at enumeration time stays.
+        if ifindex_exists(*ifindex) {
+            continue;
+        }
+        match devmap.remove(*ifindex) {
             Ok(()) => {
                 delta.removed += 1;
                 info!(ifindex, "REDIRECT_DEVMAP stale entry purged");

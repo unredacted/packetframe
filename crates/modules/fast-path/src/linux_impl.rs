@@ -339,14 +339,31 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "REDIRECT_DEVMAP map missing from ELF"))?;
     let mut devmap: DevMapHash<_> = DevMapHash::try_from(devmap_map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("REDIRECT_DEVMAP try_from: {e}")))?;
-    for (iface, _mode, ifindex) in &attach_dirs {
-        devmap.insert(*ifindex, *ifindex, None, 0).map_err(|e| {
-            ModuleError::other(
-                MODULE_NAME,
-                format!("REDIRECT_DEVMAP insert {iface} (ifindex {ifindex}): {e}"),
-            )
-        })?;
+
+    // Populate REDIRECT_DEVMAP with every UP Ethernet-type iface on the
+    // host, not just the attach ifaces. The FIB lookup is dynamic — on
+    // a BGP edge, routes change and the egress iface for any given
+    // packet is determined at lookup time. Hardcoding the attach list
+    // as the egress allowlist breaks any topology where ingress ≠
+    // egress (classic edge router: trunks in, WAN out).
+    //
+    // Filter: `/sys/class/net/<iface>/type == 1` (ARPHRD_ETHER — covers
+    // physical NICs, bridges, VLAN subifs, veth) AND operstate is `up`
+    // or `unknown` (some virtual ifaces never report operstate). Skip
+    // loopback (type 772) + tunnels (various non-1 types).
+    let targets = enumerate_redirect_targets();
+    let mut inserted = 0usize;
+    for (iface, ifindex) in &targets {
+        if let Err(e) = devmap.insert(*ifindex, *ifindex, None, 0) {
+            warn!(iface = %iface, ifindex, error = %e, "REDIRECT_DEVMAP insert skipped");
+            continue;
+        }
+        inserted += 1;
     }
+    info!(
+        count = inserted,
+        "REDIRECT_DEVMAP populated from /sys/class/net (Ethernet-type, UP)"
+    );
 
     populate_vlan_resolve(state)?;
 
@@ -686,6 +703,54 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
     info!("fast-path pins removed; kernel detached");
     Ok(())
+}
+
+/// Walk `/sys/class/net` and return the `(name, ifindex)` of every
+/// iface that's a viable XDP redirect target:
+///
+/// - `type == 1` (ARPHRD_ETHER) — covers physical NICs, bridges,
+///   VLAN subifs, veth, bonded masters. Excludes loopback (772),
+///   PPP, SLIP, tunnels (`ip_vti`, `ip6tnl`, `ip_tunnel`, tailscale,
+///   WireGuard, etc. which use ARPHRD_NONE or similar).
+/// - operstate is `up` or `unknown`. Some virtual ifaces never
+///   transition to `up` even when they're carrying traffic; accept
+///   them rather than over-exclude.
+///
+/// Callers of this must tolerate the returned set changing between
+/// invocations (new ifaces come up, old ones go down). Reconcile
+/// should re-enumerate on SIGHUP.
+pub(crate) fn enumerate_redirect_targets() -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let base = format!("/sys/class/net/{name}");
+        // ARPHRD_* type check: "1" == ARPHRD_ETHER.
+        let type_ok = std::fs::read_to_string(format!("{base}/type"))
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        if !type_ok {
+            continue;
+        }
+        // operstate filter: up or unknown.
+        let operstate_ok = std::fs::read_to_string(format!("{base}/operstate"))
+            .map(|s| matches!(s.trim(), "up" | "unknown"))
+            .unwrap_or(false);
+        if !operstate_ok {
+            continue;
+        }
+        let ifindex = match if_nametoindex(&name) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        out.push((name, ifindex));
+    }
+    out
 }
 
 /// Emit a warning if two or more of the attach ifaces share a bridge

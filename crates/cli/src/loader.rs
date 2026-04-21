@@ -316,7 +316,66 @@ fn reconfigure_from_signal(
     }
 }
 
+/// Look for a live `packetframe run` daemon via `/proc`. Returns the
+/// pid of the first match, None if none found. Only our own process
+/// name is matched (not arbitrary substrings), so a text editor
+/// holding a `packetframe.conf` file doesn't false-positive.
+#[cfg(target_os = "linux")]
+fn daemon_pid() -> Option<u32> {
+    let self_pid = std::process::id();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid: u32 = match name.to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let comm_path = format!("/proc/{pid}/comm");
+        let comm = match std::fs::read_to_string(&comm_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if comm.trim() == "packetframe" {
+            // Confirm it's actually the `run` subcommand, not e.g.
+            // `packetframe detach` from another shell.
+            let cmdline_path = format!("/proc/{pid}/cmdline");
+            if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+                if cmdline.split('\0').any(|a| a == "run") {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_pid() -> Option<u32> {
+    None
+}
+
 pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
+    // Refuse to detach while a `packetframe run` daemon is live. The
+    // daemon holds PinnedLink FDs in-process; unlinking the bpffs pin
+    // paths alone doesn't drop the kernel-side bpf_link refcount, so
+    // the XDP program stays attached even after `detach` claims
+    // success. The operator needs to SIGTERM/kill the daemon first.
+    // Confirmed outage-adjacent on the reference EFG 2026-04-21 — the
+    // detach ran, reported clean, but `ip link show` still had
+    // `xdpgeneric` attached.
+    if let Some(pid) = daemon_pid() {
+        return Err(format!(
+            "a `packetframe run` daemon is still running (pid {pid}); \
+             stop it first (e.g. `kill {pid}`) before detaching. \
+             Detach unlinks bpffs pins, but the kernel-side bpf_link \
+             holds refs through the daemon's open FDs — both have to \
+             be released for the iface to actually detach."
+        ));
+    }
+
     let (bpffs_root, state_dir) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
