@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Manual trigger for pre-release validation — runs the BPF + cross
+  # build matrix but skips publishing. Use to confirm release tarballs
+  # would ship a real BPF ELF before cutting a tag.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Skip the publish step (no GitHub release created)'
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,8 +21,81 @@ env:
   BPF_LINKER_VERSION: "0.10.3"
 
 jobs:
+  # Build the BPF ELF once on the host runner (rustup + nightly + bpf-linker
+  # all available here). Every cross-build job downloads this artifact and
+  # embeds it via PACKETFRAME_BPF_OBJ_PATH — cross's Docker images have no
+  # rustup so they cannot nest-build BPF themselves (prior release flow
+  # shipped a stub ELF and every attach silently failed).
+  bpf:
+    name: build BPF ELF
+    runs-on: ubuntu-latest
+    env:
+      PACKETFRAME_BPF_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable + nightly for BPF)
+        run: |
+          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup default ${{ env.RUST_STABLE }}
+          rustup toolchain install ${{ env.RUST_NIGHTLY }} \
+            --profile minimal --component rust-src,llvm-tools-preview
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            crates/modules/fast-path/bpf/target/
+          key: ${{ runner.os }}-release-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**') }}
+
+      - name: Install bpf-linker
+        run: |
+          if ! command -v bpf-linker >/dev/null 2>&1 || \
+             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${{ env.BPF_LINKER_VERSION }}" ]; then
+            cargo install --locked --force bpf-linker \
+              --version ${{ env.BPF_LINKER_VERSION }}
+          fi
+
+      - name: Build BPF ELF
+        run: |
+          set -eux
+          ( cd crates/modules/fast-path/bpf && cargo build --release --message-format=json ) \
+            | tee bpf-build.json >/dev/null
+          # Find the artifact path via cargo's JSON — matches what
+          # `build.rs` does normally, keeps URL drift out of this file.
+          ELF=$(python3 -c "
+          import json, sys
+          for line in open('bpf-build.json'):
+              try:
+                  msg = json.loads(line)
+              except Exception:
+                  continue
+              if msg.get('reason') == 'compiler-artifact' and msg.get('target', {}).get('name') == 'fast-path':
+                  print(msg['filenames'][0])
+                  sys.exit(0)
+          sys.exit(1)
+          ")
+          test -n "${ELF}" && test -e "${ELF}"
+          # Verify ELF magic so we fail-loud if the build regressed to a stub.
+          head -c 4 "${ELF}" | od -An -c | grep -q 'E   L   F' || \
+            (echo "BPF output is not an ELF at ${ELF}" >&2; exit 1)
+          mkdir -p dist
+          cp "${ELF}" dist/fast-path.bpf.o
+          ls -la dist/fast-path.bpf.o
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bpf-elf
+          path: dist/fast-path.bpf.o
+          retention-days: 7
+          if-no-files-found: error
+
   build:
     name: build ${{ matrix.target }}
+    needs: bpf
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -26,13 +108,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust (stable + nightly for BPF + target)
+      - name: Install Rust (stable + target)
         run: |
           rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
           rustup default ${{ env.RUST_STABLE }}
           rustup target add ${{ matrix.target }}
-          rustup toolchain install ${{ env.RUST_NIGHTLY }} \
-            --profile minimal --component rust-src,llvm-tools-preview
 
       - uses: actions/cache@v5
         with:
@@ -42,22 +122,31 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-            crates/modules/fast-path/bpf/target/
-          key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml') }}
-
-      - name: Install bpf-linker
-        run: |
-          if ! command -v bpf-linker >/dev/null 2>&1 || \
-             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${{ env.BPF_LINKER_VERSION }}" ]; then
-            cargo install --locked --force bpf-linker \
-              --version ${{ env.BPF_LINKER_VERSION }}
-          fi
+          key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cross
         run: |
           if ! command -v cross >/dev/null 2>&1; then
             cargo install --locked cross
           fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bpf-elf
+          path: prebuilt-bpf
+
+      - name: Prepare BPF ELF path for build.rs
+        run: |
+          set -eux
+          ELF="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
+          test -e "${ELF}"
+          head -c 4 "${ELF}" | od -An -c | grep -q 'E   L   F'
+          # Cross runs inside Docker, so use the container's mounted
+          # project path (`/project`) for the env var. Cross mounts the
+          # workspace root there by default.
+          echo "PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o" >> "${GITHUB_ENV}"
+          # Also forward the env var into the container.
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o" >> "${GITHUB_ENV}"
 
       - name: Build release
         run: cross build --release --workspace --target ${{ matrix.target }}
@@ -87,6 +176,9 @@ jobs:
   publish:
     name: publish release
     needs: build
+    # Skip publish on workflow_dispatch dry_run so maintainers can validate
+    # the bpf + cross-build flow without creating a GitHub release.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run == false }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
