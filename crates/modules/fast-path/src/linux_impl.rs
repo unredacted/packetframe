@@ -469,9 +469,27 @@ fn attach_and_pin(
     fd_link.pin(&pin_path).map_err(|e| {
         ModuleError::other(
             MODULE_NAME,
-            format!("pin link for {iface} at {}: {e}", pin_path.display()),
+            format!(
+                "pin link for {iface} at {}: {}",
+                pin_path.display(),
+                format_error_chain(&e)
+            ),
         )
     })
+}
+
+/// Walk a std::error::Error's source chain and join into one display
+/// string — aya's `SyscallError` hides the underlying `io::Error`
+/// behind `#[source]`, so plain `{}` drops the errno. This matters on
+/// any BPF syscall where the errno is the whole diagnostic.
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = format!("{err}");
+    let mut source = err.source();
+    while let Some(s) = source {
+        out.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    out
 }
 
 /// Populate `vlan_resolve` from `/proc/net/vlan/config`. Each VLAN
