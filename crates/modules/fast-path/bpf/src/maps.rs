@@ -8,7 +8,7 @@
 
 use aya_ebpf::{
     macros::map,
-    maps::{Array, DevMapHash, LpmTrie, PerCpuArray, RingBuf},
+    maps::{Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, RingBuf},
 };
 
 /// Runtime flags poked by userspace via the `cfg` map. `version` is a
@@ -88,6 +88,22 @@ const REDIRECT_DEVMAP_MAX_ENTRIES: u32 = 64;
 /// size; 256 KiB works across 4 KiB and 16 KiB page hosts (some ARM).
 const LOG_RINGBUF_BYTES: u32 = 256 * 1024;
 
+/// Max VLAN-subif entries. The reference EFG's agg-switch trunk carries
+/// VIDs 1/66/88/99/1337 + 3996..4040 — ~50. 256 is headroom.
+const VLAN_RESOLVE_MAX_ENTRIES: u32 = 256;
+
+/// Value stored in `vlan_resolve`. Maps an egress VLAN-subif ifindex
+/// (the key) to its physical parent + VID so the BPF program can
+/// (a) redirect to the physical port and (b) push the right tag.
+/// `#[repr(C)]` with explicit 2-byte pad so userspace layout matches.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct VlanResolve {
+    pub phys_ifindex: u32,
+    pub vid: u16,
+    pub _pad: u16,
+}
+
 // --- Maps ---------------------------------------------------------------
 
 /// IPv4 allowlist, src-or-dst match (SPEC §4.2). Key is
@@ -121,6 +137,14 @@ pub static LOG: RingBuf = RingBuf::with_byte_size(LOG_RINGBUF_BYTES, 0);
 #[map]
 pub static REDIRECT_DEVMAP: DevMapHash =
     DevMapHash::with_max_entries(REDIRECT_DEVMAP_MAX_ENTRIES, 0);
+
+/// VLAN-subif → (phys_ifindex, vid) lookup (SPEC §4.5, §4.7). Consulted
+/// after `bpf_fib_lookup` returns a subif ifindex: if present, the
+/// program redirects to the physical parent and pushes the recorded
+/// VID; if absent, the target is treated as physical/untagged.
+#[map]
+pub static VLAN_RESOLVE: HashMap<u32, VlanResolve> =
+    HashMap::with_max_entries(VLAN_RESOLVE_MAX_ENTRIES, 0);
 
 // --- Stat increment helper ---------------------------------------------
 

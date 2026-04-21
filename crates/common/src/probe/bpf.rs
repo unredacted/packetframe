@@ -229,14 +229,16 @@ pub fn map_create(
     max_entries: u32,
     map_flags: u32,
 ) -> io::Result<OwnedFd> {
-    let attr = MapCreateAttr {
-        map_type,
-        key_size,
-        value_size,
-        max_entries,
-        map_flags,
-        ..Default::default()
-    };
+    // `mem::zeroed` over struct-literal: the kernel's CHECK_ATTR checks
+    // that bytes past the command's last field are zero; struct-literal
+    // init leaves Rust's trailing padding uninitialized. Same root cause
+    // as the probe/prog_load EINVAL we hit on kernel 6.0+.
+    let mut attr: MapCreateAttr = unsafe { std::mem::zeroed() };
+    attr.map_type = map_type;
+    attr.key_size = key_size;
+    attr.value_size = value_size;
+    attr.max_entries = max_entries;
+    attr.map_flags = map_flags;
     let ret = unsafe {
         bpf_syscall(
             BPF_MAP_CREATE,
@@ -265,16 +267,20 @@ pub fn prog_load(prog_type: u32, insns: &[BpfInsn], license: &str) -> io::Result
     // 16 KiB log is plenty for our 3-5-instruction probes.
     let mut log_buf = vec![0u8; 16 * 1024];
 
-    let attr = ProgLoadAttr {
-        prog_type,
-        insn_cnt: insns.len() as u32,
-        insns: insns.as_ptr() as u64,
-        license: license_c.as_ptr() as u64,
-        log_level: 1, // BPF_LOG_LEVEL1 — emit verifier log
-        log_size: log_buf.len() as u32,
-        log_buf: log_buf.as_mut_ptr() as u64,
-        ..Default::default()
-    };
+    // `mem::zeroed` rather than struct-literal + `..Default::default()`:
+    // the kernel's CHECK_ATTR validates that bytes past the command's
+    // last field are zero. Rust's `Default` leaves padding bytes
+    // uninitialized; kernel 6.0+ rejects this with EINVAL and no log.
+    // Zeroing the whole struct, including padding, fixes the probe
+    // on modern kernels.
+    let mut attr: ProgLoadAttr = unsafe { std::mem::zeroed() };
+    attr.prog_type = prog_type;
+    attr.insn_cnt = insns.len() as u32;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = license_c.as_ptr() as u64;
+    attr.log_level = 1; // BPF_LOG_LEVEL1 — emit verifier log
+    attr.log_size = log_buf.len() as u32;
+    attr.log_buf = log_buf.as_mut_ptr() as u64;
 
     let ret = unsafe {
         bpf_syscall(
