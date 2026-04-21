@@ -7,35 +7,51 @@ loaded, attached to network interfaces, observed, and detached independently.
 
 The MVP module — and the reason the project exists — is `fast-path`, which
 takes forwarded packets for allowlisted prefixes off the kernel's
-conntrack/netfilter hot path by intercepting them at native XDP ingress and
+conntrack/netfilter hot path by intercepting them at XDP ingress and
 redirecting them via `bpf_fib_lookup` + `bpf_redirect_map`. The design
 spec lives alongside the project internally; inline code comments cite
 section numbers (e.g. "SPEC.md §4.2") as breadcrumbs.
 
-## Status — v0.0.1
+## Status
 
-v0.0.1 is the **feasibility slice**: workspace scaffolding, config parser,
-the `Module` trait, and a `packetframe feasibility` subcommand that probes
-the host kernel for PacketFrame's capability requirements (SPEC.md §2.1). It
-**does not yet load any BPF programs.** The fast-path module ships as a stub
-whose lifecycle methods return `NotImplemented`. Real BPF loading, XDP
-attachment, VLAN choreography, metrics, and the circuit breaker all land in
-v0.1.
+v0.1 ships the full fast-path module:
 
-Use v0.0.1 to:
+- **XDP ingress + allowlist match** per interface, IPv4 and IPv6, with
+  LPM-trie prefix lookups.
+- **VLAN ingress parse + egress push/pop/rewrite** for VLAN-tagged
+  forwarding.
+- **`bpf_fib_lookup` + `bpf_redirect_map`** for forwarding decisions; the
+  kernel stack is only consulted for packets that the fast-path
+  deliberately passes.
+- **bpffs pinning** of programs, maps, and links — SIGTERM exits the
+  loader without detaching attached ifaces; `packetframe detach` is the
+  explicit teardown.
+- **Live counter readback** via the pinned STATS map — `packetframe
+  status` works whether or not the loader is running.
+- **Prometheus textfile export** at 15s cadence (atomic write-then-rename)
+  with one counter per §4.6 stat plus a `packetframe_uptime_seconds`
+  gauge.
+- **SIGHUP reconcile** — delta-only updates to allowlists, VLAN resolve
+  map, and redirect devmap. A parse error on SIGHUP never kills the
+  running data plane.
+- **Circuit breaker** — sampled error/match ratio, sticky trip flag in
+  `state-dir`, SIGUSR1-driven detach on trip. Restart refuses to
+  re-attach while the flag is present.
+- **Feasibility probes** for kernel capabilities (`§2.1`) and per-interface
+  trial attach (`§2.3`).
 
-- Confirm a host has all the kernel capabilities PacketFrame needs.
-- Validate a config file's syntax before deploying v0.1.
-- Establish the install and release pipeline so v0.1 arrives as a drop-in
-  binary upgrade.
+The reference workflow is: validate the host with `packetframe
+feasibility`, attach in `dry-run on` to observe counters without
+redirecting, flip to `dry-run off` once the match/drop ratios look
+sane.
 
 ## Install
 
 From a GitHub Release tarball:
 
 ```sh
-VERSION=v0.0.1
-TARGET=aarch64-unknown-linux-musl   # or x86_64-unknown-linux-musl, etc.
+VERSION=v0.1.0
+TARGET=aarch64-unknown-linux-gnu   # also: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe-${VERSION}-${TARGET}.tar.gz"
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/SHA256SUMS"
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/SHA256SUMS.asc"
@@ -50,33 +66,99 @@ sudo install -m 0755 "packetframe-${VERSION}-${TARGET}/packetframe" /usr/local/b
 sudo install -m 0644 -D "packetframe-${VERSION}-${TARGET}/conf/example.conf" /etc/packetframe/example.conf
 ```
 
+The shipped binaries embed the compiled BPF object; no separate
+`libbpf` or nightly toolchain is required at runtime.
+
 ## Quickstart
 
-Probe the kernel:
+Probe the host kernel first:
 
 ```sh
 sudo packetframe feasibility --human
 ```
 
-Point it at a config file (validates syntax and checks that referenced
-interfaces exist):
+Write a minimal config (start with a single low-risk iface + `dry-run
+on`):
+
+```
+global
+  bpffs-root /sys/fs/bpf/packetframe
+  state-dir /var/lib/packetframe/state
+  metrics-textfile /var/lib/node_exporter/textfile/packetframe.prom
+
+module fast-path
+  attach eth0 auto
+  allow-prefix 192.0.2.0/24
+  allow-prefix6 2001:db8::/48
+  dry-run on
+  circuit-breaker drop-ratio 0.01 of matched window 5s threshold 5
+```
+
+Re-run feasibility against the config — this also runs the
+per-interface trial attach probe:
 
 ```sh
 sudo packetframe feasibility --config /etc/packetframe/packetframe.conf --human
 ```
 
-JSON output for automation:
+Run the data plane in the foreground:
 
 ```sh
-sudo packetframe feasibility --config /etc/packetframe/packetframe.conf | jq .
+sudo packetframe run --config /etc/packetframe/packetframe.conf
 ```
 
-Exit codes follow SPEC.md §7.3:
+In another shell, inspect live counters via the pinned STATS map
+(works with or without an active loader):
 
-- `0` — all required capabilities present.
-- `1` — startup error (config parse failure, missing interface, unsupported
-  kernel capability).
-- `2` — runtime error / subcommand not implemented in v0.0.1.
+```sh
+packetframe status --config /etc/packetframe/packetframe.conf
+```
+
+Tear down — removes bpffs pins and detaches attached ifaces:
+
+```sh
+sudo packetframe detach --config /etc/packetframe/packetframe.conf
+```
+
+## Attach modes
+
+Each `attach <iface> <mode>` directive picks how the XDP program is
+bound to the interface:
+
+- `native` — driver-XDP. Lowest overhead. Requires the NIC driver to
+  implement XDP natively and to deliver packets to the program with a
+  standard Ethernet frame layout.
+- `generic` — SKB-XDP. Runs after the kernel allocates an skb, so the
+  kernel normalizes the frame before the program sees it. Higher
+  per-packet overhead but works on every driver that supports XDP at
+  all.
+- `auto` — try native first, fall back to generic on attach failure.
+
+**Troubleshooting**: if `packetframe status` shows `rx_total`
+incrementing in lockstep with `pass_not_ip` while the `matched_*`
+counters stay at zero, the program is running but not parsing the
+frames it receives — typically a driver-specific native-mode delivery
+quirk. Re-attach with `generic` to confirm, then file an issue
+describing the NIC driver and kernel.
+
+## Configuration
+
+`conf/example.conf` ships as the reference. Grammar notes:
+
+- `global` and `module fast-path` blocks.
+- `attach <iface> <mode>`, where `mode` is `native` / `generic` / `auto`.
+- `allow-prefix` / `allow-prefix6` for IPv4 and IPv6 prefixes (LPM,
+  src-or-dst match per §4.2).
+- `dry-run on|off` gates actual redirects; when on, the program still
+  counts matched packets but returns `XDP_PASS`.
+- `circuit-breaker drop-ratio X of matched window Ys threshold N` —
+  optional safety valve, see §4.9.
+- `metrics-textfile <path>` — Prometheus textfile target, written every
+  15 seconds.
+
+SIGHUP re-reads the config and applies delta-only changes to allowlists
+and VLAN-resolve state without detaching. Attach-set changes (adding or
+removing an iface) require a restart.
 
 ## Build from source
 
@@ -97,6 +179,8 @@ make fmt
 ```
 
 Dependencies: a stable Rust toolchain (pinned in `rust-toolchain.toml`).
+The BPF crate lives at `crates/modules/fast-path/bpf/` and has its own
+pinned nightly toolchain + `bpf-linker`; CI installs those automatically.
 Cross-compiling to every release target uses
 [`cross`](https://github.com/cross-rs/cross); install it with
 `cargo install --locked cross`.
@@ -109,11 +193,13 @@ packetframe/
 │   ├── common/                       # config, Module trait, §2.1 probes
 │   ├── cli/                          # the `packetframe` binary
 │   └── modules/
-│       └── fast-path/                # v0.0.1 stub; v0.1 has the real module
+│       └── fast-path/                # fast-path module
+│           └── bpf/                  # the BPF program (nightly toolchain)
 ├── conf/
-│   └── example.conf                  # reference config per SPEC.md §4.8
+│   └── example.conf                  # reference config per §4.8
 └── .github/workflows/
     ├── ci.yml                        # fmt, clippy, test, cross-build
+    ├── qemu-verifier.yml             # §10.2 matrix: 5.15 + 6.6 kernels
     └── release.yml                   # tag-triggered GitHub Release
 ```
 
