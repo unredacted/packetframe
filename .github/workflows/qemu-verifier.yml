@@ -1,0 +1,116 @@
+name: QEMU verifier
+
+# SPEC.md §10.2: run the sudo-gated integration tests under two kernel
+# versions — 5.15 (EFG-parity) and 6.6 LTS (≥5.18 for
+# BPF_PROG_TEST_RUN_XDP_LIVE; the host CI job already covers whichever
+# kernel ubuntu-latest runners ship with, so this matrix targets
+# explicit EFG-parity + a modern LTS).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # Pin versions so adding a matrix dimension doesn't drift toolchains.
+  RUST_STABLE: "1.95.0"
+  RUST_NIGHTLY: "nightly-2026-04-14"
+  BPF_LINKER_VERSION: "0.10.3"
+
+jobs:
+  qemu:
+    name: qemu (kernel ${{ matrix.kernel_label }})
+    runs-on: ubuntu-latest
+    env:
+      PACKETFRAME_BPF_REQUIRED: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel_label: "5.15"
+            # Canonical mainline PPA — rebuild of upstream v5.15 for
+            # Ubuntu. First 5.15.0 mainline build.
+            kernel_url: https://kernel.ubuntu.com/mainline/v5.15/amd64/linux-image-unsigned-5.15.0-051500-generic_5.15.0-051500.202110312130_amd64.deb
+          - kernel_label: "6.6"
+            # 6.6 LTS — first mainline 6.6.0 build.
+            kernel_url: https://kernel.ubuntu.com/mainline/v6.6/amd64/linux-image-unsigned-6.6.0-060600-generic_6.6.0-060600.202310291843_amd64.deb
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable + nightly (for BPF)
+        run: |
+          rustup install ${RUST_STABLE} --profile minimal
+          rustup default ${RUST_STABLE}
+          rustup install ${RUST_NIGHTLY} --profile minimal
+          rustup component add --toolchain ${RUST_NIGHTLY} rust-src llvm-tools-preview
+
+      - name: Cache cargo + BPF target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            crates/modules/fast-path/bpf/target/
+          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_label }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_label }}-
+            ${{ runner.os }}-cargo-qemu-
+            ${{ runner.os }}-cargo-check-
+
+      - name: Install bpf-linker
+        run: |
+          if ! command -v bpf-linker >/dev/null 2>&1 || \
+             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${BPF_LINKER_VERSION}" ]; then
+            cargo install --locked --force bpf-linker --version ${BPF_LINKER_VERSION}
+          fi
+
+      - name: Install QEMU + virtme-ng
+        run: |
+          set -eux
+          sudo apt-get update
+          # virtme-ng is available in Ubuntu 24.04; fall back to pip
+          # (--break-system-packages needed on 24.04's externally-managed
+          # Python) if apt doesn't have it yet.
+          if ! sudo apt-get install -y qemu-system-x86 virtme-ng busybox-static; then
+            sudo apt-get install -y qemu-system-x86 busybox-static python3-pip
+            sudo pip3 install --break-system-packages virtme-ng
+          fi
+          virtme-ng --help >/dev/null
+
+      - name: Fetch kernel image
+        run: |
+          set -eux
+          curl -fsSL --retry 3 -o /tmp/kernel.deb '${{ matrix.kernel_url }}'
+          dpkg-deb -x /tmp/kernel.deb /tmp/kernel-root
+          KERNEL=$(find /tmp/kernel-root -name 'vmlinuz-*' | head -1)
+          test -n "${KERNEL}"
+          ls -la "${KERNEL}"
+          echo "KERNEL_PATH=${KERNEL}" >> "${GITHUB_ENV}"
+
+      - name: Build integration tests
+        run: |
+          # Build so the test binaries are ready to exec inside the VM.
+          # `--no-run` produces the ELFs without executing them on the
+          # host kernel.
+          cargo test -p packetframe-fast-path --tests --no-run
+
+      - name: Run integration tests in QEMU
+        timeout-minutes: 15
+        run: |
+          # virtme-ng makes the host filesystem available R/W inside the
+          # guest and runs as root. `--pwd` preserves the working
+          # directory so cargo paths resolve. The guest inherits the
+          # host env, so `PACKETFRAME_BPF_REQUIRED` and the rustup
+          # toolchain discovery carry over.
+          virtme-ng --kimg "${KERNEL_PATH}" --memory 1024 --pwd -- bash -c '
+            set -eux
+            uname -a
+            # --ignored runs the sudo-gated suite that attaches real BPF
+            # programs. virtme-ng already has CAP_* so no sudo needed.
+            cargo test -p packetframe-fast-path --tests -- --ignored --nocapture
+          '
