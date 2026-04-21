@@ -57,6 +57,21 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
         }
     }
 
+    // Refuse startup if a circuit-breaker trip flag from a prior
+    // invocation is still present. The flag is sticky across kernel
+    // reboots — SPEC §8.3 — and must be cleared by an operator.
+    #[cfg(feature = "fast-path")]
+    {
+        let flag_path = packetframe_fast_path::breaker::trip_flag_path(&config.global.state_dir);
+        if flag_path.exists() {
+            return Err(RunError::Startup(format!(
+                "circuit-breaker trip flag present at {}; \
+                 investigate and `rm` it before restarting (SPEC §8.3 sticky detach)",
+                flag_path.display()
+            )));
+        }
+    }
+
     // Feasibility gate: refuse to attach if any required capability is
     // missing. The per-interface trial-attach probe (§2.3) runs here
     // too — if a specific iface can't receive an XDP program at all,
@@ -152,55 +167,114 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         crate::metrics::MetricsExporter::start(path.clone(), config.global.bpffs_root.clone())
     });
 
+    // Start circuit-breaker sampler(s) for each module that declared
+    // one. v0.1 has one module so this is at most one thread.
+    let mut breaker_samplers: Vec<crate::breaker::BreakerSampler> = Vec::new();
+    for section in &config.modules {
+        if let Some(spec) = extract_breaker_spec(section) {
+            breaker_samplers.push(crate::breaker::BreakerSampler::start(
+                spec,
+                config.global.bpffs_root.clone(),
+                config.global.state_dir.clone(),
+            ));
+        }
+    }
+
     tracing::info!("fast-path running — SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
-    drive_signal_loop(config_path, &mut modules).map_err(RunError::Runtime)?;
+    let termination = drive_signal_loop(config_path, &mut modules).map_err(RunError::Runtime)?;
 
-    // Stop the exporter first so its final write completes before
-    // we drop any module state. The pin-backed STATS map would let
-    // the exporter keep reading across the module drop, but running
-    // shutdown ordering explicitly keeps logs tidy.
+    // Stop the exporter + breaker sampler(s) first so their final
+    // writes complete before we touch module state.
     if let Some(m) = metrics_exporter {
         m.shutdown();
     }
+    for sampler in breaker_samplers {
+        sampler.shutdown();
+    }
 
-    // SPEC.md §7.3 / §8.5: SIGTERM/SIGINT must exit *without* detaching.
-    // Dropping `modules` closes our userspace FDs (program, maps,
-    // links); the bpffs pins installed at attach time hold the kernel
-    // references, so the XDP attachment survives process exit. An
-    // explicit `Module::detach` tears the pins down — we deliberately
-    // don't call it here.
-    tracing::info!("termination signal received; exiting (pins hold the attach per §8.5)");
-    drop(modules);
+    match termination {
+        Termination::ExitPreserveAttach => {
+            // SPEC.md §7.3 / §8.5: SIGTERM/SIGINT exit *without*
+            // detaching. Dropping `modules` closes our userspace FDs;
+            // the bpffs pins hold the kernel references, so the XDP
+            // attachment survives.
+            tracing::info!("termination signal received; exiting (pins hold the attach per §8.5)");
+            drop(modules);
+        }
+        Termination::BreakerTrip => {
+            // Breaker fired (SIGUSR1). Tear down pins so the kernel
+            // detaches; the sticky trip flag is already on disk so
+            // subsequent `run` invocations refuse to re-attach.
+            tracing::error!("circuit breaker tripped — detaching every module");
+            for (name, module) in modules.iter_mut() {
+                if let Err(e) = module.detach() {
+                    tracing::error!(module = %name, error = %e, "detach failed");
+                }
+            }
+            drop(modules);
+        }
+    }
     Ok(())
 }
 
-/// Drive the signal loop: SIGHUP → re-parse + reconfigure every
-/// loaded module; SIGTERM/SIGINT → return so the caller can drop.
+/// Look through a module section's directives and return its
+/// `CircuitBreakerSpec`, if present. Multiple directives of the same
+/// kind aren't rejected by the parser — take the last one if so.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn extract_breaker_spec(
+    section: &packetframe_common::config::ModuleSection,
+) -> Option<packetframe_common::config::CircuitBreakerSpec> {
+    section.directives.iter().rev().find_map(|d| match d {
+        packetframe_common::config::ModuleDirective::CircuitBreaker(s) => Some(*s),
+        _ => None,
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+enum Termination {
+    /// SIGTERM/SIGINT: exit, leave pins in place.
+    ExitPreserveAttach,
+    /// SIGUSR1 from the breaker: detach, then exit.
+    BreakerTrip,
+}
+
+/// Drive the signal loop. Returns the termination reason the caller
+/// uses to decide whether to detach or preserve pins on exit.
+///
+/// - SIGHUP → re-parse config + reconfigure each loaded module.
+/// - SIGTERM/SIGINT → `Termination::ExitPreserveAttach` (keep pins).
+/// - SIGUSR1 → `Termination::BreakerTrip` (breaker fired; caller
+///   detaches). SIGUSR1 is raised by the breaker sampler thread on
+///   trip.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn drive_signal_loop(
     config_path: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
-) -> Result<(), String> {
+) -> Result<Termination, String> {
     use signal_hook::{
-        consts::{SIGHUP, SIGINT, SIGTERM},
+        consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1},
         iterator::Signals,
     };
 
-    let mut signals =
-        Signals::new([SIGTERM, SIGINT, SIGHUP]).map_err(|e| format!("signal registration: {e}"))?;
+    let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP, SIGUSR1])
+        .map_err(|e| format!("signal registration: {e}"))?;
 
     for sig in signals.forever() {
         match sig {
             SIGHUP => reconfigure_from_signal(config_path, modules),
             SIGTERM | SIGINT => {
                 tracing::info!(signal = sig, "termination requested");
-                return Ok(());
+                return Ok(Termination::ExitPreserveAttach);
+            }
+            SIGUSR1 => {
+                tracing::warn!("SIGUSR1 received — breaker-triggered shutdown");
+                return Ok(Termination::BreakerTrip);
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(Termination::ExitPreserveAttach)
 }
 
 /// SIGHUP handler. Re-parses the config from `config_path` and calls

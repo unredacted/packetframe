@@ -15,6 +15,7 @@ use packetframe_common::module::{
     ModuleError, ModuleResult,
 };
 
+pub mod breaker;
 pub mod metrics;
 pub mod pin;
 pub mod registry;

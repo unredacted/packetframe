@@ -7,6 +7,8 @@
 //! respectively. The `reconfigure` flow (SIGHUP → delta-only reconcile)
 //! lands with PR #6.
 
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+mod breaker;
 mod feasibility;
 mod loader;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
