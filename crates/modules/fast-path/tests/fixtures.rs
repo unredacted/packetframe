@@ -474,6 +474,17 @@ fn vlan_tagged_non_ip_inner_passes_with_pass_not_ip() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn ipv4_jumbo_payload_src_match_dry_run() {
+    // Kernel <5.18 caps BPF_PROG_TEST_RUN data at a page (~4 KiB);
+    // subtract headroom + headers and 3.6K exceeds it → EMSGSIZE. 5.18
+    // lifted the cap (via BPF_F_TEST_XDP_LIVE_FRAMES plumbing). Skip
+    // on older kernels so the QEMU 5.15 matrix can still run the rest
+    // of the suite. True 9K jumbo is netns-integration-test territory
+    // (SPEC §11.5) regardless.
+    if kernel_lt(5, 18) {
+        eprintln!("Skipping: jumbo fixture needs kernel ≥5.18 for BPF_PROG_TEST_RUN buffer cap");
+        return;
+    }
+
     let mut h = Harness::new();
     h.add_allow_v4("10.0.0.0/8");
     h.set_dry_run(true);
@@ -489,4 +500,17 @@ fn ipv4_jumbo_payload_src_match_dry_run() {
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_PASS);
     assert_eq!(h.stat(StatIdx::MatchedV4), before + 1);
+}
+
+/// Reads `/proc/sys/kernel/osrelease` and returns true when the running
+/// kernel is older than `target_major.target_minor`. Used to skip
+/// fixtures that exercise kernel features added after our EFG-parity
+/// baseline (5.15).
+fn kernel_lt(target_major: u32, target_minor: u32) -> bool {
+    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let prefix = osrelease.split('-').next().unwrap_or("");
+    let mut parts = prefix.split('.');
+    let maj: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (maj, min) < (target_major, target_minor)
 }
