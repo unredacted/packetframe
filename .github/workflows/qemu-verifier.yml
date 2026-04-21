@@ -100,13 +100,23 @@ jobs:
           test -n "${MODS_DEB}"
           echo "Fetching ${BASE}${MODS_DEB}"
           curl -fsSL --retry 3 -o /tmp/modules.deb "${BASE}${MODS_DEB}"
-          # Install into host paths virtme-run will look at.
-          sudo dpkg-deb -x /tmp/kernel.deb /
-          sudo dpkg-deb -x /tmp/modules.deb /
-          KVER=$(ls /lib/modules/ | grep -- '-generic$' | tail -1)
+          # Extract to a staging dir, then copy only /boot/* and
+          # /lib/modules/* into the host. Extracting the .deb directly
+          # to / with `dpkg-deb -x` changes parent-directory perms on
+          # /lib/, which in the prior iteration bricked
+          # /lib/x86_64-linux-gnu (cc linker couldn't find libm).
+          sudo rm -rf /tmp/kstage
+          sudo mkdir -p /tmp/kstage
+          sudo dpkg-deb -x /tmp/kernel.deb /tmp/kstage
+          sudo dpkg-deb -x /tmp/modules.deb /tmp/kstage
+          sudo cp -a /tmp/kstage/boot/. /boot/
+          sudo cp -a /tmp/kstage/lib/modules/. /lib/modules/
+          KVER=$(ls /tmp/kstage/lib/modules/ | grep -- '-generic$' | tail -1)
           test -n "${KVER}"
           sudo depmod -a "${KVER}"
           ls -la "/boot/vmlinuz-${KVER}"
+          # Sanity: host toolchain still works after the install.
+          test -e /lib/x86_64-linux-gnu/libm.so.6
           echo "KVER=${KVER}" >> "${GITHUB_ENV}"
 
       - name: Build integration tests
