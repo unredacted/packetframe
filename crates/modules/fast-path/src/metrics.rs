@@ -38,19 +38,20 @@ pub const COUNTER_NAMES: [&str; 19] = [
 
 /// Render a Prometheus textfile body from stat values + module uptime.
 /// Every counter gets `# TYPE` and `# HELP` headers so Prometheus's
-/// textfile collector categorizes it correctly.
+/// textfile collector categorizes it correctly. Counter names that
+/// already end in `_total` (e.g. `rx_total`) get emitted as-is —
+/// Prometheus convention requires one `_total` suffix, not two.
 pub fn render_textfile(stats: &[u64], uptime_seconds: u64) -> String {
     let mut out = String::with_capacity(4096);
     for (name, value) in COUNTER_NAMES.iter().zip(stats.iter()) {
-        let _ = writeln!(
-            out,
-            "# HELP packetframe_{name}_total fast-path §4.6 counter"
-        );
-        let _ = writeln!(out, "# TYPE packetframe_{name}_total counter");
-        let _ = writeln!(
-            out,
-            "packetframe_{name}_total{{module=\"fast-path\"}} {value}"
-        );
+        let metric = if name.ends_with("_total") {
+            format!("packetframe_{name}")
+        } else {
+            format!("packetframe_{name}_total")
+        };
+        let _ = writeln!(out, "# HELP {metric} fast-path §4.6 counter");
+        let _ = writeln!(out, "# TYPE {metric} counter");
+        let _ = writeln!(out, "{metric}{{module=\"fast-path\"}} {value}");
     }
     let _ = writeln!(
         out,
@@ -81,10 +82,23 @@ mod tests {
         let stats = vec![0u64; 19];
         let body = render_textfile(&stats, 42);
         for name in COUNTER_NAMES {
-            let line = format!("packetframe_{name}_total{{module=\"fast-path\"}} 0");
+            let metric = if name.ends_with("_total") {
+                format!("packetframe_{name}")
+            } else {
+                format!("packetframe_{name}_total")
+            };
+            let line = format!("{metric}{{module=\"fast-path\"}} 0");
             assert!(body.contains(&line), "missing line: {line}");
         }
         assert!(body.contains("packetframe_uptime_seconds{module=\"fast-path\"} 42"));
+    }
+
+    #[test]
+    fn counter_names_ending_in_total_are_not_double_suffixed() {
+        let stats = vec![0u64; 19];
+        let body = render_textfile(&stats, 0);
+        assert!(body.contains("packetframe_rx_total{module=\"fast-path\"}"));
+        assert!(!body.contains("packetframe_rx_total_total"));
     }
 
     #[test]
