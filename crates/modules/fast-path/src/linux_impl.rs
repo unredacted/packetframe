@@ -45,7 +45,7 @@ pub struct FpCfg {
 // the struct into the kernel's array value slot.
 unsafe impl aya::Pod for FpCfg {}
 
-const FP_CFG_VERSION_V1: u32 = 0;
+pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
 
 /// Layout mirror of `VlanResolve` in `bpf/src/maps.rs`. Hash-map value
 /// that tells the BPF program "this subif ifindex really egresses on
@@ -689,7 +689,7 @@ pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
 /// Read STATS directly from the bpffs pin — no live module required.
 /// Used by `packetframe status` when the loader isn't running.
 pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
-    use aya::maps::{MapData, PerCpuArray};
+    use aya::maps::{Map, MapData, PerCpuArray};
 
     let pin_path = pin::map_path(bpffs_root, "STATS");
     let map_data = MapData::from_pin(&pin_path).map_err(|e| {
@@ -698,7 +698,10 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
             format!("open STATS pin at {}: {e}", pin_path.display()),
         )
     })?;
-    let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map_data)
+    // aya's `PerCpuArray::try_from` takes a `Map` enum, not a bare
+    // `MapData`; wrap before converting.
+    let map = Map::PerCpuArray(map_data);
+    let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("STATS PerCpuArray: {e}")))?;
     read_stats(&stats)
 }
