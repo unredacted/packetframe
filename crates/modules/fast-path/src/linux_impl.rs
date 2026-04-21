@@ -276,6 +276,14 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         })
         .collect::<Result<_, _>>()?;
 
+    warn_shared_bridge_masters(
+        &attach_dirs
+            .iter()
+            .map(|(i, _, _)| i.as_str())
+            .collect::<Vec<_>>(),
+        cfg.global.attach_settle_time,
+    );
+
     // Attach each interface with trial-attach per §2.3: Auto → try
     // native first, fall back to generic on error; explicit Native or
     // Generic uses the requested mode directly (no fallback). Each
@@ -284,7 +292,24 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // survives process exit (§8.5). If pinning is kernel-rejected
     // (e.g. EPERM on some kernels for generic-XDP links) the attach
     // still succeeds but that specific link won't outlive the process.
-    for (iface, mode, ifindex) in &attach_dirs {
+    //
+    // SPEC.md §11.8 — XDP attach on some drivers (rvu-nicpf observed)
+    // briefly bounces the link. If multiple attach ifaces share a
+    // bridge master, attaching them inside one STP reconvergence
+    // window risks an L2 loop and packet storm. Sleep
+    // `attach_settle_time` between attaches so each link stabilizes
+    // before the next touches the driver. 0s disables (useful on
+    // non-bridge topologies).
+    let settle_time = cfg.global.attach_settle_time;
+    for (idx, (iface, mode, ifindex)) in attach_dirs.iter().enumerate() {
+        if idx > 0 && !settle_time.is_zero() {
+            info!(
+                settle_secs = settle_time.as_secs_f64(),
+                next_iface = %iface,
+                "waiting for link to settle before next attach (§11.8)"
+            );
+            std::thread::sleep(settle_time);
+        }
         let (effective_mode, link) =
             try_attach_with_fallback(prog, *ifindex, iface, *mode, &state.bpffs_root)?;
         let persist = link.is_pinned();
@@ -661,6 +686,42 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
     info!("fast-path pins removed; kernel detached");
     Ok(())
+}
+
+/// Emit a warning if two or more of the attach ifaces share a bridge
+/// master. SPEC.md §11.8 — on drivers that bounce the link at attach
+/// time, bouncing multiple bridge members inside one STP reconvergence
+/// window has been observed to trigger L2 loops. `attach_settle_time`
+/// between per-iface attaches mitigates but does not eliminate this.
+fn warn_shared_bridge_masters(ifaces: &[&str], settle_time: std::time::Duration) {
+    use std::collections::HashMap;
+    let mut by_master: HashMap<String, Vec<String>> = HashMap::new();
+    for iface in ifaces {
+        let master_link = format!("/sys/class/net/{iface}/master");
+        let Ok(target) = std::fs::read_link(&master_link) else {
+            continue;
+        };
+        let Some(master) = target.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        by_master
+            .entry(master.to_string())
+            .or_default()
+            .push((*iface).to_string());
+    }
+    for (master, members) in by_master {
+        if members.len() < 2 {
+            continue;
+        }
+        warn!(
+            bridge = %master,
+            members = ?members,
+            settle_secs = settle_time.as_secs_f64(),
+            "multiple attach ifaces share bridge master — XDP attach can cause L2 loops \
+             during STP reconvergence (§11.8). `attach-settle-time` spaces the attaches; \
+             ensure it is long enough for your bridge to reconverge (default 2s)."
+        );
+    }
 }
 
 /// Wrap `libc::if_nametoindex`. Returns a clear error on failure.

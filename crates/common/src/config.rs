@@ -68,7 +68,17 @@ pub struct GlobalConfig {
     pub log_level: LogLevel,
     pub bpffs_root: PathBuf,
     pub state_dir: PathBuf,
+    /// Pause between per-iface attaches during `packetframe run` to let
+    /// each link settle before the next attach touches the driver. See
+    /// SPEC.md §11.8 — on some drivers (rvu-nicpf observed) XDP attach
+    /// briefly bounces the link, and attaching two bridge slaves of the
+    /// same bridge inside one STP reconvergence window can trigger an
+    /// L2 loop. Default 2s. `0s` disables.
+    #[serde(with = "duration_seconds_serde")]
+    pub attach_settle_time: Duration,
 }
+
+pub const DEFAULT_ATTACH_SETTLE_TIME: Duration = Duration::from_secs(2);
 
 impl Default for GlobalConfig {
     fn default() -> Self {
@@ -77,7 +87,21 @@ impl Default for GlobalConfig {
             log_level: LogLevel::Info,
             bpffs_root: PathBuf::from(DEFAULT_BPFFS_ROOT),
             state_dir: PathBuf::from(DEFAULT_STATE_DIR),
+            attach_settle_time: DEFAULT_ATTACH_SETTLE_TIME,
         }
+    }
+}
+
+mod duration_seconds_serde {
+    use serde::Serializer;
+    use std::time::Duration;
+
+    pub fn serialize<S>(d: &Duration, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Keep the same `Ns` convention as `circuit-breaker window`.
+        s.serialize_str(&format!("{}s", d.as_secs()))
     }
 }
 
@@ -427,6 +451,21 @@ fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<
             }
             g.state_dir = PathBuf::from(path);
         }
+        "attach-settle-time" => {
+            let tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "attach-settle-time requires a duration (e.g. `2s`, `500ms`)",
+                )
+            })?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "attach-settle-time takes exactly one argument",
+                ));
+            }
+            g.attach_settle_time = parse_duration(line, tok, "attach-settle-time")?;
+        }
         other => {
             return Err(ConfigError::parse(
                 line,
@@ -625,6 +664,28 @@ fn parse_window(line: usize, tok: &str) -> Result<Duration, ConfigError> {
     Ok(Duration::from_secs(secs))
 }
 
+/// Parse a duration literal. Accepts `Nms` and `Ns` suffixes.
+/// `context` is the directive name, used for error messages.
+/// Zero is allowed (for disabling settle time).
+fn parse_duration(line: usize, tok: &str, context: &str) -> Result<Duration, ConfigError> {
+    if let Some(rest) = tok.strip_suffix("ms") {
+        let ms: u64 = rest.parse().map_err(|e| {
+            ConfigError::parse(line, format!("{context}: bad duration `{tok}`: {e}"))
+        })?;
+        Ok(Duration::from_millis(ms))
+    } else if let Some(rest) = tok.strip_suffix('s') {
+        let s: u64 = rest.parse().map_err(|e| {
+            ConfigError::parse(line, format!("{context}: bad duration `{tok}`: {e}"))
+        })?;
+        Ok(Duration::from_secs(s))
+    } else {
+        Err(ConfigError::parse(
+            line,
+            format!("{context}: duration must end in `s` or `ms`, got `{tok}`"),
+        ))
+    }
+}
+
 fn strip_comment(s: &str) -> &str {
     match s.find('#') {
         Some(i) => &s[..i],
@@ -760,6 +821,42 @@ module fast-path
         let c = Config::parse("global\n").expect("parse");
         assert_eq!(c.global, GlobalConfig::default());
         assert!(c.modules.is_empty());
+    }
+
+    #[test]
+    fn attach_settle_time_seconds() {
+        let c = Config::parse("global\n  attach-settle-time 5s\n").expect("parse");
+        assert_eq!(c.global.attach_settle_time, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn attach_settle_time_milliseconds() {
+        let c = Config::parse("global\n  attach-settle-time 250ms\n").expect("parse");
+        assert_eq!(c.global.attach_settle_time, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn attach_settle_time_zero_allowed() {
+        let c = Config::parse("global\n  attach-settle-time 0s\n").expect("parse");
+        assert_eq!(c.global.attach_settle_time, Duration::ZERO);
+    }
+
+    #[test]
+    fn attach_settle_time_default_is_2s() {
+        let c = Config::parse("global\n").expect("parse");
+        assert_eq!(c.global.attach_settle_time, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn attach_settle_time_bad_suffix_errors() {
+        let err = Config::parse("global\n  attach-settle-time 5min\n").expect_err("must fail");
+        assert!(format!("{err}").contains("duration must end in `s` or `ms`"));
+    }
+
+    #[test]
+    fn attach_settle_time_bad_number_errors() {
+        let err = Config::parse("global\n  attach-settle-time abcs\n").expect_err("must fail");
+        assert!(format!("{err}").contains("bad duration"));
     }
 
     #[test]
