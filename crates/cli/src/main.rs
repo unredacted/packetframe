@@ -7,8 +7,12 @@
 //! respectively. The `reconfigure` flow (SIGHUP → delta-only reconcile)
 //! lands with PR #6.
 
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+mod breaker;
 mod feasibility;
 mod loader;
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+mod metrics;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,13 +59,16 @@ enum Command {
         config: PathBuf,
     },
 
-    /// Detach attached programs recorded in the pin registry.
+    /// Detach attached programs by removing every pin under the
+    /// module's bpffs pin root. Removing a link pin triggers the
+    /// kernel-side XDP detach (SPEC.md §8.5); removing map + program
+    /// pins is housekeeping.
     Detach {
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Tear down every PacketFrame pin, regardless of config.
-        /// v0.1 honors the registry only; `--all` requires pinning
-        /// (PR #6).
+        /// Tear down every PacketFrame pin across every module, not
+        /// just the one in the supplied config. v0.1 has one module
+        /// so this is equivalent to the default.
         #[arg(long)]
         all: bool,
     },

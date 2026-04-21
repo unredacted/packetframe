@@ -23,6 +23,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 signal-hook.workspace = true
 
 [features]

@@ -45,6 +45,33 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
 
+    // Fail fast if metrics-textfile can't be written — the exporter
+    // would retry silently every 15s otherwise.
+    if let Some(path) = &config.global.metrics_textfile {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.exists() {
+            return Err(RunError::Startup(format!(
+                "metrics-textfile parent dir {} does not exist",
+                parent.display()
+            )));
+        }
+    }
+
+    // Refuse startup if a circuit-breaker trip flag from a prior
+    // invocation is still present. The flag is sticky across kernel
+    // reboots — SPEC §8.3 — and must be cleared by an operator.
+    #[cfg(feature = "fast-path")]
+    {
+        let flag_path = packetframe_fast_path::breaker::trip_flag_path(&config.global.state_dir);
+        if flag_path.exists() {
+            return Err(RunError::Startup(format!(
+                "circuit-breaker trip flag present at {}; \
+                 investigate and `rm` it before restarting (SPEC §8.3 sticky detach)",
+                flag_path.display()
+            )));
+        }
+    }
+
     // Feasibility gate: refuse to attach if any required capability is
     // missing. The per-interface trial-attach probe (§2.3) runs here
     // too — if a specific iface can't receive an XDP program at all,
@@ -134,71 +161,177 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
     }
 
-    tracing::info!(
-        "fast-path running — SIGTERM/SIGINT to exit; detach on exit pending pin support (PR #6)"
-    );
+    // Start the metrics exporter once STATS is pinned (which happens
+    // in the attach loop above).
+    let metrics_exporter = config.global.metrics_textfile.as_ref().map(|path| {
+        crate::metrics::MetricsExporter::start(path.clone(), config.global.bpffs_root.clone())
+    });
 
-    wait_for_termination().map_err(RunError::Runtime)?;
+    // Start circuit-breaker sampler(s) for each module that declared
+    // one. v0.1 has one module so this is at most one thread.
+    let mut breaker_samplers: Vec<crate::breaker::BreakerSampler> = Vec::new();
+    for section in &config.modules {
+        if let Some(spec) = extract_breaker_spec(section) {
+            breaker_samplers.push(crate::breaker::BreakerSampler::start(
+                spec,
+                config.global.bpffs_root.clone(),
+                config.global.state_dir.clone(),
+            ));
+        }
+    }
 
-    // SPEC.md §7.3 / §8.5: SIGTERM/SIGINT must exit *without* detaching.
-    // In v0.1 there's no bpffs pinning yet, so dropping the `Ebpf`
-    // inside `modules` necessarily tears down the attach (the
-    // kernel-side `bpf_link` closes when its FD does). PR #6 will
-    // make this a true no-op-on-exit by pinning programs + maps
-    // before the drop. For now we deliberately *do not* call
-    // `Module::detach` here; the drop path is the same end state,
-    // and leaving it implicit keeps the exit intent aligned with
-    // what pinning will later honor.
-    tracing::info!("termination signal received; exiting (no explicit detach, per §8.5)");
-    drop(modules);
+    tracing::info!("fast-path running — SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
+
+    let termination = drive_signal_loop(config_path, &mut modules).map_err(RunError::Runtime)?;
+
+    // Stop the exporter + breaker sampler(s) first so their final
+    // writes complete before we touch module state.
+    if let Some(m) = metrics_exporter {
+        m.shutdown();
+    }
+    for sampler in breaker_samplers {
+        sampler.shutdown();
+    }
+
+    match termination {
+        Termination::ExitPreserveAttach => {
+            // SPEC.md §7.3 / §8.5: SIGTERM/SIGINT exit *without*
+            // detaching. Dropping `modules` closes our userspace FDs;
+            // the bpffs pins hold the kernel references, so the XDP
+            // attachment survives.
+            tracing::info!("termination signal received; exiting (pins hold the attach per §8.5)");
+            drop(modules);
+        }
+        Termination::BreakerTrip => {
+            // Breaker fired (SIGUSR1). Tear down pins so the kernel
+            // detaches; the sticky trip flag is already on disk so
+            // subsequent `run` invocations refuse to re-attach.
+            tracing::error!("circuit breaker tripped — detaching every module");
+            for (name, module) in modules.iter_mut() {
+                if let Err(e) = module.detach() {
+                    tracing::error!(module = %name, error = %e, "detach failed");
+                }
+            }
+            drop(modules);
+        }
+    }
     Ok(())
 }
 
+/// Look through a module section's directives and return its
+/// `CircuitBreakerSpec`, if present. Multiple directives of the same
+/// kind aren't rejected by the parser — take the last one if so.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
-fn wait_for_termination() -> Result<(), String> {
+fn extract_breaker_spec(
+    section: &packetframe_common::config::ModuleSection,
+) -> Option<packetframe_common::config::CircuitBreakerSpec> {
+    section.directives.iter().rev().find_map(|d| match d {
+        packetframe_common::config::ModuleDirective::CircuitBreaker(s) => Some(*s),
+        _ => None,
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+enum Termination {
+    /// SIGTERM/SIGINT: exit, leave pins in place.
+    ExitPreserveAttach,
+    /// SIGUSR1 from the breaker: detach, then exit.
+    BreakerTrip,
+}
+
+/// Drive the signal loop. Returns the termination reason the caller
+/// uses to decide whether to detach or preserve pins on exit.
+///
+/// - SIGHUP → re-parse config + reconfigure each loaded module.
+/// - SIGTERM/SIGINT → `Termination::ExitPreserveAttach` (keep pins).
+/// - SIGUSR1 → `Termination::BreakerTrip` (breaker fired; caller
+///   detaches). SIGUSR1 is raised by the breaker sampler thread on
+///   trip.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn drive_signal_loop(
+    config_path: &Path,
+    modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+) -> Result<Termination, String> {
     use signal_hook::{
-        consts::{SIGHUP, SIGINT, SIGTERM},
+        consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1},
         iterator::Signals,
     };
 
-    let mut signals =
-        Signals::new([SIGTERM, SIGINT, SIGHUP]).map_err(|e| format!("signal registration: {e}"))?;
+    let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP, SIGUSR1])
+        .map_err(|e| format!("signal registration: {e}"))?;
 
     for sig in signals.forever() {
         match sig {
-            SIGHUP => {
-                // SPEC.md §8.4 / §4.5: delta-only reconcile lives in PR #6.
-                tracing::warn!("SIGHUP received; reconfigure flow not implemented in this release");
-            }
+            SIGHUP => reconfigure_from_signal(config_path, modules),
             SIGTERM | SIGINT => {
-                // SPEC.md §7.3 / §8.5: exit without detach. Pin-based
-                // program persistence requires PR #6; until then, exit
-                // *does* implicitly detach.
                 tracing::info!(signal = sig, "termination requested");
-                return Ok(());
+                return Ok(Termination::ExitPreserveAttach);
+            }
+            SIGUSR1 => {
+                tracing::warn!("SIGUSR1 received — breaker-triggered shutdown");
+                return Ok(Termination::BreakerTrip);
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(Termination::ExitPreserveAttach)
+}
+
+/// SIGHUP handler. Re-parses the config from `config_path` and calls
+/// `Module::reconfigure` on each loaded module. Parse failures and
+/// per-module reconfigure errors are logged and swallowed — a bad
+/// SIGHUP never kills the running data plane.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn reconfigure_from_signal(
+    config_path: &Path,
+    modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+) {
+    use packetframe_common::module::ModuleConfig;
+
+    tracing::info!(config = %config_path.display(), "SIGHUP received; reconfiguring");
+
+    let new_config = match Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "SIGHUP config parse failed; keeping current config");
+            return;
+        }
+    };
+
+    for (name, module) in modules.iter_mut() {
+        let section = match new_config.modules.iter().find(|m| &m.name == name) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    module = %name,
+                    "module removed from config; reconfigure skipped (attach-set changes require restart)"
+                );
+                continue;
+            }
+        };
+        let mcfg = ModuleConfig::new(section, &new_config.global);
+        if let Err(e) = module.reconfigure(&mcfg) {
+            tracing::warn!(module = %name, error = %e, "reconfigure failed");
+        }
+    }
 }
 
 pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
-    let state_dir = match config {
+    let (bpffs_root, state_dir) = match config {
         Some(p) => {
-            Config::from_file(p)
-                .map_err(|e| format!("config parse: {e}"))?
-                .global
-                .state_dir
+            let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
+            (c.global.bpffs_root, c.global.state_dir)
         }
-        None => PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
+        None => (
+            PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
+            PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
+        ),
     };
 
-    if all {
-        tracing::warn!(
-            "`--all` requires bpffs pin sweep (PR #6); for now, honoring the pin registry only"
-        );
-    }
+    // v0.1 has one module (fast-path), so `--all` and the default case
+    // behave identically — both tear down every pin under the module's
+    // pin root. `--all` becomes meaningful once a second module ships.
+    let _ = all;
 
     #[cfg(feature = "fast-path")]
     {
@@ -208,7 +341,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
                 tracing::info!(
                     module = %file.module,
                     count = file.attachments.len(),
-                    "pin registry found"
+                    "pin registry found; tearing down"
                 );
                 for a in &file.attachments {
                     tracing::info!(
@@ -218,17 +351,25 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
                         "registered attachment"
                     );
                 }
-                tracing::warn!(
-                    "in-kernel detach without an active loader requires bpffs pinning (SPEC.md §8.5 + pinning support in PR #6); removing registry file only"
-                );
-                packetframe_fast_path::registry::remove(&state_dir)
-                    .map_err(|e| format!("registry remove: {e}"))?;
             }
             Ok(None) => {
-                tracing::info!("no pin registry found — nothing to detach");
+                tracing::info!("no pin registry found — sweeping bpffs pin root anyway");
             }
             Err(e) => return Err(format!("registry read: {e}")),
         }
+
+        // Unlink every pin under `<bpffs-root>/fast-path/`. Removing
+        // link pins triggers the kernel-side XDP detach (§8.5); the
+        // map and program pins are housekeeping.
+        packetframe_fast_path::pin::remove_all(&bpffs_root)
+            .map_err(|e| format!("remove pins under {}: {e}", bpffs_root.display()))?;
+        tracing::info!(
+            pin_root = %packetframe_fast_path::pin::module_root(&bpffs_root).display(),
+            "pins removed; kernel detached"
+        );
+
+        packetframe_fast_path::registry::remove(&state_dir)
+            .map_err(|e| format!("registry remove: {e}"))?;
     }
 
     Ok(())
@@ -265,10 +406,56 @@ pub fn status(config_path: &Path) -> Result<(), String> {
             }
             Err(e) => return Err(format!("registry read: {e}")),
         }
+
+        // Live counter readback from the pinned STATS map. Works
+        // whether or not the loader is running — the pin survives
+        // process exit (§8.5).
+        #[cfg(target_os = "linux")]
+        print_stats(&config.global.bpffs_root);
     }
 
-    eprintln!("note: live counter readback requires bpffs-pinned stats (PR #6)");
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn print_stats(bpffs_root: &Path) {
+    // §4.6 counter names, indexed by `StatIdx` discriminants. Order
+    // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
+    const NAMES: [&str; 19] = [
+        "rx_total",
+        "matched_v4",
+        "matched_v6",
+        "matched_src_only",
+        "matched_dst_only",
+        "matched_both",
+        "fwd_ok",
+        "fwd_dry_run",
+        "pass_fragment",
+        "pass_low_ttl",
+        "pass_no_neigh",
+        "pass_not_ip",
+        "pass_frag_needed",
+        "drop_unreachable",
+        "err_parse",
+        "err_fib_other",
+        "err_vlan",
+        "pass_not_in_devmap",
+        "pass_complex_header",
+    ];
+
+    match packetframe_fast_path::stats_from_pin(bpffs_root) {
+        Ok(values) => {
+            println!();
+            println!("counters (from {}):", bpffs_root.display());
+            let name_w = NAMES.iter().map(|n| n.len()).max().unwrap_or(20);
+            for (name, value) in NAMES.iter().zip(values.iter()) {
+                println!("  {name:<name_w$}  {value}");
+            }
+        }
+        Err(e) => {
+            eprintln!("note: STATS pin unavailable ({e}); loader may not be attached");
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]

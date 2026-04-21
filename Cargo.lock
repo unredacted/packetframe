@@ -357,6 +357,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "packetframe-common",
  "packetframe-fast-path",
  "serde_json",
