@@ -65,19 +65,17 @@ jobs:
             cargo install --locked --force bpf-linker --version ${BPF_LINKER_VERSION}
           fi
 
-      - name: Install QEMU + virtme
+      - name: Install QEMU + virtme-ng
         run: |
           set -eux
           sudo apt-get update
-          # virtme-ng's `--run` takes a kernel *build directory*, not a
-          # pre-built vmlinuz path. Classic `virtme-run` has the stable
-          # `--kimg <path>` flag that accepts a raw vmlinuz; install that
-          # via pip (Ubuntu 24.04 dropped the `virtme` apt package).
-          sudo apt-get install -y qemu-system-x86 busybox-static python3-pip python3-virtualenv
-          sudo pip3 install --break-system-packages virtme
-          which virtme-run
+          # virtme-ng is the maintained fork (classic virtme-run uses
+          # -watchdog which QEMU 8.x dropped). Its `--run <deb>` accepts
+          # a pre-built kernel package directly.
+          sudo apt-get install -y qemu-system-x86 virtme-ng busybox-static
+          virtme-ng --version || true
 
-      - name: Fetch + install kernel image
+      - name: Fetch kernel package
         run: |
           set -eux
           # Discover the .deb URL from the PPA directory listing —
@@ -91,33 +89,8 @@ jobs:
           test -n "${DEB}"
           echo "Fetching ${BASE}${DEB}"
           curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${DEB}"
-          # Also grab modules — virtme-run's `--installed-kernel` needs
-          # /lib/modules/$VER/ populated.
-          MODS_DEB=$(curl -fsSL "${BASE}" \
-            | grep -oE 'linux-modules-[0-9][^"]*generic_[^"]*_amd64\.deb' \
-            | sort -u \
-            | head -1)
-          test -n "${MODS_DEB}"
-          echo "Fetching ${BASE}${MODS_DEB}"
-          curl -fsSL --retry 3 -o /tmp/modules.deb "${BASE}${MODS_DEB}"
-          # Extract to a staging dir, then copy only /boot/* and
-          # /lib/modules/* into the host. Extracting the .deb directly
-          # to / with `dpkg-deb -x` changes parent-directory perms on
-          # /lib/, which in the prior iteration bricked
-          # /lib/x86_64-linux-gnu (cc linker couldn't find libm).
-          sudo rm -rf /tmp/kstage
-          sudo mkdir -p /tmp/kstage
-          sudo dpkg-deb -x /tmp/kernel.deb /tmp/kstage
-          sudo dpkg-deb -x /tmp/modules.deb /tmp/kstage
-          sudo cp -a /tmp/kstage/boot/. /boot/
-          sudo cp -a /tmp/kstage/lib/modules/. /lib/modules/
-          KVER=$(ls /tmp/kstage/lib/modules/ | grep -- '-generic$' | tail -1)
-          test -n "${KVER}"
-          sudo depmod -a "${KVER}"
-          ls -la "/boot/vmlinuz-${KVER}"
-          # Sanity: host toolchain still works after the install.
-          test -e /lib/x86_64-linux-gnu/libm.so.6
-          echo "KVER=${KVER}" >> "${GITHUB_ENV}"
+          ls -la /tmp/kernel.deb
+          echo "KERNEL_DEB=/tmp/kernel.deb" >> "${GITHUB_ENV}"
 
       - name: Build integration tests
         run: |
@@ -130,15 +103,14 @@ jobs:
         timeout-minutes: 15
         run: |
           set -eux
-          # virtme-run boots the target kernel via QEMU and mounts the
-          # host / as the guest root via 9p. --installed-kernel expects
-          # the kernel + modules to live under /boot and /lib/modules/
-          # on the host — we installed them in the previous step.
-          # --script-sh runs a command and exits; stdout is forwarded.
-          #
-          # --qemu-opts must come last (argparse REMAINDER).
-          WORKSPACE="$(pwd)"
-          virtme-run \
-            --installed-kernel "${KVER}" \
-            --script-sh "set -eux; cd '${WORKSPACE}'; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture" \
-            --qemu-opts -m 1024M -machine accel=tcg
+          # virtme-ng `--run <deb>` accepts a Debian/Ubuntu kernel .deb
+          # directly. Host / is mounted R/W in the guest via 9p, so
+          # cargo resolves the same paths inside as outside. `--pwd`
+          # preserves cwd. GHA runners may not expose /dev/kvm, so
+          # force TCG via --disable-kvm.
+          virtme-ng \
+            --run "${KERNEL_DEB}" \
+            --pwd \
+            --memory 1024 \
+            --disable-kvm \
+            -- bash -c 'set -eux; uname -a; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture'
