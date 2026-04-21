@@ -78,15 +78,31 @@ pub struct ActiveState {
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
-/// `Auto` mode so `status` can report it. `pinned_link` owns the
-/// PinnedLink returned from `FdLink::pin` — dropping it closes the
-/// userspace FD without unlinking the bpffs inode, so the kernel-side
-/// attach survives process exit.
+/// `Auto` mode so `status` can report it. `link` is either:
+///
+/// - `Pinned(PinnedLink)` — the happy path; dropping closes the
+///   userspace FD but leaves the bpffs inode, so the kernel attach
+///   survives process exit (§8.5).
+/// - `Transient(FdLink)` — pin syscall was rejected (e.g. EPERM on
+///   generic-mode XDP links on some kernels). The attach still works,
+///   but dropping the FdLink detaches the kernel-side XDP program.
+///   SIGTERM will detach these interfaces; native-mode ones persist.
 pub struct LinkRecord {
     pub iface: String,
     pub ifindex: u32,
     pub effective_mode: AttachMode,
-    pub pinned_link: PinnedLink,
+    pub link: LinkHandle,
+}
+
+pub enum LinkHandle {
+    Pinned(PinnedLink),
+    Transient(FdLink),
+}
+
+impl LinkHandle {
+    pub fn is_pinned(&self) -> bool {
+        matches!(self, LinkHandle::Pinned(_))
+    }
 }
 
 pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveState> {
@@ -263,18 +279,28 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // Attach each interface with trial-attach per §2.3: Auto → try
     // native first, fall back to generic on error; explicit Native or
     // Generic uses the requested mode directly (no fallback). Each
-    // attach pins its link under `<bpffs-root>/fast-path/links/<iface>`
-    // so the kernel attach survives process exit (§8.5).
+    // attach tries to pin its link under
+    // `<bpffs-root>/fast-path/links/<iface>` so the kernel attach
+    // survives process exit (§8.5). If pinning is kernel-rejected
+    // (e.g. EPERM on some kernels for generic-XDP links) the attach
+    // still succeeds but that specific link won't outlive the process.
     for (iface, mode, ifindex) in &attach_dirs {
-        let (effective_mode, pinned_link) =
+        let (effective_mode, link) =
             try_attach_with_fallback(prog, *ifindex, iface, *mode, &state.bpffs_root)?;
+        let persist = link.is_pinned();
         state.links.push(LinkRecord {
             iface: iface.clone(),
             ifindex: *ifindex,
             effective_mode,
-            pinned_link,
+            link,
         });
-        info!(iface, ifindex, ?effective_mode, "fast-path attached");
+        info!(
+            iface,
+            ifindex,
+            ?effective_mode,
+            persists_across_exit = persist,
+            "fast-path attached"
+        );
     }
 
     // Populate redirect_devmap with every attach-scope ifindex so the
@@ -379,7 +405,7 @@ fn try_attach_with_fallback(
     iface: &str,
     mode: AttachMode,
     bpffs_root: &Path,
-) -> ModuleResult<(AttachMode, PinnedLink)> {
+) -> ModuleResult<(AttachMode, LinkHandle)> {
     match mode {
         AttachMode::Native => attach_and_pin(
             prog,
@@ -427,12 +453,18 @@ fn try_attach_with_fallback(
     }
 }
 
-/// Attach + `take_link` + pin in one go. The returned `PinnedLink`
-/// holds both the bpffs path and the FD; dropping it closes the FD
-/// without removing the pin (see `pin::remove_all` for teardown).
+/// Attach + `take_link`, then try to pin. Returns:
 ///
-/// `mode_label` is only used for error message clarity — "native"
-/// vs "generic".
+/// - `LinkHandle::Pinned` on success — the kernel attach survives
+///   process exit via the bpffs inode.
+/// - `LinkHandle::Transient` if pinning was rejected (EPERM on
+///   generic-mode XDP links on some kernels, for instance). The
+///   attach still works, but dropping the returned `FdLink` detaches
+///   the kernel-side program.
+///
+/// Hard errors (attach fails, `take_link` fails, link isn't
+/// bpf_link_create-backed) remain hard errors — the caller bubbles
+/// them up.
 fn attach_and_pin(
     prog: &mut Xdp,
     ifindex: u32,
@@ -440,7 +472,7 @@ fn attach_and_pin(
     flags: XdpFlags,
     bpffs_root: &Path,
     mode_label: &str,
-) -> ModuleResult<PinnedLink> {
+) -> ModuleResult<LinkHandle> {
     let link_id = prog.attach_to_if_index(ifindex, flags).map_err(|e| {
         ModuleError::other(
             MODULE_NAME,
@@ -466,16 +498,46 @@ fn attach_and_pin(
         )
     })?;
     let pin_path = pin::link_path(bpffs_root, iface);
-    fd_link.pin(&pin_path).map_err(|e| {
-        ModuleError::other(
-            MODULE_NAME,
-            format!(
-                "pin link for {iface} at {}: {}",
-                pin_path.display(),
-                format_error_chain(&e)
-            ),
-        )
-    })
+    match fd_link.pin(&pin_path) {
+        Ok(pinned) => Ok(LinkHandle::Pinned(pinned)),
+        Err(err) => {
+            // Some kernels reject pinning for specific link types
+            // (observed: EPERM on generic-XDP links on 6.12). The
+            // attach itself is still valid; we just can't persist it
+            // across process exit. Open a fresh FdLink from the
+            // program's internal link tracking so we have something
+            // to hold (PinnedLink consumed the prior one on failure).
+            warn!(
+                iface,
+                pin_err = %format_error_chain(&err),
+                "link pin failed; attach will not survive process exit"
+            );
+            // Re-attach so we have an FdLink to hold. `attach_to_if_index`
+            // was already called; calling it again would double-attach
+            // which the kernel rejects. Fortunately `FdLink::pin`
+            // consumes `self` even on error — the link FD is already
+            // gone. Re-attach from scratch:
+            let link_id = prog.attach_to_if_index(ifindex, flags).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!("{mode_label} XDP re-attach to {iface} after pin failure: {e}"),
+                )
+            })?;
+            let owned_link = prog.take_link(link_id).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!("take_link after re-attach to {iface}: {e}"),
+                )
+            })?;
+            let fd_link: FdLink = owned_link.try_into().map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!("XDP re-attach link for {iface} not FdLink: {e}"),
+                )
+            })?;
+            Ok(LinkHandle::Transient(fd_link))
+        }
+    }
 }
 
 /// Walk a std::error::Error's source chain and join into one display
