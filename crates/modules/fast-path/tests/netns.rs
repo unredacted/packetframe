@@ -457,20 +457,24 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
     // REDIRECT_DEVMAP intentionally left empty — the dummy ifindex is
     // therefore NOT in it, which is what drives the pre-check miss.
 
-    let prog: &mut Xdp = bpf
-        .program_mut("fast_path")
-        .expect("fast_path program present")
-        .try_into()
-        .expect("fast_path is XDP");
-    prog.load().expect("verifier accepts program");
-
+    // Scoped so the `&mut bpf` borrow held by `prog` ends before we
+    // read stats via shared `&bpf`. `link_id` is a plain value and
+    // stays live for the subsequent detach.
+    //
     // Generic XDP is enough — veth supports it across every kernel we
     // target, and we're testing logic not performance. Sticking to
     // SKB_MODE also keeps this test from being flaky on kernels where
     // native veth XDP has quirks.
-    let link_id = prog
-        .attach_to_if_index(ifindex_a, XdpFlags::SKB_MODE)
-        .expect("attach XDP generic");
+    let link_id = {
+        let prog: &mut Xdp = bpf
+            .program_mut("fast_path")
+            .expect("fast_path program present")
+            .try_into()
+            .expect("fast_path is XDP");
+        prog.load().expect("verifier accepts program");
+        prog.attach_to_if_index(ifindex_a, XdpFlags::SKB_MODE)
+            .expect("attach XDP generic")
+    };
 
     let cap_fd = open_packet_socket(ifindex_a);
     let inject_fd = open_packet_socket(ifindex_b);
@@ -508,8 +512,16 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
     // Detach before we poke more assertions so a test abort can't
     // leave the iface XDP-armed. Netns drop would clean up anyway
     // (deleting the netns detaches XDP programs on its ifaces), but
-    // it's good hygiene.
-    let _ = prog.detach(link_id);
+    // it's good hygiene. Re-borrow briefly so the subsequent stat
+    // reads can go back to shared `&bpf`.
+    {
+        let prog: &mut Xdp = bpf
+            .program_mut("fast_path")
+            .expect("fast_path program present")
+            .try_into()
+            .expect("fast_path is XDP");
+        let _ = prog.detach(link_id);
+    }
 
     // Counter assertions first — if these fail, the byte-equality
     // assertion is academic.
