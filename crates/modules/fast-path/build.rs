@@ -40,14 +40,51 @@ fn main() {
     }
     println!("cargo::rerun-if-env-changed=PACKETFRAME_SKIP_BPF_BUILD");
     println!("cargo::rerun-if-env-changed=PACKETFRAME_BPF_REQUIRED");
+    println!("cargo::rerun-if-env-changed=PACKETFRAME_BPF_OBJ_PATH");
 
     let bpf_required = std::env::var("PACKETFRAME_BPF_REQUIRED").is_ok();
     let bpf_skip = std::env::var("PACKETFRAME_SKIP_BPF_BUILD").is_ok();
+    let bpf_obj_override = std::env::var("PACKETFRAME_BPF_OBJ_PATH").ok();
 
     if bpf_required && bpf_skip {
         panic!(
             "PACKETFRAME_BPF_REQUIRED=1 and PACKETFRAME_SKIP_BPF_BUILD=1 are mutually exclusive"
         );
+    }
+
+    // Pre-built ELF override — used by release.yml to build BPF once on
+    // the host runner (where nightly + bpf-linker exist), upload as an
+    // artifact, and hand the path to every cross-build job. Cross
+    // containers lack rustup entirely, so nested cargo would fail and
+    // silently stub; this bypass makes shipped binaries carry the real
+    // ELF across all four targets.
+    if let Some(path) = bpf_obj_override {
+        let src = PathBuf::from(&path);
+        if !src.exists() {
+            panic!(
+                "PACKETFRAME_BPF_OBJ_PATH points at {} which does not exist",
+                src.display()
+            );
+        }
+        let bytes = std::fs::read(&src)
+            .unwrap_or_else(|e| panic!("read PACKETFRAME_BPF_OBJ_PATH at {}: {e}", src.display()));
+        if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+            panic!(
+                "PACKETFRAME_BPF_OBJ_PATH at {} does not start with ELF magic \
+                 (got {:02x?}); refusing to embed a broken object",
+                src.display(),
+                bytes.iter().take(4).collect::<Vec<_>>()
+            );
+        }
+        std::fs::copy(&src, &obj_out).expect("stage overridden BPF ELF into OUT_DIR");
+        println!("cargo::rustc-cfg=packetframe_bpf_built");
+        println!(
+            "cargo::warning=Using pre-built BPF ELF from PACKETFRAME_BPF_OBJ_PATH ({} bytes) at {}",
+            bytes.len(),
+            src.display()
+        );
+        println!("cargo::rustc-env=FAST_PATH_BPF_OBJ={}", obj_out.display());
+        return;
     }
 
     // Explicit opt-out for debugging/local work (or for cross-build CI
