@@ -22,7 +22,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::gen::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::RingBuf,
+    maps::{Array, RingBuf},
     programs::XdpContext,
 };
 use core::mem;
@@ -56,8 +56,46 @@ pub struct ProbeEvent {
 #[map]
 pub static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// Probe configuration, poked by userspace before attach. Single
+/// element. Value layout is `#[repr(C)]` + u16 + `[u8; 6]` padding
+/// reserved for future fields; keep the struct a multiple of 8 bytes
+/// so the `Array` map's per-CPU alignment rules hold on every target.
+///
+/// `offset` is the byte offset at which the BPF program samples the
+/// 16-byte head. Normally `0`, but some broken drivers point
+/// `xdp->data` into headroom instead of at the packet — the CLI
+/// surfaces `--offset N` so the operator can confirm where the packet
+/// really starts. `OTX2_HEAD_ROOM = 128` is the interesting value for
+/// rvu-nicpf on pre-upstream-v6.8 kernels; see SPEC.md §11.1(c).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ProbeCfg {
+    pub offset: u16,
+    pub _reserved: [u8; 6],
+}
+
+#[map]
+pub static CFG: Array<ProbeCfg> = Array::with_max_entries(1, 0);
+
+/// Upper cap on `offset`. Kept modest to keep the verifier's bounds
+/// analysis cheap and to avoid letting a bogus userspace value
+/// turn the probe into a distant-memory peek tool. 512 covers every
+/// real driver headroom I know of; bump if a pathological case shows
+/// up.
+const MAX_OFFSET: u16 = 512;
+
 #[xdp]
 pub fn probe(ctx: XdpContext) -> u32 {
+    // Read the userspace-supplied sample offset. Default 0 (sample at
+    // `data`). Clamp at `MAX_OFFSET` so a malformed userspace value
+    // can't turn this into an unbounded memory peek, and mask to u16
+    // so the verifier's bounds tracker stays tight.
+    let offset = CFG
+        .get(0)
+        .map(|c| c.offset)
+        .unwrap_or(0)
+        .min(MAX_OFFSET) as usize;
+
     // Reserve a slot before reading packet bytes — keeps the hot path
     // cheap when the ringbuf is full (no reads, no work). Rust's
     // `#[must_use]` on `RingBufEntry` enforces that we either submit
@@ -73,11 +111,12 @@ pub fn probe(ctx: XdpContext) -> u32 {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    // Verifier-friendly bounds check for the 16-byte head read. On
-    // frames shorter than 16 bytes the entry is discarded — those
-    // are invalid Ethernet anyway and not what the operator is
-    // trying to diagnose.
-    if start + mem::size_of::<[u8; 16]>() > end {
+    // Verifier-friendly bounds check for the 16-byte head read at
+    // `start + offset`. Short packets (or a too-large offset on a
+    // small frame) discard the sample rather than fault — the probe
+    // is diagnostic; frames that don't fit just aren't interesting
+    // evidence and we keep forwarding.
+    if start + offset + mem::size_of::<[u8; 16]>() > end {
         entry.discard(0);
         return xdp_action::XDP_PASS;
     }
@@ -93,10 +132,11 @@ pub fn probe(ctx: XdpContext) -> u32 {
         let e = entry.as_mut_ptr();
         (*e).ts_ns = ts;
         (*e).pkt_len = pkt_len;
-        // Bounds-checked 16-byte read from packet head. `read_unaligned`
-        // is safe here because XDP context pointers have no guaranteed
-        // alignment and the verifier tracks the read range.
-        let p = start as *const [u8; 16];
+        // Bounds-checked 16-byte read at `start + offset`. The
+        // verifier has the tight [start, end) range and a clamped
+        // `offset ≤ MAX_OFFSET`, so `start + offset` is a
+        // well-defined in-range pointer.
+        let p = (start + offset) as *const [u8; 16];
         (*e).head = core::ptr::read_unaligned(p);
     }
 

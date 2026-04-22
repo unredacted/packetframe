@@ -25,8 +25,8 @@ use crate::{EXIT_OK, EXIT_RUNTIME_ERROR, EXIT_STARTUP_ERROR};
 /// iface (hundreds to low thousands pps) doesn't fill the terminal.
 const MAX_TABLE_ROWS: usize = 64;
 
-pub fn run(iface: String, mode: AttachMode, duration: Duration) -> ExitCode {
-    match packetframe_probe::run(&iface, mode, duration) {
+pub fn run(iface: String, mode: AttachMode, duration: Duration, offset: u16) -> ExitCode {
+    match packetframe_probe::run(&iface, mode, duration, offset) {
         Ok(out) => {
             print_report(&iface, duration, &out);
             ExitCode::from(EXIT_OK)
@@ -43,6 +43,10 @@ pub fn run(iface: String, mode: AttachMode, duration: Duration) -> ExitCode {
             eprintln!("packetframe probe: {msg}");
             ExitCode::from(EXIT_STARTUP_ERROR)
         }
+        Err(e @ ProbeError::OffsetTooLarge { .. }) => {
+            eprintln!("packetframe probe: {e}");
+            ExitCode::from(EXIT_STARTUP_ERROR)
+        }
         Err(ProbeError::Other(msg)) => {
             eprintln!("packetframe probe: {msg}");
             ExitCode::from(EXIT_RUNTIME_ERROR)
@@ -52,8 +56,9 @@ pub fn run(iface: String, mode: AttachMode, duration: Duration) -> ExitCode {
 
 fn print_report(iface: &str, duration: Duration, out: &ProbeOutput) {
     println!(
-        "PacketFrame probe on {iface} (mode={} duration={:?})",
+        "PacketFrame probe on {iface} (mode={} offset={} duration={:?})",
         out.effective_mode.as_str(),
+        out.offset,
         duration
     );
     println!("{} samples collected", out.samples.len());

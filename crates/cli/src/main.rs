@@ -118,6 +118,14 @@ enum Command {
         /// standard way to confirm a driver-specific non-conformance.
         #[arg(long, default_value = "auto", value_parser = parse_mode)]
         mode: packetframe_probe::AttachMode,
+        /// Byte offset at which the BPF program samples each packet's
+        /// head. Default `0` (start of `xdp->data`). Non-zero values
+        /// are for diagnosing drivers that point `xdp->data` into
+        /// headroom instead of at the packet — e.g. `--offset 128`
+        /// on rvu-nicpf pre-Linux-v6.8 to see the real Ethernet
+        /// header. Capped at 512.
+        #[arg(long, default_value_t = 0)]
+        offset: u16,
     },
 }
 
@@ -201,7 +209,8 @@ fn main() -> ExitCode {
             iface,
             duration,
             mode,
-        } => probe::run(iface, mode, duration),
+            offset,
+        } => probe::run(iface, mode, duration, offset),
     }
 }
 
