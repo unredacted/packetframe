@@ -54,11 +54,17 @@ pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
 /// §11.1(c)). Keep in lockstep with the BPF side.
 pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 
-/// Kernel driver name that triggers the head-shift workaround — any
-/// rvu-nicpf iface attached in native mode on a pre-v6.8 kernel
-/// sees `xdp->data` 128 bytes before the real packet. Stored as a
-/// constant rather than a regex so the check is trivially greppable.
-const RVU_NICPF_DRIVER: &str = "rvu-nicpf";
+/// Kernel driver names that trigger the head-shift workaround.
+/// `/sys/class/net/<iface>/device/driver` is a symlink into
+/// `/sys/bus/pci/drivers/<module_name>` — for this driver the kernel
+/// module is `rvu_nicpf.ko`, so the sysfs leaf is `rvu_nicpf` (with
+/// an underscore). `ethtool -i` happens to print the pci_driver's
+/// `name` field as `rvu-nicpf` (with a hyphen) on the reference
+/// hardware, which had us matching the wrong spelling in v0.1.3 —
+/// confirmed empirically via `readlink /sys/class/net/ethN/device/driver`
+/// on 5.15.72-ui-cn9670. Accepting both spellings is cheap and keeps
+/// us correct even if a distro one day canonicalises differently.
+const RVU_NICPF_DRIVERS: &[&str] = &["rvu_nicpf", "rvu-nicpf"];
 
 /// Layout mirror of `VlanResolve` in `bpf/src/maps.rs`. Hash-map value
 /// that tells the BPF program "this subif ifindex really egresses on
@@ -451,10 +457,9 @@ fn apply_driver_quirks_cfg(state: &mut ActiveState, mcfg: &ModuleConfig<'_>) -> 
         ToggleAutoOnOff::On => true,
         ToggleAutoOnOff::Auto => state.links.iter().any(|l| {
             matches!(l.effective_mode, AttachMode::Native)
-                && matches!(
-                    read_iface_driver(&l.iface).as_deref(),
-                    Some(RVU_NICPF_DRIVER)
-                )
+                && read_iface_driver(&l.iface)
+                    .as_deref()
+                    .is_some_and(|d| RVU_NICPF_DRIVERS.contains(&d))
         }),
     };
 
