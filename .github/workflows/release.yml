@@ -49,7 +49,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             crates/modules/fast-path/bpf/target/
-          key: ${{ runner.os }}-release-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**') }}
+            crates/modules/probe/bpf/target/
+          key: ${{ runner.os }}-release-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/probe/bpf/**') }}
 
       - name: Install bpf-linker
         run: |
@@ -59,37 +60,45 @@ jobs:
               --version ${{ env.BPF_LINKER_VERSION }}
           fi
 
-      - name: Build BPF ELF
+      - name: Build BPF ELFs
         run: |
           set -eux
-          ( cd crates/modules/fast-path/bpf && cargo build --release --message-format=json ) \
-            | tee bpf-build.json >/dev/null
-          # Find the artifact path via cargo's JSON — matches what
-          # `build.rs` does normally, keeps URL drift out of this file.
-          ELF=$(python3 -c "
+          build_one() {
+            local bpf_dir="$1"
+            local bin_name="$2"
+            local out_name="$3"
+            ( cd "${bpf_dir}" && cargo build --release --message-format=json ) \
+              | tee "${out_name}.json" >/dev/null
+            local elf
+            elf=$(python3 -c "
           import json, sys
-          for line in open('bpf-build.json'):
+          for line in open('${out_name}.json'):
               try:
                   msg = json.loads(line)
               except Exception:
                   continue
-              if msg.get('reason') == 'compiler-artifact' and msg.get('target', {}).get('name') == 'fast-path':
+              if msg.get('reason') == 'compiler-artifact' and msg.get('target', {}).get('name') == '${bin_name}':
                   print(msg['filenames'][0])
                   sys.exit(0)
           sys.exit(1)
           ")
-          test -n "${ELF}" && test -e "${ELF}"
-          # Verify ELF magic so we fail-loud if the build regressed to a stub.
-          head -c 4 "${ELF}" | od -An -c | grep -q 'E   L   F' || \
-            (echo "BPF output is not an ELF at ${ELF}" >&2; exit 1)
+            test -n "${elf}" && test -e "${elf}"
+            # Verify ELF magic so we fail-loud if the build regressed to a stub.
+            head -c 4 "${elf}" | od -An -c | grep -q 'E   L   F' || \
+              (echo "BPF output is not an ELF at ${elf}" >&2; exit 1)
+            cp "${elf}" "dist/${out_name}"
+          }
           mkdir -p dist
-          cp "${ELF}" dist/fast-path.bpf.o
-          ls -la dist/fast-path.bpf.o
+          build_one crates/modules/fast-path/bpf fast-path fast-path.bpf.o
+          build_one crates/modules/probe/bpf     probe     probe.bpf.o
+          ls -la dist/*.bpf.o
 
       - uses: actions/upload-artifact@v7
         with:
           name: bpf-elf
-          path: dist/fast-path.bpf.o
+          path: |
+            dist/fast-path.bpf.o
+            dist/probe.bpf.o
           retention-days: 7
           if-no-files-found: error
 
@@ -135,18 +144,23 @@ jobs:
           name: bpf-elf
           path: prebuilt-bpf
 
-      - name: Prepare BPF ELF path for build.rs
+      - name: Prepare BPF ELF paths for build.rs
         run: |
           set -eux
-          ELF="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
-          test -e "${ELF}"
-          head -c 4 "${ELF}" | od -An -c | grep -q 'E   L   F'
+          FAST="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
+          PROBE="$(pwd)/prebuilt-bpf/probe.bpf.o"
+          test -e "${FAST}" && test -e "${PROBE}"
+          head -c 4 "${FAST}"  | od -An -c | grep -q 'E   L   F'
+          head -c 4 "${PROBE}" | od -An -c | grep -q 'E   L   F'
           # Cross runs inside Docker, so use the container's mounted
-          # project path (`/project`) for the env var. Cross mounts the
-          # workspace root there by default.
-          echo "PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o" >> "${GITHUB_ENV}"
-          # Also forward the env var into the container.
-          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o" >> "${GITHUB_ENV}"
+          # project path (`/project`) for the env vars. Cross mounts
+          # the workspace root there by default.
+          {
+            echo "PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o"
+            echo "PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o"
+          } >> "${GITHUB_ENV}"
+          # Forward both env vars into the container.
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o" >> "${GITHUB_ENV}"
 
       - name: Build release
         run: cross build --release --workspace --target ${{ matrix.target }}

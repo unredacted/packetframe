@@ -360,6 +360,7 @@ dependencies = [
  "libc",
  "packetframe-common",
  "packetframe-fast-path",
+ "packetframe-probe",
  "serde_json",
  "signal-hook",
  "thiserror 2.0.18",
@@ -390,6 +391,18 @@ dependencies = [
  "packetframe-common",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "packetframe-probe"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "aya",
+ "libc",
+ "packetframe-common",
  "thiserror 2.0.18",
  "tracing",
 ]
