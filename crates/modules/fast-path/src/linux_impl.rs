@@ -54,6 +54,15 @@ pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
 /// §11.1(c)). Keep in lockstep with the BPF side.
 pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 
+/// Minimum mainline Linux version that ships the rvu-nicpf XDP fix
+/// (commit 04f647c8e456). Kernels below this expose both the
+/// xdp.data_hard_start offset bug (workaroundable via head-shift) AND
+/// the `non_qos_queues` leak at XDP attach/detach (NOT workaroundable
+/// from userspace). On such kernels we refuse native-mode attach on
+/// rvu-nicpf ifaces unless the operator explicitly opts in via the
+/// `driver-workaround rvu-nicpf-head-shift on` override.
+const RVU_NICPF_FIXED_IN_KERNEL: (u32, u32) = (6, 8);
+
 /// Kernel driver names that trigger the head-shift workaround.
 /// `/sys/class/net/<iface>/device/driver` is a symlink into
 /// `/sys/bus/pci/drivers/<module_name>` — for this driver the kernel
@@ -303,6 +312,26 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         cfg.global.attach_settle_time,
     );
 
+    // Version-gate native-mode attach on rvu-nicpf kernels that lack
+    // the upstream fix (commit 04f647c8e456, Linux v6.8). That commit
+    // fixes two bugs in one patch: (1) the xdp.data_hard_start offset
+    // bug that v0.1.3 worked around via head-shift; (2) a
+    // `non_qos_queues` leak at `otx2_xdp_setup` that is *not* fixable
+    // from userspace — every native XDP attach leaks the count, and
+    // after enough attach/detach cycles the driver's queue sizing
+    // drifts and the page allocator's freelist gets a NULL write,
+    // producing the `get_page_from_freelist` NULL deref crash signature
+    // seen on edge1-mci1-net 2026-04-22 (SPEC §11.1(c)). This
+    // preprocessor runs *before* `try_attach_with_fallback` so we
+    // don't leak even once.
+    //
+    // `driver-workaround rvu-nicpf-head-shift = on` bypasses the
+    // check: operator takes responsibility. `= off` bypasses both
+    // the version check and the head-shift workaround, for operators
+    // who have backported the fix into a kernel whose uname still
+    // reports pre-v6.8.
+    let attach_dirs = rvu_nicpf_version_gate(attach_dirs, cfg)?;
+
     // Attach each interface with trial-attach per §2.3: Auto → try
     // native first, fall back to generic on error; explicit Native or
     // Generic uses the requested mode directly (no fallback). Each
@@ -511,6 +540,108 @@ fn apply_driver_quirks_cfg(state: &mut ActiveState, mcfg: &ModuleConfig<'_>) -> 
          kernel backport lands."
     );
     Ok(())
+}
+
+/// Read `/proc/sys/kernel/osrelease` (= `uname -r`) and parse the
+/// leading `major.minor`. Returns `None` if the file is unreadable
+/// or the format is unrecognizable — callers treat that as "can't
+/// prove the fix is present", i.e. the conservative path.
+fn kernel_version() -> Option<(u32, u32)> {
+    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    let prefix = osrelease.split('-').next().unwrap_or(osrelease.trim());
+    let mut parts = prefix.trim().split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Return true if the running kernel's `major.minor` is at least the
+/// requested threshold. `None` from [`kernel_version`] returns false
+/// (conservative: treat as missing the fix).
+fn kernel_at_least(min: (u32, u32)) -> bool {
+    kernel_version().map(|v| v >= min).unwrap_or(false)
+}
+
+/// Walk the attach directives and decide whether native-mode attach is
+/// safe on each rvu-nicpf iface. Downgrades `Auto` to `Generic` with a
+/// warning on affected kernels; hard-errors on explicit `Native`
+/// unless the operator's `driver-workaround rvu-nicpf-head-shift`
+/// toggle opts into the known-unsafe path. Runs *before* any
+/// hardware-level XDP attach so the driver's attach-time bugs don't
+/// even get one chance to trip.
+fn rvu_nicpf_version_gate(
+    attach_dirs: Vec<(String, AttachMode, u32)>,
+    mcfg: &ModuleConfig<'_>,
+) -> ModuleResult<Vec<(String, AttachMode, u32)>> {
+    let toggle = mcfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::DriverWorkaround(DriverWorkaround::RvuNicpfHeadShift(v)) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    // `Off` = operator asserts they've backported the fix (or are
+    // otherwise certain native is safe). Skip both the version check
+    // and the later head-shift application. `On` = operator takes
+    // responsibility for the known-unsafe path and opts into both the
+    // head-shift workaround and skipping the version refusal.
+    if matches!(toggle, ToggleAutoOnOff::Off | ToggleAutoOnOff::On) {
+        return Ok(attach_dirs);
+    }
+
+    // `Auto` (default): check kernel version and refuse or downgrade.
+    let kernel_ok = kernel_at_least(RVU_NICPF_FIXED_IN_KERNEL);
+    if kernel_ok {
+        // v6.8+; the fix is present; native attach is safe.
+        return Ok(attach_dirs);
+    }
+
+    let mut out = Vec::with_capacity(attach_dirs.len());
+    for (iface, mode, ifindex) in attach_dirs {
+        let is_rvu = read_iface_driver(&iface)
+            .as_deref()
+            .is_some_and(|d| RVU_NICPF_DRIVERS.contains(&d));
+        let wants_native = matches!(mode, AttachMode::Native | AttachMode::Auto);
+        if !is_rvu || !wants_native {
+            out.push((iface, mode, ifindex));
+            continue;
+        }
+        match mode {
+            AttachMode::Native => {
+                return Err(ModuleError::other(
+                    MODULE_NAME,
+                    format!(
+                        "refusing native XDP attach on rvu-nicpf iface `{iface}`: kernel \
+                         {} lacks upstream fix (commit 04f647c8e456, Linux v6.8+) for two \
+                         rvu-nicpf bugs that together make native XDP unsafe on this driver \
+                         (SPEC §11.1(c)). Either (a) backport 04f647c8e456 into this \
+                         kernel, (b) switch `{iface}` to `attach … generic` (no attach-time \
+                         queue leak; slightly lower throughput), or (c) override with \
+                         `driver-workaround rvu-nicpf-head-shift on` to accept the known \
+                         crash risk",
+                        kernel_version()
+                            .map(|(a, b)| format!("{a}.{b}"))
+                            .unwrap_or_else(|| "<unknown>".into())
+                    ),
+                ));
+            }
+            AttachMode::Auto => {
+                warn!(
+                    iface = %iface,
+                    kernel = ?kernel_version(),
+                    "rvu-nicpf on pre-v6.8 kernel: downgrading `auto` to `generic` \
+                     (SPEC §11.1(c)). Upstream fix is commit 04f647c8e456; set \
+                     `driver-workaround rvu-nicpf-head-shift on` to force native anyway."
+                );
+                out.push((iface, AttachMode::Generic, ifindex));
+            }
+            AttachMode::Generic => unreachable!("filtered by wants_native check above"),
+        }
+    }
+    Ok(out)
 }
 
 /// Read the kernel driver name backing a netdev via

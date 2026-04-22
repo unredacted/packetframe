@@ -29,6 +29,21 @@ pub(crate) const EXIT_OK: u8 = 0;
 pub(crate) const EXIT_STARTUP_ERROR: u8 = 1;
 pub(crate) const EXIT_RUNTIME_ERROR: u8 = 2;
 
+/// Default config path used when the caller omits `--config`. Matches
+/// the systemd-unit install location in the deployment playbook so
+/// `packetframe run` alone works without flags on a standard deploy.
+pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/packetframe/packetframe.conf";
+
+/// Resolve a caller-supplied `Option<PathBuf>` against the default.
+/// Returns the caller's value if `Some`; otherwise returns the default
+/// path unchanged. We deliberately don't stat the path here — the
+/// config parser emits a clear "I/O error reading {path}" if the
+/// default file is missing, which is a more actionable error than a
+/// generic "provide --config".
+pub(crate) fn config_path_or_default(caller: Option<PathBuf>) -> PathBuf {
+    caller.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+}
+
 #[derive(Parser)]
 #[command(
     name = "packetframe",
@@ -58,8 +73,10 @@ enum Command {
 
     /// Run PacketFrame in the foreground: load + attach + block on signal.
     Run {
+        /// Path to the config file. Defaults to
+        /// `/etc/packetframe/packetframe.conf`.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
 
     /// Detach attached programs by removing every pin under the
@@ -67,6 +84,8 @@ enum Command {
     /// kernel-side XDP detach (SPEC.md §8.5); removing map + program
     /// pins is housekeeping.
     Detach {
+        /// Path to the config file. Defaults to
+        /// `/etc/packetframe/packetframe.conf`.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Tear down every PacketFrame pin across every module, not
@@ -78,14 +97,18 @@ enum Command {
 
     /// Show attach state and live counter values.
     Status {
+        /// Path to the config file. Defaults to
+        /// `/etc/packetframe/packetframe.conf`.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
 
     /// Re-read config and reconcile. Stubbed until PR #6.
     Reconfigure {
+        /// Path to the config file. Defaults to
+        /// `/etc/packetframe/packetframe.conf`.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
 
     /// Direct BPF map ops for debugging. Lands in PR #6 alongside
@@ -177,31 +200,50 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Feasibility { config, human } => run_feasibility(config, human),
-        Command::Run { config } => match loader::run(&config) {
-            Ok(()) => ExitCode::from(EXIT_OK),
-            Err(loader::RunError::Startup(msg)) => {
-                tracing::error!(error = %msg, "startup failed");
-                ExitCode::from(EXIT_STARTUP_ERROR)
+        Command::Run { config } => {
+            let path = config_path_or_default(config);
+            match loader::run(&path) {
+                Ok(()) => ExitCode::from(EXIT_OK),
+                Err(loader::RunError::Startup(msg)) => {
+                    tracing::error!(error = %msg, "startup failed");
+                    ExitCode::from(EXIT_STARTUP_ERROR)
+                }
+                Err(loader::RunError::Runtime(msg)) => {
+                    tracing::error!(error = %msg, "runtime error");
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
             }
-            Err(loader::RunError::Runtime(msg)) => {
-                tracing::error!(error = %msg, "runtime error");
-                ExitCode::from(EXIT_RUNTIME_ERROR)
+        }
+        Command::Detach { config, all } => {
+            // `detach --all` with no config is still meaningful (rip
+            // every pin we can find). Only default the path for the
+            // scoped case where `config` is expected to name the
+            // module whose pins to tear down.
+            let path = config.or_else(|| {
+                if all {
+                    None
+                } else {
+                    Some(PathBuf::from(DEFAULT_CONFIG_PATH))
+                }
+            });
+            match loader::detach(path.as_deref(), all) {
+                Ok(()) => ExitCode::from(EXIT_OK),
+                Err(e) => {
+                    tracing::error!(error = %e);
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
             }
-        },
-        Command::Detach { config, all } => match loader::detach(config.as_deref(), all) {
-            Ok(()) => ExitCode::from(EXIT_OK),
-            Err(e) => {
-                tracing::error!(error = %e);
-                ExitCode::from(EXIT_RUNTIME_ERROR)
+        }
+        Command::Status { config } => {
+            let path = config_path_or_default(config);
+            match loader::status(&path) {
+                Ok(()) => ExitCode::from(EXIT_OK),
+                Err(e) => {
+                    tracing::error!(error = %e);
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
             }
-        },
-        Command::Status { config } => match loader::status(&config) {
-            Ok(()) => ExitCode::from(EXIT_OK),
-            Err(e) => {
-                tracing::error!(error = %e);
-                ExitCode::from(EXIT_RUNTIME_ERROR)
-            }
-        },
+        }
         Command::Reconfigure { .. } => not_implemented("reconfigure"),
         Command::Map { .. } => not_implemented("map"),
         #[cfg(feature = "probe")]
