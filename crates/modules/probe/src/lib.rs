@@ -16,12 +16,30 @@ pub const MODULE_NAME: &str = "probe";
 /// The compiled probe BPF ELF, staged by `build.rs` and embedded at
 /// crate-compile time. Empty (zero bytes) when the BPF toolchain
 /// isn't available — see [`PROBE_BPF_AVAILABLE`].
+///
+/// Note: `include_bytes!` returns a 1-byte-aligned slice. Passing it
+/// directly to `aya::Ebpf::load` fails with "Invalid ELF header size
+/// or alignment" on every non-8-byte-aligned placement — which is
+/// wherever the linker happens to drop a `.rodata` blob of the
+/// current size. v0.1.1's probe ELF grew from 1432 → 1608 bytes (CFG
+/// map added) and its in-binary address flipped from aligned to
+/// unaligned, which is how that release shipped broken. Callers must
+/// copy to an aligned buffer — use [`aligned_bpf_copy`].
 pub const PROBE_BPF: &[u8] = include_bytes!(env!("PROBE_BPF_OBJ"));
 
 /// `true` when `build.rs` produced a real probe BPF ELF; `false` when
 /// the build fell back to the stub. Const-evaluable for use in test
 /// early-returns and `#[cfg]`-like branches.
 pub const PROBE_BPF_AVAILABLE: bool = !PROBE_BPF.is_empty();
+
+/// Allocate an aligned `Vec<u8>` containing a copy of [`PROBE_BPF`].
+/// The system allocator aligns to at least 8 bytes on 64-bit
+/// platforms, which is enough for `object`'s ELF parser to read the
+/// header without tripping the alignment check (`parse_header` does
+/// `u64` reads at offset 0x20, so 1..7-byte offsets trap).
+pub fn aligned_bpf_copy() -> Vec<u8> {
+    PROBE_BPF.to_vec()
+}
 
 /// One packet sample. `#[repr(C)]` and layout-identical to the BPF
 /// program's `ProbeEvent` struct — the ringbuf delivers these bytes
@@ -184,8 +202,16 @@ mod linux_impl {
 
         let ifindex = if_nametoindex(iface)?;
 
-        let mut bpf = Ebpf::load(PROBE_BPF).map_err(|e| {
-            ProbeError::Other(format!("load probe BPF ELF via aya::Ebpf::load: {e}"))
+        // Heap-copy PROBE_BPF into an aligned `Vec<u8>` — passing the
+        // raw `include_bytes!` static to `Ebpf::load` fails on
+        // unaligned placements (v0.1.1 regression). The alignment
+        // pattern mirrors `packetframe-fast-path::aligned_bpf_copy`.
+        let bytes = aligned_bpf_copy();
+        let mut bpf = Ebpf::load(&bytes).map_err(|e| {
+            ProbeError::Other(format!(
+                "load probe BPF ELF via aya::Ebpf::load: {}",
+                fmt_error_chain(&e)
+            ))
         })?;
 
         // Populate CFG before attach so the very first packet sees the
@@ -381,5 +407,22 @@ mod linux_impl {
             )));
         }
         Ok(idx)
+    }
+
+    /// Render an error's full source chain into one string. aya's
+    /// `EbpfError::ParseError` display drops the inner `object`
+    /// error — so a bare `{e}` emits only `"error parsing ELF data"`
+    /// with no indication whether the cause is alignment, a truncated
+    /// header, a malformed section, etc. Walking `Error::source()`
+    /// picks up what the outer formatter skipped.
+    fn fmt_error_chain(e: &dyn std::error::Error) -> String {
+        let mut out = e.to_string();
+        let mut src = e.source();
+        while let Some(s) = src {
+            out.push_str(" → ");
+            out.push_str(&s.to_string());
+            src = s.source();
+        }
+        out
     }
 }
