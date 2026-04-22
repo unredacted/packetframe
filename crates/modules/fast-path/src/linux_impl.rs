@@ -18,7 +18,9 @@ use aya::{
     Ebpf,
 };
 use packetframe_common::{
-    config::{AttachMode, Ipv4Prefix, Ipv6Prefix, ModuleDirective},
+    config::{
+        AttachMode, DriverWorkaround, Ipv4Prefix, Ipv6Prefix, ModuleDirective, ToggleAutoOnOff,
+    },
     module::{Attachment, HookType, LoaderCtx, ModuleConfig, ModuleError, ModuleResult},
 };
 use tracing::{info, warn};
@@ -46,6 +48,17 @@ pub struct FpCfg {
 unsafe impl aya::Pod for FpCfg {}
 
 pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
+
+/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_HEAD_SHIFT_128`. Enables
+/// the pre-Linux-v6.8 rvu-nicpf `xdp_prepare_buff` workaround (SPEC
+/// §11.1(c)). Keep in lockstep with the BPF side.
+pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
+
+/// Kernel driver name that triggers the head-shift workaround — any
+/// rvu-nicpf iface attached in native mode on a pre-v6.8 kernel
+/// sees `xdp->data` 128 bytes before the real packet. Stored as a
+/// constant rather than a regex so the check is trivially greppable.
+const RVU_NICPF_DRIVER: &str = "rvu-nicpf";
 
 /// Layout mirror of `VlanResolve` in `bpf/src/maps.rs`. Hash-map value
 /// that tells the BPF program "this subif ifindex really egresses on
@@ -328,6 +341,14 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         );
     }
 
+    // Detect buggy-kernel rvu-nicpf native XDP delivery and flip the
+    // head-shift bit in FpCfg so the BPF program applies the
+    // `bpf_xdp_adjust_head(+128)` + `bpf_xdp_adjust_tail(+128)`
+    // workaround (SPEC §11.1(c)). Runs *after* attach so we have the
+    // effective mode (auto-native-fallback-to-generic resolved) and
+    // can scope the flag only to actually-native attaches.
+    apply_driver_quirks_cfg(state, cfg)?;
+
     // Populate redirect_devmap with every attach-scope ifindex so the
     // defensive devmap pre-check in the BPF program (§4.4 step 9d)
     // recognizes them as valid redirect targets. The value ifindex
@@ -397,6 +418,109 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
 /// Pin the fast-path program and every §4.5 map under the module's
 /// bpffs pin root. Called at the end of `attach` so partial failure
 /// in link attach doesn't leak pins.
+/// Inspect each attached link's driver + effective mode and set the
+/// `FP_CFG_FLAG_HEAD_SHIFT_128` bit in `FpCfg.flags` when any link
+/// hits the rvu-nicpf native-mode delivery bug (SPEC §11.1(c),
+/// upstream-fixed in Linux v6.8 commit `04f647c8e456` but absent
+/// from many downstream kernels). Safe and idempotent on fixed
+/// kernels — set `off` via config override once the operator
+/// confirms the backport (future PR; for v0.1.3 the detection is
+/// purely driver-name-based).
+///
+/// Called *after* the attach loop so `effective_mode` reflects any
+/// auto-fallback (`Auto` → `Generic` on drivers that refuse native).
+/// Generic-mode rvu-nicpf does **not** need the workaround because
+/// the kernel normalises the frame into an skb before running XDP;
+/// applying the shift there would corrupt packet data.
+fn apply_driver_quirks_cfg(state: &mut ActiveState, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    // Resolve the operator's override for the head-shift workaround.
+    // Default `Auto` matches v0.1.3 behaviour: detect by driver name,
+    // apply on native-mode rvu-nicpf attaches.
+    let toggle = mcfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::DriverWorkaround(DriverWorkaround::RvuNicpfHeadShift(v)) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let apply = match toggle {
+        ToggleAutoOnOff::Off => false,
+        ToggleAutoOnOff::On => true,
+        ToggleAutoOnOff::Auto => state.links.iter().any(|l| {
+            matches!(l.effective_mode, AttachMode::Native)
+                && matches!(
+                    read_iface_driver(&l.iface).as_deref(),
+                    Some(RVU_NICPF_DRIVER)
+                )
+        }),
+    };
+
+    if !apply {
+        if matches!(toggle, ToggleAutoOnOff::Off) {
+            info!(
+                "rvu-nicpf head-shift workaround disabled by config (`driver-workaround \
+                 rvu-nicpf-head-shift off`) — assuming Linux v6.8+ or backported fix"
+            );
+        }
+        return Ok(());
+    }
+
+    // Read current FpCfg, OR in the flag, write back. We only set —
+    // never clear — so we don't clobber the IPv4/IPv6 enable bits
+    // that `populate_cfg` wrote at load time.
+    let map = state
+        .ebpf
+        .map_mut("CFG")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "CFG map missing from ELF"))?;
+    let mut arr: Array<_, FpCfg> = Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG Array::try_from: {e}")))?;
+    let mut current: FpCfg = arr
+        .get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
+    current.flags |= FP_CFG_FLAG_HEAD_SHIFT_128;
+    arr.set(0, current, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))?;
+
+    let reason = match toggle {
+        ToggleAutoOnOff::On => "forced on by config",
+        ToggleAutoOnOff::Auto => "auto-detected rvu-nicpf on a native-mode attach",
+        ToggleAutoOnOff::Off => unreachable!("filtered above"),
+    };
+    let affected: Vec<&str> = state
+        .links
+        .iter()
+        .filter(|l| matches!(l.effective_mode, AttachMode::Native))
+        .map(|l| l.iface.as_str())
+        .collect();
+    warn!(
+        reason,
+        ifaces = ?affected,
+        upstream_fix_commit = "04f647c8e456",
+        fixed_in_kernel = "v6.8",
+        "enabling pre-v6.8 rvu-nicpf head-shift workaround (SPEC §11.1(c)) — fast-path will \
+         bpf_xdp_adjust_head(+128) + bpf_xdp_adjust_tail(+128) on every packet to expose the \
+         real frame. Set `driver-workaround rvu-nicpf-head-shift off` in the config once the \
+         kernel backport lands."
+    );
+    Ok(())
+}
+
+/// Read the kernel driver name backing a netdev via
+/// `/sys/class/net/<iface>/device/driver` (a symlink into
+/// `/sys/bus/*/drivers/<driver>`). Returns `None` for netdevs that
+/// have no underlying device (veth pairs, bridges, loopback) or when
+/// the file isn't present. Doesn't try ethtool — sysfs is
+/// netns-aware when mounted per-netns and avoids another
+/// capability-gated syscall just for a name.
+fn read_iface_driver(iface: &str) -> Option<String> {
+    let path = format!("/sys/class/net/{iface}/device/driver");
+    let target = std::fs::read_link(&path).ok()?;
+    target.file_name().map(|s| s.to_string_lossy().into_owned())
+}
+
 fn pin_program_and_maps(state: &mut ActiveState) -> ModuleResult<()> {
     let prog_path = pin::program_path(&state.bpffs_root);
     {
