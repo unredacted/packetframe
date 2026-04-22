@@ -22,7 +22,7 @@ use aya::{
     programs::{xdp::XdpFlags, Xdp},
     Ebpf,
 };
-use packetframe_probe::{PROBE_BPF, PROBE_BPF_AVAILABLE};
+use packetframe_probe::{aligned_bpf_copy, PROBE_BPF_AVAILABLE};
 
 const PEER_A: &str = "pf-probe-a";
 const PEER_B: &str = "pf-probe-b";
@@ -68,7 +68,11 @@ fn load_attach_detach_roundtrip_on_veth() {
         idx
     };
 
-    let mut bpf = Ebpf::load(PROBE_BPF).expect("aya::Ebpf::load probe");
+    // Use the aligned copy, same as production — passing the raw
+    // `PROBE_BPF` static trips aya's ELF header alignment check on
+    // unlucky placements (see v0.1.1 regression).
+    let bytes = aligned_bpf_copy();
+    let mut bpf = Ebpf::load(&bytes).expect("aya::Ebpf::load probe");
 
     // EVENTS map must be present and typed as a ring buffer. This
     // catches the common mis-declaration where a map ends up in the
