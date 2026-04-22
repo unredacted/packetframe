@@ -636,6 +636,7 @@ fn delta_labels(before: &[u64], after: &[u64]) -> Vec<(&'static str, u64)> {
         "err_vlan",
         "pass_not_in_devmap",
         "pass_complex_header",
+        "err_head_shift",
     ];
     before
         .iter()

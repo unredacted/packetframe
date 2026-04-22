@@ -97,13 +97,13 @@ impl FastPathModule {
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
         match &self.state {
             Some(s) => linux_impl::snapshot_stats(s),
-            None => Ok(vec![0u64; 19]),
+            None => Ok(vec![0u64; 20]),
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
-        Ok(vec![0u64; 19])
+        Ok(vec![0u64; 20])
     }
 }
 

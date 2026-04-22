@@ -44,7 +44,7 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V1: u32 = 0;
-pub const STATS_COUNT: u32 = 19;
+pub const STATS_COUNT: u32 = 20;
 
 /// Wire-format counter indices (SPEC.md §4.6). Append-only once v0.1
 /// ships; never renumber.
@@ -70,6 +70,7 @@ pub enum StatIdx {
     ErrVlan = 16,
     PassNotInDevmap = 17,
     PassComplexHeader = 18,
+    ErrHeadShift = 19,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a

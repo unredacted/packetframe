@@ -148,6 +148,46 @@ pub enum ModuleDirective {
     AllowPrefix6(Ipv6Prefix),
     DryRun(bool),
     CircuitBreaker(CircuitBreakerSpec),
+    /// Operator override for a driver-specific workaround. Currently
+    /// the only defined knob is `rvu-nicpf-head-shift` (SPEC
+    /// §11.1(c)) — see [`DriverWorkaround`] for the axes.
+    DriverWorkaround(DriverWorkaround),
+}
+
+/// One line of `driver-workaround <name> <value>` config.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum DriverWorkaround {
+    /// Controls whether the fast-path BPF program applies the
+    /// pre-Linux-v6.8 `bpf_xdp_adjust_head(+128)` /
+    /// `bpf_xdp_adjust_tail(+128)` shim (SPEC §11.1(c)). `Auto`
+    /// detects the `rvu-nicpf` driver via `/sys/class/net/*/device/driver`
+    /// and applies only on native-mode attaches; `On` forces it on
+    /// (useful for non-rvu drivers that exhibit the same pattern);
+    /// `Off` disables it entirely (correct once the kernel ships the
+    /// upstream commit 04f647c8e456 fix).
+    RvuNicpfHeadShift(ToggleAutoOnOff),
+}
+
+/// Tri-state on/off/auto toggle used by driver workarounds.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToggleAutoOnOff {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl FromStr for ToggleAutoOnOff {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            other => Err(format!("expected `auto`, `on`, or `off`, got `{other}`")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -546,9 +586,46 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::DryRun(on))
         }
         "circuit-breaker" => parse_circuit_breaker(line, rest),
+        "driver-workaround" => parse_driver_workaround(line, rest),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
+        )),
+    }
+}
+
+fn parse_driver_workaround<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    let name = rest.next().ok_or_else(|| {
+        ConfigError::parse(
+            line,
+            "driver-workaround requires a name + value (e.g. `rvu-nicpf-head-shift auto`)",
+        )
+    })?;
+    let value_tok = rest.next().ok_or_else(|| {
+        ConfigError::parse(
+            line,
+            format!("driver-workaround `{name}` requires a value (`auto`, `on`, or `off`)"),
+        )
+    })?;
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(
+            line,
+            "driver-workaround takes exactly two arguments: <name> <value>",
+        ));
+    }
+    let value: ToggleAutoOnOff = value_tok.parse().map_err(|e: String| {
+        ConfigError::parse(line, format!("driver-workaround `{name}`: {e}"))
+    })?;
+    match name {
+        "rvu-nicpf-head-shift" => Ok(ModuleDirective::DriverWorkaround(
+            DriverWorkaround::RvuNicpfHeadShift(value),
+        )),
+        other => Err(ConfigError::parse(
+            line,
+            format!("unknown driver-workaround `{other}` (known: `rvu-nicpf-head-shift`)"),
         )),
     }
 }

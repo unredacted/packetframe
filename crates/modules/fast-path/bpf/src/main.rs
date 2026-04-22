@@ -17,7 +17,9 @@ use aya_ebpf::{
         BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LKUP_RET_PROHIBIT, BPF_FIB_LKUP_RET_SUCCESS,
         BPF_FIB_LKUP_RET_UNREACHABLE,
     },
-    helpers::gen::{bpf_fib_lookup as fib_lookup_helper, bpf_xdp_adjust_head},
+    helpers::gen::{
+        bpf_fib_lookup as fib_lookup_helper, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
+    },
     macros::xdp,
     maps::lpm_trie::Key,
     programs::XdpContext,
@@ -30,7 +32,10 @@ use network_types::{
 
 mod maps;
 
-use maps::{bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, CFG, REDIRECT_DEVMAP, VLAN_RESOLVE};
+use maps::{
+    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, CFG, FP_CFG_FLAG_HEAD_SHIFT_128, REDIRECT_DEVMAP,
+    VLAN_RESOLVE,
+};
 
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
@@ -61,6 +66,40 @@ const VLAN_HDR_LEN: usize = 4;
 #[xdp]
 pub fn fast_path(ctx: XdpContext) -> u32 {
     bump_stat(StatIdx::RxTotal);
+
+    // Pre-parse workaround for the pre-Linux-v6.8 rvu-nicpf XDP path
+    // bug (SPEC §11.1(c)). The driver passes
+    // `xdp_prepare_buff(&xdp, hard_start, data - hard_start, seg_size, false)`
+    // with `data` pointing at `buffer_start`, 128 bytes before the
+    // actual packet — so `xdp->data` is headroom and `xdp->data_end`
+    // is `seg_size` bytes past `buffer_start`, which cuts off the
+    // last 128 bytes of the frame. Rebalance both pointers: skip 128
+    // bytes of leading headroom and extend the tail 128 bytes to
+    // expose the full frame. Upstream commit `04f647c8e456` (Linux
+    // v6.8) fixes this; the workaround is a no-op there because the
+    // operator leaves the flag clear.
+    //
+    // Scoped behind a CFG flag so correct drivers pay zero runtime
+    // cost. Userspace sets the flag per attach iface's driver
+    // (§11.12 compat matrix).
+    if unsafe { cfg_has_flag(FP_CFG_FLAG_HEAD_SHIFT_128) } {
+        let rc = unsafe { bpf_xdp_adjust_head(ctx.ctx as *mut _, 128) };
+        if rc != 0 {
+            bump_stat(StatIdx::ErrHeadShift);
+            return xdp_action::XDP_PASS;
+        }
+        // `adjust_tail(+128)` can fail if the current frame is close
+        // to `xdp->frame_sz` — unlikely on rvu-nicpf (rbsize is 2048+)
+        // for MTU-sized traffic. `XDP_PASS` on failure preserves the
+        // invariant that the kernel never sees a frame the fast path
+        // has half-mutated (SPEC §11.13).
+        let rc = unsafe { bpf_xdp_adjust_tail(ctx.ctx as *mut _, 128) };
+        if rc != 0 {
+            bump_stat(StatIdx::ErrHeadShift);
+            return xdp_action::XDP_PASS;
+        }
+    }
+
     match try_fast_path(&ctx) {
         Ok(action) => action,
         Err(()) => {
@@ -68,6 +107,14 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
             xdp_action::XDP_PASS
         }
     }
+}
+
+/// Read the `FpCfg.flags` byte via the CFG array map and check
+/// whether `bit` is set. Returns `false` if the map is somehow empty
+/// (shouldn't happen — userspace always populates it before attach).
+#[inline(always)]
+unsafe fn cfg_has_flag(bit: u8) -> bool {
+    CFG.get(0).map(|c| c.flags & bit != 0).unwrap_or(false)
 }
 
 /// Returns Err(()) on bounds-check failure (always counted as

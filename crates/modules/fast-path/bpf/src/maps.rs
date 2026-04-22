@@ -68,11 +68,28 @@ pub enum StatIdx {
     ErrVlan = 16,
     PassNotInDevmap = 17,
     PassComplexHeader = 18,
+    /// `bpf_xdp_adjust_head` or `bpf_xdp_adjust_tail` failed while
+    /// applying the `FP_CFG_FLAG_HEAD_SHIFT_128` workaround (SPEC
+    /// §11.1(c)). Typically means the ingress frame is smaller than
+    /// the 128-byte shift — e.g. a 64-byte TCP ACK on a buggy-kernel
+    /// rvu-nicpf iface, which the workaround can't expose in full
+    /// because the driver's `data_end` is 128 bytes short. The packet
+    /// returns `XDP_PASS` unmodified; the counter tells operators how
+    /// many frames the fast path couldn't touch because of this.
+    ErrHeadShift = 19,
 }
 
 /// Total counter count. Used as `stats` map `max_entries`. New counters
 /// bump this; dashboards keying on indices keep working.
-pub const STATS_COUNT: u32 = 19;
+pub const STATS_COUNT: u32 = 20;
+
+/// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
+/// mask (historical, load-bearing for dashboards). Bit 2 is the
+/// rvu-nicpf head-shift workaround (SPEC §11.1(c)). Higher bits
+/// reserved for future per-iface or per-driver quirks.
+pub const FP_CFG_FLAG_IPV4: u8 = 0b0000_0001;
+pub const FP_CFG_FLAG_IPV6: u8 = 0b0000_0010;
+pub const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 
 /// Max prefixes per allowlist trie. Sized generously: SPEC.md §4.5
 /// scales to /24-range tries comfortably. `1024` entries covers the
