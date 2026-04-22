@@ -50,11 +50,17 @@ pub fn run(
     _iface: &str,
     _mode: AttachMode,
     _duration: std::time::Duration,
+    _offset: u16,
 ) -> Result<ProbeOutput, ProbeError> {
     Err(ProbeError::Unsupported(
         "packetframe probe is only supported on Linux".into(),
     ))
 }
+
+/// Matches the BPF-side `MAX_OFFSET`. Userspace rejects values above
+/// this with [`ProbeError::OffsetTooLarge`] so the operator gets a
+/// clear error rather than a silent clamp inside the BPF program.
+pub const MAX_OFFSET: u16 = 512;
 
 /// Attach mode the operator requested. Wire-compatible with the
 /// fast-path module's SPEC.md §2.3 semantics: `Native` is driver XDP,
@@ -87,6 +93,11 @@ pub struct ProbeOutput {
     pub effective_mode: AttachMode,
     /// Samples collected during the probe window. Ordered by arrival.
     pub samples: Vec<ProbeEvent>,
+    /// Offset (bytes) at which the BPF program sampled each packet's
+    /// head. Echoed back so the CLI can label the output — e.g. an
+    /// rvu-nicpf pre-v6.8 trace at `offset=128` shows the real frame
+    /// while `offset=0` shows the headroom zeros.
+    pub offset: u16,
     /// Whether the ringbuf went empty before the duration elapsed
     /// (false = probe exited on timer) vs. we kept seeing packets
     /// right up to the end (true). Useful for the CLI to hint at
@@ -104,6 +115,8 @@ pub enum ProbeError {
     NoBpf,
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("--offset {got} exceeds the BPF-side cap of {max}; the program clamps reads to stay verifier-friendly and avoid distant-memory peeks")]
+    OffsetTooLarge { got: u16, max: u16 },
     #[error("{0}")]
     Other(String),
 }
@@ -125,9 +138,31 @@ mod linux_impl {
         Ebpf,
     };
 
+    /// Layout mirror of `ProbeCfg` in `bpf/src/main.rs`. Bytes-for-
+    /// bytes equal — if you change one, change the other. `u16` +
+    /// `[u8; 6]` packs to 8 bytes; `repr(C)` with all-bit-patterns-
+    /// valid primitives makes `aya::Pod` safe to impl.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    struct ProbeCfg {
+        offset: u16,
+        _reserved: [u8; 6],
+    }
+
+    // SAFETY: repr(C) + primitive fields + no padding → every bit
+    // pattern is valid.
+    unsafe impl aya::Pod for ProbeCfg {}
+
     /// Load the probe BPF ELF, attach it to `iface` in the requested
     /// mode, drain the ringbuf for `duration`, then detach. Returns
     /// samples in arrival order.
+    ///
+    /// `offset` selects the byte offset at which the BPF program
+    /// samples each packet's head — normally `0` (real frame start).
+    /// Non-zero values are for diagnosing drivers that point
+    /// `xdp->data` into headroom (e.g. `128` on rvu-nicpf pre-v6.8,
+    /// see SPEC.md §11.1(c)). Clamped to [`MAX_OFFSET`] — past that,
+    /// the function rejects rather than silently truncate.
     ///
     /// Uses a short (~50ms) poll interval on the ringbuf fd so
     /// ctrl-c / duration expiry is responsive even under load.
@@ -135,9 +170,16 @@ mod linux_impl {
         iface: &str,
         mode: AttachMode,
         duration: Duration,
+        offset: u16,
     ) -> Result<ProbeOutput, ProbeError> {
         if !PROBE_BPF_AVAILABLE {
             return Err(ProbeError::NoBpf);
+        }
+        if offset > MAX_OFFSET {
+            return Err(ProbeError::OffsetTooLarge {
+                got: offset,
+                max: MAX_OFFSET,
+            });
         }
 
         let ifindex = if_nametoindex(iface)?;
@@ -145,6 +187,26 @@ mod linux_impl {
         let mut bpf = Ebpf::load(PROBE_BPF).map_err(|e| {
             ProbeError::Other(format!("load probe BPF ELF via aya::Ebpf::load: {e}"))
         })?;
+
+        // Populate CFG before attach so the very first packet sees the
+        // operator-requested offset, not the default 0.
+        {
+            use aya::maps::Array;
+            let map = bpf
+                .map_mut("CFG")
+                .ok_or_else(|| ProbeError::Other("CFG map missing from probe ELF".into()))?;
+            let mut arr: Array<_, ProbeCfg> = Array::try_from(map)
+                .map_err(|e| ProbeError::Other(format!("Array::try_from CFG: {e}")))?;
+            arr.set(
+                0,
+                ProbeCfg {
+                    offset,
+                    _reserved: [0; 6],
+                },
+                0,
+            )
+            .map_err(|e| ProbeError::Other(format!("CFG set: {e}")))?;
+        }
 
         // Attach in the requested mode, with the same "auto" semantics
         // that the fast-path module uses — try native, fall back to
@@ -228,6 +290,7 @@ mod linux_impl {
         Ok(ProbeOutput {
             effective_mode,
             samples,
+            offset,
             saw_traffic,
             dropped_samples: 0,
         })
