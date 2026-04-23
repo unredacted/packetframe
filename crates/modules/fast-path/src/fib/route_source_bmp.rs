@@ -145,7 +145,7 @@ impl BmpStation {
             let msg_len =
                 u32::from_be_bytes([header_buf[1], header_buf[2], header_buf[3], header_buf[4]])
                     as usize;
-            if msg_len < 6 || msg_len > MAX_BMP_MSG_SIZE {
+            if !(6..=MAX_BMP_MSG_SIZE).contains(&msg_len) {
                 return Err(RouteSourceError::recoverable(format!(
                     "invalid msg_len {msg_len} (frames_parsed={frames_parsed})"
                 )));
