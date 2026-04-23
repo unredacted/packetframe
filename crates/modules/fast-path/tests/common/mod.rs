@@ -27,7 +27,13 @@ use aya::{
     programs::{ProgramFd, Xdp},
     Ebpf, Pod,
 };
-use packetframe_fast_path::aligned_bpf_copy;
+use packetframe_fast_path::{
+    aligned_bpf_copy,
+    fib::types::{
+        EcmpGroup, FibValue, FpFibCfg, NexthopEntry, ECMP_NH_UNUSED, MAX_ECMP_PATHS, NH_FAMILY_V4,
+        NH_FAMILY_V6, NH_STATE_RESOLVED,
+    },
+};
 
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs`. Must track
 /// `linux_impl::FpCfg` — if you change one, change both (and both's
@@ -44,7 +50,16 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V1: u32 = 0;
-pub const STATS_COUNT: u32 = 20;
+pub const STATS_COUNT: u32 = 32;
+
+/// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
+/// uses these to flip forwarding modes on the live BPF program.
+pub const FP_CFG_FLAG_IPV4: u8 = 0b0000_0001;
+pub const FP_CFG_FLAG_IPV6: u8 = 0b0000_0010;
+#[allow(dead_code)]
+pub const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
+pub const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
+pub const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 
 /// Wire-format counter indices (SPEC.md §4.6). Append-only once v0.1
 /// ships; never renumber.
@@ -71,6 +86,19 @@ pub enum StatIdx {
     PassNotInDevmap = 17,
     PassComplexHeader = 18,
     ErrHeadShift = 19,
+    // --- Custom FIB (Option F, Phase 1) ---
+    CustomFibHit = 20,
+    CustomFibMiss = 21,
+    CustomFibNoNeigh = 22,
+    CompareAgree = 23,
+    CompareDisagree = 24,
+    EcmpHashV4 = 25,
+    EcmpHashV6 = 26,
+    EcmpDeadLegFallback = 27,
+    RouteSourceResync = 28,
+    NeighCacheMiss = 29,
+    NexthopSeqRetry = 30,
+    BmpPeerDown = 31,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a
@@ -144,6 +172,177 @@ impl Harness {
         let mut trie: LpmTrie<_, [u8; 16], u8> = LpmTrie::try_from(map).expect("LpmTrie try_from");
         let key = LpmKey::new(u32::from(plen), addr);
         trie.insert(&key, 1u8, 0).expect("ALLOW_V6 insert");
+    }
+
+    // --- Custom-FIB helpers (Option F, Phase 1) -----------------------
+
+    /// Flip the CFG flag to select the custom-FIB XDP lookup path.
+    /// `compare` additionally enables compare mode (runs both lookups,
+    /// forwards via kernel result, bumps CompareAgree/CompareDisagree).
+    pub fn set_custom_fib(&mut self, on: bool, compare: bool) {
+        let mut flags = FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6;
+        if on {
+            flags |= FP_CFG_FLAG_CUSTOM_FIB;
+            if compare {
+                flags |= FP_CFG_FLAG_COMPARE_MODE;
+            }
+        }
+        self.set_cfg(FpCfg {
+            dry_run: 0,
+            flags,
+            _reserved: [0; 2],
+            version: FP_CFG_VERSION_V1,
+        });
+    }
+
+    /// Write the default FIB_CONFIG with the given hash mode (3/4/5).
+    pub fn set_fib_hash_mode(&mut self, mode: u8) {
+        let map = self.bpf.map_mut("FIB_CONFIG").expect("FIB_CONFIG map");
+        let mut arr: Array<_, FpFibCfg> = Array::try_from(map).expect("FIB_CONFIG try_from");
+        arr.set(
+            0,
+            FpFibCfg {
+                default_hash_mode: mode,
+                _pad: [0; 3],
+                version: FpFibCfg::VERSION_V1,
+            },
+            0,
+        )
+        .expect("FIB_CONFIG set");
+    }
+
+    /// Populate `NEXTHOPS[idx]` with a resolved IPv4 nexthop. Writes
+    /// the full entry with `seq = 2` (even, stable, post-first-write).
+    pub fn add_nexthop_v4(&mut self, idx: u32, ifindex: u32, smac: [u8; 6], dmac: [u8; 6]) {
+        self.add_nexthop_raw(idx, ifindex, smac, dmac, NH_FAMILY_V4);
+    }
+
+    /// Populate `NEXTHOPS[idx]` with a resolved IPv6 nexthop.
+    pub fn add_nexthop_v6(&mut self, idx: u32, ifindex: u32, smac: [u8; 6], dmac: [u8; 6]) {
+        self.add_nexthop_raw(idx, ifindex, smac, dmac, NH_FAMILY_V6);
+    }
+
+    /// Set a nexthop entry's state to something other than `Resolved`
+    /// — tests exercising the `NoNeigh` path use this.
+    pub fn set_nexthop_state(&mut self, idx: u32, state: u8) {
+        let map = self.bpf.map_mut("NEXTHOPS").expect("NEXTHOPS map");
+        let mut arr: Array<_, NexthopEntry> = Array::try_from(map).expect("NEXTHOPS try_from");
+        let mut entry: NexthopEntry = arr.get(&idx, 0).expect("NEXTHOPS get");
+        // Seqlock write: odd, fence, fields, fence, even. Since aya::set
+        // is a single syscall (not atomic vs the BPF reader, hence the
+        // seqlock in the first place), we write odd, then even. Callers
+        // running BPF concurrently must use set_nexthop_state with care.
+        entry.seq = entry.seq.wrapping_add(1);
+        arr.set(idx, entry, 0).expect("NEXTHOPS set (odd)");
+        entry.state = state;
+        entry.seq = entry.seq.wrapping_add(1);
+        arr.set(idx, entry, 0).expect("NEXTHOPS set (even)");
+    }
+
+    fn add_nexthop_raw(
+        &mut self,
+        idx: u32,
+        ifindex: u32,
+        smac: [u8; 6],
+        dmac: [u8; 6],
+        family: u8,
+    ) {
+        let map = self.bpf.map_mut("NEXTHOPS").expect("NEXTHOPS map");
+        let mut arr: Array<_, NexthopEntry> = Array::try_from(map).expect("NEXTHOPS try_from");
+        // First-time write: go 0 → 1 (odd, in progress) → 2 (even, stable).
+        let odd = NexthopEntry {
+            seq: 1,
+            ifindex,
+            dst_mac: dmac,
+            _pad0: [0; 2],
+            src_mac: smac,
+            _pad1: [0; 2],
+            state: NH_STATE_RESOLVED,
+            family,
+            bmp_peer_hint: [0; 2],
+        };
+        arr.set(idx, odd, 0).expect("NEXTHOPS set (odd phase)");
+        let even = NexthopEntry { seq: 2, ..odd };
+        arr.set(idx, even, 0).expect("NEXTHOPS set (even phase)");
+    }
+
+    /// Insert an IPv4 route pointing at a single nexthop ID.
+    pub fn add_fib_v4_single(&mut self, prefix: &str, nh_idx: u32) {
+        let (addr, plen) = parse_v4_prefix(prefix);
+        let map = self.bpf.map_mut("FIB_V4").expect("FIB_V4 map");
+        let mut trie: LpmTrie<_, [u8; 4], FibValue> =
+            LpmTrie::try_from(map).expect("FIB_V4 LpmTrie try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(&key, FibValue::single(nh_idx), 0)
+            .expect("FIB_V4 insert");
+    }
+
+    /// Insert an IPv4 route pointing at an ECMP group ID.
+    pub fn add_fib_v4_ecmp(&mut self, prefix: &str, group_id: u32) {
+        let (addr, plen) = parse_v4_prefix(prefix);
+        let map = self.bpf.map_mut("FIB_V4").expect("FIB_V4 map");
+        let mut trie: LpmTrie<_, [u8; 4], FibValue> =
+            LpmTrie::try_from(map).expect("FIB_V4 LpmTrie try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(&key, FibValue::ecmp(group_id), 0)
+            .expect("FIB_V4 insert ecmp");
+    }
+
+    /// Insert an IPv6 route pointing at a single nexthop ID.
+    pub fn add_fib_v6_single(&mut self, prefix: &str, nh_idx: u32) {
+        let (addr, plen) = parse_v6_prefix(prefix);
+        let map = self.bpf.map_mut("FIB_V6").expect("FIB_V6 map");
+        let mut trie: LpmTrie<_, [u8; 16], FibValue> =
+            LpmTrie::try_from(map).expect("FIB_V6 LpmTrie try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(&key, FibValue::single(nh_idx), 0)
+            .expect("FIB_V6 insert");
+    }
+
+    /// Insert an IPv6 route pointing at an ECMP group ID.
+    pub fn add_fib_v6_ecmp(&mut self, prefix: &str, group_id: u32) {
+        let (addr, plen) = parse_v6_prefix(prefix);
+        let map = self.bpf.map_mut("FIB_V6").expect("FIB_V6 map");
+        let mut trie: LpmTrie<_, [u8; 16], FibValue> =
+            LpmTrie::try_from(map).expect("FIB_V6 LpmTrie try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(&key, FibValue::ecmp(group_id), 0)
+            .expect("FIB_V6 insert ecmp");
+    }
+
+    /// Insert an ECMP group with the given nexthop IDs and hash mode.
+    pub fn add_ecmp_group(&mut self, group_id: u32, hash_mode: u8, nh_ids: &[u32]) {
+        assert!(
+            nh_ids.len() <= MAX_ECMP_PATHS,
+            "ECMP group exceeds MAX_ECMP_PATHS"
+        );
+        let mut nh_idx = [ECMP_NH_UNUSED; MAX_ECMP_PATHS];
+        for (i, id) in nh_ids.iter().enumerate() {
+            nh_idx[i] = *id;
+        }
+        let group = EcmpGroup {
+            hash_mode,
+            nh_count: nh_ids.len() as u8,
+            _pad: [0; 2],
+            nh_idx,
+        };
+        let map = self.bpf.map_mut("ECMP_GROUPS").expect("ECMP_GROUPS map");
+        let mut arr: Array<_, EcmpGroup> = Array::try_from(map).expect("ECMP_GROUPS try_from");
+        arr.set(group_id, group, 0).expect("ECMP_GROUPS set");
+    }
+
+    /// Insert an ifindex into `REDIRECT_DEVMAP` so the XDP success
+    /// path's devmap pre-check passes for that egress.
+    pub fn add_devmap_ifindex(&mut self, ifindex: u32) {
+        use aya::maps::xdp::DevMapHash;
+        let map = self
+            .bpf
+            .map_mut("REDIRECT_DEVMAP")
+            .expect("REDIRECT_DEVMAP map");
+        let mut devmap: DevMapHash<_> = DevMapHash::try_from(map).expect("DevMapHash try_from");
+        devmap
+            .insert(ifindex, ifindex, None, 0)
+            .expect("REDIRECT_DEVMAP insert");
     }
 
     /// Run the BPF program against `packet`. Returns (verdict, output

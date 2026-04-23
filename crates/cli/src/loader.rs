@@ -480,7 +480,11 @@ pub fn status(config_path: &Path) -> Result<(), String> {
 fn print_stats(bpffs_root: &Path) {
     // §4.6 counter names, indexed by `StatIdx` discriminants. Order
     // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
-    const NAMES: [&str; 19] = [
+    // Append-only — adding new entries at the end is fine; renumbering
+    // breaks dashboards. Previous versions hardcoded 19 and silently
+    // dropped `err_head_shift` (index 19); Phase 1 fixes that in
+    // passing and adds the 12 custom-FIB counters (indices 20-31).
+    const NAMES: [&str; 32] = [
         "rx_total",
         "matched_v4",
         "matched_v6",
@@ -500,6 +504,20 @@ fn print_stats(bpffs_root: &Path) {
         "err_vlan",
         "pass_not_in_devmap",
         "pass_complex_header",
+        "err_head_shift",
+        // --- Custom FIB (Option F, Phase 1) ---
+        "custom_fib_hit",
+        "custom_fib_miss",
+        "custom_fib_no_neigh",
+        "compare_agree",
+        "compare_disagree",
+        "ecmp_hash_v4",
+        "ecmp_hash_v6",
+        "ecmp_dead_leg_fallback",
+        "route_source_resync",
+        "neigh_cache_miss",
+        "nexthop_seq_retry",
+        "bmp_peer_down",
     ];
 
     match packetframe_fast_path::stats_from_pin(bpffs_root) {

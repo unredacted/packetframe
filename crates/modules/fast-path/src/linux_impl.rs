@@ -54,6 +54,22 @@ pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
 /// §11.1(c)). Keep in lockstep with the BPF side.
 pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 
+/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_CUSTOM_FIB` (Option F).
+/// Set when `forwarding-mode` is `custom-fib` or `compare`; routes
+/// the XDP program to consult `FIB_V4`/`FIB_V6` instead of
+/// `bpf_fib_lookup()`. Not yet read from the XDP program — Phase 1
+/// Slice 1B lands the dispatch gate. Kept in lockstep with the BPF
+/// side so userspace writes the right bit.
+#[allow(dead_code)]
+pub(crate) const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
+
+/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_COMPARE_MODE` (Option F).
+/// Enables compare mode (both lookups run, forward via kernel
+/// result, bump disagreement counter). Requires
+/// `FP_CFG_FLAG_CUSTOM_FIB`; userspace rejects compare without it.
+#[allow(dead_code)]
+pub(crate) const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
+
 /// Minimum mainline Linux version that ships the rvu-nicpf XDP fix
 /// (commit 04f647c8e456). Kernels below this expose both the
 /// xdp.data_hard_start offset bug (workaroundable via head-shift) AND
@@ -172,6 +188,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 
     populate_cfg(&mut ebpf, cfg)?;
     populate_allowlists(&mut ebpf, cfg)?;
+    populate_fib_config(&mut ebpf, cfg)?;
 
     Ok(ActiveState {
         ebpf,
@@ -179,6 +196,24 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         state_dir: ctx.state_dir.to_path_buf(),
         bpffs_root: ctx.bpffs_root.to_path_buf(),
     })
+}
+
+/// Translate a [`ForwardingMode`](packetframe_common::config::ForwardingMode)
+/// into the bits-3-4 portion of `FpCfg.flags`. Shared between
+/// `populate_cfg` (initial load) and `reconcile::reconcile_cfg`
+/// (SIGHUP) so both agree on the mode→bit mapping.
+///
+/// Invariant: `Compare` sets both bits. The BPF program's compare
+/// branch assumes bit 3 is set when bit 4 is; never emit bit 4 alone.
+pub(crate) fn fib_flags_from_forwarding_mode(
+    mode: packetframe_common::config::ForwardingMode,
+) -> u8 {
+    use packetframe_common::config::ForwardingMode;
+    match mode {
+        ForwardingMode::KernelFib => 0,
+        ForwardingMode::CustomFib => FP_CFG_FLAG_CUSTOM_FIB,
+        ForwardingMode::Compare => FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_COMPARE_MODE,
+    }
 }
 
 fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
@@ -192,9 +227,26 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         })
         .unwrap_or(false);
 
+    // Option F forwarding-mode → CFG flag bits 3-4. See
+    // fib_flags_from_forwarding_mode for the mapping.
+    let forwarding = mcfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::ForwardingMode(m) => Some(*m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let fib_flags = fib_flags_from_forwarding_mode(forwarding);
+
     let fp_cfg = FpCfg {
         dry_run: u8::from(dry_run),
-        flags: 0b11, // both IPv4 and IPv6 enabled; bit semantics reserved
+        // bits 0-1: IPv4/IPv6 enabled (historical, load-bearing for
+        // dashboards). bits 3-4: custom-FIB / compare (Option F).
+        // bit 2 (HEAD_SHIFT_128) is OR'd on later in
+        // apply_driver_quirks_cfg for rvu-nicpf attaches.
+        flags: 0b11 | fib_flags,
         _reserved: [0; 2],
         version: FP_CFG_VERSION_V1,
     };
@@ -209,7 +261,46 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         .set(0, fp_cfg, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG map set: {e}")))?;
 
-    info!(dry_run, "fast-path cfg populated");
+    info!(dry_run, forwarding = ?forwarding, "fast-path cfg populated");
+    Ok(())
+}
+
+/// Populate the `FIB_CONFIG` map with the parsed `ecmp-default-hash-mode`
+/// directive (default: 5-tuple). Always runs regardless of forwarding
+/// mode so the XDP program reads consistent config even if an
+/// operator flips to `custom-fib` via `packetframe reconfigure`
+/// later. Fail-soft: if the map is missing from the ELF (older build
+/// during development), log and continue — the BPF program reads the
+/// map defensively and falls back to built-in defaults.
+fn populate_fib_config(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    let hash_mode = mcfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::EcmpDefaultHashMode(m) => Some(m.as_wire()),
+            _ => None,
+        })
+        .unwrap_or(crate::fib::types::FpFibCfg::DEFAULT_HASH_MODE);
+
+    let fib_cfg = crate::fib::types::FpFibCfg {
+        default_hash_mode: hash_mode,
+        _pad: [0; 3],
+        version: crate::fib::types::FpFibCfg::VERSION_V1,
+    };
+
+    let map = match ebpf.map_mut("FIB_CONFIG") {
+        Some(m) => m,
+        None => {
+            info!("FIB_CONFIG map missing from ELF — skipping (older build?)");
+            return Ok(());
+        }
+    };
+    let mut arr: Array<_, crate::fib::types::FpFibCfg> = Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG Array::try_from: {e}")))?;
+    arr.set(0, fib_cfg, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG set: {e}")))?;
+    info!(hash_mode, "FIB_CONFIG populated");
     Ok(())
 }
 
@@ -1175,7 +1266,13 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
 fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
     stats: &aya::maps::PerCpuArray<T, u64>,
 ) -> ModuleResult<Vec<u64>> {
-    let mut out = vec![0u64; 19];
+    // `STATS_COUNT` in bpf/src/maps.rs is 32 as of Phase 1 (20 core
+    // + 12 custom-FIB). Previous versions hardcoded 19 — an off-by-one
+    // that hid the `err_head_shift` counter from status readback.
+    // Keep this in lockstep with the BPF side or the last counters
+    // show zero unfairly.
+    const STATS_LEN: usize = 32;
+    let mut out = vec![0u64; STATS_LEN];
     for (idx, slot) in out.iter_mut().enumerate() {
         let values = stats
             .get(&(idx as u32), 0)

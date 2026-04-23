@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 7] = [
+pub const MAP_NAMES: [&str; 12] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -30,6 +30,15 @@ pub const MAP_NAMES: [&str; 7] = [
     "REDIRECT_DEVMAP",
     "VLAN_RESOLVE",
     "LOG",
+    // --- Custom-FIB maps (Option F, Phase 1) ---
+    // Pinned even when `forwarding-mode` is `kernel-fib`; they're
+    // present in the ELF regardless and pinning them keeps detach
+    // teardown uniform across modes.
+    "FIB_V4",
+    "FIB_V6",
+    "NEXTHOPS",
+    "ECMP_GROUPS",
+    "FIB_CONFIG",
 ];
 
 /// The XDP program's pinned basename.

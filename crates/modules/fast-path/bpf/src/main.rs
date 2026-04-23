@@ -30,11 +30,12 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
 };
 
+mod fib;
 mod maps;
 
 use maps::{
-    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, CFG, FP_CFG_FLAG_HEAD_SHIFT_128, REDIRECT_DEVMAP,
-    VLAN_RESOLVE,
+    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, CFG, FP_CFG_FLAG_COMPARE_MODE, FP_CFG_FLAG_CUSTOM_FIB,
+    FP_CFG_FLAG_HEAD_SHIFT_128, REDIRECT_DEVMAP, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -207,6 +208,25 @@ fn handle_ipv4(
 
     let (sport, dport) = l4_ports(ctx, ip_offset + Ipv4Hdr::LEN, proto);
 
+    // Option F: select between custom-FIB (LPM trie + NEXTHOPS) and
+    // kernel-FIB (bpf_fib_lookup) based on runtime flags. Compare mode
+    // runs both and forwards via the kernel result.
+    //
+    // `l4_ports` returns BE-in-memory u16s (read_unaligned of BE wire
+    // bytes on an LE host) because that's what bpf_fib_lookup's
+    // `__be16` contract wants. Our own hash operates on native u16
+    // values so it's byte-order-agnostic between BPF and the userspace
+    // reference. Byte-swap once at the handoff.
+    let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
+    let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
+    let sport_h = u16::from_be(sport);
+    let dport_h = u16::from_be(dport);
+
+    if use_custom && !compare {
+        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
+        return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, true, ingress_vid);
+    }
+
     let mut fib: bpf_fib_lookup = unsafe { mem::zeroed() };
     fib.family = AF_INET;
     fib.l4_protocol = proto as u8;
@@ -226,6 +246,18 @@ fn handle_ipv4(
             0,
         )
     };
+
+    if compare {
+        // Compare mode: we also ran above iff `use_custom`; but since
+        // `compare` implies `use_custom` (userspace rejects otherwise),
+        // both flags set ⇒ we take this else-branch with kernel FIB
+        // and additionally run the custom lookup for comparison. If
+        // the operator managed to set COMPARE without CUSTOM_FIB (bug
+        // or manual map poke), the branch above is unreachable and
+        // we still do only the kernel lookup here.
+        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
+        compare_and_bump(ret as u32, &fib, &custom);
+    }
 
     dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, true, &fib, ingress_vid)
 }
@@ -276,6 +308,18 @@ fn handle_ipv6(
 
     let (sport, dport) = l4_ports(ctx, ip_offset + Ipv6Hdr::LEN, next);
 
+    // Option F dispatch — see handle_ipv4 for commentary, including the
+    // port byte-swap rationale.
+    let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
+    let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
+    let sport_h = u16::from_be(sport);
+    let dport_h = u16::from_be(dport);
+
+    if use_custom && !compare {
+        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport_h, dport_h);
+        return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, false, ingress_vid);
+    }
+
     let mut fib: bpf_fib_lookup = unsafe { mem::zeroed() };
     fib.family = AF_INET6;
     fib.l4_protocol = next as u8;
@@ -297,6 +341,11 @@ fn handle_ipv6(
         )
     };
 
+    if compare {
+        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport_h, dport_h);
+        compare_and_bump(ret as u32, &fib, &custom);
+    }
+
     dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, false, &fib, ingress_vid)
 }
 
@@ -312,62 +361,7 @@ fn dispatch_fib(
 ) -> Result<u32, ()> {
     match ret {
         BPF_FIB_LKUP_RET_SUCCESS => {
-            // Resolve the egress port's expected tagging. If fib.ifindex
-            // is recorded in `vlan_resolve`, it's a VLAN subif — redirect
-            // to the physical parent and push/rewrite to the recorded
-            // VID. Otherwise the target is physical/untagged.
-            let (egress_ifindex, egress_vid) = match unsafe { VLAN_RESOLVE.get(&fib.ifindex) } {
-                Some(vi) => (vi.phys_ifindex, vi.vid),
-                None => (fib.ifindex, VLAN_NONE),
-            };
-
-            // Defensive devmap pre-check (§4.4 step 9d) — **before any
-            // packet mutation**. A prior version rewrote L2 + ran VLAN
-            // choreography first, then decided to XDP_PASS when the
-            // egress ifindex wasn't in REDIRECT_DEVMAP. That handed the
-            // kernel a mangled packet (wrong MACs, TTL decremented, maybe
-            // pushed/popped tag) and silently black-holed forwarded
-            // traffic. Confirmed outage cause on the reference EFG
-            // 2026-04-21. If we can't redirect, we must leave the
-            // packet pristine.
-            if REDIRECT_DEVMAP.get(egress_ifindex).is_none() {
-                bump_stat(StatIdx::PassNotInDevmap);
-                return Ok(xdp_action::XDP_PASS);
-            }
-
-            // TTL/hop_limit + csum first — IP header's position in
-            // memory doesn't change with adjust_head, only its offset
-            // from `data` does.
-            if is_v4 {
-                decrement_ipv4_ttl(ip as *mut Ipv4Hdr);
-            } else {
-                decrement_ipv6_hop_limit(ip as *mut Ipv6Hdr);
-            }
-            // L2 rewrite BEFORE push/pop — push moves the current MAC
-            // positions into new slots, so the values there need to be
-            // the post-FIB MACs.
-            unsafe {
-                (*eth).dst_addr = fib.dmac;
-                (*eth).src_addr = fib.smac;
-            }
-
-            // VLAN choreography (SPEC §4.7). On error, XDP_ABORTED +
-            // err_vlan per the spec.
-            if apply_vlan_egress(ctx, ingress_vid, egress_vid).is_err() {
-                bump_stat(StatIdx::ErrVlan);
-                return Ok(xdp_action::XDP_ABORTED);
-            }
-
-            match REDIRECT_DEVMAP.redirect(egress_ifindex, 0) {
-                Ok(_) => {
-                    bump_stat(StatIdx::FwdOk);
-                    Ok(xdp_action::XDP_REDIRECT)
-                }
-                Err(_) => {
-                    bump_stat(StatIdx::ErrFibOther);
-                    Ok(xdp_action::XDP_PASS)
-                }
-            }
+            forward_success(ctx, eth, ip, is_v4, fib.ifindex, fib.smac, fib.dmac, ingress_vid)
         }
         BPF_FIB_LKUP_RET_NO_NEIGH => {
             bump_stat(StatIdx::PassNoNeigh);
@@ -387,6 +381,145 @@ fn dispatch_fib(
             bump_stat(StatIdx::ErrFibOther);
             Ok(xdp_action::XDP_PASS)
         }
+    }
+}
+
+/// Success path shared between the kernel-FIB (`dispatch_fib`) and
+/// custom-FIB (`dispatch_custom_fib`) code paths. Takes a decided
+/// `(egress_ifindex, smac, dmac)` and performs VLAN resolution,
+/// devmap pre-check, TTL decrement, L2 rewrite, VLAN choreography,
+/// and redirect. Must not be called without a valid forward decision.
+#[inline(always)]
+fn forward_success(
+    ctx: &XdpContext,
+    eth: *mut EthHdr,
+    ip: *mut u8,
+    is_v4: bool,
+    ifindex: u32,
+    smac: [u8; 6],
+    dmac: [u8; 6],
+    ingress_vid: u16,
+) -> Result<u32, ()> {
+    // Resolve the egress port's expected tagging. If `ifindex` is
+    // recorded in `vlan_resolve`, it's a VLAN subif — redirect to the
+    // physical parent and push/rewrite to the recorded VID. Otherwise
+    // the target is physical/untagged.
+    let (egress_ifindex, egress_vid) = match unsafe { VLAN_RESOLVE.get(&ifindex) } {
+        Some(vi) => (vi.phys_ifindex, vi.vid),
+        None => (ifindex, VLAN_NONE),
+    };
+
+    // Defensive devmap pre-check (§4.4 step 9d) — **before any packet
+    // mutation**. A prior version rewrote L2 + ran VLAN choreography
+    // first, then decided to XDP_PASS when the egress ifindex wasn't
+    // in REDIRECT_DEVMAP. That handed the kernel a mangled packet
+    // (wrong MACs, TTL decremented, maybe pushed/popped tag) and
+    // silently black-holed forwarded traffic. Confirmed outage cause
+    // on the reference EFG 2026-04-21. If we can't redirect, we must
+    // leave the packet pristine.
+    if REDIRECT_DEVMAP.get(egress_ifindex).is_none() {
+        bump_stat(StatIdx::PassNotInDevmap);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // TTL/hop_limit + csum first — IP header's position in memory
+    // doesn't change with adjust_head, only its offset from `data`.
+    if is_v4 {
+        decrement_ipv4_ttl(ip as *mut Ipv4Hdr);
+    } else {
+        decrement_ipv6_hop_limit(ip as *mut Ipv6Hdr);
+    }
+    // L2 rewrite BEFORE push/pop — push moves the current MAC
+    // positions into new slots, so the values there need to be the
+    // post-FIB MACs.
+    unsafe {
+        (*eth).dst_addr = dmac;
+        (*eth).src_addr = smac;
+    }
+
+    // VLAN choreography (SPEC §4.7). On error, XDP_ABORTED +
+    // err_vlan per the spec.
+    if apply_vlan_egress(ctx, ingress_vid, egress_vid).is_err() {
+        bump_stat(StatIdx::ErrVlan);
+        return Ok(xdp_action::XDP_ABORTED);
+    }
+
+    match REDIRECT_DEVMAP.redirect(egress_ifindex, 0) {
+        Ok(_) => {
+            bump_stat(StatIdx::FwdOk);
+            Ok(xdp_action::XDP_REDIRECT)
+        }
+        Err(_) => {
+            bump_stat(StatIdx::ErrFibOther);
+            Ok(xdp_action::XDP_PASS)
+        }
+    }
+}
+
+/// Dispatch on a [`fib::CustomFibResult`] returned by the custom-FIB
+/// path. Maps the four action codes into the same XDP verdicts
+/// `dispatch_fib` returns for the equivalent kernel-FIB outcomes —
+/// so the allowlist / dry-run / VLAN-resolve plumbing upstream and
+/// downstream is unchanged whether we took the kernel or custom path.
+#[inline(always)]
+fn dispatch_custom_fib(
+    result: fib::CustomFibResult,
+    ctx: &XdpContext,
+    eth: *mut EthHdr,
+    ip: *mut u8,
+    is_v4: bool,
+    ingress_vid: u16,
+) -> Result<u32, ()> {
+    match result.action {
+        fib::FIB_ACTION_FORWARD => forward_success(
+            ctx,
+            eth,
+            ip,
+            is_v4,
+            result.egress_ifindex,
+            result.smac,
+            result.dmac,
+            ingress_vid,
+        ),
+        fib::FIB_ACTION_NO_NEIGH => {
+            bump_stat(StatIdx::PassNoNeigh);
+            Ok(xdp_action::XDP_PASS)
+        }
+        fib::FIB_ACTION_DROP => {
+            bump_stat(StatIdx::DropUnreachable);
+            Ok(xdp_action::XDP_DROP)
+        }
+        // FIB_ACTION_MISS or any unexpected action.
+        _ => Ok(xdp_action::XDP_PASS),
+    }
+}
+
+/// Compare-mode: kernel-FIB is authoritative (its decision drives
+/// forwarding), but we've also computed a custom-FIB decision and
+/// want to know whether they agree. Agreement is defined as
+/// `(egress_ifindex, dst_mac)` match when both forward, or both
+/// don't-forward. Transient disagreement during BGP convergence is
+/// expected; the userspace alert thresholds are set ratio-based.
+#[inline(always)]
+fn compare_and_bump(
+    kernel_ret: u32,
+    kernel_fib: &bpf_fib_lookup,
+    custom: &fib::CustomFibResult,
+) {
+    let kernel_forwards = kernel_ret == BPF_FIB_LKUP_RET_SUCCESS;
+    let custom_forwards = custom.action == fib::FIB_ACTION_FORWARD;
+    let agree = if kernel_forwards && custom_forwards {
+        // Both forward — compare the decision tuple.
+        kernel_fib.ifindex == custom.egress_ifindex && kernel_fib.dmac == custom.dmac
+    } else {
+        // Both non-forward is "agree" (both defer upstream). Any
+        // mix — one forwards while the other doesn't — is disagree.
+        !kernel_forwards && !custom_forwards
+    };
+    if agree {
+        bump_stat(StatIdx::CompareAgree);
+    } else {
+        bump_stat(StatIdx::CompareDisagree);
     }
 }
 

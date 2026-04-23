@@ -11,11 +11,12 @@
 //! from every lifecycle method.
 
 use packetframe_common::module::{
-    Attachment, HealthCtx, HookType, HookUse, LoaderCtx, MetricsWriter, Module, ModuleConfig,
-    ModuleError, ModuleResult,
+    Attachment, HealthCtx, HealthReport, HookType, HookUse, LoaderCtx, MetricsWriter, Module,
+    ModuleConfig, ModuleError, ModuleResult,
 };
 
 pub mod breaker;
+pub mod fib;
 pub mod metrics;
 pub mod pin;
 pub mod registry;
@@ -97,13 +98,13 @@ impl FastPathModule {
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
         match &self.state {
             Some(s) => linux_impl::snapshot_stats(s),
-            None => Ok(vec![0u64; 20]),
+            None => Ok(vec![0u64; 32]),
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
-        Ok(vec![0u64; 20])
+        Ok(vec![0u64; 32])
     }
 }
 
@@ -184,9 +185,14 @@ impl Module for FastPathModule {
         Ok(())
     }
 
-    fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<()> {
-        // Circuit breaker evaluation lands in PR #6. No-op here.
-        Ok(())
+    fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
+        // Phase 1 (Option F): structured health reporting is now the
+        // trait surface, but fast-path has no live subsystems yet —
+        // RouteController / BmpStation / NeighborResolver land in
+        // Phase 2-3 and will populate `subsystems`. For now, always
+        // report healthy with no subsystems. Circuit-breaker wiring
+        // stays as-is until the reporting contract is consumed.
+        Ok(HealthReport::healthy())
     }
 }
 

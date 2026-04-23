@@ -23,7 +23,8 @@ use packetframe_common::{
 use tracing::{info, warn};
 
 use crate::linux_impl::{
-    if_nametoindex, read_vlan_config, ActiveState, FpCfg, VlanResolve, FP_CFG_VERSION_V1,
+    fib_flags_from_forwarding_mode, if_nametoindex, read_vlan_config, ActiveState, FpCfg,
+    VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_VERSION_V1,
 };
 use crate::MODULE_NAME;
 
@@ -66,12 +67,15 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         })
         .unwrap_or(false);
 
-    let new_cfg = FpCfg {
-        dry_run: u8::from(dry_run),
-        flags: 0b11,
-        _reserved: [0; 2],
-        version: FP_CFG_VERSION_V1,
-    };
+    let forwarding = cfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::ForwardingMode(m) => Some(*m),
+            _ => None,
+        })
+        .unwrap_or_default();
 
     let map = state
         .ebpf
@@ -79,10 +83,28 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "CFG map missing from ELF"))?;
     let mut cfg_arr: Array<_, FpCfg> = Array::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG Array::try_from: {e}")))?;
+
+    // Preserve bit 2 (HEAD_SHIFT_128) from the current CFG. That bit
+    // is set at attach time by apply_driver_quirks_cfg based on
+    // driver detection; SIGHUP reconfigure must not wipe it. Without
+    // this preservation, a SIGHUP on an rvu-nicpf box would silently
+    // disable the head-shift workaround until the next full restart.
+    let current: FpCfg = cfg_arr
+        .get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
+    let head_shift = current.flags & FP_CFG_FLAG_HEAD_SHIFT_128;
+
+    let new_cfg = FpCfg {
+        dry_run: u8::from(dry_run),
+        flags: 0b11 | head_shift | fib_flags_from_forwarding_mode(forwarding),
+        _reserved: [0; 2],
+        version: FP_CFG_VERSION_V1,
+    };
+
     cfg_arr
         .set(0, new_cfg, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))?;
-    info!(dry_run, "CFG reconciled");
+    info!(dry_run, forwarding = ?forwarding, "CFG reconciled");
     Ok(())
 }
 
