@@ -17,22 +17,36 @@
 //! **Wire framing:** BMP's common header carries a 32-bit
 //! big-endian message length. Read 6 bytes, extract length, read
 //! `length - 6` bytes of body, hand the whole frame to
-//! `parse_bmp_msg`.
+//! `parse_bmp_msg`. Framing runs in a dedicated task so the main
+//! event loop's `select!` can interleave a quiescence timer without
+//! cancel-safety issues — `read_exact` isn't cancel-safe, so running
+//! it under a `select!` arm would desync the stream whenever the
+//! timer arm fired mid-read.
 //!
 //! **BGP UPDATE → RouteEvent translation:** `Elementor::bgp_to_elems`
 //! converts the UPDATE wrapped inside a RouteMonitoring message into
 //! per-prefix `BgpElem`s. Announces with a next_hop become
 //! `RouteEvent::Add { peer_id, prefix, nexthops: vec![next_hop] }`.
-//! Withdraws become `RouteEvent::Del`. ECMP at the BMP layer is
-//! unusual — bird's Loc-RIB surfaces one best path per prefix — but
-//! the FibProgrammer handles multi-nexthop routes anyway if that
-//! ever changes.
+//! Withdraws become `RouteEvent::Del`.
+//!
+//! **InitiationComplete heuristic.** RFC 7854 doesn't signal "initial
+//! dump complete" explicitly. We fire `RouteEvent::InitiationComplete`
+//! once per connection, after [`INIT_COMPLETE_QUIESCENCE`] of no
+//! incoming RouteMonitoring frames post the first RouteMonitoring.
+//! Bird's full-RIB dump normally finishes within a few seconds; a 5 s
+//! window of silence is a reasonable proxy for "dump done."
+//! False-positive risk: if bird is dumping so slowly that individual
+//! peers quiesce for > 5 s between batches, we fire early and GC
+//! mid-dump routes. Mitigation: the next Add events after InitComplete
+//! simply re-populate them — the programmer mirror gets rewritten.
+//! Operationally benign.
 
 #![cfg(target_os = "linux")]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bgpkit_parser::models::{ElemType, NetworkPrefix};
 use bgpkit_parser::parser::bmp::messages::*;
@@ -41,6 +55,7 @@ use bgpkit_parser::Elementor;
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -53,6 +68,16 @@ use crate::fib::programmer::FibProgrammerHandle;
 /// far smaller messages. 1 MiB is comfortable headroom and cheap
 /// defense against a malformed stream claiming 4 GiB per frame.
 const MAX_BMP_MSG_SIZE: usize = 1024 * 1024;
+
+/// InitiationComplete quiescence threshold. See the module-level
+/// docstring for the rationale. Tune by PR if operators see
+/// false-positives on slow full-table dumps.
+const INIT_COMPLETE_QUIESCENCE: Duration = Duration::from_secs(5);
+
+/// Bounded channel between the BMP reader task and the main select!
+/// loop. 256 absorbs a burst of route-monitoring frames between 1-
+/// second tick wakeups without backpressuring bird.
+const FRAME_CHANNEL_CAPACITY: usize = 256;
 
 pub struct BmpStation {
     listen_addr: SocketAddr,
@@ -122,60 +147,77 @@ impl BmpStation {
         }
     }
 
-    /// Read BMP messages from `stream` until EOF or error. Frames
-    /// each message by reading the 6-byte common header, extracting
-    /// `msg_len`, reading the body, and handing the whole frame to
-    /// `parse_bmp_msg`.
-    async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), RouteSourceError> {
+    /// Handle one BMP connection. Spawns a reader task that pushes
+    /// parsed messages into a bounded channel; the main select! loop
+    /// below drains that channel alongside a 1-second quiescence tick
+    /// that fires InitiationComplete exactly once per connection.
+    async fn handle_connection(&self, stream: TcpStream) -> Result<(), RouteSourceError> {
+        let (frame_tx, mut frame_rx) = mpsc::channel::<BmpMessage>(FRAME_CHANNEL_CAPACITY);
+        let reader = tokio::spawn(async move { reader_task(stream, frame_tx).await });
+
+        let mut last_route_monitoring: Option<std::time::Instant> = None;
+        let mut init_complete_fired = false;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // interval fires immediately the first tick; skip it so the
+        // first real quiescence check lands one full period in.
+        tick.tick().await;
+
         let mut frames_parsed = 0usize;
         loop {
-            let mut header_buf = [0u8; 6];
-            match stream.read_exact(&mut header_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    debug!(frames_parsed, "BMP stream EOF");
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    reader.abort();
                     return Ok(());
                 }
-                Err(e) => {
-                    return Err(RouteSourceError::recoverable(format!("read header: {e}")));
+                msg = frame_rx.recv() => {
+                    match msg {
+                        Some(m) => {
+                            frames_parsed += 1;
+                            if matches!(m.message_body, BmpMessageBody::RouteMonitoring(_)) {
+                                last_route_monitoring = Some(std::time::Instant::now());
+                            }
+                            self.process_msg(m).await;
+                        }
+                        None => {
+                            // Reader task exited — EOF or error. Join it
+                            // to surface any error, then return.
+                            match reader.await {
+                                Ok(Ok(())) => {
+                                    debug!(frames_parsed, "BMP stream done");
+                                    return Ok(());
+                                }
+                                Ok(Err(e)) => return Err(e),
+                                Err(e) => {
+                                    return Err(RouteSourceError::recoverable(format!(
+                                        "reader task join: {e}"
+                                    )))
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-            // BMP common header: version(1) + msg_len(4) + msg_type(1).
-            // msg_len covers the entire frame including the header.
-            let msg_len =
-                u32::from_be_bytes([header_buf[1], header_buf[2], header_buf[3], header_buf[4]])
-                    as usize;
-            if !(6..=MAX_BMP_MSG_SIZE).contains(&msg_len) {
-                return Err(RouteSourceError::recoverable(format!(
-                    "invalid msg_len {msg_len} (frames_parsed={frames_parsed})"
-                )));
-            }
-            let body_len = msg_len - 6;
-            let mut body_buf = vec![0u8; body_len];
-            if body_len > 0 {
-                stream
-                    .read_exact(&mut body_buf)
-                    .await
-                    .map_err(|e| RouteSourceError::recoverable(format!("read body: {e}")))?;
-            }
-
-            // Reconstruct the full frame. `parse_bmp_msg` expects the
-            // header bytes at the front of the buffer — it re-reads
-            // them to validate the version / type.
-            let mut full = Vec::with_capacity(msg_len);
-            full.extend_from_slice(&header_buf);
-            full.extend_from_slice(&body_buf);
-            let mut bytes = Bytes::from(full);
-
-            match parse_bmp_msg(&mut bytes) {
-                Ok(msg) => {
-                    frames_parsed += 1;
-                    self.process_msg(msg).await;
-                }
-                Err(e) => {
-                    return Err(RouteSourceError::recoverable(format!(
-                        "parse_bmp_msg after {frames_parsed}: {e}"
-                    )));
+                _ = tick.tick() => {
+                    if init_complete_fired {
+                        continue;
+                    }
+                    if let Some(last) = last_route_monitoring {
+                        if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
+                            if let Err(e) = self
+                                .prog_handle
+                                .apply_route_event(RouteEvent::InitiationComplete)
+                                .await
+                            {
+                                warn!(error = %e, "InitiationComplete dispatch failed");
+                            } else {
+                                info!(
+                                    frames_parsed,
+                                    quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
+                                    "InitiationComplete fired"
+                                );
+                                init_complete_fired = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -282,6 +324,73 @@ impl BmpStation {
             }
             BmpMessageBody::StatsReport(_) => {
                 debug!("StatsReport ignored");
+            }
+        }
+    }
+}
+
+/// Reader task. Reads BMP frames from `stream` and pushes parsed
+/// messages into `tx` until EOF or error. Exits cleanly (`Ok(())`)
+/// on EOF; error on anything else. Kept in its own function so the
+/// main select! loop never holds a non-cancel-safe `read_exact`
+/// future.
+async fn reader_task(
+    mut stream: TcpStream,
+    tx: mpsc::Sender<BmpMessage>,
+) -> Result<(), RouteSourceError> {
+    let mut frames_parsed = 0usize;
+    loop {
+        let mut header_buf = [0u8; 6];
+        match stream.read_exact(&mut header_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!(frames_parsed, "BMP stream EOF (reader)");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(RouteSourceError::recoverable(format!("read header: {e}")));
+            }
+        }
+        // BMP common header: version(1) + msg_len(4) + msg_type(1).
+        // msg_len covers the entire frame including the header.
+        let msg_len =
+            u32::from_be_bytes([header_buf[1], header_buf[2], header_buf[3], header_buf[4]])
+                as usize;
+        if !(6..=MAX_BMP_MSG_SIZE).contains(&msg_len) {
+            return Err(RouteSourceError::recoverable(format!(
+                "invalid msg_len {msg_len} (frames_parsed={frames_parsed})"
+            )));
+        }
+        let body_len = msg_len - 6;
+        let mut body_buf = vec![0u8; body_len];
+        if body_len > 0 {
+            stream
+                .read_exact(&mut body_buf)
+                .await
+                .map_err(|e| RouteSourceError::recoverable(format!("read body: {e}")))?;
+        }
+
+        // Reconstruct the full frame. `parse_bmp_msg` expects the
+        // header bytes at the front of the buffer — it re-reads
+        // them to validate the version / type.
+        let mut full = Vec::with_capacity(msg_len);
+        full.extend_from_slice(&header_buf);
+        full.extend_from_slice(&body_buf);
+        let mut bytes = Bytes::from(full);
+
+        match parse_bmp_msg(&mut bytes) {
+            Ok(msg) => {
+                frames_parsed += 1;
+                if tx.send(msg).await.is_err() {
+                    // Main loop dropped the receiver — shutdown.
+                    debug!(frames_parsed, "frame receiver closed; reader exiting");
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                return Err(RouteSourceError::recoverable(format!(
+                    "parse_bmp_msg after {frames_parsed}: {e}"
+                )));
             }
         }
     }
