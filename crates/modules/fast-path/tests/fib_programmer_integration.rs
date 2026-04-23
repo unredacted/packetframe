@@ -24,6 +24,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 
 use aya::maps::lpm_trie::Key as LpmKey;
@@ -45,9 +46,25 @@ struct PinDirs {
 }
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BPFFS_MOUNT: Once = Once::new();
+
+/// Ensure `/sys/fs/bpf` exists and has bpffs mounted on it. GitHub's
+/// hosted Ubuntu runner already has this; virtme-ng's VM does not, so
+/// we mount it ourselves. Best-effort: errors are tolerated — the
+/// subsequent `create_dir_all` / `pin` call will surface the real
+/// problem with a clearer message.
+fn ensure_bpffs_mounted() {
+    BPFFS_MOUNT.call_once(|| {
+        let _ = std::fs::create_dir_all(BPFFS_ROOT);
+        let _ = std::process::Command::new("mount")
+            .args(["-t", "bpf", "bpf", BPFFS_ROOT])
+            .status();
+    });
+}
 
 impl PinDirs {
     fn setup() -> Self {
+        ensure_bpffs_mounted();
         // Unique per-invocation subdir under bpffs. The test binary PID
         // is shared across parallel #[test] fns, so include an atomic
         // counter to disambiguate concurrent harness instances.
@@ -201,9 +218,11 @@ impl Drop for ProgrammerHarness {
     fn drop(&mut self) {
         self.shutdown.cancel();
         if let Some(task) = self.task.take() {
+            // Construct the timeout future *inside* the runtime context
+            // so the timer's reactor lookup succeeds.
             let _ = self
                 .rt
-                .block_on(tokio::time::timeout(Duration::from_secs(2), task));
+                .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await });
         }
     }
 }
