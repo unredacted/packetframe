@@ -11,6 +11,9 @@
 pub mod hash;
 pub mod types;
 
+#[cfg(target_os = "linux")]
+pub mod netlink_neigh;
+
 pub use types::{
     EcmpGroup, FibValue, FpFibCfg, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, FIB_KIND_SINGLE,
     MAX_ECMP_PATHS, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE,
