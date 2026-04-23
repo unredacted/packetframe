@@ -273,21 +273,20 @@ Check:
 
 ## Known gaps
 
-The following are known limitations that will be addressed in Phase
-3.5+. Listed here so you don't spend time debugging behaviors that
-are known-missing:
+The following are known limitations. Listed here so you don't spend
+time debugging behaviors that are known-missing. Items marked ✅
+landed since the runbook was first written.
 
-- **Proactive resolve is a no-op.** `request_resolve(ip)` logs the
-  request but doesn't issue `RTM_NEWNEIGH NUD_NONE`. First-packet
-  kernel ARP is the fallback.
-- **`src_mac` is zero.** The MAC packetframe writes as the Ethernet
-  source address on redirected frames is currently `00:00:00:00:00:00`.
-  Switches don't generally care about src_mac for forwarding decisions,
-  but any policy-based tooling that does will trip on this. Phase 3.5+
-  adds RTM_GETLINK lookup of the egress iface MAC.
-- **InitiationComplete doesn't fire autonomously.** The programmer
-  receives `Resync` on BMP disconnect and reconcile on reconnect, but
-  the InitComplete signal that GCs stale entries is Phase 3.5+.
+- ✅ **Proactive resolve** (Phase 3.6). `request_resolve(ip)` now
+  issues `RTM_NEWNEIGH NUD_NONE` after looking up the route to find
+  the egress ifindex. Best-effort: if route lookup or neighbor add
+  fails, first-packet kernel ARP remains the fallback.
+- ✅ **`src_mac` via RTM_GETLINK** (Phase 3.6). The NeighborResolver
+  now caches `ifindex → MAC` from an RTM_GETLINK dump at startup and
+  RTM_NEWLINK / RTM_DELLINK multicast events thereafter.
+  `NEXTHOPS[id].src_mac` is the egress iface MAC, not zero.
+- ✅ **InitiationComplete quiescence timer** (Phase 3.5). Fires once
+  per BMP connection after 5 s of no RouteMonitoring frames.
 - **`packetframe-ctl fib dump/lookup/stats`** subcommands are not yet
   implemented. Use `packetframe status` + counter deltas for now.
 - **Prometheus metrics** are limited to the existing textfile counters
@@ -295,3 +294,9 @@ are known-missing:
   occupancy isn't exported yet.
 - **Offline comparison harness** isn't wired into CI yet; we rely on
   the staging soak + `compare` mode for pre-cutover validation.
+- **Netns integration test + BMP mock test** — Phase 3.6 ships the
+  code for both sides (resolver + BMP station) but the end-to-end
+  netns tests that drive `kernel neigh → NeighborResolver → NEXTHOPS`
+  and `captured BMP frames → BmpStation → FibProgrammer → FIB_V4` are
+  deferred to a follow-up. CI's qemu jobs still validate all unit
+  tests, and the staging soak validates the real thing end-to-end.
