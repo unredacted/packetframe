@@ -7,7 +7,14 @@
 //! table is implicitly ordered by discriminant. Runtime formatting
 //! depends on both lists matching: the zipping loop in
 //! `render_textfile` assumes `NAMES` and `stats` line up.
+//!
+//! Phase 3.8 adds a sibling `render_fib_gauges` for custom-FIB
+//! occupancy. Those are gauges (not counters), rendered in a separate
+//! body so the primary counters surface stays independent of whether
+//! the FIB pins are readable.
 
+#[cfg(target_os = "linux")]
+use crate::FibStatusSnapshot;
 use std::fmt::Write as _;
 
 /// Wire-format counter names, index-aligned with `StatIdx` in
@@ -84,6 +91,111 @@ pub fn render_textfile(stats: &[u64], uptime_seconds: u64) -> String {
     out
 }
 
+/// Render custom-FIB occupancy metrics as Prometheus gauges
+/// (Option F, Phase 3.8).
+///
+/// Output mirrors what `packetframe status` prints in its FIB block,
+/// but as a textfile-collector-scrapeable format. `forwarding_mode`
+/// is encoded as a one-hot label so PromQL can still aggregate /
+/// alert on mode transitions (`packetframe_fib_forwarding_mode{mode="custom-fib"} 1`).
+///
+/// When the pins aren't readable, `snap` carries its default values
+/// (zeroes + `forwarding_mode = None`); rendering proceeds and the
+/// scraper sees a consistent set of gauges with zero occupancy.
+#[cfg(target_os = "linux")]
+pub fn render_fib_gauges(snap: &FibStatusSnapshot) -> String {
+    let mut out = String::with_capacity(1024);
+
+    // forwarding_mode one-hot
+    let _ = writeln!(
+        out,
+        "# HELP packetframe_fib_forwarding_mode 1 for the active forwarding mode, 0 otherwise"
+    );
+    let _ = writeln!(out, "# TYPE packetframe_fib_forwarding_mode gauge");
+    for mode in ["kernel-fib", "custom-fib", "compare"] {
+        let active = snap.forwarding_mode == Some(mode);
+        let _ = writeln!(
+            out,
+            "packetframe_fib_forwarding_mode{{module=\"fast-path\",mode=\"{mode}\"}} {}",
+            u8::from(active),
+        );
+    }
+
+    // default hash mode (present only when the CFG pin is readable)
+    if let Some(mode) = snap.default_hash_mode {
+        let _ = writeln!(
+            out,
+            "# HELP packetframe_fib_default_hash_mode ECMP default hash mode (3/4/5-tuple)"
+        );
+        let _ = writeln!(out, "# TYPE packetframe_fib_default_hash_mode gauge");
+        let _ = writeln!(
+            out,
+            "packetframe_fib_default_hash_mode{{module=\"fast-path\"}} {mode}"
+        );
+    }
+
+    // NEXTHOPS state buckets
+    let _ = writeln!(
+        out,
+        "# HELP packetframe_nexthops nexthop-entry count per state bucket"
+    );
+    let _ = writeln!(out, "# TYPE packetframe_nexthops gauge");
+    let _ = writeln!(
+        out,
+        "packetframe_nexthops{{module=\"fast-path\",state=\"resolved\"}} {}",
+        snap.nh_resolved
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_nexthops{{module=\"fast-path\",state=\"failed\"}} {}",
+        snap.nh_failed
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_nexthops{{module=\"fast-path\",state=\"stale\"}} {}",
+        snap.nh_stale
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_nexthops{{module=\"fast-path\",state=\"unwritten_or_incomplete\"}} {}",
+        snap.nh_unwritten_or_incomplete
+    );
+    let _ = writeln!(
+        out,
+        "# HELP packetframe_nexthops_max configured NEXTHOPS map capacity"
+    );
+    let _ = writeln!(out, "# TYPE packetframe_nexthops_max gauge");
+    let _ = writeln!(
+        out,
+        "packetframe_nexthops_max{{module=\"fast-path\"}} {}",
+        snap.nh_max_entries
+    );
+
+    // ECMP groups
+    let _ = writeln!(
+        out,
+        "# HELP packetframe_ecmp_groups_active ECMP groups with nh_count > 0"
+    );
+    let _ = writeln!(out, "# TYPE packetframe_ecmp_groups_active gauge");
+    let _ = writeln!(
+        out,
+        "packetframe_ecmp_groups_active{{module=\"fast-path\"}} {}",
+        snap.ecmp_active
+    );
+    let _ = writeln!(
+        out,
+        "# HELP packetframe_ecmp_groups_max configured ECMP_GROUPS map capacity"
+    );
+    let _ = writeln!(out, "# TYPE packetframe_ecmp_groups_max gauge");
+    let _ = writeln!(
+        out,
+        "packetframe_ecmp_groups_max{{module=\"fast-path\"}} {}",
+        snap.ecmp_max_entries
+    );
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +239,67 @@ mod tests {
         let type_lines = body.lines().filter(|l| l.starts_with("# TYPE")).count();
         // COUNTER_NAMES.len() counters + 1 uptime gauge.
         assert_eq!(type_lines, COUNTER_NAMES.len() + 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fib_gauges_emit_forwarding_mode_onehot() {
+        let snap = FibStatusSnapshot {
+            forwarding_mode: Some("custom-fib"),
+            default_hash_mode: Some(5),
+            nh_resolved: 12,
+            nh_failed: 1,
+            nh_stale: 0,
+            nh_unwritten_or_incomplete: 8179,
+            nh_max_entries: 8192,
+            ecmp_active: 3,
+            ecmp_max_entries: 1024,
+        };
+        let body = render_fib_gauges(&snap);
+        assert!(body.contains(
+            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"custom-fib\"} 1"
+        ));
+        assert!(body.contains(
+            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"kernel-fib\"} 0"
+        ));
+        assert!(body
+            .contains("packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"compare\"} 0"));
+        assert!(body.contains("packetframe_fib_default_hash_mode{module=\"fast-path\"} 5"));
+        assert!(body.contains("packetframe_nexthops{module=\"fast-path\",state=\"resolved\"} 12"));
+        assert!(body.contains("packetframe_nexthops{module=\"fast-path\",state=\"failed\"} 1"));
+        assert!(body.contains("packetframe_nexthops_max{module=\"fast-path\"} 8192"));
+        assert!(body.contains("packetframe_ecmp_groups_active{module=\"fast-path\"} 3"));
+        assert!(body.contains("packetframe_ecmp_groups_max{module=\"fast-path\"} 1024"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fib_gauges_handle_unreadable_pins() {
+        // All zeroes / None is what fib_status_from_pin returns when
+        // the pins aren't there (e.g., kernel-fib mode or first boot).
+        let snap = FibStatusSnapshot {
+            forwarding_mode: None,
+            default_hash_mode: None,
+            nh_resolved: 0,
+            nh_failed: 0,
+            nh_stale: 0,
+            nh_unwritten_or_incomplete: 0,
+            nh_max_entries: 0,
+            ecmp_active: 0,
+            ecmp_max_entries: 0,
+        };
+        let body = render_fib_gauges(&snap);
+        // With `forwarding_mode: None`, no mode is "active" — every
+        // one-hot emits 0.
+        assert!(body.contains(
+            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"custom-fib\"} 0"
+        ));
+        assert!(body.contains(
+            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"kernel-fib\"} 0"
+        ));
+        // default_hash_mode absent when the CFG pin isn't readable —
+        // scrapers see the metric simply not emitted.
+        assert!(!body.contains("packetframe_fib_default_hash_mode"));
+        assert!(body.contains("packetframe_nexthops_max{module=\"fast-path\"} 0"));
     }
 }

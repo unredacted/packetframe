@@ -77,7 +77,13 @@ fn exporter_loop(textfile_path: PathBuf, bpffs_root: PathBuf, shutdown: Arc<Atom
 fn write_once(textfile_path: &Path, bpffs_root: &Path, uptime_seconds: u64) -> Result<(), String> {
     let stats = packetframe_fast_path::stats_from_pin(bpffs_root)
         .map_err(|e| format!("read STATS pin: {e}"))?;
-    let body = packetframe_fast_path::metrics::render_textfile(&stats, uptime_seconds);
+    let mut body = packetframe_fast_path::metrics::render_textfile(&stats, uptime_seconds);
+    // Custom-FIB occupancy gauges (Option F, Phase 3.8). Best-effort:
+    // `fib_status_from_pin` returns a default snapshot when the pins
+    // aren't readable (e.g., kernel-fib mode), and the renderer
+    // handles that by emitting zeros + a `mode=\"kernel-fib\"` one-hot.
+    let fib = packetframe_fast_path::fib_status_from_pin(bpffs_root);
+    body.push_str(&packetframe_fast_path::metrics::render_fib_gauges(&fib));
     atomic_write(textfile_path, body.as_bytes())
         .map_err(|e| format!("atomic write {}: {e}", textfile_path.display()))?;
     Ok(())
