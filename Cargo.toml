@@ -65,6 +65,7 @@ tokio-util = { version = "0.7", default-features = false }
 # shape changes across minor versions and we rely on specific constants.
 rtnetlink = "0.21"
 netlink-packet-route = "0.30"
+netlink-packet-core = "0.8"
 futures = "0.3"
 
 [profile.release]

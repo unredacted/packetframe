@@ -36,8 +36,10 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::NeighEvent;
 
-use crate::fib::types::{NexthopEntry, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED,
-    NH_STATE_INCOMPLETE, NH_STATE_RESOLVED};
+use crate::fib::types::{
+    NexthopEntry, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE,
+    NH_STATE_RESOLVED,
+};
 use crate::pin;
 
 /// Command queue capacity. Commands are rare (one per route add/del
@@ -95,10 +97,7 @@ impl FibProgrammerHandle {
     /// (e.g., integration tests driving the programmer from a sync
     /// thread). Panics if called from within a tokio context — use
     /// `register_nexthop` there instead.
-    pub fn register_nexthop_blocking(
-        &self,
-        ip: IpAddr,
-    ) -> Result<NexthopId, ProgrammerError> {
+    pub fn register_nexthop_blocking(&self, ip: IpAddr) -> Result<NexthopId, ProgrammerError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .blocking_send(Command::RegisterNexthop { ip, reply: tx })
@@ -163,7 +162,9 @@ impl FibProgrammer {
     /// Open the `NEXTHOPS` map from the bpffs pin and return a
     /// typed `Array` handle. Must be called after the loader has
     /// attached and pinned the map.
-    pub fn open_nexthops(bpffs_root: &Path) -> Result<Array<MapData, NexthopEntry>, ProgrammerError> {
+    pub fn open_nexthops(
+        bpffs_root: &Path,
+    ) -> Result<Array<MapData, NexthopEntry>, ProgrammerError> {
         let pin_path = pin::map_path(bpffs_root, "NEXTHOPS");
         let map_data = MapData::from_pin(&pin_path)
             .map_err(|e| ProgrammerError::MapOpen(format!("NEXTHOPS pin open: {e}")))?;
@@ -358,9 +359,7 @@ impl FibProgrammer {
         };
 
         let entry = match evt {
-            NeighEvent::Learned {
-                mac, ifindex, ..
-            } => {
+            NeighEvent::Learned { mac, ifindex, .. } => {
                 // Remember the MAC so later Failed/Gone → revert-to-Incomplete
                 // preserves the last-known-good for diagnostic use if we
                 // ever expose it. Actual forwarding uses the live state only.

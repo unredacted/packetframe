@@ -554,6 +554,7 @@ dependencies = [
  "aya",
  "futures",
  "libc",
+ "netlink-packet-core",
  "netlink-packet-route",
  "packetframe-common",
  "rtnetlink",

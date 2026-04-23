@@ -12,6 +12,9 @@ pub mod hash;
 pub mod types;
 
 #[cfg(target_os = "linux")]
+pub mod controller;
+
+#[cfg(target_os = "linux")]
 pub mod netlink_neigh;
 
 #[cfg(target_os = "linux")]
