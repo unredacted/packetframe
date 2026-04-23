@@ -253,6 +253,9 @@ async fn run_birdc_protocols(birdc: &std::path::Path) -> Result<usize, String> {
 async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let birdc = birdc.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    // Stringify the args before the blocking task takes ownership; we
+    // still want to name them in the timeout-error message.
+    let args_display = format!("{args:?}");
     let join = tokio::task::spawn_blocking(move || {
         Command::new(&birdc)
             .args(&args)
@@ -261,7 +264,7 @@ async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, Str
     });
     let result = tokio::time::timeout(BIRDC_TIMEOUT, join)
         .await
-        .map_err(|_| format!("birdc {args:?} exceeded {BIRDC_TIMEOUT:?}"))?
+        .map_err(|_| format!("birdc {args_display} exceeded {BIRDC_TIMEOUT:?}"))?
         .map_err(|e| format!("birdc task join: {e}"))??;
     if !result.status.success() {
         return Err(format!(

@@ -440,11 +440,13 @@ async fn stall_monitor(
                 // Gate on bird's cached peer state.
                 let established = integrity.read().await.bird_established_peers;
                 match established {
-                    Some(n) if n > 0 => {
-                        warn!(
+                    None => {
+                        // Integrity cache cold. Can't gate the alert
+                        // responsibly; stay quiet rather than risk
+                        // false-positives during bird downtime.
+                        debug!(
                             quiet_seconds,
-                            bird_established_peers = n,
-                            "BMP session appears stalled (no ROUTE MONITORING + bird reports Established peers)"
+                            "BMP quiet but integrity cache is cold — stall alert suppressed"
                         );
                     }
                     Some(0) => {
@@ -453,13 +455,11 @@ async fn stall_monitor(
                             "BMP quiet but bird reports zero Established peers — stall alert suppressed"
                         );
                     }
-                    None => {
-                        // Integrity cache cold. Can't gate the alert
-                        // responsibly; stay quiet rather than risk
-                        // false-positives during bird downtime.
-                        debug!(
+                    Some(n) => {
+                        warn!(
                             quiet_seconds,
-                            "BMP quiet but integrity cache is cold — stall alert suppressed"
+                            bird_established_peers = n,
+                            "BMP session appears stalled (no ROUTE MONITORING + bird reports Established peers)"
                         );
                     }
                 }

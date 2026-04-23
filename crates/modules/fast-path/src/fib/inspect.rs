@@ -111,8 +111,9 @@ pub fn dump_v4(bpffs_root: &Path) -> Result<Vec<FibEntry>, String> {
     let mut out = Vec::new();
     for res in trie.iter() {
         let (key, value) = res.map_err(|e| format!("FIB_V4 iter: {e}"))?;
+        // `key.data()` returns `K` by value (aya 0.13), so no deref.
         let prefix = IpPrefix::V4 {
-            addr: Ipv4Addr::from(*key.data()),
+            addr: Ipv4Addr::from(key.data()),
             prefix_len: key.prefix_len() as u8,
         };
         out.push(resolve_fib_entry(prefix, value, &nexthops, &ecmp)?);
@@ -130,7 +131,7 @@ pub fn dump_v6(bpffs_root: &Path) -> Result<Vec<FibEntry>, String> {
     for res in trie.iter() {
         let (key, value) = res.map_err(|e| format!("FIB_V6 iter: {e}"))?;
         let prefix = IpPrefix::V6 {
-            addr: Ipv6Addr::from(*key.data()),
+            addr: Ipv6Addr::from(key.data()),
             prefix_len: key.prefix_len() as u8,
         };
         out.push(resolve_fib_entry(prefix, value, &nexthops, &ecmp)?);
