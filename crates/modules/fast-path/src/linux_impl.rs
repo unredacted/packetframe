@@ -119,6 +119,11 @@ pub struct ActiveState {
     pub links: Vec<LinkRecord>,
     pub state_dir: PathBuf,
     pub bpffs_root: PathBuf,
+    /// Option F control plane, started in `attach` when
+    /// `forwarding-mode` is `custom-fib` or `compare`. `None` in
+    /// `kernel-fib` mode (which is the default and today's behavior).
+    /// `detach` shuts it down cooperatively before tearing down pins.
+    pub route_controller: Option<crate::fib::controller::RouteController>,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -195,6 +200,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         links: Vec::new(),
         state_dir: ctx.state_dir.to_path_buf(),
         bpffs_root: ctx.bpffs_root.to_path_buf(),
+        route_controller: None,
     })
 }
 
@@ -520,6 +526,40 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // partial-load failure (above) doesn't leave half-initialized maps
     // in bpffs.
     pin_program_and_maps(state)?;
+
+    // Start Option F's RouteController if the operator asked for the
+    // custom FIB path. Uses `MapData::from_pin` internally, so it
+    // must run after `pin_program_and_maps`. Kernel-fib mode skips
+    // this entirely and pays nothing for the feature.
+    let forwarding = cfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::ForwardingMode(m) => Some(*m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if matches!(
+        forwarding,
+        packetframe_common::config::ForwardingMode::CustomFib
+            | packetframe_common::config::ForwardingMode::Compare
+    ) {
+        let ctrl =
+            crate::fib::controller::RouteController::start(&state.bpffs_root).map_err(|e| {
+                ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
+            })?;
+        state.route_controller = Some(ctrl);
+        info!(
+            ?forwarding,
+            "RouteController started (NeighborResolver + FibProgrammer active)"
+        );
+    } else {
+        info!(
+            ?forwarding,
+            "RouteController not started (kernel-fib mode); Option F control plane idle"
+        );
+    }
 
     // Build Attachment records for the pin registry. `pinned_path`
     // points at the real link pin — when `packetframe detach` runs,
@@ -1038,7 +1078,16 @@ pub(crate) fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> 
 }
 
 pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
-    // Drop every PinnedLink first: this closes our userspace FDs but
+    // Stop the Option F control plane first. Its tasks hold map
+    // handles opened via `MapData::from_pin`; draining them before we
+    // remove the pins keeps shutdown ordered and avoids "map removed
+    // while programmer was mid-write" races.
+    if let Some(ctrl) = state.route_controller.take() {
+        info!("shutting down RouteController");
+        ctrl.shutdown();
+    }
+
+    // Drop every PinnedLink next: this closes our userspace FDs but
     // the kernel keeps the attach alive via the bpffs inodes. Drain
     // in reverse attach order — no practical consequence here, matches
     // typical lifecycle expectations.

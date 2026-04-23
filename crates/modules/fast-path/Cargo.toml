@@ -24,8 +24,20 @@ libc.workspace = true
 # loader implementation is cfg-gated accordingly. Non-Linux builds
 # (macOS dev) compile without aya and have `load`/`attach` return
 # NotImplemented.
+#
+# Option F control plane (Phase 2+): tokio + rtnetlink are also
+# Linux-only here because the only consumer is the netlink-based
+# NeighborResolver and (Phase 3) BMP station. Gating keeps the macOS
+# dev-loop dependency graph lean.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rtnetlink.workspace = true
+netlink-packet-route.workspace = true
+netlink-packet-core.workspace = true
+futures.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 aya.workspace = true
+tokio.workspace = true

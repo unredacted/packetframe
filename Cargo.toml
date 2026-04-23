@@ -50,6 +50,24 @@ aya = "=0.13.1"
 aya-log = "=0.2.1"
 aya-build = "=0.1.3"
 
+# Option F control plane (Phase 2+). Tokio is scoped to the minimum
+# feature set needed by NeighborResolver + RouteController: async TCP
+# for BMP (Phase 3), netlink I/O for neighbor events, bounded mpsc
+# channels between subsystems, cooperative shutdown. `full` pulls in
+# tokio-fs and process machinery we don't need; keeping this lean keeps
+# build times and binary size reasonable on cross targets.
+tokio = { version = "1.52", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", default-features = false }
+# rtnetlink is our async netlink client for RTM_NEWNEIGH / RTM_DELNEIGH
+# and link-state events. It layers on netlink-packet-route which we also
+# pull directly for message parsing where rtnetlink's helpers don't
+# cover what we need. Both pinned tight — rtnetlink has had message-
+# shape changes across minor versions and we rely on specific constants.
+rtnetlink = "0.21"
+netlink-packet-route = "0.30"
+netlink-packet-core = "0.8"
+futures = "0.3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
