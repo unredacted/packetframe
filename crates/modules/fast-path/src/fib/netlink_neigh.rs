@@ -28,13 +28,19 @@
 
 use std::net::IpAddr;
 
-use futures::StreamExt;
+use std::collections::HashMap;
+
+use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{
+    link::{LinkAttribute, LinkMessage},
     neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState},
+    route::RouteAttribute,
     RouteNetlinkMessage,
 };
-use rtnetlink::{new_multicast_connection, MulticastGroup};
+use rtnetlink::{
+    new_connection, new_multicast_connection, Handle, MulticastGroup, RouteMessageBuilder,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -80,6 +86,12 @@ pub struct NetlinkNeighborResolver {
     events_tx: mpsc::Sender<NeighEvent>,
     resolve_rx: mpsc::Receiver<IpAddr>,
     shutdown: CancellationToken,
+    /// Cache mapping ifindex → egress MAC. Populated at startup via
+    /// a single `RTM_GETLINK` dump; maintained by `RTM_NEWLINK` /
+    /// `RTM_DELLINK` multicast events. Used to attach `src_mac` to
+    /// `NeighEvent::Learned` so the FibProgrammer writes the correct
+    /// Ethernet source address into `NEXTHOPS[id].src_mac`.
+    iface_mac: HashMap<u32, [u8; 6]>,
 }
 
 impl NetlinkNeighborResolver {
@@ -98,6 +110,7 @@ impl NetlinkNeighborResolver {
                 events_tx,
                 resolve_rx,
                 shutdown,
+                iface_mac: HashMap::new(),
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -107,8 +120,34 @@ impl NetlinkNeighborResolver {
     /// Main event loop. Runs until shutdown is signaled or the netlink
     /// stream closes unexpectedly.
     pub async fn run(mut self) -> Result<(), NeighError> {
+        // Seed the ifindex→MAC cache from an RTM_GETLINK dump BEFORE
+        // we start listening to the multicast stream. Otherwise a
+        // NEWNEIGH arriving in the first few microseconds after
+        // subscription would emit src_mac=[0;6] because we hadn't
+        // discovered the egress iface yet.
+        //
+        // The dump uses a separate unicast netlink connection; the
+        // multicast one below is dedicated to the event stream
+        // (RTM_NEWNEIGH/DELNEIGH/NEWLINK/DELLINK) so dump traffic
+        // doesn't compete with live events.
+        match dump_link_macs().await {
+            Ok(macs) => {
+                self.iface_mac = macs;
+                info!(
+                    count = self.iface_mac.len(),
+                    "ifindex→MAC cache seeded from RTM_GETLINK dump"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "RTM_GETLINK dump failed; src_mac will be [0;6] until RTM_NEWLINK events arrive"
+                );
+            }
+        }
+
         let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
-        let (connection, _handle, mut messages) = new_multicast_connection(&groups)
+        let (connection, handle, mut messages) = new_multicast_connection(&groups)
             .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
         tokio::spawn(connection);
         info!(
@@ -134,14 +173,10 @@ impl NetlinkNeighborResolver {
                 req = self.resolve_rx.recv() => {
                     match req {
                         Some(ip) => {
-                            // Phase 3: full proactive resolve (route lookup
-                            // → ifindex → `ip neigh add ... nud none`). For
-                            // now log and rely on first-packet kernel ARP.
-                            debug!(
-                                ?ip,
-                                "proactive resolve request queued (Phase 3 TODO; \
-                                 kernel will resolve on first matching packet)"
-                            );
+                            // Best-effort proactive resolve. If the route
+                            // lookup or neighbor add fails, log at debug
+                            // and fall back to first-packet kernel ARP.
+                            issue_proactive_resolve(&handle, ip).await;
                         }
                         None => {
                             // All NeighborResolveHandle clones dropped; continue
@@ -158,10 +193,19 @@ impl NetlinkNeighborResolver {
     /// [`NeighEvent`]s and push them into the events channel. Send
     /// errors (programmer too slow) log at debug because backpressure
     /// is expected during convergence bursts, not a bug.
-    async fn handle_packet(&self, packet: NetlinkMessage<RouteNetlinkMessage>) {
+    ///
+    /// Also maintains the `iface_mac` cache in response to RTM_NEWLINK
+    /// / RTM_DELLINK so `src_mac` on subsequent `NeighEvent::Learned`
+    /// reflects current egress MACs.
+    async fn handle_packet(&mut self, packet: NetlinkMessage<RouteNetlinkMessage>) {
         match packet.payload {
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) => {
-                if let Some(evt) = parse_neighbour_add(&msg) {
+                let src_mac = self
+                    .iface_mac
+                    .get(&msg.header.ifindex)
+                    .copied()
+                    .unwrap_or([0; 6]);
+                if let Some(evt) = parse_neighbour_add(&msg, src_mac) {
                     if let Err(e) = self.events_tx.send(evt).await {
                         debug!(error = %e, "NeighEvent::Learned send failed");
                     }
@@ -174,13 +218,26 @@ impl NetlinkNeighborResolver {
                     }
                 }
             }
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(msg)) => {
+                if let Some(mac) = extract_link_mac(&msg) {
+                    let ifindex = msg.header.index;
+                    let prev = self.iface_mac.insert(ifindex, mac);
+                    if prev != Some(mac) {
+                        debug!(
+                            ifindex,
+                            mac = format_args!(
+                                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                            ),
+                            "iface MAC cached"
+                        );
+                    }
+                }
+            }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(msg)) => {
-                // Link-down ⇒ every neighbor on that iface is implicitly
-                // gone. RTM_DELNEIGH events usually accompany it; Phase 2
-                // relies on those. Tracking per-ifindex neighbor sets to
-                // evict proactively lands in Phase 3 alongside route
-                // scoping.
-                debug!(ifindex = msg.header.index, "RTM_DELLINK observed");
+                let ifindex = msg.header.index;
+                self.iface_mac.remove(&ifindex);
+                debug!(ifindex, "RTM_DELLINK observed; MAC cache entry purged");
             }
             NetlinkPayload::Error(err) => {
                 warn!(?err, "netlink error message");
@@ -190,10 +247,143 @@ impl NetlinkNeighborResolver {
     }
 }
 
+/// Proactively kick kernel ARP/ND for `ip`. Looks up the route to
+/// find the egress ifindex, then issues `RTM_NEWNEIGH` with
+/// `state = NUD_NONE`. The kernel responds by starting resolution;
+/// the eventual `RTM_NEWNEIGH` with a resolved state arrives via the
+/// multicast subscription and turns into `NeighEvent::Learned` through
+/// the normal path.
+///
+/// Best-effort. If the route lookup can't find an egress (dest
+/// unroutable, or kernel's NETLINK_GET_STRICT_CHK doesn't accept our
+/// message shape), or the neighbor add fails (EEXIST because the
+/// neighbor already exists, permission issues, etc.), we log at debug
+/// and return. The fallback is "kernel resolves when real traffic
+/// arrives" — exactly what we'd get without proactive resolve, so
+/// the only cost of a proactive-resolve failure is one-packet latency
+/// on first forward.
+async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
+    let (oif, plen) = match ip {
+        IpAddr::V4(v4) => {
+            let req = RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(IpAddr::V4(v4), 32)
+                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
+                .build();
+            (lookup_oif(handle, req).await, 32u8)
+        }
+        IpAddr::V6(v6) => {
+            let req = RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(IpAddr::V6(v6), 128)
+                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
+                .build();
+            (lookup_oif(handle, req).await, 128u8)
+        }
+    };
+    let _ = plen; // retained for future per-family path divergence if needed
+    let oif = match oif {
+        Some(i) => i,
+        None => {
+            debug!(
+                ?ip,
+                "proactive resolve: route lookup returned no OIF; skipping"
+            );
+            return;
+        }
+    };
+    // Issue the RTM_NEWNEIGH with NUD_NONE. The kernel interprets
+    // "state NONE + no lladdr" as "initialize this neighbor and start
+    // resolving." Replace lets the call be idempotent — if the
+    // neighbor already exists, we quietly succeed.
+    match handle
+        .neighbours()
+        .add(oif, ip)
+        .state(NeighbourState::None)
+        .replace()
+        .execute()
+        .await
+    {
+        Ok(()) => debug!(?ip, oif, "proactive resolve kicked"),
+        Err(e) => debug!(?ip, oif, error = %e, "proactive resolve failed"),
+    }
+}
+
+/// Query the main routing table for `msg`, return the OIF of the
+/// first route returned. Kernel answers via a stream; we only care
+/// about the first entry — subsequent entries for multipath routes
+/// are handled at the programmer level via ECMP groups.
+async fn lookup_oif(
+    handle: &Handle,
+    msg: netlink_packet_route::route::RouteMessage,
+) -> Option<u32> {
+    let mut routes = handle.route().get(msg).execute();
+    match routes.try_next().await {
+        Ok(Some(route)) => {
+            for attr in route.attributes {
+                if let RouteAttribute::Oif(idx) = attr {
+                    return Some(idx);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Dump every link on the box via a single RTM_GETLINK-dump request;
+/// return a fresh ifindex→MAC map. Uses a dedicated unicast netlink
+/// connection — the main multicast one is owned by the select! loop.
+///
+/// Links without a usable MAC (e.g., tunnels, loopback, bridge masters
+/// before an attachment) are skipped silently; they'll show up in a
+/// later RTM_NEWLINK when their hardware address is set.
+async fn dump_link_macs() -> Result<HashMap<u32, [u8; 6]>, NeighError> {
+    let (connection, handle, _) =
+        new_connection().map_err(|e| NeighError::new(format!("new_connection: {e}")))?;
+    tokio::spawn(connection);
+
+    let mut macs: HashMap<u32, [u8; 6]> = HashMap::new();
+    let mut links = handle.link().get().execute();
+    while let Some(msg) = links
+        .try_next()
+        .await
+        .map_err(|e| NeighError::new(format!("link dump: {e}")))?
+    {
+        if let Some(mac) = extract_link_mac(&msg) {
+            macs.insert(msg.header.index, mac);
+        }
+    }
+    Ok(macs)
+}
+
+/// Pull the `Address` (IFLA_ADDRESS) attribute out of a LinkMessage
+/// if it's a plausible Ethernet MAC. Returns None for non-Ethernet
+/// links — tunnels encode the peer address in `Address` with varying
+/// widths, and a 6-byte address on a tunnel isn't semantically what
+/// we want as src_mac anyway.
+fn extract_link_mac(msg: &LinkMessage) -> Option<[u8; 6]> {
+    for attr in &msg.attributes {
+        if let LinkAttribute::Address(bytes) = attr {
+            if bytes.len() == 6 {
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(bytes);
+                // Skip the all-zero MAC some virtual ifaces present
+                // before they're configured — that would be worse than
+                // not providing one (looks like a real address).
+                if mac != [0; 6] {
+                    return Some(mac);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Build a [`NeighEvent`] from an RTM_NEWNEIGH message. Returns
 /// `None` for transient or uninteresting states (`Incomplete` / `None`
-/// — no MAC yet; `Other` — unknown variant).
-fn parse_neighbour_add(msg: &NeighbourMessage) -> Option<NeighEvent> {
+/// — no MAC yet; `Other` — unknown variant). `src_mac` is the cached
+/// egress iface MAC (Phase 3.6); `[0; 6]` when the cache hasn't been
+/// populated for this ifindex yet.
+fn parse_neighbour_add(msg: &NeighbourMessage, src_mac: [u8; 6]) -> Option<NeighEvent> {
     let ip = extract_ip(&msg.attributes)?;
 
     match msg.header.state {
@@ -216,6 +406,7 @@ fn parse_neighbour_add(msg: &NeighbourMessage) -> Option<NeighEvent> {
                 ip,
                 mac,
                 ifindex: msg.header.ifindex,
+                src_mac,
             })
         }
         // Incomplete / None: resolution in progress, no MAC yet. The
@@ -271,6 +462,8 @@ mod tests {
         m
     }
 
+    const TEST_SRC_MAC: [u8; 6] = [0xbb, 0xbb, 0xbb, 0, 0, 42];
+
     #[test]
     fn learned_from_reachable() {
         let ip = Ipv4Addr::new(10, 0, 0, 1);
@@ -281,15 +474,17 @@ mod tests {
                 NeighbourAttribute::LinkLayerAddress(vec![0xaa, 0, 0, 0, 0, 1]),
             ],
         );
-        match parse_neighbour_add(&msg) {
+        match parse_neighbour_add(&msg, TEST_SRC_MAC) {
             Some(NeighEvent::Learned {
                 ip: got_ip,
                 mac,
                 ifindex,
+                src_mac,
             }) => {
                 assert_eq!(got_ip, IpAddr::V4(ip));
                 assert_eq!(mac, [0xaa, 0, 0, 0, 0, 1]);
                 assert_eq!(ifindex, 42);
+                assert_eq!(src_mac, TEST_SRC_MAC);
             }
             other => panic!("expected Learned, got {other:?}"),
         }
@@ -303,7 +498,7 @@ mod tests {
             vec![NeighbourAttribute::Destination(NeighbourAddress::Inet(ip))],
         );
         assert!(matches!(
-            parse_neighbour_add(&msg),
+            parse_neighbour_add(&msg, TEST_SRC_MAC),
             Some(NeighEvent::Failed { .. })
         ));
     }
@@ -315,7 +510,7 @@ mod tests {
             NeighbourState::Incomplete,
             vec![NeighbourAttribute::Destination(NeighbourAddress::Inet(ip))],
         );
-        assert!(parse_neighbour_add(&msg).is_none());
+        assert!(parse_neighbour_add(&msg, TEST_SRC_MAC).is_none());
     }
 
     #[test]
@@ -326,7 +521,7 @@ mod tests {
             NeighbourState::Reachable,
             vec![NeighbourAttribute::Destination(NeighbourAddress::Inet(ip))],
         );
-        assert!(parse_neighbour_add(&msg).is_none());
+        assert!(parse_neighbour_add(&msg, TEST_SRC_MAC).is_none());
     }
 
     #[test]
