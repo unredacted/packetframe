@@ -76,6 +76,10 @@ futures = "0.3"
 # that we don't need.
 bgpkit-parser = { version = "0.16", default-features = false, features = ["parser", "bytes"] }
 bytes = "1.11"
+# ipnet: IPv4/IPv6 prefix types used by bgpkit-parser's NetworkPrefix.
+# We pattern-match on `IpNet::{V4,V6}` directly to extract addr +
+# prefix_len, which requires the type to be in scope.
+ipnet = "2.12"
 
 [profile.release]
 lto = "thin"

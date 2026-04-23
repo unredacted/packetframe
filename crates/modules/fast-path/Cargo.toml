@@ -25,6 +25,7 @@ libc.workspace = true
 # example binary run on macOS dev loops against captured frames.
 bgpkit-parser.workspace = true
 bytes.workspace = true
+ipnet.workspace = true
 
 # aya (userspace) is Linux-only (uses netlink, SYS_bpf, etc.); the
 # loader implementation is cfg-gated accordingly. Non-Linux builds

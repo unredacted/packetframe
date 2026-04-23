@@ -717,6 +717,7 @@ dependencies = [
  "bgpkit-parser",
  "bytes",
  "futures",
+ "ipnet",
  "libc",
  "netlink-packet-core",
  "netlink-packet-route",
