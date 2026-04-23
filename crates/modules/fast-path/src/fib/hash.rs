@@ -72,14 +72,7 @@ pub fn pack_ports(proto: u8, sport: u16, dport: u16, mode: u8) -> u32 {
 
 /// IPv4 flow hash. `mode` is 3 / 4 / 5; any other value falls back to 3.
 #[inline]
-pub fn hash_v4(
-    src: [u8; 4],
-    dst: [u8; 4],
-    proto: u8,
-    sport: u16,
-    dport: u16,
-    mode: u8,
-) -> u32 {
+pub fn hash_v4(src: [u8; 4], dst: [u8; 4], proto: u8, sport: u16, dport: u16, mode: u8) -> u32 {
     let a = u32::from_be_bytes(src).wrapping_add(JHASH_INITVAL);
     let b = u32::from_be_bytes(dst).wrapping_add(JHASH_INITVAL);
     let c = pack_ports(proto, sport, dport, mode).wrapping_add(JHASH_INITVAL);
@@ -89,14 +82,7 @@ pub fn hash_v4(
 
 /// IPv6 flow hash.
 #[inline]
-pub fn hash_v6(
-    src: [u8; 16],
-    dst: [u8; 16],
-    proto: u8,
-    sport: u16,
-    dport: u16,
-    mode: u8,
-) -> u32 {
+pub fn hash_v6(src: [u8; 16], dst: [u8; 16], proto: u8, sport: u16, dport: u16, mode: u8) -> u32 {
     let s0 = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
     let s1 = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
     let s2 = u32::from_be_bytes([src[8], src[9], src[10], src[11]]);

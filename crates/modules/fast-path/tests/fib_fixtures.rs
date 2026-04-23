@@ -51,7 +51,7 @@ fn prep_custom_fib_harness() -> Harness {
 fn custom_fib_v4_miss_returns_pass() {
     let mut h = prep_custom_fib_harness();
     h.add_allow_v4("10.0.0.0/8"); // match the allowlist so we exercise FIB path
-    // No FIB_V4 entries → every destination misses.
+                                  // No FIB_V4 entries → every destination misses.
 
     let pkt = Ipv4TcpBuilder::default().build();
 
@@ -88,7 +88,7 @@ fn custom_fib_v4_single_nexthop_hit_redirects() {
     h.add_fib_v4_single("10.0.0.0/24", 1);
 
     let pkt = Ipv4TcpBuilder {
-        src_ip: [10, 0, 0, 5], // matches allow
+        src_ip: [10, 0, 0, 5],  // matches allow
         dst_ip: [10, 0, 0, 42], // covered by FIB_V4 10.0.0.0/24
         ..Default::default()
     }

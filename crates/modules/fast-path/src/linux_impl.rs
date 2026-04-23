@@ -296,9 +296,8 @@ fn populate_fib_config(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
             return Ok(());
         }
     };
-    let mut arr: Array<_, crate::fib::types::FpFibCfg> = Array::try_from(map).map_err(|e| {
-        ModuleError::other(MODULE_NAME, format!("FIB_CONFIG Array::try_from: {e}"))
-    })?;
+    let mut arr: Array<_, crate::fib::types::FpFibCfg> = Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG Array::try_from: {e}")))?;
     arr.set(0, fib_cfg, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG set: {e}")))?;
     info!(hash_mode, "FIB_CONFIG populated");

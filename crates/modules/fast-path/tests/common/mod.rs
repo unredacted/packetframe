@@ -226,8 +226,7 @@ impl Harness {
     /// — tests exercising the `NoNeigh` path use this.
     pub fn set_nexthop_state(&mut self, idx: u32, state: u8) {
         let map = self.bpf.map_mut("NEXTHOPS").expect("NEXTHOPS map");
-        let mut arr: Array<_, NexthopEntry> =
-            Array::try_from(map).expect("NEXTHOPS try_from");
+        let mut arr: Array<_, NexthopEntry> = Array::try_from(map).expect("NEXTHOPS try_from");
         let mut entry: NexthopEntry = arr.get(&idx, 0).expect("NEXTHOPS get");
         // Seqlock write: odd, fence, fields, fence, even. Since aya::set
         // is a single syscall (not atomic vs the BPF reader, hence the
@@ -249,8 +248,7 @@ impl Harness {
         family: u8,
     ) {
         let map = self.bpf.map_mut("NEXTHOPS").expect("NEXTHOPS map");
-        let mut arr: Array<_, NexthopEntry> =
-            Array::try_from(map).expect("NEXTHOPS try_from");
+        let mut arr: Array<_, NexthopEntry> = Array::try_from(map).expect("NEXTHOPS try_from");
         // First-time write: go 0 → 1 (odd, in progress) → 2 (even, stable).
         let odd = NexthopEntry {
             seq: 1,
@@ -275,7 +273,8 @@ impl Harness {
         let mut trie: LpmTrie<_, [u8; 4], FibValue> =
             LpmTrie::try_from(map).expect("FIB_V4 LpmTrie try_from");
         let key = LpmKey::new(u32::from(plen), addr);
-        trie.insert(&key, FibValue::single(nh_idx), 0).expect("FIB_V4 insert");
+        trie.insert(&key, FibValue::single(nh_idx), 0)
+            .expect("FIB_V4 insert");
     }
 
     /// Insert an IPv4 route pointing at an ECMP group ID.
@@ -285,7 +284,8 @@ impl Harness {
         let mut trie: LpmTrie<_, [u8; 4], FibValue> =
             LpmTrie::try_from(map).expect("FIB_V4 LpmTrie try_from");
         let key = LpmKey::new(u32::from(plen), addr);
-        trie.insert(&key, FibValue::ecmp(group_id), 0).expect("FIB_V4 insert ecmp");
+        trie.insert(&key, FibValue::ecmp(group_id), 0)
+            .expect("FIB_V4 insert ecmp");
     }
 
     /// Insert an IPv6 route pointing at a single nexthop ID.
@@ -295,7 +295,8 @@ impl Harness {
         let mut trie: LpmTrie<_, [u8; 16], FibValue> =
             LpmTrie::try_from(map).expect("FIB_V6 LpmTrie try_from");
         let key = LpmKey::new(u32::from(plen), addr);
-        trie.insert(&key, FibValue::single(nh_idx), 0).expect("FIB_V6 insert");
+        trie.insert(&key, FibValue::single(nh_idx), 0)
+            .expect("FIB_V6 insert");
     }
 
     /// Insert an IPv6 route pointing at an ECMP group ID.
@@ -305,7 +306,8 @@ impl Harness {
         let mut trie: LpmTrie<_, [u8; 16], FibValue> =
             LpmTrie::try_from(map).expect("FIB_V6 LpmTrie try_from");
         let key = LpmKey::new(u32::from(plen), addr);
-        trie.insert(&key, FibValue::ecmp(group_id), 0).expect("FIB_V6 insert ecmp");
+        trie.insert(&key, FibValue::ecmp(group_id), 0)
+            .expect("FIB_V6 insert ecmp");
     }
 
     /// Insert an ECMP group with the given nexthop IDs and hash mode.
@@ -325,8 +327,7 @@ impl Harness {
             nh_idx,
         };
         let map = self.bpf.map_mut("ECMP_GROUPS").expect("ECMP_GROUPS map");
-        let mut arr: Array<_, EcmpGroup> =
-            Array::try_from(map).expect("ECMP_GROUPS try_from");
+        let mut arr: Array<_, EcmpGroup> = Array::try_from(map).expect("ECMP_GROUPS try_from");
         arr.set(group_id, group, 0).expect("ECMP_GROUPS set");
     }
 

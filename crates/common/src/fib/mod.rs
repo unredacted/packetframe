@@ -51,10 +51,7 @@ pub enum RouteEvent {
         nexthops: Vec<IpAddr>,
     },
     /// Route withdrawal.
-    Del {
-        peer_id: PeerId,
-        prefix: IpPrefix,
-    },
+    Del { peer_id: PeerId, prefix: IpPrefix },
     /// The RouteSource finished its initial RIB dump (all known
     /// peers have quiesced). The programmer uses this to garbage-
     /// collect entries left over from a prior session.

@@ -709,12 +709,10 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 ModuleDirective::FibSize(FibSizeDirective::EcmpGroupsMaxEntries(n))
             })
         }
-        "ecmp-default-hash-mode" => {
-            parse_single_arg(line, rest, "ecmp-default-hash-mode", |t| {
-                let mode: EcmpHashMode = t.parse().map_err(|e: String| e)?;
-                Ok(ModuleDirective::EcmpDefaultHashMode(mode))
-            })
-        }
+        "ecmp-default-hash-mode" => parse_single_arg(line, rest, "ecmp-default-hash-mode", |t| {
+            let mode: EcmpHashMode = t.parse().map_err(|e: String| e)?;
+            Ok(ModuleDirective::EcmpDefaultHashMode(mode))
+        }),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
@@ -733,9 +731,9 @@ fn parse_single_arg<'a, F>(
 where
     F: FnOnce(&'a str) -> Result<ModuleDirective, String>,
 {
-    let tok = rest.next().ok_or_else(|| {
-        ConfigError::parse(line, format!("{directive} requires a value"))
-    })?;
+    let tok = rest
+        .next()
+        .ok_or_else(|| ConfigError::parse(line, format!("{directive} requires a value")))?;
     if rest.next().is_some() {
         return Err(ConfigError::parse(
             line,
@@ -764,9 +762,9 @@ where
             format!("{directive} takes exactly one argument"),
         ));
     }
-    let n: u32 = tok.parse().map_err(|e| {
-        ConfigError::parse(line, format!("{directive}: bad integer `{tok}`: {e}"))
-    })?;
+    let n: u32 = tok
+        .parse()
+        .map_err(|e| ConfigError::parse(line, format!("{directive}: bad integer `{tok}`: {e}")))?;
     if n == 0 {
         return Err(ConfigError::parse(
             line,
@@ -808,10 +806,7 @@ fn parse_route_source<'a>(
                 )
             })?;
             if addr.is_empty() {
-                return Err(ConfigError::parse(
-                    line,
-                    "route-source bmp: addr is empty",
-                ));
+                return Err(ConfigError::parse(line, "route-source bmp: addr is empty"));
             }
             let port: u16 = port_str.parse().map_err(|e| {
                 ConfigError::parse(
@@ -826,9 +821,7 @@ fn parse_route_source<'a>(
         }
         other => Err(ConfigError::parse(
             line,
-            format!(
-                "route-source `{other}` unknown (Phase 1 supports only `bmp <addr>:<port>`)"
-            ),
+            format!("route-source `{other}` unknown (Phase 1 supports only `bmp <addr>:<port>`)"),
         )),
     }
 }

@@ -31,9 +31,7 @@ const EGRESS_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x01];
 /// Fabricate `n` distinct dst MACs so the observed egress MAC after
 /// a redirect uniquely identifies which ECMP leg was chosen.
 fn distinct_macs(n: usize) -> Vec<[u8; 6]> {
-    (0..n)
-        .map(|i| [0xaa, 0, 0, 0, 0, i as u8 + 1])
-        .collect()
+    (0..n).map(|i| [0xaa, 0, 0, 0, 0, i as u8 + 1]).collect()
 }
 
 /// Build a harness primed for ECMP hash cross-checks: custom-FIB on,
