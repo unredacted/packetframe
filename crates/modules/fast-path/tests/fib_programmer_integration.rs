@@ -76,7 +76,7 @@ impl Drop for PinDirs {
 /// stay alive after `take_map` hands them to the programmer.
 fn load_and_pin(pins: &PinDirs) -> Ebpf {
     let bytes = aligned_bpf_copy();
-    let mut ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
+    let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
     for name in ["NEXTHOPS", "FIB_V4", "FIB_V6", "ECMP_GROUPS"] {
         let path = pins.path(name);
         ebpf.map(name)
