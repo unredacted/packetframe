@@ -163,7 +163,6 @@ enum Command {
     },
 }
 
-
 #[cfg(feature = "probe")]
 fn parse_duration(s: &str) -> Result<Duration, String> {
     // Unit suffixes: `ms`, `s`, `m` — parsed in longest-match order so

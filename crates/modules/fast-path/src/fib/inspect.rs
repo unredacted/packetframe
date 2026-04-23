@@ -254,7 +254,10 @@ mod tests {
             NH_STATE_STALE,
             NH_STATE_FAILED,
         ] {
-            assert!(!matches!(NexthopState::from_raw(raw), NexthopState::Unknown(_)));
+            assert!(!matches!(
+                NexthopState::from_raw(raw),
+                NexthopState::Unknown(_)
+            ));
         }
         assert!(matches!(
             NexthopState::from_raw(99),

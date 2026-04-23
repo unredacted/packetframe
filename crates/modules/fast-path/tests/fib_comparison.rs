@@ -307,7 +307,9 @@ fn synthetic_rib_v6() -> Vec<(IpPrefix, Vec<IpAddr>)> {
         // 2001:db8:1::/48 — nested under the above.
         (
             IpPrefix::V6 {
-                addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                addr: [
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
                 prefix_len: 48,
             },
             vec![IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 3))],
@@ -372,7 +374,9 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
     );
 
     // 203.0.113.5 — different nexthop set; different group.
-    let v = h.lookup_v4([203, 0, 113, 5]).expect("FIB_V4[different-ecmp]");
+    let v = h
+        .lookup_v4([203, 0, 113, 5])
+        .expect("FIB_V4[different-ecmp]");
     assert_eq!(v.kind, FIB_KIND_ECMP);
     assert_ne!(v.idx, ecmp_192, "different nexthop set → different group");
 

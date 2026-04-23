@@ -75,21 +75,23 @@ pub fn run(op: FibOp) -> ExitCode {
             }
             ExitCode::from(EXIT_OK)
         }),
-        FibOp::Lookup { config, ip } => dispatch(config, |bpffs| match inspect::lookup(bpffs, ip) {
-            Ok(Some(entry)) => {
-                println!("MATCH");
-                print_entry(&entry);
-                ExitCode::from(EXIT_OK)
-            }
-            Ok(None) => {
-                println!("NO MATCH — {ip} has no covering prefix in FIB");
-                ExitCode::from(EXIT_OK)
-            }
-            Err(e) => {
-                eprintln!("fib lookup failed: {e}");
-                ExitCode::from(EXIT_RUNTIME_ERROR)
-            }
-        }),
+        FibOp::Lookup { config, ip } => {
+            dispatch(config, |bpffs| match inspect::lookup(bpffs, ip) {
+                Ok(Some(entry)) => {
+                    println!("MATCH");
+                    print_entry(&entry);
+                    ExitCode::from(EXIT_OK)
+                }
+                Ok(None) => {
+                    println!("NO MATCH — {ip} has no covering prefix in FIB");
+                    ExitCode::from(EXIT_OK)
+                }
+                Err(e) => {
+                    eprintln!("fib lookup failed: {e}");
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
+            })
+        }
         FibOp::Stats { config } => dispatch(config, |bpffs| {
             let snap = packetframe_fast_path::fib_status_from_pin(bpffs);
             print_stats(&snap);
@@ -118,7 +120,11 @@ fn print_dump(family_tag: &str, entries: &[FibEntry]) {
         println!("(FIB_{} empty)", family_tag.to_uppercase());
         return;
     }
-    println!("{} entries in FIB_{}", entries.len(), family_tag.to_uppercase());
+    println!(
+        "{} entries in FIB_{}",
+        entries.len(),
+        family_tag.to_uppercase()
+    );
     for entry in entries {
         print_entry(entry);
     }
