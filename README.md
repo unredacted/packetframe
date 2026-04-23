@@ -9,9 +9,15 @@ observed, and detached independently.
 The MVP module, and the reason the project exists, is `fast-path`:
 it takes forwarded packets for allowlisted prefixes off the kernel's
 conntrack/netfilter hot path by intercepting them at XDP ingress and
-redirecting via `bpf_fib_lookup` + `bpf_redirect_map`. The design
-spec lives alongside the project internally; inline code comments
-cite section numbers (e.g. `§4.2`) as breadcrumbs.
+redirecting with `bpf_redirect_map`. For forwarding decisions the
+module supports two modes — `kernel-fib` consults the kernel's FIB
+via `bpf_fib_lookup()`; `custom-fib` consults its own LPM-trie FIB
+populated from a BMP stream out of bird (RFC 7854 + 9069 Loc-RIB),
+which is what runs in production when a peer between the kernel's
+route table and a closed-source sibling daemon would otherwise race
+on BGP attributes. The design spec lives alongside the project
+internally; inline code comments cite section numbers (e.g. `§4.2`)
+as breadcrumbs.
 
 ## Status
 
@@ -22,17 +28,20 @@ diagnostic:
   with LPM-trie prefix lookups.
 - **VLAN ingress parse + egress push / pop / rewrite** for VLAN-tagged
   forwarding topologies.
-- **`bpf_fib_lookup` + `bpf_redirect_map`** for forwarding decisions.
-  The kernel stack is only consulted for packets the fast path
-  deliberately passes.
+- **Two forwarding modes** — `kernel-fib` uses `bpf_fib_lookup()`
+  against the kernel FIB; `custom-fib` (Option F) consults an
+  in-BPF LPM trie populated from bird over BMP. Both redirect via
+  `bpf_redirect_map`. `compare` mode runs both and bumps a
+  disagreement counter for pre-cutover validation.
 - **bpffs pinning** of programs, maps, and links. SIGTERM exits the
   loader without detaching attached ifaces; `packetframe detach` is
   the explicit teardown.
 - **Live counter readback** via the pinned STATS map —
   `packetframe status` works whether or not the loader is running.
 - **Prometheus textfile export** at 15 s cadence (atomic
-  write-then-rename), one counter per stat plus a
-  `packetframe_uptime_seconds` gauge.
+  write-then-rename), one counter per stat plus custom-FIB
+  occupancy gauges (`packetframe_nexthops{state=...}`,
+  `packetframe_ecmp_groups_active`, `packetframe_fib_forwarding_mode`).
 - **SIGHUP reconcile** — delta-only updates to allowlists, VLAN-resolve
   map, and redirect devmap. A parse error on SIGHUP never kills the
   running data plane.
@@ -45,9 +54,20 @@ diagnostic:
   chosen iface for a fixed duration, dump the first 16 bytes of a
   sample of packets, then detach. Useful for answering "what does
   this driver hand to XDP?" without patching BPF.
+- **`packetframe fib dump / lookup / stats`** — operator tools for
+  the custom-FIB maps. `lookup <ip>` answers "what would XDP do for
+  this address?" against the live pinned maps.
 - **Driver-quirk workarounds** with a `driver-workaround` config
   directive for per-driver opt-ins when a NIC's XDP path deviates
   from the kernel's documented contract.
+
+Custom-FIB mode also ships a control plane under `packetframe run`:
+a BMP station (TCP listener) that parses bird's Loc-RIB into an LPM
+trie, a netlink-based neighbor resolver that tracks nexthop MAC /
+ifindex changes, and a periodic integrity check that cross-checks
+the mirror against `birdc show route count`. See
+[`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) for the
+operational runbook.
 
 The reference workflow is: validate the host with
 `packetframe feasibility`, attach in `dry-run on` to watch counters
@@ -204,6 +224,20 @@ like Ethernet").
 - `driver-workaround <name> <auto|on|off>` — per-driver opt-ins for
   known kernel-level quirks. See the *Known driver / kernel
   interactions* section above for the catalog.
+- `forwarding-mode <kernel-fib|custom-fib|compare>` — forwarding
+  path selector. `kernel-fib` is the default and the permanent
+  rollback option; `custom-fib` consults the BPF-map FIB populated
+  from BMP; `compare` runs both and bumps a disagreement counter.
+- `route-source bmp <addr>:<port>` — TCP listen address for bird's
+  BMP session. Required when `forwarding-mode` is `custom-fib` or
+  `compare`.
+- `ecmp-default-hash-mode <3|4|5>` — tuple size for ECMP hashing;
+  default 5.
+- `fib-v4-max-entries` / `fib-v6-max-entries` / `nexthops-max-entries`
+  / `ecmp-groups-max-entries` — custom-FIB map sizing. Parsed but
+  not yet runtime-applied; the BPF ELF embeds compile-time sizes
+  that cover the current DFZ. Override only if you've rebuilt the
+  BPF with new caps.
 
 SIGHUP re-reads the config and applies delta-only changes to
 allowlists and VLAN-resolve state without detaching. Attach-set
