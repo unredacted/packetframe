@@ -167,7 +167,11 @@ mod tests {
     }
 
     fn stats(matched_v4: u64, drops: u64) -> Vec<u64> {
-        let mut s = vec![0u64; 19];
+        // Matches STATS_COUNT in bpf/src/maps.rs (32 after the Option F
+        // Phase 1 additions). Was 19 pre-Phase-1 — that was already
+        // off-by-one against the 20-variant StatIdx enum; fixed in
+        // passing by the custom-FIB work that bumped STATS_COUNT.
+        let mut s = vec![0u64; crate::metrics::COUNTER_NAMES.len()];
         s[STAT_MATCHED_V4] = matched_v4;
         s[STAT_DROP_UNREACHABLE] = drops;
         s

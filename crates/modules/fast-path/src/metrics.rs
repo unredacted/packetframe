@@ -13,8 +13,13 @@ use std::fmt::Write as _;
 /// Wire-format counter names, index-aligned with `StatIdx` in
 /// `bpf/src/maps.rs`. These become the `packetframe_<name>_total`
 /// metric names; changing any value changes the operator-facing
-/// metric name.
-pub const COUNTER_NAMES: [&str; 19] = [
+/// metric name. Append-only — renumbering breaks dashboards.
+///
+/// Phase 1 (Option F custom FIB): length grew from 19 → 32. The
+/// pre-existing 19 was already off-by-one (`err_head_shift` at
+/// index 19 silently dropped); fixed in passing. Indices 20-31 are
+/// the new custom-FIB counters.
+pub const COUNTER_NAMES: [&str; 32] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -34,6 +39,20 @@ pub const COUNTER_NAMES: [&str; 19] = [
     "err_vlan",
     "pass_not_in_devmap",
     "pass_complex_header",
+    "err_head_shift",
+    // --- Custom FIB (Option F, Phase 1) ---
+    "custom_fib_hit",
+    "custom_fib_miss",
+    "custom_fib_no_neigh",
+    "compare_agree",
+    "compare_disagree",
+    "ecmp_hash_v4",
+    "ecmp_hash_v6",
+    "ecmp_dead_leg_fallback",
+    "route_source_resync",
+    "neigh_cache_miss",
+    "nexthop_seq_retry",
+    "bmp_peer_down",
 ];
 
 /// Render a Prometheus textfile body from stat values + module uptime.
@@ -74,12 +93,12 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates —
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 19);
+        assert_eq!(COUNTER_NAMES.len(), 32);
     }
 
     #[test]
     fn rendered_output_contains_every_counter() {
-        let stats = vec![0u64; 19];
+        let stats = vec![0u64; COUNTER_NAMES.len()];
         let body = render_textfile(&stats, 42);
         for name in COUNTER_NAMES {
             let metric = if name.ends_with("_total") {
@@ -95,7 +114,7 @@ mod tests {
 
     #[test]
     fn counter_names_ending_in_total_are_not_double_suffixed() {
-        let stats = vec![0u64; 19];
+        let stats = vec![0u64; COUNTER_NAMES.len()];
         let body = render_textfile(&stats, 0);
         assert!(body.contains("packetframe_rx_total{module=\"fast-path\"}"));
         assert!(!body.contains("packetframe_rx_total_total"));
@@ -103,10 +122,10 @@ mod tests {
 
     #[test]
     fn rendered_output_has_type_header_per_counter() {
-        let stats = vec![1u64; 19];
+        let stats = vec![1u64; COUNTER_NAMES.len()];
         let body = render_textfile(&stats, 0);
         let type_lines = body.lines().filter(|l| l.starts_with("# TYPE")).count();
-        // 19 counters + 1 uptime gauge
-        assert_eq!(type_lines, 20);
+        // COUNTER_NAMES.len() counters + 1 uptime gauge.
+        assert_eq!(type_lines, COUNTER_NAMES.len() + 1);
     }
 }

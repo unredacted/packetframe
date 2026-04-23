@@ -54,6 +54,22 @@ pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
 /// §11.1(c)). Keep in lockstep with the BPF side.
 pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 
+/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_CUSTOM_FIB` (Option F).
+/// Set when `forwarding-mode` is `custom-fib` or `compare`; routes
+/// the XDP program to consult `FIB_V4`/`FIB_V6` instead of
+/// `bpf_fib_lookup()`. Not yet read from the XDP program — Phase 1
+/// Slice 1B lands the dispatch gate. Kept in lockstep with the BPF
+/// side so userspace writes the right bit.
+#[allow(dead_code)]
+pub(crate) const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
+
+/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_COMPARE_MODE` (Option F).
+/// Enables compare mode (both lookups run, forward via kernel
+/// result, bump disagreement counter). Requires
+/// `FP_CFG_FLAG_CUSTOM_FIB`; userspace rejects compare without it.
+#[allow(dead_code)]
+pub(crate) const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
+
 /// Minimum mainline Linux version that ships the rvu-nicpf XDP fix
 /// (commit 04f647c8e456). Kernels below this expose both the
 /// xdp.data_hard_start offset bug (workaroundable via head-shift) AND
@@ -1175,7 +1191,13 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
 fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
     stats: &aya::maps::PerCpuArray<T, u64>,
 ) -> ModuleResult<Vec<u64>> {
-    let mut out = vec![0u64; 19];
+    // `STATS_COUNT` in bpf/src/maps.rs is 32 as of Phase 1 (20 core
+    // + 12 custom-FIB). Previous versions hardcoded 19 — an off-by-one
+    // that hid the `err_head_shift` counter from status readback.
+    // Keep this in lockstep with the BPF side or the last counters
+    // show zero unfairly.
+    const STATS_LEN: usize = 32;
+    let mut out = vec![0u64; STATS_LEN];
     for (idx, slot) in out.iter_mut().enumerate() {
         let values = stats
             .get(&(idx as u32), 0)

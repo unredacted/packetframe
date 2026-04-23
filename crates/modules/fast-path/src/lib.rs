@@ -16,6 +16,7 @@ use packetframe_common::module::{
 };
 
 pub mod breaker;
+pub mod fib;
 pub mod metrics;
 pub mod pin;
 pub mod registry;
@@ -97,13 +98,13 @@ impl FastPathModule {
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
         match &self.state {
             Some(s) => linux_impl::snapshot_stats(s),
-            None => Ok(vec![0u64; 20]),
+            None => Ok(vec![0u64; 32]),
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
-        Ok(vec![0u64; 20])
+        Ok(vec![0u64; 32])
     }
 }
 
