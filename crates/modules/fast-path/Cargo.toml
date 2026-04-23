@@ -19,6 +19,13 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
+# bgpkit-parser + bytes are cross-platform: the BMP parser itself
+# doesn't depend on OS-specific APIs, only the TCP listener (Linux)
+# does. Keeping the parser cross-platform lets the `bmp_probe`
+# example binary run on macOS dev loops against captured frames.
+bgpkit-parser.workspace = true
+bytes.workspace = true
+ipnet.workspace = true
 
 # aya (userspace) is Linux-only (uses netlink, SYS_bpf, etc.); the
 # loader implementation is cfg-gated accordingly. Non-Linux builds

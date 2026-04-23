@@ -545,8 +545,25 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         packetframe_common::config::ForwardingMode::CustomFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
-        let ctrl =
-            crate::fib::controller::RouteController::start(&state.bpffs_root).map_err(|e| {
+        // Parse `route-source bmp <addr>:<port>` from the module
+        // config. None → controller runs without a BMP station (test
+        // harness or pre-production smoke test with manual programmer
+        // calls). Some → controller spawns BmpStation on that addr.
+        let bmp_listen = cfg.section.directives.iter().find_map(|d| match d {
+            ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bmp {
+                addr,
+                port,
+            }) => {
+                // `parse()` handles bracketed IPv6 literals
+                // naturally (e.g. `[::1]:6543`).
+                format!("{addr}:{port}")
+                    .parse::<std::net::SocketAddr>()
+                    .ok()
+            }
+            _ => None,
+        });
+        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, bmp_listen)
+            .map_err(|e| {
                 ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
             })?;
         state.route_controller = Some(ctrl);

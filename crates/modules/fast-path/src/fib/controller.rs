@@ -19,6 +19,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use tracing::{info, warn};
 
 use crate::fib::netlink_neigh::{NeighborResolveHandle, NetlinkNeighborResolver};
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
+use crate::fib::route_source_bmp::BmpStation;
 
 /// Grace period for tasks to drain after `cancel()` fires. Netlink
 /// reader and programmer should both unwind well within this.
@@ -58,12 +60,21 @@ pub struct RouteController {
 impl RouteController {
     /// Build and start the controller. `bpffs_root` is the same
     /// `global.bpffs_root` path the loader pins maps under; the
-    /// programmer opens `NEXTHOPS` from
-    /// `<bpffs_root>/fast-path/maps/NEXTHOPS`.
-    pub fn start(bpffs_root: &Path) -> Result<Self, ControllerError> {
+    /// programmer opens each map from its corresponding pin.
+    ///
+    /// `bmp_listen` is `Some(addr:port)` when the operator configured
+    /// `route-source bmp <addr>:<port>`; the controller then spawns
+    /// the BmpStation as a third task alongside the resolver + programmer.
+    /// `None` runs without a live route source — useful for test
+    /// harnesses that drive the programmer directly via its
+    /// `FibProgrammerHandle`.
+    pub fn start(
+        bpffs_root: &Path,
+        bmp_listen: Option<SocketAddr>,
+    ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
-        // what Phase 2 + 3 actually need; larger worker counts buy
-        // nothing because the resolver + programmer aren't CPU-bound.
+        // what Phase 3 actually needs; the resolver, programmer, and
+        // BMP station are all I/O-bound so CPU is never the limit.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -73,11 +84,20 @@ impl RouteController {
 
         let shutdown_token = CancellationToken::new();
         let nexthops = FibProgrammer::open_nexthops(bpffs_root)?;
+        let fib_v4 = FibProgrammer::open_fib_v4(bpffs_root)?;
+        let fib_v6 = FibProgrammer::open_fib_v6(bpffs_root)?;
+        let ecmp_groups = FibProgrammer::open_ecmp_groups(bpffs_root)?;
 
         let (resolver, events_rx, neigh_handle) =
             NetlinkNeighborResolver::new(shutdown_token.clone());
-        let (programmer, prog_handle) =
-            FibProgrammer::new(nexthops, events_rx, shutdown_token.clone());
+        let (programmer, prog_handle) = FibProgrammer::new(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            events_rx,
+            shutdown_token.clone(),
+        );
 
         let resolver_task = runtime.spawn(async move {
             if let Err(e) = resolver.run().await {
@@ -89,15 +109,34 @@ impl RouteController {
         });
         let programmer_task = runtime.spawn(async move { programmer.run().await });
 
-        info!(
-            "RouteController started: NetlinkNeighborResolver + FibProgrammer spawned \
-             on dedicated 2-thread tokio runtime"
-        );
+        let mut tasks = vec![resolver_task, programmer_task];
+
+        // Spawn BmpStation iff the operator asked for `route-source bmp`.
+        // Without that, the programmer still works — test harnesses
+        // drive it directly via its handle — but no live routes flow in.
+        if let Some(addr) = bmp_listen {
+            let station = BmpStation::new(addr, prog_handle.clone(), shutdown_token.clone());
+            let bmp_task = runtime.spawn(async move {
+                if let Err(e) = station.run().await {
+                    warn!(error = %e, "BmpStation task exited with error");
+                }
+            });
+            tasks.push(bmp_task);
+            info!(
+                bmp_addr = %addr,
+                "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation"
+            );
+        } else {
+            info!(
+                "RouteController started: NetlinkNeighborResolver + FibProgrammer \
+                 (no BmpStation — `route-source` not configured)"
+            );
+        }
 
         Ok(Self {
             runtime: Some(runtime),
             shutdown_token,
-            tasks: vec![resolver_task, programmer_task],
+            tasks,
             neigh_handle,
             prog_handle,
         })
