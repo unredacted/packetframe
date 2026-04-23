@@ -35,9 +35,12 @@ use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{
     link::{LinkAttribute, LinkMessage},
     neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState},
+    route::RouteAttribute,
     RouteNetlinkMessage,
 };
-use rtnetlink::{new_connection, new_multicast_connection, MulticastGroup};
+use rtnetlink::{
+    new_connection, new_multicast_connection, Handle, MulticastGroup, RouteMessageBuilder,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -144,7 +147,7 @@ impl NetlinkNeighborResolver {
         }
 
         let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
-        let (connection, _handle, mut messages) = new_multicast_connection(&groups)
+        let (connection, handle, mut messages) = new_multicast_connection(&groups)
             .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
         tokio::spawn(connection);
         info!(
@@ -170,13 +173,10 @@ impl NetlinkNeighborResolver {
                 req = self.resolve_rx.recv() => {
                     match req {
                         Some(ip) => {
-                            // Phase 3.6 full proactive resolve lands in Slice 3.6B
-                            // (next commit). For this slice the handle still logs
-                            // and relies on first-packet kernel ARP.
-                            debug!(
-                                ?ip,
-                                "proactive resolve request queued (Phase 3.6B TODO)"
-                            );
+                            // Best-effort proactive resolve. If the route
+                            // lookup or neighbor add fails, log at debug
+                            // and fall back to first-packet kernel ARP.
+                            issue_proactive_resolve(&handle, ip).await;
                         }
                         None => {
                             // All NeighborResolveHandle clones dropped; continue
@@ -244,6 +244,88 @@ impl NetlinkNeighborResolver {
             }
             _ => {}
         }
+    }
+}
+
+/// Proactively kick kernel ARP/ND for `ip`. Looks up the route to
+/// find the egress ifindex, then issues `RTM_NEWNEIGH` with
+/// `state = NUD_NONE`. The kernel responds by starting resolution;
+/// the eventual `RTM_NEWNEIGH` with a resolved state arrives via the
+/// multicast subscription and turns into `NeighEvent::Learned` through
+/// the normal path.
+///
+/// Best-effort. If the route lookup can't find an egress (dest
+/// unroutable, or kernel's NETLINK_GET_STRICT_CHK doesn't accept our
+/// message shape), or the neighbor add fails (EEXIST because the
+/// neighbor already exists, permission issues, etc.), we log at debug
+/// and return. The fallback is "kernel resolves when real traffic
+/// arrives" — exactly what we'd get without proactive resolve, so
+/// the only cost of a proactive-resolve failure is one-packet latency
+/// on first forward.
+async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
+    let (oif, plen) = match ip {
+        IpAddr::V4(v4) => {
+            let req = RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(IpAddr::V4(v4), 32)
+                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
+                .build();
+            (lookup_oif(handle, req).await, 32u8)
+        }
+        IpAddr::V6(v6) => {
+            let req = RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(IpAddr::V6(v6), 128)
+                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
+                .build();
+            (lookup_oif(handle, req).await, 128u8)
+        }
+    };
+    let _ = plen; // retained for future per-family path divergence if needed
+    let oif = match oif {
+        Some(i) => i,
+        None => {
+            debug!(
+                ?ip,
+                "proactive resolve: route lookup returned no OIF; skipping"
+            );
+            return;
+        }
+    };
+    // Issue the RTM_NEWNEIGH with NUD_NONE. The kernel interprets
+    // "state NONE + no lladdr" as "initialize this neighbor and start
+    // resolving." Replace lets the call be idempotent — if the
+    // neighbor already exists, we quietly succeed.
+    match handle
+        .neighbours()
+        .add(oif, ip)
+        .state(NeighbourState::None)
+        .replace()
+        .execute()
+        .await
+    {
+        Ok(()) => debug!(?ip, oif, "proactive resolve kicked"),
+        Err(e) => debug!(?ip, oif, error = %e, "proactive resolve failed"),
+    }
+}
+
+/// Query the main routing table for `msg`, return the OIF of the
+/// first route returned. Kernel answers via a stream; we only care
+/// about the first entry — subsequent entries for multipath routes
+/// are handled at the programmer level via ECMP groups.
+async fn lookup_oif(
+    handle: &Handle,
+    msg: netlink_packet_route::route::RouteMessage,
+) -> Option<u32> {
+    let mut routes = handle.route().get(msg).execute();
+    match routes.try_next().await {
+        Ok(Some(route)) => {
+            for attr in route.attributes {
+                if let RouteAttribute::Oif(idx) = attr {
+                    return Some(idx);
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
