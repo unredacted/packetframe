@@ -35,6 +35,27 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # GitHub's `ubuntu-latest` runners ship with ~14 GB free after
+      # the preinstalled toolchains (CodeQL, Android SDK, .NET, etc.).
+      # Adding the Option F tokio/rtnetlink/futures dep graph pushes
+      # target/ past that during debug-profile linking and we get
+      # "ld: signal 7 (Bus error)" / "No space left on device".
+      # Dropping the hosted-tool caches we don't use recovers ~20 GB,
+      # which is plenty of headroom. Standard
+      # jlumbroso/free-disk-space-style idiom, inlined to avoid
+      # pulling a non-first-party action.
+      - name: Free disk space on runner
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo docker system prune -af 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
       - name: Install Rust stable + nightly (for BPF)
         run: |
           rustup install ${RUST_STABLE} --profile minimal
