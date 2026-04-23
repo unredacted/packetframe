@@ -109,8 +109,12 @@ If it's missing, check:
 birdc show route for 1.2.3.4
 # What the kernel says (main table, should be minimal under Option F):
 ip route get 1.2.3.4
-# What packetframe would do: currently requires tcpdump/BPF-inspect;
-# `packetframe-ctl fib lookup` lands in Phase 3.5+.
+# What packetframe has in its BPF maps (Phase 3.8+):
+sudo packetframe fib lookup 1.2.3.4
+# Full dump (O(N) on FIB size; don't do this casually on a 1M-route table):
+sudo packetframe fib dump-v4 | head -50
+# Just occupancy / mode / hash settings:
+sudo packetframe fib stats
 ```
 
 ### Force a BMP resync
@@ -125,6 +129,71 @@ birdc enable bmp1
 packetframe emits `RouteEvent::Resync` on disconnect and receives the
 fresh dump on reconnect. Stale entries from before the reconnect are
 GC'd by `InitiationComplete` (Phase 3.5+) or the next Resync.
+
+### Inspecting the FIB programmatically
+
+The `packetframe fib` subcommand opens the pinned BPF maps directly
+— no daemon IPC. Works as long as the pins exist (i.e., after
+`systemctl stop packetframe` but before `detach --all`).
+
+```sh
+# LPM-resolve a single IP.
+sudo packetframe fib lookup 8.8.8.8
+
+# Walk the whole FIB (O(N); slow on a 1M-route table).
+sudo packetframe fib dump-v4
+
+# Occupancy / mode / hash block only — scriptable.
+sudo packetframe fib stats
+```
+
+### Prometheus metrics for custom-FIB
+
+Alongside the existing counter family, the textfile exporter emits:
+
+- `packetframe_fib_forwarding_mode{mode="kernel-fib|custom-fib|compare"}`
+  — one-hot gauge; alert on unexpected transitions.
+- `packetframe_nexthops{state="resolved|failed|stale|unwritten_or_incomplete"}`
+  — NEXTHOPS state bucket counts.
+- `packetframe_nexthops_max` — configured NEXTHOPS capacity.
+- `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`.
+- `packetframe_fib_default_hash_mode` — 3/4/5-tuple.
+
+Example alerts:
+
+```promql
+# 80% NEXTHOPS occupancy.
+(packetframe_nexthops{state="resolved"} + packetframe_nexthops{state="failed"})
+  / packetframe_nexthops_max > 0.8
+
+# Unexpected forwarding-mode transition.
+changes(packetframe_fib_forwarding_mode{mode="custom-fib"}[5m]) > 0
+```
+
+### Integrity check + BmpStalled alert
+
+When `route-source bmp` is configured, the daemon runs a 5-minute
+periodic job that shells out to `birdc show route count` and
+`birdc show protocols`, compares the totals against the
+programmer's mirror size, and logs warnings on drift ≥ 1%:
+
+```
+WARN integrity drift above threshold bird_routes=1048587 packetframe_routes=1048501 drift_fraction=0.000082
+```
+
+The drift threshold is `IntegrityConfig::drift_warn_fraction`
+(default `0.01` = 1%). Below threshold goes to `DEBUG` level only.
+
+BmpStalled:
+
+```
+WARN BMP session appears stalled (no ROUTE MONITORING + bird reports Established peers) quiet_seconds=312 bird_established_peers=2
+```
+
+Fires on: no ROUTE MONITORING for ≥ 5 min AND bird's cached
+Established-peer-count ≥ 1 AND process uptime > 10 min. Gated on
+the `birdc show protocols` cache to avoid false-positives during
+bird outages.
 
 ## Cutover and rollback
 
@@ -188,6 +257,75 @@ sudo systemctl start packetframe
 the kernel FIB again, udapi parses them, parse-error window opens up.
 Rollback is "restore service now," not a steady state. Follow it with
 same-day diagnosis and a forward-fix plan.
+
+### Phase 4 bird + pathvector config
+
+For a cutover to `forwarding-mode custom-fib`, bird's BMP protocol
+dials the packetframe station, and bird's kernel export drops BGP
+routes so udapi stays off the BGP parse path.
+
+Pathvector template addition (inside the appropriate `global:` /
+`kernel:` / `templates:` section — adapt to your deployment):
+
+```yaml
+# bird 2.17 Loc-RIB BMP export. Station address matches the
+# `route-source bmp <addr>:<port>` in packetframe.conf.
+bmp:
+  bmp1:
+    station-address: 127.0.0.1
+    station-port: 6543
+    monitoring-rib: local   # RFC 9069 Loc-RIB (bird 2.17+).
+
+# Restrict the kernel-export filter so BGP-learned routes stop
+# flowing to the kernel FIB. Customer /32s, connected, static
+# default still go; udapi parses those fine.
+kernel-export-filter: |
+  if source = RTS_BGP then reject;
+  accept;
+```
+
+Validate after pushing:
+
+```sh
+birdc show protocols | grep bmp1           # state=up
+birdc show route count | head              # count matches packetframe mirror ±convergence noise
+sudo packetframe fib stats                 # forwarding-mode=custom-fib
+ip route | wc -l                           # kernel FIB should drop ~1M entries
+```
+
+### Phase 4 systemd ordering
+
+Packetframe's BMP station binds before bird dials in, so the service
+order must be `packetframe.service` first, `bird.service` second.
+
+`/etc/systemd/system/packetframe.service.d/bmp-ordering.conf`:
+
+```ini
+[Unit]
+Before=bird.service
+# Optional but recommended: fail the boot if bird can't start, so
+# an oncall sees it before traffic reaches a forwarding-without-
+# updates window.
+Wants=bird.service
+```
+
+`/etc/systemd/system/bird.service.d/wait-for-packetframe.conf`:
+
+```ini
+[Unit]
+After=packetframe.service
+# Cheap guard against races at boot — wait up to 30 s for the BMP
+# listener to be reachable before dialing.
+[Service]
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ss -Htnl sport = :6543 | grep -q . && exit 0; sleep 1; done; exit 0'
+```
+
+Reload + restart the units after dropping these files:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart packetframe bird
+```
 
 ## Triage by symptom
 
@@ -287,16 +425,24 @@ landed since the runbook was first written.
   `NEXTHOPS[id].src_mac` is the egress iface MAC, not zero.
 - ✅ **InitiationComplete quiescence timer** (Phase 3.5). Fires once
   per BMP connection after 5 s of no RouteMonitoring frames.
-- **`packetframe-ctl fib dump/lookup/stats`** subcommands are not yet
-  implemented. Use `packetframe status` + counter deltas for now.
-- **Prometheus metrics** are limited to the existing textfile counters
-  in `/var/lib/node_exporter/textfile/packetframe.prom`. Custom-FIB
-  occupancy isn't exported yet.
-- **Offline comparison harness** isn't wired into CI yet; we rely on
-  the staging soak + `compare` mode for pre-cutover validation.
-- **Netns integration test + BMP mock test** — Phase 3.6 ships the
-  code for both sides (resolver + BMP station) but the end-to-end
-  netns tests that drive `kernel neigh → NeighborResolver → NEXTHOPS`
-  and `captured BMP frames → BmpStation → FibProgrammer → FIB_V4` are
-  deferred to a follow-up. CI's qemu jobs still validate all unit
-  tests, and the staging soak validates the real thing end-to-end.
+- ✅ **`packetframe fib` subcommands** (Phase 3.8). `dump-v4 / dump-v6
+  / lookup <ip> / stats` ship in the main binary. Opens the pinned
+  maps directly; works without the daemon running.
+- ✅ **Custom-FIB Prometheus metrics** (Phase 3.8). The textfile
+  exporter now emits `packetframe_fib_forwarding_mode{mode="..."}`,
+  `packetframe_nexthops{state="..."}`, `packetframe_nexthops_max`,
+  `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`,
+  and `packetframe_fib_default_hash_mode` on the usual 15 s cadence.
+- ✅ **Offline comparison harness** (Phase 3.8). `tests/fib_comparison.rs`
+  drives a synthetic RIB through the programmer and asserts the LPM
+  lookups resolve correctly — runs in every qemu-verifier CI job.
+- ✅ **Integrity check + BmpStalled alert** (Phase 3.8). When BMP is
+  configured, the RouteController spawns a 5-minute periodic job
+  that cross-checks `birdc show route count` against the mirror size
+  and logs a warning on ≥1% drift. BmpStalled fires (warning log)
+  when no ROUTE MONITORING in 5 min AND bird reports ≥1 Established
+  peer AND process uptime > 10 min.
+- ✅ **Netns integration test + BMP integration test** (Phase 3.7).
+  `tests/neigh_resolver_netns.rs` + `tests/fib_programmer_integration.rs`
+  cover the resolver and programmer paths end-to-end under sudo in
+  CI's qemu-verifier jobs.
