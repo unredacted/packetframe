@@ -15,6 +15,12 @@ pub mod types;
 pub mod controller;
 
 #[cfg(target_os = "linux")]
+pub mod inspect;
+
+#[cfg(target_os = "linux")]
+pub mod integrity;
+
+#[cfg(target_os = "linux")]
 pub mod netlink_neigh;
 
 #[cfg(target_os = "linux")]

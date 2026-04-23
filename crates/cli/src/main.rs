@@ -10,6 +10,8 @@
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod breaker;
 mod feasibility;
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+mod fib_cli;
 mod loader;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod metrics;
@@ -118,6 +120,15 @@ enum Command {
         map: String,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+
+    /// Inspect the custom-FIB maps (Option F, Phase 3.8). Opens the
+    /// pinned LPM tries / nexthop arrays directly — works without the
+    /// daemon running.
+    #[cfg(all(target_os = "linux", feature = "fast-path"))]
+    Fib {
+        #[command(subcommand)]
+        op: fib_cli::FibOp,
     },
 
     /// Attach a diagnostic XDP program, dump the first 16 bytes of a
@@ -246,6 +257,8 @@ fn main() -> ExitCode {
         }
         Command::Reconfigure { .. } => not_implemented("reconfigure"),
         Command::Map { .. } => not_implemented("map"),
+        #[cfg(all(target_os = "linux", feature = "fast-path"))]
+        Command::Fib { op } => fib_cli::run(op),
         #[cfg(feature = "probe")]
         Command::Probe {
             iface,

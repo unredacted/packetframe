@@ -46,7 +46,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bgpkit_parser::models::{ElemType, NetworkPrefix};
 use bgpkit_parser::parser::bmp::messages::*;
@@ -83,7 +85,28 @@ pub struct BmpStation {
     listen_addr: SocketAddr,
     prog_handle: FibProgrammerHandle,
     shutdown: CancellationToken,
+    /// Shared atomic updated on each ROUTE MONITORING frame. Unix
+    /// seconds; `0` means "never seen one since process start."
+    /// Exposed so a stall-monitor task can read it without holding
+    /// a reference to the BmpStation itself.
+    last_rm_unix: Arc<AtomicI64>,
+    /// Optional integrity snapshot. When `Some`, the stall monitor
+    /// reads `bird_established_peers`: an alert only fires when bird
+    /// thinks there's at least one peer we should be hearing from.
+    stall_gate: Option<SharedIntegritySnapshot>,
 }
+
+/// Re-export for callers building the station.
+pub type SharedIntegritySnapshot = crate::fib::integrity::SharedSnapshot;
+
+/// After this long with no ROUTE MONITORING frame, the stall monitor
+/// considers the session stalled. Plan: 5 min.
+pub const STALL_THRESHOLD: Duration = Duration::from_secs(300);
+/// First alert suppressed for this long after process start so the
+/// integrity cache can warm and the initial RIB dump can complete.
+pub const STALL_STARTUP_SUPPRESSION: Duration = Duration::from_secs(600);
+/// Cadence at which the stall monitor re-evaluates the condition.
+pub const STALL_TICK: Duration = Duration::from_secs(30);
 
 impl BmpStation {
     pub fn new(
@@ -95,7 +118,18 @@ impl BmpStation {
             listen_addr,
             prog_handle,
             shutdown,
+            last_rm_unix: Arc::new(AtomicI64::new(0)),
+            stall_gate: None,
         }
+    }
+
+    /// Attach the integrity checker's snapshot so `run()` spawns a
+    /// stall monitor alongside the accept loop. Without this, stall
+    /// detection is silent — appropriate for test harnesses that
+    /// don't care about the alert path.
+    pub fn with_stall_gate(mut self, snapshot: SharedIntegritySnapshot) -> Self {
+        self.stall_gate = Some(snapshot);
+        self
     }
 
     /// Main loop: bind, accept, handle one connection at a time.
@@ -110,10 +144,28 @@ impl BmpStation {
             .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.listen_addr)))?;
         info!(addr = %self.listen_addr, "BMP station listening");
 
+        // Optional stall monitor. Fires a warning log when no ROUTE
+        // MONITORING frame arrives for `STALL_THRESHOLD` *and* the
+        // integrity check reports ≥1 Established peer. Suppressed for
+        // `STALL_STARTUP_SUPPRESSION` so the initial RIB dump has a
+        // chance to land.
+        let stall_task = self.stall_gate.clone().map(|snap| {
+            let last_rm = self.last_rm_unix.clone();
+            let shutdown = self.shutdown.clone();
+            let start = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            tokio::spawn(async move { stall_monitor(last_rm, snap, shutdown, start).await })
+        });
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     info!("BmpStation shutdown requested");
+                    if let Some(t) = stall_task {
+                        t.abort();
+                    }
                     return Ok(());
                 }
                 accept = listener.accept() => {
@@ -174,7 +226,17 @@ impl BmpStation {
                         Some(m) => {
                             frames_parsed += 1;
                             if matches!(m.message_body, BmpMessageBody::RouteMonitoring(_)) {
-                                last_route_monitoring = Some(std::time::Instant::now());
+                                let now = std::time::Instant::now();
+                                last_route_monitoring = Some(now);
+                                // Publish wall-clock unix seconds so
+                                // the stall monitor (a separate task
+                                // with no direct reference to this
+                                // loop's `Instant`) can evaluate age.
+                                let unix = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+                                self.last_rm_unix.store(unix, Ordering::Relaxed);
                             }
                             self.process_msg(m).await;
                         }
@@ -330,6 +392,82 @@ impl BmpStation {
 }
 
 /// Reader task. Reads BMP frames from `stream` and pushes parsed
+/// Stall monitor: fires a warning log if no ROUTE MONITORING frame
+/// has arrived for [`STALL_THRESHOLD`] *and* the integrity check
+/// reports ≥1 Established BGP peer. The cross-check avoids a
+/// false-positive during a global bird outage — in that case the
+/// alert we'd actually want is "bird down," not "BMP stalled."
+///
+/// Startup suppression: first [`STALL_STARTUP_SUPPRESSION`] of
+/// process life is quiet so the initial RIB dump can complete.
+/// The caller passes `process_start_unix` so we don't re-measure
+/// here (and because the function has no other access to a clock
+/// reference point).
+///
+/// Evaluation cadence is [`STALL_TICK`] — a real stall sits long
+/// enough for any reasonable poll interval.
+async fn stall_monitor(
+    last_rm_unix: Arc<AtomicI64>,
+    integrity: SharedIntegritySnapshot,
+    shutdown: CancellationToken,
+    process_start_unix: i64,
+) {
+    let mut tick = tokio::time::interval(STALL_TICK);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                // Startup suppression.
+                if now - process_start_unix < STALL_STARTUP_SUPPRESSION.as_secs() as i64 {
+                    continue;
+                }
+                let last_rm = last_rm_unix.load(Ordering::Relaxed);
+                // `0` means "no RM ever seen." After startup
+                // suppression that's itself a stall, but only if bird
+                // says it has Established peers.
+                let quiet_seconds = if last_rm == 0 {
+                    now - process_start_unix
+                } else {
+                    now - last_rm
+                };
+                if quiet_seconds < STALL_THRESHOLD.as_secs() as i64 {
+                    continue;
+                }
+                // Gate on bird's cached peer state.
+                let established = integrity.read().await.bird_established_peers;
+                match established {
+                    None => {
+                        // Integrity cache cold. Can't gate the alert
+                        // responsibly; stay quiet rather than risk
+                        // false-positives during bird downtime.
+                        debug!(
+                            quiet_seconds,
+                            "BMP quiet but integrity cache is cold — stall alert suppressed"
+                        );
+                    }
+                    Some(0) => {
+                        debug!(
+                            quiet_seconds,
+                            "BMP quiet but bird reports zero Established peers — stall alert suppressed"
+                        );
+                    }
+                    Some(n) => {
+                        warn!(
+                            quiet_seconds,
+                            bird_established_peers = n,
+                            "BMP session appears stalled (no ROUTE MONITORING + bird reports Established peers)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// messages into `tx` until EOF or error. Exits cleanly (`Ok(())`)
 /// on EOF; error on anything else. Kept in its own function so the
 /// main select! loop never holds a non-cancel-safe `read_exact`
