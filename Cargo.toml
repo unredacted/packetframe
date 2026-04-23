@@ -56,7 +56,7 @@ aya-build = "=0.1.3"
 # channels between subsystems, cooperative shutdown. `full` pulls in
 # tokio-fs and process machinery we don't need; keeping this lean keeps
 # build times and binary size reasonable on cross targets.
-tokio = { version = "1.52", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { version = "1.52", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tokio-util = { version = "0.7", default-features = false }
 # rtnetlink is our async netlink client for RTM_NEWNEIGH / RTM_DELNEIGH
 # and link-state events. It layers on netlink-packet-route which we also
