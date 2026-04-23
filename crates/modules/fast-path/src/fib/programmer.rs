@@ -191,6 +191,20 @@ impl FibProgrammerHandle {
             .map_err(|_| ProgrammerError::Shutdown)?;
         rx.await.map_err(|_| ProgrammerError::Shutdown)?
     }
+
+    /// Return the current `(v4, v6)` route mirror counts. Used by the
+    /// integrity checker to diff against bird's `show route count`.
+    /// Reads the programmer's in-memory mirror, not the BPF maps —
+    /// the mirror is the authoritative record of what the programmer
+    /// believes it has written.
+    pub async fn mirror_counts(&self) -> Result<(usize, usize), ProgrammerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::MirrorCounts { reply: tx })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown)?;
+        rx.await.map_err(|_| ProgrammerError::Shutdown)
+    }
 }
 
 enum Command {
@@ -208,6 +222,11 @@ enum Command {
     ApplyRouteEvent {
         event: RouteEvent,
         reply: oneshot::Sender<Result<(), ProgrammerError>>,
+    },
+    /// Report `(routes_v4.len(), routes_v6.len())` from the
+    /// programmer's mirror state. Used by the integrity checker.
+    MirrorCounts {
+        reply: oneshot::Sender<(usize, usize)>,
     },
 }
 
@@ -465,6 +484,9 @@ impl FibProgrammer {
             }
             Command::ApplyRouteEvent { event, reply } => {
                 let _ = reply.send(self.on_route_event(event));
+            }
+            Command::MirrorCounts { reply } => {
+                let _ = reply.send((self.routes_v4.len(), self.routes_v6.len()));
             }
         }
     }

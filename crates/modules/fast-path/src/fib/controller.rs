@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::fib::integrity::{shared_snapshot, IntegrityChecker, IntegrityConfig, SharedSnapshot};
 use crate::fib::netlink_neigh::{NeighborResolveHandle, NetlinkNeighborResolver};
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
 use crate::fib::route_source_bmp::BmpStation;
@@ -55,6 +56,9 @@ pub struct RouteController {
 
     neigh_handle: NeighborResolveHandle,
     prog_handle: FibProgrammerHandle,
+    /// Shared snapshot from the integrity checker. `None` when the
+    /// checker isn't enabled (no BMP configured → no bird to ask).
+    integrity: Option<SharedSnapshot>,
 }
 
 impl RouteController {
@@ -114,17 +118,35 @@ impl RouteController {
         // Spawn BmpStation iff the operator asked for `route-source bmp`.
         // Without that, the programmer still works — test harnesses
         // drive it directly via its handle — but no live routes flow in.
+        let mut integrity: Option<SharedSnapshot> = None;
         if let Some(addr) = bmp_listen {
-            let station = BmpStation::new(addr, prog_handle.clone(), shutdown_token.clone());
+            // Integrity checker runs only when BMP is configured —
+            // without BMP there's no bird session for us to cross-
+            // check against. Defaults (5 min cadence, 1% drift
+            // warn, /usr/sbin/birdc) match the plan.
+            let snapshot = shared_snapshot();
+            let checker = IntegrityChecker::new(
+                IntegrityConfig::default(),
+                snapshot.clone(),
+                prog_handle.clone(),
+                shutdown_token.clone(),
+            );
+            let integrity_task = runtime.spawn(async move { checker.run().await });
+            tasks.push(integrity_task);
+
+            let station = BmpStation::new(addr, prog_handle.clone(), shutdown_token.clone())
+                .with_stall_gate(snapshot.clone());
             let bmp_task = runtime.spawn(async move {
                 if let Err(e) = station.run().await {
                     warn!(error = %e, "BmpStation task exited with error");
                 }
             });
             tasks.push(bmp_task);
+            integrity = Some(snapshot);
+
             info!(
                 bmp_addr = %addr,
-                "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation"
+                "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
             );
         } else {
             info!(
@@ -139,7 +161,16 @@ impl RouteController {
             tasks,
             neigh_handle,
             prog_handle,
+            integrity,
         })
+    }
+
+    /// Shared snapshot from the integrity checker. `None` when BMP
+    /// isn't configured. Callers read the snapshot to diagnose drift
+    /// or to gate a BmpStalled alert on "bird still thinks there are
+    /// peers to hear from."
+    pub fn integrity_snapshot(&self) -> Option<SharedSnapshot> {
+        self.integrity.clone()
     }
 
     /// Cooperative shutdown. Signals the cancellation token, awaits
