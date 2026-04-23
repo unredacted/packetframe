@@ -211,11 +211,19 @@ fn handle_ipv4(
     // Option F: select between custom-FIB (LPM trie + NEXTHOPS) and
     // kernel-FIB (bpf_fib_lookup) based on runtime flags. Compare mode
     // runs both and forwards via the kernel result.
+    //
+    // `l4_ports` returns BE-in-memory u16s (read_unaligned of BE wire
+    // bytes on an LE host) because that's what bpf_fib_lookup's
+    // `__be16` contract wants. Our own hash operates on native u16
+    // values so it's byte-order-agnostic between BPF and the userspace
+    // reference. Byte-swap once at the handoff.
     let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
     let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
+    let sport_h = u16::from_be(sport);
+    let dport_h = u16::from_be(dport);
 
     if use_custom && !compare {
-        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport, dport);
+        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
         return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, true, ingress_vid);
     }
 
@@ -247,7 +255,7 @@ fn handle_ipv4(
         // the operator managed to set COMPARE without CUSTOM_FIB (bug
         // or manual map poke), the branch above is unreachable and
         // we still do only the kernel lookup here.
-        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport, dport);
+        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
         compare_and_bump(ret as u32, &fib, &custom);
     }
 
@@ -300,12 +308,15 @@ fn handle_ipv6(
 
     let (sport, dport) = l4_ports(ctx, ip_offset + Ipv6Hdr::LEN, next);
 
-    // Option F dispatch — see handle_ipv4 for commentary.
+    // Option F dispatch — see handle_ipv4 for commentary, including the
+    // port byte-swap rationale.
     let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
     let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
+    let sport_h = u16::from_be(sport);
+    let dport_h = u16::from_be(dport);
 
     if use_custom && !compare {
-        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport, dport);
+        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport_h, dport_h);
         return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, false, ingress_vid);
     }
 
@@ -331,7 +342,7 @@ fn handle_ipv6(
     };
 
     if compare {
-        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport, dport);
+        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport_h, dport_h);
         compare_and_bump(ret as u32, &fib, &custom);
     }
 

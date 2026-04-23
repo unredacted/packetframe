@@ -86,6 +86,12 @@ impl CustomFibResult {
 /// L4 ports from the packet. Returns a [`CustomFibResult`] the caller
 /// feeds into the existing `dispatch_fib` success / miss paths in
 /// `main.rs`.
+///
+/// `sport` / `dport` are **native-order u16** (host byte order). The
+/// caller is responsible for byte-swapping from the BE-in-memory
+/// representation that `l4_ports` returns for the kernel-FIB's
+/// `__be16` contract. This keeps the hash byte-order-agnostic
+/// between BPF and the userspace reference in `src/fib/hash.rs`.
 #[inline(always)]
 pub fn lookup_v4(
     src: [u8; 4],
@@ -124,7 +130,8 @@ pub fn lookup_v4(
     }
 }
 
-/// IPv6 custom-FIB lookup. See [`lookup_v4`].
+/// IPv6 custom-FIB lookup. See [`lookup_v4`] — same byte-order
+/// contract on `sport` / `dport`.
 #[inline(always)]
 pub fn lookup_v6(
     src: [u8; 16],
