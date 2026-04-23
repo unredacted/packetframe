@@ -73,11 +73,20 @@ impl RouteController {
 
         let shutdown_token = CancellationToken::new();
         let nexthops = FibProgrammer::open_nexthops(bpffs_root)?;
+        let fib_v4 = FibProgrammer::open_fib_v4(bpffs_root)?;
+        let fib_v6 = FibProgrammer::open_fib_v6(bpffs_root)?;
+        let ecmp_groups = FibProgrammer::open_ecmp_groups(bpffs_root)?;
 
         let (resolver, events_rx, neigh_handle) =
             NetlinkNeighborResolver::new(shutdown_token.clone());
-        let (programmer, prog_handle) =
-            FibProgrammer::new(nexthops, events_rx, shutdown_token.clone());
+        let (programmer, prog_handle) = FibProgrammer::new(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            events_rx,
+            shutdown_token.clone(),
+        );
 
         let resolver_task = runtime.spawn(async move {
             if let Err(e) = resolver.run().await {
