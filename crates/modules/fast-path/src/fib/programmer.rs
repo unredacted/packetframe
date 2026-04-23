@@ -583,7 +583,12 @@ impl FibProgrammer {
         };
 
         let entry = match evt {
-            NeighEvent::Learned { mac, ifindex, .. } => {
+            NeighEvent::Learned {
+                mac,
+                ifindex,
+                src_mac,
+                ..
+            } => {
                 // Remember the MAC so later Failed/Gone → revert-to-Incomplete
                 // preserves the last-known-good for diagnostic use if we
                 // ever expose it. Actual forwarding uses the live state only.
@@ -595,14 +600,11 @@ impl FibProgrammer {
                     ifindex,
                     dst_mac: mac,
                     _pad0: [0; 2],
-                    // src_mac unresolved in Phase 2 — we don't yet
-                    // query the egress iface's MAC via netlink. Phase 3
-                    // fills this in alongside BMP peer tracking; for
-                    // Phase 2 tests the src MAC stays zero, which is
-                    // fine because the XDP program just writes
-                    // whatever it finds and the test harness observes
-                    // the dst MAC. Flagged for follow-up.
-                    src_mac: [0; 6],
+                    // src_mac is now provided by the resolver (Phase 3.6).
+                    // Falls back to [0; 6] if the resolver hasn't yet
+                    // cached the egress iface's MAC (link came up after
+                    // startup and we haven't seen its RTM_NEWLINK).
+                    src_mac,
                     _pad1: [0; 2],
                     state: NH_STATE_RESOLVED,
                     family,

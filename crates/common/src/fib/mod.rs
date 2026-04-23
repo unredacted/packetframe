@@ -140,11 +140,19 @@ pub trait NeighborResolver: Send {
 #[derive(Debug, Clone)]
 pub enum NeighEvent {
     /// A neighbor resolved successfully. Programmer writes
-    /// `{mac, ifindex}` into the corresponding `NexthopEntry`.
+    /// `{mac, ifindex, src_mac}` into the corresponding `NexthopEntry`.
+    /// `src_mac` is the MAC of the egress interface (i.e., the MAC
+    /// the XDP program writes as the Ethernet source address on
+    /// redirected frames). Added in Phase 3.6; pre-3.6 the programmer
+    /// wrote `0x00…00` here, which works on most switches but breaks
+    /// policy tools that inspect src_mac. `[0; 6]` is still a valid
+    /// value when the resolver couldn't look up the egress MAC — the
+    /// programmer writes whatever's provided.
     Learned {
         ip: IpAddr,
         mac: [u8; 6],
         ifindex: u32,
+        src_mac: [u8; 6],
     },
     /// Resolution failed after retries. Programmer marks the
     /// nexthop `Failed`; XDP packets for routes pointing at this
