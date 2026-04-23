@@ -150,10 +150,15 @@ jobs:
           # (only the listed overlay paths are writable). Point
           # HOME/CARGO_HOME/RUSTUP_HOME at the /home overlay so rustup
           # can write its state without going read-only.
+          # --memory 4096 (up from 1024): virtme-ng sizes the in-VM
+          # tmpfs against RAM, and the Option F dep graph (tokio +
+          # rtnetlink + netlink-packet-route + futures) pushes
+          # incremental-relink tmpfs usage past the old ~500 MB.
+          # 4 GB RAM ⇒ ~2 GB writable tmpfs, comfortable headroom.
           virtme-ng \
             --run "${KERNEL_IMG}" \
             --pwd \
-            --memory 1024 \
+            --memory 4096 \
             --disable-kvm \
             --verbose \
             -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
