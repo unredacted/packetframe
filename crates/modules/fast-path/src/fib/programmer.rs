@@ -241,11 +241,11 @@ struct RouteRecord {
 }
 
 /// Per-ECMP-group state. Refcount lets many prefixes share one
-/// group. `signature` is the dedup key and mirrors the BPF-side
-/// `EcmpGroup` value's `nh_idx + hash_mode`.
+/// group. The `id` is always the HashMap key we found this record
+/// under; no separate `id` field since we only ever look it up by
+/// that key.
 #[derive(Debug)]
 struct EcmpRecord {
-    id: EcmpGroupId,
     refcount: u32,
     /// Sorted `NexthopId`s + hash_mode. Sorting gives a canonical
     /// signature so `{NH1, NH2}` and `{NH2, NH1}` dedup to the same
@@ -935,16 +935,6 @@ impl FibProgrammer {
 
     // --- FIB map ops ---
 
-    /// Is this a default route (0.0.0.0/0 or ::/0)? Default-route
-    /// replaces use the grace-period reclaim path to avoid a window
-    /// where traffic falls off the FIB.
-    fn is_default_route(prefix: &IpPrefix) -> bool {
-        matches!(
-            prefix,
-            IpPrefix::V4 { prefix_len: 0, .. } | IpPrefix::V6 { prefix_len: 0, .. }
-        )
-    }
-
     fn write_fib_entry(
         &mut self,
         prefix: &IpPrefix,
@@ -1046,7 +1036,6 @@ impl FibProgrammer {
         self.ecmp_by_id.insert(
             id,
             EcmpRecord {
-                id,
                 refcount: 1,
                 nh_ids_sorted: signature.nh_ids_sorted,
                 hash_mode,
