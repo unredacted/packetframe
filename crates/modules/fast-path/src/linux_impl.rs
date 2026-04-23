@@ -188,6 +188,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 
     populate_cfg(&mut ebpf, cfg)?;
     populate_allowlists(&mut ebpf, cfg)?;
+    populate_fib_config(&mut ebpf, cfg)?;
 
     Ok(ActiveState {
         ebpf,
@@ -208,9 +209,36 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         })
         .unwrap_or(false);
 
+    // Option F forwarding-mode → CFG flag bits 3-4.
+    // `kernel-fib` (default) leaves both clear; the XDP program
+    // takes the legacy bpf_fib_lookup path. `custom-fib` sets bit 3.
+    // `compare` sets both bits — the program runs both lookups and
+    // forwards via the kernel result. Never set bit 4 without bit 3;
+    // the BPF program's compare-mode branch assumes bit 3 is set.
+    let forwarding = mcfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::ForwardingMode(m) => Some(*m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let fib_flags = match forwarding {
+        packetframe_common::config::ForwardingMode::KernelFib => 0,
+        packetframe_common::config::ForwardingMode::CustomFib => FP_CFG_FLAG_CUSTOM_FIB,
+        packetframe_common::config::ForwardingMode::Compare => {
+            FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_COMPARE_MODE
+        }
+    };
+
     let fp_cfg = FpCfg {
         dry_run: u8::from(dry_run),
-        flags: 0b11, // both IPv4 and IPv6 enabled; bit semantics reserved
+        // bits 0-1: IPv4/IPv6 enabled (historical, load-bearing for
+        // dashboards). bits 3-4: custom-FIB / compare (Option F).
+        // bit 2 (HEAD_SHIFT_128) is OR'd on later in
+        // apply_driver_quirks_cfg for rvu-nicpf attaches.
+        flags: 0b11 | fib_flags,
         _reserved: [0; 2],
         version: FP_CFG_VERSION_V1,
     };
@@ -225,7 +253,47 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         .set(0, fp_cfg, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG map set: {e}")))?;
 
-    info!(dry_run, "fast-path cfg populated");
+    info!(dry_run, forwarding = ?forwarding, "fast-path cfg populated");
+    Ok(())
+}
+
+/// Populate the `FIB_CONFIG` map with the parsed `ecmp-default-hash-mode`
+/// directive (default: 5-tuple). Always runs regardless of forwarding
+/// mode so the XDP program reads consistent config even if an
+/// operator flips to `custom-fib` via `packetframe reconfigure`
+/// later. Fail-soft: if the map is missing from the ELF (older build
+/// during development), log and continue — the BPF program reads the
+/// map defensively and falls back to built-in defaults.
+fn populate_fib_config(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    let hash_mode = mcfg
+        .section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::EcmpDefaultHashMode(m) => Some(m.as_wire()),
+            _ => None,
+        })
+        .unwrap_or(crate::fib::types::FpFibCfg::DEFAULT_HASH_MODE);
+
+    let fib_cfg = crate::fib::types::FpFibCfg {
+        default_hash_mode: hash_mode,
+        _pad: [0; 3],
+        version: crate::fib::types::FpFibCfg::VERSION_V1,
+    };
+
+    let map = match ebpf.map_mut("FIB_CONFIG") {
+        Some(m) => m,
+        None => {
+            info!("FIB_CONFIG map missing from ELF — skipping (older build?)");
+            return Ok(());
+        }
+    };
+    let mut arr: Array<_, crate::fib::types::FpFibCfg> = Array::try_from(map).map_err(|e| {
+        ModuleError::other(MODULE_NAME, format!("FIB_CONFIG Array::try_from: {e}"))
+    })?;
+    arr.set(0, fib_cfg, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG set: {e}")))?;
+    info!(hash_mode, "FIB_CONFIG populated");
     Ok(())
 }
 

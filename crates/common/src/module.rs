@@ -104,6 +104,67 @@ impl HealthCtx {
     }
 }
 
+/// Overall health of a subsystem.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HealthState {
+    /// Subsystem is operating normally; all checks pass.
+    #[default]
+    Healthy,
+    /// Subsystem is operational but partially impaired (e.g. stale
+    /// data, backpressure, one of several redundant inputs down).
+    /// Callers should continue forwarding; alert operators.
+    Degraded,
+    /// Subsystem is not functioning; caller should escalate (process
+    /// supervisor restart, operator page, etc.).
+    Unhealthy,
+}
+
+/// Per-subsystem health entry within a [`HealthReport`]. `name` is
+/// stable for dashboards; changing it breaks operator tooling that
+/// keys on the string.
+#[derive(Debug, Clone)]
+pub struct SubsystemHealth {
+    /// Stable identifier, e.g. `"bmp-station"`, `"netlink-neigh"`,
+    /// `"fib-programmer"`. Append-safe (new subsystems can land);
+    /// rename-unsafe (breaks dashboards).
+    pub name: String,
+    pub state: HealthState,
+    /// Optional human-readable detail. Rendered alongside the state
+    /// in `packetframe status` output and structured logging.
+    pub message: Option<String>,
+    /// Seconds since the subsystem's last successful operation
+    /// (e.g. last ROUTE MONITORING message for the BMP station,
+    /// last neighbor event for netlink). `None` when the notion
+    /// doesn't apply. Operators alert on sustained-high values.
+    pub last_success_age_seconds: Option<u64>,
+}
+
+/// Structured health report returned by `Module::health_check`.
+///
+/// Phase 1 shape carries an overall state + a `Vec<SubsystemHealth>`
+/// populated by modules with internal subsystems (e.g. fast-path's
+/// RouteController, which aggregates BMP + netlink + FibProgrammer
+/// freshness once Phase 2+ lands). Modules without subsystems
+/// return `HealthReport::default()` — an empty, healthy report.
+///
+/// Added in Phase 1 of Option F (custom-FIB migration) because the
+/// prior `ModuleResult<()>` surface couldn't express partial-degraded
+/// states across multiple control-plane subsystems. No dashboards
+/// consume this yet; Phase 3.5 wires it into `packetframe status`.
+#[derive(Debug, Clone, Default)]
+pub struct HealthReport {
+    pub overall: HealthState,
+    pub subsystems: Vec<SubsystemHealth>,
+}
+
+impl HealthReport {
+    /// An empty, healthy report — the default any module with no
+    /// subsystems to report on can return.
+    pub fn healthy() -> Self {
+        Self::default()
+    }
+}
+
 /// Destination for Prometheus textfile emission from
 /// `Module::sample_metrics`. In v0.0.1 this wraps a `String` the loader
 /// flushes; v0.1 adds labels, timestamps, and the textfile atomic-rename.
@@ -138,7 +199,13 @@ pub trait Module: Send + Sync {
 
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()>;
 
-    fn health_check(&self, ctx: &HealthCtx) -> ModuleResult<()>;
+    /// Structured health readback. Returns a [`HealthReport`] the
+    /// caller can render in `packetframe status`, feed to circuit
+    /// breakers, or expose via Prometheus. Phase 1 return type
+    /// replaces the earlier `ModuleResult<()>` which couldn't carry
+    /// per-subsystem detail; modules without subsystems return
+    /// `Ok(HealthReport::default())`.
+    fn health_check(&self, ctx: &HealthCtx) -> ModuleResult<HealthReport>;
 }
 
 #[cfg(test)]
@@ -172,8 +239,8 @@ mod tests {
         fn sample_metrics(&self, _: &mut MetricsWriter<'_>) -> ModuleResult<()> {
             Ok(())
         }
-        fn health_check(&self, _: &HealthCtx) -> ModuleResult<()> {
-            Ok(())
+        fn health_check(&self, _: &HealthCtx) -> ModuleResult<HealthReport> {
+            Ok(HealthReport::default())
         }
     }
 

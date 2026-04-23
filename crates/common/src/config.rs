@@ -152,6 +152,109 @@ pub enum ModuleDirective {
     /// the only defined knob is `rvu-nicpf-head-shift` (SPEC
     /// §11.1(c)) — see [`DriverWorkaround`] for the axes.
     DriverWorkaround(DriverWorkaround),
+    // --- Custom FIB (Option F, Phase 1) ---
+    /// Selects the forwarding lookup path. `kernel-fib` (default)
+    /// uses the existing `bpf_fib_lookup()`; `custom-fib` consults
+    /// the module's own LPM-trie FIB + NEXTHOPS array; `compare`
+    /// runs both and bumps CompareAgree/CompareDisagree (pre-cutover
+    /// validation, temporary).
+    ForwardingMode(ForwardingMode),
+    /// RouteSource configuration — where the custom FIB gets its
+    /// routes. Phase 1 accepts the directive but doesn't yet start
+    /// a live RouteSource; Phase 3 wires up the BMP station.
+    RouteSource(RouteSourceSpec),
+    /// Max entries for the custom-FIB LPM tries and side arrays.
+    /// Accepted but **not yet runtime-applied** — aya / kernel
+    /// allocate maps at compile-time sizes. Phase 1 documents the
+    /// directive so operator config forward-compatibility holds;
+    /// actual runtime sizing requires a recompile of the BPF ELF.
+    FibSize(FibSizeDirective),
+    /// Default ECMP hash tuple width (3, 4, or 5). Written into
+    /// `FIB_CONFIG.default_hash_mode` at load time.
+    EcmpDefaultHashMode(EcmpHashMode),
+}
+
+/// Forwarding-path selector. `KernelFib` keeps today's behavior —
+/// bpf_fib_lookup() and the legacy success path. `CustomFib` routes
+/// through the Option-F LPM trie + nexthop cache. `Compare` runs
+/// both and bumps disagreement counters; the kernel result is
+/// authoritative.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForwardingMode {
+    #[default]
+    KernelFib,
+    CustomFib,
+    Compare,
+}
+
+impl FromStr for ForwardingMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "kernel-fib" => Ok(Self::KernelFib),
+            "custom-fib" => Ok(Self::CustomFib),
+            "compare" => Ok(Self::Compare),
+            other => Err(format!(
+                "expected `kernel-fib`, `custom-fib`, or `compare`, got `{other}`"
+            )),
+        }
+    }
+}
+
+/// RouteSource configuration. Only `bmp <addr>:<port>` is accepted
+/// in Phase 1; other variants land alongside their implementations.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum RouteSourceSpec {
+    /// BMP station listen address. Bird dials out to this
+    /// address:port; packetframe accepts the TCP connection and
+    /// consumes the BMP stream. RFC 7854 roles: bird is the router
+    /// (client), packetframe is the station (server).
+    Bmp { addr: String, port: u16 },
+}
+
+/// One `fib-*-max-entries` directive. Phase 1 accepts these but
+/// doesn't runtime-apply — see the struct-level doc on
+/// [`ModuleDirective::FibSize`].
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum FibSizeDirective {
+    FibV4MaxEntries(u32),
+    FibV6MaxEntries(u32),
+    NexthopsMaxEntries(u32),
+    EcmpGroupsMaxEntries(u32),
+}
+
+/// ECMP hash tuple width. `Three` = src/dst/proto, `Four` = + one
+/// port, `Five` = + both ports. The numeric wire value is the tuple
+/// width and is what `EcmpGroup.hash_mode` stores.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EcmpHashMode {
+    Three,
+    Four,
+    Five,
+}
+
+impl EcmpHashMode {
+    pub fn as_wire(self) -> u8 {
+        match self {
+            Self::Three => 3,
+            Self::Four => 4,
+            Self::Five => 5,
+        }
+    }
+}
+
+impl FromStr for EcmpHashMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "3" => Ok(Self::Three),
+            "4" => Ok(Self::Four),
+            "5" => Ok(Self::Five),
+            other => Err(format!("expected `3`, `4`, or `5`, got `{other}`")),
+        }
+    }
 }
 
 /// One line of `driver-workaround <name> <value>` config.
@@ -587,9 +690,145 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         }
         "circuit-breaker" => parse_circuit_breaker(line, rest),
         "driver-workaround" => parse_driver_workaround(line, rest),
+        "forwarding-mode" => parse_single_arg(line, rest, "forwarding-mode", |t| {
+            let mode: ForwardingMode = t.parse().map_err(|e: String| e)?;
+            Ok(ModuleDirective::ForwardingMode(mode))
+        }),
+        "route-source" => parse_route_source(line, rest),
+        "fib-v4-max-entries" => parse_u32_directive(line, rest, "fib-v4-max-entries", |n| {
+            ModuleDirective::FibSize(FibSizeDirective::FibV4MaxEntries(n))
+        }),
+        "fib-v6-max-entries" => parse_u32_directive(line, rest, "fib-v6-max-entries", |n| {
+            ModuleDirective::FibSize(FibSizeDirective::FibV6MaxEntries(n))
+        }),
+        "nexthops-max-entries" => parse_u32_directive(line, rest, "nexthops-max-entries", |n| {
+            ModuleDirective::FibSize(FibSizeDirective::NexthopsMaxEntries(n))
+        }),
+        "ecmp-groups-max-entries" => {
+            parse_u32_directive(line, rest, "ecmp-groups-max-entries", |n| {
+                ModuleDirective::FibSize(FibSizeDirective::EcmpGroupsMaxEntries(n))
+            })
+        }
+        "ecmp-default-hash-mode" => {
+            parse_single_arg(line, rest, "ecmp-default-hash-mode", |t| {
+                let mode: EcmpHashMode = t.parse().map_err(|e: String| e)?;
+                Ok(ModuleDirective::EcmpDefaultHashMode(mode))
+            })
+        }
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
+        )),
+    }
+}
+
+/// Helper: one argument → one `ModuleDirective`. Centralizes the
+/// "exactly one token, errors if missing or if trailing tokens" check.
+fn parse_single_arg<'a, F>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+    directive: &'static str,
+    f: F,
+) -> Result<ModuleDirective, ConfigError>
+where
+    F: FnOnce(&'a str) -> Result<ModuleDirective, String>,
+{
+    let tok = rest.next().ok_or_else(|| {
+        ConfigError::parse(line, format!("{directive} requires a value"))
+    })?;
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive} takes exactly one argument"),
+        ));
+    }
+    f(tok).map_err(|e| ConfigError::parse(line, format!("{directive}: {e}")))
+}
+
+/// Helper: single-u32 argument variants (`fib-*-max-entries`).
+fn parse_u32_directive<'a, F>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+    directive: &'static str,
+    wrap: F,
+) -> Result<ModuleDirective, ConfigError>
+where
+    F: FnOnce(u32) -> ModuleDirective,
+{
+    let tok = rest.next().ok_or_else(|| {
+        ConfigError::parse(line, format!("{directive} requires a positive integer"))
+    })?;
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive} takes exactly one argument"),
+        ));
+    }
+    let n: u32 = tok.parse().map_err(|e| {
+        ConfigError::parse(line, format!("{directive}: bad integer `{tok}`: {e}"))
+    })?;
+    if n == 0 {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive}: must be >= 1, got 0"),
+        ));
+    }
+    Ok(wrap(n))
+}
+
+/// Parse `route-source <kind> <args...>`. Phase 1 accepts only
+/// `bmp <addr>:<port>`. Other kinds become parse errors so
+/// operators get an explicit message if they configure something
+/// that hasn't landed yet.
+fn parse_route_source<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    let kind = rest.next().ok_or_else(|| {
+        ConfigError::parse(
+            line,
+            "route-source requires a kind + args (e.g. `bmp 127.0.0.1:6543`)",
+        )
+    })?;
+    match kind {
+        "bmp" => {
+            let endpoint = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "route-source bmp requires <addr>:<port>")
+            })?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "route-source bmp takes exactly one argument: <addr>:<port>",
+                ));
+            }
+            let (addr, port_str) = endpoint.rsplit_once(':').ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    format!("route-source bmp: expected <addr>:<port>, got `{endpoint}`"),
+                )
+            })?;
+            if addr.is_empty() {
+                return Err(ConfigError::parse(
+                    line,
+                    "route-source bmp: addr is empty",
+                ));
+            }
+            let port: u16 = port_str.parse().map_err(|e| {
+                ConfigError::parse(
+                    line,
+                    format!("route-source bmp: bad port `{port_str}`: {e}"),
+                )
+            })?;
+            Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bmp {
+                addr: addr.to_string(),
+                port,
+            }))
+        }
+        other => Err(ConfigError::parse(
+            line,
+            format!(
+                "route-source `{other}` unknown (Phase 1 supports only `bmp <addr>:<port>`)"
+            ),
         )),
     }
 }
@@ -1134,5 +1373,138 @@ module fast-path
     fn parses_ipv6_prefix() {
         let p: Ipv6Prefix = "2001:db8::/48".parse().unwrap();
         assert_eq!(p.prefix_len, 48);
+    }
+
+    // --- Option F config directive tests ---
+
+    fn parse_module_body(body: &str) -> Result<ModuleSection, ConfigError> {
+        let s = format!("module fast-path\n{body}");
+        let mut c = Config::parse(&s)?;
+        Ok(c.modules.remove(0))
+    }
+
+    #[test]
+    fn forwarding_mode_accepts_all_three_values() {
+        for (tok, expected) in [
+            ("kernel-fib", ForwardingMode::KernelFib),
+            ("custom-fib", ForwardingMode::CustomFib),
+            ("compare", ForwardingMode::Compare),
+        ] {
+            let m = parse_module_body(&format!("  forwarding-mode {tok}\n")).unwrap();
+            assert_eq!(
+                m.directives.iter().find_map(|d| match d {
+                    ModuleDirective::ForwardingMode(m) => Some(*m),
+                    _ => None,
+                }),
+                Some(expected),
+                "failed for {tok}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarding_mode_rejects_unknown_value() {
+        let e = parse_module_body("  forwarding-mode foo\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("foo"), "msg was {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_parses_endpoint() {
+        let m = parse_module_body("  route-source bmp 127.0.0.1:6543\n").unwrap();
+        let src = m
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::RouteSource(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap();
+        match src {
+            RouteSourceSpec::Bmp { addr, port } => {
+                assert_eq!(addr, "127.0.0.1");
+                assert_eq!(port, 6543);
+            }
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_ipv6_endpoint() {
+        // rsplit_once(':') on `[::1]:6543` cleanly splits off the port.
+        let m = parse_module_body("  route-source bmp [::1]:6543\n").unwrap();
+        let src = m
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::RouteSource(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap();
+        match src {
+            RouteSourceSpec::Bmp { addr, port } => {
+                assert_eq!(addr, "[::1]");
+                assert_eq!(port, 6543);
+            }
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_missing_port_errors() {
+        let e = parse_module_body("  route-source bmp 127.0.0.1\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn route_source_unknown_kind_errors() {
+        let e = parse_module_body("  route-source frr /run/frr/frr.fpm\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("frr") || message.contains("unknown"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fib_max_entries_parse_and_reject_zero() {
+        let m = parse_module_body("  fib-v4-max-entries 1048576\n").unwrap();
+        assert!(m.directives.iter().any(|d| matches!(
+            d,
+            ModuleDirective::FibSize(FibSizeDirective::FibV4MaxEntries(1048576))
+        )));
+
+        let e = parse_module_body("  fib-v4-max-entries 0\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => assert!(message.contains(">= 1")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ecmp_default_hash_mode_parses_valid_widths() {
+        for (tok, expected) in [
+            ("3", EcmpHashMode::Three),
+            ("4", EcmpHashMode::Four),
+            ("5", EcmpHashMode::Five),
+        ] {
+            let m = parse_module_body(&format!("  ecmp-default-hash-mode {tok}\n")).unwrap();
+            assert_eq!(
+                m.directives.iter().find_map(|d| match d {
+                    ModuleDirective::EcmpDefaultHashMode(m) => Some(*m),
+                    _ => None,
+                }),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn ecmp_default_hash_mode_rejects_other_widths() {
+        let e = parse_module_body("  ecmp-default-hash-mode 6\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
     }
 }

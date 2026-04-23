@@ -6,11 +6,13 @@
 //! - [`probe`]: kernel capability probes (see SPEC.md §2.1)
 
 pub mod config;
+pub mod fib;
 pub mod module;
 pub mod probe;
 
 pub use config::{Config, ConfigError, GlobalConfig, ModuleSection};
 pub use module::{
-    Attachment, HealthCtx, HookType, HookUse, LoaderCtx, MetricsWriter, Module, ModuleConfig,
+    Attachment, HealthCtx, HealthReport, HookType, HookUse, LoaderCtx, MetricsWriter, Module,
+    ModuleConfig, SubsystemHealth,
 };
 pub use probe::{Capability, CapabilityStatus, FeasibilityReport};
