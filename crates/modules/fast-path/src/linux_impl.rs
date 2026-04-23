@@ -198,6 +198,24 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
     })
 }
 
+/// Translate a [`ForwardingMode`](packetframe_common::config::ForwardingMode)
+/// into the bits-3-4 portion of `FpCfg.flags`. Shared between
+/// `populate_cfg` (initial load) and `reconcile::reconcile_cfg`
+/// (SIGHUP) so both agree on the mode→bit mapping.
+///
+/// Invariant: `Compare` sets both bits. The BPF program's compare
+/// branch assumes bit 3 is set when bit 4 is; never emit bit 4 alone.
+pub(crate) fn fib_flags_from_forwarding_mode(
+    mode: packetframe_common::config::ForwardingMode,
+) -> u8 {
+    use packetframe_common::config::ForwardingMode;
+    match mode {
+        ForwardingMode::KernelFib => 0,
+        ForwardingMode::CustomFib => FP_CFG_FLAG_CUSTOM_FIB,
+        ForwardingMode::Compare => FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_COMPARE_MODE,
+    }
+}
+
 fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
     let dry_run = mcfg
         .section
@@ -209,12 +227,8 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         })
         .unwrap_or(false);
 
-    // Option F forwarding-mode → CFG flag bits 3-4.
-    // `kernel-fib` (default) leaves both clear; the XDP program
-    // takes the legacy bpf_fib_lookup path. `custom-fib` sets bit 3.
-    // `compare` sets both bits — the program runs both lookups and
-    // forwards via the kernel result. Never set bit 4 without bit 3;
-    // the BPF program's compare-mode branch assumes bit 3 is set.
+    // Option F forwarding-mode → CFG flag bits 3-4. See
+    // fib_flags_from_forwarding_mode for the mapping.
     let forwarding = mcfg
         .section
         .directives
@@ -224,13 +238,7 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
             _ => None,
         })
         .unwrap_or_default();
-    let fib_flags = match forwarding {
-        packetframe_common::config::ForwardingMode::KernelFib => 0,
-        packetframe_common::config::ForwardingMode::CustomFib => FP_CFG_FLAG_CUSTOM_FIB,
-        packetframe_common::config::ForwardingMode::Compare => {
-            FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_COMPARE_MODE
-        }
-    };
+    let fib_flags = fib_flags_from_forwarding_mode(forwarding);
 
     let fp_cfg = FpCfg {
         dry_run: u8::from(dry_run),
