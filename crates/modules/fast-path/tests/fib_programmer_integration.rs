@@ -23,6 +23,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aya::maps::lpm_trie::Key as LpmKey;
@@ -43,12 +44,19 @@ struct PinDirs {
     dir: PathBuf,
 }
 
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl PinDirs {
     fn setup() -> Self {
-        // Unique per-test-process subdir under bpffs so concurrent
-        // tests don't collide on pin paths.
-        let dir = PathBuf::from(BPFFS_ROOT).join(format!("{TEST_PREFIX}-{}", std::process::id()));
-        // Idempotent cleanup of any leftover from a prior crashed run.
+        // Unique per-invocation subdir under bpffs. The test binary PID
+        // is shared across parallel #[test] fns, so include an atomic
+        // counter to disambiguate concurrent harness instances.
+        let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(BPFFS_ROOT).join(format!(
+            "{TEST_PREFIX}-{}-{}",
+            std::process::id(),
+            unique
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir bpffs subdir");
         Self { dir }
@@ -128,7 +136,7 @@ impl ProgrammerHarness {
         // Programmer opens the maps via from_pin. `FibProgrammer::open_*`
         // hard-codes the production pin layout
         // (`<bpffs>/fast-path/maps/<NAME>`); we pin flat under
-        // `<bpffs>/pftestprog-<pid>/<NAME>` for test isolation, so
+        // `<bpffs>/pftestprog-<pid>-<n>/<NAME>` for test isolation, so
         // construct the typed handles directly here.
         let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
         let fib_v4 = open_lpm_v4(&pins.path("FIB_V4"));
