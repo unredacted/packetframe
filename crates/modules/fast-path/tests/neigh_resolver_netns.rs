@@ -48,16 +48,21 @@ struct Names {
     veth_b: String,
 }
 
+static NAMES_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 impl Names {
     fn new() -> Self {
-        // Suffix with PID+thread-hash so concurrent tests don't collide
-        // on the netns/iface namespace.
-        let suffix = std::process::id() % 10_000;
-        // "rn" = resolver netns; keeps names short (IFNAMSIZ limit).
+        // Disambiguate with (pid, per-invocation counter) so parallel
+        // `#[test]` fns in the same binary don't collide on the netns
+        // or interface namespace. IFNAMSIZ is 16, so keep prefixes
+        // short and the numeric tail ≤ ~8 chars.
+        let pid = (std::process::id() % 1000) as u16;
+        let n = NAMES_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let suffix = format!("{pid:03}{n:02}");
         Self {
-            netns: format!("pfrn{suffix:04}"),
-            veth_a: format!("pfra{suffix:04}"),
-            veth_b: format!("pfrb{suffix:04}"),
+            netns: format!("pfrn{suffix}"),
+            veth_a: format!("pfra{suffix}"),
+            veth_b: format!("pfrb{suffix}"),
         }
     }
 }
