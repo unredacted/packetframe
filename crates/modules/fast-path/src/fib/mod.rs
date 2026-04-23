@@ -8,6 +8,7 @@
 //! `crates/common/src/fib/` (Phase 1 Slice 1C). Concrete impls of
 //! those traits live here.
 
+pub mod hash;
 pub mod types;
 
 pub use types::{
