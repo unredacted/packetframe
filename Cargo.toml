@@ -67,6 +67,15 @@ rtnetlink = "0.21"
 netlink-packet-route = "0.30"
 netlink-packet-core = "0.8"
 futures = "0.3"
+# BMP parser for Option F Phase 3's RouteSource. Supports RFC 7854
+# (classic BMP) and RFC 9069 (Loc-RIB / peer type 3) natively, which
+# is what bird 2.17's `monitoring rib local` emits. Cross-platform;
+# no OS gate needed. Features: `parser` and `bytes` are the minimum
+# for offline BMP byte-stream parsing — no TLS fetcher, no MRT
+# downloader. Default features pull in rustls/chrono/regex/zerocopy
+# that we don't need.
+bgpkit-parser = { version = "0.16", default-features = false, features = ["parser", "bytes"] }
+bytes = "1.11"
 
 [profile.release]
 lto = "thin"
