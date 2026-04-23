@@ -1309,6 +1309,183 @@ pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     read_stats(&stats)
 }
 
+/// Snapshot of the custom-FIB control-plane state that's readable
+/// from a separate process via the bpffs pins — i.e., no live
+/// `FibProgrammer` handle required. Used by `packetframe status` to
+/// surface an operator-facing summary during and after cutover.
+///
+/// **Not readable from pins (requires IPC to the live daemon):**
+/// - FibProgrammer mpsc queue depth
+/// - BMP session state (connected / initiating / stalled)
+/// - Last route / neigh update timestamps per peer
+///
+/// Those land when Phase 3.5 or later wires up a daemon-side
+/// control socket. For now the pin-based snapshot is enough to
+/// answer "is the control plane populating maps the way I expect."
+#[derive(Debug, Clone)]
+pub struct FibStatusSnapshot {
+    /// Which forwarding mode the live `FpCfg.flags` encodes. Derived
+    /// from bits 3-4. `None` if the CFG map is missing (pre-Phase-1
+    /// binary left pins behind).
+    pub forwarding_mode: Option<&'static str>,
+    pub default_hash_mode: Option<u8>,
+    /// NEXTHOPS[idx].state distribution. Slots that were never
+    /// written read as state=0 which collides with
+    /// `NH_STATE_INCOMPLETE`; we can't distinguish those from
+    /// actual in-progress entries without programmer-internal
+    /// refcount state, so `nh_unwritten_or_incomplete` is reported
+    /// as a single bucket.
+    pub nh_resolved: u32,
+    pub nh_failed: u32,
+    pub nh_stale: u32,
+    pub nh_unwritten_or_incomplete: u32,
+    pub nh_max_entries: u32,
+    /// ECMP groups where `nh_count > 0` — a conservative estimate
+    /// of "how many groups are actively in use." Slots with nh_count=0
+    /// are either unwritten or tombstoned; we can't distinguish
+    /// without programmer state.
+    pub ecmp_active: u32,
+    pub ecmp_max_entries: u32,
+}
+
+/// Read the custom-FIB snapshot from the bpffs pins. Best-effort:
+/// missing or malformed pins produce warnings and default values
+/// rather than hard errors — `packetframe status` should still
+/// show whatever it can even if a subset of the custom-FIB maps
+/// aren't pinned yet (e.g., kernel-fib mode).
+pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
+    let mut snapshot = FibStatusSnapshot {
+        forwarding_mode: None,
+        default_hash_mode: None,
+        nh_resolved: 0,
+        nh_failed: 0,
+        nh_stale: 0,
+        nh_unwritten_or_incomplete: 0,
+        nh_max_entries: 0,
+        ecmp_active: 0,
+        ecmp_max_entries: 0,
+    };
+
+    // --- CFG flags: forwarding mode ---
+    if let Ok(fp_cfg) = read_cfg_map(bpffs_root) {
+        let flags = fp_cfg.flags;
+        let custom = flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
+        let compare = flags & FP_CFG_FLAG_COMPARE_MODE != 0;
+        snapshot.forwarding_mode = Some(match (custom, compare) {
+            (false, _) => "kernel-fib",
+            (true, false) => "custom-fib",
+            (true, true) => "compare",
+        });
+    }
+
+    // --- FIB_CONFIG: default hash mode ---
+    if let Ok(mode) = read_fib_config_hash_mode(bpffs_root) {
+        snapshot.default_hash_mode = Some(mode);
+    }
+
+    // --- NEXTHOPS: walk for state distribution ---
+    if let Ok((dist, cap)) = read_nexthops_state_distribution(bpffs_root) {
+        snapshot.nh_resolved = dist.resolved;
+        snapshot.nh_failed = dist.failed;
+        snapshot.nh_stale = dist.stale;
+        snapshot.nh_unwritten_or_incomplete = dist.unwritten_or_incomplete;
+        snapshot.nh_max_entries = cap;
+    }
+
+    // --- ECMP_GROUPS: count active ---
+    if let Ok((active, cap)) = read_ecmp_groups_active(bpffs_root) {
+        snapshot.ecmp_active = active;
+        snapshot.ecmp_max_entries = cap;
+    }
+
+    snapshot
+}
+
+fn read_cfg_map(bpffs_root: &Path) -> ModuleResult<FpCfg> {
+    let pin_path = pin::map_path(bpffs_root, "CFG");
+    let map_data = aya::maps::MapData::from_pin(&pin_path)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("open CFG pin: {e}")))?;
+    let map = aya::maps::Map::Array(map_data);
+    let arr: aya::maps::Array<_, FpCfg> = aya::maps::Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG try_from: {e}")))?;
+    arr.get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))
+}
+
+fn read_fib_config_hash_mode(bpffs_root: &Path) -> ModuleResult<u8> {
+    let pin_path = pin::map_path(bpffs_root, "FIB_CONFIG");
+    let map_data = aya::maps::MapData::from_pin(&pin_path)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("open FIB_CONFIG pin: {e}")))?;
+    let map = aya::maps::Map::Array(map_data);
+    let arr: aya::maps::Array<_, crate::fib::types::FpFibCfg> = aya::maps::Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG try_from: {e}")))?;
+    let cfg = arr
+        .get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("FIB_CONFIG get: {e}")))?;
+    Ok(cfg.default_hash_mode)
+}
+
+#[derive(Debug, Default)]
+struct NhStateDistribution {
+    resolved: u32,
+    failed: u32,
+    stale: u32,
+    unwritten_or_incomplete: u32,
+}
+
+fn read_nexthops_state_distribution(bpffs_root: &Path) -> ModuleResult<(NhStateDistribution, u32)> {
+    use crate::fib::programmer::NEXTHOPS_CAP;
+    use crate::fib::types::{NexthopEntry, NH_STATE_FAILED, NH_STATE_RESOLVED, NH_STATE_STALE};
+
+    let pin_path = pin::map_path(bpffs_root, "NEXTHOPS");
+    let map_data = aya::maps::MapData::from_pin(&pin_path)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("open NEXTHOPS pin: {e}")))?;
+    let map = aya::maps::Map::Array(map_data);
+    let arr: aya::maps::Array<_, NexthopEntry> = aya::maps::Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("NEXTHOPS try_from: {e}")))?;
+
+    let mut dist = NhStateDistribution::default();
+    // Walk up to NEXTHOPS_CAP (8192). At ~100ns per Array::get syscall
+    // this is ~1ms on a modern box — fine for status on demand.
+    for idx in 0..NEXTHOPS_CAP {
+        let entry = match arr.get(&idx, 0) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        match entry.state {
+            NH_STATE_RESOLVED => dist.resolved += 1,
+            NH_STATE_FAILED => dist.failed += 1,
+            NH_STATE_STALE => dist.stale += 1,
+            _ => dist.unwritten_or_incomplete += 1,
+        }
+    }
+    Ok((dist, NEXTHOPS_CAP))
+}
+
+fn read_ecmp_groups_active(bpffs_root: &Path) -> ModuleResult<(u32, u32)> {
+    use crate::fib::programmer::ECMP_GROUPS_CAP;
+    use crate::fib::types::EcmpGroup;
+
+    let pin_path = pin::map_path(bpffs_root, "ECMP_GROUPS");
+    let map_data = aya::maps::MapData::from_pin(&pin_path)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("open ECMP_GROUPS pin: {e}")))?;
+    let map = aya::maps::Map::Array(map_data);
+    let arr: aya::maps::Array<_, EcmpGroup> = aya::maps::Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("ECMP_GROUPS try_from: {e}")))?;
+
+    let mut active = 0u32;
+    for idx in 0..ECMP_GROUPS_CAP {
+        let group = match arr.get(&idx, 0) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        if group.nh_count > 0 {
+            active += 1;
+        }
+    }
+    Ok((active, ECMP_GROUPS_CAP))
+}
+
 /// Read STATS directly from the bpffs pin — no live module required.
 /// Used by `packetframe status` when the loader isn't running.
 pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {

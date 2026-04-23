@@ -520,6 +520,8 @@ fn print_stats(bpffs_root: &Path) {
         "bmp_peer_down",
     ];
 
+    print_fib_status(bpffs_root);
+
     match packetframe_fast_path::stats_from_pin(bpffs_root) {
         Ok(values) => {
             println!();
@@ -533,6 +535,50 @@ fn print_stats(bpffs_root: &Path) {
             eprintln!("note: STATS pin unavailable ({e}); loader may not be attached");
         }
     }
+}
+
+/// Print the Option F custom-FIB status — map occupancies, nexthop
+/// state distribution, default hash mode. Best-effort: prints
+/// whatever readable slice of the FIB pins returns. Runs regardless
+/// of forwarding-mode so operators can verify pins exist and the
+/// programmer has populated them (or hasn't, in kernel-fib mode).
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn print_fib_status(bpffs_root: &Path) {
+    let snap = packetframe_fast_path::fib_status_from_pin(bpffs_root);
+    println!();
+    println!("custom-FIB status (from {}):", bpffs_root.display());
+    match snap.forwarding_mode {
+        Some(mode) => println!("  forwarding-mode:            {mode}"),
+        None => println!("  forwarding-mode:            <CFG pin not readable>"),
+    }
+    if let Some(h) = snap.default_hash_mode {
+        println!("  default-hash-mode:          {h}-tuple");
+    }
+    if snap.nh_max_entries > 0 {
+        let used = snap.nh_resolved + snap.nh_failed + snap.nh_stale;
+        let pct = 100.0 * used as f64 / snap.nh_max_entries as f64;
+        println!("  nexthops (resolved):        {}", snap.nh_resolved);
+        println!("  nexthops (failed):          {}", snap.nh_failed);
+        println!("  nexthops (stale):           {}", snap.nh_stale);
+        println!(
+            "  nexthops (total used / max): {} / {} ({pct:.2}%)",
+            used, snap.nh_max_entries
+        );
+    } else {
+        println!("  nexthops pin:               unavailable");
+    }
+    if snap.ecmp_max_entries > 0 {
+        println!(
+            "  ecmp groups (active / max): {} / {}",
+            snap.ecmp_active, snap.ecmp_max_entries
+        );
+    } else {
+        println!("  ecmp groups pin:            unavailable");
+    }
+    println!(
+        "  FIB_V4 / FIB_V6 occupancy:  not shown (LpmTrie walk is O(N); \
+         infer from custom_fib_hit / custom_fib_miss counters below)"
+    );
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
