@@ -160,9 +160,10 @@ pub enum ModuleDirective {
     /// validation, temporary).
     ForwardingMode(ForwardingMode),
     /// RouteSource configuration — where the custom FIB gets its
-    /// routes. Currently only `bmp <addr>:<port>`; the BMP station
-    /// is spawned by the RouteController when this is set and
-    /// `forwarding-mode` is `custom-fib` or `compare`.
+    /// routes. Two kinds: `bmp <addr>:<port>` and `bgp <addr>:<port>
+    /// local-as <asn> peer-as <asn>`. Spawned by the RouteController
+    /// when this is set and `forwarding-mode` is `custom-fib` or
+    /// `compare`. See [`RouteSourceSpec`] for the per-kind shape.
     RouteSource(RouteSourceSpec),
     /// Max entries for the custom-FIB LPM tries and side arrays.
     /// Accepted but **not yet runtime-applied** — aya / kernel
@@ -1644,8 +1645,8 @@ module fast-path
 
     #[test]
     fn route_source_bgp_missing_local_as_errors() {
-        let e = parse_module_body("  route-source bgp 127.0.0.1:1179 peer-as 401401\n")
-            .unwrap_err();
+        let e =
+            parse_module_body("  route-source bgp 127.0.0.1:1179 peer-as 401401\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("local-as"), "msg was: {message}");

@@ -568,8 +568,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 peer_as,
                 router_id,
             }) => {
-                let listen: std::net::SocketAddr =
-                    format!("{addr}:{port}").parse().ok()?;
+                let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
                 // Default router-id: lowest 32 bits of the listen
                 // address when v4; for v6 listens, fall back to the
                 // local_as (uniquely identifies this speaker within
@@ -587,11 +586,10 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             }
             _ => None,
         });
-        let ctrl =
-            crate::fib::controller::RouteController::start(&state.bpffs_root, route_source)
-                .map_err(|e| {
-                    ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
-                })?;
+        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, route_source)
+            .map_err(|e| {
+                ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
+            })?;
         state.route_controller = Some(ctrl);
         info!(
             ?forwarding,

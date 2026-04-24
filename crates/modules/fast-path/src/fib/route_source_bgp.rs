@@ -438,10 +438,7 @@ impl BgpListener {
 /// Drains the TCP stream, parses BGP messages, and forwards them to
 /// the main `select!` loop via a bounded channel. Same cancel-safety
 /// pattern as `BmpStation::reader_task`.
-async fn reader_task<R>(
-    mut stream: R,
-    tx: mpsc::Sender<BgpMessage>,
-) -> Result<(), RouteSourceError>
+async fn reader_task<R>(mut stream: R, tx: mpsc::Sender<BgpMessage>) -> Result<(), RouteSourceError>
 where
     R: AsyncReadExt + Unpin + Send,
 {

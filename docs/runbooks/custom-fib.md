@@ -18,10 +18,10 @@ how to roll back to the kernel-FIB path if something goes wrong.
 ```
    bird (BGP RIB)                         kernel FIB
       │                                       │
-      │  BMP over TCP                         │  local delivery +
-      │  (RFC 7854 + 9069 Loc-RIB)            │  connected + static
+      │  iBGP over TCP (RFC 4271)             │  local delivery +
+      │  bird best-path → packetframe         │  connected + static
       ▼                                       │
-   packetframe BmpStation ──┐                 │
+   packetframe BgpListener ─┐                 │
                             ▼                 │
                     FibProgrammer             │
                             │                 │
@@ -37,9 +37,14 @@ how to roll back to the kernel-FIB path if something goes wrong.
              XDP_REDIRECT / XDP_PASS
 ```
 
-- **BmpStation** accepts bird's BMP dial-in. Bird sends one route-monitoring
-  message per best-path prefix (Loc-RIB mode); we translate each to a
-  `RouteEvent::Add`/`Del`.
+- **BgpListener** (the recommended forwarding feed) accepts bird's
+  iBGP session. Bird's `protocol bgp` export filter runs after
+  best-path selection, so we get exactly one UPDATE per prefix
+  with bird's chosen nexthop. Translated to
+  `RouteEvent::Add`/`Del`. **BmpStation** is also available behind
+  the `RouteSource` trait but bird's BMP doesn't ship RFC 9069
+  Loc-RIB — see the section "When to use `route-source bmp`
+  instead" near the bottom.
 - **FibProgrammer** owns the BPF map write path. Allocates `NexthopId`s
   and `EcmpGroupId`s with refcount + free-list dedup.
 - **NeighborResolver** subscribes to kernel neighbor multicast
@@ -89,18 +94,31 @@ Look at:
   counts, ECMP group count.
 - counter block — especially the `custom_fib_*` family.
 
-### Is the BMP session live?
+### Is the route-source session live?
+
+For the recommended iBGP feed:
+
+```sh
+ss -Htnp state established "( sport = :1179 )" 2>&1
+# Expect one line: bird ↔ packetframe on the BGP listener port.
+birdc show protocols packetframe
+# State should be "Established" with a non-zero "Routes:" count.
+```
+
+For BMP (FRR or future bird with Loc-RIB):
 
 ```sh
 ss -Htnp state established "( sport = :6543 )" 2>&1
-# Expect one line: bird ↔ packetframe on the BMP port.
+birdc show protocols | grep -i bmp
 ```
 
-If it's missing, check:
+If the session is missing:
 
 - `packetframe` daemon is running: `pgrep -a packetframe`
 - bird is running: `birdc show status`
-- bird's BMP config is live: `birdc show protocols | grep -i bmp`
+- bird's `protocol bgp packetframe { ... }` block is present and
+  bird hasn't logged a session-establishment failure: `journalctl
+  -u bird | tail -50`
 
 ### Is a specific prefix forwarding through custom-fib?
 
@@ -117,18 +135,25 @@ sudo packetframe fib dump-v4 | head -50
 sudo packetframe fib stats
 ```
 
-### Force a BMP resync
+### Force a route-source resync
 
-Stop bird's BMP session; it will reconnect automatically:
+Bouncing bird's session to packetframe triggers a Resync + fresh
+dump. Same flow for either feed kind:
 
 ```sh
-birdc disable bmp1   # protocol name per your pathvector config
+# iBGP feed:
+birdc disable packetframe
+birdc enable packetframe
+
+# BMP feed (FRR / future bird):
+birdc disable bmp1   # whatever protocol name is in your pathvector config
 birdc enable bmp1
 ```
 
-packetframe emits `RouteEvent::Resync` on disconnect and receives the
-fresh dump on reconnect. Stale entries from before the reconnect are
-GC'd by `InitiationComplete` (Phase 3.5+) or the next Resync.
+packetframe emits `RouteEvent::Resync` on disconnect and receives
+the fresh dump on reconnect. Stale entries from before the
+reconnect are GC'd by `InitiationComplete` (fires after 5 s of
+post-first-update quiescence) or the next Resync.
 
 ### Inspecting the FIB programmatically
 
@@ -201,15 +226,18 @@ bird outages.
 
 **Pre-flight:**
 
-1. Run the staging soak: custom-fib + BMP live to a bird mirror for
-   24h. Zero `compare_disagree` sustained above 0.01% of matched
-   packets, zero `StaleFib`, NEXTHOPS occupancy stable.
-2. Confirm bird 2.17 exposes `monitoring rib local` BMP (RFC 9069
-   Loc-RIB) and pathvector's template emits the block.
-3. Add `forwarding-mode custom-fib` + `route-source bmp 127.0.0.1:6543`
-   under `module fast-path` in `/etc/packetframe/packetframe.conf`.
-4. Confirm bird's kernel-export filter keeps customer /32s + connected
-   + static default only (no BGP routes).
+1. Run the staging soak: custom-fib + the iBGP feed live to a bird
+   mirror for 24h. Zero `compare_disagree` sustained above 0.01%
+   of matched packets, zero `StaleFib`, NEXTHOPS occupancy stable.
+2. Pathvector `global-config` injects the `protocol bgp packetframe
+   { ... }` block (see "Phase 4 bird + pathvector config" below).
+3. Add `forwarding-mode custom-fib` + `route-source bgp
+   127.0.0.1:1179 local-as <ASN> peer-as <ASN>` under `module
+   fast-path` in `/etc/packetframe/packetframe.conf`.
+4. Confirm bird's `kernel.export: false` (or equivalent) so no BGP
+   routes flow to the kernel FIB. Customer /32s, connected, static
+   default still flow via non-BGP mechanisms — udapi parses those
+   fine.
 
 **Cutover sequence:**
 
@@ -224,7 +252,9 @@ sudo packetframe detach --all --config /etc/packetframe/packetframe.conf
 sudo systemctl start packetframe
 
 # 4. Wait ~2-3 minutes for attach-settle-time × 6 interfaces.
-# 5. Verify BMP session up.
+# 5. Verify route-source session up:
+#      birdc show protocols packetframe   # or `bmp1`, depending on feed
+#      ss -Htnp state established "( sport = :1179 )"   # or 6543 for BMP
 # 6. Verify custom_fib_hit climbing.
 # 7. Verify udapi log parse errors are zero (journalctl -u ubios-udapi-server).
 ```
@@ -260,45 +290,88 @@ same-day diagnosis and a forward-fix plan.
 
 ### Phase 4 bird + pathvector config
 
-For a cutover to `forwarding-mode custom-fib`, bird's BMP protocol
-dials the packetframe station, and bird's kernel export drops BGP
-routes so udapi stays off the BGP parse path.
+For a cutover to `forwarding-mode custom-fib`, packetframe needs
+a feed of bird's selected best paths, and bird's kernel-protocol
+export needs to stay off so udapi never sees BGP routes.
 
-Pathvector template addition (inside the appropriate `global:` /
-`kernel:` / `templates:` section — adapt to your deployment):
+**Why iBGP and not BMP for the forwarding feed.** Bird (2.x and
+3.x master) does not ship RFC 9069 Loc-RIB BMP — only
+`monitoring rib in pre_policy / post_policy`, which deliver
+per-peer Adj-RIB-In streams. That's wrong for forwarding: a
+prefix announced by N peers becomes N RouteMonitoring frames
+with N nexthops, with no signal which one bird actually picked.
+iBGP, by contrast, runs bird's `protocol bgp` export filter
+*after* best-path selection, so packetframe receives exactly
+one UPDATE per prefix carrying bird's chosen path. See
+`crates/modules/fast-path/src/fib/route_source_bgp.rs` for the
+full design rationale.
+
+**Bird config — inject via pathvector's `global-config`.**
+Pathvector ships `global-config` verbatim into the rendered bird
+config (no template fork needed). Add to `pathvector.yml`:
 
 ```yaml
-# bird 2.17 Loc-RIB BMP export. Station address matches the
-# `route-source bmp <addr>:<port>` in packetframe.conf.
-bmp:
-  bmp1:
-    station-address: 127.0.0.1
-    station-port: 6543
-    monitoring-rib: local   # RFC 9069 Loc-RIB (bird 2.17+).
-
-# Restrict the kernel-export filter so BGP-learned routes stop
-# flowing to the kernel FIB. Customer /32s, connected, static
-# default still go; udapi parses those fine.
-kernel-export-filter: |
-  if source = RTS_BGP then reject;
-  accept;
+global-config: |
+  # iBGP feed to packetframe's BgpListener. AS 401401 is our own
+  # AS — replace with yours. `passive` ensures bird only initiates;
+  # we listen on 1179 (NOT 179, to avoid clashing with anyone else
+  # who happens to bind 179 on the loopback).
+  protocol bgp packetframe {
+    local 127.0.0.1 as 401401;
+    neighbor 127.0.0.1 port 1179 as 401401;
+    multihop;
+    hold time 90;
+    # We never want bird to reject our session for failing best-
+    # path tiebreakers. iBGP treats packetframe as a peer; with
+    # no real routes from us this is a no-op.
+    ipv4 {
+      import none;
+      export where source = RTS_BGP;
+    };
+    ipv6 {
+      import none;
+      export where source = RTS_BGP;
+    };
+  }
 ```
 
-Validate after pushing:
+`kernel.export: false` in your existing pathvector config already
+keeps BGP routes off the kernel FIB; no further kernel-filter
+changes needed.
+
+**Packetframe config:**
+
+```
+module fast-path
+  forwarding-mode custom-fib              # or `compare` for the soak window
+  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 103.17.154.7
+```
+
+`router-id` is optional — defaults to the listen-address (v4) or
+the local AS (v6 listen).
+
+**Validate after pushing:**
 
 ```sh
-birdc show protocols | grep bmp1           # state=up
-birdc show route count | head              # count matches packetframe mirror ±convergence noise
-sudo packetframe fib stats                 # forwarding-mode=custom-fib
-ip route | wc -l                           # kernel FIB should drop ~1M entries
+birdc show protocols packetframe          # state=Established (after a few seconds)
+birdc show route count                    # bird's total
+sudo packetframe fib stats                # forwarding-mode=custom-fib
+sudo packetframe fib lookup 8.8.8.8       # MATCH with sane nexthop
+journalctl -u packetframe | grep -i bgp   # "BGP listener started", no errors
 ```
+
+**Once-per-5-minute integrity check** (when BMP/BGP route source
+configured) cross-checks bird's `show route count` against the
+programmer mirror; drift ≥ 1% logs a `WARN integrity drift above
+threshold`.
 
 ### Phase 4 systemd ordering
 
-Packetframe's BMP station binds before bird dials in, so the service
-order must be `packetframe.service` first, `bird.service` second.
+Packetframe's BGP listener binds before bird dials in, so the
+service order must be `packetframe.service` first, `bird.service`
+second.
 
-`/etc/systemd/system/packetframe.service.d/bmp-ordering.conf`:
+`/etc/systemd/system/packetframe.service.d/bgp-ordering.conf`:
 
 ```ini
 [Unit]
@@ -314,10 +387,10 @@ Wants=bird.service
 ```ini
 [Unit]
 After=packetframe.service
-# Cheap guard against races at boot — wait up to 30 s for the BMP
+# Cheap guard against races at boot — wait up to 30 s for the BGP
 # listener to be reachable before dialing.
 [Service]
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ss -Htnl sport = :6543 | grep -q . && exit 0; sleep 1; done; exit 0'
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ss -Htnl sport = :1179 | grep -q . && exit 0; sleep 1; done; exit 0'
 ```
 
 Reload + restart the units after dropping these files:
@@ -326,6 +399,26 @@ Reload + restart the units after dropping these files:
 sudo systemctl daemon-reload
 sudo systemctl restart packetframe bird
 ```
+
+### When to use `route-source bmp` instead
+
+The BMP route source is useful when:
+
+- Your routing daemon emits **RFC 9069 Loc-RIB BMP** (peer_type 3).
+  FRR has this today; bird does not. Set `require-loc-rib` on the
+  `route-source bmp` line — the BmpStation will refuse any
+  non-Loc-RIB frame and tear the session down with an error,
+  preventing silent wrong-forwarding from pre/post-policy streams:
+
+  ```
+  route-source bmp 127.0.0.1:6543 require-loc-rib
+  ```
+
+- You want a **pure observability** feed (analytics, anomaly
+  detection on per-peer Adj-RIB-In streams) running alongside
+  the BGP forwarding feed. This isn't wired into the controller
+  yet — the current build accepts exactly one `route-source`
+  per fast-path module.
 
 ## Triage by symptom
 
@@ -339,10 +432,10 @@ Check:
 
 - `packetframe status` — is `nexthops (resolved)` ≥ your expected
   peer count?
-- `journalctl -u packetframe | grep -i bmp` — any errors from the BMP
-  handler?
-- `birdc show protocols bmp1` (or whatever protocol name) — is the
-  session established?
+- `journalctl -u packetframe | grep -iE 'bgp|bmp'` — any errors from
+  the route-source handler?
+- `birdc show protocols packetframe` (or your BMP protocol name)
+  — is the session established and propagating routes?
 
 ### Symptom: `pass_no_neigh` climbs sustainedly
 
@@ -384,7 +477,7 @@ Check:
 - No process other than packetframe should be writing to
   `/sys/fs/bpf/packetframe/fast-path/maps/NEXTHOPS`.
 
-### Symptom: BMP session stays up but routes stop flowing
+### Symptom: route-source session stays up but routes stop flowing
 
 What it means: bird is connected and idle. No new BGP churn, no new
 routes. Usually benign — BGP in stable state just doesn't send much.
@@ -446,3 +539,11 @@ landed since the runbook was first written.
   `tests/neigh_resolver_netns.rs` + `tests/fib_programmer_integration.rs`
   cover the resolver and programmer paths end-to-end under sudo in
   CI's qemu-verifier jobs.
+- ✅ **BGP route source + BMP Loc-RIB safety mode** (Phase 3.9).
+  `route-source bgp <addr>:<port> local-as <asn> peer-as <asn>`
+  spawns an iBGP listener that receives bird's selected best paths;
+  bird's `protocol bgp` export filter runs after best-path so we
+  never see per-peer Adj-RIB-In duplicates. BmpStation gains
+  `require-loc-rib` which hard-rejects non-Loc-RIB frames. The
+  iBGP feed is the recommended forwarding path for bird; the
+  BMP path is for Loc-RIB-emitting daemons (FRR; future bird).
