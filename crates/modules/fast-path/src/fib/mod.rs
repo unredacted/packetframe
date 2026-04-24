@@ -27,6 +27,9 @@ pub mod netlink_neigh;
 pub mod programmer;
 
 #[cfg(target_os = "linux")]
+pub mod route_source_bgp;
+
+#[cfg(target_os = "linux")]
 pub mod route_source_bmp;
 
 pub use types::{
