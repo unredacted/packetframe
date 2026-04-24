@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PacketFrame fast-path module (BPF object via build.rs; loader wiring lands in PR #4)"
+description = "PacketFrame fast-path module: XDP forwarding (kernel-fib or custom-fib via BMP), allowlist + VLAN handling, optional BMP control plane"
 build = "build.rs"
 
 [lib]

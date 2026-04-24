@@ -481,9 +481,8 @@ fn print_stats(bpffs_root: &Path) {
     // §4.6 counter names, indexed by `StatIdx` discriminants. Order
     // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
     // Append-only — adding new entries at the end is fine; renumbering
-    // breaks dashboards. Previous versions hardcoded 19 and silently
-    // dropped `err_head_shift` (index 19); Phase 1 fixes that in
-    // passing and adds the 12 custom-FIB counters (indices 20-31).
+    // breaks dashboards. Indices 0-19 are the kernel-fib counter set;
+    // 20-31 were appended in the Option F custom-FIB rollout (§4.11).
     const NAMES: [&str; 32] = [
         "rx_total",
         "matched_v4",

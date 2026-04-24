@@ -160,14 +160,17 @@ pub enum ModuleDirective {
     /// validation, temporary).
     ForwardingMode(ForwardingMode),
     /// RouteSource configuration — where the custom FIB gets its
-    /// routes. Phase 1 accepts the directive but doesn't yet start
-    /// a live RouteSource; Phase 3 wires up the BMP station.
+    /// routes. Currently only `bmp <addr>:<port>`; the BMP station
+    /// is spawned by the RouteController when this is set and
+    /// `forwarding-mode` is `custom-fib` or `compare`.
     RouteSource(RouteSourceSpec),
     /// Max entries for the custom-FIB LPM tries and side arrays.
     /// Accepted but **not yet runtime-applied** — aya / kernel
-    /// allocate maps at compile-time sizes. Phase 1 documents the
-    /// directive so operator config forward-compatibility holds;
-    /// actual runtime sizing requires a recompile of the BPF ELF.
+    /// allocate maps at compile-time sizes set in
+    /// `crates/modules/fast-path/bpf/src/maps.rs`. The directive is
+    /// preserved for operator config forward-compatibility; actual
+    /// runtime sizing requires a recompile of the BPF ELF with
+    /// matching constants.
     FibSize(FibSizeDirective),
     /// Default ECMP hash tuple width (3, 4, or 5). Written into
     /// `FIB_CONFIG.default_hash_mode` at load time.
@@ -202,8 +205,9 @@ impl FromStr for ForwardingMode {
     }
 }
 
-/// RouteSource configuration. Only `bmp <addr>:<port>` is accepted
-/// in Phase 1; other variants land alongside their implementations.
+/// RouteSource configuration. Currently only `bmp <addr>:<port>` is
+/// supported; other variants would land alongside their concrete
+/// `RouteSource` impls if added.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum RouteSourceSpec {
     /// BMP station listen address. Bird dials out to this
@@ -213,9 +217,8 @@ pub enum RouteSourceSpec {
     Bmp { addr: String, port: u16 },
 }
 
-/// One `fib-*-max-entries` directive. Phase 1 accepts these but
-/// doesn't runtime-apply — see the struct-level doc on
-/// [`ModuleDirective::FibSize`].
+/// One `fib-*-max-entries` directive. Parsed but not runtime-applied
+/// — see the doc on [`ModuleDirective::FibSize`].
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum FibSizeDirective {
     FibV4MaxEntries(u32),
@@ -774,10 +777,9 @@ where
     Ok(wrap(n))
 }
 
-/// Parse `route-source <kind> <args...>`. Phase 1 accepts only
-/// `bmp <addr>:<port>`. Other kinds become parse errors so
-/// operators get an explicit message if they configure something
-/// that hasn't landed yet.
+/// Parse `route-source <kind> <args...>`. Currently only
+/// `bmp <addr>:<port>` is supported. Unknown kinds become parse
+/// errors with an explicit message.
 fn parse_route_source<'a>(
     line: usize,
     mut rest: impl Iterator<Item = &'a str>,
@@ -821,7 +823,7 @@ fn parse_route_source<'a>(
         }
         other => Err(ConfigError::parse(
             line,
-            format!("route-source `{other}` unknown (Phase 1 supports only `bmp <addr>:<port>`)"),
+            format!("route-source `{other}` unknown (only `bmp <addr>:<port>` is supported)"),
         )),
     }
 }
