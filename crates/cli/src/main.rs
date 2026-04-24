@@ -1,11 +1,12 @@
 //! `packetframe` — PacketFrame CLI.
 //!
-//! See SPEC.md §7.4 for the subcommand surface. PR #4 wires `run` to
-//! load + attach the fast-path module via aya, persists the pin
-//! registry, and blocks on SIGTERM/SIGINT for graceful exit. `detach`
-//! and `status` read the pin registry and the live stats map
-//! respectively. The `reconfigure` flow (SIGHUP → delta-only reconcile)
-//! lands with PR #6.
+//! See SPEC.md §7.4 for the subcommand surface. `run` loads + attaches
+//! the fast-path module via aya, persists the pin registry, and blocks
+//! on SIGTERM/SIGINT for graceful exit. `detach` and `status` read the
+//! pin registry and the live stats map respectively. SIGHUP triggers a
+//! delta-only reconcile (allowlists, VLAN-resolve, devmap) without
+//! detaching. `fib` (Option F, Phase 3.8 — see SPEC.md §4.11) opens
+//! the pinned custom-FIB maps directly for inspection.
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod breaker;

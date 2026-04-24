@@ -61,7 +61,8 @@ pub fn aligned_bpf_copy() -> Vec<u8> {
 }
 
 /// `true` when `build.rs` produced a real BPF ELF; `false` when the build
-/// fell back to an empty stub (CI-only BPF builds per the PR #3 plan).
+/// fell back to an empty stub (build.rs uses a stub when bpf-linker / the
+/// nightly toolchain isn't available, so macOS dev loops still compile).
 /// Const-evaluable so tests can early-return or be `cfg`-gated on it.
 pub const FAST_PATH_BPF_AVAILABLE: bool = !FAST_PATH_BPF.is_empty();
 
@@ -183,7 +184,9 @@ impl Module for FastPathModule {
     }
 
     fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
-        // Prometheus textfile emission lands in PR #6. No-op here.
+        // Module-side hook is a no-op; the cli's MetricsExporter
+        // (`crates/cli/src/metrics.rs`) reads STATS + the FIB
+        // snapshot from pinned maps directly on its 15 s cadence.
         Ok(())
     }
 

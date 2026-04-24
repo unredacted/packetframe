@@ -141,16 +141,15 @@ pub struct SubsystemHealth {
 
 /// Structured health report returned by `Module::health_check`.
 ///
-/// Phase 1 shape carries an overall state + a `Vec<SubsystemHealth>`
-/// populated by modules with internal subsystems (e.g. fast-path's
-/// RouteController, which aggregates BMP + netlink + FibProgrammer
-/// freshness once Phase 2+ lands). Modules without subsystems
-/// return `HealthReport::default()` — an empty, healthy report.
+/// Carries an overall state plus a `Vec<SubsystemHealth>` for
+/// modules with internal subsystems — e.g. fast-path's
+/// RouteController, which can report BMP + netlink + FibProgrammer
+/// freshness independently. Modules without subsystems return
+/// `HealthReport::default()` (an empty, healthy report).
 ///
-/// Added in Phase 1 of Option F (custom-FIB migration) because the
-/// prior `ModuleResult<()>` surface couldn't express partial-degraded
-/// states across multiple control-plane subsystems. No dashboards
-/// consume this yet; Phase 3.5 wires it into `packetframe status`.
+/// Added during the Option F custom-FIB rollout because the prior
+/// `ModuleResult<()>` surface couldn't express partial-degraded
+/// states across multiple control-plane subsystems.
 #[derive(Debug, Clone, Default)]
 pub struct HealthReport {
     pub overall: HealthState,
@@ -166,8 +165,9 @@ impl HealthReport {
 }
 
 /// Destination for Prometheus textfile emission from
-/// `Module::sample_metrics`. In v0.0.1 this wraps a `String` the loader
-/// flushes; v0.1 adds labels, timestamps, and the textfile atomic-rename.
+/// `Module::sample_metrics`. Wraps a `String` the loader flushes;
+/// the cli's [`MetricsExporter`](../../../cli/src/metrics.rs)
+/// handles labels, timestamps, and the atomic write-then-rename.
 #[derive(Debug)]
 pub struct MetricsWriter<'a> {
     pub out: &'a mut String,
@@ -201,10 +201,8 @@ pub trait Module: Send + Sync {
 
     /// Structured health readback. Returns a [`HealthReport`] the
     /// caller can render in `packetframe status`, feed to circuit
-    /// breakers, or expose via Prometheus. Phase 1 return type
-    /// replaces the earlier `ModuleResult<()>` which couldn't carry
-    /// per-subsystem detail; modules without subsystems return
-    /// `Ok(HealthReport::default())`.
+    /// breakers, or expose via Prometheus. Modules without
+    /// subsystems return `Ok(HealthReport::default())`.
     fn health_check(&self, ctx: &HealthCtx) -> ModuleResult<HealthReport>;
 }
 
