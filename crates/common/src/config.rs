@@ -216,7 +216,21 @@ pub enum RouteSourceSpec {
     /// address:port; packetframe accepts the TCP connection and
     /// consumes the BMP stream. RFC 7854 roles: bird is the router
     /// (client), packetframe is the station (server).
-    Bmp { addr: String, port: u16 },
+    ///
+    /// `require_loc_rib`: when true, only RouteMonitoring frames
+    /// with peer_type = 3 (RFC 9069 Loc-RIB Instance Peer) are
+    /// accepted; pre/post-policy frames cause the session to be
+    /// torn down with an error. **This is required for safe use
+    /// against pre/post-policy emitters** like bird 2.x — without
+    /// it, multiple peers' Adj-RIB-In streams would race-overwrite
+    /// per-prefix nexthops in the FIB and produce silent
+    /// wrong-forwarding. See module docs in
+    /// `route_source_bmp.rs`.
+    Bmp {
+        addr: String,
+        port: u16,
+        require_loc_rib: bool,
+    },
     /// iBGP listener — packetframe accepts an iBGP session from
     /// bird and ingests UPDATEs as bird's selected best paths.
     /// `local_as`/`peer_as` are typically equal (iBGP within one AS);
@@ -810,16 +824,27 @@ fn parse_route_source<'a>(
             let endpoint = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "route-source bmp requires <addr>:<port>")
             })?;
-            if rest.next().is_some() {
-                return Err(ConfigError::parse(
-                    line,
-                    "route-source bmp takes exactly one argument: <addr>:<port>",
-                ));
-            }
             let (addr, port) = parse_endpoint(line, endpoint, "bmp")?;
+            // Optional trailing `require-loc-rib` flag. Any other
+            // tail token is a parse error.
+            let mut require_loc_rib = false;
+            for tok in rest {
+                match tok {
+                    "require-loc-rib" => require_loc_rib = true,
+                    other => {
+                        return Err(ConfigError::parse(
+                            line,
+                            format!(
+                                "route-source bmp: unknown tail flag `{other}` (only `require-loc-rib` is recognized)"
+                            ),
+                        ));
+                    }
+                }
+            }
             Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bmp {
                 addr,
                 port,
+                require_loc_rib,
             }))
         }
         "bgp" => {
@@ -1520,9 +1545,14 @@ module fast-path
     #[test]
     fn route_source_bmp_parses_endpoint() {
         match extract_route_source("  route-source bmp 127.0.0.1:6543\n") {
-            RouteSourceSpec::Bmp { addr, port } => {
+            RouteSourceSpec::Bmp {
+                addr,
+                port,
+                require_loc_rib,
+            } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 6543);
+                assert!(!require_loc_rib, "default should be off");
             }
             other => panic!("expected Bmp, got {other:?}"),
         }
@@ -1532,11 +1562,36 @@ module fast-path
     fn route_source_bmp_ipv6_endpoint() {
         // rsplit_once(':') on `[::1]:6543` cleanly splits off the port.
         match extract_route_source("  route-source bmp [::1]:6543\n") {
-            RouteSourceSpec::Bmp { addr, port } => {
+            RouteSourceSpec::Bmp { addr, port, .. } => {
                 assert_eq!(addr, "[::1]");
                 assert_eq!(port, 6543);
             }
             other => panic!("expected Bmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_require_loc_rib_flag() {
+        match extract_route_source("  route-source bmp 127.0.0.1:6543 require-loc-rib\n") {
+            RouteSourceSpec::Bmp {
+                require_loc_rib, ..
+            } => assert!(require_loc_rib),
+            other => panic!("expected Bmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_unknown_tail_flag_errors() {
+        let e = parse_module_body("  route-source bmp 127.0.0.1:6543 require-pre-policy\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("require-pre-policy") || message.contains("unknown tail"),
+                    "msg was: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 

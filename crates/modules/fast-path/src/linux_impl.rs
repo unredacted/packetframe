@@ -553,10 +553,14 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bmp {
                 addr,
                 port,
+                require_loc_rib,
             }) => format!("{addr}:{port}")
                 .parse::<std::net::SocketAddr>()
                 .ok()
-                .map(|listen| crate::fib::controller::RouteSourceConfig::Bmp { listen }),
+                .map(|listen| crate::fib::controller::RouteSourceConfig::Bmp {
+                    listen,
+                    require_loc_rib: *require_loc_rib,
+                }),
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
                 addr,
                 port,

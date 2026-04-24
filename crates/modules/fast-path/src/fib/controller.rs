@@ -42,6 +42,11 @@ use crate::fib::route_source_bmp::BmpStation;
 pub enum RouteSourceConfig {
     Bmp {
         listen: SocketAddr,
+        /// When true, the BmpStation rejects any RouteMonitoring
+        /// frame whose peer_type is not `LocalRib` (RFC 9069 peer
+        /// type 3). Required for safe forwarding use against
+        /// emitters that send pre/post-policy streams.
+        require_loc_rib: bool,
     },
     Bgp {
         listen: SocketAddr,
@@ -138,7 +143,10 @@ impl RouteController {
         // depend on a live bird to cross-check against.
         let mut integrity: Option<SharedSnapshot> = None;
         match route_source {
-            Some(RouteSourceConfig::Bmp { listen }) => {
+            Some(RouteSourceConfig::Bmp {
+                listen,
+                require_loc_rib,
+            }) => {
                 let snapshot = shared_snapshot();
                 let checker = IntegrityChecker::new(
                     IntegrityConfig::default(),
@@ -148,8 +156,12 @@ impl RouteController {
                 );
                 tasks.push(runtime.spawn(async move { checker.run().await }));
 
-                let station = BmpStation::new(listen, prog_handle.clone(), shutdown_token.clone())
-                    .with_stall_gate(snapshot.clone());
+                let mut station =
+                    BmpStation::new(listen, prog_handle.clone(), shutdown_token.clone())
+                        .with_stall_gate(snapshot.clone());
+                if require_loc_rib {
+                    station = station.with_require_loc_rib();
+                }
                 tasks.push(runtime.spawn(async move {
                     if let Err(e) = station.run().await {
                         warn!(error = %e, "BmpStation task exited with error");
@@ -159,6 +171,7 @@ impl RouteController {
 
                 info!(
                     bmp_addr = %listen,
+                    require_loc_rib,
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
                 );
             }
