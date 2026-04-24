@@ -372,10 +372,10 @@ impl BgpListener {
                 // Hold timer reset already happened; no further work.
             }
             BgpMessage::Notification(n) => {
-                warn!(
-                    code = n.error.error_type,
-                    "received NOTIFICATION; closing session"
-                );
+                // BgpError is a typed enum (MessageHeaderError,
+                // OpenError, UpdateError, HoldTimerExpired, Cease, ...);
+                // log the Debug repr — operator can grep on it.
+                warn!(error = ?n.error, "received NOTIFICATION; closing session");
                 // Reader will see EOF after bird closes; that path
                 // emits Resync via the accept loop.
             }

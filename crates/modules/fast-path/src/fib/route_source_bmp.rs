@@ -331,7 +331,7 @@ impl BmpStation {
             BmpMessageBody::PeerUpNotification(_) => {
                 let pph = match &msg.per_peer_header {
                     Some(p) => p,
-                    None => return,
+                    None => return Ok(()),
                 };
                 let peer_id = peer_id_from_header(pph);
                 info!(
@@ -356,7 +356,7 @@ impl BmpStation {
             BmpMessageBody::PeerDownNotification(_) => {
                 let pph = match &msg.per_peer_header {
                     Some(p) => p,
-                    None => return,
+                    None => return Ok(()),
                 };
                 let peer_id = peer_id_from_header(pph);
                 info!(?peer_id, peer_ip = %pph.peer_ip, "PeerDown");
