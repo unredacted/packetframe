@@ -545,27 +545,49 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         packetframe_common::config::ForwardingMode::CustomFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
-        // Parse `route-source bmp <addr>:<port>` from the module
-        // config. None → controller runs without a BMP station (test
-        // harness or pre-production smoke test with manual programmer
-        // calls). Some → controller spawns BmpStation on that addr.
-        let bmp_listen = cfg.section.directives.iter().find_map(|d| match d {
+        // Translate the operator's `route-source ...` directive into
+        // a `RouteSourceConfig` for the controller. None → controller
+        // runs without a feed (test harness or pre-production smoke
+        // test with manual programmer calls).
+        let route_source = cfg.section.directives.iter().find_map(|d| match d {
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bmp {
                 addr,
                 port,
+            }) => format!("{addr}:{port}")
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|listen| crate::fib::controller::RouteSourceConfig::Bmp { listen }),
+            ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
+                addr,
+                port,
+                local_as,
+                peer_as,
+                router_id,
             }) => {
-                // `parse()` handles bracketed IPv6 literals
-                // naturally (e.g. `[::1]:6543`).
-                format!("{addr}:{port}")
-                    .parse::<std::net::SocketAddr>()
-                    .ok()
+                let listen: std::net::SocketAddr =
+                    format!("{addr}:{port}").parse().ok()?;
+                // Default router-id: lowest 32 bits of the listen
+                // address when v4; for v6 listens, fall back to the
+                // local_as (uniquely identifies this speaker within
+                // the AS).
+                let rid = router_id.unwrap_or_else(|| match listen.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    std::net::IpAddr::V6(_) => std::net::Ipv4Addr::from(*local_as),
+                });
+                Some(crate::fib::controller::RouteSourceConfig::Bgp {
+                    listen,
+                    local_as: *local_as,
+                    peer_as: *peer_as,
+                    router_id: rid,
+                })
             }
             _ => None,
         });
-        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, bmp_listen)
-            .map_err(|e| {
-                ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
-            })?;
+        let ctrl =
+            crate::fib::controller::RouteController::start(&state.bpffs_root, route_source)
+                .map_err(|e| {
+                    ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
+                })?;
         state.route_controller = Some(ctrl);
         info!(
             ?forwarding,
