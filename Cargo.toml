@@ -17,7 +17,12 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+# Bumped from 0.0.1 with the Option F custom-FIB rollout (Phase 3.9
+# adds the BGP route source needed for production cutover). RC
+# series is cut from this PR branch directly so we can iterate
+# (rc1, rc2, ...) without churning main; promote to `v0.2.0` from
+# main after the 72 h post-cutover watch confirms stability.
+version = "0.2.0-rc1"
 edition = "2021"
 # MSRV. Deliberately behind the rust-toolchain.toml pin (which is the
 # latest stable) so a contributor with a slightly older toolchain still
