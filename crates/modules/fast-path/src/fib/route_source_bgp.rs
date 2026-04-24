@@ -77,10 +77,14 @@ const BGP_HEADER_LEN: usize = 19;
 /// envelope for the framing buffer.
 const MAX_BGP_MSG_SIZE: usize = 65535;
 
-/// BGP message-type bytes (RFC 4271 §4.1).
+/// BGP message-type bytes (RFC 4271 §4.1). Kept as named constants
+/// for readability at call sites and self-documentation of the
+/// protocol; UPDATE / NOTIFICATION are recognized via bgpkit-parser's
+/// typed enum, so the constants don't appear directly in code.
 const MSG_TYPE_OPEN: u8 = 1;
 #[allow(dead_code)]
 const MSG_TYPE_UPDATE: u8 = 2;
+#[allow(dead_code)]
 const MSG_TYPE_NOTIFICATION: u8 = 3;
 const MSG_TYPE_KEEPALIVE: u8 = 4;
 const MSG_TYPE_ROUTE_REFRESH: u8 = 5;
