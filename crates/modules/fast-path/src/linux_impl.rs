@@ -124,6 +124,13 @@ pub struct ActiveState {
     /// `kernel-fib` mode (which is the default and today's behavior).
     /// `detach` shuts it down cooperatively before tearing down pins.
     pub route_controller: Option<crate::fib::controller::RouteController>,
+    /// `attach_settle_time` from the config, retained for use in
+    /// `detach` so we can pace link-pin removals symmetrically with
+    /// the attach path. Removing all link pins inside one STP
+    /// reconvergence window has been observed to wedge the bridge
+    /// stack on rvu-nicpf hardware (kernel panic, full reboot)
+    /// — the same class of bug §11.8 calls out for attach.
+    pub attach_settle_time: std::time::Duration,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -201,6 +208,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         state_dir: ctx.state_dir.to_path_buf(),
         bpffs_root: ctx.bpffs_root.to_path_buf(),
         route_controller: None,
+        attach_settle_time: cfg.global.attach_settle_time,
     })
 }
 
@@ -1137,12 +1145,19 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         drop(link);
     }
 
-    // Unlink every pin under the module's pin root. Removing link
-    // pins triggers the kernel-side detach; removing map + program
-    // pins is housekeeping.
-    pin::remove_all(&state.bpffs_root)
+    // Unlink every pin under the module's pin root. Pace the link-pin
+    // removals by `attach_settle_time` so we don't trigger an STP
+    // reconvergence storm on shared bridge masters — same hazard
+    // §11.8 calls out for the attach path. Removing all link pins in
+    // ~1 ms (the pre-rc5 behavior) wedged the bridge stack on rvu-
+    // nicpf with eth0/eth4/eth5 all bridged on switch0, kernel-
+    // panicking the EFG during Phase 4 cutover testing.
+    pin::remove_all_paced(&state.bpffs_root, state.attach_settle_time)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
-    info!("fast-path pins removed; kernel detached");
+    info!(
+        settle_secs = state.attach_settle_time.as_secs_f64(),
+        "fast-path pins removed; kernel detached"
+    );
     Ok(())
 }
 

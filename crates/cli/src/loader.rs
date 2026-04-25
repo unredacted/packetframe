@@ -376,14 +376,19 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         ));
     }
 
-    let (bpffs_root, state_dir) = match config {
+    let (bpffs_root, state_dir, settle_time) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
-            (c.global.bpffs_root, c.global.state_dir)
+            (
+                c.global.bpffs_root,
+                c.global.state_dir,
+                c.global.attach_settle_time,
+            )
         }
         None => (
             PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
+            packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
         ),
     };
 
@@ -418,12 +423,17 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         }
 
         // Unlink every pin under `<bpffs-root>/fast-path/`. Removing
-        // link pins triggers the kernel-side XDP detach (§8.5); the
-        // map and program pins are housekeeping.
-        packetframe_fast_path::pin::remove_all(&bpffs_root)
+        // link pins triggers the kernel-side XDP detach (§8.5). Pace
+        // by `attach_settle_time` so bridge-member detaches don't
+        // pile up inside one STP reconvergence window — that's the
+        // post-rc5 fix for the EFG kernel-panic-on-detach observed
+        // during Phase 4 cutover testing. Map + program pins are
+        // housekeeping with no kernel-link side effects, no pacing.
+        packetframe_fast_path::pin::remove_all_paced(&bpffs_root, settle_time)
             .map_err(|e| format!("remove pins under {}: {e}", bpffs_root.display()))?;
         tracing::info!(
             pin_root = %packetframe_fast_path::pin::module_root(&bpffs_root).display(),
+            settle_secs = settle_time.as_secs_f64(),
             "pins removed; kernel detached"
         );
 
