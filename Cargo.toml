@@ -22,7 +22,7 @@ exclude = [
 # series is cut from this PR branch directly so we can iterate
 # (rc1, rc2, ...) without churning main; promote to `v0.2.0` from
 # main after the 72 h post-cutover watch confirms stability.
-version = "0.2.0-rc2"
+version = "0.2.0-rc3"
 edition = "2021"
 # MSRV. Deliberately behind the rust-toolchain.toml pin (which is the
 # latest stable) so a contributor with a slightly older toolchain still

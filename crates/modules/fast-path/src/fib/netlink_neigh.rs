@@ -86,6 +86,11 @@ pub struct NetlinkNeighborResolver {
     events_tx: mpsc::Sender<NeighEvent>,
     resolve_rx: mpsc::Receiver<IpAddr>,
     shutdown: CancellationToken,
+    /// Diagnostic counters (Phase 3.9 debug). Logged periodically so
+    /// the operator can see whether register_nexthop calls are
+    /// landing on cache hits or fanning out to proactive probes.
+    synth_learned_emitted: u64,
+    cache_misses: u64,
     /// Cache mapping ifindex → egress MAC. Populated at startup via
     /// a single `RTM_GETLINK` dump; maintained by `RTM_NEWLINK` /
     /// `RTM_DELLINK` multicast events. Used to attach `src_mac` to
@@ -129,6 +134,8 @@ impl NetlinkNeighborResolver {
                 shutdown,
                 iface_mac: HashMap::new(),
                 neigh_cache: HashMap::new(),
+                synth_learned_emitted: 0,
+                cache_misses: 0,
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -197,6 +204,12 @@ impl NetlinkNeighborResolver {
             "NeighborResolver netlink multicast subscription live"
         );
 
+        // Phase 3.9 diagnostic: periodic stats so we can see whether
+        // synthetic Learned events are firing for most BGP nexthops or
+        // not. Cheap (single info log every 10 s).
+        let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        stats_tick.tick().await; // skip immediate fire
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -232,11 +245,22 @@ impl NetlinkNeighborResolver {
                                     .copied()
                                     .unwrap_or([0; 6]);
                                 let evt = NeighEvent::Learned { ip, mac, ifindex, src_mac };
-                                if let Err(e) = self.events_tx.send(evt).await {
-                                    debug!(?ip, error = %e, "synthetic Learned send failed");
+                                match self.events_tx.send(evt).await {
+                                    Ok(()) => {
+                                        self.synth_learned_emitted += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!(?ip, error = %e, "synthetic Learned send failed");
+                                    }
                                 }
-                                debug!(?ip, ifindex, "resolved from kernel neighbour cache");
                             } else {
+                                self.cache_misses += 1;
+                                if self.cache_misses <= 20 {
+                                    // First few misses — log explicitly so
+                                    // the operator can see *which* IPs the
+                                    // dump didn't capture.
+                                    info!(?ip, "neighbour cache miss; proactive probe");
+                                }
                                 // Best-effort proactive resolve. If the route
                                 // lookup or neighbor add fails, log at debug
                                 // and fall back to first-packet kernel ARP.
@@ -249,6 +273,19 @@ impl NetlinkNeighborResolver {
                             debug!("resolve request channel closed");
                         }
                     }
+                }
+                _ = stats_tick.tick() => {
+                    // Periodic resolver stats. Helps diagnose whether
+                    // register_nexthop calls are landing on cache hits
+                    // (good — synthetic Learned fired) or misses (kernel
+                    // didn't have an ARP entry; relying on proactive
+                    // probe).
+                    info!(
+                        cache_size = self.neigh_cache.len(),
+                        synth_learned_emitted = self.synth_learned_emitted,
+                        cache_misses = self.cache_misses,
+                        "neighbour resolver stats"
+                    );
                 }
             }
         }
