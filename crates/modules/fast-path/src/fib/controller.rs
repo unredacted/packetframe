@@ -117,13 +117,19 @@ impl RouteController {
 
         let (resolver, events_rx, neigh_handle) =
             NetlinkNeighborResolver::new(shutdown_token.clone());
-        let (programmer, prog_handle) = FibProgrammer::new(
+        // Phase 3.9 fix: pass the resolve handle through so
+        // FibProgrammer::register() can kick proactive resolution on
+        // every newly-allocated nexthop. Pre-fix this was wired but
+        // never called, leaving nexthops dependent on multicast events
+        // that don't fire for stable REACHABLE kernel entries.
+        let (programmer, prog_handle) = FibProgrammer::new_with_resolver(
             nexthops,
             fib_v4,
             fib_v6,
             ecmp_groups,
             events_rx,
             shutdown_token.clone(),
+            Some(neigh_handle.clone()),
         );
 
         let resolver_task = runtime.spawn(async move {
