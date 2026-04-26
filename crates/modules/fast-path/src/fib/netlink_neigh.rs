@@ -1251,6 +1251,7 @@ mod tests {
             addr: "23.191.200.0".parse().unwrap(),
             prefix_len: 24,
             iface: "br1337".into(),
+            arp_scavenge: false,
         };
         assert!(spec.contains("23.191.200.0".parse().unwrap()));
         assert!(spec.contains("23.191.200.10".parse().unwrap()));
@@ -1265,6 +1266,7 @@ mod tests {
             addr: "10.10.1.2".parse().unwrap(),
             prefix_len: 32,
             iface: "honeypot0".into(),
+            arp_scavenge: false,
         };
         assert!(spec.contains("10.10.1.2".parse().unwrap()));
         assert!(!spec.contains("10.10.1.3".parse().unwrap()));
@@ -1280,6 +1282,7 @@ mod tests {
             addr: "0.0.0.0".parse().unwrap(),
             prefix_len: 0,
             iface: "any".into(),
+            arp_scavenge: false,
         };
         assert!(spec.contains("1.2.3.4".parse().unwrap()));
         assert!(spec.contains("255.255.255.255".parse().unwrap()));
@@ -1294,6 +1297,7 @@ mod tests {
             addr: "23.191.200.5".parse().unwrap(),
             prefix_len: 24,
             iface: "br1337".into(),
+            arp_scavenge: false,
         };
         assert!(spec.contains("23.191.200.10".parse().unwrap()));
     }
