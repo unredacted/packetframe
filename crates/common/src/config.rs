@@ -166,6 +166,38 @@ pub enum ModuleDirective {
         iface: String,
         line: usize,
     },
+    /// Synthetic IPv4 default route for the custom FIB (v0.2.1). With
+    /// `fallback-default via <iface> nexthop <ipv4>`, the resolver
+    /// injects a `RouteEvent::Add { prefix: 0.0.0.0/0, nexthops: [nh] }`
+    /// at startup. Every more-specific bird-fed route still wins in
+    /// LPM; the /0 catches destinations bird's iBGP feed doesn't have.
+    ///
+    /// Bird's `default4` is `unreachable` by design (pathvector's
+    /// `accept-default: false` keeps stray defaults out of the RIB),
+    /// so packetframe never gets a usable 0.0.0.0/0 from the feed.
+    /// Without one in the FIB, traffic to destinations bird doesn't
+    /// know (RFC 1918, CGNAT, test-net, anything outside DFZ) misses
+    /// LPM, falls to slow path, and clogs conntrack with flows that
+    /// just get dropped upstream anyway. With this fallback, those
+    /// packets XDP-redirect to upstream — same upstream behavior,
+    /// but conntrack stays out of it.
+    FallbackDefault {
+        iface: String,
+        nexthop: Ipv4Addr,
+        line: usize,
+    },
+    /// XDP-time prefix block (v0.2.1). When dst (or src for symmetry)
+    /// falls in `block-prefix <cidr>` AND the packet is otherwise
+    /// allowlist-matched, the program returns `XDP_DROP` rather than
+    /// XDP_PASS-to-kernel. Used to drop traffic toward bogons /
+    /// RFC 1918 / CGNAT — destinations that would just get RST'd
+    /// upstream anyway, but currently waste skb allocation +
+    /// netfilter walk + conntrack capacity. Operator opt-in: empty
+    /// list = no behavior change.
+    BlockPrefix {
+        cidr: Ipv4Prefix,
+        line: usize,
+    },
     DryRun(bool),
     CircuitBreaker(CircuitBreakerSpec),
     /// Operator override for a driver-specific workaround. Currently
@@ -491,6 +523,7 @@ impl Config {
                 let (iface, line) = match d {
                     ModuleDirective::Attach { iface, line, .. } => (iface, line),
                     ModuleDirective::LocalPrefix { iface, line, .. } => (iface, line),
+                    ModuleDirective::FallbackDefault { iface, line, .. } => (iface, line),
                     _ => continue,
                 };
                 let p = sysfs_net.join(iface);
@@ -757,6 +790,72 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 iface: iface.to_string(),
                 line,
             })
+        }
+        "fallback-default" => {
+            // Grammar: fallback-default via <iface> nexthop <ipv4>
+            let via_tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "fallback-default requires `via <iface> nexthop <ipv4>`",
+                )
+            })?;
+            if via_tok != "via" {
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "fallback-default: expected `via`, got `{via_tok}` \
+                         (form: `fallback-default via <iface> nexthop <ipv4>`)"
+                    ),
+                ));
+            }
+            let iface = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "fallback-default: expected an iface name after `via`")
+            })?;
+            let nh_kw = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "fallback-default: expected `nexthop <ipv4>` after iface",
+                )
+            })?;
+            if nh_kw != "nexthop" {
+                return Err(ConfigError::parse(
+                    line,
+                    format!("fallback-default: expected `nexthop`, got `{nh_kw}`"),
+                ));
+            }
+            let nh_tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "fallback-default: missing IPv4 nexthop after `nexthop`",
+                )
+            })?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "fallback-default takes exactly: via <iface> nexthop <ipv4>",
+                ));
+            }
+            let nh: Ipv4Addr = nh_tok
+                .parse()
+                .map_err(|e| ConfigError::parse(line, format!("bad IPv4 `{nh_tok}`: {e}")))?;
+            Ok(ModuleDirective::FallbackDefault {
+                iface: iface.to_string(),
+                nexthop: nh,
+                line,
+            })
+        }
+        "block-prefix" => {
+            // Grammar: block-prefix <cidr>
+            let cidr = rest
+                .next()
+                .ok_or_else(|| ConfigError::parse(line, "block-prefix requires a CIDR"))?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(line, "block-prefix takes one argument"));
+            }
+            let p: Ipv4Prefix = cidr
+                .parse()
+                .map_err(|e: String| ConfigError::parse(line, e))?;
+            Ok(ModuleDirective::BlockPrefix { cidr: p, line })
         }
         "dry-run" => {
             let v = rest
@@ -1880,5 +1979,135 @@ module fast-path
             other => panic!("expected InterfaceMissing, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- v0.2.1 fallback-default + block-prefix ---
+
+    #[test]
+    fn fallback_default_parses_basic_form() {
+        let m = parse_module_body("  fallback-default via eth3 nexthop 194.110.60.50\n")
+            .expect("parse");
+        let fbd = m.directives.iter().find_map(|d| match d {
+            ModuleDirective::FallbackDefault { iface, nexthop, .. } => {
+                Some((iface.clone(), *nexthop))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            fbd,
+            Some((
+                "eth3".to_string(),
+                "194.110.60.50".parse::<Ipv4Addr>().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn fallback_default_missing_via_errors() {
+        let e = parse_module_body("  fallback-default eth3 nexthop 194.110.60.50\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("expected `via`"), "msg: {message}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn fallback_default_missing_nexthop_keyword_errors() {
+        let e = parse_module_body("  fallback-default via eth3 194.110.60.50\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("expected `nexthop`"), "msg: {message}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn fallback_default_bad_ipv4_errors() {
+        let e = parse_module_body("  fallback-default via eth3 nexthop not-an-ip\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn fallback_default_extra_arg_errors() {
+        let e =
+            parse_module_body("  fallback-default via eth3 nexthop 1.2.3.4 extra\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn fallback_default_iface_validated_against_sysfs() {
+        let dir = std::env::temp_dir().join(format!(
+            "pf-cfg-fbd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("eth3")).unwrap();
+        let cfg_ok = Config::parse(
+            "module fast-path\n  attach eth3 generic\n  \
+             fallback-default via eth3 nexthop 1.2.3.4\n",
+        )
+        .expect("parse");
+        cfg_ok.validate_interfaces_in(&dir).expect("ok");
+
+        let cfg_bad = Config::parse(
+            "module fast-path\n  attach eth3 generic\n  \
+             fallback-default via missing0 nexthop 1.2.3.4\n",
+        )
+        .expect("parse");
+        let err = cfg_bad.validate_interfaces_in(&dir).unwrap_err();
+        match err {
+            ConfigError::InterfaceMissing { iface, .. } => assert_eq!(iface, "missing0"),
+            other => panic!("expected InterfaceMissing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_prefix_parses_basic_form() {
+        let m = parse_module_body("  block-prefix 10.0.0.0/8\n").expect("parse");
+        let bp = m
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::BlockPrefix { cidr, .. } => Some(*cidr),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bp.len(), 1);
+        assert_eq!(bp[0].addr, "10.0.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(bp[0].prefix_len, 8);
+    }
+
+    #[test]
+    fn block_prefix_multiple_lines_accumulate() {
+        let body = "  block-prefix 10.0.0.0/8\n\
+                    block-prefix 172.16.0.0/12\n\
+                    block-prefix 192.168.0.0/16\n\
+                    block-prefix 100.64.0.0/10\n";
+        let m = parse_module_body(body).expect("parse");
+        let n = m
+            .directives
+            .iter()
+            .filter(|d| matches!(d, ModuleDirective::BlockPrefix { .. }))
+            .count();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn block_prefix_missing_cidr_errors() {
+        let e = parse_module_body("  block-prefix\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn block_prefix_extra_arg_errors() {
+        let e = parse_module_body("  block-prefix 10.0.0.0/8 something\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
     }
 }

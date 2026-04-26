@@ -607,6 +607,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                         addr: cidr.addr,
                         prefix_len: cidr.prefix_len,
                         iface: iface.clone(),
+                        arp_scavenge: false,
                     })
                 }
                 _ => None,
@@ -618,11 +619,30 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 "v0.2.1 local-prefix connected fast-path enabled"
             );
         }
+        // v0.2.1 issue #31: optional synthetic 0.0.0.0/0.
+        let fallback_default: Option<crate::fib::netlink_neigh::FallbackDefaultSpec> =
+            cfg.section.directives.iter().find_map(|d| match d {
+                ModuleDirective::FallbackDefault { iface, nexthop, .. } => {
+                    Some(crate::fib::netlink_neigh::FallbackDefaultSpec {
+                        iface: iface.clone(),
+                        nexthop: *nexthop,
+                    })
+                }
+                _ => None,
+            });
+        if let Some(fbd) = &fallback_default {
+            info!(
+                iface = %fbd.iface,
+                nexthop = %fbd.nexthop,
+                "v0.2.1 fallback-default 0.0.0.0/0 catch-all enabled"
+            );
+        }
 
         let ctrl = crate::fib::controller::RouteController::start(
             &state.bpffs_root,
             route_source,
             local_prefixes,
+            fallback_default,
         )
         .map_err(|e| {
             ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))

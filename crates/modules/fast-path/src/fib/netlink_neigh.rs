@@ -68,6 +68,33 @@ pub struct LocalPrefixSpec {
     /// resolver doesn't gate startup on it because operators may stage
     /// config before the iface comes up).
     pub iface: String,
+    /// v0.2.1: when true, the resolver issues an ARP probe for every
+    /// IP in the prefix at startup (capped to /22 = ≤ 1024 hosts to
+    /// avoid kernel `gc_thresh3` overflow + ARP storms). Useful for
+    /// quiet LANs (storage networks like Ceph) where hosts don't
+    /// communicate L3 with the gateway and therefore never appear in
+    /// `ip neigh show <iface>`. Off by default — generates noticeable
+    /// ARP traffic during startup.
+    pub arp_scavenge: bool,
+}
+
+/// Operator-declared synthetic IPv4 default route (v0.2.1, issue #31).
+/// The resolver injects a single `RouteEvent::Add { 0.0.0.0/0,
+/// nexthops: [nexthop] }` at startup so the custom-FIB has a
+/// catch-all for destinations bird's iBGP feed doesn't cover (RFC 1918,
+/// CGNAT, test-net, anything not in DFZ). Otherwise those packets
+/// miss LPM, fall to slow-path through netfilter / conntrack, and
+/// get dropped upstream anyway. With this directive they XDP-redirect
+/// to upstream — same upstream behavior, conntrack stays out of it.
+///
+/// `iface` is validated at startup against `/sys/class/net` (same
+/// as `attach`/`local-prefix`); `nexthop` is the IPv4 address of an
+/// existing reachable upstream peer (kernel ARP must already know it
+/// or the resolver's existing proactive-resolve fires for it).
+#[derive(Debug, Clone)]
+pub struct FallbackDefaultSpec {
+    pub iface: String,
+    pub nexthop: Ipv4Addr,
 }
 
 impl LocalPrefixSpec {
@@ -172,6 +199,10 @@ pub struct NetlinkNeighborResolver {
     /// running under a test harness that doesn't drive a programmer
     /// — e.g., the existing netns ARP-walk tests).
     prog_handle: Option<FibProgrammerHandle>,
+    /// v0.2.1 issue #31: optional synthetic 0.0.0.0/0 catch-all.
+    /// `None` = no fallback (default). `Some(spec)` = inject a /0
+    /// RouteEvent::Add at startup once the iface is resolvable.
+    fallback_default: Option<FallbackDefaultSpec>,
 }
 
 impl NetlinkNeighborResolver {
@@ -199,6 +230,7 @@ impl NetlinkNeighborResolver {
                 local_arp_routes_removed: 0,
                 local_prefixes: Vec::new(),
                 prog_handle: None,
+                fallback_default: None,
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -222,6 +254,22 @@ impl NetlinkNeighborResolver {
     ) -> Self {
         self.local_prefixes = local_prefixes;
         self.prog_handle = Some(prog_handle);
+        self
+    }
+
+    /// v0.2.1 issue #31. Set the synthetic IPv4 default route. The
+    /// resolver also needs a `prog_handle` to emit RouteEvents; if
+    /// `with_local_prefixes` was already called the same handle is
+    /// reused, otherwise the caller passes one here.
+    pub fn with_fallback_default(
+        mut self,
+        spec: FallbackDefaultSpec,
+        prog_handle: FibProgrammerHandle,
+    ) -> Self {
+        self.fallback_default = Some(spec);
+        if self.prog_handle.is_none() {
+            self.prog_handle = Some(prog_handle);
+        }
         self
     }
 
@@ -301,11 +349,19 @@ impl NetlinkNeighborResolver {
         // wrapper); this is the documented usage pattern.
         if let Some(prog) = self.prog_handle.clone() {
             self.seed_local_prefix_routes(&prog).await;
-        } else if !self.local_prefixes.is_empty() {
+            // v0.2.1 issue #31: inject the synthetic 0.0.0.0/0 if the
+            // operator declared `fallback-default`. Order matters: the
+            // /0 goes in *after* the per-/32 seed so ECMP-group dedup
+            // signatures don't accidentally collapse the catch-all
+            // with a real route. Bird's actual /0 (if any) wins via
+            // peer_id scoping inside FibProgrammer.
+            self.seed_fallback_default(&prog).await;
+        } else if !self.local_prefixes.is_empty() || self.fallback_default.is_some() {
             warn!(
-                count = self.local_prefixes.len(),
-                "local-prefix directives configured but no FibProgrammer handle wired through; \
-                 connected fast-path will not be enabled — file a bug if you see this on a \
+                local_prefixes = self.local_prefixes.len(),
+                has_fallback = self.fallback_default.is_some(),
+                "v0.2.1 directives configured but no FibProgrammer handle wired through; \
+                 fast-path features will not be enabled — file a bug if you see this on a \
                  production deploy"
             );
         }
@@ -549,6 +605,45 @@ impl NetlinkNeighborResolver {
             local_prefixes = self.local_prefixes.len(),
             "local-prefix /32 seed complete"
         );
+    }
+
+    /// v0.2.1 issue #31. Inject a synthetic IPv4 default route into
+    /// the custom-FIB if the operator declared `fallback-default`.
+    /// One-shot at startup; no ongoing maintenance because the
+    /// /0 doesn't change (operator restarts to remove it). Uses a
+    /// dedicated PeerId derived from the iface ifindex so it scopes
+    /// cleanly the same way local-prefix /32s do.
+    async fn seed_fallback_default(&mut self, prog: &FibProgrammerHandle) {
+        let Some(spec) = self.fallback_default.clone() else {
+            return;
+        };
+        let Some(&ifindex) = self.iface_to_ifindex.get(&spec.iface) else {
+            warn!(
+                iface = %spec.iface,
+                "fallback-default iface not yet known to the kernel; will retry on RTM_NEWLINK \
+                 (config validates iface exists at startup, so this should only fire on transient \
+                 races)"
+            );
+            return;
+        };
+        let peer_id = PeerId::local_arp(ifindex);
+        let event = RouteEvent::Add {
+            peer_id,
+            prefix: IpPrefix::V4 {
+                addr: [0, 0, 0, 0],
+                prefix_len: 0,
+            },
+            nexthops: vec![IpAddr::V4(spec.nexthop)],
+        };
+        match prog.apply_route_event(event).await {
+            Ok(()) => info!(
+                iface = %spec.iface,
+                ifindex,
+                nexthop = %spec.nexthop,
+                "v0.2.1 fallback-default 0.0.0.0/0 injected"
+            ),
+            Err(e) => warn!(error = %e, "fallback-default injection failed"),
+        }
     }
 
     /// Same as [`Self::seed_local_prefix_routes`] but for a single

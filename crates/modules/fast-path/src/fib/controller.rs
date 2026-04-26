@@ -29,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::fib::integrity::{shared_snapshot, IntegrityChecker, IntegrityConfig, SharedSnapshot};
-use crate::fib::netlink_neigh::{LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver};
+use crate::fib::netlink_neigh::{
+    FallbackDefaultSpec, LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver,
+};
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
 use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
 use crate::fib::route_source_bmp::BmpStation;
@@ -99,6 +101,7 @@ impl RouteController {
         bpffs_root: &Path,
         route_source: Option<RouteSourceConfig>,
         local_prefixes: Vec<LocalPrefixSpec>,
+        fallback_default: Option<FallbackDefaultSpec>,
     ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
@@ -143,6 +146,12 @@ impl RouteController {
             resolver
         } else {
             resolver.with_local_prefixes(local_prefixes, prog_handle.clone())
+        };
+        // v0.2.1 issue #31: optional synthetic 0.0.0.0/0. Unused unless
+        // the operator declared `fallback-default`.
+        let resolver = match fallback_default {
+            Some(spec) => resolver.with_fallback_default(spec, prog_handle.clone()),
+            None => resolver,
         };
 
         let resolver_task = runtime.spawn(async move {
