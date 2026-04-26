@@ -164,6 +164,13 @@ pub enum ModuleDirective {
     LocalPrefix {
         cidr: Ipv4Prefix,
         iface: String,
+        /// v0.2.1 issue #32: when true (operator added `arp-scavenge`
+        /// after the iface), the resolver issues an ARP probe for every
+        /// IP in the CIDR at startup so quiet hosts (e.g. Ceph
+        /// nodes that never speak L3 with the gateway) get registered
+        /// and fast-pathed. Capped to /22 to avoid `gc_thresh3` overflow
+        /// + visible ARP storms on operator networks. Off by default.
+        arp_scavenge: bool,
         line: usize,
     },
     /// Synthetic IPv4 default route for the custom FIB (v0.2.1). With
@@ -757,7 +764,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::AllowPrefix6(p))
         }
         "local-prefix" => {
-            // Grammar: local-prefix <cidr> via <iface>
+            // Grammar: local-prefix <cidr> via <iface> [arp-scavenge]
             let cidr_tok = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "local-prefix requires a CIDR (e.g. 23.191.200.0/24)")
             })?;
@@ -769,25 +776,50 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                     line,
                     format!(
                         "local-prefix: expected `via` after the CIDR, got `{via_tok}` \
-                         (form: `local-prefix <cidr> via <iface>`)"
+                         (form: `local-prefix <cidr> via <iface> [arp-scavenge]`)"
                     ),
                 ));
             }
             let iface = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "local-prefix: expected an interface name after `via`")
             })?;
-            if rest.next().is_some() {
-                return Err(ConfigError::parse(
-                    line,
-                    "local-prefix takes exactly three arguments: <cidr> via <iface>",
-                ));
+            // v0.2.1 issue #32: optional `arp-scavenge` tail flag.
+            let mut arp_scavenge = false;
+            for tail in rest {
+                match tail {
+                    "arp-scavenge" => arp_scavenge = true,
+                    other => {
+                        return Err(ConfigError::parse(
+                            line,
+                            format!(
+                                "local-prefix: unknown tail flag `{other}` \
+                                 (only `arp-scavenge` is recognized)"
+                            ),
+                        ));
+                    }
+                }
             }
             let p: Ipv4Prefix = cidr_tok
                 .parse()
                 .map_err(|e: String| ConfigError::parse(line, e))?;
+            // Cap arp-scavenge at /22 (≤ 1024 hosts) to avoid kernel
+            // gc_thresh3 overflow. Larger prefixes silently fall back to
+            // arp-scavenge=false with a config-error so the operator
+            // notices.
+            if arp_scavenge && p.prefix_len < 22 {
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "local-prefix arp-scavenge requires prefix_len >= 22 (≤ 1024 hosts) \
+                         to avoid kernel ARP storms; got /{}",
+                        p.prefix_len
+                    ),
+                ));
+            }
             Ok(ModuleDirective::LocalPrefix {
                 cidr: p,
                 iface: iface.to_string(),
+                arp_scavenge,
                 line,
             })
         }
@@ -1941,14 +1973,75 @@ module fast-path
 
     #[test]
     fn local_prefix_extra_arg_errors() {
-        let e = parse_module_body("  local-prefix 23.191.200.0/24 via br1337 extra\n").unwrap_err();
-        assert!(matches!(e, ConfigError::Parse { .. }));
+        let e =
+            parse_module_body("  local-prefix 23.191.200.0/24 via br1337 garbage\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("unknown tail flag"), "msg: {message}");
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
     fn local_prefix_bad_cidr_errors() {
         let e = parse_module_body("  local-prefix 23.191.200.0 via br1337\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix_arp_scavenge_flag_parses() {
+        let m = parse_module_body("  local-prefix 23.191.200.0/24 via br1337 arp-scavenge\n")
+            .expect("parse");
+        let lp = m
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::LocalPrefix {
+                    cidr,
+                    iface,
+                    arp_scavenge,
+                    ..
+                } => Some((*cidr, iface.clone(), *arp_scavenge)),
+                _ => None,
+            })
+            .expect("local-prefix");
+        assert_eq!(lp.0.prefix_len, 24);
+        assert_eq!(lp.1, "br1337");
+        assert!(lp.2, "arp-scavenge flag should be set");
+    }
+
+    #[test]
+    fn local_prefix_arp_scavenge_omitted_defaults_off() {
+        let m = parse_module_body("  local-prefix 23.191.200.0/24 via br1337\n").expect("parse");
+        let arp = m.directives.iter().find_map(|d| match d {
+            ModuleDirective::LocalPrefix { arp_scavenge, .. } => Some(*arp_scavenge),
+            _ => None,
+        });
+        assert_eq!(arp, Some(false));
+    }
+
+    #[test]
+    fn local_prefix_arp_scavenge_rejects_oversized_prefix() {
+        // /16 = 65K hosts, way over the /22 = 1024 cap.
+        let e = parse_module_body("  local-prefix 10.0.0.0/16 via br0 arp-scavenge\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("requires prefix_len >= 22"),
+                    "msg: {message}"
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn local_prefix_arp_scavenge_accepts_slash22_boundary() {
+        // /22 = 1024 hosts is the boundary — should be allowed.
+        let m =
+            parse_module_body("  local-prefix 10.0.0.0/22 via br0 arp-scavenge\n").expect("parse");
+        assert_eq!(m.directives.len(), 1);
     }
 
     #[test]

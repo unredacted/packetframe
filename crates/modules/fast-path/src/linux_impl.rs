@@ -602,14 +602,17 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             .directives
             .iter()
             .filter_map(|d| match d {
-                ModuleDirective::LocalPrefix { cidr, iface, .. } => {
-                    Some(crate::fib::netlink_neigh::LocalPrefixSpec {
-                        addr: cidr.addr,
-                        prefix_len: cidr.prefix_len,
-                        iface: iface.clone(),
-                        arp_scavenge: false,
-                    })
-                }
+                ModuleDirective::LocalPrefix {
+                    cidr,
+                    iface,
+                    arp_scavenge,
+                    ..
+                } => Some(crate::fib::netlink_neigh::LocalPrefixSpec {
+                    addr: cidr.addr,
+                    prefix_len: cidr.prefix_len,
+                    iface: iface.clone(),
+                    arp_scavenge: *arp_scavenge,
+                }),
                 _ => None,
             })
             .collect();

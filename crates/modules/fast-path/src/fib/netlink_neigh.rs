@@ -605,6 +605,139 @@ impl NetlinkNeighborResolver {
             local_prefixes = self.local_prefixes.len(),
             "local-prefix /32 seed complete"
         );
+
+        // v0.2.1 issue #32: ARP-scavenge any prefix the operator
+        // flagged. For each IP in the CIDR (excluding network and
+        // broadcast), call NeighborResolveHandle::request_resolve via
+        // the resolve_tx channel — the proactive-resolve path then
+        // issues an RTM_NEWNEIGH NUD_NONE which the kernel turns into
+        // an ARP request. Hosts that respond land in the L3 ARP cache,
+        // RTM_NEWNEIGH multicasts back to us, and our existing
+        // multicast handler emits the per-/32 RouteEvent::Add.
+        //
+        // For the in-resolver path we directly enqueue the IPs into
+        // resolve_tx. This bypasses the NeighborResolveHandle's
+        // try_send overflow handling, but the queue is bounded by
+        // RESOLVE_QUEUE_CAPACITY (1024) which is exactly the cap we
+        // require for arp-scavenge prefixes anyway.
+        self.scavenge_local_prefix_arp().await;
+    }
+
+    /// v0.2.1 issue #32 — for every `local-prefix` flagged with
+    /// `arp-scavenge`, enqueue every host IP in the CIDR for proactive
+    /// resolution. Caps at /22 (1024 hosts) per spec validation —
+    /// larger prefixes are rejected at config-parse time.
+    async fn scavenge_local_prefix_arp(&mut self) {
+        // Snapshot the specs to avoid borrowing self twice.
+        let specs: Vec<LocalPrefixSpec> = self
+            .local_prefixes
+            .iter()
+            .filter(|s| s.arp_scavenge)
+            .cloned()
+            .collect();
+        if specs.is_empty() {
+            return;
+        }
+        let mut total_probed = 0usize;
+        for spec in specs {
+            let net_u32 = u32::from(spec.addr);
+            let plen = spec.prefix_len;
+            // Number of host bits + the host range.
+            let host_bits = 32u8.saturating_sub(plen) as u32;
+            let host_count = if host_bits >= 32 {
+                u32::MAX
+            } else {
+                1u32 << host_bits
+            };
+            // Mask off any host bits the operator left set in the
+            // declared CIDR — treat 23.191.200.5/24 as 23.191.200.0/24.
+            let mask: u32 = if plen == 0 {
+                0
+            } else {
+                (!0u32) << (32 - plen as u32)
+            };
+            let net_aligned = net_u32 & mask;
+            // Skip the network and broadcast addresses for /24 and shorter.
+            // For /32 (single host), probe just that. For /31, probe both.
+            let (start_host, end_host) = match plen {
+                32 => (0u32, 1u32),
+                31 => (0u32, 2u32),
+                _ => (1u32, host_count.saturating_sub(1)),
+            };
+            let mut probed = 0u32;
+            for offset in start_host..end_host {
+                let ip = Ipv4Addr::from(net_aligned + offset);
+                Self::issue_arp_probe(IpAddr::V4(ip)).await;
+                probed += 1;
+                // Rate-limit at ~500 probes/sec (50 per 100ms). Without
+                // pacing, a /22 sweep (1024 hosts) issues 1024 ARP
+                // requests in milliseconds — saturates the kernel
+                // neighbour queue and triggers `Neighbour table
+                // overflow` warnings. 500/s is comfortably under the
+                // default `gc_thresh3` (1024) replenishment rate and
+                // matches typical NIC ARP-handling capacity.
+                if probed % 50 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            total_probed += probed as usize;
+            info!(
+                cidr = %format_args!("{}/{}", spec.addr, spec.prefix_len),
+                iface = %spec.iface,
+                probed,
+                "arp-scavenge sweep complete"
+            );
+        }
+        info!(
+            total_probed,
+            "arp-scavenge total probes issued; live hosts will land in L3 ARP cache \
+             and trigger RTM_NEWNEIGH → /32 fast-path within seconds"
+        );
+    }
+
+    /// One-shot ARP probe via a dedicated unicast netlink connection.
+    /// Standalone (vs. `issue_proactive_resolve` which lives inside
+    /// the select! loop) so we can fire many in sequence at startup
+    /// without blocking the multicast reader.
+    async fn issue_arp_probe(ip: IpAddr) {
+        let (connection, handle, _) = match new_connection() {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(?ip, error = %e, "scavenge: new_connection failed");
+                return;
+            }
+        };
+        tokio::spawn(connection);
+        // Look up the egress ifindex via route lookup, same as
+        // issue_proactive_resolve.
+        let req = match ip {
+            IpAddr::V4(v4) => RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(IpAddr::V4(v4), 32)
+                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
+                .build(),
+            IpAddr::V6(v6) => RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(IpAddr::V6(v6), 128)
+                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
+                .build(),
+        };
+        let oif = match lookup_oif(&handle, req).await {
+            Some(i) => i,
+            None => {
+                debug!(?ip, "scavenge: no OIF; skipping");
+                return;
+            }
+        };
+        match handle
+            .neighbours()
+            .add(oif, ip)
+            .state(NeighbourState::None)
+            .replace()
+            .execute()
+            .await
+        {
+            Ok(()) => debug!(?ip, oif, "scavenge probe issued"),
+            Err(e) => debug!(?ip, oif, error = %e, "scavenge probe failed"),
+        }
     }
 
     /// v0.2.1 issue #31. Inject a synthetic IPv4 default route into
