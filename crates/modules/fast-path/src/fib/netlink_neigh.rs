@@ -746,22 +746,16 @@ async fn lookup_oif(
 }
 
 /// Dump every link on the box via a single RTM_GETLINK-dump request;
-/// return a fresh ifindex→MAC map. Uses a dedicated unicast netlink
-/// connection — the main multicast one is owned by the select! loop.
+/// return both an `ifindex → MAC` map and a `name → ifindex` map.
+/// Uses a dedicated unicast netlink connection — the main multicast
+/// one is owned by the select! loop.
 ///
 /// Links without a usable MAC (e.g., tunnels, loopback, bridge masters
-/// before an attachment) are skipped silently; they'll show up in a
-/// later RTM_NEWLINK when their hardware address is set.
-async fn dump_link_macs() -> Result<HashMap<u32, [u8; 6]>, NeighError> {
-    let (macs, _names) = dump_link_info().await?;
-    Ok(macs)
-}
-
-/// Variant of [`dump_link_macs`] that also returns a `name → ifindex`
-/// map. v0.2.1 uses this so the resolver can resolve `LocalPrefixSpec`
-/// iface names to ifindices once at startup. Kept separate from the
-/// MAC-only path so older callers (tests, kernel-fib-only flows) don't
-/// pay for the extra hashmap they never read.
+/// before an attachment) are skipped silently in the MAC map; they'll
+/// show up in a later RTM_NEWLINK when their hardware address is set.
+/// The name map captures every iface regardless (every link has an
+/// `IFNAME` attribute), so the v0.2.1 local-prefix path can resolve
+/// iface names to ifindices for ifaces that don't have a MAC.
 async fn dump_link_info() -> Result<(HashMap<u32, [u8; 6]>, HashMap<String, u32>), NeighError> {
     let (connection, handle, _) =
         new_connection().map_err(|e| NeighError::new(format!("new_connection: {e}")))?;
