@@ -12,17 +12,23 @@ conntrack/netfilter hot path by intercepting them at XDP ingress and
 redirecting with `bpf_redirect_map`. For forwarding decisions the
 module supports two modes — `kernel-fib` consults the kernel's FIB
 via `bpf_fib_lookup()`; `custom-fib` consults its own LPM-trie FIB
-populated from a BMP stream out of bird (RFC 7854 + 9069 Loc-RIB),
-which is what runs in production when a peer between the kernel's
-route table and a closed-source sibling daemon would otherwise race
-on BGP attributes. The design spec lives alongside the project
+populated from bird, which is what runs in production when a peer
+between the kernel's route table and a closed-source sibling daemon
+would otherwise race on BGP attributes. The custom-FIB route feed is
+iBGP today (bird's `protocol bgp` export filter runs after best-path
+selection, so packetframe receives one UPDATE per prefix); a BMP
+station for emitters that ship RFC 9069 Loc-RIB (FRR; future bird)
+ships in the same binary. The design spec lives alongside the project
 internally; inline code comments cite section numbers (e.g. `§4.2`)
 as breadcrumbs.
 
 ## Status
 
-v0.1 ships the full fast-path module and a general-purpose `probe`
-diagnostic:
+v0.1 shipped the kernel-FIB fast-path module + the `probe` diagnostic.
+v0.2.0 (currently in the rc5 cutover window on the reference EFG)
+adds the Option F custom-FIB control plane — iBGP route source,
+neighbor resolver, FIB programmer, integrity check, and the
+`packetframe fib` operator subcommands. Together the binary ships:
 
 - **XDP ingress + allowlist match** per interface, IPv4 and IPv6,
   with LPM-trie prefix lookups.
@@ -30,9 +36,11 @@ diagnostic:
   forwarding topologies.
 - **Two forwarding modes** — `kernel-fib` uses `bpf_fib_lookup()`
   against the kernel FIB; `custom-fib` (Option F) consults an
-  in-BPF LPM trie populated from bird over BMP. Both redirect via
-  `bpf_redirect_map`. `compare` mode runs both and bumps a
-  disagreement counter for pre-cutover validation.
+  in-BPF LPM trie populated from a userspace route source (iBGP
+  to bird in production today, or RFC 9069 BMP for emitters that
+  ship it). Both redirect via `bpf_redirect_map`. `compare` mode
+  runs both and bumps a disagreement counter for pre-cutover
+  validation.
 - **bpffs pinning** of programs, maps, and links. SIGTERM exits the
   loader without detaching attached ifaces; `packetframe detach` is
   the explicit teardown.
@@ -62,12 +70,14 @@ diagnostic:
   from the kernel's documented contract.
 
 Custom-FIB mode also ships a control plane under `packetframe run`:
-a BMP station (TCP listener) that parses bird's Loc-RIB into an LPM
-trie, a netlink-based neighbor resolver that tracks nexthop MAC /
-ifindex changes, and a periodic integrity check that cross-checks
-the mirror against `birdc show route count`. See
-[`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) for the
-operational runbook.
+a route-source listener (BGP for production with bird, BMP for
+emitters that ship RFC 9069 Loc-RIB) that turns wire frames into
+LPM-trie inserts, a netlink-based neighbor resolver that seeds from
+the kernel's existing ARP/NDP tables on startup and tracks
+nexthop MAC / ifindex changes thereafter, and a periodic integrity
+check that cross-checks the mirror against `birdc show route count`.
+See [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md)
+for the operational runbook.
 
 The reference workflow is: validate the host with
 `packetframe feasibility`, attach in `dry-run on` to watch counters
@@ -79,7 +89,7 @@ look sane.
 From a GitHub Release tarball:
 
 ```sh
-VERSION=v0.1.5   # check the Releases page for the latest
+VERSION=vX.X.X   # check the Releases page for the latest and replace it
 TARGET=aarch64-unknown-linux-gnu   # also: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe-${VERSION}-${TARGET}.tar.gz"
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/SHA256SUMS"
@@ -178,6 +188,16 @@ are unsafe. Currently tracked:
   `attach <iface> native` on this combination and downgrades
   `auto` to `generic`. Operators who have backported the upstream fix
   can opt out via `driver-workaround rvu-nicpf-head-shift off`.
+- **Marvell `rvu-nicpf` on multi-member bridges, attach AND detach**:
+  XDP attach (and `pin` removal on detach) briefly bounces the
+  link, which the bridge stack treats as a port-state change.
+  Bouncing two members inside one STP/RSTP reconvergence window
+  has been observed to wedge the bridge into a brief L2 loop
+  state, panicking the kernel. PacketFrame paces both attach AND
+  detach (v0.2.0-rc5+) by `attach-settle-time` whenever ≥ 2
+  attached ifaces share a `/sys/class/net/<iface>/master`. Raise
+  `attach-settle-time` if your bridge takes longer than 2s to
+  reconverge.
 
 ### Diagnosing driver-specific issues
 
@@ -218,19 +238,33 @@ like Ethernet").
 - `metrics-textfile <path>` — Prometheus textfile target, atomically
   rewritten every 15 seconds.
 - `attach-settle-time <dur>` (global) — sleep between per-iface
-  attaches so each link settles before the next touches the driver.
-  Default 2s; raise on bridged topologies whose STP takes longer to
-  reconverge.
+  attaches *and* between per-iface detaches when ≥ 2 attached
+  ifaces share a bridge master, so each link settles before the
+  next touches the driver. Default 2s; raise on bridged topologies
+  whose STP takes longer to reconverge. Isolated-iface topologies
+  pay no settle cost.
 - `driver-workaround <name> <auto|on|off>` — per-driver opt-ins for
   known kernel-level quirks. See the *Known driver / kernel
   interactions* section above for the catalog.
 - `forwarding-mode <kernel-fib|custom-fib|compare>` — forwarding
   path selector. `kernel-fib` is the default and the permanent
   rollback option; `custom-fib` consults the BPF-map FIB populated
-  from BMP; `compare` runs both and bumps a disagreement counter.
-- `route-source bmp <addr>:<port>` — TCP listen address for bird's
-  BMP session. Required when `forwarding-mode` is `custom-fib` or
-  `compare`.
+  by the configured `route-source`; `compare` runs both and bumps
+  a disagreement counter.
+- `route-source <kind> <addr>:<port> [args...]` — route feed for
+  the custom FIB. Required when `forwarding-mode` is `custom-fib`
+  or `compare`. Two kinds:
+  - `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`
+    — passive iBGP listener; bird dials in via
+    `protocol bgp packetframe { neighbor <addr> port <port> as <asn>; ... }`.
+    Bird's export filter runs after best-path so packetframe
+    receives one UPDATE per prefix. **Recommended for production
+    today** — bird does not implement RFC 9069 Loc-RIB BMP.
+  - `bmp <addr>:<port> [require-loc-rib]` — BMP station; the
+    emitter dials in. Production-safe **only** when the emitter
+    ships RFC 9069 Loc-RIB peer_type=3 (FRR; not bird). The
+    `require-loc-rib` flag rejects pre/post-policy frames at
+    session-init so misconfiguration fails loudly.
 - `ecmp-default-hash-mode <3|4|5>` — tuple size for ECMP hashing;
   default 5.
 - `fib-v4-max-entries` / `fib-v6-max-entries` / `nexthops-max-entries`
