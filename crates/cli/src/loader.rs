@@ -493,7 +493,7 @@ fn print_stats(bpffs_root: &Path) {
     // Append-only — adding new entries at the end is fine; renumbering
     // breaks dashboards. Indices 0-19 are the kernel-fib counter set;
     // 20-31 were appended in the Option F custom-FIB rollout (§4.11).
-    const NAMES: [&str; 32] = [
+    const NAMES: [&str; 33] = [
         "rx_total",
         "matched_v4",
         "matched_v6",
@@ -527,6 +527,7 @@ fn print_stats(bpffs_root: &Path) {
         "neigh_cache_miss",
         "nexthop_seq_retry",
         "bmp_peer_down",
+        "bogon_dropped",
     ];
 
     print_fib_status(bpffs_root);

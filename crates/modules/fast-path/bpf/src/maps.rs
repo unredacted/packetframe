@@ -114,11 +114,16 @@ pub enum StatIdx {
     /// BMP station observed a `PEER DOWN` message from bird and the
     /// RouteSource emitted a `PeerDown` event. Userspace-driven.
     BmpPeerDown = 31,
+    /// v0.2.1 issue #33: matched packet whose destination fell in
+    /// a `block-prefix <cidr>` LPM trie. Program returned `XDP_DROP`.
+    /// Diagnostic counter so operators can see which/how many flows
+    /// the bogon-block is catching.
+    BogonDropped = 32,
 }
 
 /// Total counter count. Used as `stats` map `max_entries`. New counters
 /// bump this; dashboards keying on indices keep working.
-pub const STATS_COUNT: u32 = 32;
+pub const STATS_COUNT: u32 = 33;
 
 /// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
 /// mask (historical, load-bearing for dashboards). Bit 2 is the
@@ -332,6 +337,23 @@ pub static ALLOW_V4: LpmTrie<[u8; 4], u8> =
 /// IPv6 allowlist. Same semantics, 16-byte address.
 #[map]
 pub static ALLOW_V6: LpmTrie<[u8; 16], u8> =
+    LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
+
+/// v0.2.1 issue #33: IPv4 destination block list. Matched packets
+/// whose dst falls in this LPM trie return `XDP_DROP` (counter
+/// `BogonDropped` bumped). Empty by default — operator opts in by
+/// declaring `block-prefix <cidr>` lines in config. Sized the same
+/// as the allowlist; expected entries are a handful of bogon ranges
+/// (RFC 1918, CGNAT, test-net) so 1024 is generous.
+#[map]
+pub static BLOCK_V4: LpmTrie<[u8; 4], u8> =
+    LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
+
+/// IPv6 destination block list. Same semantics. Currently unused by
+/// any common config; ULA (`fc00::/7`) is the obvious entry point but
+/// most operators will leave this empty.
+#[map]
+pub static BLOCK_V6: LpmTrie<[u8; 16], u8> =
     LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
 
 /// Runtime flags. One-entry array; userspace writes index 0.

@@ -200,6 +200,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 
     populate_cfg(&mut ebpf, cfg)?;
     populate_allowlists(&mut ebpf, cfg)?;
+    populate_blocklists(&mut ebpf, cfg)?;
     populate_fib_config(&mut ebpf, cfg)?;
 
     Ok(ActiveState {
@@ -374,6 +375,98 @@ fn populate_allowlists(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
         "allowlists populated"
     );
     Ok(())
+}
+
+/// v0.2.1 issue #33: populate `BLOCK_V4` (and `BLOCK_V6`, currently
+/// always empty since IPv6 bogon-block has no commonly-blocked range
+/// equivalent to RFC 1918) from the operator's `block-prefix`
+/// directives. Empty list is a no-op (the BPF trie stays empty,
+/// LPM lookup misses cheaply, no per-packet overhead).
+fn populate_blocklists(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    let v4_blocks: Vec<Ipv4Prefix> = mcfg
+        .section
+        .directives
+        .iter()
+        .filter_map(|d| match d {
+            ModuleDirective::BlockPrefix { cidr, .. } => Some(*cidr),
+            _ => None,
+        })
+        .collect();
+    if v4_blocks.is_empty() {
+        return Ok(());
+    }
+    // Sanity-guard: refuse to start if a block-prefix overlaps an
+    // allow-prefix or local-prefix. Operator config bug — they almost
+    // certainly didn't mean to block traffic to their own customer
+    // /24.
+    let allow_v4: Vec<Ipv4Prefix> = mcfg
+        .section
+        .directives
+        .iter()
+        .filter_map(|d| match d {
+            ModuleDirective::AllowPrefix4(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    let local_v4: Vec<Ipv4Prefix> = mcfg
+        .section
+        .directives
+        .iter()
+        .filter_map(|d| match d {
+            ModuleDirective::LocalPrefix { cidr, .. } => Some(*cidr),
+            _ => None,
+        })
+        .collect();
+    for b in &v4_blocks {
+        for a in allow_v4.iter().chain(local_v4.iter()) {
+            if prefix_contains(b, a) || prefix_contains(a, b) {
+                return Err(ModuleError::other(
+                    MODULE_NAME,
+                    format!(
+                        "block-prefix {}/{} overlaps with allow-prefix or local-prefix \
+                         {}/{} — refusing to start (operator config bug; would silently \
+                         drop traffic to declared customer prefixes)",
+                        b.addr, b.prefix_len, a.addr, a.prefix_len
+                    ),
+                ));
+            }
+        }
+    }
+
+    let map = ebpf
+        .map_mut("BLOCK_V4")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "BLOCK_V4 map missing from ELF"))?;
+    let mut trie: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("BLOCK_V4 LpmTrie::try_from: {e}")))?;
+    for p in &v4_blocks {
+        let key = LpmKey::new(u32::from(p.prefix_len), p.addr.octets());
+        trie.insert(&key, 1u8, 0).map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("BLOCK_V4 insert {}/{}: {e}", p.addr, p.prefix_len),
+            )
+        })?;
+    }
+    info!(
+        v4_count = v4_blocks.len(),
+        "v0.2.1 block-prefix bogon list populated"
+    );
+    Ok(())
+}
+
+/// True iff `outer` contains `inner` (inner's network is in outer
+/// AND inner's prefix_len is >= outer's). Used to detect overlap
+/// between block-prefix and allow-/local-prefix at startup.
+fn prefix_contains(outer: &Ipv4Prefix, inner: &Ipv4Prefix) -> bool {
+    if outer.prefix_len > inner.prefix_len {
+        return false;
+    }
+    let mask: u32 = if outer.prefix_len == 0 {
+        0
+    } else {
+        (!0u32) << (32 - outer.prefix_len as u32)
+    };
+    (u32::from(outer.addr) & mask) == (u32::from(inner.addr) & mask)
 }
 
 pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
@@ -594,10 +687,62 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             }
             _ => None,
         });
-        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, route_source)
-            .map_err(|e| {
-                ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
-            })?;
+        // v0.2.1: collect operator-declared `local-prefix` directives
+        // and pass them to the controller. Empty list = feature off
+        // (back-compat with v0.2.0 configs that never had this).
+        let local_prefixes: Vec<crate::fib::netlink_neigh::LocalPrefixSpec> = cfg
+            .section
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::LocalPrefix {
+                    cidr,
+                    iface,
+                    arp_scavenge,
+                    ..
+                } => Some(crate::fib::netlink_neigh::LocalPrefixSpec {
+                    addr: cidr.addr,
+                    prefix_len: cidr.prefix_len,
+                    iface: iface.clone(),
+                    arp_scavenge: *arp_scavenge,
+                }),
+                _ => None,
+            })
+            .collect();
+        if !local_prefixes.is_empty() {
+            info!(
+                count = local_prefixes.len(),
+                "v0.2.1 local-prefix connected fast-path enabled"
+            );
+        }
+        // v0.2.1 issue #31: optional synthetic 0.0.0.0/0.
+        let fallback_default: Option<crate::fib::netlink_neigh::FallbackDefaultSpec> =
+            cfg.section.directives.iter().find_map(|d| match d {
+                ModuleDirective::FallbackDefault { iface, nexthop, .. } => {
+                    Some(crate::fib::netlink_neigh::FallbackDefaultSpec {
+                        iface: iface.clone(),
+                        nexthop: *nexthop,
+                    })
+                }
+                _ => None,
+            });
+        if let Some(fbd) = &fallback_default {
+            info!(
+                iface = %fbd.iface,
+                nexthop = %fbd.nexthop,
+                "v0.2.1 fallback-default 0.0.0.0/0 catch-all enabled"
+            );
+        }
+
+        let ctrl = crate::fib::controller::RouteController::start(
+            &state.bpffs_root,
+            route_source,
+            local_prefixes,
+            fallback_default,
+        )
+        .map_err(|e| {
+            ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
+        })?;
         state.route_controller = Some(ctrl);
         info!(
             ?forwarding,
@@ -1548,12 +1693,13 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
 fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
     stats: &aya::maps::PerCpuArray<T, u64>,
 ) -> ModuleResult<Vec<u64>> {
-    // `STATS_COUNT` in bpf/src/maps.rs is 32 as of Phase 1 (20 core
-    // + 12 custom-FIB). Previous versions hardcoded 19 — an off-by-one
-    // that hid the `err_head_shift` counter from status readback.
-    // Keep this in lockstep with the BPF side or the last counters
-    // show zero unfairly.
-    const STATS_LEN: usize = 32;
+    // `STATS_COUNT` in bpf/src/maps.rs. v0.2.0 = 32 (20 core + 12
+    // custom-FIB). v0.2.1 = 33 (added `bogon_dropped` for issue #33).
+    // Previous versions hardcoded 19 — an off-by-one that hid the
+    // `err_head_shift` counter from status readback. Keep this in
+    // lockstep with the BPF side or the last counters show zero
+    // unfairly.
+    const STATS_LEN: usize = 33;
     let mut out = vec![0u64; STATS_LEN];
     for (idx, slot) in out.iter_mut().enumerate() {
         let values = stats

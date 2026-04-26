@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 12] = [
+pub const MAP_NAMES: [&str; 14] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -39,6 +39,11 @@ pub const MAP_NAMES: [&str; 12] = [
     "NEXTHOPS",
     "ECMP_GROUPS",
     "FIB_CONFIG",
+    // --- v0.2.1 issue #33: bogon-block LPM tries ---
+    // Same rationale as the FIB maps: present in the ELF regardless,
+    // pinned for uniform detach.
+    "BLOCK_V4",
+    "BLOCK_V6",
 ];
 
 /// The XDP program's pinned basename.

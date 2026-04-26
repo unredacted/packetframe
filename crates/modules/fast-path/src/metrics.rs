@@ -26,7 +26,7 @@ use std::fmt::Write as _;
 /// pre-existing 19 was already off-by-one (`err_head_shift` at
 /// index 19 silently dropped); fixed in passing. Indices 20-31 are
 /// the new custom-FIB counters.
-pub const COUNTER_NAMES: [&str; 32] = [
+pub const COUNTER_NAMES: [&str; 33] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -60,6 +60,7 @@ pub const COUNTER_NAMES: [&str; 32] = [
     "neigh_cache_miss",
     "nexthop_seq_retry",
     "bmp_peer_down",
+    "bogon_dropped",
 ];
 
 /// Render a Prometheus textfile body from stat values + module uptime.
@@ -205,7 +206,7 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates —
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 32);
+        assert_eq!(COUNTER_NAMES.len(), 33);
     }
 
     #[test]

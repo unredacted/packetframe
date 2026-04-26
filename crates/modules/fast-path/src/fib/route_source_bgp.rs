@@ -44,7 +44,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -406,27 +406,11 @@ impl BgpListener {
                     &peer_ip_for_elems,
                     &peer_asn_for_elems,
                 );
+                let fallback_nh = self.cfg.listen_addr.ip();
                 for elem in elems {
-                    let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {
-                        Some(p) => p,
+                    let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
+                        Some(e) => e,
                         None => continue,
-                    };
-                    let event = match elem.elem_type {
-                        ElemType::ANNOUNCE => {
-                            let nh = match elem.next_hop {
-                                Some(h) => h,
-                                None => {
-                                    debug!(?prefix, "announce without next_hop — skipping");
-                                    continue;
-                                }
-                            };
-                            RouteEvent::Add {
-                                peer_id,
-                                prefix,
-                                nexthops: vec![nh],
-                            }
-                        }
-                        ElemType::WITHDRAW => RouteEvent::Del { peer_id, prefix },
                     };
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
                         warn!(error = %e, "route event dispatch failed");
@@ -612,6 +596,57 @@ fn asn_to_u32(asn: Asn) -> u32 {
     asn.to_string().parse().unwrap_or(0)
 }
 
+/// Translate one parsed BGP element (announce or withdraw of a single
+/// prefix) into a [`RouteEvent`] for the FibProgrammer. Returns `None`
+/// when the element's prefix can't be represented in our [`IpPrefix`]
+/// type — graceful skip; bgpkit-parser's [`Elementor`] occasionally
+/// emits malformed prefixes from withdraw NLRIs and we don't want
+/// those to crash the session.
+///
+/// **The `fallback_nh` parameter** is the v0.2.1 fix for silently
+/// dropping bird's `protocol direct` exports. Direct-origin (and
+/// static-origin) routes go out via iBGP without an explicit BGP
+/// NEXT_HOP attribute when the bird-side BGP block has no
+/// `next hop self` directive — there's no upstream eBGP next-hop
+/// to preserve, and bird doesn't synthesize one. bgpkit-parser's
+/// `Elementor::bgp_update_to_elems` returns `next_hop = None` for
+/// those announces.
+///
+/// Pre-v0.2.1 we silently `continue`d on `None`, so connected /24s
+/// bird was correctly exporting never landed in `FIB_V4` at all —
+/// the prefix wasn't present for XDP to LPM-match. Operator-visible
+/// symptom: `matched_dst_only` inbound to customer /24s all bumped
+/// `custom_fib_miss` instead of `custom_fib_no_neigh`, and the FIB
+/// integrity check perpetually reported drift between bird's
+/// exported-route count and packetframe's mirror count.
+///
+/// The chosen fallback is the BGP session's listen address (typically
+/// `127.0.0.1` for the loopback iBGP setup). The neighbor resolver
+/// can't get a useful MAC for loopback, so the route lands with
+/// `state=Incomplete` — operationally the same XDP_PASS-to-kernel as
+/// the silent-drop, but now the prefix exists in `FIB_V4`, the
+/// nexthop counter (`custom_fib_no_neigh`) reflects reality, and
+/// integrity drift goes away. Phase B (`local-prefix` ARP-walk)
+/// turns those /24s into per-/32 fast-paths.
+fn elem_to_route_event(
+    elem: &bgpkit_parser::models::BgpElem,
+    peer_id: PeerId,
+    fallback_nh: IpAddr,
+) -> Option<RouteEvent> {
+    let prefix = network_prefix_to_ip_prefix(&elem.prefix)?;
+    Some(match elem.elem_type {
+        ElemType::ANNOUNCE => {
+            let nh = elem.next_hop.unwrap_or(fallback_nh);
+            RouteEvent::Add {
+                peer_id,
+                prefix,
+                nexthops: vec![nh],
+            }
+        }
+        ElemType::WITHDRAW => RouteEvent::Del { peer_id, prefix },
+    })
+}
+
 // --- Tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -742,5 +777,99 @@ mod tests {
         assert_eq!(a, b);
         let c = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 64512);
         assert_ne!(a, c);
+    }
+
+    /// v0.2.1 regression guard. Pre-fix, `elem_to_route_event` (then
+    /// inlined in the read loop) silently `continue`d on
+    /// `next_hop = None`, which is exactly what bird's iBGP emits for
+    /// `protocol direct` announces without `next hop self`. Result:
+    /// connected /24s never reached `FIB_V4`, every inbound
+    /// matched_dst_only packet bumped `custom_fib_miss`, and the FIB
+    /// integrity check chronically reported drift. The fix makes
+    /// `elem_to_route_event` fall back to a caller-supplied address
+    /// (the BGP session's listen IP) so the route lands in the FIB
+    /// with an unresolvable nexthop. This test pins the new behavior.
+    /// Build a minimal BgpElem for the elem_to_route_event tests below.
+    /// Uses struct-update syntax (`..Default::default()`) explicitly to
+    /// keep clippy happy on the `field_reassign_with_default` lint.
+    #[cfg(test)]
+    fn make_test_elem(
+        elem_type: ElemType,
+        prefix_str: &str,
+        next_hop: Option<IpAddr>,
+    ) -> bgpkit_parser::models::BgpElem {
+        use bgpkit_parser::models::{BgpElem, NetworkPrefix};
+        use ipnet::IpNet;
+        use std::str::FromStr;
+        BgpElem {
+            elem_type,
+            prefix: NetworkPrefix {
+                prefix: IpNet::from_str(prefix_str).unwrap(),
+                path_id: None,
+            },
+            next_hop,
+            ..BgpElem::default()
+        }
+    }
+
+    #[test]
+    fn elem_to_route_event_uses_fallback_when_next_hop_missing() {
+        use bgpkit_parser::models::ElemType;
+        use std::net::Ipv4Addr;
+        let elem = make_test_elem(ElemType::ANNOUNCE, "23.191.200.0/24", None);
+        let peer_id = PeerId(0xdeadbeef);
+        let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let event = elem_to_route_event(&elem, peer_id, fallback)
+            .expect("elem with valid prefix must yield an event");
+        match event {
+            RouteEvent::Add {
+                peer_id: pid,
+                prefix,
+                nexthops,
+            } => {
+                assert_eq!(pid, peer_id);
+                assert!(matches!(
+                    prefix,
+                    IpPrefix::V4 {
+                        addr: [23, 191, 200, 0],
+                        prefix_len: 24
+                    }
+                ));
+                assert_eq!(nexthops, vec![fallback]);
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// Sibling test: when bgpkit-parser does decode a `next_hop`
+    /// (the normal case for eBGP-origin routes), we use *that*, not
+    /// the fallback. Guards against regressing the fallback into a
+    /// "always overwrite" footgun.
+    #[test]
+    fn elem_to_route_event_prefers_decoded_next_hop_over_fallback() {
+        use bgpkit_parser::models::ElemType;
+        use std::net::Ipv4Addr;
+        let real_nh = IpAddr::V4(Ipv4Addr::new(194, 110, 60, 50)); // Macarne-style nh
+        let elem = make_test_elem(ElemType::ANNOUNCE, "1.1.1.0/24", Some(real_nh));
+        let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            .expect("elem with valid prefix must yield an event");
+        match event {
+            RouteEvent::Add { nexthops, .. } => {
+                assert_eq!(nexthops, vec![real_nh]);
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// Withdraws never look at next_hop; verify the fallback path
+    /// doesn't accidentally synthesize one for a Del.
+    #[test]
+    fn elem_to_route_event_withdraw_unaffected_by_fallback() {
+        use bgpkit_parser::models::ElemType;
+        use std::net::Ipv4Addr;
+        let elem = make_test_elem(ElemType::WITHDRAW, "23.191.200.0/24", None);
+        let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            .expect("withdraw with valid prefix must yield an event");
+        assert!(matches!(event, RouteEvent::Del { .. }));
     }
 }

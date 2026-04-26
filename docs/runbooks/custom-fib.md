@@ -9,6 +9,7 @@ how to roll back to the kernel-FIB path if something goes wrong.
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Healthy operation](#healthy-operation)
 - [Everyday inspection commands](#everyday-inspection-commands)
+- [Connected fast-path (v0.2.1)](#connected-fast-path-v021)
 - [Cutover and rollback](#cutover-and-rollback)
 - [Triage by symptom](#triage-by-symptom)
 - [Known gaps](#known-gaps)
@@ -219,6 +220,180 @@ Fires on: no ROUTE MONITORING for ≥ 5 min AND bird's cached
 Established-peer-count ≥ 1 AND process uptime > 10 min. Gated on
 the `birdc show protocols` cache to avoid false-positives during
 bird outages.
+
+## Connected fast-path (v0.2.1)
+
+### What it solves
+
+Bird's iBGP feed gives us the connected /24 (e.g. `23.191.200.0/24`
+on `br1337`) with a self-referential BGP NEXT_HOP (the device's local
+IP). The neighbour resolver can't map that to a useful destination
+MAC — it's our own IP. Without the connected fast-path, the LPM
+lookup hits the /24 with `state=Incomplete` and returns
+`custom_fib_no_neigh` (or, pre-v0.2.1, `custom_fib_miss` because the
+listener silently dropped the announce). Either way, the packet
+falls through XDP_PASS to kernel slow-path — through netfilter,
+conntrack, the FIB walk, and finally out the bridge. That's exactly
+the load fast-path was built to remove.
+
+The connected fast-path inverts this: NetlinkNeighborResolver walks
+the kernel ARP table for hosts within an operator-declared CIDR
++ iface, registers a per-/32 NEXTHOPS entry with the host's real
+MAC at `state=Resolved`, and inserts the /32 in FIB_V4. The /32
+wins over the /24 in LPM, so XDP redirects directly to the host.
+
+### When to enable it
+
+When you're running custom-fib (not kernel-fib) and the box has
+connected /24s carrying meaningful inbound traffic. Typical case
+on the reference EFG: customer LANs (`23.191.200.0/24`), internal
+storage networks (Ceph: `10.88.1.0/24`), and other LAN bridges.
+On the reference EFG with all peers up, expect the bypass rate
+to climb from ~30% to >95% once kernel ARP populates.
+
+### Config
+
+```
+module fast-path
+  forwarding-mode custom-fib
+  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401
+
+  # One line per local prefix you want fast-pathed inbound:
+  local-prefix 23.191.200.0/24 via br1337    # customer LAN
+  local-prefix 10.88.1.0/24    via br88      # Ceph internal
+  local-prefix 10.10.1.0/24    via br0       # other LAN
+```
+
+The `via <iface>` is required and must match the kernel iface
+hosting the prefix. Validate at startup the same way `attach`
+directives validate (must exist under `/sys/class/net`); a missing
+iface is a startup-fatal error.
+
+The directive set is additive — declare as many as you have
+connected destinations to fast-path. Each adds one hashmap-walk
+of the kernel's neighbour table at startup and one match per
+multicast neighbour event. Match cost is O(N) over the local-prefix
+list, so keep the list to a handful (the reference EFG has 6).
+
+### Verification after enabling
+
+```sh
+# 1. Confirm /32s landed in the FIB. Should see one entry per
+# kernel ARP entry within each declared local-prefix.
+sudo packetframe fib dump-v4 | grep -E '^23\.191\.200\.[0-9]+/32' | head
+sudo packetframe fib dump-v4 | grep -E '^10\.88\.1\.[0-9]+/32'   | head
+
+# 2. Lookup a specific host. Should report state=resolved with the
+# host's actual MAC and the iface's ifindex.
+sudo packetframe fib lookup 23.191.200.10
+
+# 3. Watch the resolver stats — `local_arp_routes_added` climbs as
+# the kernel ARPs new hosts; `_removed` climbs on RTM_DELNEIGH
+# (typical aging churn).
+journalctl -u packetframe -f | grep 'neighbour resolver stats'
+
+# 4. Bypass rate. Compare custom_fib_hit / matched_v4 before vs.
+# after enabling. Typical recovery: matched_dst_only flips from
+# ~100% miss to ~100% hit. (rate may climb gradually as kernel
+# ARP populates the cache for under-trafficked hosts.)
+sudo packetframe status | grep -E 'matched_v4|custom_fib_hit|custom_fib_miss|custom_fib_no_neigh'
+```
+
+### Capacity considerations
+
+Each declared local-prefix can register up to one /32 per active
+kernel ARP entry. NEXTHOPS_MAX_ENTRIES is 8192 by default; a typical
+EFG with a few dense customer /24s plus internal LANs sits well
+under this (the reference EFG configured below uses ~500-1000 of
+8192). If you operate a *very* dense LAN where active hosts
+approach 8192, plan to either raise the cap (BPF rebuild) or skip
+the directive on that prefix and accept the slow-path fallback.
+
+### When NOT to enable it
+
+- **kernel-fib mode.** The kernel handles connected destinations
+  natively via `bpf_fib_lookup()` + ARP cache, no extra config
+  needed. The directive is a no-op in this mode (parsed and
+  validated, but the resolver only emits events when both
+  custom-fib AND a route-source are configured).
+- **Operator hasn't declared the customer prefix in `allow-prefix`.**
+  XDP filters on allowlist BEFORE the FIB lookup, so a /32 in the
+  FIB does nothing if the parent prefix isn't matched. Add the
+  customer /24 to `allow-prefix` first.
+- **Tunnels and weirdness.** Don't declare local-prefix on a tunnel
+  iface (WireGuard, GRE, IPSec) — the BPF program can't redirect
+  to non-XDP-capable interfaces, so the /32 just sits unused.
+  Stick to physical and bridge interfaces.
+
+### Disabling
+
+Remove (or comment out) the `local-prefix` lines and restart
+packetframe. SIGHUP doesn't reconcile this directive in v0.2.1
+— a future version may add live add/remove via SIGHUP, but for
+now it's a startup-time-only configuration. The /32 entries get
+flushed on detach and don't reappear at next startup without the
+directive.
+
+### `arp-scavenge` for quiet LANs (v0.2.1, issue #32)
+
+Some LANs — Ceph clusters, monitoring networks, anything where
+hosts only do intra-/24 L2 traffic — never appear in the kernel's
+L3 ARP cache. Without entries to feed from, the per-/32 emission
+finds nothing.
+
+The optional tail flag forces a one-shot ARP sweep at startup:
+
+```
+local-prefix 10.88.1.0/24 via br88 arp-scavenge
+```
+
+Capped at /22 (≤ 1024 hosts) at config-parse time. Rate-limited at
+500 probes/sec internally. Live hosts respond → kernel ARPs them →
+multicast event lands the /32. Operator opt-in (default off) because
+it generates noticeable ARP traffic.
+
+### `fallback-default` synthetic /0 (v0.2.1, issue #31)
+
+Custom-FIB only has prefixes bird's iBGP feed advertised. Destinations
+bird doesn't have specific routes for (RFC 1918, CGNAT, test-net,
+anything outside DFZ) miss LPM, fall to kernel slow path through
+netfilter / conntrack, and get dropped upstream anyway — wasting
+kernel CPU + conntrack table capacity.
+
+```
+fallback-default via eth3 nexthop 194.110.60.50
+```
+
+Injects a `0.0.0.0/0` into FIB_V4 at startup. Every more-specific
+bird-fed route still wins LPM; the /0 catches bogon-bound traffic.
+XDP redirects directly to upstream — same upstream rejection behavior,
+just no kernel / conntrack involvement. Measured ~25% reduction in
+steady-state conntrack pressure on a busy Tor exit relay.
+
+### `block-prefix` (v0.2.1, issue #33)
+
+Drop bogon-bound traffic at XDP rather than let it traverse the
+kernel forwarding path:
+
+```
+allow-prefix 23.191.200.0/24
+block-prefix 10.0.0.0/8
+block-prefix 100.64.0.0/10
+block-prefix 192.168.0.0/16
+```
+
+After the allowlist match (so we only affect traffic we'd otherwise
+fast-path), if dst is in any `block-prefix` the program returns
+`XDP_DROP` and bumps `bogon_dropped`. Saves skb allocation +
+netfilter walk + conntrack entry per dropped packet.
+
+dst-only match — we never block by src, because that would silently
+drop reply traffic for asymmetric flows where the *peer* happens to
+be in a bogon range.
+
+Refuses to start if a `block-prefix` overlaps any `allow-prefix` or
+`local-prefix` (operator config bug — would silently drop traffic to
+declared customer prefixes).
 
 ## Cutover and rollback
 
@@ -547,3 +722,23 @@ landed since the runbook was first written.
   `require-loc-rib` which hard-rejects non-Loc-RIB frames. The
   iBGP feed is the recommended forwarding path for bird; the
   BMP path is for Loc-RIB-emitting daemons (FRR; future bird).
+- ✅ **BgpListener direct-origin fallback + connected fast-path**
+  (v0.2.1). Pre-v0.2.1 the BgpListener silently dropped iBGP UPDATEs
+  whose decoded NEXT_HOP was None — exactly what bird emits for
+  `protocol direct` (and static-origin) routes when the BGP block has
+  no `next hop self`. Connected /24s never landed in FIB_V4, so every
+  inbound packet to a customer host bumped `custom_fib_miss` and fell
+  through to slow path. v0.2.1 makes the listener fall back to its
+  own listen address; the route lands with `state=Incomplete` so
+  counters reflect reality. The `local-prefix <cidr> via <iface>`
+  directive turns those /24s into per-/32 fast-paths — see the
+  [Connected fast-path](#connected-fast-path-v021) section above.
+- ✅ **`fallback-default` synthetic /0** (v0.2.1, issue #31). Inject
+  a catch-all default into the custom-FIB so bogon-bound traffic
+  XDP-redirects to upstream instead of slow-pathing.
+- ✅ **`arp-scavenge` for quiet LANs** (v0.2.1, issue #32). One-shot
+  ARP sweep of declared local-prefix CIDRs at startup so storage
+  networks (Ceph) get fast-path coverage even when their hosts don't
+  voluntarily talk to the gateway.
+- ✅ **`block-prefix` XDP-time drop** (v0.2.1, issue #33). Bogon
+  destinations dropped at XDP instead of forwarded-and-failed.
