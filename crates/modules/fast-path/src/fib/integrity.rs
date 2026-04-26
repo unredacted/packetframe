@@ -207,9 +207,9 @@ impl IntegrityChecker {
 /// table sums to avoid double-counting when bird emitted both. But
 /// on operators with RPKI enabled (including the reference EFG via
 /// pathvector's `rtr-server` directive), the Total includes the
-/// RPKI tables — observed `bird_routes = 2,120,822` (= master4 1.04M
-/// + master6 0.24M + rpki4 0.66M + rpki6 0.19M) where the operator
-/// expected 1.27M (= master4 + master6). The drift warning fired
+/// RPKI tables — observed `bird_routes = 2,120,822` (sum of master4
+/// 1.04M, master6 0.24M, rpki4 0.66M, rpki6 0.19M) where the operator
+/// expected 1.27M (master4 plus master6). The drift warning fired
 /// every 5 minutes for a non-existent drift.
 ///
 /// Now we explicitly filter for `in table master4` / `in table master6`
