@@ -789,19 +789,34 @@ mod tests {
     /// `elem_to_route_event` fall back to a caller-supplied address
     /// (the BGP session's listen IP) so the route lands in the FIB
     /// with an unresolvable nexthop. This test pins the new behavior.
+    /// Build a minimal BgpElem for the elem_to_route_event tests below.
+    /// Uses struct-update syntax (`..Default::default()`) explicitly to
+    /// keep clippy happy on the `field_reassign_with_default` lint.
+    #[cfg(test)]
+    fn make_test_elem(
+        elem_type: ElemType,
+        prefix_str: &str,
+        next_hop: Option<IpAddr>,
+    ) -> bgpkit_parser::models::BgpElem {
+        use bgpkit_parser::models::{BgpElem, NetworkPrefix};
+        use ipnet::IpNet;
+        use std::str::FromStr;
+        BgpElem {
+            elem_type,
+            prefix: NetworkPrefix {
+                prefix: IpNet::from_str(prefix_str).unwrap(),
+                path_id: None,
+            },
+            next_hop,
+            ..BgpElem::default()
+        }
+    }
+
     #[test]
     fn elem_to_route_event_uses_fallback_when_next_hop_missing() {
-        use bgpkit_parser::models::{BgpElem, ElemType, NetworkPrefix};
-        use ipnet::IpNet;
+        use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
-        use std::str::FromStr;
-        let mut elem = BgpElem::default();
-        elem.elem_type = ElemType::ANNOUNCE;
-        elem.prefix = NetworkPrefix {
-            prefix: IpNet::from_str("23.191.200.0/24").unwrap(),
-            path_id: None,
-        };
-        elem.next_hop = None;
+        let elem = make_test_elem(ElemType::ANNOUNCE, "23.191.200.0/24", None);
         let peer_id = PeerId(0xdeadbeef);
         let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let event = elem_to_route_event(&elem, peer_id, fallback)
@@ -832,18 +847,10 @@ mod tests {
     /// "always overwrite" footgun.
     #[test]
     fn elem_to_route_event_prefers_decoded_next_hop_over_fallback() {
-        use bgpkit_parser::models::{BgpElem, ElemType, NetworkPrefix};
-        use ipnet::IpNet;
+        use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
-        use std::str::FromStr;
         let real_nh = IpAddr::V4(Ipv4Addr::new(194, 110, 60, 50)); // Macarne-style nh
-        let mut elem = BgpElem::default();
-        elem.elem_type = ElemType::ANNOUNCE;
-        elem.prefix = NetworkPrefix {
-            prefix: IpNet::from_str("1.1.1.0/24").unwrap(),
-            path_id: None,
-        };
-        elem.next_hop = Some(real_nh);
+        let elem = make_test_elem(ElemType::ANNOUNCE, "1.1.1.0/24", Some(real_nh));
         let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
             .expect("elem with valid prefix must yield an event");
         match event {
@@ -858,17 +865,9 @@ mod tests {
     /// doesn't accidentally synthesize one for a Del.
     #[test]
     fn elem_to_route_event_withdraw_unaffected_by_fallback() {
-        use bgpkit_parser::models::{BgpElem, ElemType, NetworkPrefix};
-        use ipnet::IpNet;
+        use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
-        use std::str::FromStr;
-        let mut elem = BgpElem::default();
-        elem.elem_type = ElemType::WITHDRAW;
-        elem.prefix = NetworkPrefix {
-            prefix: IpNet::from_str("23.191.200.0/24").unwrap(),
-            path_id: None,
-        };
-        elem.next_hop = None;
+        let elem = make_test_elem(ElemType::WITHDRAW, "23.191.200.0/24", None);
         let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
             .expect("withdraw with valid prefix must yield an event");
         assert!(matches!(event, RouteEvent::Del { .. }));
