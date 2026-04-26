@@ -194,58 +194,54 @@ impl IntegrityChecker {
     }
 }
 
-/// Parse `birdc show route count` output. Bird emits one
-/// `N of M routes for K networks in table <name>` line per table,
-/// followed by a `Total: N of M routes for K networks in N tables`
-/// summary on multi-table outputs. Single-table output omits the
-/// Total line.
+/// Parse `birdc show route count` output and return the selected-route
+/// total across the BGP RIB tables (`master4` + `master6`). Bird emits
+/// one `N of M routes for K networks in table <name>` line per table,
+/// followed by a `Total: ...` summary across ALL tables in
+/// multi-table outputs. The `Total:` line includes RPKI tables (and
+/// any other custom tables operators have configured), which is NOT
+/// what we want — packetframe's mirror only ever holds master4/master6
+/// content.
 ///
-/// **rc5 fix.** The pre-rc5 implementation summed the first integer
-/// of *every* line containing "routes" — including, on certain
-/// transient bird outputs during convergence, lines that shouldn't
-/// be counted, producing >2× the real count. The user observed
-/// `bird_routes=2,804,280` against an actual selected-route count
-/// of ~1.27M, triggering false-positive integrity-drift warnings
-/// every 5 minutes.
+/// **v0.2.2 fix.** The rc5 fix preferred the `Total:` line over per-
+/// table sums to avoid double-counting when bird emitted both. But
+/// on operators with RPKI enabled (including the reference EFG via
+/// pathvector's `rtr-server` directive), the Total includes the
+/// RPKI tables — observed `bird_routes = 2,120,822` (= master4 1.04M
+/// + master6 0.24M + rpki4 0.66M + rpki6 0.19M) where the operator
+/// expected 1.27M (= master4 + master6). The drift warning fired
+/// every 5 minutes for a non-existent drift.
 ///
-/// Post-rc5 behavior:
-/// 1. If a `Total: ...` line is present, use *its* first integer
-///    (authoritative summary).
-/// 2. Otherwise, sum the first integer of each non-Total `routes`
-///    line (single-table case, or older bird that doesn't emit
-///    Total).
+/// Now we explicitly filter for `in table master4` / `in table master6`
+/// per-table lines and sum those, ignoring `Total:` and any other
+/// table names. Single-table outputs (just `master4`) still work — we
+/// pick up that one line.
 ///
-/// The "first integer" semantics treat the count as bird's view of
-/// SELECTED routes — what it would actually export — which is the
-/// number we want to compare against packetframe's mirror.
+/// **rc5 fix retained**: pre-rc5 we summed every line containing
+/// `routes`, including transient lines that produced >2× counts. The
+/// `in table master[46]` filter is strict enough that this can't
+/// recur.
 pub fn parse_route_count(output: &str) -> Result<usize, String> {
-    let mut total_line: Option<usize> = None;
-    let mut per_table_sum: Option<usize> = None;
+    let mut sum: Option<usize> = None;
 
     for line in output.lines() {
         let trimmed = line.trim();
-        if !trimmed.contains("routes") {
+        // Strict filter: only sum lines for the BGP RIB tables we
+        // actually mirror. Skip RPKI tables, kernel-export tables,
+        // and the `Total:` aggregate (which includes them all).
+        if !(trimmed.contains("in table master4") || trimmed.contains("in table master6")) {
             continue;
         }
-
-        if let Some(rest) = trimmed.strip_prefix("Total:") {
-            // "Total: N of M routes for K networks in N tables" —
-            // the next whitespace-delimited token is N.
-            if let Some(first) = rest.split_whitespace().next() {
-                if let Ok(n) = first.parse::<usize>() {
-                    total_line = Some(n);
-                }
-            }
-        } else if let Some(first) = trimmed.split_whitespace().next() {
+        if let Some(first) = trimmed.split_whitespace().next() {
             if let Ok(n) = first.parse::<usize>() {
-                per_table_sum = Some(per_table_sum.unwrap_or(0) + n);
+                sum = Some(sum.unwrap_or(0) + n);
             }
         }
     }
 
-    total_line
-        .or(per_table_sum)
-        .ok_or_else(|| "no `N routes` line in birdc output".to_string())
+    sum.ok_or_else(|| {
+        "no `... in table master4` / `... in table master6` line in birdc output".to_string()
+    })
 }
 
 /// Parse `birdc show protocols` output for Established BGP peer
@@ -331,30 +327,59 @@ mod tests {
     }
 
     #[test]
-    fn parse_route_count_prefers_total_line_when_present() {
-        // Modern bird with multi-table output emits a `Total:` line
-        // that is authoritative. Pre-rc5 we summed per-table AND
-        // included the Total, double-counting; this test guards
-        // against regression to that behavior.
+    fn parse_route_count_ignores_total_line() {
+        // v0.2.2: even when `Total:` is present, we sum master4 +
+        // master6 ourselves. This protects against the RPKI-table
+        // case where Total includes tables we don't mirror.
         let out = "BIRD 2.17.2 ready.\n\
                    1037000 of 1500467 routes for 1037000 networks in table master4\n\
                    235306 of 457217 routes for 235306 networks in table master6\n\
                    Total: 1272306 of 1957684 routes for 1272306 networks in 2 tables\n";
-        assert_eq!(parse_route_count(out).unwrap(), 1_272_306);
+        assert_eq!(parse_route_count(out).unwrap(), 1_037_000 + 235_306);
+    }
+
+    #[test]
+    fn parse_route_count_excludes_rpki_tables() {
+        // v0.2.2 fix: operators with `rtr-server` enabled get rpki4 /
+        // rpki6 tables in `show route count`. Pre-fix we picked the
+        // Total: line which summed all 4 tables, producing a count
+        // ~70% above reality and triggering false integrity-drift
+        // warnings every 5 minutes. Post-fix we strictly count only
+        // `in table master4` + `in table master6`.
+        let out = "BIRD 2.17.2 ready.\n\
+                   1038232 of 1038232 routes for 1038230 networks in table master4\n\
+                   235677 of 235677 routes for 235677 networks in table master6\n\
+                   657970 of 657970 routes for 657970 networks in table rpki4\n\
+                   188943 of 188943 routes for 188943 networks in table rpki6\n\
+                   Total: 2120822 of 2120822 routes for 2120820 networks in 4 tables\n";
+        // Should be master4 + master6 only, NOT the 2.12M Total.
+        assert_eq!(parse_route_count(out).unwrap(), 1_038_232 + 235_677);
+    }
+
+    #[test]
+    fn parse_route_count_ignores_kernel_protocol_tables() {
+        // Bird operators sometimes have additional tables for
+        // kernel-import / static / per-protocol shadow RIBs. Confirm
+        // we don't accidentally count those either.
+        let out = "BIRD 2.17.2 ready.\n\
+                   1000 of 1000 routes for 1000 networks in table master4\n\
+                   500  of  500 routes for  500 networks in table kernel_in\n\
+                   200  of  200 routes for  200 networks in table master6\n";
+        assert_eq!(parse_route_count(out).unwrap(), 1_000 + 200);
     }
 
     #[test]
     fn parse_route_count_missing_errors() {
         let out = "BIRD 2.17.2 ready.\n";
-        assert!(parse_route_count(out).is_err());
+        let err = parse_route_count(out).unwrap_err();
+        assert!(err.contains("master4"));
     }
 
     #[test]
-    fn parse_route_count_total_line_only() {
-        // Defensive: if bird ever emits *only* a Total line (degenerate
-        // edge case), still parse it correctly.
+    fn parse_route_count_only_master4() {
+        // Single-table case (operator only runs IPv4 BGP).
         let out = "BIRD 2.17.2 ready.\n\
-                   Total: 42 of 100 routes for 42 networks in 1 tables\n";
+                   42 of 100 routes for 42 networks in table master4\n";
         assert_eq!(parse_route_count(out).unwrap(), 42);
     }
 

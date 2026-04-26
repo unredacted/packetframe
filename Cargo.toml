@@ -23,7 +23,7 @@ exclude = [
 # detach pacing for bridge members, integrity-check Total-line parse
 # fix). See SPEC.md §11.14 for the rollout history and
 # `docs/runbooks/custom-fib.md` for operations.
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 # MSRV. Deliberately behind the rust-toolchain.toml pin (which is the
 # latest stable) so a contributor with a slightly older toolchain still
