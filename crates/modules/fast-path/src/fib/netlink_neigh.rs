@@ -623,23 +623,58 @@ impl NetlinkNeighborResolver {
         self.scavenge_local_prefix_arp().await;
     }
 
-    /// v0.2.1 issue #32 — for every `local-prefix` flagged with
-    /// `arp-scavenge`, enqueue every host IP in the CIDR for proactive
-    /// resolution. Caps at /22 (1024 hosts) per spec validation —
-    /// larger prefixes are rejected at config-parse time.
+    /// v0.2.1 issue #32, with v0.2.2 broadcast-storm safety (#34).
+    /// For every `local-prefix` flagged with `arp-scavenge`, ARP-probe
+    /// every host IP in the CIDR via the **operator-declared iface**
+    /// (NOT the kernel's routing-table OIF — see safety rationale below).
+    /// Capped at /22 (1024 hosts) per config-parse validation.
+    ///
+    /// **Safety: why we use the operator's declared iface, not the
+    /// kernel's OIF.** Pre-v0.2.2 this method called `issue_arp_probe`
+    /// which looked up the kernel's egress for each target IP. On a
+    /// box with multi-VID bridges (the reference EFG's `switch0`
+    /// carries customer VID 1337 alongside IX VIDs 3998/SIX, 3999/KCIX,
+    /// etc.), a misconfigured `local-prefix` whose CIDR happened to
+    /// resolve via an IX VID's bridge subif would broadcast 1024 ARP
+    /// requests onto that IX bridge. That violates IX route-server
+    /// policies (anti-DoS, MANRS) and could trigger session shutdown
+    /// or peer-side complaints.
+    ///
+    /// The fix: pass the operator's declared iface (resolved to ifindex
+    /// at startup via `iface_to_ifindex`) directly to
+    /// `handle.neighbours().add(oif, ip)`. The kernel issues ARP only
+    /// on that iface, regardless of what the routing table says. If
+    /// the operator's iface and the kernel's view disagree, probes
+    /// are sent but no responses come back; the entries time out
+    /// harmlessly. ARP traffic CANNOT escape the operator-declared
+    /// iface's L2 broadcast domain.
     async fn scavenge_local_prefix_arp(&mut self) {
-        // Snapshot the specs to avoid borrowing self twice.
-        let specs: Vec<LocalPrefixSpec> = self
+        // Snapshot the specs (filter to arp-scavenge enabled) AND
+        // resolve each spec's iface to ifindex up-front. If an iface
+        // doesn't resolve, we refuse the sweep entirely — that's
+        // safer than falling back to kernel-OIF behavior.
+        let specs: Vec<(LocalPrefixSpec, u32)> = self
             .local_prefixes
             .iter()
             .filter(|s| s.arp_scavenge)
-            .cloned()
+            .filter_map(|s| match self.iface_to_ifindex.get(&s.iface).copied() {
+                Some(ifindex) => Some((s.clone(), ifindex)),
+                None => {
+                    warn!(
+                        iface = %s.iface,
+                        cidr = %format_args!("{}/{}", s.addr, s.prefix_len),
+                        "arp-scavenge: iface not resolvable to ifindex; refusing sweep \
+                         (will retry if iface comes up later via RTM_NEWLINK)"
+                    );
+                    None
+                }
+            })
             .collect();
         if specs.is_empty() {
             return;
         }
         let mut total_probed = 0usize;
-        for spec in specs {
+        for (spec, oif) in specs {
             let net_u32 = u32::from(spec.addr);
             let plen = spec.prefix_len;
             // Number of host bits + the host range.
@@ -667,7 +702,9 @@ impl NetlinkNeighborResolver {
             let mut probed = 0u32;
             for offset in start_host..end_host {
                 let ip = Ipv4Addr::from(net_aligned + offset);
-                Self::issue_arp_probe(IpAddr::V4(ip)).await;
+                // v0.2.2: pass the operator's iface ifindex. ARP only
+                // goes out the iface the operator declared.
+                Self::issue_arp_probe(IpAddr::V4(ip), oif).await;
                 probed += 1;
                 // Rate-limit at ~500 probes/sec (50 per 100ms). Without
                 // pacing, a /22 sweep (1024 hosts) issues 1024 ARP
@@ -684,8 +721,9 @@ impl NetlinkNeighborResolver {
             info!(
                 cidr = %format_args!("{}/{}", spec.addr, spec.prefix_len),
                 iface = %spec.iface,
+                ifindex = oif,
                 probed,
-                "arp-scavenge sweep complete"
+                "arp-scavenge sweep complete (scoped to operator-declared iface)"
             );
         }
         info!(
@@ -695,11 +733,13 @@ impl NetlinkNeighborResolver {
         );
     }
 
-    /// One-shot ARP probe via a dedicated unicast netlink connection.
+    /// One-shot ARP probe issued on a caller-specified iface (v0.2.2:
+    /// previously used kernel route lookup, which created the IX
+    /// broadcast-storm risk documented in `scavenge_local_prefix_arp`).
     /// Standalone (vs. `issue_proactive_resolve` which lives inside
     /// the select! loop) so we can fire many in sequence at startup
     /// without blocking the multicast reader.
-    async fn issue_arp_probe(ip: IpAddr) {
+    async fn issue_arp_probe(ip: IpAddr, oif: u32) {
         let (connection, handle, _) = match new_connection() {
             Ok(c) => c,
             Err(e) => {
@@ -708,25 +748,6 @@ impl NetlinkNeighborResolver {
             }
         };
         tokio::spawn(connection);
-        // Look up the egress ifindex via route lookup, same as
-        // issue_proactive_resolve.
-        let req = match ip {
-            IpAddr::V4(v4) => RouteMessageBuilder::<IpAddr>::new()
-                .destination_prefix(IpAddr::V4(v4), 32)
-                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
-                .build(),
-            IpAddr::V6(v6) => RouteMessageBuilder::<IpAddr>::new()
-                .destination_prefix(IpAddr::V6(v6), 128)
-                .unwrap_or_else(|_| RouteMessageBuilder::<IpAddr>::new())
-                .build(),
-        };
-        let oif = match lookup_oif(&handle, req).await {
-            Some(i) => i,
-            None => {
-                debug!(?ip, "scavenge: no OIF; skipping");
-                return;
-            }
-        };
         match handle
             .neighbours()
             .add(oif, ip)
