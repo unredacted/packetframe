@@ -194,25 +194,58 @@ impl IntegrityChecker {
     }
 }
 
-/// Parse `birdc show route count` output. Bird emits a line of the
-/// form `1048587 of 1048587 routes for 1048573 networks in table
-/// master4` per table; we sum the first number across tables.
+/// Parse `birdc show route count` output. Bird emits one
+/// `N of M routes for K networks in table <name>` line per table,
+/// followed by a `Total: N of M routes for K networks in N tables`
+/// summary on multi-table outputs. Single-table output omits the
+/// Total line.
+///
+/// **rc5 fix.** The pre-rc5 implementation summed the first integer
+/// of *every* line containing "routes" — including, on certain
+/// transient bird outputs during convergence, lines that shouldn't
+/// be counted, producing >2× the real count. The user observed
+/// `bird_routes=2,804,280` against an actual selected-route count
+/// of ~1.27M, triggering false-positive integrity-drift warnings
+/// every 5 minutes.
+///
+/// Post-rc5 behavior:
+/// 1. If a `Total: ...` line is present, use *its* first integer
+///    (authoritative summary).
+/// 2. Otherwise, sum the first integer of each non-Total `routes`
+///    line (single-table case, or older bird that doesn't emit
+///    Total).
+///
+/// The "first integer" semantics treat the count as bird's view of
+/// SELECTED routes — what it would actually export — which is the
+/// number we want to compare against packetframe's mirror.
 pub fn parse_route_count(output: &str) -> Result<usize, String> {
-    let mut total: Option<usize> = None;
+    let mut total_line: Option<usize> = None;
+    let mut per_table_sum: Option<usize> = None;
+
     for line in output.lines() {
         let trimmed = line.trim();
-        // Matches `N of N routes for M networks in table X` — take
-        // the first integer.
-        if let Some(first_space) = trimmed.find(' ') {
-            let first_tok = &trimmed[..first_space];
-            if trimmed.contains("routes") {
-                if let Ok(n) = first_tok.parse::<usize>() {
-                    total = Some(total.unwrap_or(0) + n);
+        if !trimmed.contains("routes") {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("Total:") {
+            // "Total: N of M routes for K networks in N tables" —
+            // the next whitespace-delimited token is N.
+            if let Some(first) = rest.split_whitespace().next() {
+                if let Ok(n) = first.parse::<usize>() {
+                    total_line = Some(n);
                 }
+            }
+        } else if let Some(first) = trimmed.split_whitespace().next() {
+            if let Ok(n) = first.parse::<usize>() {
+                per_table_sum = Some(per_table_sum.unwrap_or(0) + n);
             }
         }
     }
-    total.ok_or_else(|| "no `N routes` line in birdc output".to_string())
+
+    total_line
+        .or(per_table_sum)
+        .ok_or_else(|| "no `N routes` line in birdc output".to_string())
 }
 
 /// Parse `birdc show protocols` output for Established BGP peer
@@ -288,7 +321,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_route_count_multi_table_sums() {
+    fn parse_route_count_multi_table_no_total_line_sums_per_table() {
+        // Older bird builds (or single-table outputs) don't emit a
+        // Total line. Fall back to summing per-table firsts.
         let out = "BIRD 2.17.2 ready.\n\
                    1048587 of 1048587 routes for 1048573 networks in table master4\n\
                    233456 of 233456 routes for 233456 networks in table master6\n";
@@ -296,9 +331,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_route_count_prefers_total_line_when_present() {
+        // Modern bird with multi-table output emits a `Total:` line
+        // that is authoritative. Pre-rc5 we summed per-table AND
+        // included the Total, double-counting; this test guards
+        // against regression to that behavior.
+        let out = "BIRD 2.17.2 ready.\n\
+                   1037000 of 1500467 routes for 1037000 networks in table master4\n\
+                   235306 of 457217 routes for 235306 networks in table master6\n\
+                   Total: 1272306 of 1957684 routes for 1272306 networks in 2 tables\n";
+        assert_eq!(parse_route_count(out).unwrap(), 1_272_306);
+    }
+
+    #[test]
     fn parse_route_count_missing_errors() {
         let out = "BIRD 2.17.2 ready.\n";
         assert!(parse_route_count(out).is_err());
+    }
+
+    #[test]
+    fn parse_route_count_total_line_only() {
+        // Defensive: if bird ever emits *only* a Total line (degenerate
+        // edge case), still parse it correctly.
+        let out = "BIRD 2.17.2 ready.\n\
+                   Total: 42 of 100 routes for 42 networks in 1 tables\n";
+        assert_eq!(parse_route_count(out).unwrap(), 42);
     }
 
     #[test]

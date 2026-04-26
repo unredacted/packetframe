@@ -112,14 +112,71 @@ pub fn has_existing_pins(bpffs_root: &Path) -> bool {
 /// — their kernel-side objects disappear once no FDs or links
 /// reference them.
 pub fn remove_all(bpffs_root: &Path) -> std::io::Result<()> {
+    remove_all_paced(bpffs_root, std::time::Duration::ZERO)
+}
+
+/// Variant of [`remove_all`] that paces link-pin removal by `settle_time`
+/// when two or more attached interfaces share a bridge master.
+///
+/// **Why this exists.** Removing a link pin causes the kernel to
+/// detach the XDP program from the iface. On certain drivers (rvu-
+/// nicpf in particular — observed during Phase 4 cutover testing),
+/// detach briefly bounces the link, which the bridge stack treats as
+/// a port-state change. Bouncing multiple bridge members inside one
+/// STP/RSTP reconvergence window can wedge the bridge into a brief
+/// L2-loop state. On the reference EFG hardware that translates to
+/// a kernel panic + full reboot.
+///
+/// SPEC.md §11.8 documents this for the attach side. The detach side
+/// is symmetric and was missing — pre-rc5 `pin::remove_all` deleted
+/// every link inode in a tight loop with no spacing. This function
+/// fixes that by sleeping `settle_time` between consecutive bridge-
+/// member detaches.
+///
+/// `settle_time = ZERO` reverts to the pre-rc5 fast-path (used by
+/// tests and by the cli `detach --all` path when no config provides
+/// a settle time). Production callers (linux_impl::detach) pass the
+/// config's `attach_settle_time`.
+pub fn remove_all_paced(
+    bpffs_root: &Path,
+    settle_time: std::time::Duration,
+) -> std::io::Result<()> {
     // Remove links first so the kernel-side attach is gone before the
     // program is unreferenced. Order is defensive — the kernel copes
     // with reverse order too.
-    for sub in [
-        links_dir(bpffs_root),
-        maps_dir(bpffs_root),
-        progs_dir(bpffs_root),
-    ] {
+    let links = links_dir(bpffs_root);
+    let link_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&links) {
+        Ok(e) => e.flatten().map(|entry| entry.path()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+
+    // Identify which link-pin filenames are bridge members. The pin
+    // filename is the iface name; we read /sys/class/net/<iface>/master
+    // to see if it's bridged. Pace iff settle_time > 0 AND ≥ 2 members
+    // share a master.
+    let bridged_count = if settle_time.is_zero() {
+        0
+    } else {
+        count_shared_bridge_masters(&link_files)
+    };
+
+    for (idx, path) in link_files.iter().enumerate() {
+        if idx > 0 && bridged_count >= 2 && !settle_time.is_zero() {
+            // Only pace once we've removed at least one — the first
+            // removal doesn't need a preceding sleep.
+            std::thread::sleep(settle_time);
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Maps + progs are housekeeping. No kernel-link side effects, no
+    // pacing needed.
+    for sub in [maps_dir(bpffs_root), progs_dir(bpffs_root)] {
         let entries = match std::fs::read_dir(&sub) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -134,6 +191,30 @@ pub fn remove_all(bpffs_root: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Count how many of the given link-pin paths refer to interfaces
+/// that share a bridge master. Returns 0 if none are bridged, the
+/// total count of bridge members otherwise. Used to gate detach
+/// pacing — paying the per-iface settle cost only matters when a
+/// bridge is actually involved.
+fn count_shared_bridge_masters(link_files: &[std::path::PathBuf]) -> usize {
+    use std::collections::HashMap;
+    let mut by_master: HashMap<String, usize> = HashMap::new();
+    for path in link_files {
+        let Some(iface) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let master_link = format!("/sys/class/net/{iface}/master");
+        let Ok(target) = std::fs::read_link(&master_link) else {
+            continue;
+        };
+        let Some(master) = target.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        *by_master.entry(master.to_string()).or_insert(0) += 1;
+    }
+    by_master.values().filter(|&&n| n >= 2).sum()
 }
 
 #[cfg(test)]
@@ -204,6 +285,47 @@ mod tests {
         let dir = tempdir();
         remove_all(&dir).unwrap();
         remove_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_paced_zero_duration_matches_unpaced() {
+        // settle_time=ZERO must behave identically to remove_all —
+        // tests rely on this and the cli `detach --all` without
+        // config defaults to the standard 2 s, but should still
+        // function with zero in unit-test context.
+        let dir = tempdir();
+        ensure_dirs(&dir).unwrap();
+        std::fs::write(program_path(&dir), b"fake").unwrap();
+        std::fs::write(map_path(&dir, "STATS"), b"fake").unwrap();
+        std::fs::write(link_path(&dir, "eth0"), b"fake").unwrap();
+        std::fs::write(link_path(&dir, "eth1"), b"fake").unwrap();
+        remove_all_paced(&dir, std::time::Duration::ZERO).unwrap();
+        assert!(!has_existing_pins(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_all_paced_skips_pacing_when_no_bridge_detected() {
+        // /sys/class/net lookups will fail for our fake "eth0"
+        // pin (it's not a real interface), so `count_shared_bridge_masters`
+        // returns 0 and pacing is skipped. The point of this test is
+        // to confirm pacing-when-no-bridge doesn't slow tests down —
+        // a 5 s settle must NOT be slept here.
+        let dir = tempdir();
+        ensure_dirs(&dir).unwrap();
+        std::fs::write(link_path(&dir, "eth-test-fake-1"), b"fake").unwrap();
+        std::fs::write(link_path(&dir, "eth-test-fake-2"), b"fake").unwrap();
+        let start = std::time::Instant::now();
+        remove_all_paced(&dir, std::time::Duration::from_secs(5)).unwrap();
+        let elapsed = start.elapsed();
+        // Should complete near-instantly. 1 s is generous headroom.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "remove_all_paced unexpectedly slept (elapsed={elapsed:?}); \
+             this means count_shared_bridge_masters incorrectly \
+             reported a bridge for non-existent ifaces"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

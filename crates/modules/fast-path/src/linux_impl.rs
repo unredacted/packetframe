@@ -124,6 +124,13 @@ pub struct ActiveState {
     /// `kernel-fib` mode (which is the default and today's behavior).
     /// `detach` shuts it down cooperatively before tearing down pins.
     pub route_controller: Option<crate::fib::controller::RouteController>,
+    /// `attach_settle_time` from the config, retained for use in
+    /// `detach` so we can pace link-pin removals symmetrically with
+    /// the attach path. Removing all link pins inside one STP
+    /// reconvergence window has been observed to wedge the bridge
+    /// stack on rvu-nicpf hardware (kernel panic, full reboot)
+    /// — the same class of bug §11.8 calls out for attach.
+    pub attach_settle_time: std::time::Duration,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -201,6 +208,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         state_dir: ctx.state_dir.to_path_buf(),
         bpffs_root: ctx.bpffs_root.to_path_buf(),
         route_controller: None,
+        attach_settle_time: cfg.global.attach_settle_time,
     })
 }
 
@@ -545,24 +553,48 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         packetframe_common::config::ForwardingMode::CustomFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
-        // Parse `route-source bmp <addr>:<port>` from the module
-        // config. None → controller runs without a BMP station (test
-        // harness or pre-production smoke test with manual programmer
-        // calls). Some → controller spawns BmpStation on that addr.
-        let bmp_listen = cfg.section.directives.iter().find_map(|d| match d {
+        // Translate the operator's `route-source ...` directive into
+        // a `RouteSourceConfig` for the controller. None → controller
+        // runs without a feed (test harness or pre-production smoke
+        // test with manual programmer calls).
+        let route_source = cfg.section.directives.iter().find_map(|d| match d {
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bmp {
                 addr,
                 port,
+                require_loc_rib,
+            }) => format!("{addr}:{port}")
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|listen| crate::fib::controller::RouteSourceConfig::Bmp {
+                    listen,
+                    require_loc_rib: *require_loc_rib,
+                }),
+            ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
+                addr,
+                port,
+                local_as,
+                peer_as,
+                router_id,
             }) => {
-                // `parse()` handles bracketed IPv6 literals
-                // naturally (e.g. `[::1]:6543`).
-                format!("{addr}:{port}")
-                    .parse::<std::net::SocketAddr>()
-                    .ok()
+                let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
+                // Default router-id: lowest 32 bits of the listen
+                // address when v4; for v6 listens, fall back to the
+                // local_as (uniquely identifies this speaker within
+                // the AS).
+                let rid = router_id.unwrap_or_else(|| match listen.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    std::net::IpAddr::V6(_) => std::net::Ipv4Addr::from(*local_as),
+                });
+                Some(crate::fib::controller::RouteSourceConfig::Bgp {
+                    listen,
+                    local_as: *local_as,
+                    peer_as: *peer_as,
+                    router_id: rid,
+                })
             }
             _ => None,
         });
-        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, bmp_listen)
+        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, route_source)
             .map_err(|e| {
                 ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
             })?;
@@ -1113,12 +1145,19 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         drop(link);
     }
 
-    // Unlink every pin under the module's pin root. Removing link
-    // pins triggers the kernel-side detach; removing map + program
-    // pins is housekeeping.
-    pin::remove_all(&state.bpffs_root)
+    // Unlink every pin under the module's pin root. Pace the link-pin
+    // removals by `attach_settle_time` so we don't trigger an STP
+    // reconvergence storm on shared bridge masters — same hazard
+    // §11.8 calls out for the attach path. Removing all link pins in
+    // ~1 ms (the pre-rc5 behavior) wedged the bridge stack on rvu-
+    // nicpf with eth0/eth4/eth5 all bridged on switch0, kernel-
+    // panicking the EFG during Phase 4 cutover testing.
+    pin::remove_all_paced(&state.bpffs_root, state.attach_settle_time)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
-    info!("fast-path pins removed; kernel detached");
+    info!(
+        settle_secs = state.attach_settle_time.as_secs_f64(),
+        "fast-path pins removed; kernel detached"
+    );
     Ok(())
 }
 

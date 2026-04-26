@@ -19,7 +19,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -31,7 +31,30 @@ use tracing::{info, warn};
 use crate::fib::integrity::{shared_snapshot, IntegrityChecker, IntegrityConfig, SharedSnapshot};
 use crate::fib::netlink_neigh::{NeighborResolveHandle, NetlinkNeighborResolver};
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
+use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
 use crate::fib::route_source_bmp::BmpStation;
+
+/// Forwarding-feed source. The controller spawns at most one route
+/// source: operators pick `bmp` or `bgp` via `route-source ...`.
+/// `Bgp` is the recommended choice today because bird lacks RFC 9069
+/// Loc-RIB BMP — see `route_source_bgp.rs` module docs.
+#[derive(Debug, Clone)]
+pub enum RouteSourceConfig {
+    Bmp {
+        listen: SocketAddr,
+        /// When true, the BmpStation rejects any RouteMonitoring
+        /// frame whose peer_type is not `LocalRib` (RFC 9069 peer
+        /// type 3). Required for safe forwarding use against
+        /// emitters that send pre/post-policy streams.
+        require_loc_rib: bool,
+    },
+    Bgp {
+        listen: SocketAddr,
+        local_as: u32,
+        peer_as: u32,
+        router_id: Ipv4Addr,
+    },
+}
 
 /// Grace period for tasks to drain after `cancel()` fires. Netlink
 /// reader and programmer should both unwind well within this.
@@ -66,15 +89,15 @@ impl RouteController {
     /// `global.bpffs_root` path the loader pins maps under; the
     /// programmer opens each map from its corresponding pin.
     ///
-    /// `bmp_listen` is `Some(addr:port)` when the operator configured
-    /// `route-source bmp <addr>:<port>`; the controller then spawns
-    /// the BmpStation as a third task alongside the resolver + programmer.
-    /// `None` runs without a live route source — useful for test
-    /// harnesses that drive the programmer directly via its
-    /// `FibProgrammerHandle`.
+    /// `route_source` is `Some(...)` when the operator configured
+    /// `route-source bmp ...` or `route-source bgp ...`; the
+    /// controller then spawns the matching listener as a third task
+    /// alongside the resolver + programmer. `None` runs without a
+    /// live route source — useful for test harnesses that drive the
+    /// programmer directly via its `FibProgrammerHandle`.
     pub fn start(
         bpffs_root: &Path,
-        bmp_listen: Option<SocketAddr>,
+        route_source: Option<RouteSourceConfig>,
     ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
@@ -94,13 +117,19 @@ impl RouteController {
 
         let (resolver, events_rx, neigh_handle) =
             NetlinkNeighborResolver::new(shutdown_token.clone());
-        let (programmer, prog_handle) = FibProgrammer::new(
+        // Phase 3.9 fix: pass the resolve handle through so
+        // FibProgrammer::register() can kick proactive resolution on
+        // every newly-allocated nexthop. Pre-fix this was wired but
+        // never called, leaving nexthops dependent on multicast events
+        // that don't fire for stable REACHABLE kernel entries.
+        let (programmer, prog_handle) = FibProgrammer::new_with_resolver(
             nexthops,
             fib_v4,
             fib_v6,
             ecmp_groups,
             events_rx,
             shutdown_token.clone(),
+            Some(neigh_handle.clone()),
         );
 
         let resolver_task = runtime.spawn(async move {
@@ -115,44 +144,81 @@ impl RouteController {
 
         let mut tasks = vec![resolver_task, programmer_task];
 
-        // Spawn BmpStation iff the operator asked for `route-source bmp`.
-        // Without that, the programmer still works — test harnesses
-        // drive it directly via its handle — but no live routes flow in.
+        // Spawn the configured route-source feed (BMP or BGP). The
+        // integrity checker spawns alongside any feed because both
+        // depend on a live bird to cross-check against.
         let mut integrity: Option<SharedSnapshot> = None;
-        if let Some(addr) = bmp_listen {
-            // Integrity checker runs only when BMP is configured —
-            // without BMP there's no bird session for us to cross-
-            // check against. Defaults (5 min cadence, 1% drift
-            // warn, /usr/sbin/birdc) match the plan.
-            let snapshot = shared_snapshot();
-            let checker = IntegrityChecker::new(
-                IntegrityConfig::default(),
-                snapshot.clone(),
-                prog_handle.clone(),
-                shutdown_token.clone(),
-            );
-            let integrity_task = runtime.spawn(async move { checker.run().await });
-            tasks.push(integrity_task);
+        match route_source {
+            Some(RouteSourceConfig::Bmp {
+                listen,
+                require_loc_rib,
+            }) => {
+                let snapshot = shared_snapshot();
+                let checker = IntegrityChecker::new(
+                    IntegrityConfig::default(),
+                    snapshot.clone(),
+                    prog_handle.clone(),
+                    shutdown_token.clone(),
+                );
+                tasks.push(runtime.spawn(async move { checker.run().await }));
 
-            let station = BmpStation::new(addr, prog_handle.clone(), shutdown_token.clone())
-                .with_stall_gate(snapshot.clone());
-            let bmp_task = runtime.spawn(async move {
-                if let Err(e) = station.run().await {
-                    warn!(error = %e, "BmpStation task exited with error");
+                let mut station =
+                    BmpStation::new(listen, prog_handle.clone(), shutdown_token.clone())
+                        .with_stall_gate(snapshot.clone());
+                if require_loc_rib {
+                    station = station.with_require_loc_rib();
                 }
-            });
-            tasks.push(bmp_task);
-            integrity = Some(snapshot);
+                tasks.push(runtime.spawn(async move {
+                    if let Err(e) = station.run().await {
+                        warn!(error = %e, "BmpStation task exited with error");
+                    }
+                }));
+                integrity = Some(snapshot);
 
-            info!(
-                bmp_addr = %addr,
-                "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
-            );
-        } else {
-            info!(
-                "RouteController started: NetlinkNeighborResolver + FibProgrammer \
-                 (no BmpStation — `route-source` not configured)"
-            );
+                info!(
+                    bmp_addr = %listen,
+                    require_loc_rib,
+                    "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
+                );
+            }
+            Some(RouteSourceConfig::Bgp {
+                listen,
+                local_as,
+                peer_as,
+                router_id,
+            }) => {
+                let snapshot = shared_snapshot();
+                let checker = IntegrityChecker::new(
+                    IntegrityConfig::default(),
+                    snapshot.clone(),
+                    prog_handle.clone(),
+                    shutdown_token.clone(),
+                );
+                tasks.push(runtime.spawn(async move { checker.run().await }));
+
+                let cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
+                let listener = BgpListener::new(cfg, prog_handle.clone(), shutdown_token.clone())
+                    .with_stall_gate(snapshot.clone());
+                tasks.push(runtime.spawn(async move {
+                    if let Err(e) = listener.run().await {
+                        warn!(error = %e, "BgpListener task exited with error");
+                    }
+                }));
+                integrity = Some(snapshot);
+
+                info!(
+                    bgp_addr = %listen,
+                    local_as,
+                    peer_as,
+                    "RouteController started: NetlinkNeighborResolver + FibProgrammer + BgpListener + IntegrityChecker"
+                );
+            }
+            None => {
+                info!(
+                    "RouteController started: NetlinkNeighborResolver + FibProgrammer \
+                     (no route source — `route-source` not configured)"
+                );
+            }
         }
 
         Ok(Self {

@@ -94,6 +94,14 @@ pub struct BmpStation {
     /// reads `bird_established_peers`: an alert only fires when bird
     /// thinks there's at least one peer we should be hearing from.
     stall_gate: Option<SharedIntegritySnapshot>,
+    /// Loc-RIB-only safety mode. When true, RouteMonitoring frames
+    /// whose per-peer-header carries `peer_type != LocalRib` (RFC
+    /// 9069 peer type 3) cause the session to be torn down with an
+    /// error rather than silently producing per-peer Adj-RIB-In
+    /// programmer writes that race-overwrite per-prefix nexthops.
+    /// Required for safe forwarding use against bird 2.x / bird 3.x
+    /// (which only emit pre/post-policy frames).
+    require_loc_rib: bool,
 }
 
 /// Re-export for callers building the station.
@@ -120,6 +128,7 @@ impl BmpStation {
             shutdown,
             last_rm_unix: Arc::new(AtomicI64::new(0)),
             stall_gate: None,
+            require_loc_rib: false,
         }
     }
 
@@ -129,6 +138,15 @@ impl BmpStation {
     /// don't care about the alert path.
     pub fn with_stall_gate(mut self, snapshot: SharedIntegritySnapshot) -> Self {
         self.stall_gate = Some(snapshot);
+        self
+    }
+
+    /// Enable Loc-RIB-only safety mode: any RouteMonitoring frame
+    /// with `peer_type != LocalRib` tears the session down with an
+    /// error. Required when running against pre/post-policy emitters
+    /// like bird 2.x — see the `require_loc_rib` field doc.
+    pub fn with_require_loc_rib(mut self) -> Self {
+        self.require_loc_rib = true;
         self
     }
 
@@ -238,7 +256,15 @@ impl BmpStation {
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
                             }
-                            self.process_msg(m).await;
+                            // Loc-RIB safety check happens inside
+                            // process_msg; a violation returns Err and
+                            // tears down the session here. Bird (or
+                            // whoever) will reconnect; the operator
+                            // sees the error log.
+                            if let Err(e) = self.process_msg(m).await {
+                                reader.abort();
+                                return Err(e);
+                            }
                         }
                         None => {
                             // Reader task exited — EOF or error. Join it
@@ -286,10 +312,15 @@ impl BmpStation {
     }
 
     /// Dispatch on the BMP message body and fan out the appropriate
-    /// RouteEvents. Errors from the programmer are logged, not
-    /// propagated — a single bad map write shouldn't kill the BMP
-    /// connection when the next route might succeed.
-    async fn process_msg(&self, msg: BmpMessage) {
+    /// RouteEvents. Programmer errors are logged but not propagated —
+    /// a single bad map write shouldn't kill the BMP connection when
+    /// the next route might succeed.
+    ///
+    /// **Returns Err only on session-fatal protocol violations** —
+    /// today that's a RouteMonitoring frame whose peer_type isn't
+    /// `LocalRib` while `require_loc_rib` is set. The caller closes
+    /// the session and lets the peer reconnect.
+    async fn process_msg(&self, msg: BmpMessage) -> Result<(), RouteSourceError> {
         match msg.message_body {
             BmpMessageBody::InitiationMessage(_) => {
                 info!("BMP INITIATION received from bird");
@@ -300,7 +331,7 @@ impl BmpStation {
             BmpMessageBody::PeerUpNotification(_) => {
                 let pph = match &msg.per_peer_header {
                     Some(p) => p,
-                    None => return,
+                    None => return Ok(()),
                 };
                 let peer_id = peer_id_from_header(pph);
                 info!(
@@ -325,7 +356,7 @@ impl BmpStation {
             BmpMessageBody::PeerDownNotification(_) => {
                 let pph = match &msg.per_peer_header {
                     Some(p) => p,
-                    None => return,
+                    None => return Ok(()),
                 };
                 let peer_id = peer_id_from_header(pph);
                 info!(?peer_id, peer_ip = %pph.peer_ip, "PeerDown");
@@ -342,9 +373,19 @@ impl BmpStation {
                     Some(p) => p,
                     None => {
                         warn!("RouteMonitoring without per-peer header");
-                        return;
+                        return Ok(());
                     }
                 };
+                if self.require_loc_rib && pph.peer_type != BmpPeerType::LocalRib {
+                    return Err(RouteSourceError::recoverable(format!(
+                        "rejecting RouteMonitoring with peer_type={:?} \
+                         (require-loc-rib is set; only RFC 9069 Loc-RIB peer_type=3 \
+                         is safe to drive forwarding from). The emitter (bird 2.x?) \
+                         likely needs `monitoring rib in pre_policy` removed; switch \
+                         to `route-source bgp` for a safe forwarding feed.",
+                        pph.peer_type
+                    )));
+                }
                 let peer_id = peer_id_from_header(pph);
                 // Elementor converts the UPDATE wrapped in this
                 // RouteMonitoring into one BgpElem per prefix.
@@ -388,6 +429,7 @@ impl BmpStation {
                 debug!("StatsReport ignored");
             }
         }
+        Ok(())
     }
 }
 

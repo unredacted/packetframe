@@ -160,9 +160,10 @@ pub enum ModuleDirective {
     /// validation, temporary).
     ForwardingMode(ForwardingMode),
     /// RouteSource configuration — where the custom FIB gets its
-    /// routes. Currently only `bmp <addr>:<port>`; the BMP station
-    /// is spawned by the RouteController when this is set and
-    /// `forwarding-mode` is `custom-fib` or `compare`.
+    /// routes. Two kinds: `bmp <addr>:<port>` and `bgp <addr>:<port>
+    /// local-as <asn> peer-as <asn>`. Spawned by the RouteController
+    /// when this is set and `forwarding-mode` is `custom-fib` or
+    /// `compare`. See [`RouteSourceSpec`] for the per-kind shape.
     RouteSource(RouteSourceSpec),
     /// Max entries for the custom-FIB LPM tries and side arrays.
     /// Accepted but **not yet runtime-applied** — aya / kernel
@@ -205,16 +206,43 @@ impl FromStr for ForwardingMode {
     }
 }
 
-/// RouteSource configuration. Currently only `bmp <addr>:<port>` is
-/// supported; other variants would land alongside their concrete
-/// `RouteSource` impls if added.
+/// RouteSource configuration. Two impls today: BMP and iBGP. BGP
+/// is the recommended forwarding feed because bird's BMP
+/// implementation lacks RFC 9069 Loc-RIB — see
+/// `route_source_bgp.rs` module docs and
+/// `docs/runbooks/custom-fib.md` for the rationale.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum RouteSourceSpec {
     /// BMP station listen address. Bird dials out to this
     /// address:port; packetframe accepts the TCP connection and
     /// consumes the BMP stream. RFC 7854 roles: bird is the router
     /// (client), packetframe is the station (server).
-    Bmp { addr: String, port: u16 },
+    ///
+    /// `require_loc_rib`: when true, only RouteMonitoring frames
+    /// with peer_type = 3 (RFC 9069 Loc-RIB Instance Peer) are
+    /// accepted; pre/post-policy frames cause the session to be
+    /// torn down with an error. **This is required for safe use
+    /// against pre/post-policy emitters** like bird 2.x — without
+    /// it, multiple peers' Adj-RIB-In streams would race-overwrite
+    /// per-prefix nexthops in the FIB and produce silent
+    /// wrong-forwarding. See module docs in
+    /// `route_source_bmp.rs`.
+    Bmp {
+        addr: String,
+        port: u16,
+        require_loc_rib: bool,
+    },
+    /// iBGP listener — packetframe accepts an iBGP session from
+    /// bird and ingests UPDATEs as bird's selected best paths.
+    /// `local_as`/`peer_as` are typically equal (iBGP within one AS);
+    /// `router_id` defaults to `addr` when not specified.
+    Bgp {
+        addr: String,
+        port: u16,
+        local_as: u32,
+        peer_as: u32,
+        router_id: Option<std::net::Ipv4Addr>,
+    },
 }
 
 /// One `fib-*-max-entries` directive. Parsed but not runtime-applied
@@ -777,9 +805,11 @@ where
     Ok(wrap(n))
 }
 
-/// Parse `route-source <kind> <args...>`. Currently only
-/// `bmp <addr>:<port>` is supported. Unknown kinds become parse
-/// errors with an explicit message.
+/// Parse `route-source <kind> <args...>`. Two kinds supported:
+/// - `bmp <addr>:<port>`
+/// - `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`
+///
+/// Unknown kinds become parse errors with an explicit message.
 fn parse_route_source<'a>(
     line: usize,
     mut rest: impl Iterator<Item = &'a str>,
@@ -787,7 +817,7 @@ fn parse_route_source<'a>(
     let kind = rest.next().ok_or_else(|| {
         ConfigError::parse(
             line,
-            "route-source requires a kind + args (e.g. `bmp 127.0.0.1:6543`)",
+            "route-source requires a kind + args (e.g. `bgp 127.0.0.1:1179 local-as 401401 peer-as 401401`)",
         )
     })?;
     match kind {
@@ -795,37 +825,131 @@ fn parse_route_source<'a>(
             let endpoint = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "route-source bmp requires <addr>:<port>")
             })?;
-            if rest.next().is_some() {
-                return Err(ConfigError::parse(
-                    line,
-                    "route-source bmp takes exactly one argument: <addr>:<port>",
-                ));
+            let (addr, port) = parse_endpoint(line, endpoint, "bmp")?;
+            // Optional trailing `require-loc-rib` flag. Any other
+            // tail token is a parse error.
+            let mut require_loc_rib = false;
+            for tok in rest {
+                match tok {
+                    "require-loc-rib" => require_loc_rib = true,
+                    other => {
+                        return Err(ConfigError::parse(
+                            line,
+                            format!(
+                                "route-source bmp: unknown tail flag `{other}` (only `require-loc-rib` is recognized)"
+                            ),
+                        ));
+                    }
+                }
             }
-            let (addr, port_str) = endpoint.rsplit_once(':').ok_or_else(|| {
-                ConfigError::parse(
-                    line,
-                    format!("route-source bmp: expected <addr>:<port>, got `{endpoint}`"),
-                )
-            })?;
-            if addr.is_empty() {
-                return Err(ConfigError::parse(line, "route-source bmp: addr is empty"));
-            }
-            let port: u16 = port_str.parse().map_err(|e| {
-                ConfigError::parse(
-                    line,
-                    format!("route-source bmp: bad port `{port_str}`: {e}"),
-                )
-            })?;
             Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bmp {
-                addr: addr.to_string(),
+                addr,
                 port,
+                require_loc_rib,
+            }))
+        }
+        "bgp" => {
+            let endpoint = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "route-source bgp requires <addr>:<port> local-as <asn> peer-as <asn>",
+                )
+            })?;
+            let (addr, port) = parse_endpoint(line, endpoint, "bgp")?;
+            let mut local_as: Option<u32> = None;
+            let mut peer_as: Option<u32> = None;
+            let mut router_id: Option<std::net::Ipv4Addr> = None;
+            while let Some(key) = rest.next() {
+                let value = rest.next().ok_or_else(|| {
+                    ConfigError::parse(
+                        line,
+                        format!("route-source bgp: `{key}` requires a value"),
+                    )
+                })?;
+                match key {
+                    "local-as" => {
+                        local_as = Some(value.parse::<u32>().map_err(|e| {
+                            ConfigError::parse(
+                                line,
+                                format!("route-source bgp: bad local-as `{value}`: {e}"),
+                            )
+                        })?);
+                    }
+                    "peer-as" => {
+                        peer_as = Some(value.parse::<u32>().map_err(|e| {
+                            ConfigError::parse(
+                                line,
+                                format!("route-source bgp: bad peer-as `{value}`: {e}"),
+                            )
+                        })?);
+                    }
+                    "router-id" => {
+                        router_id = Some(value.parse::<std::net::Ipv4Addr>().map_err(|e| {
+                            ConfigError::parse(
+                                line,
+                                format!("route-source bgp: bad router-id `{value}`: {e}"),
+                            )
+                        })?);
+                    }
+                    other => {
+                        return Err(ConfigError::parse(
+                            line,
+                            format!(
+                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id)"
+                            ),
+                        ));
+                    }
+                }
+            }
+            let local_as = local_as.ok_or_else(|| {
+                ConfigError::parse(line, "route-source bgp: missing required `local-as <asn>`")
+            })?;
+            let peer_as = peer_as.ok_or_else(|| {
+                ConfigError::parse(line, "route-source bgp: missing required `peer-as <asn>`")
+            })?;
+            Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bgp {
+                addr,
+                port,
+                local_as,
+                peer_as,
+                router_id,
             }))
         }
         other => Err(ConfigError::parse(
             line,
-            format!("route-source `{other}` unknown (only `bmp <addr>:<port>` is supported)"),
+            format!(
+                "route-source `{other}` unknown (supported: `bmp <addr>:<port>`, `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`)"
+            ),
         )),
     }
+}
+
+/// Common `<addr>:<port>` parser, used by both `bmp` and `bgp`
+/// kinds. `kind_label` is interpolated into error messages.
+fn parse_endpoint(
+    line: usize,
+    endpoint: &str,
+    kind_label: &str,
+) -> Result<(String, u16), ConfigError> {
+    let (addr, port_str) = endpoint.rsplit_once(':').ok_or_else(|| {
+        ConfigError::parse(
+            line,
+            format!("route-source {kind_label}: expected <addr>:<port>, got `{endpoint}`"),
+        )
+    })?;
+    if addr.is_empty() {
+        return Err(ConfigError::parse(
+            line,
+            format!("route-source {kind_label}: addr is empty"),
+        ));
+    }
+    let port: u16 = port_str.parse().map_err(|e| {
+        ConfigError::parse(
+            line,
+            format!("route-source {kind_label}: bad port `{port_str}`: {e}"),
+        )
+    })?;
+    Ok((addr.to_string(), port))
 }
 
 fn parse_driver_workaround<'a>(
@@ -1408,42 +1532,67 @@ module fast-path
         }
     }
 
-    #[test]
-    fn route_source_bmp_parses_endpoint() {
-        let m = parse_module_body("  route-source bmp 127.0.0.1:6543\n").unwrap();
-        let src = m
-            .directives
+    fn extract_route_source(s: &str) -> RouteSourceSpec {
+        let m = parse_module_body(s).unwrap();
+        m.directives
             .iter()
             .find_map(|d| match d {
                 ModuleDirective::RouteSource(s) => Some(s.clone()),
                 _ => None,
             })
-            .unwrap();
-        match src {
-            RouteSourceSpec::Bmp { addr, port } => {
+            .unwrap()
+    }
+
+    #[test]
+    fn route_source_bmp_parses_endpoint() {
+        match extract_route_source("  route-source bmp 127.0.0.1:6543\n") {
+            RouteSourceSpec::Bmp {
+                addr,
+                port,
+                require_loc_rib,
+            } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 6543);
+                assert!(!require_loc_rib, "default should be off");
             }
+            other => panic!("expected Bmp, got {other:?}"),
         }
     }
 
     #[test]
     fn route_source_bmp_ipv6_endpoint() {
         // rsplit_once(':') on `[::1]:6543` cleanly splits off the port.
-        let m = parse_module_body("  route-source bmp [::1]:6543\n").unwrap();
-        let src = m
-            .directives
-            .iter()
-            .find_map(|d| match d {
-                ModuleDirective::RouteSource(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap();
-        match src {
-            RouteSourceSpec::Bmp { addr, port } => {
+        match extract_route_source("  route-source bmp [::1]:6543\n") {
+            RouteSourceSpec::Bmp { addr, port, .. } => {
                 assert_eq!(addr, "[::1]");
                 assert_eq!(port, 6543);
             }
+            other => panic!("expected Bmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_require_loc_rib_flag() {
+        match extract_route_source("  route-source bmp 127.0.0.1:6543 require-loc-rib\n") {
+            RouteSourceSpec::Bmp {
+                require_loc_rib, ..
+            } => assert!(require_loc_rib),
+            other => panic!("expected Bmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_unknown_tail_flag_errors() {
+        let e = parse_module_body("  route-source bmp 127.0.0.1:6543 require-pre-policy\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("require-pre-policy") || message.contains("unknown tail"),
+                    "msg was: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 
@@ -1459,6 +1608,79 @@ module fast-path
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("frr") || message.contains("unknown"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_parses_full_form() {
+        let s = "  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 103.17.154.7\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp {
+                addr,
+                port,
+                local_as,
+                peer_as,
+                router_id,
+            } => {
+                assert_eq!(addr, "127.0.0.1");
+                assert_eq!(port, 1179);
+                assert_eq!(local_as, 401401);
+                assert_eq!(peer_as, 401401);
+                assert_eq!(router_id, Some("103.17.154.7".parse().unwrap()));
+            }
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_router_id_optional() {
+        let s = "  route-source bgp 127.0.0.1:1179 local-as 64512 peer-as 64512\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp { router_id, .. } => assert_eq!(router_id, None),
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_missing_local_as_errors() {
+        let e =
+            parse_module_body("  route-source bgp 127.0.0.1:1179 peer-as 401401\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("local-as"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_unknown_key_errors() {
+        let e = parse_module_body(
+            "  route-source bgp 127.0.0.1:1179 local-as 1 peer-as 2 hold-time 60\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("hold-time") || message.contains("unknown key"),
+                    "msg was: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_bad_router_id_errors() {
+        let e = parse_module_body(
+            "  route-source bgp 127.0.0.1:1179 local-as 1 peer-as 2 router-id not-an-ip\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("router-id"), "msg was: {message}");
             }
             other => panic!("expected Parse, got {other:?}"),
         }

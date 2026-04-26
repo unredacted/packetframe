@@ -201,7 +201,25 @@ fn parse_mode(s: &str) -> Result<packetframe_probe::AttachMode, String> {
 }
 
 fn main() -> ExitCode {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Default: info from our crates, plus suppress one upstream
+        // noise source. `bgpkit_parser::parser::bgp::messages`
+        // emits a `WARN seeing strange one-byte NLRI field` whenever
+        // a BGP UPDATE arrives with a 1-byte NLRI section — which is
+        // the valid wire encoding of a default route (`0.0.0.0/0`:
+        // prefix-length byte = 0, zero prefix bytes follow).
+        // bgpkit-parser conservatively treats it as malformed and
+        // skips. For our use case (bird with `accept-default: false`,
+        // no defaults in the RIB), the warning fires once per session
+        // when bird emits a withdraw of the default and is otherwise
+        // misleading noise. Demote that one module's warnings to
+        // error level so genuine bgpkit-parser failures still
+        // surface but the cosmetic noise is gone.
+        //
+        // Operators who want the raw parser warnings back: set
+        // `RUST_LOG=info,bgpkit_parser::parser::bgp::messages=warn`.
+        EnvFilter::new("info,bgpkit_parser::parser::bgp::messages=error")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

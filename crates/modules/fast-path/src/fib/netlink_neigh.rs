@@ -86,12 +86,34 @@ pub struct NetlinkNeighborResolver {
     events_tx: mpsc::Sender<NeighEvent>,
     resolve_rx: mpsc::Receiver<IpAddr>,
     shutdown: CancellationToken,
+    /// Diagnostic counters (Phase 3.9 debug). Logged periodically so
+    /// the operator can see whether register_nexthop calls are
+    /// landing on cache hits or fanning out to proactive probes.
+    synth_learned_emitted: u64,
+    cache_misses: u64,
     /// Cache mapping ifindex → egress MAC. Populated at startup via
     /// a single `RTM_GETLINK` dump; maintained by `RTM_NEWLINK` /
     /// `RTM_DELLINK` multicast events. Used to attach `src_mac` to
     /// `NeighEvent::Learned` so the FibProgrammer writes the correct
     /// Ethernet source address into `NEXTHOPS[id].src_mac`.
     iface_mac: HashMap<u32, [u8; 6]>,
+    /// Cache of the kernel's neighbour table. Populated at startup via
+    /// a single `RTM_GETNEIGH` dump; maintained by `RTM_NEWNEIGH` /
+    /// `RTM_DELNEIGH` multicast events.
+    ///
+    /// **Why we need this** (Phase 3.9 fix): if the kernel already
+    /// has a stable `REACHABLE` entry for a BGP nexthop when
+    /// packetframe starts, the multicast subscription will never see
+    /// it — multicast only fires on state *transitions*. Without this
+    /// cache, `request_resolve(ip)` would issue an `RTM_NEWNEIGH
+    /// NUD_NONE` probe for an entry the kernel already has, which
+    /// the kernel correctly treats as a no-op and produces no event,
+    /// leaving the nexthop forever `incomplete` in our NEXTHOPS map.
+    /// Now `issue_proactive_resolve` consults this cache first and
+    /// synthesizes a `Learned` event for any pre-existing entry,
+    /// recovering the ~22 % of nexthops that would otherwise be
+    /// stuck.
+    neigh_cache: HashMap<IpAddr, (u32, [u8; 6])>,
 }
 
 impl NetlinkNeighborResolver {
@@ -111,6 +133,9 @@ impl NetlinkNeighborResolver {
                 resolve_rx,
                 shutdown,
                 iface_mac: HashMap::new(),
+                neigh_cache: HashMap::new(),
+                synth_learned_emitted: 0,
+                cache_misses: 0,
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -146,6 +171,30 @@ impl NetlinkNeighborResolver {
             }
         }
 
+        // Phase 3.9 fix: seed the kernel-neighbour cache so
+        // request_resolve(ip) for an already-REACHABLE entry can be
+        // satisfied synchronously instead of relying on a multicast
+        // event that won't fire (kernel only multicasts state
+        // *transitions*, not steady state). Without this, BGP nexthops
+        // ARP'd before packetframe started never get a Learned event.
+        match dump_neighbours().await {
+            Ok(neighs) => {
+                self.neigh_cache = neighs;
+                info!(
+                    count = self.neigh_cache.len(),
+                    "kernel neighbour cache seeded from RTM_GETNEIGH dump"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "RTM_GETNEIGH dump failed; pre-existing kernel neighbour entries \
+                     won't be visible until they transition (degraded perf only — first-packet \
+                     ARP is the fallback)"
+                );
+            }
+        }
+
         let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
         let (connection, handle, mut messages) = new_multicast_connection(&groups)
             .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
@@ -154,6 +203,12 @@ impl NetlinkNeighborResolver {
             groups = ?groups,
             "NeighborResolver netlink multicast subscription live"
         );
+
+        // Phase 3.9 diagnostic: periodic stats so we can see whether
+        // synthetic Learned events are firing for most BGP nexthops or
+        // not. Cheap (single info log every 10 s).
+        let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        stats_tick.tick().await; // skip immediate fire
 
         loop {
             tokio::select! {
@@ -173,10 +228,44 @@ impl NetlinkNeighborResolver {
                 req = self.resolve_rx.recv() => {
                     match req {
                         Some(ip) => {
-                            // Best-effort proactive resolve. If the route
-                            // lookup or neighbor add fails, log at debug
-                            // and fall back to first-packet kernel ARP.
-                            issue_proactive_resolve(&handle, ip).await;
+                            // Phase 3.9: synchronously resolve from
+                            // the seeded cache first. If kernel already
+                            // has a usable entry, emit Learned right
+                            // here so the FibProgrammer flips the
+                            // nexthop to Resolved immediately, no
+                            // multicast wait. Falls through to the
+                            // proactive RTM_NEWNEIGH NUD_NONE probe
+                            // when the cache misses (kernel doesn't
+                            // know the IP yet → first-packet ARP
+                            // remains the safety net).
+                            if let Some(&(ifindex, mac)) = self.neigh_cache.get(&ip) {
+                                let src_mac = self
+                                    .iface_mac
+                                    .get(&ifindex)
+                                    .copied()
+                                    .unwrap_or([0; 6]);
+                                let evt = NeighEvent::Learned { ip, mac, ifindex, src_mac };
+                                match self.events_tx.send(evt).await {
+                                    Ok(()) => {
+                                        self.synth_learned_emitted += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!(?ip, error = %e, "synthetic Learned send failed");
+                                    }
+                                }
+                            } else {
+                                self.cache_misses += 1;
+                                if self.cache_misses <= 20 {
+                                    // First few misses — log explicitly so
+                                    // the operator can see *which* IPs the
+                                    // dump didn't capture.
+                                    info!(?ip, "neighbour cache miss; proactive probe");
+                                }
+                                // Best-effort proactive resolve. If the route
+                                // lookup or neighbor add fails, log at debug
+                                // and fall back to first-packet kernel ARP.
+                                issue_proactive_resolve(&handle, ip).await;
+                            }
                         }
                         None => {
                             // All NeighborResolveHandle clones dropped; continue
@@ -184,6 +273,19 @@ impl NetlinkNeighborResolver {
                             debug!("resolve request channel closed");
                         }
                     }
+                }
+                _ = stats_tick.tick() => {
+                    // Periodic resolver stats. Helps diagnose whether
+                    // register_nexthop calls are landing on cache hits
+                    // (good — synthetic Learned fired) or misses (kernel
+                    // didn't have an ARP entry; relying on proactive
+                    // probe).
+                    info!(
+                        cache_size = self.neigh_cache.len(),
+                        synth_learned_emitted = self.synth_learned_emitted,
+                        cache_misses = self.cache_misses,
+                        "neighbour resolver stats"
+                    );
                 }
             }
         }
@@ -206,6 +308,16 @@ impl NetlinkNeighborResolver {
                     .copied()
                     .unwrap_or([0; 6]);
                 if let Some(evt) = parse_neighbour_add(&msg, src_mac) {
+                    // Mirror Learned events into the local cache so
+                    // a later request_resolve for the same IP hits
+                    // synchronously (Phase 3.9 fix). Cache misses on
+                    // Failed/Gone — those don't carry a usable MAC.
+                    if let NeighEvent::Learned {
+                        ip, mac, ifindex, ..
+                    } = &evt
+                    {
+                        self.neigh_cache.insert(*ip, (*ifindex, *mac));
+                    }
                     if let Err(e) = self.events_tx.send(evt).await {
                         debug!(error = %e, "NeighEvent::Learned send failed");
                     }
@@ -213,6 +325,9 @@ impl NetlinkNeighborResolver {
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelNeighbour(msg)) => {
                 if let Some(evt) = parse_neighbour_del(&msg) {
+                    if let NeighEvent::Gone { ip } = &evt {
+                        self.neigh_cache.remove(ip);
+                    }
                     if let Err(e) = self.events_tx.send(evt).await {
                         debug!(error = %e, "NeighEvent::Gone send failed");
                     }
@@ -353,6 +468,47 @@ async fn dump_link_macs() -> Result<HashMap<u32, [u8; 6]>, NeighError> {
         }
     }
     Ok(macs)
+}
+
+/// Dump every neighbour in the kernel's table via a single
+/// `RTM_GETNEIGH` dump and return an `IpAddr → (ifindex, mac)` map.
+///
+/// **Why this exists** (Phase 3.9): the multicast subscription only
+/// observes neighbour state *transitions*, not the steady state at
+/// the moment we subscribe. If the kernel already has REACHABLE
+/// entries for BGP peers when packetframe starts (typical — bird's
+/// been ARPing them for hours), we'd never see them. This dump
+/// gives us a one-time snapshot to seed the cache, and the
+/// multicast subscription keeps it current from then on.
+///
+/// Skips entries whose state isn't usable for forwarding
+/// (Incomplete/None/Failed) and entries without a Link-Layer
+/// Address attribute. STALE/DELAY/PROBE are kept — same policy as
+/// `parse_neighbour_add` for the multicast path.
+async fn dump_neighbours() -> Result<HashMap<IpAddr, (u32, [u8; 6])>, NeighError> {
+    let (connection, handle, _) =
+        new_connection().map_err(|e| NeighError::new(format!("new_connection: {e}")))?;
+    tokio::spawn(connection);
+
+    let mut out: HashMap<IpAddr, (u32, [u8; 6])> = HashMap::new();
+    let mut neighs = handle.neighbours().get().execute();
+    while let Some(msg) = neighs
+        .try_next()
+        .await
+        .map_err(|e| NeighError::new(format!("neighbour dump: {e}")))?
+    {
+        // Use the same parser the multicast path uses so dump-time
+        // and live-time behavior agree on what counts as resolved.
+        // src_mac is filled in by the cache lookup at consumption
+        // time; we only need (ip, mac, ifindex) here.
+        if let Some(NeighEvent::Learned {
+            ip, mac, ifindex, ..
+        }) = parse_neighbour_add(&msg, [0; 6])
+        {
+            out.insert(ip, (ifindex, mac));
+        }
+    }
+    Ok(out)
 }
 
 /// Pull the `Address` (IFLA_ADDRESS) attribute out of a LinkMessage

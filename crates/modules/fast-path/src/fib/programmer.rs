@@ -57,6 +57,7 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
 
+use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::types::{
     EcmpGroup, FibValue, NexthopEntry, ECMP_NH_UNUSED, MAX_ECMP_PATHS, NH_FAMILY_V4, NH_FAMILY_V6,
     NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED,
@@ -343,6 +344,20 @@ pub struct FibProgrammer {
 
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
+
+    // --- Proactive resolve (Phase 3.9 fix) ---
+    /// Handle to the NeighborResolver. Every newly-allocated nexthop
+    /// fires `request_resolve(ip)`. The resolver consults its seeded
+    /// kernel-ARP cache and either emits a synthetic Learned event
+    /// (typical case post-rc2) or falls through to an
+    /// `RTM_NEWNEIGH NUD_NONE` proactive probe.
+    ///
+    /// Without this call, nexthops only resolve when the kernel
+    /// happens to multicast a state transition, which doesn't fire
+    /// for stable REACHABLE entries. That bug left ~95 % of BGP
+    /// nexthops stuck in `incomplete` in pre-rc4 builds.
+    /// `Option` so test harnesses can pass `None`.
+    neigh_handle: Option<NeighborResolveHandle>,
 }
 
 impl FibProgrammer {
@@ -408,6 +423,32 @@ impl FibProgrammer {
         events_rx: mpsc::Receiver<NeighEvent>,
         shutdown: CancellationToken,
     ) -> (Self, FibProgrammerHandle) {
+        Self::new_with_resolver(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            events_rx,
+            shutdown,
+            None,
+        )
+    }
+
+    /// Variant that wires in a [`NeighborResolveHandle`] so each
+    /// newly-allocated nexthop triggers proactive resolution. The
+    /// `new()` shortcut above (which test harnesses use) defers to
+    /// this with `None`, leaving resolution to multicast events
+    /// only. Production callers (RouteController) MUST pass `Some`
+    /// or BGP nexthops will not resolve cleanly.
+    pub fn new_with_resolver(
+        nexthops: Array<MapData, NexthopEntry>,
+        fib_v4: LpmTrie<MapData, [u8; 4], FibValue>,
+        fib_v6: LpmTrie<MapData, [u8; 16], FibValue>,
+        ecmp_groups: Array<MapData, EcmpGroup>,
+        events_rx: mpsc::Receiver<NeighEvent>,
+        shutdown: CancellationToken,
+        neigh_handle: Option<NeighborResolveHandle>,
+    ) -> (Self, FibProgrammerHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
         (
             Self {
@@ -431,6 +472,7 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
+                neigh_handle,
             },
             FibProgrammerHandle { tx: cmd_tx },
         )
@@ -543,6 +585,22 @@ impl FibProgrammer {
         );
         self.by_id.insert(id, ip);
         debug!(?ip, id, "NexthopId allocated");
+
+        // Phase 3.9 fix: kick the NeighborResolver so this nexthop
+        // gets resolved promptly. The resolver consults its kernel-
+        // ARP cache (seeded at startup); on hit it synthesizes a
+        // Learned event and our `events_rx` arm flips state to
+        // Resolved. On miss it falls back to RTM_NEWNEIGH NUD_NONE
+        // (proactive probe). Without this call, the only thing that
+        // resolves a nexthop is a kernel ARP state-transition
+        // multicast — which never fires for entries that are
+        // already-stable REACHABLE. Pre-fix, ~95 % of BGP nexthops
+        // stayed `incomplete` forever and forwarding silently fell
+        // back to XDP_PASS for those routes.
+        if let Some(h) = &self.neigh_handle {
+            h.request_resolve(ip);
+        }
+
         Ok(id)
     }
 
