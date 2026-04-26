@@ -799,7 +799,7 @@ mod tests {
         elem.elem_type = ElemType::ANNOUNCE;
         elem.prefix = NetworkPrefix {
             prefix: IpNet::from_str("23.191.200.0/24").unwrap(),
-            path_id: 0,
+            path_id: None,
         };
         elem.next_hop = None;
         let peer_id = PeerId(0xdeadbeef);
@@ -841,7 +841,7 @@ mod tests {
         elem.elem_type = ElemType::ANNOUNCE;
         elem.prefix = NetworkPrefix {
             prefix: IpNet::from_str("1.1.1.0/24").unwrap(),
-            path_id: 0,
+            path_id: None,
         };
         elem.next_hop = Some(real_nh);
         let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
@@ -866,7 +866,7 @@ mod tests {
         elem.elem_type = ElemType::WITHDRAW;
         elem.prefix = NetworkPrefix {
             prefix: IpNet::from_str("23.191.200.0/24").unwrap(),
-            path_id: 0,
+            path_id: None,
         };
         elem.next_hop = None;
         let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))

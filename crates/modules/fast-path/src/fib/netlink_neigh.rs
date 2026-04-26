@@ -295,8 +295,12 @@ impl NetlinkNeighborResolver {
         // calls request_resolve, which (post-rc4) consults this same
         // neigh_cache and synthesizes a Learned event back to the
         // programmer with the kernel-cached MAC. State flips Resolved.
-        if let Some(prog) = &self.prog_handle {
-            self.seed_local_prefix_routes(prog).await;
+        // Clone the handle so the &self borrow on `prog_handle` is
+        // released before the call below takes &mut self for counter
+        // updates. FibProgrammerHandle is `Clone` (cheap mpsc sender
+        // wrapper); this is the documented usage pattern.
+        if let Some(prog) = self.prog_handle.clone() {
+            self.seed_local_prefix_routes(&prog).await;
         } else if !self.local_prefixes.is_empty() {
             warn!(
                 count = self.local_prefixes.len(),
@@ -556,7 +560,11 @@ impl NetlinkNeighborResolver {
         let Some(peer_id) = self.match_local_prefix(v4, ifindex) else {
             return;
         };
-        let Some(prog) = &self.prog_handle else {
+        // Clone to release the &self borrow on prog_handle before the
+        // mutable counter update below — same pattern as
+        // seed_local_prefix_routes. FibProgrammerHandle is cheap to
+        // clone (mpsc Sender wrapper).
+        let Some(prog) = self.prog_handle.clone() else {
             return;
         };
         if let Err(e) = prog
@@ -582,7 +590,7 @@ impl NetlinkNeighborResolver {
         let Some(peer_id) = self.match_local_prefix(v4, ifindex) else {
             return;
         };
-        let Some(prog) = &self.prog_handle else {
+        let Some(prog) = self.prog_handle.clone() else {
             return;
         };
         if let Err(e) = prog
@@ -624,7 +632,7 @@ impl NetlinkNeighborResolver {
         if !was_local && self.local_prefixes.is_empty() {
             return;
         }
-        let Some(prog) = &self.prog_handle else {
+        let Some(prog) = self.prog_handle.clone() else {
             return;
         };
         let peer_id = PeerId::local_arp(ifindex);
