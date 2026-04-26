@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::fib::integrity::{shared_snapshot, IntegrityChecker, IntegrityConfig, SharedSnapshot};
-use crate::fib::netlink_neigh::{NeighborResolveHandle, NetlinkNeighborResolver};
+use crate::fib::netlink_neigh::{LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver};
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
 use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
 use crate::fib::route_source_bmp::BmpStation;
@@ -98,6 +98,7 @@ impl RouteController {
     pub fn start(
         bpffs_root: &Path,
         route_source: Option<RouteSourceConfig>,
+        local_prefixes: Vec<LocalPrefixSpec>,
     ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
@@ -131,6 +132,18 @@ impl RouteController {
             shutdown_token.clone(),
             Some(neigh_handle.clone()),
         );
+
+        // v0.2.1: enable the connected fast-path when the operator
+        // declared at least one `local-prefix`. The resolver gets the
+        // FibProgrammer handle so it can synthesize per-/32
+        // RouteEvent::Add events directly (sibling to the BgpListener
+        // / BmpStation paths), reusing the existing nexthop-resolution
+        // pipeline. Empty list → no-op.
+        let resolver = if local_prefixes.is_empty() {
+            resolver
+        } else {
+            resolver.with_local_prefixes(local_prefixes, prog_handle.clone())
+        };
 
         let resolver_task = runtime.spawn(async move {
             if let Err(e) = resolver.run().await {

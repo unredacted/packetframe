@@ -64,10 +64,77 @@ pub enum RouteEvent {
 }
 
 /// Opaque peer identifier assigned by the RouteSource. For BMP this
-/// derives from the per-peer header's `peer_address + peer_distinguisher`.
-/// FibProgrammer treats it as a transparent handle.
+/// derives from the per-peer header's `peer_address + peer_distinguisher`;
+/// for the iBGP source, a hash of `(listen_addr, peer_asn)`. The
+/// FibProgrammer treats it as a transparent handle, scoped per-source
+/// so that a `PeerDown` from one feed never tears down routes another
+/// feed installed.
+///
+/// **`local_arp(ifindex)`** (v0.2.1) carves out a deterministic
+/// sub-range for the v0.2.1 connected fast-path feature
+/// ([`crate::config::ModuleDirective::LocalPrefix`]): the high bit of
+/// the 64-bit space is set, the next 31 bits are zeroed, and the low
+/// 32 bits hold the kernel ifindex. RouteSource-derived hashes
+/// effectively never produce values with both halves of this layout
+/// (the high bit set + 31 zero bits + a small u32-shaped low half),
+/// so collision with a hash-allocated PeerId is mathematically
+/// negligible. `is_local_arp` recovers the per-iface scope so the
+/// programmer can withdraw a single iface's worth of /32s on
+/// `RTM_DELLINK`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerId(pub u64);
+
+impl PeerId {
+    /// High-bit marker that distinguishes [`PeerId::local_arp`] values
+    /// from RouteSource-derived hashes. See the type-level docs.
+    const LOCAL_ARP_MARKER: u64 = 1u64 << 63;
+
+    /// Synthesize a per-iface PeerId for the v0.2.1 connected
+    /// fast-path source. `ifindex` is the kernel ifindex; PeerDown
+    /// for this PeerId withdraws every /32 the resolver registered
+    /// behind that iface.
+    pub fn local_arp(ifindex: u32) -> Self {
+        Self(Self::LOCAL_ARP_MARKER | (ifindex as u64))
+    }
+
+    /// `Some(ifindex)` when this PeerId came from
+    /// [`Self::local_arp`]; `None` otherwise.
+    pub fn as_local_arp_ifindex(self) -> Option<u32> {
+        if self.0 & Self::LOCAL_ARP_MARKER != 0 {
+            Some((self.0 & 0xFFFF_FFFF) as u32)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod peer_id_tests {
+    use super::*;
+
+    #[test]
+    fn local_arp_round_trips_ifindex() {
+        for ifindex in [1u32, 33, 1234, u32::MAX] {
+            let pid = PeerId::local_arp(ifindex);
+            assert_eq!(pid.as_local_arp_ifindex(), Some(ifindex));
+        }
+    }
+
+    #[test]
+    fn non_local_arp_peer_id_is_not_misidentified() {
+        // A small / hash-shaped value (high bit clear) must NOT
+        // present as local-arp.
+        assert_eq!(PeerId(0xdead_beef).as_local_arp_ifindex(), None);
+        assert_eq!(PeerId(0).as_local_arp_ifindex(), None);
+    }
+
+    #[test]
+    fn distinct_ifindexes_yield_distinct_peer_ids() {
+        let a = PeerId::local_arp(1);
+        let b = PeerId::local_arp(2);
+        assert_ne!(a, b);
+    }
+}
 
 /// Either v4 or v6 prefix with length. The address octets are
 /// stored in network order.

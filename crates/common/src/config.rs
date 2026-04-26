@@ -146,6 +146,26 @@ pub enum ModuleDirective {
     },
     AllowPrefix4(Ipv4Prefix),
     AllowPrefix6(Ipv6Prefix),
+    /// Connected/local prefix the operator wants packetframe to
+    /// fast-path inbound traffic for. Bird's iBGP feed gives us the
+    /// /24 with an unresolvable next-hop (a self-IP for direct-origin
+    /// routes), so without per-host /32 entries the LPM lookup hits
+    /// the /24 with `state=Incomplete` and bumps `custom_fib_no_neigh`
+    /// — XDP_PASS to kernel for every packet. With a `local-prefix`
+    /// directive, [`NetlinkNeighborResolver`] walks the kernel's
+    /// neighbour table for IPs within `cidr` reachable via `iface`
+    /// and synthesizes per-/32 `RouteEvent::Add { peer_id: LocalArp,
+    /// prefix: /32, nexthops: [host_ip] }` events into FibProgrammer.
+    /// The host's own MAC (already in the kernel ARP cache) is what
+    /// `state=Resolved` writes into `NEXTHOPS[id].dst_mac`, and the
+    /// /32 wins in the LPM walk over the /24 from the BGP feed —
+    /// inbound packets to that customer fast-path via `bpf_redirect_map`.
+    /// New in v0.2.1; complements the BgpListener fallback fix.
+    LocalPrefix {
+        cidr: Ipv4Prefix,
+        iface: String,
+        line: usize,
+    },
     DryRun(bool),
     CircuitBreaker(CircuitBreakerSpec),
     /// Operator override for a driver-specific workaround. Currently
@@ -468,14 +488,17 @@ impl Config {
     pub fn validate_interfaces_in(&self, sysfs_net: &Path) -> Result<(), ConfigError> {
         for m in &self.modules {
             for d in &m.directives {
-                if let ModuleDirective::Attach { iface, line, .. } = d {
-                    let p = sysfs_net.join(iface);
-                    if !p.exists() {
-                        return Err(ConfigError::InterfaceMissing {
-                            iface: iface.clone(),
-                            line: *line,
-                        });
-                    }
+                let (iface, line) = match d {
+                    ModuleDirective::Attach { iface, line, .. } => (iface, line),
+                    ModuleDirective::LocalPrefix { iface, line, .. } => (iface, line),
+                    _ => continue,
+                };
+                let p = sysfs_net.join(iface);
+                if !p.exists() {
+                    return Err(ConfigError::InterfaceMissing {
+                        iface: iface.clone(),
+                        line: *line,
+                    });
                 }
             }
         }
@@ -699,6 +722,41 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .parse()
                 .map_err(|e: String| ConfigError::parse(line, e))?;
             Ok(ModuleDirective::AllowPrefix6(p))
+        }
+        "local-prefix" => {
+            // Grammar: local-prefix <cidr> via <iface>
+            let cidr_tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "local-prefix requires a CIDR (e.g. 23.191.200.0/24)")
+            })?;
+            let via_tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "local-prefix requires `via <iface>` after the CIDR")
+            })?;
+            if via_tok != "via" {
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "local-prefix: expected `via` after the CIDR, got `{via_tok}` \
+                         (form: `local-prefix <cidr> via <iface>`)"
+                    ),
+                ));
+            }
+            let iface = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "local-prefix: expected an interface name after `via`")
+            })?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "local-prefix takes exactly three arguments: <cidr> via <iface>",
+                ));
+            }
+            let p: Ipv4Prefix = cidr_tok
+                .parse()
+                .map_err(|e: String| ConfigError::parse(line, e))?;
+            Ok(ModuleDirective::LocalPrefix {
+                cidr: p,
+                iface: iface.to_string(),
+                line,
+            })
         }
         "dry-run" => {
             let v = rest
@@ -1723,5 +1781,104 @@ module fast-path
     fn ecmp_default_hash_mode_rejects_other_widths() {
         let e = parse_module_body("  ecmp-default-hash-mode 6\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    // --- local-prefix (v0.2.1; SPEC.md §4.11 connected fast-path) ---
+
+    fn extract_local_prefixes(body: &str) -> Vec<(Ipv4Prefix, String)> {
+        let m = parse_module_body(body).expect("parse");
+        m.directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::LocalPrefix { cidr, iface, .. } => Some((*cidr, iface.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_prefix_parses_basic_form() {
+        let lp = extract_local_prefixes("  local-prefix 23.191.200.0/24 via br1337\n");
+        assert_eq!(lp.len(), 1);
+        let (cidr, iface) = &lp[0];
+        assert_eq!(cidr.addr, "23.191.200.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(cidr.prefix_len, 24);
+        assert_eq!(iface, "br1337");
+    }
+
+    #[test]
+    fn local_prefix_multiple_directives_accumulate() {
+        let body = "  local-prefix 23.191.200.0/24 via br1337\n\
+                    local-prefix 10.88.1.0/24 via br88\n\
+                    local-prefix 10.10.1.0/24 via br0\n";
+        let lp = extract_local_prefixes(body);
+        assert_eq!(lp.len(), 3);
+        let ifaces: Vec<&str> = lp.iter().map(|(_, i)| i.as_str()).collect();
+        assert_eq!(ifaces, vec!["br1337", "br88", "br0"]);
+    }
+
+    #[test]
+    fn local_prefix_missing_via_keyword_errors() {
+        let e = parse_module_body("  local-prefix 23.191.200.0/24 br1337\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("expected `via`"), "message was: {message}");
+            }
+            _ => panic!("expected Parse error, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn local_prefix_missing_iface_errors() {
+        let e = parse_module_body("  local-prefix 23.191.200.0/24 via\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix_missing_cidr_errors() {
+        let e = parse_module_body("  local-prefix\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix_extra_arg_errors() {
+        let e = parse_module_body("  local-prefix 23.191.200.0/24 via br1337 extra\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix_bad_cidr_errors() {
+        let e = parse_module_body("  local-prefix 23.191.200.0 via br1337\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix_iface_validated_against_sysfs() {
+        // Same machinery as `attach`: a non-existent iface in a
+        // local-prefix directive must fail validate_interfaces_in.
+        let dir = std::env::temp_dir().join(format!(
+            "pf-cfg-local-prefix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("br1337")).unwrap();
+        // Note: br88 is deliberately missing.
+        let cfg = Config::parse(
+            "module fast-path\n  attach br1337 generic\n  \
+             local-prefix 23.191.200.0/24 via br1337\n  \
+             local-prefix 10.88.1.0/24 via br88\n",
+        )
+        .expect("parse ok; validation runs separately");
+        let err = cfg.validate_interfaces_in(&dir).unwrap_err();
+        match err {
+            ConfigError::InterfaceMissing { iface, .. } => {
+                assert_eq!(iface, "br88");
+            }
+            other => panic!("expected InterfaceMissing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

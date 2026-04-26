@@ -594,10 +594,39 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             }
             _ => None,
         });
-        let ctrl = crate::fib::controller::RouteController::start(&state.bpffs_root, route_source)
-            .map_err(|e| {
-                ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
-            })?;
+        // v0.2.1: collect operator-declared `local-prefix` directives
+        // and pass them to the controller. Empty list = feature off
+        // (back-compat with v0.2.0 configs that never had this).
+        let local_prefixes: Vec<crate::fib::netlink_neigh::LocalPrefixSpec> = cfg
+            .section
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::LocalPrefix { cidr, iface, .. } => {
+                    Some(crate::fib::netlink_neigh::LocalPrefixSpec {
+                        addr: cidr.addr,
+                        prefix_len: cidr.prefix_len,
+                        iface: iface.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        if !local_prefixes.is_empty() {
+            info!(
+                count = local_prefixes.len(),
+                "v0.2.1 local-prefix connected fast-path enabled"
+            );
+        }
+
+        let ctrl = crate::fib::controller::RouteController::start(
+            &state.bpffs_root,
+            route_source,
+            local_prefixes,
+        )
+        .map_err(|e| {
+            ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
+        })?;
         state.route_controller = Some(ctrl);
         info!(
             ?forwarding,

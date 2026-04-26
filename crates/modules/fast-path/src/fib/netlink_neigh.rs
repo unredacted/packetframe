@@ -26,7 +26,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use std::collections::HashMap;
 
@@ -45,7 +45,42 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use packetframe_common::fib::{NeighError, NeighEvent};
+use packetframe_common::fib::{IpPrefix, NeighError, NeighEvent, PeerId, RouteEvent};
+
+use crate::fib::programmer::FibProgrammerHandle;
+
+/// Operator-declared local prefix (v0.2.1 connected fast-path). The
+/// resolver walks the kernel ARP table for IPs falling in `cidr` that
+/// are reachable via `iface`, and synthesizes per-/32 `RouteEvent::Add`s
+/// into FibProgrammer so inbound traffic to those hosts fast-paths
+/// through XDP redirect instead of falling to kernel slow path. See
+/// [`packetframe_common::config::ModuleDirective::LocalPrefix`] for the
+/// config-side surface.
+#[derive(Debug, Clone)]
+pub struct LocalPrefixSpec {
+    /// Network address (host bits zeroed) of the prefix.
+    pub addr: Ipv4Addr,
+    /// Prefix length in bits, 0..=32.
+    pub prefix_len: u8,
+    /// The kernel iface name (e.g., `br1337`). Resolved to ifindex
+    /// once at resolver startup via the RTM_GETLINK dump; if the iface
+    /// doesn't exist at startup, the spec is logged and dropped (the
+    /// resolver doesn't gate startup on it because operators may stage
+    /// config before the iface comes up).
+    pub iface: String,
+}
+
+impl LocalPrefixSpec {
+    /// True iff `ip` falls within this prefix.
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        if self.prefix_len == 0 {
+            return true;
+        }
+        let mask: u32 = (!0u32) << (32 - self.prefix_len as u32);
+        let net = u32::from(self.addr) & mask;
+        u32::from(ip) & mask == net
+    }
+}
 
 /// Outbound `NeighEvent` queue capacity. Sized to absorb a full-table
 /// neighbor-churn storm without blocking the netlink reader. If the
@@ -91,12 +126,24 @@ pub struct NetlinkNeighborResolver {
     /// landing on cache hits or fanning out to proactive probes.
     synth_learned_emitted: u64,
     cache_misses: u64,
+    /// v0.2.1: count of /32 RouteEvents emitted for local-prefix hosts,
+    /// split by add and remove. Logged in the same periodic stats line
+    /// as the resolver counters above so operators can see at a glance
+    /// whether the local-prefix sweep is doing useful work.
+    local_arp_routes_added: u64,
+    local_arp_routes_removed: u64,
     /// Cache mapping ifindex → egress MAC. Populated at startup via
     /// a single `RTM_GETLINK` dump; maintained by `RTM_NEWLINK` /
     /// `RTM_DELLINK` multicast events. Used to attach `src_mac` to
     /// `NeighEvent::Learned` so the FibProgrammer writes the correct
     /// Ethernet source address into `NEXTHOPS[id].src_mac`.
     iface_mac: HashMap<u32, [u8; 6]>,
+    /// v0.2.1: name → ifindex map populated alongside `iface_mac` from
+    /// the same RTM_GETLINK dump. Used to resolve user-facing iface
+    /// names in `LocalPrefixSpec` to kernel ifindices once at startup
+    /// (and re-resolve on RTM_NEWLINK if a previously-missing iface
+    /// appears).
+    iface_to_ifindex: HashMap<String, u32>,
     /// Cache of the kernel's neighbour table. Populated at startup via
     /// a single `RTM_GETNEIGH` dump; maintained by `RTM_NEWNEIGH` /
     /// `RTM_DELNEIGH` multicast events.
@@ -114,6 +161,17 @@ pub struct NetlinkNeighborResolver {
     /// recovering the ~22 % of nexthops that would otherwise be
     /// stuck.
     neigh_cache: HashMap<IpAddr, (u32, [u8; 6])>,
+    /// v0.2.1: operator-declared local prefixes. Empty when the feature
+    /// is unused; non-empty enables the per-/32 fast-path emission
+    /// path. Each spec is matched against (ip, ifindex) of every
+    /// kernel neighbour event (and the startup dump) to decide whether
+    /// to synthesize a `RouteEvent::Add` for the FibProgrammer.
+    local_prefixes: Vec<LocalPrefixSpec>,
+    /// v0.2.1: handle to the FibProgrammer for local-prefix /32
+    /// emission. `None` when no local-prefix is configured (or when
+    /// running under a test harness that doesn't drive a programmer
+    /// — e.g., the existing netns ARP-walk tests).
+    prog_handle: Option<FibProgrammerHandle>,
 }
 
 impl NetlinkNeighborResolver {
@@ -133,13 +191,38 @@ impl NetlinkNeighborResolver {
                 resolve_rx,
                 shutdown,
                 iface_mac: HashMap::new(),
+                iface_to_ifindex: HashMap::new(),
                 neigh_cache: HashMap::new(),
                 synth_learned_emitted: 0,
                 cache_misses: 0,
+                local_arp_routes_added: 0,
+                local_arp_routes_removed: 0,
+                local_prefixes: Vec::new(),
+                prog_handle: None,
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
         )
+    }
+
+    /// Enable the v0.2.1 connected fast-path. `local_prefixes` are the
+    /// operator-declared CIDRs from `local-prefix <cidr> via <iface>`
+    /// config directives. `prog_handle` is the FibProgrammer handle
+    /// the resolver uses to inject synthesized per-/32
+    /// `RouteEvent::Add`/`Del`/`PeerDown` events.
+    ///
+    /// Pass an empty `local_prefixes` and the fast-path is a no-op
+    /// (no extra netlink work, no event emission). Builder-style so
+    /// the existing 1-arg `new()` callers (test harnesses, the
+    /// kernel-fib-only path) keep compiling unchanged.
+    pub fn with_local_prefixes(
+        mut self,
+        local_prefixes: Vec<LocalPrefixSpec>,
+        prog_handle: FibProgrammerHandle,
+    ) -> Self {
+        self.local_prefixes = local_prefixes;
+        self.prog_handle = Some(prog_handle);
+        self
     }
 
     /// Main event loop. Runs until shutdown is signaled or the netlink
@@ -155,18 +238,21 @@ impl NetlinkNeighborResolver {
         // multicast one below is dedicated to the event stream
         // (RTM_NEWNEIGH/DELNEIGH/NEWLINK/DELLINK) so dump traffic
         // doesn't compete with live events.
-        match dump_link_macs().await {
-            Ok(macs) => {
+        match dump_link_info().await {
+            Ok((macs, names)) => {
                 self.iface_mac = macs;
+                self.iface_to_ifindex = names;
                 info!(
-                    count = self.iface_mac.len(),
-                    "ifindex→MAC cache seeded from RTM_GETLINK dump"
+                    macs = self.iface_mac.len(),
+                    names = self.iface_to_ifindex.len(),
+                    "iface caches seeded from RTM_GETLINK dump"
                 );
             }
             Err(e) => {
                 warn!(
                     error = %e,
-                    "RTM_GETLINK dump failed; src_mac will be [0;6] until RTM_NEWLINK events arrive"
+                    "RTM_GETLINK dump failed; src_mac will be [0;6] until RTM_NEWLINK events arrive, \
+                     and any configured local-prefix directives won't resolve until then"
                 );
             }
         }
@@ -193,6 +279,31 @@ impl NetlinkNeighborResolver {
                      ARP is the fallback)"
                 );
             }
+        }
+
+        // v0.2.1: seed the FibProgrammer with one /32 RouteEvent::Add
+        // per kernel ARP entry that lives within an operator-declared
+        // local-prefix CIDR + iface. The /32 wins in LPM over the /24
+        // bird's iBGP exports (with state=Incomplete from the v0.2.1-A
+        // listen-addr fallback), so inbound traffic to those hosts
+        // fast-paths via XDP redirect. Without local-prefix configured
+        // (`local_prefixes` empty), this loop is a no-op.
+        //
+        // The neigh_cache lookup inside FibProgrammer's register_nexthop
+        // ↔ NeighborResolver ↔ programmer feedback path does the heavy
+        // lifting once the route lands: registering nexthop=host_ip
+        // calls request_resolve, which (post-rc4) consults this same
+        // neigh_cache and synthesizes a Learned event back to the
+        // programmer with the kernel-cached MAC. State flips Resolved.
+        if let Some(prog) = &self.prog_handle {
+            self.seed_local_prefix_routes(prog).await;
+        } else if !self.local_prefixes.is_empty() {
+            warn!(
+                count = self.local_prefixes.len(),
+                "local-prefix directives configured but no FibProgrammer handle wired through; \
+                 connected fast-path will not be enabled — file a bug if you see this on a \
+                 production deploy"
+            );
         }
 
         let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
@@ -284,6 +395,8 @@ impl NetlinkNeighborResolver {
                         cache_size = self.neigh_cache.len(),
                         synth_learned_emitted = self.synth_learned_emitted,
                         cache_misses = self.cache_misses,
+                        local_arp_routes_added = self.local_arp_routes_added,
+                        local_arp_routes_removed = self.local_arp_routes_removed,
                         "neighbour resolver stats"
                     );
                 }
@@ -317,6 +430,15 @@ impl NetlinkNeighborResolver {
                     } = &evt
                     {
                         self.neigh_cache.insert(*ip, (*ifindex, *mac));
+                        // v0.2.1: if this neighbour falls in a configured
+                        // local-prefix and is reachable via the matching
+                        // iface, emit a /32 RouteEvent::Add. The
+                        // FibProgrammer takes it from there; we don't
+                        // need to track per-/32 state ourselves —
+                        // RouteEvent::Del on RTM_DELNEIGH is the symmetric
+                        // cleanup, and PeerDown on RTM_DELLINK handles
+                        // the iface-disappears case.
+                        self.maybe_emit_local_arp_add(*ip, *ifindex).await;
                     }
                     if let Err(e) = self.events_tx.send(evt).await {
                         debug!(error = %e, "NeighEvent::Learned send failed");
@@ -324,9 +446,15 @@ impl NetlinkNeighborResolver {
                 }
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelNeighbour(msg)) => {
+                // Capture ifindex before we move msg into parse_neighbour_del.
+                let ifindex = msg.header.ifindex;
                 if let Some(evt) = parse_neighbour_del(&msg) {
                     if let NeighEvent::Gone { ip } = &evt {
                         self.neigh_cache.remove(ip);
+                        // v0.2.1 symmetric: withdraw the /32 if the
+                        // departing neighbour was registered under a
+                        // local-prefix.
+                        self.maybe_emit_local_arp_del(*ip, ifindex).await;
                     }
                     if let Err(e) = self.events_tx.send(evt).await {
                         debug!(error = %e, "NeighEvent::Gone send failed");
@@ -334,8 +462,8 @@ impl NetlinkNeighborResolver {
                 }
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(msg)) => {
+                let ifindex = msg.header.index;
                 if let Some(mac) = extract_link_mac(&msg) {
-                    let ifindex = msg.header.index;
                     let prev = self.iface_mac.insert(ifindex, mac);
                     if prev != Some(mac) {
                         debug!(
@@ -348,17 +476,182 @@ impl NetlinkNeighborResolver {
                         );
                     }
                 }
+                // v0.2.1: keep iface_to_ifindex current. An iface that
+                // came up after packetframe started — covered by a
+                // local-prefix that the operator staged in config —
+                // becomes resolvable now.
+                if let Some(name) = extract_link_name(&msg) {
+                    self.iface_to_ifindex.insert(name, ifindex);
+                }
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(msg)) => {
                 let ifindex = msg.header.index;
                 self.iface_mac.remove(&ifindex);
-                debug!(ifindex, "RTM_DELLINK observed; MAC cache entry purged");
+                // Drop the name→ifindex mapping for this iface (single
+                // pass; rare event).
+                self.iface_to_ifindex.retain(|_, &mut v| v != ifindex);
+                // v0.2.1: if this iface backed a local-prefix, withdraw
+                // every /32 we registered for it. Cheap PeerDown event
+                // to FibProgrammer; FibProgrammer's existing peer-walk
+                // does the table sweep.
+                self.maybe_emit_local_arp_peerdown(ifindex).await;
+                debug!(ifindex, "RTM_DELLINK observed; iface caches purged");
             }
             NetlinkPayload::Error(err) => {
                 warn!(?err, "netlink error message");
             }
             _ => {}
         }
+    }
+
+    /// Walk the seeded `neigh_cache` once at startup and emit a
+    /// `RouteEvent::Add` for each entry that falls in a configured
+    /// local-prefix CIDR + ifindex pair. v0.2.1.
+    async fn seed_local_prefix_routes(&mut self, prog: &FibProgrammerHandle) {
+        // Snapshot the cache under a copy so the iteration doesn't
+        // borrow self while we call &mut self below for counter
+        // updates. Cache is small (low thousands at most on the
+        // reference EFG); allocation cost is irrelevant against the
+        // single-shot startup work.
+        let snapshot: Vec<(IpAddr, u32)> = self
+            .neigh_cache
+            .iter()
+            .map(|(ip, (ifindex, _mac))| (*ip, *ifindex))
+            .collect();
+        let mut emitted = 0usize;
+        for (ip, ifindex) in snapshot {
+            let IpAddr::V4(v4) = ip else { continue };
+            if let Some(peer_id) = self.match_local_prefix(v4, ifindex) {
+                if let Err(e) = prog
+                    .apply_route_event(RouteEvent::Add {
+                        peer_id,
+                        prefix: IpPrefix::V4 {
+                            addr: v4.octets(),
+                            prefix_len: 32,
+                        },
+                        nexthops: vec![ip],
+                    })
+                    .await
+                {
+                    warn!(?ip, error = %e, "local-prefix seed RouteEvent::Add dispatch failed");
+                } else {
+                    emitted += 1;
+                    self.local_arp_routes_added += 1;
+                }
+            }
+        }
+        info!(
+            emitted,
+            local_prefixes = self.local_prefixes.len(),
+            "local-prefix /32 seed complete"
+        );
+    }
+
+    /// Same as [`Self::seed_local_prefix_routes`] but for a single
+    /// (ip, ifindex) pair — called from the multicast event handler
+    /// on RTM_NEWNEIGH. Idempotent against the FibProgrammer side
+    /// (multiple Adds for the same /32 just bump a refcount).
+    async fn maybe_emit_local_arp_add(&mut self, ip: IpAddr, ifindex: u32) {
+        let IpAddr::V4(v4) = ip else { return };
+        let Some(peer_id) = self.match_local_prefix(v4, ifindex) else {
+            return;
+        };
+        let Some(prog) = &self.prog_handle else {
+            return;
+        };
+        if let Err(e) = prog
+            .apply_route_event(RouteEvent::Add {
+                peer_id,
+                prefix: IpPrefix::V4 {
+                    addr: v4.octets(),
+                    prefix_len: 32,
+                },
+                nexthops: vec![ip],
+            })
+            .await
+        {
+            warn!(?ip, error = %e, "local-prefix RouteEvent::Add dispatch failed");
+        } else {
+            self.local_arp_routes_added += 1;
+        }
+    }
+
+    /// Symmetric withdrawal for a single (ip, ifindex) on RTM_DELNEIGH.
+    async fn maybe_emit_local_arp_del(&mut self, ip: IpAddr, ifindex: u32) {
+        let IpAddr::V4(v4) = ip else { return };
+        let Some(peer_id) = self.match_local_prefix(v4, ifindex) else {
+            return;
+        };
+        let Some(prog) = &self.prog_handle else {
+            return;
+        };
+        if let Err(e) = prog
+            .apply_route_event(RouteEvent::Del {
+                peer_id,
+                prefix: IpPrefix::V4 {
+                    addr: v4.octets(),
+                    prefix_len: 32,
+                },
+            })
+            .await
+        {
+            warn!(?ip, error = %e, "local-prefix RouteEvent::Del dispatch failed");
+        } else {
+            self.local_arp_routes_removed += 1;
+        }
+    }
+
+    /// On RTM_DELLINK for any iface that backed at least one
+    /// local-prefix, send a single PeerDown to the FibProgrammer.
+    /// Cheaper than walking the cache to emit per-/32 Dels and
+    /// matches the existing semantics for BGP peer departure.
+    async fn maybe_emit_local_arp_peerdown(&mut self, ifindex: u32) {
+        // Only interesting if at least one local-prefix names this iface.
+        let was_local = self.local_prefixes.iter().any(|spec| {
+            self.iface_to_ifindex
+                .get(&spec.iface)
+                .copied()
+                .map(|i| i == ifindex)
+                .unwrap_or(false)
+        });
+        // After the iface_to_ifindex purge above, we may have already
+        // lost the entry — fall back to comparing against any cached
+        // matching done in seed time. For now the simpler heuristic is
+        // "always emit a PeerDown if local-prefixes are configured at
+        // all" — wasteful for ifaces that weren't local-prefix targets,
+        // but safe (programmer's PeerDown handler is a HashMap walk
+        // that does nothing for an unknown peer_id).
+        if !was_local && self.local_prefixes.is_empty() {
+            return;
+        }
+        let Some(prog) = &self.prog_handle else {
+            return;
+        };
+        let peer_id = PeerId::local_arp(ifindex);
+        if let Err(e) = prog
+            .apply_route_event(RouteEvent::PeerDown { peer_id })
+            .await
+        {
+            warn!(ifindex, error = %e, "local-prefix RouteEvent::PeerDown dispatch failed");
+        }
+    }
+
+    /// Match `(ip, ifindex)` against the configured `local_prefixes`.
+    /// Returns the per-iface PeerId if one matches; `None` otherwise.
+    /// Linear scan; the operator-declared list is small (handful at
+    /// most on the reference EFG) so this is cheap on every neighbour
+    /// event.
+    fn match_local_prefix(&self, ip: Ipv4Addr, ifindex: u32) -> Option<PeerId> {
+        for spec in &self.local_prefixes {
+            if !spec.contains(ip) {
+                continue;
+            }
+            if self.iface_to_ifindex.get(&spec.iface).copied() != Some(ifindex) {
+                continue;
+            }
+            return Some(PeerId::local_arp(ifindex));
+        }
+        None
     }
 }
 
@@ -452,22 +745,49 @@ async fn lookup_oif(
 /// before an attachment) are skipped silently; they'll show up in a
 /// later RTM_NEWLINK when their hardware address is set.
 async fn dump_link_macs() -> Result<HashMap<u32, [u8; 6]>, NeighError> {
+    let (macs, _names) = dump_link_info().await?;
+    Ok(macs)
+}
+
+/// Variant of [`dump_link_macs`] that also returns a `name → ifindex`
+/// map. v0.2.1 uses this so the resolver can resolve `LocalPrefixSpec`
+/// iface names to ifindices once at startup. Kept separate from the
+/// MAC-only path so older callers (tests, kernel-fib-only flows) don't
+/// pay for the extra hashmap they never read.
+async fn dump_link_info() -> Result<(HashMap<u32, [u8; 6]>, HashMap<String, u32>), NeighError> {
     let (connection, handle, _) =
         new_connection().map_err(|e| NeighError::new(format!("new_connection: {e}")))?;
     tokio::spawn(connection);
 
     let mut macs: HashMap<u32, [u8; 6]> = HashMap::new();
+    let mut names: HashMap<String, u32> = HashMap::new();
     let mut links = handle.link().get().execute();
     while let Some(msg) = links
         .try_next()
         .await
         .map_err(|e| NeighError::new(format!("link dump: {e}")))?
     {
+        let ifindex = msg.header.index;
         if let Some(mac) = extract_link_mac(&msg) {
-            macs.insert(msg.header.index, mac);
+            macs.insert(ifindex, mac);
+        }
+        if let Some(name) = extract_link_name(&msg) {
+            names.insert(name, ifindex);
         }
     }
-    Ok(macs)
+    Ok((macs, names))
+}
+
+/// Pull the `IfName` (IFLA_IFNAME) attribute out of a `LinkMessage`.
+/// Returns `None` if the attribute is absent (rare — the kernel sets
+/// it on every iface) or non-UTF-8 (effectively never on Linux).
+fn extract_link_name(msg: &LinkMessage) -> Option<String> {
+    for attr in &msg.attributes {
+        if let LinkAttribute::IfName(name) = attr {
+            return Some(name.clone());
+        }
+    }
+    None
 }
 
 /// Dump every neighbour in the kernel's table via a single
@@ -691,5 +1011,60 @@ mod tests {
             parse_neighbour_del(&msg),
             Some(NeighEvent::Gone { .. })
         ));
+    }
+
+    // --- v0.2.1 LocalPrefixSpec --------------------------------------------
+
+    #[test]
+    fn local_prefix_contains_basic_ipv4() {
+        let spec = LocalPrefixSpec {
+            addr: "23.191.200.0".parse().unwrap(),
+            prefix_len: 24,
+            iface: "br1337".into(),
+        };
+        assert!(spec.contains("23.191.200.0".parse().unwrap()));
+        assert!(spec.contains("23.191.200.10".parse().unwrap()));
+        assert!(spec.contains("23.191.200.255".parse().unwrap()));
+        assert!(!spec.contains("23.191.201.0".parse().unwrap()));
+        assert!(!spec.contains("23.191.199.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn local_prefix_contains_handles_slash32() {
+        let spec = LocalPrefixSpec {
+            addr: "10.10.1.2".parse().unwrap(),
+            prefix_len: 32,
+            iface: "honeypot0".into(),
+        };
+        assert!(spec.contains("10.10.1.2".parse().unwrap()));
+        assert!(!spec.contains("10.10.1.3".parse().unwrap()));
+        assert!(!spec.contains("10.10.1.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn local_prefix_contains_handles_slash0() {
+        // Edge case: 0.0.0.0/0 matches everything. Exercising the
+        // overflow-guard path in `contains` (a 32-bit shift-by-32
+        // would wrap; the guard short-circuits to true).
+        let spec = LocalPrefixSpec {
+            addr: "0.0.0.0".parse().unwrap(),
+            prefix_len: 0,
+            iface: "any".into(),
+        };
+        assert!(spec.contains("1.2.3.4".parse().unwrap()));
+        assert!(spec.contains("255.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn local_prefix_contains_misalignment_is_treated_as_aligned() {
+        // Operator wrote `local-prefix 23.191.200.5/24` (host bits
+        // set). The mask logic ignores host bits when comparing —
+        // semantically the prefix is still 23.191.200.0/24.
+        let spec = LocalPrefixSpec {
+            addr: "23.191.200.5".parse().unwrap(),
+            prefix_len: 24,
+            iface: "br1337".into(),
+        };
+        assert!(spec.contains("23.191.200.10".parse().unwrap()));
     }
 }
