@@ -352,6 +352,26 @@ Capped at /22 (≤ 1024 hosts) at config-parse time. Rate-limited at
 multicast event lands the /32. Operator opt-in (default off) because
 it generates noticeable ARP traffic.
 
+**Safety guarantee (v0.2.2+).** ARP probes are issued ONLY on the
+operator-declared `via <iface>` — the resolver does NOT consult the
+kernel's routing table when picking the egress iface for the probe.
+This is a deliberate v0.2.2 safety fix: pre-v0.2.2 the code used
+kernel route lookup, which on a multi-VID bridge box (e.g. EFG's
+`switch0` carrying customer VIDs alongside IX peering VIDs) could
+broadcast ARP probes onto an IX bridge if the declared CIDR
+happened to resolve via an IX VLAN subif. The fix scopes the sweep
+strictly to the operator's chosen iface; ARP traffic cannot escape
+that iface's L2 broadcast domain.
+
+**Critical: do NOT declare `arp-scavenge` on an IX-attached iface.**
+Even with the safety scoping, declaring `local-prefix <ix-subnet> via
+<ix-bridge> arp-scavenge` would still broadcast ARP into the IX
+fabric — which violates IX ToS (MANRS, anti-DoS) on most exchanges.
+`arp-scavenge` is for INTERNAL LANs only (storage, management,
+customer LAN). For IX peer subnets, rely on bird's natural ARP
+behavior — bird already maintains ARP for active BGP peers, so
+their /32s will land via the normal nexthop-resolution path.
+
 ### `fallback-default` synthetic /0 (v0.2.1, issue #31)
 
 Custom-FIB only has prefixes bird's iBGP feed advertised. Destinations

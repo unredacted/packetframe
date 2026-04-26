@@ -56,7 +56,7 @@ use bgpkit_parser::parser::bmp::parse_bmp_msg;
 use bgpkit_parser::Elementor;
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -157,8 +157,7 @@ impl BmpStation {
     /// (emitted by a quiescence timer inside `handle_connection`)
     /// GCs whatever never reappeared.
     pub async fn run(self) -> Result<(), RouteSourceError> {
-        let listener = TcpListener::bind(self.listen_addr)
-            .await
+        let listener = bind_with_reuseaddr(self.listen_addr)
             .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.listen_addr)))?;
         info!(addr = %self.listen_addr, "BMP station listening");
 
@@ -609,4 +608,17 @@ fn network_prefix_to_ip_prefix(np: &NetworkPrefix) -> Option<IpPrefix> {
 fn asn_to_u32(asn: bgpkit_parser::models::Asn) -> u32 {
     // `Asn` impls `Display` as the decimal integer.
     asn.to_string().parse().unwrap_or(0)
+}
+
+/// Bind a `TcpListener` with `SO_REUSEADDR` enabled (v0.2.2 fix). See
+/// the `bind_with_reuseaddr` doc in `route_source_bgp.rs` for the
+/// rationale — same problem class on both listeners.
+fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(8)
 }
