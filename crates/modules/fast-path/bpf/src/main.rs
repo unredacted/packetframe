@@ -34,7 +34,8 @@ mod fib;
 mod maps;
 
 use maps::{
-    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, CFG, FP_CFG_FLAG_COMPARE_MODE, FP_CFG_FLAG_CUSTOM_FIB,
+    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG, FP_CFG_FLAG_COMPARE_MODE,
+    FP_CFG_FLAG_CUSTOM_FIB,
     FP_CFG_FLAG_HEAD_SHIFT_128, REDIRECT_DEVMAP, VLAN_RESOLVE,
 };
 
@@ -201,6 +202,22 @@ fn handle_ipv4(
     bump_stat(StatIdx::MatchedV4);
     bump_match_subset(src_hit, dst_hit);
 
+    // v0.2.1 issue #33: bogon block. After allowlist match (so we only
+    // affect traffic we'd otherwise touch), check if dst falls in any
+    // operator-declared `block-prefix`. If so, drop here — saves the
+    // skb allocation, netfilter walk, and conntrack entry that this
+    // packet would otherwise burn just to be RST'd by upstream. Empty
+    // map (default config) → LPM lookup misses cheaply, no perf impact.
+    //
+    // We block on dst only, not src. Blocking by src would silently
+    // drop reply traffic (asymmetric flows where the *other* side is
+    // in the bogon range, e.g. Tailscale DERP relay responses) which
+    // is worse than the operator's intent.
+    if BLOCK_V4.get(&dst_key).is_some() {
+        bump_stat(StatIdx::BogonDropped);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     if is_dry_run() {
         bump_stat(StatIdx::FwdDryRun);
         return Ok(xdp_action::XDP_PASS);
@@ -300,6 +317,12 @@ fn handle_ipv6(
 
     bump_stat(StatIdx::MatchedV6);
     bump_match_subset(src_hit, dst_hit);
+
+    // v0.2.1 issue #33: bogon block (IPv6 side).
+    if BLOCK_V6.get(&dst_key).is_some() {
+        bump_stat(StatIdx::BogonDropped);
+        return Ok(xdp_action::XDP_DROP);
+    }
 
     if is_dry_run() {
         bump_stat(StatIdx::FwdDryRun);
