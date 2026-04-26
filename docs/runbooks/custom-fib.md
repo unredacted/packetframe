@@ -334,6 +334,67 @@ now it's a startup-time-only configuration. The /32 entries get
 flushed on detach and don't reappear at next startup without the
 directive.
 
+### `arp-scavenge` for quiet LANs (v0.2.1, issue #32)
+
+Some LANs — Ceph clusters, monitoring networks, anything where
+hosts only do intra-/24 L2 traffic — never appear in the kernel's
+L3 ARP cache. Without entries to feed from, the per-/32 emission
+finds nothing.
+
+The optional tail flag forces a one-shot ARP sweep at startup:
+
+```
+local-prefix 10.88.1.0/24 via br88 arp-scavenge
+```
+
+Capped at /22 (≤ 1024 hosts) at config-parse time. Rate-limited at
+500 probes/sec internally. Live hosts respond → kernel ARPs them →
+multicast event lands the /32. Operator opt-in (default off) because
+it generates noticeable ARP traffic.
+
+### `fallback-default` synthetic /0 (v0.2.1, issue #31)
+
+Custom-FIB only has prefixes bird's iBGP feed advertised. Destinations
+bird doesn't have specific routes for (RFC 1918, CGNAT, test-net,
+anything outside DFZ) miss LPM, fall to kernel slow path through
+netfilter / conntrack, and get dropped upstream anyway — wasting
+kernel CPU + conntrack table capacity.
+
+```
+fallback-default via eth3 nexthop 194.110.60.50
+```
+
+Injects a `0.0.0.0/0` into FIB_V4 at startup. Every more-specific
+bird-fed route still wins LPM; the /0 catches bogon-bound traffic.
+XDP redirects directly to upstream — same upstream rejection behavior,
+just no kernel / conntrack involvement. Measured ~25% reduction in
+steady-state conntrack pressure on a busy Tor exit relay.
+
+### `block-prefix` (v0.2.1, issue #33)
+
+Drop bogon-bound traffic at XDP rather than let it traverse the
+kernel forwarding path:
+
+```
+allow-prefix 23.191.200.0/24
+block-prefix 10.0.0.0/8
+block-prefix 100.64.0.0/10
+block-prefix 192.168.0.0/16
+```
+
+After the allowlist match (so we only affect traffic we'd otherwise
+fast-path), if dst is in any `block-prefix` the program returns
+`XDP_DROP` and bumps `bogon_dropped`. Saves skb allocation +
+netfilter walk + conntrack entry per dropped packet.
+
+dst-only match — we never block by src, because that would silently
+drop reply traffic for asymmetric flows where the *peer* happens to
+be in a bogon range.
+
+Refuses to start if a `block-prefix` overlaps any `allow-prefix` or
+`local-prefix` (operator config bug — would silently drop traffic to
+declared customer prefixes).
+
 ## Cutover and rollback
 
 ### Cutover to custom-fib
@@ -667,8 +728,17 @@ landed since the runbook was first written.
   `protocol direct` (and static-origin) routes when the BGP block has
   no `next hop self`. Connected /24s never landed in FIB_V4, so every
   inbound packet to a customer host bumped `custom_fib_miss` and fell
-  through to slow path. v0.2.1-A makes the listener fall back to its
+  through to slow path. v0.2.1 makes the listener fall back to its
   own listen address; the route lands with `state=Incomplete` so
-  counters reflect reality. v0.2.1-B adds the `local-prefix <cidr>
-  via <iface>` directive — see the [Connected fast-path](#connected-fast-path-v021)
-  section above.
+  counters reflect reality. The `local-prefix <cidr> via <iface>`
+  directive turns those /24s into per-/32 fast-paths — see the
+  [Connected fast-path](#connected-fast-path-v021) section above.
+- ✅ **`fallback-default` synthetic /0** (v0.2.1, issue #31). Inject
+  a catch-all default into the custom-FIB so bogon-bound traffic
+  XDP-redirects to upstream instead of slow-pathing.
+- ✅ **`arp-scavenge` for quiet LANs** (v0.2.1, issue #32). One-shot
+  ARP sweep of declared local-prefix CIDRs at startup so storage
+  networks (Ceph) get fast-path coverage even when their hosts don't
+  voluntarily talk to the gateway.
+- ✅ **`block-prefix` XDP-time drop** (v0.2.1, issue #33). Bogon
+  destinations dropped at XDP instead of forwarded-and-failed.
