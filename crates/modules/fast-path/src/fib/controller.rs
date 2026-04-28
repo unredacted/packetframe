@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::fib::integrity::{shared_snapshot, IntegrityChecker, IntegrityConfig, SharedSnapshot};
 use crate::fib::netlink_neigh::{
@@ -61,6 +61,17 @@ pub enum RouteSourceConfig {
 /// Grace period for tasks to drain after `cancel()` fires. Netlink
 /// reader and programmer should both unwind well within this.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// v0.2.2: starting backoff between route-source listener restart
+/// attempts. Doubles up to [`LISTENER_BACKOFF_MAX`] then plateaus.
+const LISTENER_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// v0.2.2: ceiling on the listener restart backoff. After a transient
+/// bind failure (TIME_WAIT, port held by orphan, etc.), we want to
+/// retry promptly. After a sustained failure (real port conflict), we
+/// don't want to spam the kernel — 60 s is operator-readable in the
+/// log without being too loud.
+const LISTENER_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
@@ -184,15 +195,40 @@ impl RouteController {
                 );
                 tasks.push(runtime.spawn(async move { checker.run().await }));
 
-                let mut station =
-                    BmpStation::new(listen, prog_handle.clone(), shutdown_token.clone())
-                        .with_stall_gate(snapshot.clone());
-                if require_loc_rib {
-                    station = station.with_require_loc_rib();
-                }
+                // v0.2.2: spawn under a retry-with-backoff loop. Pre-fix,
+                // a `bind` failure (TIME_WAIT after a quick restart) would
+                // exit `run()` with `Err(...)`, the JoinHandle would
+                // swallow it, and packetframe would silently keep running
+                // with a dead BMP feed. Now we restart on Err, capped at
+                // LISTENER_BACKOFF_MAX between attempts. Clean shutdown
+                // (Ok(())) returns immediately; the cancel token check in
+                // the sleep arm exits promptly on operator shutdown.
+                let prog = prog_handle.clone();
+                let shut = shutdown_token.clone();
+                let stall = snapshot.clone();
                 tasks.push(runtime.spawn(async move {
-                    if let Err(e) = station.run().await {
-                        warn!(error = %e, "BmpStation task exited with error");
+                    let mut backoff = LISTENER_BACKOFF_INITIAL;
+                    loop {
+                        let mut station = BmpStation::new(listen, prog.clone(), shut.clone())
+                            .with_stall_gate(stall.clone());
+                        if require_loc_rib {
+                            station = station.with_require_loc_rib();
+                        }
+                        match station.run().await {
+                            Ok(()) => return,
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    backoff_secs = backoff.as_secs(),
+                                    "BmpStation task exited with error; restarting"
+                                );
+                            }
+                        }
+                        tokio::select! {
+                            _ = shut.cancelled() => return,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
                     }
                 }));
                 integrity = Some(snapshot);
@@ -218,12 +254,32 @@ impl RouteController {
                 );
                 tasks.push(runtime.spawn(async move { checker.run().await }));
 
+                // v0.2.2: same retry-with-backoff pattern as BmpStation
+                // above. See that comment for rationale.
                 let cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
-                let listener = BgpListener::new(cfg, prog_handle.clone(), shutdown_token.clone())
-                    .with_stall_gate(snapshot.clone());
+                let prog = prog_handle.clone();
+                let shut = shutdown_token.clone();
+                let stall = snapshot.clone();
                 tasks.push(runtime.spawn(async move {
-                    if let Err(e) = listener.run().await {
-                        warn!(error = %e, "BgpListener task exited with error");
+                    let mut backoff = LISTENER_BACKOFF_INITIAL;
+                    loop {
+                        let listener = BgpListener::new(cfg.clone(), prog.clone(), shut.clone())
+                            .with_stall_gate(stall.clone());
+                        match listener.run().await {
+                            Ok(()) => return,
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    backoff_secs = backoff.as_secs(),
+                                    "BgpListener task exited with error; restarting"
+                                );
+                            }
+                        }
+                        tokio::select! {
+                            _ = shut.cancelled() => return,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
                     }
                 }));
                 integrity = Some(snapshot);

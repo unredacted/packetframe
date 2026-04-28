@@ -54,7 +54,7 @@ use bgpkit_parser::parser::bgp::messages::parse_bgp_message;
 use bgpkit_parser::Elementor;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -169,8 +169,7 @@ impl BgpListener {
     /// Accept loop. One bird connection at a time; on disconnect emit
     /// `Resync` and re-accept.
     pub async fn run(self) -> Result<(), RouteSourceError> {
-        let listener = TcpListener::bind(self.cfg.listen_addr)
-            .await
+        let listener = bind_with_reuseaddr(self.cfg.listen_addr)
             .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.cfg.listen_addr)))?;
         info!(addr = %self.cfg.listen_addr, local_as = self.cfg.local_as, peer_as = self.cfg.peer_as, "BGP listener started");
 
@@ -576,6 +575,31 @@ fn synthetic_peer_id(listen: SocketAddr, peer_asn: u32) -> PeerId {
     listen.ip().hash(&mut h);
     peer_asn.hash(&mut h);
     PeerId(h.finish())
+}
+
+/// Bind a `TcpListener` with `SO_REUSEADDR` enabled. v0.2.2 fix for the
+/// silent-failure scenario observed in production: when packetframe is
+/// killed and quickly restarted, the prior listener's socket can sit
+/// in `TIME_WAIT` for ~60 s, and the default `tokio::net::TcpListener::bind`
+/// fails the new bind during that window. The error currently propagates
+/// out of `BgpListener::run` and the controller's `JoinHandle` swallows
+/// it — leaving the rest of packetframe running with a dead BGP feed
+/// and no operator-visible signal short of bird's "Connection refused"
+/// state. `SO_REUSEADDR` lets the new bind succeed even with lingering
+/// TIME_WAIT state.
+///
+/// Returns the listener on success. Bind failures are still real (port
+/// conflict with another process, etc.) and propagate via the `io::Error`.
+fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    // Backlog of 8: only one BGP peer ever connects, but TCP semantics
+    // mean we still need a non-zero backlog for the listen queue.
+    socket.listen(8)
 }
 
 fn network_prefix_to_ip_prefix(np: &NetworkPrefix) -> Option<IpPrefix> {
