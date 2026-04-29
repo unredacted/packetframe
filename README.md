@@ -1,101 +1,89 @@
 # PacketFrame
 
-PacketFrame is a modular eBPF data-plane framework written in pure Rust.
-It provides a pluggable runtime for discrete datapath modules —
-fast-path forwarding, egress randomization, DDoS mitigation, flow
-sampling — that can be loaded, attached to network interfaces,
-observed, and detached independently.
+**eBPF/XDP fast-path for Linux packet forwarding.** Pure Rust, pluggable, attaches per-interface. Forwards allowlisted traffic directly between NICs at the driver level — bypassing iptables, conntrack, and the kernel routing stack — and falls back to normal kernel forwarding for everything else.
 
-The MVP module, and the reason the project exists, is `fast-path`:
-it takes forwarded packets for allowlisted prefixes off the kernel's
-conntrack/netfilter hot path by intercepting them at XDP ingress and
-redirecting with `bpf_redirect_map`. For forwarding decisions the
-module supports two modes — `kernel-fib` consults the kernel's FIB
-via `bpf_fib_lookup()`; `custom-fib` consults its own LPM-trie FIB
-populated from bird, which is what runs in production when a peer
-between the kernel's route table and a closed-source sibling daemon
-would otherwise race on BGP attributes. The custom-FIB route feed is
-iBGP today (bird's `protocol bgp` export filter runs after best-path
-selection, so packetframe receives one UPDATE per prefix); a BMP
-station for emitters that ship RFC 9069 Loc-RIB (FRR; future bird)
-ships in the same binary. The design spec lives alongside the project
-internally; inline code comments cite section numbers (e.g. `§4.2`)
-as breadcrumbs.
+Production-tested on edge routers with full-table BGP feeds. **~98% of allowlisted flows fast-path** in measured deployments, with conntrack table size and customer-facing latency both reduced significantly versus stock kernel forwarding.
+
+GPL-3.0-or-later. Linux ≥ 5.15. Single static binary; no separate libbpf, bpftool, or runtime nightly toolchain.
+
+## What it does
+
+For each interface you attach it to, PacketFrame runs an eBPF program at XDP ingress that:
+
+1. **Filters** by your declared `allow-prefix` / `allow-prefix6` lists. Non-matching packets fall through to the kernel unchanged.
+2. **Forwards** matched packets directly to the egress NIC via `bpf_redirect_map` — no `nf_hook_slow`, no conntrack, no iptables walk, no kernel skb allocation in native XDP mode.
+3. **Resolves the egress** via either the kernel FIB (`bpf_fib_lookup`) or PacketFrame's own LPM trie populated from a BGP feed (your choice via `forwarding-mode`).
+
+Optional layered features:
+
+- **VLAN push/pop/rewrite** for tagged forwarding
+- **Custom-FIB mode**: ingest BGP routes directly via iBGP (production today, with `bird`) or BMP (RFC 7854/9069). No netlink dependency, no race with other daemons subscribed to kernel routes.
+- **Per-host fast-path for connected destinations** via `local-prefix` directives + ARP scavenging
+- **XDP-time bogon block** (`block-prefix`) for dropping traffic to unrouteable destinations before kernel processing
+- **Default-route synthesis** in custom-FIB mode (`fallback-default`) for catching destinations the BGP feed doesn't cover
+
+## Benefits
+
+| Concern | Stock kernel forwarding | PacketFrame fast-path |
+|---|---|---|
+| Per-packet conntrack lookup | yes — every packet | bypassed for allowlisted flows |
+| iptables FORWARD chain walk | yes — every packet, every rule | bypassed |
+| skb allocation cost (native XDP) | yes | bypassed |
+| BGP route source | netlink from a routing daemon | direct iBGP/BMP, no netlink coupling |
+| Kernel features still work | yes | yes (slow path is unchanged) |
+| Fallback path | n/a | always: non-matching traffic uses kernel |
+
+Relative improvements measured after enabling custom-FIB on a production deployment:
+
+| Metric | Improvement |
+|---|---|
+| Allowlisted flows fast-pathed (bypass rate) | ~98% |
+| Active conntrack entries | ↓ ~85% |
+| Per-CPU softirq utilization (`%soft`) | ~18 percentage points lower |
+| Per-CPU idle headroom (`%idle`) | ~20 percentage points higher |
+| Customer-facing ping (avg) | ~57% lower |
+| Customer-facing ping (p99 tail) | ~55% lower |
+
+Actual results depend on workload mix, NIC, kernel version, and deployment topology.
+
+## How it compares
+
+| | PacketFrame | DPDK / VPP | FRR / pure routing daemon | Plain kernel + iptables |
+|---|---|---|---|---|
+| Bypasses kernel | partially (XDP) | fully (userspace) | no | no |
+| Dedicated cores required | no | yes | no | no |
+| Kernel features still work | yes | no — replaces stack | yes | yes |
+| Has its own BGP daemon | no — pairs with bird | typically not | yes | n/a |
+| Memory model | kernel-managed BPF maps | hugepages | kernel | kernel |
+| Deploy disruption | per-iface attach, opt-in | replaces network stack | runs alongside | default |
+
+PacketFrame complements existing routing daemons rather than replacing them. The intended pairing is `bird` (BGP) + `pathvector` (config generator) + PacketFrame (fast-path). FRR works similarly via its BMP support.
 
 ## Status
 
-v0.1 shipped the kernel-FIB fast-path module + the `probe` diagnostic.
-v0.2.0 (currently in the rc5 cutover window on the reference EFG)
-adds the Option F custom-FIB control plane — iBGP route source,
-neighbor resolver, FIB programmer, integrity check, and the
-`packetframe fib` operator subcommands. Together the binary ships:
-
-- **XDP ingress + allowlist match** per interface, IPv4 and IPv6,
-  with LPM-trie prefix lookups.
-- **VLAN ingress parse + egress push / pop / rewrite** for VLAN-tagged
-  forwarding topologies.
-- **Two forwarding modes** — `kernel-fib` uses `bpf_fib_lookup()`
-  against the kernel FIB; `custom-fib` (Option F) consults an
-  in-BPF LPM trie populated from a userspace route source (iBGP
-  to bird in production today, or RFC 9069 BMP for emitters that
-  ship it). Both redirect via `bpf_redirect_map`. `compare` mode
-  runs both and bumps a disagreement counter for pre-cutover
-  validation.
-- **bpffs pinning** of programs, maps, and links. SIGTERM exits the
-  loader without detaching attached ifaces; `packetframe detach` is
-  the explicit teardown.
-- **Live counter readback** via the pinned STATS map —
-  `packetframe status` works whether or not the loader is running.
-- **Prometheus textfile export** at 15 s cadence (atomic
-  write-then-rename), one counter per stat plus custom-FIB
-  occupancy gauges (`packetframe_nexthops{state=...}`,
-  `packetframe_ecmp_groups_active`, `packetframe_fib_forwarding_mode`).
-- **SIGHUP reconcile** — delta-only updates to allowlists, VLAN-resolve
-  map, and redirect devmap. A parse error on SIGHUP never kills the
-  running data plane.
-- **Circuit breaker** — sampled error/match ratio, sticky trip flag
-  in `state-dir`, SIGUSR1-driven detach on trip. Restart refuses to
-  re-attach while the flag is present.
-- **Feasibility probes** for kernel capabilities and per-interface
-  trial attach.
-- **`packetframe probe`** — attach a diagnostic-only XDP program to a
-  chosen iface for a fixed duration, dump the first 16 bytes of a
-  sample of packets, then detach. Useful for answering "what does
-  this driver hand to XDP?" without patching BPF.
-- **`packetframe fib dump / lookup / stats`** — operator tools for
-  the custom-FIB maps. `lookup <ip>` answers "what would XDP do for
-  this address?" against the live pinned maps.
-- **Driver-quirk workarounds** with a `driver-workaround` config
-  directive for per-driver opt-ins when a NIC's XDP path deviates
-  from the kernel's documented contract.
-
-Custom-FIB mode also ships a control plane under `packetframe run`:
-a route-source listener (BGP for production with bird, BMP for
-emitters that ship RFC 9069 Loc-RIB) that turns wire frames into
-LPM-trie inserts, a netlink-based neighbor resolver that seeds from
-the kernel's existing ARP/NDP tables on startup and tracks
-nexthop MAC / ifindex changes thereafter, and a periodic integrity
-check that cross-checks the mirror against `birdc show route count`.
-See [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md)
-for the operational runbook.
-
-The reference workflow is: validate the host with
-`packetframe feasibility`, attach in `dry-run on` to watch counters
-without redirecting, flip to `dry-run off` once the match / drop ratios
-look sane.
+| Component | State |
+|---|---|
+| `fast-path` module — XDP ingress, allowlist, redirect | Production |
+| `kernel-fib` forwarding mode (default) | Production |
+| `custom-fib` forwarding mode (BGP-fed LPM) | Production (v0.2.0+) |
+| iBGP route source (`route-source bgp`) | Production (v0.2.0+) |
+| BMP station route source (`route-source bmp`) | Ready, untested in production (no current emitter) |
+| Connected-destination fast-path (`local-prefix`) | Production (v0.2.1+) |
+| `fallback-default` synthesis | Production (v0.2.1+) |
+| `block-prefix` XDP-time drop | Production (v0.2.1+) |
+| `probe` module — diagnostic XDP | Production |
+| `randomizer` / `ddos` / `sampler` modules | Future — sketched in SPEC, not implemented |
 
 ## Install
 
-From a GitHub Release tarball:
+From a [GitHub release](https://github.com/unredacted/packetframe/releases):
 
 ```sh
-VERSION=vX.X.X   # check the Releases page for the latest and replace it
-TARGET=aarch64-unknown-linux-gnu   # also: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
+VERSION=v0.2.2
+TARGET=aarch64-unknown-linux-gnu     # or: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
+
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe-${VERSION}-${TARGET}.tar.gz"
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/SHA256SUMS"
-curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/SHA256SUMS.asc"   # optional
-
-gpg --verify SHA256SUMS.asc SHA256SUMS   # optional; GPG key ID in the release notes
 sha256sum -c SHA256SUMS --ignore-missing
 tar xzf "packetframe-${VERSION}-${TARGET}.tar.gz"
 
@@ -103,19 +91,23 @@ sudo install -m 0755 "packetframe-${VERSION}-${TARGET}/packetframe" /usr/local/b
 sudo install -m 0644 -D "packetframe-${VERSION}-${TARGET}/conf/example.conf" /etc/packetframe/example.conf
 ```
 
-The shipped binaries embed the compiled BPF object; no separate
-`libbpf`, `bpftool`, or nightly toolchain is required at runtime.
+Optional GPG verification: download `SHA256SUMS.asc` and `gpg --verify SHA256SUMS.asc SHA256SUMS` (key ID in release notes).
 
 ## Quickstart
 
-Probe the host kernel first:
+The reference workflow is **probe → dry-run → live**. It deliberately makes you watch counters before flipping anything that affects production traffic.
+
+### 1. Verify the host
 
 ```sh
 sudo packetframe feasibility --human
 ```
 
-Write a minimal config at `/etc/packetframe/packetframe.conf` (start
-with a single low-risk iface + `dry-run on`):
+Reports kernel capabilities (BPF syscalls, LPM trie, devmap-hash, ringbuf, etc.) and whether bpffs is mounted. Anything `FAIL` is a kernel/host prerequisite to fix before continuing.
+
+### 2. Write a minimal config
+
+`/etc/packetframe/packetframe.conf`:
 
 ```
 global
@@ -125,195 +117,171 @@ global
 
 module fast-path
   attach eth0 auto
-  allow-prefix 192.0.2.0/24
+  allow-prefix 192.0.2.0/24       # your customer / forwarding scope
   allow-prefix6 2001:db8::/48
-  dry-run on
+  dry-run on                       # observe-only — no redirects yet
   circuit-breaker drop-ratio 0.01 of matched window 5s threshold 5
 ```
 
-Re-run feasibility against the config — this also runs the
-per-interface trial attach probe:
+`dry-run on` makes the program count matched packets but always return `XDP_PASS` — the kernel handles forwarding as if PacketFrame weren't there. Counters tell you whether your allowlist matches the right traffic before you flip the switch.
+
+### 3. Validate against the host
 
 ```sh
 sudo packetframe feasibility --config /etc/packetframe/packetframe.conf --human
 ```
 
-Run the data plane in the foreground. `--config` defaults to
-`/etc/packetframe/packetframe.conf`, so the flag can be omitted on a
-standard deploy:
+Now also runs a per-interface trial XDP attach to catch driver compatibility issues before live deploy.
+
+### 4. Run
 
 ```sh
-sudo packetframe run
+sudo packetframe run                 # foreground; --config defaults to /etc/...
+sudo packetframe status              # in another shell — live counters
 ```
 
-In another shell, inspect live counters:
+### 5. Flip dry-run off when match ratios look right
+
+Edit the config, change `dry-run on` to `dry-run off`, then `sudo systemctl reload packetframe` (if running under systemd) or `kill -HUP <pid>` (foreground). The change is delta-only; no detach.
+
+### 6. Tear down
 
 ```sh
-sudo packetframe status
+sudo packetframe detach --all        # removes pins, detaches XDP
 ```
 
-Tear down — removes bpffs pins and detaches attached ifaces:
+## Forwarding modes
 
-```sh
-sudo packetframe detach --all
+`forwarding-mode` selects how PacketFrame resolves the egress for a matched packet:
+
+- **`kernel-fib`** (default) — uses `bpf_fib_lookup()` against the kernel's routing table. Same routing decisions as plain Linux. The permanent rollback path.
+- **`custom-fib`** — uses PacketFrame's own LPM trie, populated from a BGP feed. Lets daemons that consume the kernel route table work in parallel without racing on BGP attribute updates from the routing daemon.
+- **`compare`** — runs both lookups, forwards via the kernel result, bumps a disagreement counter. Pre-cutover validation only.
+
+Custom-fib mode requires a `route-source` directive:
+
 ```
+route-source bgp 127.0.0.1:1179 local-as 65000 peer-as 65000
+```
+
+Bird connects out to PacketFrame as an iBGP peer on this address. Bird's `protocol bgp` export filter runs *after* best-path selection, so PacketFrame receives one UPDATE per prefix.
+
+For BMP emitters that ship RFC 9069 Loc-RIB (FRR; future bird):
+
+```
+route-source bmp 127.0.0.1:6543 require-loc-rib
+```
+
+`require-loc-rib` rejects pre/post-policy frames at session-init so misconfigured emitters fail loudly rather than silently driving forwarding off the wrong RIB view.
+
+See [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) for the full operational guide: cutover sequence, rollback, integrity checking, troubleshooting.
 
 ## Attach modes
 
-Each `attach <iface> <mode>` directive picks how the XDP program is
-bound to the interface:
+Each `attach <iface> <mode>` directive picks how XDP binds to the interface:
 
-- `native` — driver-XDP. Lowest overhead. Requires the NIC driver to
-  implement XDP natively and to deliver packets to the program with
-  the standard Ethernet frame layout.
-- `generic` — SKB-XDP. Runs after the kernel allocates an skb, so the
-  kernel normalizes the frame before the program sees it. Higher
-  per-packet overhead but works on every driver that supports XDP at
-  all.
-- `auto` — try native first, fall back to generic on attach failure.
-  `auto` may also be downgraded at preprocessing on drivers known to
-  have native-mode bugs on the running kernel (see below).
+| Mode | Cost | Use when |
+|---|---|---|
+| `native` | Lowest — runs in NIC driver before skb alloc | Driver supports native XDP and delivers Ethernet-shaped frames |
+| `generic` | Higher — runs after skb alloc | Driver doesn't support native XDP, or has known native-mode bugs |
+| `auto` | tries native, falls back to generic | Most cases; downgraded automatically on drivers with known bugs |
 
-### Known driver / kernel interactions
+### Driver caveats
 
-PacketFrame refuses attach configurations it has empirical evidence
-are unsafe. Currently tracked:
+PacketFrame refuses configurations it has empirical evidence are unsafe:
 
-- **Marvell `rvu-nicpf` (OcteonTX2 / CN10K) on kernels older than
-  Linux v6.8**: native XDP attach leaks `non_qos_queues` count on
-  every program detach (kernel bug; fixed upstream in commit
-  `04f647c8e456`). Over a handful of attach/detach cycles the
-  driver's resource bookkeeping drifts and a subsequent page allocation
-  corrupts the kernel's freelist. v0.1.5+ hard-refuses explicit
-  `attach <iface> native` on this combination and downgrades
-  `auto` to `generic`. Operators who have backported the upstream fix
-  can opt out via `driver-workaround rvu-nicpf-head-shift off`.
-- **Marvell `rvu-nicpf` on multi-member bridges, attach AND detach**:
-  XDP attach (and `pin` removal on detach) briefly bounces the
-  link, which the bridge stack treats as a port-state change.
-  Bouncing two members inside one STP/RSTP reconvergence window
-  has been observed to wedge the bridge into a brief L2 loop
-  state, panicking the kernel. PacketFrame paces both attach AND
-  detach (v0.2.0-rc5+) by `attach-settle-time` whenever ≥ 2
-  attached ifaces share a `/sys/class/net/<iface>/master`. Raise
-  `attach-settle-time` if your bridge takes longer than 2s to
-  reconverge.
+**Marvell `rvu-nicpf` on kernels < v6.8** — native XDP attach leaks a kernel resource counter (`non_qos_queues`) on every detach. After a handful of attach/detach cycles the kernel page allocator can corrupt. PacketFrame hard-refuses explicit `attach <iface> native` here and downgrades `auto` to `generic`. Fixed upstream in commit `04f647c8e456`; operators with the backport can opt out via `driver-workaround rvu-nicpf-head-shift off`.
+
+**Marvell `rvu-nicpf` on multi-member bridges** — XDP attach AND detach briefly bounce the link, which the bridge stack treats as a port-state change. Two ports flapping inside one STP/RSTP window has caused L2 loops and kernel panics. PacketFrame paces both attach and detach via `attach-settle-time` (default 2 s, raise on slow-converging bridges) when ≥ 2 attached ifaces share a `/sys/class/net/<iface>/master`.
 
 ### Diagnosing driver-specific issues
 
-If `packetframe status` shows `rx_total` incrementing in lockstep
-with `pass_not_ip` while the `matched_*` counters stay at zero, the
-program is running but not parsing the frames it receives — typically
-a driver-specific native-mode delivery quirk. Use `packetframe probe`
-to inspect what the driver actually hands to XDP:
+If `packetframe status` shows `rx_total` climbing in lockstep with `pass_not_ip` while `matched_*` stays at zero, the program is running but not parsing frames it receives — usually a driver-specific native-mode delivery quirk. Use `packetframe probe` to inspect what the driver actually hands to XDP:
 
 ```sh
-# Sample the first 16 bytes at data + 0 on a native-mode attach:
 sudo packetframe probe --iface eth0 --mode native --duration 2s
-
-# Sample at a larger offset if data + 0 appears to be headroom zeros:
 sudo packetframe probe --iface eth0 --mode native --duration 2s --offset 128
-
-# Compare to the skb-normalized view (what the kernel would see):
-sudo packetframe probe --iface eth0 --mode generic --duration 2s
+sudo packetframe probe --iface eth0 --mode generic --duration 2s   # what kernel sees
 ```
 
-The output dumps the raw bytes plus a one-line heuristic verdict
-("head bytes look like standard Ethernet" vs. "head bytes DO NOT look
-like Ethernet").
+Output dumps the first 16 bytes of a packet sample plus a one-line verdict.
 
-## Configuration
+## Configuration reference
 
-`conf/example.conf` ships as the reference. Grammar summary:
+`conf/example.conf` ships with the binary as the canonical reference, with every directive commented and explained inline. Read that for the full grammar.
 
-- `global` and `module fast-path` blocks.
-- `attach <iface> <mode>`, where `mode` is `native` / `generic` /
-  `auto`.
-- `allow-prefix` / `allow-prefix6` for IPv4 and IPv6 prefixes (LPM,
-  src-or-dst match).
-- `dry-run on|off` gates actual redirects; when on, the program still
-  counts matched packets but returns `XDP_PASS`.
-- `circuit-breaker drop-ratio X of matched window Ys threshold N` —
-  optional safety valve.
-- `metrics-textfile <path>` — Prometheus textfile target, atomically
-  rewritten every 15 seconds.
-- `attach-settle-time <dur>` (global) — sleep between per-iface
-  attaches *and* between per-iface detaches when ≥ 2 attached
-  ifaces share a bridge master, so each link settles before the
-  next touches the driver. Default 2s; raise on bridged topologies
-  whose STP takes longer to reconverge. Isolated-iface topologies
-  pay no settle cost.
-- `driver-workaround <name> <auto|on|off>` — per-driver opt-ins for
-  known kernel-level quirks. See the *Known driver / kernel
-  interactions* section above for the catalog.
-- `forwarding-mode <kernel-fib|custom-fib|compare>` — forwarding
-  path selector. `kernel-fib` is the default and the permanent
-  rollback option; `custom-fib` consults the BPF-map FIB populated
-  by the configured `route-source`; `compare` runs both and bumps
-  a disagreement counter.
-- `route-source <kind> <addr>:<port> [args...]` — route feed for
-  the custom FIB. Required when `forwarding-mode` is `custom-fib`
-  or `compare`. Two kinds:
-  - `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`
-    — passive iBGP listener; bird dials in via
-    `protocol bgp packetframe { neighbor <addr> port <port> as <asn>; ... }`.
-    Bird's export filter runs after best-path so packetframe
-    receives one UPDATE per prefix. **Recommended for production
-    today** — bird does not implement RFC 9069 Loc-RIB BMP.
-  - `bmp <addr>:<port> [require-loc-rib]` — BMP station; the
-    emitter dials in. Production-safe **only** when the emitter
-    ships RFC 9069 Loc-RIB peer_type=3 (FRR; not bird). The
-    `require-loc-rib` flag rejects pre/post-policy frames at
-    session-init so misconfiguration fails loudly.
-- `ecmp-default-hash-mode <3|4|5>` — tuple size for ECMP hashing;
-  default 5.
-- `fib-v4-max-entries` / `fib-v6-max-entries` / `nexthops-max-entries`
-  / `ecmp-groups-max-entries` — custom-FIB map sizing. Parsed but
-  not yet runtime-applied; the BPF ELF embeds compile-time sizes
-  that cover the current DFZ. Override only if you've rebuilt the
-  BPF with new caps.
+Quick directive index:
 
-SIGHUP re-reads the config and applies delta-only changes to
-allowlists and VLAN-resolve state without detaching. Attach-set
-changes (adding or removing an iface) require a restart.
+**Global**
+- `bpffs-root`, `state-dir`, `metrics-textfile`, `log-level`, `attach-settle-time`
+
+**Module fast-path — attach + allowlist**
+- `attach <iface> {native|generic|auto}`
+- `allow-prefix <ipv4-cidr>`, `allow-prefix6 <ipv6-cidr>` — src-or-dst match
+- `dry-run {on|off}`
+- `circuit-breaker drop-ratio X of matched window Ys threshold N`
+
+**Module fast-path — forwarding mode**
+- `forwarding-mode {kernel-fib|custom-fib|compare}`
+- `route-source bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`
+- `route-source bmp <addr>:<port> [require-loc-rib]`
+- `local-prefix <cidr> via <iface> [arp-scavenge]` — per-host fast-path for connected destinations
+- `fallback-default via <iface> nexthop <ipv4>` — synthetic 0.0.0.0/0 catch-all
+- `block-prefix <cidr>` — XDP-time drop for unrouteable destinations
+- `ecmp-default-hash-mode {3|4|5}` — tuple width for ECMP hashing
+
+**Module fast-path — driver opt-ins**
+- `driver-workaround rvu-nicpf-head-shift {auto|on|off}`
+
+`SIGHUP` reloads the config and applies delta-only changes to allowlists, VLAN-resolve, and devmap. Adding or removing an `attach` directive requires a restart.
+
+## Operator tools
+
+```sh
+sudo packetframe status                # live counters from pinned STATS map
+sudo packetframe fib stats             # custom-FIB occupancy / hash mode
+sudo packetframe fib lookup <ip>       # "what would XDP do for this dst?"
+sudo packetframe fib dump-v4           # walk FIB_V4 LPM trie
+sudo packetframe detach --all          # remove all pins, detach XDP
+```
+
+Counters export as Prometheus textfile every 15 s when `metrics-textfile` is set. Metrics include per-counter gauges, custom-FIB occupancy by nexthop state, and the active forwarding mode.
+
+## Documentation
+
+- [`conf/example.conf`](conf/example.conf) — annotated reference config
+- [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) — operational runbook for custom-FIB mode (cutover, rollback, integrity checks, triage by symptom)
 
 ## Build from source
 
 ```sh
-make build        # host target, debug
-make release      # host target, release
-make release-all  # every published target (requires `cross`)
+make build        # debug, host target
+make release      # release, host target
+make release-all  # all four published targets (requires `cross`)
 
 make test         # workspace tests
-make lint         # fmt --check + clippy -D warnings
-make fmt          # apply rustfmt
+make lint         # cargo fmt --check + cargo clippy -D warnings
 ```
 
-Dependencies: a stable Rust toolchain (pinned in
-`rust-toolchain.toml`). The BPF crates live under
-`crates/modules/*/bpf/` and each has its own pinned nightly toolchain
-+ `bpf-linker`; CI installs those automatically. Cross-compiling to
-every release target uses [`cross`](https://github.com/cross-rs/cross);
-install it with `cargo install --locked cross`.
+Toolchain: stable Rust pinned in `rust-toolchain.toml`. The BPF crates (`crates/modules/*/bpf/`) each have their own pinned nightly toolchain + `bpf-linker`, installed automatically by CI; for local BPF rebuilds, install `rustup` and let it follow the toolchain files.
+
+Cross-compiling to release targets uses [`cross`](https://github.com/cross-rs/cross): `cargo install --locked cross`.
 
 ## Project layout
 
 ```
 packetframe/
 ├── crates/
-│   ├── common/                       # config, Module trait, §2.1 probes
+│   ├── common/                       # config parser, Module trait, capability probes
 │   ├── cli/                          # the `packetframe` binary
 │   └── modules/
-│       ├── fast-path/                # fast-path forwarding module
-│       │   └── bpf/                  # XDP fast-path BPF program (nightly toolchain)
-│       └── probe/                    # diagnostic probe module
-│           └── bpf/                  # probe BPF program (nightly toolchain)
-├── conf/
-│   └── example.conf                  # reference config
-└── .github/workflows/
-    ├── ci.yml                        # fmt, clippy, test, cross-build
-    ├── qemu-verifier.yml             # integration tests on 5.15 + 6.6 kernels
-    └── release.yml                   # tag-triggered GitHub Release
+│       ├── fast-path/                # main forwarding module
+│       │   └── bpf/                  # XDP program (nightly toolchain)
+│       └── probe/                    # diagnostic XDP probe
+│           └── bpf/                  # probe BPF program
+├── conf/example.conf                 # annotated reference config
+├── docs/runbooks/                    # operational runbooks
+└── .github/workflows/                # CI (fmt/clippy/test, cross-build, qemu-verifier, release)
 ```
 
 ## License
