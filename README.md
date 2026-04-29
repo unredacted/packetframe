@@ -2,7 +2,7 @@
 
 **eBPF/XDP fast-path for Linux packet forwarding.** Pure Rust, pluggable, attaches per-interface. Forwards allowlisted traffic directly between NICs at the driver level — bypassing iptables, conntrack, and the kernel routing stack — and falls back to normal kernel forwarding for everything else.
 
-Production-deployed on a UniFi Enterprise Fortress Gateway carrying 1-2 Gbps of customer traffic across a 1.27M-route full-table BGP feed. **~98% of allowlisted flows fast-path**, conntrack table reduced ~85%, customer ping latency cut in half.
+Production-tested on edge routers with full-table BGP feeds. **~98% of allowlisted flows fast-path** in measured deployments, with conntrack table size and customer-facing latency both reduced significantly versus stock kernel forwarding.
 
 GPL-3.0-or-later. Linux ≥ 5.15. Single static binary; no separate libbpf, bpftool, or runtime nightly toolchain.
 
@@ -33,19 +33,18 @@ Optional layered features:
 | Kernel features still work | yes | yes (slow path is unchanged) |
 | Fallback path | n/a | always: non-matching traffic uses kernel |
 
-Measured on the reference deployment after enabling custom-FIB:
+Relative improvements measured after enabling custom-FIB on a production deployment:
 
-| Metric | Before (kernel-fib) | After (custom-fib + fast-path) |
-|---|---|---|
-| Bypass rate | n/a | ~98% |
-| Active conntrack entries | 1.15M | 168K |
-| `%soft` per CPU | 51% | 33% |
-| `%idle` per CPU | 31% | 51% |
-| Customer ping (avg) | 1.65 ms | 0.71 ms |
-| Customer ping (p99 tail) | 61 ms | 27.5 ms |
-| udapi parse errors / 24h | nonzero | zero |
+| Metric | Improvement |
+|---|---|
+| Allowlisted flows fast-pathed (bypass rate) | ~98% |
+| Active conntrack entries | ↓ ~85% |
+| Per-CPU softirq utilization (`%soft`) | ~18 percentage points lower |
+| Per-CPU idle headroom (`%idle`) | ~20 percentage points higher |
+| Customer-facing ping (avg) | ~57% lower |
+| Customer-facing ping (p99 tail) | ~55% lower |
 
-Numbers are workload-specific and from a Tor-exit-relay edge serving ~1-2 Gbps. Your traffic mix will differ.
+Actual results depend on workload mix, NIC, kernel version, and deployment topology.
 
 ## How it compares
 
@@ -156,13 +155,13 @@ sudo packetframe detach --all        # removes pins, detaches XDP
 `forwarding-mode` selects how PacketFrame resolves the egress for a matched packet:
 
 - **`kernel-fib`** (default) — uses `bpf_fib_lookup()` against the kernel's routing table. Same routing decisions as plain Linux. The permanent rollback path.
-- **`custom-fib`** — uses PacketFrame's own LPM trie, populated from a BGP feed. Lets routing daemons that consume the kernel route table (UniFi `udapi-server`, etc.) work in parallel without racing on BGP attribute updates.
+- **`custom-fib`** — uses PacketFrame's own LPM trie, populated from a BGP feed. Lets daemons that consume the kernel route table work in parallel without racing on BGP attribute updates from the routing daemon.
 - **`compare`** — runs both lookups, forwards via the kernel result, bumps a disagreement counter. Pre-cutover validation only.
 
 Custom-fib mode requires a `route-source` directive:
 
 ```
-route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401
+route-source bgp 127.0.0.1:1179 local-as 65000 peer-as 65000
 ```
 
 Bird connects out to PacketFrame as an iBGP peer on this address. Bird's `protocol bgp` export filter runs *after* best-path selection, so PacketFrame receives one UPDATE per prefix.
