@@ -42,6 +42,14 @@ use maps::{
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
+// IANA protocol numbers, materialized as u8 from the `IpProto` enum
+// (`#[repr(u8)]`). network-types 0.2.0 changed `Ipv4Hdr.proto` and
+// `Ipv6Hdr.next_hdr` from `IpProto` to raw `u8`, so we match against
+// these instead of enum variants.
+const PROTO_TCP: u8 = IpProto::Tcp as u8;
+const PROTO_UDP: u8 = IpProto::Udp as u8;
+const PROTO_ICMPV6: u8 = IpProto::Ipv6Icmp as u8;
+
 /// 802.1Q TPID. What we write back on push / rewrite.
 const TPID_8021Q: u16 = 0x8100;
 
@@ -290,7 +298,7 @@ fn handle_ipv6(
 
     let next = unsafe { (*ip).next_hdr };
     match next {
-        IpProto::Tcp | IpProto::Udp | IpProto::Ipv6Icmp => {}
+        PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {}
         _ => {
             bump_stat(StatIdx::PassComplexHeader);
             return Ok(xdp_action::XDP_PASS);
@@ -711,8 +719,8 @@ fn ptr_mut_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
 /// kernel's `bpf_fib_lookup` expects for its `__be16` sport/dport
 /// fields on an LE host. (0, 0) for ICMP / ICMPv6 or truncated L4.
 #[inline(always)]
-fn l4_ports(ctx: &XdpContext, offset: usize, proto: IpProto) -> (u16, u16) {
-    if !matches!(proto, IpProto::Tcp | IpProto::Udp) {
+fn l4_ports(ctx: &XdpContext, offset: usize, proto: u8) -> (u16, u16) {
+    if !matches!(proto, PROTO_TCP | PROTO_UDP) {
         return (0, 0);
     }
     let start = ctx.data();
