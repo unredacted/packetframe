@@ -76,7 +76,26 @@ PacketFrame complements existing routing daemons rather than replacing them. The
 
 ## Install
 
-From a [GitHub release](https://github.com/unredacted/packetframe/releases):
+Releases are published on the [GitHub releases page](https://github.com/unredacted/packetframe/releases) as both `.deb` packages (Debian / Ubuntu, `amd64` and `arm64`) and `.tar.gz` archives (any Linux, four target triples).
+
+### Debian / Ubuntu (.deb)
+
+```sh
+VERSION=v0.2.2
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+
+curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe_${VERSION#v}_${ARCH}.deb"
+curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+
+sudo apt-get install ./packetframe_${VERSION#v}_${ARCH}.deb
+```
+
+Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packetframe.service`, and an example config at `/etc/packetframe/example.conf`. The service is **not** auto-started — copy the example to `/etc/packetframe/packetframe.conf`, edit per the [Quickstart](#quickstart), then `sudo systemctl enable --now packetframe`. Requires glibc ≥ 2.31 (Debian 11+ / Ubuntu 20.04+).
+
+### Tarball (any Linux)
+
+For musl-static deployments, non-Debian distros, or anything else:
 
 ```sh
 VERSION=v0.2.2

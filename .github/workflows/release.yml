@@ -116,6 +116,22 @@ jobs:
           - x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
+        with:
+          # `git log -1 --pretty=%ct <ref>` below needs the tagged commit
+          # in history. Default fetch-depth=1 is fine for tag pushes (the
+          # tag *is* the checked-out commit) but workflow_dispatch on a
+          # branch needs more history to resolve the ref.
+          fetch-depth: 0
+
+      # Reproducibility: derive SOURCE_DATE_EPOCH from the tag commit so
+      # both rustc-embedded timestamps and the .deb archive's file mtimes
+      # are deterministic. Same value across all matrix legs ensures the
+      # binary contents (and the .deb wrapping it) match across runners.
+      - name: Set SOURCE_DATE_EPOCH from tag commit
+        run: |
+          set -euo pipefail
+          SDE=$(git log -1 --pretty=%ct "${GITHUB_REF_NAME}")
+          echo "SOURCE_DATE_EPOCH=${SDE}" >> "${GITHUB_ENV}"
 
       - name: Install Rust (stable + target)
         run: |
@@ -159,8 +175,10 @@ jobs:
             echo "PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o"
             echo "PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o"
           } >> "${GITHUB_ENV}"
-          # Forward both env vars into the container.
-          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o" >> "${GITHUB_ENV}"
+          # Forward env vars into the container. SOURCE_DATE_EPOCH is also
+          # forwarded so rustc-embedded timestamps inside the cross build
+          # match the tag commit time set in GITHUB_ENV earlier.
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o -e SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" >> "${GITHUB_ENV}"
 
       - name: Build release
         run: cross build --release --workspace --target ${{ matrix.target }}
@@ -178,11 +196,47 @@ jobs:
           ( cd dist && tar czf "${STEM}.tar.gz" "${STEM}" )
           ( cd dist && sha256sum "${STEM}.tar.gz" > "${STEM}.tar.gz.sha256" )
 
+      # cargo-deb runs only for the gnu targets — .deb is for glibc-based
+      # Debian-family distros, and the existing musl tarballs cover the
+      # static-binary use case. Pinned version: bump deliberately.
+      - name: Install cargo-deb
+        if: contains(matrix.target, '-gnu')
+        run: |
+          if ! command -v cargo-deb >/dev/null 2>&1 || \
+             [ "$(cargo deb --version 2>/dev/null | awk '{print $2}')" != "2.7.0" ]; then
+            cargo install --locked --force cargo-deb --version 2.7.0
+          fi
+
+      - name: Build .deb
+        if: contains(matrix.target, '-gnu')
+        run: |
+          set -euo pipefail
+          # Strip the leading `v` so the .deb version is plain semver (e.g.
+          # 0.2.2), matching what `dpkg -s packetframe` will report.
+          DEB_VERSION="${GITHUB_REF_NAME#v}"
+          STEM="packetframe-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # SOURCE_DATE_EPOCH is already in GITHUB_ENV from the earlier
+          # step; cargo-deb honors it for archive mtimes and the
+          # changelog Date field. --no-build because cross already
+          # produced the binary at target/<triple>/release/packetframe.
+          # --no-strip because the workspace release profile already
+          # stripped, and the host's `strip` can't read a cross-built
+          # arm64 ELF anyway.
+          cargo deb --no-build --no-strip \
+            --target "${{ matrix.target }}" \
+            -p packetframe-cli \
+            --deb-version "${DEB_VERSION}" \
+            --output dist/
+          # Append .deb hash to the per-target .sha256 so the publish
+          # job's combined SHA256SUMS picks it up automatically.
+          ( cd dist && sha256sum *.deb >> "${STEM}.tar.gz.sha256" )
+
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
             dist/*.tar.gz
+            dist/*.deb
             dist/*.sha256
           retention-days: 7
           if-no-files-found: error
