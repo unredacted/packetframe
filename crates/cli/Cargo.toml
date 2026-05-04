@@ -48,11 +48,10 @@ See /usr/share/doc/packetframe/README.md for documentation.\
 """
 section = "net"
 priority = "optional"
-# Workspace `[profile.release]` sets `strip = true`, so cargo-deb's own
-# strip step would re-run on an already-stripped binary — and on CI it
-# would shell out to the host's `strip`, which can't read cross-built
-# arm64 ELFs. Skip it.
-strip = false
+# Workspace `[profile.release]` already strips, and the host's `strip`
+# can't read cross-built arm64 ELFs anyway. Skipping is handled at the
+# cargo-deb invocation site via the `--no-strip` CLI flag — there's no
+# `strip` key in [package.metadata.deb]; cargo-deb 2.7 rejects it.
 # dpkg-shlibdeps doesn't work cross-arch on the Ubuntu CI runner, so
 # pin the glibc dependency floor explicitly. 2.31 = Ubuntu 20.04 /
 # Debian 11 (oldest supported glibc as of 2026).
