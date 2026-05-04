@@ -296,7 +296,14 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             PRERELEASE_FLAG="--prerelease"
           fi
-          FILES=(dist/*.tar.gz dist/SHA256SUMS)
+          # nullglob so an empty `dist/*.deb` expands to nothing rather
+          # than the literal string (which would make `gh release create`
+          # fail). The build job currently always emits .debs from the
+          # gnu legs, but defensive: also tolerates a future tag that
+          # ships only tarballs.
+          shopt -s nullglob
+          FILES=(dist/*.tar.gz dist/*.deb dist/SHA256SUMS)
+          shopt -u nullglob
           if [[ -f dist/SHA256SUMS.asc ]]; then
             FILES+=(dist/SHA256SUMS.asc)
           fi
