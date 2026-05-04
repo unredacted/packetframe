@@ -1,0 +1,24 @@
+[Unit]
+Description=PacketFrame eBPF data plane
+Documentation=https://github.com/unredacted/packetframe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/packetframe run
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+StateDirectory=packetframe
+StateDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=packetframe
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

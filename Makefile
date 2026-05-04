@@ -1,4 +1,4 @@
-.PHONY: build release test lint fmt clean help
+.PHONY: build release test lint fmt clean deb help
 
 CARGO ?= cargo
 TARGETS := aarch64-unknown-linux-musl x86_64-unknown-linux-musl aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
@@ -11,6 +11,7 @@ help:
 	@echo "  make test         cargo test across the workspace"
 	@echo "  make lint         cargo fmt --check + cargo clippy"
 	@echo "  make fmt          cargo fmt"
+	@echo "  make deb          host-arch .deb via cargo-deb (Linux/glibc only)"
 	@echo "  make clean        cargo clean"
 
 build:
@@ -37,6 +38,13 @@ fmt:
 
 clean:
 	$(CARGO) clean
+
+# Host-arch .deb. Sets SOURCE_DATE_EPOCH from HEAD's commit time so
+# rebuilds at the same commit produce byte-identical .deb files (cargo-deb
+# honors it for archive mtimes; rustc honors it for embedded timestamps).
+# Cross-arch .debs are CI-only; see .github/workflows/release.yml.
+deb:
+	SOURCE_DATE_EPOCH=$$(git log -1 --pretty=%ct HEAD) $(CARGO) deb -p packetframe-cli
 
 # bpf-test target is defined by v0.1 when BPF sources exist
 bpf-test:

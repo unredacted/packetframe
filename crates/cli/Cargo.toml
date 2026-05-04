@@ -31,3 +31,49 @@ signal-hook.workspace = true
 default = ["fast-path", "probe"]
 fast-path = ["dep:packetframe-fast-path"]
 probe = ["dep:packetframe-probe"]
+
+# cargo-deb metadata. CI builds the .deb in the release workflow via
+# `cargo deb --no-build --target <triple>` after the cross-compiled
+# binary is in place. Local builds run `make deb` (host-arch only).
+[package.metadata.deb]
+name = "packetframe"
+maintainer = "PacketFrame maintainers <noreply@unredacted.org>"
+copyright = "Copyright (C) 2024-2026 Unredacted contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+PacketFrame is a modular eBPF data plane for Linux packet forwarding.
+The fast-path module attaches per-interface XDP programs that forward
+allowlisted traffic at the driver level, bypassing iptables and conntrack.
+See /usr/share/doc/packetframe/README.md for documentation.\
+"""
+section = "net"
+priority = "optional"
+# Workspace `[profile.release]` sets `strip = true`, so cargo-deb's own
+# strip step would re-run on an already-stripped binary — and on CI it
+# would shell out to the host's `strip`, which can't read cross-built
+# arm64 ELFs. Skip it.
+strip = false
+# dpkg-shlibdeps doesn't work cross-arch on the Ubuntu CI runner, so
+# pin the glibc dependency floor explicitly. 2.31 = Ubuntu 20.04 /
+# Debian 11 (oldest supported glibc as of 2026).
+depends = "libc6 (>= 2.31)"
+assets = [
+    ["target/release/packetframe", "/usr/bin/packetframe", "755"],
+    ["../../conf/example.conf", "/etc/packetframe/example.conf", "644"],
+    ["../../README.md", "/usr/share/doc/packetframe/README.md", "644"],
+]
+
+# Built-in systemd-units integration: cargo-deb generates the
+# postinst/prerm/postrm maintainer scripts to register the unit with
+# systemctl. enable+start are off because the daemon needs an
+# operator-supplied interface list before it can do anything useful;
+# auto-starting would just produce a noisy first-launch failure.
+# `restart-after-upgrade = true` keeps a running daemon alive across
+# `apt upgrade` (the SIGTERM handler preserves pins per SPEC.md §8.5).
+[package.metadata.deb.systemd-units]
+unit-name = "packetframe"
+unit-scripts = "debian"
+enable = false
+start = false
+restart-after-upgrade = true
+stop-on-upgrade = false
