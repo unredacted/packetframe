@@ -81,7 +81,7 @@ Releases are published on the [GitHub releases page](https://github.com/unredact
 ### Debian / Ubuntu (.deb)
 
 ```sh
-VERSION=v0.2.2
+VERSION=v0.2.3
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe_${VERSION#v}_${ARCH}.deb"
@@ -98,7 +98,7 @@ Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packet
 For musl-static deployments, non-Debian distros, or anything else:
 
 ```sh
-VERSION=v0.2.2
+VERSION=v0.2.3
 TARGET=aarch64-unknown-linux-gnu     # or: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
 
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe-${VERSION}-${TARGET}.tar.gz"
