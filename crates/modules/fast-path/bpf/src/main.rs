@@ -461,7 +461,14 @@ fn forward_success(
     // existing bytes in place). No-op for non-TCP, non-SYN packets,
     // or when no clamp policy applies. Skipped under `is_dry_run()`
     // because dry-run returns XDP_PASS earlier in the flow.
-    mss_clamp_inline(ctx, ip, is_v4, egress_ifindex);
+    //
+    // Pass a scalar `ip_offset` rather than the packet pointer:
+    // BPF subprograms can't accept packet pointers as args (the
+    // verifier rejects the lift instruction LLVM emits — "R1 pointer
+    // arithmetic with <<= operator prohibited"). Reconstruct the
+    // pointer inside the subprogram from `ctx.data() + ip_offset`.
+    let ip_offset = (ip as usize).saturating_sub(ctx.data());
+    mss_clamp_inline(ctx, ip_offset, is_v4, egress_ifindex);
 
     // TTL/hop_limit + csum first — IP header's position in memory
     // doesn't change with adjust_head, only its offset from `data`.
@@ -692,22 +699,30 @@ const TCP_FLAG_SYN: u8 = 0x02;
 /// `fast_path` XDP entry. Inlining mss_clamp pushes the cumulative
 /// stack frame past BPF's 512-byte limit (the link error is "Looks
 /// like the BPF stack limit is exceeded"). Letting LLVM emit it as a
-/// separate BPF subprogram gives it its own 512-byte stack budget,
-/// which is plenty for the locals here.
+/// separate BPF subprogram gives it its own 512-byte stack budget.
+///
+/// Takes `ip_offset` (a scalar) rather than a packet pointer because
+/// BPF subprograms cannot accept packet pointers as arguments — the
+/// verifier rejects LLVM's pointer-lift instruction with "R1 pointer
+/// arithmetic with <<= operator prohibited". Reconstruct the pointer
+/// inside from `ctx.data() + ip_offset`, which the verifier tracks
+/// safely as a fresh packet-derived pointer with bounds checks.
 #[inline(never)]
-fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: u32) {
+fn mss_clamp_inline(ctx: &XdpContext, ip_offset: usize, is_v4: bool, egress_ifindex: u32) {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    // ip pointer was derived from start + ip_offset; recover that.
-    let ip_addr = ip as usize;
-    if ip_addr < start {
+    let ip_hdr_size = if is_v4 {
+        Ipv4Hdr::LEN
+    } else {
+        Ipv6Hdr::LEN
+    };
+    if start + ip_offset + ip_hdr_size > end {
         return;
     }
-    let ip_offset = ip_addr - start;
 
-    let (proto, tcp_offset, clamp) = if is_v4 {
-        let ipv4 = ip as *const Ipv4Hdr;
+    let (tcp_offset, clamp) = if is_v4 {
+        let ipv4 = (start + ip_offset) as *const Ipv4Hdr;
         let proto = unsafe { (*ipv4).proto };
         if proto != PROTO_TCP {
             return;
@@ -716,9 +731,9 @@ fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: 
         let dst_addr = unsafe { (*ipv4).dst_addr };
         let tcp_off = ip_offset + Ipv4Hdr::LEN;
         let clamp = lookup_mss_clamp_v4(src_addr, dst_addr, egress_ifindex);
-        (proto, tcp_off, clamp)
+        (tcp_off, clamp)
     } else {
-        let ipv6 = ip as *const Ipv6Hdr;
+        let ipv6 = (start + ip_offset) as *const Ipv6Hdr;
         let proto = unsafe { (*ipv6).next_hdr };
         if proto != PROTO_TCP {
             return;
@@ -727,7 +742,7 @@ fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: 
         let dst_addr = unsafe { (*ipv6).dst_addr };
         let tcp_off = ip_offset + Ipv6Hdr::LEN;
         let clamp = lookup_mss_clamp_v6(src_addr, dst_addr, egress_ifindex);
-        (proto, tcp_off, clamp)
+        (tcp_off, clamp)
     };
 
     // No policy applies; not even a "skipped" event since we never
@@ -735,7 +750,6 @@ fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: 
     if clamp == 0 {
         return;
     }
-    let _ = proto; // already checked above; clarifies intent.
 
     // Need 20 bytes for the fixed TCP header before walking options.
     if start + tcp_offset + 20 > end {
