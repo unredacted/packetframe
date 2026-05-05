@@ -461,14 +461,7 @@ fn forward_success(
     // existing bytes in place). No-op for non-TCP, non-SYN packets,
     // or when no clamp policy applies. Skipped under `is_dry_run()`
     // because dry-run returns XDP_PASS earlier in the flow.
-    //
-    // Pass a scalar `ip_offset` rather than the packet pointer:
-    // BPF subprograms can't accept packet pointers as args (the
-    // verifier rejects the lift instruction LLVM emits — "R1 pointer
-    // arithmetic with <<= operator prohibited"). Reconstruct the
-    // pointer inside the subprogram from `ctx.data() + ip_offset`.
-    let ip_offset = (ip as usize).saturating_sub(ctx.data());
-    mss_clamp_inline(ctx, ip_offset, is_v4, egress_ifindex);
+    mss_clamp_inline(ctx, ip, is_v4, egress_ifindex);
 
     // TTL/hop_limit + csum first — IP header's position in memory
     // doesn't change with adjust_head, only its offset from `data`.
@@ -694,62 +687,54 @@ const TCP_FLAG_SYN: u8 = 0x02;
 /// each iteration consumes at least 1 byte) so the BPF verifier
 /// accepts it without unrolling concerns.
 ///
-/// Deliberately NOT `#[inline(always)]` — this gets called from
-/// `forward_success`, which is itself inlined into the already-large
-/// `fast_path` XDP entry. Inlining mss_clamp pushes the cumulative
-/// stack frame past BPF's 512-byte limit (the link error is "Looks
-/// like the BPF stack limit is exceeded"). Letting LLVM emit it as a
-/// separate BPF subprogram gives it its own 512-byte stack budget.
+/// Marked `#[inline(always)]` deliberately. Two earlier attempts to
+/// split this into a subprogram (for stack budget) ran into the BPF
+/// kernel verifier rejecting the bpf2bpf calling convention LLVM
+/// emits: even when arguments are scalar, LLVM SROA decomposes
+/// `&XdpContext` into `(data, data_end)` packet pointers, and the
+/// verifier prohibits pointer-shift instructions on packet pointers
+/// (the lift LLVM emits to extend 32-bit→64-bit). Inlining is the
+/// only verifier-friendly option for code that touches the packet.
 ///
-/// Takes `ip_offset` (a scalar) rather than a packet pointer because
-/// BPF subprograms cannot accept packet pointers as arguments — the
-/// verifier rejects LLVM's pointer-lift instruction with "R1 pointer
-/// arithmetic with <<= operator prohibited". Reconstruct the pointer
-/// inside from `ctx.data() + ip_offset`, which the verifier tracks
-/// safely as a fresh packet-derived pointer with bounds checks.
-#[inline(never)]
-fn mss_clamp_inline(ctx: &XdpContext, ip_offset: usize, is_v4: bool, egress_ifindex: u32) {
+/// Stack trim: each LPM key is block-scoped so the compiler can
+/// reuse the same stack slot for src and dst keys rather than
+/// holding both live; lookup helpers are also `#[inline(always)]`
+/// for the same reason; src/dst addresses are read inside their
+/// respective LPM blocks rather than at the function top.
+#[inline(always)]
+fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: u32) {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    let ip_hdr_size = if is_v4 {
-        Ipv4Hdr::LEN
+    // Read protocol byte first — bail early on non-TCP, which is
+    // the overwhelmingly common case for fast-pathed traffic.
+    let proto = if is_v4 {
+        unsafe { (*(ip as *const Ipv4Hdr)).proto }
     } else {
-        Ipv6Hdr::LEN
+        unsafe { (*(ip as *const Ipv6Hdr)).next_hdr }
     };
-    if start + ip_offset + ip_hdr_size > end {
+    if proto != PROTO_TCP {
         return;
     }
 
-    let (tcp_offset, clamp) = if is_v4 {
-        let ipv4 = (start + ip_offset) as *const Ipv4Hdr;
-        let proto = unsafe { (*ipv4).proto };
-        if proto != PROTO_TCP {
-            return;
-        }
-        let src_addr = unsafe { (*ipv4).src_addr };
-        let dst_addr = unsafe { (*ipv4).dst_addr };
-        let tcp_off = ip_offset + Ipv4Hdr::LEN;
-        let clamp = lookup_mss_clamp_v4(src_addr, dst_addr, egress_ifindex);
-        (tcp_off, clamp)
+    // Look up clamp value via the precedence chain. Returns 0 if no
+    // policy applies. Helper is `#[inline(always)]`; its locals share
+    // this function's frame and are block-scoped for slot reuse.
+    let clamp = if is_v4 {
+        lookup_mss_clamp_v4(ip as *const Ipv4Hdr, egress_ifindex)
     } else {
-        let ipv6 = (start + ip_offset) as *const Ipv6Hdr;
-        let proto = unsafe { (*ipv6).next_hdr };
-        if proto != PROTO_TCP {
-            return;
-        }
-        let src_addr = unsafe { (*ipv6).src_addr };
-        let dst_addr = unsafe { (*ipv6).dst_addr };
-        let tcp_off = ip_offset + Ipv6Hdr::LEN;
-        let clamp = lookup_mss_clamp_v6(src_addr, dst_addr, egress_ifindex);
-        (tcp_off, clamp)
+        lookup_mss_clamp_v6(ip as *const Ipv6Hdr, egress_ifindex)
     };
-
-    // No policy applies; not even a "skipped" event since we never
-    // really considered this packet.
     if clamp == 0 {
         return;
     }
+
+    // Recover the IP-header offset so we can compute the TCP offset
+    // (and bounds-check) without holding `ip` as a separate pointer
+    // variable. ip - start is a scalar (pkt_a - pkt_b) per the
+    // verifier.
+    let ip_offset = (ip as usize) - start;
+    let tcp_offset = ip_offset + if is_v4 { Ipv4Hdr::LEN } else { Ipv6Hdr::LEN };
 
     // Need 20 bytes for the fixed TCP header before walking options.
     if start + tcp_offset + 20 > end {
@@ -877,22 +862,24 @@ fn csum_replace_u16(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
 /// Resolve the mss-clamp value for an IPv4 packet, in precedence
 /// order: src-prefix → dst-prefix → per-egress → global. Returns 0 if
 /// no policy applies. The LPM lookups respect each entry's
-/// `iface_filter` (0 = wildcard). Block-scope each key so LLVM can
-/// reuse the same stack slot rather than carrying both keys live —
-/// matters for the cumulative BPF 512-byte stack budget.
-#[inline(never)]
-fn lookup_mss_clamp_v4(src_addr: [u8; 4], dst_addr: [u8; 4], egress_ifindex: u32) -> u16 {
+/// `iface_filter` (0 = wildcard). Block-scope each Key + addr so LLVM
+/// can reuse the same stack slot rather than carrying both keys live
+/// — matters for the cumulative BPF 512-byte stack budget. Reads
+/// addresses through the IP-header pointer rather than taking them
+/// by value so the caller doesn't pre-materialize them on its frame.
+#[inline(always)]
+fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32) -> u16 {
     {
-        let src_key = Key::new(32, src_addr);
-        if let Some(entry) = MSS_CLAMP_V4.get(&src_key) {
+        let key = Key::new(32, unsafe { (*ip).src_addr });
+        if let Some(entry) = MSS_CLAMP_V4.get(&key) {
             if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
                 return entry.mss;
             }
         }
     }
     {
-        let dst_key = Key::new(32, dst_addr);
-        if let Some(entry) = MSS_CLAMP_V4.get(&dst_key) {
+        let key = Key::new(32, unsafe { (*ip).dst_addr });
+        if let Some(entry) = MSS_CLAMP_V4.get(&key) {
             if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
                 return entry.mss;
             }
@@ -910,19 +897,19 @@ fn lookup_mss_clamp_v4(src_addr: [u8; 4], dst_addr: [u8; 4], egress_ifindex: u32
 }
 
 /// IPv6 mirror of [`lookup_mss_clamp_v4`] — same precedence, /128 keys.
-#[inline(never)]
-fn lookup_mss_clamp_v6(src_addr: [u8; 16], dst_addr: [u8; 16], egress_ifindex: u32) -> u16 {
+#[inline(always)]
+fn lookup_mss_clamp_v6(ip: *const Ipv6Hdr, egress_ifindex: u32) -> u16 {
     {
-        let src_key = Key::new(128, src_addr);
-        if let Some(entry) = MSS_CLAMP_V6.get(&src_key) {
+        let key = Key::new(128, unsafe { (*ip).src_addr });
+        if let Some(entry) = MSS_CLAMP_V6.get(&key) {
             if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
                 return entry.mss;
             }
         }
     }
     {
-        let dst_key = Key::new(128, dst_addr);
-        if let Some(entry) = MSS_CLAMP_V6.get(&dst_key) {
+        let key = Key::new(128, unsafe { (*ip).dst_addr });
+        if let Some(entry) = MSS_CLAMP_V6.get(&key) {
             if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
                 return entry.mss;
             }
