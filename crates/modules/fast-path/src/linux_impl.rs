@@ -31,23 +31,27 @@ use crate::{aligned_bpf_copy, pin, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 /// with all-bit-patterns-valid primitive fields, so `aya::Pod` is safe
 /// to impl — the marker tells aya the struct is safe to byte-copy into
 /// the kernel's map buffer. Bytes-for-bytes match the BPF-side struct.
+///
+/// Layout V2 (v0.2.4): the formerly-`_reserved [u8; 2]` slot is now
+/// `mss_clamp_global: u16` — a global MSS clamp ceiling for matched
+/// TCP SYN/SYN-ACK packets. 0 = unset. Per-prefix and per-iface clamp
+/// maps take precedence over this fallback.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct FpCfg {
     pub dry_run: u8,
     pub flags: u8,
-    pub _reserved: [u8; 2],
+    pub mss_clamp_global: u16,
     pub version: u32,
 }
 
-// SAFETY: FpCfg is repr(C), contains only primitive integer types and
-// a fixed-size byte array — every bit pattern is a valid FpCfg. No
-// padding that could leak uninitialized memory (u8/u8/[u8;2]/u32 packs
-// exactly into 8 bytes on every target). Aya uses this to byte-copy
-// the struct into the kernel's array value slot.
+// SAFETY: FpCfg is repr(C), contains only primitive integer types
+// (u8/u8/u16/u32 packs exactly into 8 bytes on every target). Every
+// bit pattern is valid; aya uses this to byte-copy the struct into
+// the kernel's array value slot.
 unsafe impl aya::Pod for FpCfg {}
 
-pub(crate) const FP_CFG_VERSION_V1: u32 = 0;
+pub(crate) const FP_CFG_VERSION_V2: u32 = 1;
 
 /// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_HEAD_SHIFT_128`. Enables
 /// the pre-Linux-v6.8 rvu-nicpf `xdp_prepare_buff` workaround (SPEC
@@ -105,6 +109,23 @@ pub struct VlanResolve {
 
 // SAFETY: repr(C), all primitive fields, every bit pattern valid.
 unsafe impl aya::Pod for VlanResolve {}
+
+/// Layout mirror of `MssClampValue` in `bpf/src/maps.rs`. Value type
+/// for the `MSS_CLAMP_V4` / `MSS_CLAMP_V6` LPM tries. `#[repr(C)]`
+/// with explicit padding so the userspace and BPF layouts match
+/// byte-for-byte (8 bytes total).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MssClampValue {
+    pub mss: u16,
+    pub _pad: u16,
+    /// Egress ifindex required for this rule. 0 = match any.
+    pub iface_filter: u32,
+}
+
+// SAFETY: repr(C), all primitive fields, no internal padding leaks
+// (u16/u16/u32 packs exactly into 8 bytes).
+unsafe impl aya::Pod for MssClampValue {}
 
 /// All state required to keep the attached program alive.
 ///
@@ -201,6 +222,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
     populate_cfg(&mut ebpf, cfg)?;
     populate_allowlists(&mut ebpf, cfg)?;
     populate_blocklists(&mut ebpf, cfg)?;
+    populate_mss_clamp(&mut ebpf, cfg)?;
     populate_fib_config(&mut ebpf, cfg)?;
 
     Ok(ActiveState {
@@ -255,6 +277,12 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         .unwrap_or_default();
     let fib_flags = fib_flags_from_forwarding_mode(forwarding);
 
+    // Global mss-clamp value from `mss-clamp <mtu>` (no prefix, no
+    // iface). Per-prefix and per-iface clamps live in their own maps
+    // populated by `populate_mss_clamp` and take precedence over this
+    // CFG fallback. 0 = unset.
+    let mss_clamp_global = mss_clamp_global_value(&mcfg.section.directives).unwrap_or(0);
+
     let fp_cfg = FpCfg {
         dry_run: u8::from(dry_run),
         // bits 0-1: IPv4/IPv6 enabled (historical, load-bearing for
@@ -262,8 +290,8 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         // bit 2 (HEAD_SHIFT_128) is OR'd on later in
         // apply_driver_quirks_cfg for rvu-nicpf attaches.
         flags: 0b11 | fib_flags,
-        _reserved: [0; 2],
-        version: FP_CFG_VERSION_V1,
+        mss_clamp_global,
+        version: FP_CFG_VERSION_V2,
     };
 
     let map = ebpf
@@ -467,6 +495,165 @@ fn prefix_contains(outer: &Ipv4Prefix, inner: &Ipv4Prefix) -> bool {
         (!0u32) << (32 - outer.prefix_len as u32)
     };
     (u32::from(outer.addr) & mask) == (u32::from(inner.addr) & mask)
+}
+
+/// Extract the global `mss-clamp <mtu>` directive (the form with no
+/// prefix and no `via <iface>` qualifier). Returns the MSS value or
+/// `None` if no such directive exists. Shared between `populate_cfg`
+/// (initial load) and `reconcile::reconcile_cfg` (SIGHUP) so both
+/// agree on which directive is "the global one." v0.2.4+.
+pub(crate) fn mss_clamp_global_value(directives: &[ModuleDirective]) -> Option<u16> {
+    directives.iter().find_map(|d| match d {
+        ModuleDirective::MssClamp {
+            prefix: None,
+            iface: None,
+            mss,
+            ..
+        } => Some(*mss),
+        _ => None,
+    })
+}
+
+/// Populate `MSS_CLAMP_V4`, `MSS_CLAMP_V6`, and `MSS_CLAMP_BY_IFACE`
+/// from any `mss-clamp` directives in the module config. The global
+/// (`mss-clamp <mtu>`) form is handled in `populate_cfg` via the
+/// `FpCfg.mss_clamp_global` field; this function handles the three
+/// scoped forms — per-prefix, per-iface, and per-prefix-+-iface.
+/// Empty / no directives → all maps stay empty (LPM lookups miss
+/// cheaply, no per-packet overhead).
+fn populate_mss_clamp(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    use packetframe_common::config::MssClampPrefix;
+
+    // Collect (prefix, iface_filter, mss) triples, splitting by family.
+    let mut v4_entries: Vec<([u8; 4], u8, u32, u16)> = Vec::new();
+    let mut v6_entries: Vec<([u8; 16], u8, u32, u16)> = Vec::new();
+    let mut iface_entries: Vec<(String, u16)> = Vec::new();
+
+    for d in &mcfg.section.directives {
+        let ModuleDirective::MssClamp {
+            prefix,
+            iface,
+            mss,
+            line,
+        } = d
+        else {
+            continue;
+        };
+        // Resolve `via <iface>` to ifindex if present. Missing ifaces
+        // are fatal at load — the operator declared a clamp on an
+        // iface that doesn't exist, which is almost certainly a typo.
+        let iface_filter: u32 = match iface {
+            Some(name) => if_nametoindex(name).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!("mss-clamp at line {line}: iface `{name}` lookup failed: {e}",),
+                )
+            })?,
+            None => 0,
+        };
+        match (prefix, iface) {
+            (Some(MssClampPrefix::V4(p)), _) => {
+                v4_entries.push((p.addr.octets(), p.prefix_len, iface_filter, *mss));
+            }
+            (Some(MssClampPrefix::V6(p)), _) => {
+                v6_entries.push((p.addr.octets(), p.prefix_len, iface_filter, *mss));
+            }
+            (None, Some(name)) => {
+                iface_entries.push((name.clone(), *mss));
+            }
+            (None, None) => {
+                // Global — handled by populate_cfg; skip here.
+            }
+        }
+    }
+
+    // IPv4 LPM trie.
+    if !v4_entries.is_empty() {
+        let map = ebpf
+            .map_mut("MSS_CLAMP_V4")
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "MSS_CLAMP_V4 map missing from ELF"))?;
+        let mut trie: LpmTrie<_, [u8; 4], MssClampValue> = LpmTrie::try_from(map)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("MSS_CLAMP_V4 try_from: {e}")))?;
+        for (addr, plen, iface_filter, mss) in &v4_entries {
+            let key = LpmKey::new(u32::from(*plen), *addr);
+            let value = MssClampValue {
+                mss: *mss,
+                _pad: 0,
+                iface_filter: *iface_filter,
+            };
+            trie.insert(&key, value, 0).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!(
+                        "MSS_CLAMP_V4 insert {}/{}: {e}",
+                        std::net::Ipv4Addr::from(*addr),
+                        plen
+                    ),
+                )
+            })?;
+        }
+    }
+
+    // IPv6 LPM trie.
+    if !v6_entries.is_empty() {
+        let map = ebpf
+            .map_mut("MSS_CLAMP_V6")
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "MSS_CLAMP_V6 map missing from ELF"))?;
+        let mut trie: LpmTrie<_, [u8; 16], MssClampValue> = LpmTrie::try_from(map)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("MSS_CLAMP_V6 try_from: {e}")))?;
+        for (addr, plen, iface_filter, mss) in &v6_entries {
+            let key = LpmKey::new(u32::from(*plen), *addr);
+            let value = MssClampValue {
+                mss: *mss,
+                _pad: 0,
+                iface_filter: *iface_filter,
+            };
+            trie.insert(&key, value, 0).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!(
+                        "MSS_CLAMP_V6 insert {}/{}: {e}",
+                        std::net::Ipv6Addr::from(*addr),
+                        plen
+                    ),
+                )
+            })?;
+        }
+    }
+
+    // Per-iface table.
+    if !iface_entries.is_empty() {
+        let map = ebpf.map_mut("MSS_CLAMP_BY_IFACE").ok_or_else(|| {
+            ModuleError::other(MODULE_NAME, "MSS_CLAMP_BY_IFACE map missing from ELF")
+        })?;
+        let mut hm: AyaHashMap<_, u32, u16> = AyaHashMap::try_from(map).map_err(|e| {
+            ModuleError::other(MODULE_NAME, format!("MSS_CLAMP_BY_IFACE try_from: {e}"))
+        })?;
+        for (name, mss) in &iface_entries {
+            let ifindex = if_nametoindex(name).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!("mss-clamp via {name}: ifindex lookup failed: {e}"),
+                )
+            })?;
+            hm.insert(ifindex, mss, 0).map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!("MSS_CLAMP_BY_IFACE insert {name}({ifindex}): {e}"),
+                )
+            })?;
+        }
+    }
+
+    if !v4_entries.is_empty() || !v6_entries.is_empty() || !iface_entries.is_empty() {
+        info!(
+            v4_count = v4_entries.len(),
+            v6_count = v6_entries.len(),
+            iface_count = iface_entries.len(),
+            "mss-clamp policy populated"
+        );
+    }
+    Ok(())
 }
 
 pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {

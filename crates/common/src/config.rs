@@ -205,6 +205,28 @@ pub enum ModuleDirective {
         cidr: Ipv4Prefix,
         line: usize,
     },
+    /// MSS clamping for matched TCP SYN/SYN-ACK packets (v0.2.4+).
+    /// Closes the SPEC §11.4 gap where iptables `TCPMSS` rules don't
+    /// fire on fast-pathed flows because XDP redirect bypasses
+    /// netfilter. Four grammars:
+    ///
+    /// - `mss-clamp <mtu>` — global default for all matched TCP SYNs
+    /// - `mss-clamp via <iface> <mtu>` — per-egress-iface
+    /// - `mss-clamp <cidr> <mtu>` — per-src-or-dst-prefix (any egress)
+    /// - `mss-clamp <cidr> via <iface> <mtu>` — most specific
+    ///
+    /// Lookup precedence at XDP runtime, most specific wins:
+    /// `(prefix + iface)` then `prefix` then `iface` then `global`.
+    /// Prefix matches on src OR dst (mirrors `allow-prefix`).
+    /// Lower-if-higher policy — only rewrites when the SYN's existing
+    /// MSS is greater than the configured clamp (matches iptables
+    /// `TCPMSS --set-mss` semantics).
+    MssClamp {
+        prefix: Option<MssClampPrefix>,
+        iface: Option<String>,
+        mss: u16,
+        line: usize,
+    },
     DryRun(bool),
     CircuitBreaker(CircuitBreakerSpec),
     /// Operator override for a driver-specific workaround. Currently
@@ -235,6 +257,16 @@ pub enum ModuleDirective {
     /// Default ECMP hash tuple width (3, 4, or 5). Written into
     /// `FIB_CONFIG.default_hash_mode` at load time.
     EcmpDefaultHashMode(EcmpHashMode),
+}
+
+/// One side of the [`ModuleDirective::MssClamp`] discriminator —
+/// either an IPv4 or IPv6 prefix. Userspace dispatches on this when
+/// populating the `MSS_CLAMP_V4` / `MSS_CLAMP_V6` LPM tries.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase", tag = "family", content = "cidr")]
+pub enum MssClampPrefix {
+    V4(Ipv4Prefix),
+    V6(Ipv6Prefix),
 }
 
 /// Forwarding-path selector. `KernelFib` keeps today's behavior —
@@ -888,6 +920,100 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .parse()
                 .map_err(|e: String| ConfigError::parse(line, e))?;
             Ok(ModuleDirective::BlockPrefix { cidr: p, line })
+        }
+        "mss-clamp" => {
+            // v0.2.4+ — four grammars accepted:
+            //   mss-clamp <mtu>
+            //   mss-clamp via <iface> <mtu>
+            //   mss-clamp <cidr> <mtu>
+            //   mss-clamp <cidr> via <iface> <mtu>
+            //
+            // Disambiguation: a token containing `/` (CIDR delimiter)
+            // is treated as a prefix; the literal `via` introduces an
+            // egress-iface scope; otherwise the token is the MSS
+            // value. SPEC §4.x.
+            let tok1 = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "mss-clamp requires at least an MTU value \
+                     (form: `mss-clamp [<cidr>] [via <iface>] <mtu>`)",
+                )
+            })?;
+            let mut prefix: Option<MssClampPrefix> = None;
+            let mut iface: Option<String> = None;
+            let mss_tok: &str;
+
+            if tok1 == "via" {
+                // mss-clamp via <iface> <mtu>
+                let iface_tok = rest.next().ok_or_else(|| {
+                    ConfigError::parse(line, "mss-clamp: expected an iface name after `via`")
+                })?;
+                iface = Some(iface_tok.to_string());
+                mss_tok = rest.next().ok_or_else(|| {
+                    ConfigError::parse(line, "mss-clamp: expected an MTU value after the iface")
+                })?;
+            } else if tok1.contains('/') {
+                // mss-clamp <cidr> [via <iface>] <mtu>
+                if let Ok(p) = tok1.parse::<Ipv4Prefix>() {
+                    prefix = Some(MssClampPrefix::V4(p));
+                } else if let Ok(p) = tok1.parse::<Ipv6Prefix>() {
+                    prefix = Some(MssClampPrefix::V6(p));
+                } else {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!(
+                            "mss-clamp: cannot parse `{tok1}` as IPv4 or IPv6 CIDR \
+                             (form: `mss-clamp [<cidr>] [via <iface>] <mtu>`)"
+                        ),
+                    ));
+                }
+                let next_tok = rest.next().ok_or_else(|| {
+                    ConfigError::parse(line, "mss-clamp: expected `via <iface>` or an MTU value")
+                })?;
+                if next_tok == "via" {
+                    let iface_tok = rest.next().ok_or_else(|| {
+                        ConfigError::parse(line, "mss-clamp: expected an iface name after `via`")
+                    })?;
+                    iface = Some(iface_tok.to_string());
+                    mss_tok = rest.next().ok_or_else(|| {
+                        ConfigError::parse(line, "mss-clamp: expected an MTU value after the iface")
+                    })?;
+                } else {
+                    mss_tok = next_tok;
+                }
+            } else {
+                // mss-clamp <mtu>
+                mss_tok = tok1;
+            }
+
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "mss-clamp: too many arguments \
+                     (form: `mss-clamp [<cidr>] [via <iface>] <mtu>`)",
+                ));
+            }
+
+            let mss: u16 = mss_tok.parse().map_err(|e| {
+                ConfigError::parse(line, format!("mss-clamp: bad MTU `{mss_tok}`: {e}"))
+            })?;
+            // 88 = TCP/IP minimum (RFC 879/1122 — 40-byte v4+TCP
+            // header on a 128-byte frame, less than 88 starts breaking
+            // assumptions). 65495 = max ethernet payload minus a v4 +
+            // TCP header (65535 - 40). Outside this range is almost
+            // certainly a config typo.
+            if !(88..=65495).contains(&mss) {
+                return Err(ConfigError::parse(
+                    line,
+                    format!("mss-clamp: MTU {mss} out of range [88, 65495]"),
+                ));
+            }
+            Ok(ModuleDirective::MssClamp {
+                prefix,
+                iface,
+                mss,
+                line,
+            })
         }
         "dry-run" => {
             let v = rest
@@ -2202,5 +2328,147 @@ module fast-path
     fn block_prefix_extra_arg_errors() {
         let e = parse_module_body("  block-prefix 10.0.0.0/8 something\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    // --- mss-clamp tests (v0.2.4+) ----------------------------------
+
+    fn extract_mss_clamps(m: &ModuleSection) -> Vec<(Option<MssClampPrefix>, Option<String>, u16)> {
+        m.directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::MssClamp {
+                    prefix, iface, mss, ..
+                } => Some((*prefix, iface.clone(), *mss)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mss_clamp_global_form() {
+        let m = parse_module_body("  mss-clamp 1360\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], (None, None, 1360));
+    }
+
+    #[test]
+    fn mss_clamp_per_iface_form() {
+        let m = parse_module_body("  mss-clamp via eth2 1400\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].0, None);
+        assert_eq!(v[0].1.as_deref(), Some("eth2"));
+        assert_eq!(v[0].2, 1400);
+    }
+
+    #[test]
+    fn mss_clamp_per_prefix_v4() {
+        let m = parse_module_body("  mss-clamp 23.191.201.0/24 1280\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v.len(), 1);
+        match v[0].0.as_ref().unwrap() {
+            MssClampPrefix::V4(p) => {
+                assert_eq!(p.addr.octets(), [23, 191, 201, 0]);
+                assert_eq!(p.prefix_len, 24);
+            }
+            other => panic!("expected V4, got {other:?}"),
+        }
+        assert_eq!(v[0].1, None);
+        assert_eq!(v[0].2, 1280);
+    }
+
+    #[test]
+    fn mss_clamp_per_prefix_v6() {
+        let m = parse_module_body("  mss-clamp 2001:db8::/48 1280\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v.len(), 1);
+        match v[0].0.as_ref().unwrap() {
+            MssClampPrefix::V6(p) => assert_eq!(p.prefix_len, 48),
+            other => panic!("expected V6, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mss_clamp_prefix_plus_iface() {
+        let m = parse_module_body("  mss-clamp 23.191.201.0/24 via eth2 1280\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v.len(), 1);
+        assert!(matches!(v[0].0, Some(MssClampPrefix::V4(_))));
+        assert_eq!(v[0].1.as_deref(), Some("eth2"));
+        assert_eq!(v[0].2, 1280);
+    }
+
+    #[test]
+    fn mss_clamp_multiple_lines_accumulate() {
+        let body = "  mss-clamp 1360\n\
+                    mss-clamp via eth2 1400\n\
+                    mss-clamp 23.191.201.0/24 1280\n";
+        let m = parse_module_body(body).expect("parse");
+        assert_eq!(extract_mss_clamps(&m).len(), 3);
+    }
+
+    #[test]
+    fn mss_clamp_missing_value_errors() {
+        let e = parse_module_body("  mss-clamp\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn mss_clamp_missing_iface_after_via_errors() {
+        let e = parse_module_body("  mss-clamp via\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn mss_clamp_missing_value_after_iface_errors() {
+        let e = parse_module_body("  mss-clamp via eth2\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn mss_clamp_value_below_minimum_errors() {
+        // 87 is below the 88 floor.
+        let e = parse_module_body("  mss-clamp 87\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn mss_clamp_value_above_maximum_errors() {
+        // 65496 is above the 65495 ceiling.
+        let e = parse_module_body("  mss-clamp 65496\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn mss_clamp_ip_without_cidr_errors() {
+        // `10.0.0.0` (no `/` slash) → parser treats it as the MSS
+        // value position, then sees `1360` as an unexpected extra
+        // arg. The error message isn't pretty but the directive is
+        // rejected, which is what matters.
+        let e = parse_module_body("  mss-clamp 10.0.0.0 1360\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }), "got: {e:?}");
+    }
+
+    #[test]
+    fn mss_clamp_extra_arg_errors() {
+        let e = parse_module_body("  mss-clamp 1360 extra\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn mss_clamp_value_at_minimum_accepted() {
+        let m = parse_module_body("  mss-clamp 88\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v[0].2, 88);
+    }
+
+    #[test]
+    fn mss_clamp_value_at_maximum_accepted() {
+        let m = parse_module_body("  mss-clamp 65495\n").expect("parse");
+        let v = extract_mss_clamps(&m);
+        assert_eq!(v[0].2, 65495);
     }
 }

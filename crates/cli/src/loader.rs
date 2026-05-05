@@ -38,6 +38,57 @@ pub enum RunError {
     Runtime(String),
 }
 
+/// Errors from `packetframe reconfigure`. Kept separate from
+/// [`RunError`] because the CLI maps each variant to a different exit
+/// code + log message — distinguishing "no daemon" from "daemon
+/// rejected the new config" matters for operator scripts. Most
+/// variants are Linux-only since the underlying signal/PID-file flow
+/// is Linux-only; the macOS dev build gates them behind a generic
+/// stub.
+#[derive(Debug, thiserror::Error)]
+pub enum ReconfigureError {
+    /// Config / pidfile / proc IO error — exit 2 (runtime).
+    #[error("{0}")]
+    Io(String),
+    /// PID file absent or stale — exit 1 (startup-style).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[error("{0}")]
+    DaemonNotRunning(String),
+    /// SIGHUP delivered, daemon ack'd, but the ack reported a parse
+    /// error or per-module reconcile failure. Exit 2 (runtime).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[error("{0}")]
+    DaemonRejected(String),
+    /// SIGHUP delivered but no ack within 5s. Daemon may be wedged.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[error("daemon did not acknowledge reconfigure within 5s")]
+    Timeout,
+}
+
+/// Sub-path under `state-dir` for the PID file. Written by the
+/// running `run` loop after attach succeeds; removed on clean exit.
+/// systemd's `PIDFile=` directive references the same path so the
+/// supervisor has a clean handle (also enables `Type=forking` later
+/// without protocol changes).
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+const PIDFILE_NAME: &str = "packetframe.pid";
+
+/// Sub-path under `state-dir` for the reconfigure ack marker. The
+/// daemon writes one line `OK <unix_ns>` after a successful SIGHUP
+/// reconcile or `ERR <unix_ns> <message>` on parse / per-module
+/// failure. The `packetframe reconfigure` CLI polls this file for
+/// up to 5s after sending SIGHUP and exits accordingly.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+const RECONFIGURE_MARKER_NAME: &str = "last-reconfigure.timestamp";
+
+/// Polling cadence + timeout for the CLI side of the reconfigure
+/// handshake. 5s is plenty: the SIGHUP handler is synchronous and
+/// finishes in ~tens of ms (mostly LPM-trie diffs).
+#[cfg(target_os = "linux")]
+const RECONFIGURE_POLL_INTERVAL_MS: u64 = 100;
+#[cfg(target_os = "linux")]
+const RECONFIGURE_TIMEOUT_MS: u64 = 5_000;
+
 pub fn run(config_path: &Path) -> Result<(), RunError> {
     let config = Config::from_file(config_path)
         .map_err(|e| RunError::Startup(format!("config parse: {e}")))?;
@@ -180,9 +231,25 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         }
     }
 
+    // Write the PID file now, after attach has fully succeeded and
+    // the breaker sampler is up. Doing it any earlier would expose
+    // operators (and systemd's PIDFile=) to a half-attached daemon.
+    // Clean-exit paths below remove it; an uncontrolled crash leaves
+    // it stale, which `packetframe reconfigure` detects via the
+    // /proc/<pid>/comm cross-check.
+    let pid_file_path = config.global.state_dir.join(PIDFILE_NAME);
+    if let Err(e) = write_pid_file(&pid_file_path) {
+        tracing::warn!(
+            path = %pid_file_path.display(),
+            error = %e,
+            "could not write PID file; `packetframe reconfigure` and `systemctl reload` will not work"
+        );
+    }
+
     tracing::info!("fast-path running — SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
-    let termination = drive_signal_loop(config_path, &mut modules).map_err(RunError::Runtime)?;
+    let termination = drive_signal_loop(config_path, &config.global.state_dir, &mut modules)
+        .map_err(RunError::Runtime)?;
 
     // Stop the exporter + breaker sampler(s) first so their final
     // writes complete before we touch module state.
@@ -215,7 +282,34 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             drop(modules);
         }
     }
+    // Best-effort PID file cleanup. Non-fatal — the file is harmless
+    // if left behind (PID will be unrecognized on re-validate).
+    if let Err(e) = std::fs::remove_file(&pid_file_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %pid_file_path.display(),
+                error = %e,
+                "could not remove PID file on exit"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Atomically write the current PID to `path`. Uses write-then-rename
+/// so a half-written file is never observed.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn write_pid_file(path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("pid.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        writeln!(f, "{}", std::process::id())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 /// Look through a module section's directives and return its
@@ -250,6 +344,7 @@ enum Termination {
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn drive_signal_loop(
     config_path: &Path,
+    state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
 ) -> Result<Termination, String> {
     use signal_hook::{
@@ -262,7 +357,7 @@ fn drive_signal_loop(
 
     for sig in signals.forever() {
         match sig {
-            SIGHUP => reconfigure_from_signal(config_path, modules),
+            SIGHUP => reconfigure_from_signal(config_path, state_dir, modules),
             SIGTERM | SIGINT => {
                 tracing::info!(signal = sig, "termination requested");
                 return Ok(Termination::ExitPreserveAttach);
@@ -280,24 +375,31 @@ fn drive_signal_loop(
 /// SIGHUP handler. Re-parses the config from `config_path` and calls
 /// `Module::reconfigure` on each loaded module. Parse failures and
 /// per-module reconfigure errors are logged and swallowed — a bad
-/// SIGHUP never kills the running data plane.
+/// SIGHUP never kills the running data plane. Writes an ack marker
+/// to `state_dir/last-reconfigure.timestamp` for the
+/// `packetframe reconfigure` CLI to poll.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn reconfigure_from_signal(
     config_path: &Path,
+    state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
 ) {
     use packetframe_common::module::ModuleConfig;
 
     tracing::info!(config = %config_path.display(), "SIGHUP received; reconfiguring");
 
+    let marker_path = state_dir.join(RECONFIGURE_MARKER_NAME);
+
     let new_config = match Config::from_file(config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "SIGHUP config parse failed; keeping current config");
+            write_reconfigure_marker(&marker_path, &format!("ERR parse: {e}"));
             return;
         }
     };
 
+    let mut failures: Vec<String> = Vec::new();
     for (name, module) in modules.iter_mut() {
         let section = match new_config.modules.iter().find(|m| &m.name == name) {
             Some(s) => s,
@@ -306,13 +408,182 @@ fn reconfigure_from_signal(
                     module = %name,
                     "module removed from config; reconfigure skipped (attach-set changes require restart)"
                 );
+                failures.push(format!("{name}: removed from config (restart required)"));
                 continue;
             }
         };
         let mcfg = ModuleConfig::new(section, &new_config.global);
         if let Err(e) = module.reconfigure(&mcfg) {
             tracing::warn!(module = %name, error = %e, "reconfigure failed");
+            failures.push(format!("{name}: {e}"));
         }
+    }
+
+    if failures.is_empty() {
+        write_reconfigure_marker(&marker_path, "OK");
+    } else {
+        write_reconfigure_marker(
+            &marker_path,
+            &format!("ERR module: {}", failures.join("; ")),
+        );
+    }
+}
+
+/// Append a timestamp + status line to the reconfigure marker file.
+/// Non-fatal on I/O error — the SIGHUP handler still completed its
+/// real work; the marker is just a hint to the CLI ack-poller.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn write_reconfigure_marker(path: &Path, status: &str) {
+    use std::io::Write;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        tracing::warn!(error = %e, "could not create reconfigure marker dir");
+        return;
+    }
+    let tmp = path.with_extension("timestamp.tmp");
+    let body = format!("{status} {now_ns}\n");
+    let r = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "could not write reconfigure marker");
+    }
+}
+
+/// CLI entry for `packetframe reconfigure <config>`. Reads the
+/// daemon's PID file from the configured `state-dir`, validates the
+/// running process, sends SIGHUP, and polls the ack-marker for up to
+/// 5s. See [`ReconfigureError`] for the failure axes.
+#[cfg(target_os = "linux")]
+pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
+    let config = Config::from_file(config_path)
+        .map_err(|e| ReconfigureError::Io(format!("config parse: {e}")))?;
+    let state_dir = &config.global.state_dir;
+    let pid_path = state_dir.join(PIDFILE_NAME);
+    let marker_path = state_dir.join(RECONFIGURE_MARKER_NAME);
+
+    let pid = read_pid_file(&pid_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ReconfigureError::DaemonNotRunning(format!(
+            "PID file not found at {} — daemon doesn't appear to be running",
+            pid_path.display()
+        )),
+        _ => ReconfigureError::Io(format!("read PID file {}: {e}", pid_path.display())),
+    })?;
+
+    // /proc/<pid>/comm cross-check defends against a stale PID file
+    // pointing at a recycled PID. The kernel truncates `comm` to 15
+    // chars + NUL; "packetframe" fits comfortably.
+    if !proc_comm_matches(pid, "packetframe") {
+        return Err(ReconfigureError::DaemonNotRunning(format!(
+            "PID {pid} from {} is not a packetframe process (stale pidfile?)",
+            pid_path.display()
+        )));
+    }
+
+    // Snapshot the marker mtime (or NotFound) before signaling so we
+    // can detect "changed since SIGHUP."
+    let pre_mtime = marker_mtime(&marker_path);
+
+    // SIGHUP. The daemon's signal loop picks it up synchronously and
+    // either reconciles or logs+writes ERR.
+    let rc = unsafe { libc::kill(pid, libc::SIGHUP) };
+    if rc != 0 {
+        return Err(ReconfigureError::Io(format!(
+            "kill -HUP {pid}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Poll for up to 5s.
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(RECONFIGURE_TIMEOUT_MS);
+    let interval = std::time::Duration::from_millis(RECONFIGURE_POLL_INTERVAL_MS);
+    loop {
+        let now_mtime = marker_mtime(&marker_path);
+        if now_mtime != pre_mtime && now_mtime.is_some() {
+            // The daemon ack'd. Read the body to distinguish OK from
+            // a parse-error or per-module reconcile failure.
+            return match std::fs::read_to_string(&marker_path) {
+                Ok(body) => parse_reconfigure_marker(&body),
+                Err(e) => Err(ReconfigureError::Io(format!(
+                    "read marker {}: {e}",
+                    marker_path.display()
+                ))),
+            };
+        }
+        if start.elapsed() >= timeout {
+            return Err(ReconfigureError::Timeout);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Non-Linux stub. The daemon can't actually run on non-Linux hosts
+/// (XDP is Linux-only), so reconfigure has nothing to talk to.
+#[cfg(not(target_os = "linux"))]
+pub fn reconfigure(_config_path: &Path) -> Result<(), ReconfigureError> {
+    Err(ReconfigureError::Io(
+        "reconfigure is Linux-only — the daemon cannot run on this host".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_pid_file(path: &Path) -> std::io::Result<libc::pid_t> {
+    let s = std::fs::read_to_string(path)?;
+    s.trim().parse::<libc::pid_t>().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("PID parse `{}`: {e}", s.trim()),
+        )
+    })
+}
+
+/// Read /proc/<pid>/comm and check that it matches `expected`.
+/// Returns false on any I/O error or mismatch — caller treats as
+/// "PID is not our process."
+#[cfg(target_os = "linux")]
+fn proc_comm_matches(pid: libc::pid_t, expected: &str) -> bool {
+    let path = format!("/proc/{pid}/comm");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim() == expected,
+        Err(_) => false,
+    }
+}
+
+/// Modified time of the marker file, in (secs, nanos). `None` if the
+/// file doesn't exist — used to detect "freshly written since
+/// SIGHUP." Any non-NotFound error is treated as "no observation,"
+/// which causes the poller to keep waiting until timeout.
+#[cfg(target_os = "linux")]
+fn marker_mtime(path: &Path) -> Option<(i64, u32)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let m = meta.modified().ok()?;
+    let dur = m.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((dur.as_secs() as i64, dur.subsec_nanos()))
+}
+
+/// Parse the marker body — `OK <ns>` or `ERR <category>: <message>`.
+#[cfg(target_os = "linux")]
+fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
+    let trimmed = body.trim();
+    if let Some(rest) = trimmed.strip_prefix("OK ") {
+        // Rest is just the timestamp; we don't use it.
+        let _ = rest;
+        Ok(())
+    } else if let Some(rest) = trimmed.strip_prefix("ERR ") {
+        Err(ReconfigureError::DaemonRejected(rest.to_string()))
+    } else {
+        // Marker exists but doesn't match the expected format.
+        Err(ReconfigureError::Io(format!(
+            "unexpected marker content: {trimmed}"
+        )))
     }
 }
 

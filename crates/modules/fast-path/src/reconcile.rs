@@ -23,8 +23,8 @@ use packetframe_common::{
 use tracing::{info, warn};
 
 use crate::linux_impl::{
-    fib_flags_from_forwarding_mode, if_nametoindex, read_vlan_config, ActiveState, FpCfg,
-    VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_VERSION_V1,
+    fib_flags_from_forwarding_mode, if_nametoindex, mss_clamp_global_value, read_vlan_config,
+    ActiveState, FpCfg, MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -39,6 +39,9 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     reconcile_cfg(state, cfg)?;
     let v4 = reconcile_allow_v4(state, cfg)?;
     let v6 = reconcile_allow_v6(state, cfg)?;
+    let block_v4 = reconcile_block_v4(state, cfg)?;
+    let block_v6 = reconcile_block_v6(state, cfg)?;
+    let mss_clamp = reconcile_mss_clamp(state, cfg)?;
     let vlan = reconcile_vlan_resolve(state)?;
     let devmap = reconcile_devmap(state)?;
 
@@ -47,6 +50,16 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         v4_removed = v4.removed,
         v6_added = v6.added,
         v6_removed = v6.removed,
+        block_v4_added = block_v4.added,
+        block_v4_removed = block_v4.removed,
+        block_v6_added = block_v6.added,
+        block_v6_removed = block_v6.removed,
+        mss_v4_added = mss_clamp.0.added,
+        mss_v4_removed = mss_clamp.0.removed,
+        mss_v6_added = mss_clamp.1.added,
+        mss_v6_removed = mss_clamp.1.removed,
+        mss_iface_added = mss_clamp.2.added,
+        mss_iface_removed = mss_clamp.2.removed,
         vlan_added = vlan.added,
         vlan_removed = vlan.removed,
         devmap_added = devmap.added,
@@ -94,11 +107,13 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
     let head_shift = current.flags & FP_CFG_FLAG_HEAD_SHIFT_128;
 
+    let mss_clamp_global = mss_clamp_global_value(&cfg.section.directives).unwrap_or(0);
+
     let new_cfg = FpCfg {
         dry_run: u8::from(dry_run),
         flags: 0b11 | head_shift | fib_flags_from_forwarding_mode(forwarding),
-        _reserved: [0; 2],
-        version: FP_CFG_VERSION_V1,
+        mss_clamp_global,
+        version: FP_CFG_VERSION_V2,
     };
 
     cfg_arr
@@ -322,4 +337,259 @@ fn ifindex_exists(ifindex: u32) -> bool {
     }
     let c = unsafe { std::ffi::CStr::from_ptr(ptr) };
     !c.to_bytes().is_empty()
+}
+
+// --- v0.2.4 additions: block-prefix + mss-clamp reconcile -----------------
+
+/// IPv4 block-prefix delta. Mirrors `reconcile_allow_v4` against the
+/// `BLOCK_V4` LPM trie. Closes the v0.2.1 gap where adding/removing
+/// `block-prefix` lines required a full restart.
+fn reconcile_block_v4(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<DeltaCount> {
+    let desired: HashSet<(u32, [u8; 4])> = cfg
+        .section
+        .directives
+        .iter()
+        .filter_map(|d| match d {
+            ModuleDirective::BlockPrefix { cidr, .. } => {
+                Some((u32::from(cidr.prefix_len), cidr.addr.octets()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let map = state
+        .ebpf
+        .map_mut("BLOCK_V4")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "BLOCK_V4 map missing from ELF"))?;
+    let mut trie: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("BLOCK_V4 try_from: {e}")))?;
+
+    let current: HashSet<(u32, [u8; 4])> = trie
+        .keys()
+        .filter_map(Result::ok)
+        .map(|k| (k.prefix_len(), k.data()))
+        .collect();
+
+    apply_prefix_delta::<[u8; 4]>(&mut trie, &desired, &current, "BLOCK_V4")
+}
+
+/// IPv6 block-prefix delta. Mirrors `reconcile_allow_v6`. Currently
+/// the BPF-side `BLOCK_V6` is consulted but the v0.2.1 grammar only
+/// has `block-prefix` for IPv4 (no `block-prefix6` directive); this
+/// path always converges to "remove anything left over" until the v6
+/// directive lands. Cheap to keep wired up so the reconcile flow is
+/// symmetric.
+fn reconcile_block_v6(
+    state: &mut ActiveState,
+    _cfg: &ModuleConfig<'_>,
+) -> ModuleResult<DeltaCount> {
+    let desired: HashSet<(u32, [u8; 16])> = HashSet::new();
+
+    let map = state
+        .ebpf
+        .map_mut("BLOCK_V6")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "BLOCK_V6 map missing from ELF"))?;
+    let mut trie: LpmTrie<_, [u8; 16], u8> = LpmTrie::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("BLOCK_V6 try_from: {e}")))?;
+
+    let current: HashSet<(u32, [u8; 16])> = trie
+        .keys()
+        .filter_map(Result::ok)
+        .map(|k| (k.prefix_len(), k.data()))
+        .collect();
+
+    apply_prefix_delta::<[u8; 16]>(&mut trie, &desired, &current, "BLOCK_V6")
+}
+
+/// MSS-clamp delta across the three maps: `MSS_CLAMP_V4`, `MSS_CLAMP_V6`,
+/// `MSS_CLAMP_BY_IFACE`. Returns three [`DeltaCount`]s for the caller's
+/// log line. The value-bearing tries use re-insert-on-key semantics
+/// (any change to `mss` or `iface_filter` for an existing prefix
+/// re-writes the entry), then drop keys absent from the desired set.
+/// The global `mss-clamp <mtu>` form is updated via `reconcile_cfg`,
+/// not here.
+#[allow(clippy::type_complexity)]
+fn reconcile_mss_clamp(
+    state: &mut ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<(DeltaCount, DeltaCount, DeltaCount)> {
+    use packetframe_common::config::MssClampPrefix;
+
+    // Build desired sets keyed by prefix; values include both mss and
+    // iface_filter so we can detect changed-MSS-on-same-prefix.
+    let mut desired_v4: std::collections::HashMap<(u32, [u8; 4]), MssClampValue> =
+        std::collections::HashMap::new();
+    let mut desired_v6: std::collections::HashMap<(u32, [u8; 16]), MssClampValue> =
+        std::collections::HashMap::new();
+    let mut desired_iface: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+
+    for d in &cfg.section.directives {
+        let ModuleDirective::MssClamp {
+            prefix, iface, mss, ..
+        } = d
+        else {
+            continue;
+        };
+        let iface_filter: u32 = match iface {
+            Some(name) => match if_nametoindex(name) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!(iface = %name, error = %e, "mss-clamp reconcile: iface lookup failed; skipping rule");
+                    continue;
+                }
+            },
+            None => 0,
+        };
+        match (prefix, iface) {
+            (Some(MssClampPrefix::V4(p)), _) => {
+                desired_v4.insert(
+                    (u32::from(p.prefix_len), p.addr.octets()),
+                    MssClampValue {
+                        mss: *mss,
+                        _pad: 0,
+                        iface_filter,
+                    },
+                );
+            }
+            (Some(MssClampPrefix::V6(p)), _) => {
+                desired_v6.insert(
+                    (u32::from(p.prefix_len), p.addr.octets()),
+                    MssClampValue {
+                        mss: *mss,
+                        _pad: 0,
+                        iface_filter,
+                    },
+                );
+            }
+            (None, Some(_)) => {
+                desired_iface.insert(iface_filter, *mss);
+            }
+            (None, None) => {
+                // Global — handled by reconcile_cfg.
+            }
+        }
+    }
+
+    let v4_delta = reconcile_mss_lpm::<[u8; 4]>(state, &desired_v4, "MSS_CLAMP_V4")?;
+    let v6_delta = reconcile_mss_lpm::<[u8; 16]>(state, &desired_v6, "MSS_CLAMP_V6")?;
+    let iface_delta = reconcile_mss_iface(state, &desired_iface)?;
+
+    Ok((v4_delta, v6_delta, iface_delta))
+}
+
+/// Generic LPM-trie reconcile for the mss-clamp value type. Differs
+/// from `apply_prefix_delta` because the value (`MssClampValue`) is
+/// part of the desired-state comparison: re-inserts entries whose
+/// value changed even if the key already exists.
+fn reconcile_mss_lpm<K>(
+    state: &mut ActiveState,
+    desired: &std::collections::HashMap<(u32, K), MssClampValue>,
+    map_label: &str,
+) -> ModuleResult<DeltaCount>
+where
+    K: aya::Pod + Eq + std::hash::Hash + std::fmt::Debug + Clone + Copy,
+{
+    let map = state.ebpf.map_mut(map_label).ok_or_else(|| {
+        ModuleError::other(MODULE_NAME, format!("{map_label} map missing from ELF"))
+    })?;
+    let mut trie: LpmTrie<_, K, MssClampValue> = LpmTrie::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("{map_label} try_from: {e}")))?;
+
+    let current_keys: HashSet<(u32, K)> = trie
+        .keys()
+        .filter_map(Result::ok)
+        .map(|k| (k.prefix_len(), k.data()))
+        .collect();
+
+    let mut delta = DeltaCount::default();
+
+    // Insert/overwrite desired entries.
+    for ((len, data), value) in desired {
+        let key = LpmKey::new(*len, *data);
+        // Treat any insert as either an add (key not present) or an
+        // update (key present, value possibly changed). The delta
+        // counts adds only; updates are silent — operators see them
+        // as "0 added, 0 removed" and have to look at counters to
+        // confirm new values landed.
+        let was_present = current_keys.contains(&(*len, *data));
+        match trie.insert(&key, *value, 0) {
+            Ok(()) => {
+                if !was_present {
+                    delta.added += 1;
+                }
+            }
+            Err(e) => warn!(
+                map = map_label,
+                prefix_len = *len,
+                ?data,
+                error = %e,
+                "mss-clamp insert failed"
+            ),
+        }
+    }
+
+    // Remove keys absent from desired.
+    for (len, data) in &current_keys {
+        if !desired.contains_key(&(*len, *data)) {
+            let key = LpmKey::new(*len, *data);
+            match trie.remove(&key) {
+                Ok(()) => delta.removed += 1,
+                Err(e) => warn!(
+                    map = map_label,
+                    prefix_len = *len,
+                    ?data,
+                    error = %e,
+                    "mss-clamp remove failed"
+                ),
+            }
+        }
+    }
+
+    Ok(delta)
+}
+
+fn reconcile_mss_iface(
+    state: &mut ActiveState,
+    desired: &std::collections::HashMap<u32, u16>,
+) -> ModuleResult<DeltaCount> {
+    let map = state.ebpf.map_mut("MSS_CLAMP_BY_IFACE").ok_or_else(|| {
+        ModuleError::other(MODULE_NAME, "MSS_CLAMP_BY_IFACE map missing from ELF")
+    })?;
+    let mut hm: AyaHashMap<_, u32, u16> = AyaHashMap::try_from(map).map_err(|e| {
+        ModuleError::other(MODULE_NAME, format!("MSS_CLAMP_BY_IFACE try_from: {e}"))
+    })?;
+
+    let current_keys: HashSet<u32> = hm.keys().filter_map(Result::ok).collect();
+
+    let mut delta = DeltaCount::default();
+
+    for (ifindex, mss) in desired {
+        let was_present = current_keys.contains(ifindex);
+        match hm.insert(ifindex, mss, 0) {
+            Ok(()) => {
+                if !was_present {
+                    delta.added += 1;
+                }
+            }
+            Err(e) => warn!(
+                ifindex = *ifindex,
+                error = %e,
+                "MSS_CLAMP_BY_IFACE insert failed"
+            ),
+        }
+    }
+    for ifindex in &current_keys {
+        if !desired.contains_key(ifindex) {
+            match hm.remove(ifindex) {
+                Ok(()) => delta.removed += 1,
+                Err(e) => warn!(
+                    ifindex = *ifindex,
+                    error = %e,
+                    "MSS_CLAMP_BY_IFACE remove failed"
+                ),
+            }
+        }
+    }
+
+    Ok(delta)
 }

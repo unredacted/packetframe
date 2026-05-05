@@ -71,8 +71,13 @@ PacketFrame complements existing routing daemons rather than replacing them. The
 | Connected-destination fast-path (`local-prefix`) | Production (v0.2.1+) |
 | `fallback-default` synthesis | Production (v0.2.1+) |
 | `block-prefix` XDP-time drop | Production (v0.2.1+) |
+| `mss-clamp` directive (fast-path) | Production (v0.2.4+) |
+| `packetframe reconfigure` / `systemctl reload packetframe` | Production (v0.2.4+) |
 | `probe` module — diagnostic XDP | Production |
-| `randomizer` / `ddos` / `sampler` modules | Future — sketched in SPEC, not implemented |
+| `ddos` module — XDP-time SYN-flood + amplification filter | Future — sketched in SPEC §5.2 (priority 0–999, security/admission) |
+| `sampler` module — per-flow ringbuf observability | Future — sketched in SPEC §5.3 (priority 2000–2999, observation) |
+| `randomizer` module — TC egress jitter for NoiseNet anti-correlation | Future — sketched in SPEC §5.1 (priority ~3000, egress) |
+| Multi-module dispatcher (prerequisite for any second module on the same hook) | Future — module trait already shaped for it (SPEC §3.2 / §3.4) |
 
 ## Install
 
@@ -140,6 +145,9 @@ module fast-path
   allow-prefix6 2001:db8::/48
   dry-run on                       # observe-only — no redirects yet
   circuit-breaker drop-ratio 0.01 of matched window 5s threshold 5
+  # mss-clamp via eth0 1360       # optional — clamp TCP MSS for fast-pathed
+                                   # traffic egressing eth0 (closes the
+                                   # iptables-bypass MSS gap; v0.2.4+)
 ```
 
 `dry-run on` makes the program count matched packets but always return `XDP_PASS` — the kernel handles forwarding as if PacketFrame weren't there. Counters tell you whether your allowlist matches the right traffic before you flip the switch.
@@ -161,7 +169,14 @@ sudo packetframe status              # in another shell — live counters
 
 ### 5. Flip dry-run off when match ratios look right
 
-Edit the config, change `dry-run on` to `dry-run off`, then `sudo systemctl reload packetframe` (if running under systemd) or `kill -HUP <pid>` (foreground). The change is delta-only; no detach.
+Edit the config, change `dry-run on` to `dry-run off`, then trigger a reload (v0.2.4+):
+
+```sh
+sudo packetframe reconfigure                # synchronous; exits non-zero on parse error
+sudo systemctl reload packetframe           # equivalent under systemd — both end up sending SIGHUP
+```
+
+What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
 
 ### 6. Tear down
 
@@ -249,10 +264,16 @@ Quick directive index:
 - `block-prefix <cidr>` — XDP-time drop for unrouteable destinations
 - `ecmp-default-hash-mode {3|4|5}` — tuple width for ECMP hashing
 
+**Module fast-path — TCP transforms (v0.2.4+)**
+- `mss-clamp <mtu>` — global clamp ceiling for matched TCP SYN/SYN-ACK
+- `mss-clamp via <iface> <mtu>` — per-egress-iface
+- `mss-clamp <cidr> <mtu>` — per-src-or-dst-prefix (any egress)
+- `mss-clamp <cidr> via <iface> <mtu>` — most specific (precedence: prefix+iface > prefix > iface > global)
+
 **Module fast-path — driver opt-ins**
 - `driver-workaround rvu-nicpf-head-shift {auto|on|off}`
 
-`SIGHUP` reloads the config and applies delta-only changes to allowlists, VLAN-resolve, and devmap. Adding or removing an `attach` directive requires a restart.
+`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, and forwarding-mode bits. Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, or editing `local-prefix` requires a restart.
 
 ## Operator tools
 

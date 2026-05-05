@@ -14,7 +14,7 @@ use aya_ebpf::{
 /// Runtime flags poked by userspace via the `cfg` map. `version` is a
 /// reserved byte carved out now so future fields can be added without
 /// breaking userspace reads of older-layout BPF objects (SPEC §4.5 note:
-/// the `fp_cfg` struct has `...` — we enumerate exactly the v0.1 fields
+/// the `fp_cfg` struct has `...` — we enumerate exactly the fields
 /// plus a version discriminator).
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -24,21 +24,25 @@ pub struct FpCfg {
     /// Bit 0 = IPv4 enabled, bit 1 = IPv6 enabled. 0 disables both
     /// (pure dry-run passthrough). Reserved bits must be zero.
     pub flags: u8,
-    pub _reserved: [u8; 2],
-    /// Layout version. `0` = v0.1 layout (this file). Userspace rejects
-    /// loads if this doesn't match what it expects.
+    /// Global MSS clamp value (native u16). 0 = unset; per-prefix and
+    /// per-iface lookups in `MSS_CLAMP_V{4,6}` and `MSS_CLAMP_BY_IFACE`
+    /// take precedence over this fallback. v0.2.4+ (SPEC §4.x).
+    /// Slot was `_reserved` in v0.1; repurposed in layout V2.
+    pub mss_clamp_global: u16,
+    /// Layout version. `1` = v0.2.4 layout (this file). Userspace
+    /// rejects loads if this doesn't match what it expects.
     pub version: u32,
 }
 
 impl FpCfg {
-    pub const VERSION_V1: u32 = 0;
+    pub const VERSION_V2: u32 = 1;
 
     pub const fn zeroed() -> Self {
         Self {
             dry_run: 0,
             flags: 0b11,
-            _reserved: [0; 2],
-            version: Self::VERSION_V1,
+            mss_clamp_global: 0,
+            version: Self::VERSION_V2,
         }
     }
 }
@@ -119,11 +123,22 @@ pub enum StatIdx {
     /// Diagnostic counter so operators can see which/how many flows
     /// the bogon-block is catching.
     BogonDropped = 32,
+    /// v0.2.4: matched TCP SYN/SYN-ACK whose MSS option was rewritten
+    /// down to the configured clamp value (SPEC §4.x — closes §11.4
+    /// gap). Bumped per packet, not per flow.
+    MssClampApplied = 33,
+    /// v0.2.4: matched TCP SYN/SYN-ACK that hit a clamp lookup but was
+    /// NOT rewritten — either the existing MSS option was already ≤ the
+    /// clamp value (no-op), there was no MSS option in the SYN, or the
+    /// TCP-options walk hit its bounded cap before finding one. Useful
+    /// to gauge how often clamps are firing vs being skipped on existing
+    /// well-behaved traffic.
+    MssClampSkipped = 34,
 }
 
 /// Total counter count. Used as `stats` map `max_entries`. New counters
 /// bump this; dashboards keying on indices keep working.
-pub const STATS_COUNT: u32 = 33;
+pub const STATS_COUNT: u32 = 35;
 
 /// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
 /// mask (historical, load-bearing for dashboards). Bit 2 is the
@@ -163,6 +178,15 @@ const LOG_RINGBUF_BYTES: u32 = 256 * 1024;
 /// Max VLAN-subif entries. The reference EFG's agg-switch trunk carries
 /// VIDs 1/66/88/99/1337 + 3996..4040 — ~50. 256 is headroom.
 const VLAN_RESOLVE_MAX_ENTRIES: u32 = 256;
+
+/// Max prefixes per mss-clamp LPM trie. Sized like the allowlist; each
+/// `mss-clamp <cidr> [via <iface>] <mtu>` directive becomes one entry.
+const MSS_CLAMP_PREFIX_MAX_ENTRIES: u32 = 1024;
+
+/// Max per-egress mss-clamp entries. Sized like the redirect devmap —
+/// one entry per attached egress iface that has a `mss-clamp via X N`
+/// rule. 64 is comfortable for any non-container deployment.
+const MSS_CLAMP_IFACE_MAX_ENTRIES: u32 = 64;
 
 // --- Custom-FIB map sizes (Option F) -----------------------------------
 //
@@ -205,6 +229,27 @@ pub struct VlanResolve {
     pub phys_ifindex: u32,
     pub vid: u16,
     pub _pad: u16,
+}
+
+/// Value stored in the mss-clamp LPM tries. `mss` is a native u16
+/// clamp ceiling; `iface_filter` is an optional egress ifindex
+/// constraint (0 = wildcard, matches any egress). `#[repr(C)]` with
+/// explicit padding so userspace layout matches byte-for-byte.
+///
+/// Why a struct rather than a bare u16: lets a single LPM lookup
+/// answer both "prefix only" and "prefix + via iface" queries — the
+/// XDP path checks `iface_filter == 0 || iface_filter == egress_ifindex`
+/// without needing two separate tries. Userspace splats one entry per
+/// `mss-clamp <cidr> [via <iface>] <mtu>` directive.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MssClampValue {
+    /// Clamp ceiling, native u16 (host endian). Comparisons with the
+    /// wire MSS option value happen after a `from_be_bytes` conversion.
+    pub mss: u16,
+    pub _pad: u16,
+    /// Egress ifindex required for this rule to apply. 0 = match any.
+    pub iface_filter: u32,
 }
 
 // --- Custom FIB value layouts (Option F) -------------------------------
@@ -383,6 +428,29 @@ pub static REDIRECT_DEVMAP: DevMapHash =
 #[map]
 pub static VLAN_RESOLVE: HashMap<u32, VlanResolve> =
     HashMap::with_max_entries(VLAN_RESOLVE_MAX_ENTRIES, 0);
+
+/// IPv4 mss-clamp policy by src-or-dst prefix (v0.2.4+). XDP looks up
+/// the packet's src first, then dst, mirroring `allow-prefix` semantics.
+/// Each hit's `iface_filter` is checked against the resolved egress
+/// ifindex (0 = wildcard). Empty by default; populated only when the
+/// operator declares `mss-clamp <cidr> [via <iface>] <mtu>` lines.
+#[map]
+pub static MSS_CLAMP_V4: LpmTrie<[u8; 4], MssClampValue> =
+    LpmTrie::with_max_entries(MSS_CLAMP_PREFIX_MAX_ENTRIES, 0);
+
+/// IPv6 mss-clamp policy by src-or-dst prefix.
+#[map]
+pub static MSS_CLAMP_V6: LpmTrie<[u8; 16], MssClampValue> =
+    LpmTrie::with_max_entries(MSS_CLAMP_PREFIX_MAX_ENTRIES, 0);
+
+/// Per-egress mss-clamp value (v0.2.4+). Keyed by FIB-resolved egress
+/// ifindex (pre-VLAN-resolve, so the operator's `mss-clamp via eth2.66`
+/// keys on the subif ifindex if that's what FIB returned). Value is
+/// the clamp ceiling as a native u16. Hash-keyed so high ifindex values
+/// don't waste memory.
+#[map]
+pub static MSS_CLAMP_BY_IFACE: HashMap<u32, u16> =
+    HashMap::with_max_entries(MSS_CLAMP_IFACE_MAX_ENTRIES, 0);
 
 // --- Custom-FIB maps (Option F, Phase 1) -------------------------------
 //
