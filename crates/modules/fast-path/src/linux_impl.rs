@@ -657,6 +657,29 @@ fn populate_mss_clamp(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<
 }
 
 pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
+    // v0.2.5: load `finalize` first so its FD is available for the
+    // MUTATION_PROGS[0] population below. Order matters: fast_path's
+    // tail_call into MUTATION_PROGS[0] must succeed on every packet
+    // from the moment fast_path is attached, so finalize has to be
+    // loaded + populated *before* the per-iface attach loop below.
+    {
+        let finalize_prog: &mut Xdp = state
+            .ebpf
+            .program_mut(pin::FINALIZE_PROGRAM_NAME)
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "finalize program missing from ELF"))?
+            .try_into()
+            .map_err(|e| {
+                ModuleError::other(MODULE_NAME, format!("finalize program not XDP: {e}"))
+            })?;
+        finalize_prog.load().map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("Xdp::load(finalize) failed (verifier rejection?): {e}"),
+            )
+        })?;
+    }
+    populate_mutation_progs(&mut state.ebpf)?;
+
     let prog: &mut Xdp = state
         .ebpf
         .program_mut("fast_path")
@@ -1170,18 +1193,26 @@ fn read_iface_driver(iface: &str) -> Option<String> {
 }
 
 fn pin_program_and_maps(state: &mut ActiveState) -> ModuleResult<()> {
-    let prog_path = pin::program_path(&state.bpffs_root);
-    {
+    // v0.2.5: pin both `fast_path` (the iface-attached XDP) and
+    // `finalize` (the tail-called second stage). Both pins survive
+    // SIGTERM per SPEC §8.5; on restart, `pin::has_existing_pins`
+    // sees both and refuses to start until operator runs `detach --all`.
+    for prog_name in [pin::PROGRAM_NAME, pin::FINALIZE_PROGRAM_NAME] {
+        let prog_path = pin::program_path_for(&state.bpffs_root, prog_name);
         let prog: &mut Xdp = state
             .ebpf
-            .program_mut(pin::PROGRAM_NAME)
-            .ok_or_else(|| ModuleError::other(MODULE_NAME, "fast_path program missing for pin"))?
+            .program_mut(prog_name)
+            .ok_or_else(|| {
+                ModuleError::other(MODULE_NAME, format!("{prog_name} program missing for pin"))
+            })?
             .try_into()
-            .map_err(|e| ModuleError::other(MODULE_NAME, format!("pin: program not XDP: {e}")))?;
+            .map_err(|e| {
+                ModuleError::other(MODULE_NAME, format!("pin: {prog_name} not XDP: {e}"))
+            })?;
         prog.pin(&prog_path).map_err(|e| {
             ModuleError::other(
                 MODULE_NAME,
-                format!("pin program at {}: {e}", prog_path.display()),
+                format!("pin {prog_name} at {}: {e}", prog_path.display()),
             )
         })?;
     }
@@ -1201,8 +1232,47 @@ fn pin_program_and_maps(state: &mut ActiveState) -> ModuleResult<()> {
 
     info!(
         pin_root = %pin::module_root(&state.bpffs_root).display(),
-        "program + maps pinned"
+        "fast_path + finalize programs + maps pinned"
     );
+    Ok(())
+}
+
+/// Populate `MUTATION_PROGS[0]` with `finalize`'s FD so fast_path's
+/// `bpf_tail_call(MUTATION_PROGS, 0)` resolves to it. Must run after
+/// `finalize.load()` (FD valid) and before `fast_path` attaches to any
+/// iface (otherwise an early packet would tail-call into an empty slot,
+/// trip ErrTailCall, and slow-path through the kernel).
+///
+/// v0.2.5+. Single program in slot 0 for now; future stages either
+/// replace slot 0 with a chain head or add to subsequent slots.
+fn populate_mutation_progs(ebpf: &mut Ebpf) -> ModuleResult<()> {
+    use aya::maps::ProgramArray;
+    use aya::programs::ProgramFd;
+
+    // Borrow scope: the ProgramFd has to outlive the ProgramArray::set
+    // call, but it borrows from `ebpf`. Open the ProgramFd first, then
+    // reborrow ebpf for the map.
+    let finalize_fd: ProgramFd = {
+        let prog: &Xdp = ebpf
+            .program(pin::FINALIZE_PROGRAM_NAME)
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "finalize program missing post-load"))?
+            .try_into()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("finalize not XDP: {e}")))?;
+        prog.fd()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("finalize fd: {e}")))?
+            .try_clone()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("finalize fd clone: {e}")))?
+    };
+
+    let map = ebpf
+        .map_mut("MUTATION_PROGS")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "MUTATION_PROGS map missing"))?;
+    let mut prog_array: ProgramArray<_> = ProgramArray::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("MUTATION_PROGS try_from: {e}")))?;
+    prog_array.set(0, &finalize_fd, 0).map_err(|e| {
+        ModuleError::other(MODULE_NAME, format!("MUTATION_PROGS.set(0, finalize): {e}"))
+    })?;
+    info!("MUTATION_PROGS[0] populated with finalize program FD");
     Ok(())
 }
 
@@ -1880,13 +1950,12 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
 fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
     stats: &aya::maps::PerCpuArray<T, u64>,
 ) -> ModuleResult<Vec<u64>> {
-    // `STATS_COUNT` in bpf/src/maps.rs. v0.2.0 = 32 (20 core + 12
-    // custom-FIB). v0.2.1 = 33 (added `bogon_dropped` for issue #33).
-    // Previous versions hardcoded 19 — an off-by-one that hid the
-    // `err_head_shift` counter from status readback. Keep this in
-    // lockstep with the BPF side or the last counters show zero
-    // unfairly.
-    const STATS_LEN: usize = 33;
+    // `STATS_COUNT` in bpf/src/maps.rs. Keep in lockstep with the BPF
+    // side or the last counters show zero unfairly. Prior versions
+    // hardcoded an off-by-one (19 hid `err_head_shift`; 33 hid
+    // `mss_clamp_*`); v0.2.5 = 37 (32 + bogon + 2 mss-clamp + 2
+    // tail-call diagnostics).
+    const STATS_LEN: usize = 37;
     let mut out = vec![0u64; STATS_LEN];
     for (idx, slot) in out.iter_mut().enumerate() {
         let values = stats
@@ -1895,6 +1964,43 @@ fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
         *slot = values.iter().copied().sum();
     }
     Ok(out)
+}
+
+/// Read `MUTATION_PROGS` from its bpffs pin and return whether slot 0
+/// is populated. Status command uses this to confirm the v0.2.5+
+/// tail-call chain (`fast_path` → `finalize`) is wired correctly.
+/// An empty slot means an attach-time bug in `populate_mutation_progs`;
+/// fast_path's `tail_call` will fail and bump `ErrTailCall` on every
+/// fast-pathed packet.
+///
+/// aya 0.13's ProgramArray exposes `indices()` (which keys are set)
+/// but not a getter that returns the populated `ProgramFd`/prog_id —
+/// the BPF_MAP_TYPE_PROG_ARRAY value is a kernel RawFd that becomes
+/// invalid outside the loader's process. We just report populated/
+/// empty here; operators can confirm prog_id via
+/// `bpftool prog show name finalize`.
+pub fn tail_call_chain_from_pin(bpffs_root: &Path) -> ModuleResult<bool> {
+    use aya::maps::{Map, MapData, ProgramArray};
+
+    let pin_path = pin::map_path(bpffs_root, "MUTATION_PROGS");
+    let map_data = MapData::from_pin(&pin_path).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("open MUTATION_PROGS pin at {}: {e}", pin_path.display()),
+        )
+    })?;
+    let map = Map::ProgramArray(map_data);
+    let prog_array: ProgramArray<_> = ProgramArray::try_from(map).map_err(|e| {
+        ModuleError::other(MODULE_NAME, format!("MUTATION_PROGS try_from pin: {e}"))
+    })?;
+    for idx in prog_array.indices() {
+        let key = idx
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("MUTATION_PROGS indices: {e}")))?;
+        if key == 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Accessor consumed by the bpffs-pin code in PR #6. For now,

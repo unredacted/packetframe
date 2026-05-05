@@ -747,6 +747,14 @@ pub fn status(config_path: &Path) -> Result<(), String> {
             Err(e) => return Err(format!("registry read: {e}")),
         }
 
+        // v0.2.5+ tail-call chain summary. Confirms MUTATION_PROGS[0]
+        // is populated with the `finalize` program FD; if empty,
+        // fast_path's tail_call hits ErrTailCall and traffic falls
+        // through to kernel slow-path. Operators see this immediately
+        // in the status output rather than chasing it via err counter.
+        #[cfg(target_os = "linux")]
+        print_tail_call_chain(&config.global.bpffs_root);
+
         // Live counter readback from the pinned STATS map. Works
         // whether or not the loader is running — the pin survives
         // process exit (§8.5).
@@ -758,13 +766,31 @@ pub fn status(config_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn print_tail_call_chain(bpffs_root: &Path) {
+    use packetframe_fast_path::tail_call_chain_from_pin;
+    println!();
+    println!("tail-call chain (from {}):", bpffs_root.display());
+    match tail_call_chain_from_pin(bpffs_root) {
+        Ok(true) => println!(
+            "  MUTATION_PROGS[0]: populated (finalize) — \
+             confirm prog_id via `bpftool prog show name finalize`"
+        ),
+        Ok(false) => println!(
+            "  MUTATION_PROGS[0]: <EMPTY> — fast_path's tail_call will fail; traffic \
+             falls to kernel slow-path. Restart packetframe to repopulate."
+        ),
+        Err(e) => eprintln!("  MUTATION_PROGS pin unavailable ({e}); loader may not be attached"),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn print_stats(bpffs_root: &Path) {
     // §4.6 counter names, indexed by `StatIdx` discriminants. Order
     // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
     // Append-only — adding new entries at the end is fine; renumbering
     // breaks dashboards. Indices 0-19 are the kernel-fib counter set;
     // 20-31 were appended in the Option F custom-FIB rollout (§4.11).
-    const NAMES: [&str; 33] = [
+    const NAMES: [&str; 37] = [
         "rx_total",
         "matched_v4",
         "matched_v6",
@@ -799,6 +825,12 @@ fn print_stats(bpffs_root: &Path) {
         "nexthop_seq_retry",
         "bmp_peer_down",
         "bogon_dropped",
+        // --- v0.2.4: mss-clamp ---
+        "mss_clamp_applied",
+        "mss_clamp_skipped",
+        // --- v0.2.5: two-stage datapath ---
+        "err_tail_call",
+        "err_mutation_ctx",
     ];
 
     print_fib_status(bpffs_root);

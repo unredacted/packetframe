@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 14] = [
+pub const MAP_NAMES: [&str; 19] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -44,10 +44,26 @@ pub const MAP_NAMES: [&str; 14] = [
     // pinned for uniform detach.
     "BLOCK_V4",
     "BLOCK_V6",
+    // --- v0.2.4: mss-clamp policy maps ---
+    "MSS_CLAMP_V4",
+    "MSS_CLAMP_V6",
+    "MSS_CLAMP_BY_IFACE",
+    // --- v0.2.5: two-stage datapath ---
+    "MUTATION_CTX",
+    "MUTATION_PROGS",
 ];
 
-/// The XDP program's pinned basename.
+/// The fast-path XDP program's pinned basename (attached per-iface).
 pub const PROGRAM_NAME: &str = "fast_path";
+
+/// The finalize XDP program's pinned basename (tail-called by fast_path
+/// via `MUTATION_PROGS[0]`; not directly attached). v0.2.5+.
+pub const FINALIZE_PROGRAM_NAME: &str = "finalize";
+
+/// All pinned program basenames in this module. Used by detach +
+/// `has_existing_pins` to walk every pinned program. Append-only; new
+/// programs go at the end.
+pub const PROGRAM_NAMES: [&str; 2] = [PROGRAM_NAME, FINALIZE_PROGRAM_NAME];
 
 pub fn module_root(bpffs_root: &Path) -> PathBuf {
     bpffs_root.join(MODULE_NAME)
@@ -67,6 +83,13 @@ pub fn links_dir(bpffs_root: &Path) -> PathBuf {
 
 pub fn program_path(bpffs_root: &Path) -> PathBuf {
     progs_dir(bpffs_root).join(PROGRAM_NAME)
+}
+
+/// Path for an arbitrary pinned program by basename. Used by the v0.2.5+
+/// pin lifecycle that walks `PROGRAM_NAMES` to pin both `fast_path` and
+/// `finalize`.
+pub fn program_path_for(bpffs_root: &Path, name: &str) -> PathBuf {
+    progs_dir(bpffs_root).join(name)
 }
 
 pub fn map_path(bpffs_root: &Path, name: &str) -> PathBuf {

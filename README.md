@@ -71,8 +71,9 @@ PacketFrame complements existing routing daemons rather than replacing them. The
 | Connected-destination fast-path (`local-prefix`) | Production (v0.2.1+) |
 | `fallback-default` synthesis | Production (v0.2.1+) |
 | `block-prefix` XDP-time drop | Production (v0.2.1+) |
-| `mss-clamp` directive (fast-path) | Production (v0.2.4+) |
+| `mss-clamp` directive (fast-path) | Production (v0.2.4+; per-prefix loads on stricter kernels in v0.2.5+) |
 | `packetframe reconfigure` / `systemctl reload packetframe` | Production (v0.2.4+) |
+| Two-stage BPF datapath (`fast_path` + `finalize` via `bpf_tail_call`) | Production (v0.2.5+) — see [docs/runbooks/tail-call-architecture.md](docs/runbooks/tail-call-architecture.md) |
 | `probe` module — diagnostic XDP | Production |
 | `ddos` module — XDP-time SYN-flood + amplification filter | Future — sketched in SPEC §5.2 (priority 0–999, security/admission) |
 | `sampler` module — per-flow ringbuf observability | Future — sketched in SPEC §5.3 (priority 2000–2999, observation) |
@@ -86,7 +87,7 @@ Releases are published on the [GitHub releases page](https://github.com/unredact
 ### Debian / Ubuntu (.deb)
 
 ```sh
-VERSION=v0.2.4
+VERSION=v0.2.5
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe_${VERSION#v}_${ARCH}.deb"
@@ -103,7 +104,7 @@ Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packet
 For musl-static deployments, non-Debian distros, or anything else:
 
 ```sh
-VERSION=v0.2.4
+VERSION=v0.2.5
 TARGET=aarch64-unknown-linux-gnu     # or: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
 
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe-${VERSION}-${TARGET}.tar.gz"
