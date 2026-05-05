@@ -23,7 +23,7 @@
 use std::os::fd::{AsFd, AsRawFd};
 
 use aya::{
-    maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, PerCpuArray},
+    maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, PerCpuArray, ProgramArray},
     programs::{ProgramFd, Xdp},
     Ebpf, Pod,
 };
@@ -116,18 +116,61 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Load + verify the fast-path program. Panics if BPF isn't built
-    /// or the kernel rejects it.
+    /// Load + verify both BPF programs (fast_path + finalize, v0.2.5+),
+    /// and populate `MUTATION_PROGS[0]` so fast_path's `bpf_tail_call`
+    /// jumps into finalize. Panics if BPF isn't built or the verifier
+    /// rejects either program.
+    ///
+    /// `bpf_prog_test_run` follows tail-calls — the kernel re-enters
+    /// its BPF dispatcher for the target program, so tests that issue
+    /// `harness.run(&packet)` see the verdict + mutations from the full
+    /// chain (fast_path → finalize) when the packet is a successful
+    /// forward.
     pub fn new() -> Self {
         let bytes = aligned_bpf_copy();
         let mut bpf = Ebpf::load(&bytes).expect("aya::Ebpf::load");
 
-        let prog: &mut Xdp = bpf
-            .program_mut("fast_path")
-            .expect("fast_path program present")
-            .try_into()
-            .expect("program is XDP-typed");
-        prog.load().expect("verifier accepts program");
+        // Load finalize first so its FD is available for the
+        // MUTATION_PROGS[0] population below.
+        {
+            let prog: &mut Xdp = bpf
+                .program_mut("finalize")
+                .expect("finalize program present")
+                .try_into()
+                .expect("finalize is XDP-typed");
+            prog.load().expect("verifier accepts finalize program");
+        }
+
+        // Then fast_path.
+        {
+            let prog: &mut Xdp = bpf
+                .program_mut("fast_path")
+                .expect("fast_path program present")
+                .try_into()
+                .expect("program is XDP-typed");
+            prog.load().expect("verifier accepts fast_path program");
+        }
+
+        // Populate the tail-call jump table.
+        {
+            let finalize_fd: ProgramFd = {
+                let prog: &Xdp = bpf
+                    .program("finalize")
+                    .expect("finalize program present")
+                    .try_into()
+                    .expect("finalize is XDP-typed");
+                prog.fd()
+                    .expect("finalize loaded")
+                    .try_clone()
+                    .expect("finalize fd dup")
+            };
+            let map = bpf.map_mut("MUTATION_PROGS").expect("MUTATION_PROGS map");
+            let mut prog_array: ProgramArray<_> =
+                ProgramArray::try_from(map).expect("ProgramArray try_from");
+            prog_array
+                .set(0, &finalize_fd, 0)
+                .expect("MUTATION_PROGS.set(0, finalize)");
+        }
 
         // Set a default cfg with dry_run=off and both families enabled.
         let mut harness = Self { bpf };

@@ -8,7 +8,7 @@
 
 use aya_ebpf::{
     macros::map,
-    maps::{Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, RingBuf},
+    maps::{Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, ProgramArray, RingBuf},
 };
 
 /// Runtime flags poked by userspace via the `cfg` map. `version` is a
@@ -134,11 +134,21 @@ pub enum StatIdx {
     /// to gauge how often clamps are firing vs being skipped on existing
     /// well-behaved traffic.
     MssClampSkipped = 34,
+    /// v0.2.5: fast-path's `bpf_tail_call` into `MUTATION_PROGS[0]`
+    /// returned an error (slot empty / invalid). Should be 0 in steady
+    /// state; non-zero means `populate_mutation_progs` failed at attach
+    /// time. fast_path falls back to XDP_PASS so traffic still flows
+    /// (kernel slow path) — the chain is fail-safe.
+    ErrTailCall = 35,
+    /// v0.2.5: finalize couldn't read the per-CPU `MUTATION_CTX`
+    /// scratch slot. Shouldn't happen — fast_path always writes before
+    /// tail_call. Diagnostic; finalize XDP_PASSes on this error.
+    ErrMutationCtx = 36,
 }
 
 /// Total counter count. Used as `stats` map `max_entries`. New counters
 /// bump this; dashboards keying on indices keep working.
-pub const STATS_COUNT: u32 = 35;
+pub const STATS_COUNT: u32 = 37;
 
 /// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
 /// mask (historical, load-bearing for dashboards). Bit 2 is the
@@ -250,6 +260,45 @@ pub struct MssClampValue {
     pub _pad: u16,
     /// Egress ifindex required for this rule to apply. 0 = match any.
     pub iface_filter: u32,
+}
+
+// --- Two-stage datapath: per-CPU mutation context (v0.2.5+) ------------
+
+/// Per-CPU scratch carrying decision state from `fast_path` (XDP, attached
+/// to ifaces) to `finalize` (XDP, tail-called by fast_path).
+///
+/// fast_path writes this immediately before `MUTATION_PROGS.tail_call(0)`;
+/// finalize reads it as its first action. The packet itself is preserved
+/// across the tail-call by the kernel (`xdp_buff` survives, mutations
+/// stick), but locally-computed scalars (FIB-resolved egress, ingress/egress
+/// VID, IP-header offset, family discriminator) need this side channel.
+///
+/// Per-CPU because the NAPI cycle is single-CPU; the read in finalize is
+/// guaranteed to see the write in fast_path with no synchronization.
+///
+/// 16 bytes, naturally aligned. Size + alignment is asserted in a
+/// userspace test (see `crates/modules/fast-path/src/linux_impl.rs`'s
+/// `MutationCtx` mirror).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MutationCtx {
+    /// FIB-resolved egress (pre-VLAN-resolve). Used by finalize for
+    /// VLAN_RESOLVE lookup, MSS_CLAMP_BY_IFACE lookup, and the final
+    /// `bpf_redirect_map` call.
+    pub egress_ifindex: u32,
+    /// Egress VLAN ID (from VLAN_RESOLVE in fast_path; 0 = untagged).
+    pub egress_vid: u16,
+    /// Ingress VLAN ID (from packet parse; 0 = untagged). Combined with
+    /// `egress_vid` drives the four-case VLAN choreography in finalize.
+    pub ingress_vid: u16,
+    /// Offset (bytes) from `ctx.data()` to the IP header. fast_path
+    /// already validated bounds; finalize uses this for mss-clamp's
+    /// TCP-header bounds check.
+    pub ip_offset: u32,
+    /// 1 = IPv4 packet, 0 = IPv6. Determines which IP-header struct
+    /// finalize casts to and which MSS_CLAMP map to consult.
+    pub is_v4: u8,
+    pub _pad: [u8; 3],
 }
 
 // --- Custom FIB value layouts (Option F) -------------------------------
@@ -451,6 +500,28 @@ pub static MSS_CLAMP_V6: LpmTrie<[u8; 16], MssClampValue> =
 #[map]
 pub static MSS_CLAMP_BY_IFACE: HashMap<u32, u16> =
     HashMap::with_max_entries(MSS_CLAMP_IFACE_MAX_ENTRIES, 0);
+
+// --- Two-stage datapath maps (v0.2.5+) ---------------------------------
+
+/// Per-CPU scratch carrying decision state from `fast_path` to `finalize`
+/// across `bpf_tail_call`. Single-element array; fast_path writes index 0
+/// before `tail_call`, finalize reads index 0 as its first action. Per-
+/// CPU avoids contention; NAPI cycle is single-CPU so the read sees the
+/// most recent write.
+#[map]
+pub static MUTATION_CTX: PerCpuArray<MutationCtx> = PerCpuArray::with_max_entries(1, 0);
+
+/// Tail-call jump table (v0.2.5+). fast_path tail_calls into slot 0 after
+/// classification + L2/TTL mutations. Slot 0 holds `finalize` today.
+/// Sized for 8 future stages (chained finalizers, alternate clamp
+/// strategies, future packet transforms) — slot count is BPF-load-time-
+/// fixed, so headroom here is cheap.
+///
+/// Tail-call into an empty slot returns an error to the caller; fast_path
+/// handles this by bumping `ErrTailCall` and returning XDP_PASS so traffic
+/// fails open to kernel slow-path rather than getting blackholed.
+#[map]
+pub static MUTATION_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
 
 // --- Custom-FIB maps (Option F, Phase 1) -------------------------------
 //

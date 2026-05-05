@@ -29,7 +29,8 @@ pub mod reconcile;
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::{
-    fib_status_from_pin, stats_from_pin, trial_attach_native, FibStatusSnapshot, TrialResult,
+    fib_status_from_pin, stats_from_pin, tail_call_chain_from_pin, trial_attach_native,
+    FibStatusSnapshot, TrialResult,
 };
 
 pub const MODULE_NAME: &str = "fast-path";
