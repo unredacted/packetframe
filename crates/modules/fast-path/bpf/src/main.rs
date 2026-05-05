@@ -13,11 +13,9 @@
 
 use aya_ebpf::{
     bindings::{
-        bpf_fib_lookup, bpf_fib_lookup__bindgen_ty_1, bpf_fib_lookup__bindgen_ty_2,
-        bpf_fib_lookup__bindgen_ty_3, bpf_fib_lookup__bindgen_ty_4,
-        bpf_fib_lookup__bindgen_ty_5, xdp_action, BPF_FIB_LKUP_RET_BLACKHOLE,
-        BPF_FIB_LKUP_RET_FRAG_NEEDED, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LKUP_RET_PROHIBIT,
-        BPF_FIB_LKUP_RET_SUCCESS, BPF_FIB_LKUP_RET_UNREACHABLE,
+        bpf_fib_lookup, xdp_action, BPF_FIB_LKUP_RET_BLACKHOLE, BPF_FIB_LKUP_RET_FRAG_NEEDED,
+        BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LKUP_RET_PROHIBIT, BPF_FIB_LKUP_RET_SUCCESS,
+        BPF_FIB_LKUP_RET_UNREACHABLE,
     },
     helpers::gen::{
         bpf_fib_lookup as fib_lookup_helper, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
@@ -252,53 +250,66 @@ fn handle_ipv4(
         return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, true, ingress_vid);
     }
 
-    // Build the FIB-lookup struct via a struct literal, NOT
-    // `mem::zeroed()`. LLVM lowers a 60-byte zero-init into a memset
-    // libcall that the BPF backend emits as a separate bpf-to-bpf
-    // function. Combined with v0.2.5's `bpf_tail_call`, that violates
-    // the kernel verifier's "tail_calls are not allowed in non-JITed
-    // programs with bpf-to-bpf calls" guard on UniFi 5.15, which runs
-    // BPF in interpreter mode. Each union is initialized via its
-    // largest variant so every byte is written explicitly — no memset
-    // libcall, no subprogram. See SPEC §11.x and the v0.2.5 UniFi
-    // post-mortem in tail-call-architecture.md.
-    let mut fib = bpf_fib_lookup {
-        family: AF_INET,
-        l4_protocol: proto,
-        sport,
-        dport,
-        __bindgen_anon_1: bpf_fib_lookup__bindgen_ty_1 {
-            tot_len: u16::from_be_bytes(unsafe { (*ip).tot_len }),
-        },
-        ifindex: unsafe { (*ctx.ctx).ingress_ifindex },
-        // 4-byte union: write the 4-byte `flowinfo` arm so all bytes
-        // are covered. For IPv4 the kernel only reads `tos` (the LSB),
-        // so put tos in the low byte and zero the rest.
-        __bindgen_anon_2: bpf_fib_lookup__bindgen_ty_2 {
-            flowinfo: unsafe { (*ip).tos } as u32,
-        },
-        // 16-byte unions: write the 16-byte `ipv6_*` arms. For IPv4
-        // the kernel reads the first 4 bytes as `ipv4_*`; that's the
-        // first u32 of the array, with the rest zero.
-        __bindgen_anon_3: bpf_fib_lookup__bindgen_ty_3 {
-            ipv6_src: [u32::from_ne_bytes(src_bytes), 0, 0, 0],
-        },
-        __bindgen_anon_4: bpf_fib_lookup__bindgen_ty_4 {
-            ipv6_dst: [u32::from_ne_bytes(dst_bytes), 0, 0, 0],
-        },
-        __bindgen_anon_5: bpf_fib_lookup__bindgen_ty_5 { tbid: 0 },
-        smac: [0; 6],
-        dmac: [0; 6],
-    };
+    // Build `bpf_fib_lookup` via `MaybeUninit` + selective field
+    // writes — NEVER as a struct literal with zero-padded arrays
+    // ([0; 6], [val, 0, 0, 0], etc.) and NEVER with `mem::zeroed()`.
+    //
+    // Why: LLVM's "merge stores" pass recognizes any run of adjacent
+    // zero stores and lowers them into a `memset` libcall. The BPF
+    // backend has no libc to link against, so memset becomes a
+    // separate BPF function — a bpf-to-bpf subprogram call. That
+    // combined with `bpf_tail_call` (which fast_path uses to enter
+    // finalize) trips the kernel verifier's
+    //     "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
+    // guard on kernels whose JIT returns false from
+    // `bpf_jit_supports_subprog_tailcalls()` (UniFi 5.15-ui-cn9670
+    // aarch64 is the canonical hit).
+    //
+    // We can't fix this with `#[no_mangle] #[inline(always)]` shim
+    // functions either: rustc warns "`#[inline]` is ignored on
+    // externally exported functions" and refuses to inline at the
+    // libcall site.
+    //
+    // The only reliable mitigation is to never produce the merge-able
+    // pattern in the first place. So: write each input field
+    // individually via raw pointer; leave smac/dmac uninit (kernel
+    // writes them as outputs); leave the unread union bytes uninit
+    // (kernel doesn't read offsets 13-15 of __bindgen_anon_2 or
+    // 20-31/36-47 of __bindgen_anon_3/4 in the IPv4 path).
+    let mut fib_uninit: core::mem::MaybeUninit<bpf_fib_lookup> =
+        core::mem::MaybeUninit::uninit();
+    let p = fib_uninit.as_mut_ptr();
+    unsafe {
+        (*p).family = AF_INET;
+        (*p).l4_protocol = proto;
+        (*p).sport = sport;
+        (*p).dport = dport;
+        (*p).__bindgen_anon_1.tot_len = u16::from_be_bytes((*ip).tot_len);
+        (*p).ifindex = (*ctx.ctx).ingress_ifindex;
+        (*p).__bindgen_anon_2.tos = (*ip).tos;
+        (*p).__bindgen_anon_3.ipv4_src = u32::from_ne_bytes(src_bytes);
+        (*p).__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(dst_bytes);
+        // tbid: routing table ID. 0 = main table. Single u32 store —
+        // no merge with other zero stores because adjacent fields are
+        // either non-zero (the writes above) or kernel-output (smac
+        // immediately follows tbid at offset 52).
+        (*p).__bindgen_anon_5.tbid = 0;
+    }
 
     let ret = unsafe {
         fib_lookup_helper(
             ctx.ctx as *mut _,
-            &mut fib as *mut _,
+            p as *mut _,
             mem::size_of::<bpf_fib_lookup>() as i32,
             0,
         )
     };
+
+    // Borrow from the raw pointer for the rest of the function.
+    // After fib_lookup_helper, the kernel has written smac/dmac on
+    // success; on failure, dispatch_fib doesn't read them. Other
+    // unread union bytes stay uninit but aren't observed.
+    let fib_ref = unsafe { &*p };
 
     if compare {
         // Compare mode: we also ran above iff `use_custom`; but since
@@ -309,10 +320,10 @@ fn handle_ipv4(
         // or manual map poke), the branch above is unreachable and
         // we still do only the kernel lookup here.
         let custom = fib::lookup_v4(src_bytes, dst_bytes, proto, sport_h, dport_h);
-        compare_and_bump(ret as u32, &fib, &custom);
+        compare_and_bump(ret as u32, fib_ref, &custom);
     }
 
-    dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, true, &fib, ingress_vid)
+    dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, true, fib_ref, ingress_vid)
 }
 
 #[inline(always)]
@@ -379,47 +390,44 @@ fn handle_ipv6(
         return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, false, ingress_vid);
     }
 
-    // See handle_ipv4 for the rationale behind the struct-literal
+    // See handle_ipv4 for the rationale behind the MaybeUninit
     // pattern (avoids the LLVM-emitted memset bpf-to-bpf subprogram
     // that conflicts with bpf_tail_call on non-JITed kernels).
-    let mut fib = bpf_fib_lookup {
-        family: AF_INET6,
-        l4_protocol: next,
-        sport,
-        dport,
-        __bindgen_anon_1: bpf_fib_lookup__bindgen_ty_1 {
-            tot_len: u16::from_be_bytes(unsafe { (*ip).payload_len }) + Ipv6Hdr::LEN as u16,
-        },
-        ifindex: unsafe { (*ctx.ctx).ingress_ifindex },
-        __bindgen_anon_2: bpf_fib_lookup__bindgen_ty_2 {
-            flowinfo: u32::from_be_bytes(unsafe { (*ip).vcf }),
-        },
-        __bindgen_anon_3: bpf_fib_lookup__bindgen_ty_3 {
-            ipv6_src: bytes_to_u32x4(&src_bytes),
-        },
-        __bindgen_anon_4: bpf_fib_lookup__bindgen_ty_4 {
-            ipv6_dst: bytes_to_u32x4(&dst_bytes),
-        },
-        __bindgen_anon_5: bpf_fib_lookup__bindgen_ty_5 { tbid: 0 },
-        smac: [0; 6],
-        dmac: [0; 6],
-    };
+    let mut fib_uninit: core::mem::MaybeUninit<bpf_fib_lookup> =
+        core::mem::MaybeUninit::uninit();
+    let p = fib_uninit.as_mut_ptr();
+    unsafe {
+        (*p).family = AF_INET6;
+        (*p).l4_protocol = next;
+        (*p).sport = sport;
+        (*p).dport = dport;
+        (*p).__bindgen_anon_1.tot_len =
+            u16::from_be_bytes((*ip).payload_len) + Ipv6Hdr::LEN as u16;
+        (*p).ifindex = (*ctx.ctx).ingress_ifindex;
+        (*p).__bindgen_anon_2.flowinfo = u32::from_be_bytes((*ip).vcf);
+        (*p).__bindgen_anon_3.ipv6_src = bytes_to_u32x4(&src_bytes);
+        (*p).__bindgen_anon_4.ipv6_dst = bytes_to_u32x4(&dst_bytes);
+        (*p).__bindgen_anon_5.tbid = 0;
+        // smac, dmac: kernel-output, leave uninit.
+    }
 
     let ret = unsafe {
         fib_lookup_helper(
             ctx.ctx as *mut _,
-            &mut fib as *mut _,
+            p as *mut _,
             mem::size_of::<bpf_fib_lookup>() as i32,
             0,
         )
     };
 
+    let fib_ref = unsafe { &*p };
+
     if compare {
         let custom = fib::lookup_v6(src_bytes, dst_bytes, next, sport_h, dport_h);
-        compare_and_bump(ret as u32, &fib, &custom);
+        compare_and_bump(ret as u32, fib_ref, &custom);
     }
 
-    dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, false, &fib, ingress_vid)
+    dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, false, fib_ref, ingress_vid)
 }
 
 #[inline(always)]
@@ -529,7 +537,11 @@ fn forward_success(
             (*mctx_ptr).ingress_vid = ingress_vid;
             (*mctx_ptr).ip_offset = ip_offset as u32;
             (*mctx_ptr).is_v4 = u8::from(is_v4);
-            (*mctx_ptr)._pad = [0; 3];
+            // _pad: per-CPU array elements are zero-initialized at map
+            // creation and we never write the padding region — leaving
+            // it as the residual zeros saves a memset libcall (now
+            // inlined via libcalls.rs anyway, but the moot store is
+            // still worth eliding).
         }
     } else {
         // Per-CPU array index 0 is always present; this branch should
