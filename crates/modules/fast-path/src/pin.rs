@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 19] = [
+pub const MAP_NAMES: [&str; 20] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -51,6 +51,9 @@ pub const MAP_NAMES: [&str; 19] = [
     // --- v0.2.5: two-stage datapath ---
     "MUTATION_CTX",
     "MUTATION_PROGS",
+    // --- v0.2.7: per-CPU scratch for bpf_fib_lookup (replaces the
+    // stack-allocated struct that was triggering memset libcalls).
+    "FIB_LOOKUP_SCRATCH",
 ];
 
 /// The fast-path XDP program's pinned basename (attached per-iface).

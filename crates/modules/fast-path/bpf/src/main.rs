@@ -35,9 +35,9 @@ mod finalize;
 mod maps;
 
 use maps::{
-    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG, FP_CFG_FLAG_COMPARE_MODE,
-    FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, MUTATION_CTX, MUTATION_PROGS,
-    REDIRECT_DEVMAP, VLAN_RESOLVE,
+    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG, FIB_LOOKUP_SCRATCH,
+    FP_CFG_FLAG_COMPARE_MODE, FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, MUTATION_CTX,
+    MUTATION_PROGS, REDIRECT_DEVMAP, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -250,66 +250,56 @@ fn handle_ipv4(
         return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, true, ingress_vid);
     }
 
-    // Build `bpf_fib_lookup` via `MaybeUninit` + selective field
-    // writes — NEVER as a struct literal with zero-padded arrays
-    // ([0; 6], [val, 0, 0, 0], etc.) and NEVER with `mem::zeroed()`.
-    //
-    // Why: LLVM's "merge stores" pass recognizes any run of adjacent
-    // zero stores and lowers them into a `memset` libcall. The BPF
-    // backend has no libc to link against, so memset becomes a
-    // separate BPF function — a bpf-to-bpf subprogram call. That
-    // combined with `bpf_tail_call` (which fast_path uses to enter
-    // finalize) trips the kernel verifier's
-    //     "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
-    // guard on kernels whose JIT returns false from
-    // `bpf_jit_supports_subprog_tailcalls()` (UniFi 5.15-ui-cn9670
-    // aarch64 is the canonical hit).
-    //
-    // We can't fix this with `#[no_mangle] #[inline(always)]` shim
-    // functions either: rustc warns "`#[inline]` is ignored on
-    // externally exported functions" and refuses to inline at the
-    // libcall site.
-    //
-    // The only reliable mitigation is to never produce the merge-able
-    // pattern in the first place. So: write each input field
-    // individually via raw pointer; leave smac/dmac uninit (kernel
-    // writes them as outputs); leave the unread union bytes uninit
-    // (kernel doesn't read offsets 13-15 of __bindgen_anon_2 or
-    // 20-31/36-47 of __bindgen_anon_3/4 in the IPv4 path).
-    let mut fib_uninit: core::mem::MaybeUninit<bpf_fib_lookup> =
-        core::mem::MaybeUninit::uninit();
-    let p = fib_uninit.as_mut_ptr();
+    // Use the per-CPU `FIB_LOOKUP_SCRATCH` map for the bpf_fib_lookup
+    // struct rather than allocating it on the stack. Per-CPU array
+    // elements are pre-zeroed at map creation by the kernel; we only
+    // ever write the input fields the kernel reads. This sidesteps
+    // LLVM's stack zero-init optimization that lowers adjacent zero
+    // stores into `memset` libcalls — those become bpf-to-bpf
+    // subprogram calls, which combined with `bpf_tail_call` violates
+    // the kernel verifier's
+    //   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
+    // guard on UniFi-style kernels (`bpf_jit_supports_subprog_tailcalls()`
+    // returns false). See SPEC §11.x and the v0.2.6 post-mortem in
+    // tail-call-architecture.md.
+    let fib_ptr = match FIB_LOOKUP_SCRATCH.get_ptr_mut(0) {
+        Some(p) => p,
+        None => {
+            // Per-CPU array index 0 is always present; this branch is
+            // unreachable in practice. Fail-safe XDP_PASS so traffic
+            // falls to kernel slow-path rather than getting dropped.
+            bump_stat(StatIdx::ErrFibOther);
+            return Ok(xdp_action::XDP_PASS);
+        }
+    };
     unsafe {
-        (*p).family = AF_INET;
-        (*p).l4_protocol = proto;
-        (*p).sport = sport;
-        (*p).dport = dport;
-        (*p).__bindgen_anon_1.tot_len = u16::from_be_bytes((*ip).tot_len);
-        (*p).ifindex = (*ctx.ctx).ingress_ifindex;
-        (*p).__bindgen_anon_2.tos = (*ip).tos;
-        (*p).__bindgen_anon_3.ipv4_src = u32::from_ne_bytes(src_bytes);
-        (*p).__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(dst_bytes);
-        // tbid: routing table ID. 0 = main table. Single u32 store —
-        // no merge with other zero stores because adjacent fields are
-        // either non-zero (the writes above) or kernel-output (smac
-        // immediately follows tbid at offset 52).
-        (*p).__bindgen_anon_5.tbid = 0;
+        (*fib_ptr).family = AF_INET;
+        (*fib_ptr).l4_protocol = proto;
+        (*fib_ptr).sport = sport;
+        (*fib_ptr).dport = dport;
+        (*fib_ptr).__bindgen_anon_1.tot_len = u16::from_be_bytes((*ip).tot_len);
+        (*fib_ptr).ifindex = (*ctx.ctx).ingress_ifindex;
+        (*fib_ptr).__bindgen_anon_2.tos = (*ip).tos;
+        (*fib_ptr).__bindgen_anon_3.ipv4_src = u32::from_ne_bytes(src_bytes);
+        (*fib_ptr).__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(dst_bytes);
+        // tbid (off 48), smac (off 52), dmac (off 58): we never write
+        // these. tbid stays 0 from initial map zero-init. smac/dmac
+        // are kernel outputs; on success the helper fills them.
     }
 
     let ret = unsafe {
         fib_lookup_helper(
             ctx.ctx as *mut _,
-            p as *mut _,
+            fib_ptr as *mut _,
             mem::size_of::<bpf_fib_lookup>() as i32,
             0,
         )
     };
 
-    // Borrow from the raw pointer for the rest of the function.
+    // Borrow from the per-CPU map pointer for the rest of the function.
     // After fib_lookup_helper, the kernel has written smac/dmac on
-    // success; on failure, dispatch_fib doesn't read them. Other
-    // unread union bytes stay uninit but aren't observed.
-    let fib_ref = unsafe { &*p };
+    // success; on failure, dispatch_fib doesn't read them.
+    let fib_ref = unsafe { &*fib_ptr };
 
     if compare {
         // Compare mode: we also ran above iff `use_custom`; but since
@@ -390,37 +380,39 @@ fn handle_ipv6(
         return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, false, ingress_vid);
     }
 
-    // See handle_ipv4 for the rationale behind the MaybeUninit
-    // pattern (avoids the LLVM-emitted memset bpf-to-bpf subprogram
-    // that conflicts with bpf_tail_call on non-JITed kernels).
-    let mut fib_uninit: core::mem::MaybeUninit<bpf_fib_lookup> =
-        core::mem::MaybeUninit::uninit();
-    let p = fib_uninit.as_mut_ptr();
+    // See handle_ipv4 for the rationale behind using FIB_LOOKUP_SCRATCH
+    // (per-CPU map) instead of stack-allocated bpf_fib_lookup.
+    let fib_ptr = match FIB_LOOKUP_SCRATCH.get_ptr_mut(0) {
+        Some(p) => p,
+        None => {
+            bump_stat(StatIdx::ErrFibOther);
+            return Ok(xdp_action::XDP_PASS);
+        }
+    };
     unsafe {
-        (*p).family = AF_INET6;
-        (*p).l4_protocol = next;
-        (*p).sport = sport;
-        (*p).dport = dport;
-        (*p).__bindgen_anon_1.tot_len =
+        (*fib_ptr).family = AF_INET6;
+        (*fib_ptr).l4_protocol = next;
+        (*fib_ptr).sport = sport;
+        (*fib_ptr).dport = dport;
+        (*fib_ptr).__bindgen_anon_1.tot_len =
             u16::from_be_bytes((*ip).payload_len) + Ipv6Hdr::LEN as u16;
-        (*p).ifindex = (*ctx.ctx).ingress_ifindex;
-        (*p).__bindgen_anon_2.flowinfo = u32::from_be_bytes((*ip).vcf);
-        (*p).__bindgen_anon_3.ipv6_src = bytes_to_u32x4(&src_bytes);
-        (*p).__bindgen_anon_4.ipv6_dst = bytes_to_u32x4(&dst_bytes);
-        (*p).__bindgen_anon_5.tbid = 0;
-        // smac, dmac: kernel-output, leave uninit.
+        (*fib_ptr).ifindex = (*ctx.ctx).ingress_ifindex;
+        (*fib_ptr).__bindgen_anon_2.flowinfo = u32::from_be_bytes((*ip).vcf);
+        (*fib_ptr).__bindgen_anon_3.ipv6_src = bytes_to_u32x4(&src_bytes);
+        (*fib_ptr).__bindgen_anon_4.ipv6_dst = bytes_to_u32x4(&dst_bytes);
+        // tbid, smac, dmac: see handle_ipv4 commentary.
     }
 
     let ret = unsafe {
         fib_lookup_helper(
             ctx.ctx as *mut _,
-            p as *mut _,
+            fib_ptr as *mut _,
             mem::size_of::<bpf_fib_lookup>() as i32,
             0,
         )
     };
 
-    let fib_ref = unsafe { &*p };
+    let fib_ref = unsafe { &*fib_ptr };
 
     if compare {
         let custom = fib::lookup_v6(src_bytes, dst_bytes, next, sport_h, dport_h);
@@ -536,12 +528,10 @@ fn forward_success(
             (*mctx_ptr).egress_vid = egress_vid;
             (*mctx_ptr).ingress_vid = ingress_vid;
             (*mctx_ptr).ip_offset = ip_offset as u32;
-            (*mctx_ptr).is_v4 = u8::from(is_v4);
-            // _pad: per-CPU array elements are zero-initialized at map
-            // creation and we never write the padding region — leaving
-            // it as the residual zeros saves a memset libcall (now
-            // inlined via libcalls.rs anyway, but the moot store is
-            // still worth eliding).
+            // is_v4 is u32 (no padding); low byte holds the bool.
+            // Single u32 store — LLVM has no adjacent zero stores to
+            // merge into a memset libcall.
+            (*mctx_ptr).is_v4 = u32::from(u8::from(is_v4));
         }
     } else {
         // Per-CPU array index 0 is always present; this branch should
