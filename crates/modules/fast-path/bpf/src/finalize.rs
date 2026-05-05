@@ -89,53 +89,82 @@ pub fn finalize(ctx: XdpContext) -> u32 {
 
 // --- MSS clamping (relocated from main.rs in v0.2.5) ----------------------
 
+/// Top-level entry: dispatch into the v4 or v6 path with a constant-sized
+/// bounds check. Splitting upfront (rather than threading `is_v4` through
+/// a single function) is what satisfies the BPF verifier — the bounds
+/// check needs to use a compile-time-known size so the verifier can
+/// track that subsequent reads via `*const Ipv4Hdr` / `*const Ipv6Hdr`
+/// stay within the checked region.
+///
+/// The ergonomic alternative — `let size = if is_v4 { 20 } else { 40 };
+/// if start + offset + size > end { ... }; ip_addr as *const Ipv4Hdr` —
+/// loses the verifier's bound-tracking when the cast is reached: see
+/// `R9 offset is outside of the packet` from the v0.2.5 prerelease build.
+#[inline(always)]
+fn mss_clamp_inline(ctx: &XdpContext, ip_offset: usize, is_v4: bool, egress_ifindex: u32) {
+    if is_v4 {
+        mss_clamp_v4(ctx, ip_offset, egress_ifindex);
+    } else {
+        mss_clamp_v6(ctx, ip_offset, egress_ifindex);
+    }
+}
+
+/// IPv4 path: bounds-check exactly `Ipv4Hdr::LEN` bytes, then cast
+/// directly to `*const Ipv4Hdr`. Mirrors the `ptr_at` pattern from
+/// main.rs that the verifier accepts.
+#[inline(always)]
+fn mss_clamp_v4(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + ip_offset + Ipv4Hdr::LEN > end {
+        return;
+    }
+    let ip: *const Ipv4Hdr = (start + ip_offset) as *const Ipv4Hdr;
+    let proto = unsafe { (*ip).proto };
+    if proto != PROTO_TCP {
+        return;
+    }
+    let clamp = lookup_mss_clamp_v4(ip, egress_ifindex);
+    if clamp == 0 {
+        return;
+    }
+    mss_clamp_tcp(ctx, ip_offset + Ipv4Hdr::LEN, clamp);
+}
+
+/// IPv6 path: same pattern as `mss_clamp_v4` but with a 40-byte bound.
+#[inline(always)]
+fn mss_clamp_v6(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + ip_offset + Ipv6Hdr::LEN > end {
+        return;
+    }
+    let ip: *const Ipv6Hdr = (start + ip_offset) as *const Ipv6Hdr;
+    let proto = unsafe { (*ip).next_hdr };
+    if proto != PROTO_TCP {
+        return;
+    }
+    let clamp = lookup_mss_clamp_v6(ip, egress_ifindex);
+    if clamp == 0 {
+        return;
+    }
+    mss_clamp_tcp(ctx, ip_offset + Ipv6Hdr::LEN, clamp);
+}
+
 /// Walk the TCP-options block of a matched SYN/SYN-ACK and mutate the MSS
-/// option in place if a clamp policy applies and the existing MSS is
-/// greater than the clamp value. Recomputes the TCP checksum incrementally
-/// (RFC 1624). Bumps `MssClampApplied` on rewrite, `MssClampSkipped` on
-/// "policy applies but no rewrite needed."
+/// option in place if the existing MSS is greater than the clamp value.
+/// Recomputes the TCP checksum incrementally (RFC 1624). Bumps
+/// `MssClampApplied` on rewrite, `MssClampSkipped` on "policy applies but
+/// no rewrite needed."
 ///
 /// Bounds-checked at every read against `ctx.data_end()`. Options walk
 /// is fixed-bound at 8 iterations to keep BPF verifier state-space
 /// exploration tractable (a 40-iteration walk hit the verifier's
 /// 1M-instruction limit during v0.2.4 development).
-///
-/// `#[inline(always)]` because BPF subprograms can't accept packet-derived
-/// pointer arguments (the verifier rejects the lift instruction LLVM emits
-/// — see SPEC §4.12). Lookup helpers are also `#[inline(always)]`; their
-/// LPM keys are block-scoped so LLVM can reuse stack slots between src
-/// and dst lookups.
 #[inline(always)]
-fn mss_clamp_inline(ctx: &XdpContext, ip_offset: usize, is_v4: bool, egress_ifindex: u32) {
+fn mss_clamp_tcp(ctx: &XdpContext, tcp_offset: usize, clamp: u16) {
     let start = ctx.data();
     let end = ctx.data_end();
-
-    let ip_hdr_size = if is_v4 { Ipv4Hdr::LEN } else { Ipv6Hdr::LEN };
-    if start + ip_offset + ip_hdr_size > end {
-        return;
-    }
-    let ip_addr = start + ip_offset;
-
-    // Read protocol byte first — bail early on non-TCP, the common case.
-    let proto = if is_v4 {
-        unsafe { (*(ip_addr as *const Ipv4Hdr)).proto }
-    } else {
-        unsafe { (*(ip_addr as *const Ipv6Hdr)).next_hdr }
-    };
-    if proto != PROTO_TCP {
-        return;
-    }
-
-    let clamp = if is_v4 {
-        lookup_mss_clamp_v4(ip_addr as *const Ipv4Hdr, egress_ifindex)
-    } else {
-        lookup_mss_clamp_v6(ip_addr as *const Ipv6Hdr, egress_ifindex)
-    };
-    if clamp == 0 {
-        return;
-    }
-
-    let tcp_offset = ip_offset + if is_v4 { Ipv4Hdr::LEN } else { Ipv6Hdr::LEN };
 
     // Need 20 bytes for the fixed TCP header before walking options.
     if start + tcp_offset + 20 > end {
