@@ -44,6 +44,12 @@ const TCP_FLAG_SYN: u8 = 0x02;
 /// 0.2 changed `proto`/`next_hdr` to raw `u8`).
 const PROTO_TCP: u8 = IpProto::Tcp as u8;
 
+/// Upper bound on `ip_offset` post-VLAN-parse. Used to give the BPF
+/// verifier a tight `umax` so range propagation through packet-pointer
+/// arithmetic works — see commentary on the `ip_offset > MAX_IP_OFFSET`
+/// check in `finalize`.
+const MAX_IP_OFFSET: usize = 64;
+
 #[xdp]
 pub fn finalize(ctx: XdpContext) -> u32 {
     // Read the per-CPU mutation context written by fast_path right
@@ -61,8 +67,25 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     let egress_ifindex = mctx.egress_ifindex;
     let egress_vid = mctx.egress_vid;
     let ingress_vid = mctx.ingress_vid;
-    let ip_offset = mctx.ip_offset as usize;
     let is_v4 = mctx.is_v4 != 0;
+
+    // Clamp ip_offset to MAX_IP_OFFSET (64). The BPF verifier's
+    // `find_good_pkt_pointers` refuses to propagate range information
+    // through packet-pointer arithmetic when the scalar offset's
+    // umax_value exceeds MAX_PACKET_OFF (0xffff) — which is the case
+    // for `mctx.ip_offset` since it's read from a map and the verifier
+    // sees its full u32 range. Capping the offset gives the verifier
+    // a tight umax it can reason about, so the subsequent
+    // `pkt + ip_offset + ip_hdr_size > end` bound check actually
+    // propagates a usable readable-range back to `pkt + ip_offset`.
+    //
+    // In practice fast_path writes `EthHdr::LEN` (14) or
+    // `EthHdr::LEN + VLAN_HDR_LEN` (18); 64 is comfortable headroom
+    // for a future second VLAN tag without having to revisit this.
+    let ip_offset = mctx.ip_offset as usize;
+    if ip_offset > MAX_IP_OFFSET {
+        return xdp_action::XDP_PASS;
+    }
 
     // mss-clamp first, then VLAN choreography (which can shift bytes
     // via bpf_xdp_adjust_head). mss-clamp's TCP-options walk relies on
