@@ -7,6 +7,7 @@
 //! `size_of`-asserting test to catch layout drift.
 
 use aya_ebpf::{
+    bindings::bpf_fib_lookup,
     macros::map,
     maps::{Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, ProgramArray, RingBuf},
 };
@@ -297,8 +298,18 @@ pub struct MutationCtx {
     pub ip_offset: u32,
     /// 1 = IPv4 packet, 0 = IPv6. Determines which IP-header struct
     /// finalize casts to and which MSS_CLAMP map to consult.
-    pub is_v4: u8,
-    pub _pad: [u8; 3],
+    ///
+    /// Stored as `u32` (not `u8`) so the struct has no padding bytes.
+    /// With padding, LLVM's "merge stores" optimization recognizes the
+    /// 3 unwritten bytes between `is_v4: u8` and the end of the struct
+    /// as a zero-init block and lowers them into a `memset` libcall —
+    /// emitted by the BPF backend as a separate bpf-to-bpf subprogram,
+    /// which then trips the kernel verifier's
+    ///   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
+    /// guard on UniFi-style kernels (5.15-ui-cn9670 aarch64). Single
+    /// `u32` field = single store, no padding, no merge-able zero
+    /// pattern. Low byte holds the boolean.
+    pub is_v4: u32,
 }
 
 // --- Custom FIB value layouts (Option F) -------------------------------
@@ -510,6 +521,30 @@ pub static MSS_CLAMP_BY_IFACE: HashMap<u32, u16> =
 /// most recent write.
 #[map]
 pub static MUTATION_CTX: PerCpuArray<MutationCtx> = PerCpuArray::with_max_entries(1, 0);
+
+/// Per-CPU scratch buffer for `bpf_fib_lookup` calls. Per-CPU array
+/// elements are pre-zeroed at map creation by the kernel and remain
+/// accessible at a stable address — fast_path writes the input fields
+/// (family, l4_protocol, sport/dport, addrs, etc.), the kernel helper
+/// fills `smac`/`dmac` on success, and the value persists per-CPU
+/// between calls.
+///
+/// Why per-CPU map instead of stack: a stack-allocated `bpf_fib_lookup`
+/// triggers LLVM's "merge stores" optimization on the unwritten union
+/// trailing bytes (`__bindgen_anon_3.ipv6_src[1..4]` in the IPv4 path,
+/// `__bindgen_anon_5.tbid`, etc.), which then lowers into a `memset`
+/// libcall — emitted by the BPF backend as a separate bpf-to-bpf
+/// subprogram. Combined with `bpf_tail_call`, that violates the kernel
+/// verifier's
+///   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
+/// guard on UniFi-style kernels (5.15-ui-cn9670 aarch64) where
+/// `bpf_jit_supports_subprog_tailcalls()` returns false. Moving the
+/// scratch struct to a per-CPU map sidesteps stack init entirely:
+/// fast_path's only writes are to fields the kernel reads (family,
+/// addrs, etc.), with no zero-padded blocks for LLVM to coalesce.
+#[map]
+pub static FIB_LOOKUP_SCRATCH: PerCpuArray<bpf_fib_lookup> =
+    PerCpuArray::with_max_entries(1, 0);
 
 /// Tail-call jump table (v0.2.5+). fast_path tail_calls into slot 0 after
 /// classification + L2/TTL mutations. Slot 0 holds `finalize` today.
