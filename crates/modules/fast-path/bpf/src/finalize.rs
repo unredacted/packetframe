@@ -381,9 +381,18 @@ fn apply_vlan_egress(ctx: &XdpContext, ingress_vid: u16, egress_vid: u16) -> Res
 }
 
 /// Untagged → tagged. Grows headroom by 4, shifts the MAC pair left by
-/// 4 bytes, writes TPID + TCI into the freed-up slot. Uses
-/// `core::ptr::copy` (memmove) not `copy_nonoverlapping` because source
-/// and destination overlap — SPEC calls this out as a footgun.
+/// 4 bytes, writes TPID + TCI into the freed-up slot.
+///
+/// Uses **manual byte-by-byte read-then-write** rather than
+/// `core::ptr::copy` (memmove). LLVM lowers `core::ptr::copy` into the
+/// `@llvm.memmove.*` intrinsic, which the BPF backend emits as a
+/// separate bpf-to-bpf `memmove` subprogram. fast_path uses
+/// `bpf_tail_call`, and on UniFi 5.15-ui-cn9670 (and any kernel where
+/// `bpf_jit_supports_subprog_tailcalls()` returns false) the verifier
+/// rejects programs that combine tail-calls with bpf-to-bpf calls.
+/// Reading all 12 source bytes into local variables before any store
+/// also handles the source/destination overlap that `core::ptr::copy`
+/// (memmove) handles for us — without the libcall.
 #[inline(always)]
 fn vlan_push(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
     let rc = unsafe { bpf_xdp_adjust_head(ctx.ctx as *mut _, -4) };
@@ -397,8 +406,34 @@ fn vlan_push(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
     }
     unsafe {
         let base = start as *mut u8;
-        core::ptr::copy(base.add(4), base, 6);
-        core::ptr::copy(base.add(10), base.add(6), 6);
+        // Read all 12 source bytes (offsets 4..16 — the original MAC
+        // pair, now shifted right by 4 from adjust_head) before writing
+        // anything. Then write to offsets 0..12. No overlap concern —
+        // source and dest don't co-exist in memory at the same time.
+        let m0 = *base.add(4);
+        let m1 = *base.add(5);
+        let m2 = *base.add(6);
+        let m3 = *base.add(7);
+        let m4 = *base.add(8);
+        let m5 = *base.add(9);
+        let m6 = *base.add(10);
+        let m7 = *base.add(11);
+        let m8 = *base.add(12);
+        let m9 = *base.add(13);
+        let m10 = *base.add(14);
+        let m11 = *base.add(15);
+        *base = m0;
+        *base.add(1) = m1;
+        *base.add(2) = m2;
+        *base.add(3) = m3;
+        *base.add(4) = m4;
+        *base.add(5) = m5;
+        *base.add(6) = m6;
+        *base.add(7) = m7;
+        *base.add(8) = m8;
+        *base.add(9) = m9;
+        *base.add(10) = m10;
+        *base.add(11) = m11;
         let tpid = TPID_8021Q.to_be_bytes();
         *base.add(12) = tpid[0];
         *base.add(13) = tpid[1];
@@ -410,7 +445,9 @@ fn vlan_push(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
 }
 
 /// Tagged → untagged. Shifts the MAC pair right by 4 over the about-to-
-/// be-discarded TPID+TCI slot, then shrinks headroom by 4.
+/// be-discarded TPID+TCI slot, then shrinks headroom by 4. Same
+/// byte-by-byte pattern as `vlan_push` — see commentary there for the
+/// `core::ptr::copy` libcall avoidance rationale.
 #[inline(always)]
 fn vlan_pop(ctx: &XdpContext) -> Result<(), ()> {
     let start = ctx.data();
@@ -420,8 +457,34 @@ fn vlan_pop(ctx: &XdpContext) -> Result<(), ()> {
     }
     unsafe {
         let base = start as *mut u8;
-        core::ptr::copy(base.add(6), base.add(10), 6);
-        core::ptr::copy(base, base.add(4), 6);
+        // Read all 12 source bytes (offsets 0..12 — the MAC pair before
+        // the 4-byte VLAN tag at offsets 12..16) before writing.
+        let m0 = *base;
+        let m1 = *base.add(1);
+        let m2 = *base.add(2);
+        let m3 = *base.add(3);
+        let m4 = *base.add(4);
+        let m5 = *base.add(5);
+        let m6 = *base.add(6);
+        let m7 = *base.add(7);
+        let m8 = *base.add(8);
+        let m9 = *base.add(9);
+        let m10 = *base.add(10);
+        let m11 = *base.add(11);
+        // Write at offsets 4..16; the 4 bytes at offsets 0..4 are about
+        // to be reclaimed by adjust_head.
+        *base.add(4) = m0;
+        *base.add(5) = m1;
+        *base.add(6) = m2;
+        *base.add(7) = m3;
+        *base.add(8) = m4;
+        *base.add(9) = m5;
+        *base.add(10) = m6;
+        *base.add(11) = m7;
+        *base.add(12) = m8;
+        *base.add(13) = m9;
+        *base.add(14) = m10;
+        *base.add(15) = m11;
     }
     let rc = unsafe { bpf_xdp_adjust_head(ctx.ctx as *mut _, 4) };
     if rc != 0 {
