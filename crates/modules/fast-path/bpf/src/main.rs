@@ -764,81 +764,78 @@ fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: 
         return;
     }
 
-    // Walk options. 40 iterations is the absolute upper bound (each
-    // iteration consumes ≥1 byte and opts_len ≤ 40). The verifier
-    // sees a constant-bound loop with packet-bounds checks at every
-    // pointer dereference, which it accepts.
+    // Walk options. Cap at 8 iterations: real SYN packets put MSS in
+    // the first 1-4 options, and 8 is plenty of headroom while
+    // keeping the BPF verifier's state-exploration bounded. A 40-
+    // iteration walk hit the verifier's 1M-instruction processing
+    // limit due to combinatorial state explosion across the branches.
+    //
+    // Use sequential `if` checks rather than `match` for the same
+    // reason — fewer state-space splits per iteration.
     let opts_start_off = tcp_offset + 20;
     let mut cursor: usize = 0;
     let mut found = false;
 
-    for _ in 0..40 {
+    for _ in 0..8 {
         if cursor >= opts_len {
             break;
         }
         let p_addr = start + opts_start_off + cursor;
-        if p_addr + 1 > end {
+        // Need at least 4 bytes for a worst-case MSS option; if
+        // there's less than that left, no MSS is possible. Also
+        // bounds-checks the kind/length reads below.
+        if p_addr + 4 > end {
             break;
         }
         let p = p_addr as *const u8;
         let kind = unsafe { *p };
-        match kind {
-            0 => break,           // EOL
-            1 => cursor += 1,     // NOP — single byte
-            2 => {
-                // MSS option: [kind=2, length=4, mss_be:2].
-                if p_addr + 4 > end {
-                    break;
-                }
-                let length = unsafe { *p.add(1) };
-                if length != 4 {
-                    break;
-                }
-                let mss_be = unsafe { [*p.add(2), *p.add(3)] };
-                let mss = u16::from_be_bytes(mss_be);
-                if mss > clamp {
-                    let new_mss_be = clamp.to_be_bytes();
-                    unsafe {
-                        let pmut = p as *mut u8;
-                        *pmut.add(2) = new_mss_be[0];
-                        *pmut.add(3) = new_mss_be[1];
-                    }
-                    // TCP csum is at offset 16 of the TCP header; do
-                    // an RFC 1624 incremental update.
-                    let csum_off = tcp_offset + 16;
-                    if start + csum_off + 2 > end {
-                        return;
-                    }
-                    let csum_p = (start + csum_off) as *mut u8;
-                    let old_csum_be =
-                        unsafe { [*csum_p, *csum_p.add(1)] };
-                    let old_csum = u16::from_be_bytes(old_csum_be);
-                    let new_csum = csum_replace_u16(old_csum, mss, clamp);
-                    let new_csum_be = new_csum.to_be_bytes();
-                    unsafe {
-                        *csum_p = new_csum_be[0];
-                        *csum_p.add(1) = new_csum_be[1];
-                    }
-                    bump_stat(StatIdx::MssClampApplied);
-                } else {
-                    bump_stat(StatIdx::MssClampSkipped);
-                }
-                found = true;
-                break;
-            }
-            _ => {
-                // Length-prefixed option. Length byte at offset +1
-                // includes the kind+length bytes themselves.
-                if p_addr + 2 > end {
-                    break;
-                }
-                let length = unsafe { *p.add(1) } as usize;
-                if length < 2 {
-                    break; // Malformed.
-                }
-                cursor += length;
-            }
+        if kind == 0 {
+            break; // EOL — no more options.
         }
+        if kind == 1 {
+            cursor += 1; // NOP, single byte.
+            continue;
+        }
+        // Length-prefixed option (kind != 0, != 1). Length includes
+        // the kind+length bytes themselves; valid range is 2..=opts_len.
+        let length = unsafe { *p.add(1) } as usize;
+        if length < 2 || cursor + length > opts_len {
+            break; // Malformed.
+        }
+        if kind == 2 && length == 4 {
+            // MSS option: [kind=2, length=4, mss_be:2].
+            let mss_be = unsafe { [*p.add(2), *p.add(3)] };
+            let mss = u16::from_be_bytes(mss_be);
+            if mss > clamp {
+                let new_mss_be = clamp.to_be_bytes();
+                unsafe {
+                    let pmut = p as *mut u8;
+                    *pmut.add(2) = new_mss_be[0];
+                    *pmut.add(3) = new_mss_be[1];
+                }
+                // TCP csum is at offset 16 of the TCP header; do an
+                // RFC 1624 incremental update.
+                let csum_off = tcp_offset + 16;
+                if start + csum_off + 2 > end {
+                    return;
+                }
+                let csum_p = (start + csum_off) as *mut u8;
+                let old_csum_be = unsafe { [*csum_p, *csum_p.add(1)] };
+                let old_csum = u16::from_be_bytes(old_csum_be);
+                let new_csum = csum_replace_u16(old_csum, mss, clamp);
+                let new_csum_be = new_csum.to_be_bytes();
+                unsafe {
+                    *csum_p = new_csum_be[0];
+                    *csum_p.add(1) = new_csum_be[1];
+                }
+                bump_stat(StatIdx::MssClampApplied);
+            } else {
+                bump_stat(StatIdx::MssClampSkipped);
+            }
+            found = true;
+            break;
+        }
+        cursor += length;
     }
 
     if !found {
