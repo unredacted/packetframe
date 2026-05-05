@@ -151,7 +151,7 @@ fn mss_clamp_v4(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
     if clamp == 0 {
         return;
     }
-    mss_clamp_tcp(ctx, ip_offset + Ipv4Hdr::LEN, clamp);
+    mss_clamp_tcp(ctx, ip as *const u8, Ipv4Hdr::LEN, clamp);
 }
 
 /// IPv6 path: same pattern as `mss_clamp_v4` but with a 40-byte bound.
@@ -171,7 +171,7 @@ fn mss_clamp_v6(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
     if clamp == 0 {
         return;
     }
-    mss_clamp_tcp(ctx, ip_offset + Ipv6Hdr::LEN, clamp);
+    mss_clamp_tcp(ctx, ip as *const u8, Ipv6Hdr::LEN, clamp);
 }
 
 /// Walk the TCP-options block of a matched SYN/SYN-ACK and mutate the MSS
@@ -180,14 +180,28 @@ fn mss_clamp_v6(ctx: &XdpContext, ip_offset: usize, egress_ifindex: u32) {
 /// `MssClampApplied` on rewrite, `MssClampSkipped` on "policy applies but
 /// no rewrite needed."
 ///
+/// Takes a typed `ip_ptr` (already bounds-checked for `ip_hdr_size` bytes)
+/// rather than a raw `tcp_offset` scalar. Inside, we recover ip_offset as
+/// `(ip_ptr as usize) - start`, which the BPF verifier tracks as a `pkt -
+/// pkt` subtraction with `umax = MAX_PACKET_OFF (0xffff)`. That tight bound
+/// is what makes subsequent `start + tcp_offset + N > end` checks
+/// propagate readable-range to the read site (mirrors v0.2.4's working
+/// pattern; passing `tcp_offset` directly as a `usize` from a map read
+/// loses verifier tracking and the post-bound-check pkt pointer ends up
+/// with `r=0`).
+///
 /// Bounds-checked at every read against `ctx.data_end()`. Options walk
 /// is fixed-bound at 8 iterations to keep BPF verifier state-space
 /// exploration tractable (a 40-iteration walk hit the verifier's
 /// 1M-instruction limit during v0.2.4 development).
 #[inline(always)]
-fn mss_clamp_tcp(ctx: &XdpContext, tcp_offset: usize, clamp: u16) {
+fn mss_clamp_tcp(ctx: &XdpContext, ip_ptr: *const u8, ip_hdr_size: usize, clamp: u16) {
     let start = ctx.data();
     let end = ctx.data_end();
+
+    // pkt-derived scalar; verifier tracks umax tightly.
+    let ip_offset = (ip_ptr as usize) - start;
+    let tcp_offset = ip_offset + ip_hdr_size;
 
     // Need 20 bytes for the fixed TCP header before walking options.
     if start + tcp_offset + 20 > end {
