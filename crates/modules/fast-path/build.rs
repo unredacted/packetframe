@@ -178,7 +178,11 @@ fn main() {
         }
         Ok(out) => {
             // stdout is cargo JSON messages with --message-format=json;
-            // only stderr is human-readable and worth forwarding.
+            // on FAILURE we parse out the `rendered` field from each
+            // compiler-message so the actual rustc diagnostic text
+            // surfaces in cargo's warning stream. stderr carries the
+            // human-readable progress + summary.
+            forward_rendered_diagnostics(&out.stdout);
             forward_output(&[], &out.stderr);
             let msg = format!(
                 "BPF build failed (exit {}) — see cargo:warning lines above for the real error, or run `(cd crates/modules/fast-path/bpf && cargo build --release)` directly",
@@ -256,4 +260,72 @@ fn forward_output(stdout: &[u8], stderr: &[u8]) {
 
 fn write_stub(path: &std::path::Path) {
     std::fs::write(path, []).expect("write stub ELF");
+}
+
+/// Walk cargo's `--message-format=json` stdout, find each
+/// `"reason":"compiler-message"` line, and forward its rendered
+/// diagnostic body. This is what makes BPF compile errors visible in
+/// the parent cargo's warning stream — they're emitted as JSON on
+/// stdout (not stderr), so without this they're invisible when
+/// `forward_output(&[], ...)` is called.
+fn forward_rendered_diagnostics(stdout: &[u8]) {
+    const REASON_MARKER: &str = "\"reason\":\"compiler-message\"";
+    const RENDERED_MARKER: &str = "\"rendered\":\"";
+    for line in String::from_utf8_lossy(stdout).lines() {
+        if !line.contains(REASON_MARKER) {
+            continue;
+        }
+        let Some(start) = line.find(RENDERED_MARKER) else {
+            continue;
+        };
+        let rest = &line[start + RENDERED_MARKER.len()..];
+        // Find the closing quote, handling backslash-escaped quotes
+        // by walking the string char-by-char.
+        let mut end = None;
+        let mut chars = rest.char_indices();
+        while let Some((idx, c)) = chars.next() {
+            if c == '\\' {
+                // skip the escaped char
+                chars.next();
+                continue;
+            }
+            if c == '"' {
+                end = Some(idx);
+                break;
+            }
+        }
+        let Some(end_idx) = end else {
+            continue;
+        };
+        let rendered = &rest[..end_idx];
+        // Unescape the JSON string. Only `\n`, `\t`, `\"`, `\\`
+        // appear in rustc rendered output.
+        let mut out = String::with_capacity(rendered.len());
+        let mut esc = false;
+        for c in rendered.chars() {
+            if esc {
+                match c {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else {
+                out.push(c);
+            }
+        }
+        for line in out.lines() {
+            if !line.trim().is_empty() {
+                println!("cargo::warning=[bpf rustc] {line}");
+            }
+        }
+    }
 }
