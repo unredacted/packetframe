@@ -106,10 +106,19 @@ enum Command {
         config: Option<PathBuf>,
     },
 
-    /// Re-read config and reconcile. Stubbed until PR #6.
+    /// Re-read config and apply hot-reloadable changes (allow-prefix,
+    /// block-prefix, dry-run, forwarding-mode, mss-clamp, etc.) on the
+    /// running daemon without touching attach state. Reads the
+    /// daemon's PID file, sends SIGHUP, then polls the
+    /// `last-reconfigure.timestamp` marker for confirmation.
+    /// Equivalent to `systemctl reload packetframe` under systemd.
+    /// Attach-set changes (interfaces added/removed) require a full
+    /// restart and are silently skipped — `packetframe status` after
+    /// the reload shows what's currently attached.
     Reconfigure {
         /// Path to the config file. Defaults to
-        /// `/etc/packetframe/packetframe.conf`.
+        /// `/etc/packetframe/packetframe.conf`. Used to discover the
+        /// daemon's `state-dir` (and from there, the PID file).
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -274,7 +283,31 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Reconfigure { .. } => not_implemented("reconfigure"),
+        Command::Reconfigure { config } => {
+            let path = config_path_or_default(config);
+            match loader::reconfigure(&path) {
+                Ok(()) => ExitCode::from(EXIT_OK),
+                Err(loader::ReconfigureError::Io(msg)) => {
+                    tracing::error!(error = %msg, "reconfigure failed");
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
+                Err(loader::ReconfigureError::DaemonNotRunning(msg)) => {
+                    tracing::error!(error = %msg, "reconfigure: daemon not running");
+                    ExitCode::from(EXIT_STARTUP_ERROR)
+                }
+                Err(loader::ReconfigureError::DaemonRejected(msg)) => {
+                    tracing::error!(error = %msg, "reconfigure: daemon rejected the new config");
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
+                Err(loader::ReconfigureError::Timeout) => {
+                    tracing::error!(
+                        "reconfigure: no acknowledgment from the daemon within 5s — \
+                         daemon may be wedged. Check `journalctl -u packetframe`."
+                    );
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
+            }
+        }
         Command::Map { .. } => not_implemented("map"),
         #[cfg(all(target_os = "linux", feature = "fast-path"))]
         Command::Fib { op } => fib_cli::run(op),

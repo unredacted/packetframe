@@ -35,8 +35,8 @@ mod maps;
 
 use maps::{
     bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG, FP_CFG_FLAG_COMPARE_MODE,
-    FP_CFG_FLAG_CUSTOM_FIB,
-    FP_CFG_FLAG_HEAD_SHIFT_128, REDIRECT_DEVMAP, VLAN_RESOLVE,
+    FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, MSS_CLAMP_BY_IFACE, MSS_CLAMP_V4,
+    MSS_CLAMP_V6, REDIRECT_DEVMAP, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -453,6 +453,16 @@ fn forward_success(
         return Ok(xdp_action::XDP_PASS);
     }
 
+    // MSS clamping (v0.2.4+, closes SPEC §11.4 gap). Mutate the TCP
+    // MSS option in SYN/SYN-ACK packets before they're handed to the
+    // egress NIC — must happen before `apply_vlan_egress` (which can
+    // shift packet bytes via `bpf_xdp_adjust_head`) but is order-
+    // independent w.r.t. TTL decrement and L2 rewrite (those edit
+    // existing bytes in place). No-op for non-TCP, non-SYN packets,
+    // or when no clamp policy applies. Skipped under `is_dry_run()`
+    // because dry-run returns XDP_PASS earlier in the flow.
+    mss_clamp_inline(ctx, ip, is_v4, egress_ifindex);
+
     // TTL/hop_limit + csum first — IP header's position in memory
     // doesn't change with adjust_head, only its offset from `data`.
     if is_v4 {
@@ -657,6 +667,260 @@ fn vlan_rewrite(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
         *base.add(15) = tci[1];
     }
     Ok(())
+}
+
+// --- MSS clamping (v0.2.4+, SPEC §4.x — closes §11.4 gap) -----------------
+
+/// SYN flag in TCP byte 13 (low byte of `doff_flags` over the wire).
+const TCP_FLAG_SYN: u8 = 0x02;
+
+/// Walk the TCP-options block of a matched SYN/SYN-ACK and mutate the
+/// MSS option in place if a clamp policy applies and the existing MSS
+/// is greater than the clamp value. Recomputes the TCP checksum
+/// incrementally (RFC 1624). Bumps `MssClampApplied` on rewrite and
+/// `MssClampSkipped` on "policy applies but no rewrite needed" — i.e.
+/// existing MSS already ≤ clamp, no MSS option present, or malformed
+/// options walked past before finding it.
+///
+/// Bounds-checked at every read against `ctx.data_end()`. The options
+/// loop is fixed-bound at 40 iterations (TCP options max 40 bytes;
+/// each iteration consumes at least 1 byte) so the BPF verifier
+/// accepts it without unrolling concerns.
+///
+/// Marked `#[inline(always)]` deliberately. Two earlier attempts to
+/// split this into a subprogram (for stack budget) ran into the BPF
+/// kernel verifier rejecting the bpf2bpf calling convention LLVM
+/// emits: even when arguments are scalar, LLVM SROA decomposes
+/// `&XdpContext` into `(data, data_end)` packet pointers, and the
+/// verifier prohibits pointer-shift instructions on packet pointers
+/// (the lift LLVM emits to extend 32-bit→64-bit). Inlining is the
+/// only verifier-friendly option for code that touches the packet.
+///
+/// Stack trim: each LPM key is block-scoped so the compiler can
+/// reuse the same stack slot for src and dst keys rather than
+/// holding both live; lookup helpers are also `#[inline(always)]`
+/// for the same reason; src/dst addresses are read inside their
+/// respective LPM blocks rather than at the function top.
+#[inline(always)]
+fn mss_clamp_inline(ctx: &XdpContext, ip: *mut u8, is_v4: bool, egress_ifindex: u32) {
+    let start = ctx.data();
+    let end = ctx.data_end();
+
+    // Read protocol byte first — bail early on non-TCP, which is
+    // the overwhelmingly common case for fast-pathed traffic.
+    let proto = if is_v4 {
+        unsafe { (*(ip as *const Ipv4Hdr)).proto }
+    } else {
+        unsafe { (*(ip as *const Ipv6Hdr)).next_hdr }
+    };
+    if proto != PROTO_TCP {
+        return;
+    }
+
+    // Look up clamp value via the precedence chain. Returns 0 if no
+    // policy applies. Helper is `#[inline(always)]`; its locals share
+    // this function's frame and are block-scoped for slot reuse.
+    let clamp = if is_v4 {
+        lookup_mss_clamp_v4(ip as *const Ipv4Hdr, egress_ifindex)
+    } else {
+        lookup_mss_clamp_v6(ip as *const Ipv6Hdr, egress_ifindex)
+    };
+    if clamp == 0 {
+        return;
+    }
+
+    // Recover the IP-header offset so we can compute the TCP offset
+    // (and bounds-check) without holding `ip` as a separate pointer
+    // variable. ip - start is a scalar (pkt_a - pkt_b) per the
+    // verifier.
+    let ip_offset = (ip as usize) - start;
+    let tcp_offset = ip_offset + if is_v4 { Ipv4Hdr::LEN } else { Ipv6Hdr::LEN };
+
+    // Need 20 bytes for the fixed TCP header before walking options.
+    if start + tcp_offset + 20 > end {
+        return;
+    }
+
+    // Bytes 12-13 of TCP header: data_offset:4 | reserved:4 | flags:8.
+    // doff is in 32-bit words; valid range [5, 15] = [20, 60] bytes.
+    let doff_byte = unsafe { *((start + tcp_offset + 12) as *const u8) };
+    let flags = unsafe { *((start + tcp_offset + 13) as *const u8) };
+    if flags & TCP_FLAG_SYN == 0 {
+        return; // Not SYN/SYN-ACK; clamp doesn't apply.
+    }
+    let doff_words = (doff_byte >> 4) as usize;
+    if !(5..=15).contains(&doff_words) {
+        return;
+    }
+    let tcp_hdr_len = doff_words * 4;
+    let opts_len = tcp_hdr_len - 20;
+    if opts_len == 0 {
+        // SYN with no options — operator policy says "clamp" but
+        // there's no MSS field to mutate. Count as skipped.
+        bump_stat(StatIdx::MssClampSkipped);
+        return;
+    }
+    if start + tcp_offset + tcp_hdr_len > end {
+        return;
+    }
+
+    // Walk options. Cap at 8 iterations: real SYN packets put MSS in
+    // the first 1-4 options, and 8 is plenty of headroom while
+    // keeping the BPF verifier's state-exploration bounded. A 40-
+    // iteration walk hit the verifier's 1M-instruction processing
+    // limit due to combinatorial state explosion across the branches.
+    //
+    // Use sequential `if` checks rather than `match` for the same
+    // reason — fewer state-space splits per iteration.
+    let opts_start_off = tcp_offset + 20;
+    let mut cursor: usize = 0;
+    let mut found = false;
+
+    for _ in 0..8 {
+        if cursor >= opts_len {
+            break;
+        }
+        let p_addr = start + opts_start_off + cursor;
+        // Need at least 4 bytes for a worst-case MSS option; if
+        // there's less than that left, no MSS is possible. Also
+        // bounds-checks the kind/length reads below.
+        if p_addr + 4 > end {
+            break;
+        }
+        let p = p_addr as *const u8;
+        let kind = unsafe { *p };
+        if kind == 0 {
+            break; // EOL — no more options.
+        }
+        if kind == 1 {
+            cursor += 1; // NOP, single byte.
+            continue;
+        }
+        // Length-prefixed option (kind != 0, != 1). Length includes
+        // the kind+length bytes themselves; valid range is 2..=opts_len.
+        let length = unsafe { *p.add(1) } as usize;
+        if length < 2 || cursor + length > opts_len {
+            break; // Malformed.
+        }
+        if kind == 2 && length == 4 {
+            // MSS option: [kind=2, length=4, mss_be:2].
+            let mss_be = unsafe { [*p.add(2), *p.add(3)] };
+            let mss = u16::from_be_bytes(mss_be);
+            if mss > clamp {
+                let new_mss_be = clamp.to_be_bytes();
+                unsafe {
+                    let pmut = p as *mut u8;
+                    *pmut.add(2) = new_mss_be[0];
+                    *pmut.add(3) = new_mss_be[1];
+                }
+                // TCP csum is at offset 16 of the TCP header; do an
+                // RFC 1624 incremental update.
+                let csum_off = tcp_offset + 16;
+                if start + csum_off + 2 > end {
+                    return;
+                }
+                let csum_p = (start + csum_off) as *mut u8;
+                let old_csum_be = unsafe { [*csum_p, *csum_p.add(1)] };
+                let old_csum = u16::from_be_bytes(old_csum_be);
+                let new_csum = csum_replace_u16(old_csum, mss, clamp);
+                let new_csum_be = new_csum.to_be_bytes();
+                unsafe {
+                    *csum_p = new_csum_be[0];
+                    *csum_p.add(1) = new_csum_be[1];
+                }
+                bump_stat(StatIdx::MssClampApplied);
+            } else {
+                bump_stat(StatIdx::MssClampSkipped);
+            }
+            found = true;
+            break;
+        }
+        cursor += length;
+    }
+
+    if !found {
+        // Hit EOL or walked past the budget without an MSS option.
+        bump_stat(StatIdx::MssClampSkipped);
+    }
+}
+
+/// Apply RFC 1624 incremental checksum update for a single 16-bit
+/// field change: `HC' = ~(~HC + ~m + m')`. Two-iteration end-around
+/// carry fold (max 2 needed for adding three 16-bit values into a
+/// u32). Verifier-friendly — no loops.
+#[inline(always)]
+fn csum_replace_u16(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
+    let mut sum: u32 = (!old_csum) as u32 + (!old_val) as u32 + new_val as u32;
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+
+/// Resolve the mss-clamp value for an IPv4 packet, in precedence
+/// order: src-prefix → dst-prefix → per-egress → global. Returns 0 if
+/// no policy applies. The LPM lookups respect each entry's
+/// `iface_filter` (0 = wildcard). Block-scope each Key + addr so LLVM
+/// can reuse the same stack slot rather than carrying both keys live
+/// — matters for the cumulative BPF 512-byte stack budget. Reads
+/// addresses through the IP-header pointer rather than taking them
+/// by value so the caller doesn't pre-materialize them on its frame.
+#[inline(always)]
+fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32) -> u16 {
+    {
+        let key = Key::new(32, unsafe { (*ip).src_addr });
+        if let Some(entry) = MSS_CLAMP_V4.get(&key) {
+            if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
+                return entry.mss;
+            }
+        }
+    }
+    {
+        let key = Key::new(32, unsafe { (*ip).dst_addr });
+        if let Some(entry) = MSS_CLAMP_V4.get(&key) {
+            if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
+                return entry.mss;
+            }
+        }
+    }
+    if let Some(mss) = unsafe { MSS_CLAMP_BY_IFACE.get(&egress_ifindex) } {
+        if *mss != 0 {
+            return *mss;
+        }
+    }
+    if let Some(c) = CFG.get(0) {
+        return c.mss_clamp_global;
+    }
+    0
+}
+
+/// IPv6 mirror of [`lookup_mss_clamp_v4`] — same precedence, /128 keys.
+#[inline(always)]
+fn lookup_mss_clamp_v6(ip: *const Ipv6Hdr, egress_ifindex: u32) -> u16 {
+    {
+        let key = Key::new(128, unsafe { (*ip).src_addr });
+        if let Some(entry) = MSS_CLAMP_V6.get(&key) {
+            if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
+                return entry.mss;
+            }
+        }
+    }
+    {
+        let key = Key::new(128, unsafe { (*ip).dst_addr });
+        if let Some(entry) = MSS_CLAMP_V6.get(&key) {
+            if entry.iface_filter == 0 || entry.iface_filter == egress_ifindex {
+                return entry.mss;
+            }
+        }
+    }
+    if let Some(mss) = unsafe { MSS_CLAMP_BY_IFACE.get(&egress_ifindex) } {
+        if *mss != 0 {
+            return *mss;
+        }
+    }
+    if let Some(c) = CFG.get(0) {
+        return c.mss_clamp_global;
+    }
+    0
 }
 
 // --- TTL / csum / helpers -------------------------------------------------
