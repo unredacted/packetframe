@@ -124,9 +124,25 @@ const INIT_COMPLETE_QUIESCENCE: Duration = Duration::from_secs(5);
 const FRAME_CHANNEL_CAPACITY: usize = 256;
 
 /// Cap on time spent waiting for the peer's OPEN after we send
-/// ours. Real peers respond within milliseconds; 2 minutes is the
-/// RFC 4271 ConnectRetry default and a safe upper bound.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+/// ours. RFC 4271's 120s ConnectRetry default applies to the
+/// *active* connector waiting for TCP to come up — we're the
+/// passive side with TCP already established, where real peers
+/// send OPEN within milliseconds. 10s is comfortable headroom that
+/// still bounds the slowloris primitive a misconfigured (or
+/// hostile) peer can leverage against the single-connection accept
+/// loop (audit Slice 2).
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on iterations through one UPDATE's per-prefix elems. A
+/// single attacker-controlled UPDATE can encode tens of thousands
+/// of NLRI entries that bgpkit-parser's `Elementor` fans out into
+/// `BgpElem`s, each of which `apply_route_event().await`s — a
+/// control-plane amplification primitive flagged by the audit
+/// (Slice 2). 8192 leaves comfortable headroom above any
+/// realistic bird best-path stream (a full v4 table is ~960K
+/// prefixes spread across many UPDATEs) while putting an explicit
+/// ceiling on per-message work.
+const MAX_ELEMS_PER_UPDATE: usize = 8192;
 
 // --- BgpListener ------------------------------------------------------------
 
@@ -499,6 +515,20 @@ impl BgpListener {
                     &peer_asn_for_elems,
                 );
                 let fallback_nh = self.cfg.listen_addr.ip();
+                if elems.len() > MAX_ELEMS_PER_UPDATE {
+                    // Session-fatal: leaving an UPDATE half-applied
+                    // would put the FIB in a torn state across
+                    // peer_id's mirror, and we don't want the next
+                    // attacker-shaped UPDATE to just keep adding to
+                    // the per-message budget. Close, emit Resync,
+                    // let the peer reconnect.
+                    warn!(
+                        elems = elems.len(),
+                        cap = MAX_ELEMS_PER_UPDATE,
+                        "BGP UPDATE elem count exceeds per-message cap; closing session"
+                    );
+                    return;
+                }
                 for elem in elems {
                     let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
                         Some(e) => e,
