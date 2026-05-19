@@ -302,6 +302,16 @@ impl FromStr for ForwardingMode {
 /// implementation lacks RFC 9069 Loc-RIB — see
 /// `route_source_bgp.rs` module docs and
 /// `docs/runbooks/custom-fib.md` for the rationale.
+///
+/// **Authorization.** The listeners are unauthenticated at the
+/// protocol level (no TCP-MD5 wiring). The default posture is
+/// loopback-only: a non-loopback listen address is rejected at
+/// parse time. Operators who genuinely need a routable bind (e.g.,
+/// a netns-segmented deploy where the listener is reachable only
+/// inside a private network) must opt in with `allow-remote` and
+/// declare an `IpNet` ACL via one or more `peer-from <cidr>` sub-
+/// keywords. The BGP variant additionally accepts `peer-ip <ip>`
+/// to pin the configured `peer-as` to a specific source address.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum RouteSourceSpec {
     /// BMP station listen address. Bird dials out to this
@@ -322,6 +332,17 @@ pub enum RouteSourceSpec {
         addr: String,
         port: u16,
         require_loc_rib: bool,
+        /// Operator opt-in for binding a non-loopback listen
+        /// address. False (the safe default) makes a non-loopback
+        /// listen a parse-time error; true requires at least one
+        /// `peer_from` entry.
+        allow_remote: bool,
+        /// CIDR ACL applied at `accept()` time when `allow_remote`
+        /// is true: peers whose source IP doesn't fall in any
+        /// entry are rejected before the BMP framing starts. Empty
+        /// is parse-rejected when `allow_remote` is true; ignored
+        /// (must be empty) when `allow_remote` is false.
+        peer_from: Vec<ipnet::IpNet>,
     },
     /// iBGP listener — packetframe accepts an iBGP session from
     /// bird and ingests UPDATEs as bird's selected best paths.
@@ -333,6 +354,19 @@ pub enum RouteSourceSpec {
         local_as: u32,
         peer_as: u32,
         router_id: Option<std::net::Ipv4Addr>,
+        /// Operator opt-in for binding a non-loopback listen
+        /// address. See [`RouteSourceSpec::Bmp::allow_remote`].
+        allow_remote: bool,
+        /// CIDR ACL on the peer's source IP. See
+        /// [`RouteSourceSpec::Bmp::peer_from`].
+        peer_from: Vec<ipnet::IpNet>,
+        /// Optional pin on the peer's source IP. When set, an
+        /// accepted connection whose source IP differs is closed.
+        /// Combined with the peer-AS check in
+        /// `route_source_bgp::handle_connection`, this is the only
+        /// real identity binding available in the absence of
+        /// TCP-MD5 / TCP-AO.
+        peer_ip: Option<std::net::IpAddr>,
     },
 }
 
@@ -1121,10 +1155,16 @@ where
 }
 
 /// Parse `route-source <kind> <args...>`. Two kinds supported:
-/// - `bmp <addr>:<port>`
-/// - `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`
+/// - `bmp <addr>:<port> [require-loc-rib] [allow-remote peer-from <cidr> ...]`
+/// - `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]
+///        [allow-remote peer-from <cidr> ... [peer-ip <ip>]]`
 ///
 /// Unknown kinds become parse errors with an explicit message.
+///
+/// **Listener authorization.** Non-loopback listen addresses require
+/// the explicit `allow-remote` opt-in plus at least one `peer-from
+/// <cidr>` entry. Loopback listens with no extra keywords keep the
+/// pre-existing config compatible. See [`RouteSourceSpec`].
 fn parse_route_source<'a>(
     line: usize,
     mut rest: impl Iterator<Item = &'a str>,
@@ -1141,26 +1181,48 @@ fn parse_route_source<'a>(
                 ConfigError::parse(line, "route-source bmp requires <addr>:<port>")
             })?;
             let (addr, port) = parse_endpoint(line, endpoint, "bmp")?;
-            // Optional trailing `require-loc-rib` flag. Any other
-            // tail token is a parse error.
             let mut require_loc_rib = false;
-            for tok in rest {
+            let mut allow_remote = false;
+            let mut peer_from: Vec<ipnet::IpNet> = Vec::new();
+            // Peek-driven loop: `require-loc-rib` / `allow-remote`
+            // are no-value flags; `peer-from` consumes one trailing
+            // CIDR argument.
+            while let Some(tok) = rest.next() {
                 match tok {
                     "require-loc-rib" => require_loc_rib = true,
+                    "allow-remote" => allow_remote = true,
+                    "peer-from" => {
+                        let cidr_str = rest.next().ok_or_else(|| {
+                            ConfigError::parse(
+                                line,
+                                "route-source bmp: `peer-from` requires a <cidr> argument",
+                            )
+                        })?;
+                        let cidr = cidr_str.parse::<ipnet::IpNet>().map_err(|e| {
+                            ConfigError::parse(
+                                line,
+                                format!("route-source bmp: bad peer-from `{cidr_str}`: {e}"),
+                            )
+                        })?;
+                        peer_from.push(cidr);
+                    }
                     other => {
                         return Err(ConfigError::parse(
                             line,
                             format!(
-                                "route-source bmp: unknown tail flag `{other}` (only `require-loc-rib` is recognized)"
+                                "route-source bmp: unknown tail flag `{other}` (known: require-loc-rib, allow-remote, peer-from <cidr>)"
                             ),
                         ));
                     }
                 }
             }
+            validate_listener_auth(line, "bmp", &addr, allow_remote, !peer_from.is_empty(), false)?;
             Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bmp {
                 addr,
                 port,
                 require_loc_rib,
+                allow_remote,
+                peer_from,
             }))
         }
         "bgp" => {
@@ -1174,7 +1236,16 @@ fn parse_route_source<'a>(
             let mut local_as: Option<u32> = None;
             let mut peer_as: Option<u32> = None;
             let mut router_id: Option<std::net::Ipv4Addr> = None;
+            let mut allow_remote = false;
+            let mut peer_from: Vec<ipnet::IpNet> = Vec::new();
+            let mut peer_ip: Option<std::net::IpAddr> = None;
             while let Some(key) = rest.next() {
+                // `allow-remote` is a no-value flag; everything
+                // else takes one argument.
+                if key == "allow-remote" {
+                    allow_remote = true;
+                    continue;
+                }
                 let value = rest.next().ok_or_else(|| {
                     ConfigError::parse(
                         line,
@@ -1206,11 +1277,29 @@ fn parse_route_source<'a>(
                             )
                         })?);
                     }
+                    "peer-from" => {
+                        let cidr = value.parse::<ipnet::IpNet>().map_err(|e| {
+                            ConfigError::parse(
+                                line,
+                                format!("route-source bgp: bad peer-from `{value}`: {e}"),
+                            )
+                        })?;
+                        peer_from.push(cidr);
+                    }
+                    "peer-ip" => {
+                        let ip = value.parse::<std::net::IpAddr>().map_err(|e| {
+                            ConfigError::parse(
+                                line,
+                                format!("route-source bgp: bad peer-ip `{value}`: {e}"),
+                            )
+                        })?;
+                        peer_ip = Some(ip);
+                    }
                     other => {
                         return Err(ConfigError::parse(
                             line,
                             format!(
-                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id)"
+                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip)"
                             ),
                         ));
                     }
@@ -1222,12 +1311,23 @@ fn parse_route_source<'a>(
             let peer_as = peer_as.ok_or_else(|| {
                 ConfigError::parse(line, "route-source bgp: missing required `peer-as <asn>`")
             })?;
+            validate_listener_auth(
+                line,
+                "bgp",
+                &addr,
+                allow_remote,
+                !peer_from.is_empty(),
+                peer_ip.is_some(),
+            )?;
             Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bgp {
                 addr,
                 port,
                 local_as,
                 peer_as,
                 router_id,
+                allow_remote,
+                peer_from,
+                peer_ip,
             }))
         }
         other => Err(ConfigError::parse(
@@ -1237,6 +1337,94 @@ fn parse_route_source<'a>(
             ),
         )),
     }
+}
+
+/// Cross-check that the listen address and the authorization opt-in
+/// agree. The rules — same shape for both kinds:
+///
+/// - Loopback address (127.0.0.0/8, ::1): default-allow with no
+///   extra keywords. `allow-remote`, `peer-from`, and `peer-ip` are
+///   parse errors because there's no source IP other than 127.x /
+///   ::1 to gate on.
+/// - Non-loopback address: requires `allow-remote` AND at least one
+///   `peer-from <cidr>`. Without those, the listener would accept
+///   any TCP connection that reaches the port and inject routes —
+///   which the audit (May 2026) flagged as the highest-severity
+///   finding.
+///
+/// `addr` is the literal string from the config so the diagnostic
+/// can interpolate exactly what the operator typed. Parsing it as
+/// an `IpAddr` here is on the hot path of config-load (one call
+/// per route-source directive), so the small cost is fine.
+fn validate_listener_auth(
+    line: usize,
+    kind_label: &str,
+    addr: &str,
+    allow_remote: bool,
+    has_peer_from: bool,
+    has_peer_ip: bool,
+) -> Result<(), ConfigError> {
+    // Strip the brackets bird/operators sometimes use around
+    // IPv6 endpoints (`[::1]`); `parse_endpoint` returns the raw
+    // segment between the brackets unchanged, but a literal `::1`
+    // is what reaches us here.
+    let parsed = addr
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .map_err(|e| {
+            ConfigError::parse(
+                line,
+                format!("route-source {kind_label}: bad listen address `{addr}`: {e}"),
+            )
+        })?;
+    if parsed.is_loopback() {
+        if allow_remote {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: `allow-remote` is only valid with a non-loopback listen address (got loopback `{addr}`)"
+                ),
+            ));
+        }
+        if has_peer_from {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: `peer-from` is only valid with `allow-remote` on a non-loopback listen (got loopback `{addr}`)"
+                ),
+            ));
+        }
+        if has_peer_ip {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: `peer-ip` is only valid with `allow-remote` on a non-loopback listen (got loopback `{addr}`)"
+                ),
+            ));
+        }
+    } else {
+        if !allow_remote {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: listen address `{addr}` is not loopback; \
+                     add `allow-remote peer-from <cidr>` to bind a routable address. \
+                     Without that opt-in the listener has no authentication and would \
+                     accept route injections from any reachable host."
+                ),
+            ));
+        }
+        if !has_peer_from {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: `allow-remote` requires at least one `peer-from <cidr>` to bound which source IPs may complete the handshake"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Common `<addr>:<port>` parser, used by both `bmp` and `bgp`
@@ -1865,10 +2053,14 @@ module fast-path
                 addr,
                 port,
                 require_loc_rib,
+                allow_remote,
+                peer_from,
             } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 6543);
                 assert!(!require_loc_rib, "default should be off");
+                assert!(!allow_remote, "loopback default does not need opt-in");
+                assert!(peer_from.is_empty());
             }
             other => panic!("expected Bmp, got {other:?}"),
         }
@@ -1938,12 +2130,18 @@ module fast-path
                 local_as,
                 peer_as,
                 router_id,
+                allow_remote,
+                peer_from,
+                peer_ip,
             } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 1179);
                 assert_eq!(local_as, 401401);
                 assert_eq!(peer_as, 401401);
                 assert_eq!(router_id, Some("103.17.154.7".parse().unwrap()));
+                assert!(!allow_remote, "loopback default does not need opt-in");
+                assert!(peer_from.is_empty());
+                assert!(peer_ip.is_none());
             }
             other => panic!("expected Bgp, got {other:?}"),
         }
@@ -1998,6 +2196,194 @@ module fast-path
                 assert!(message.contains("router-id"), "msg was: {message}");
             }
             other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // --- Listener authorization (security audit slice 1) -----------
+
+    #[test]
+    fn route_source_bgp_non_loopback_requires_opt_in() {
+        // Binding 0.0.0.0 without `allow-remote` is the failure mode
+        // the audit (May 2026) flagged as Critical — any TCP-reachable
+        // host could speak iBGP and inject routes. Reject at parse
+        // time so the operator can't silently misconfigure into the
+        // unsafe state.
+        let e = parse_module_body("  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("not loopback") && message.contains("allow-remote"),
+                    "msg was: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_non_loopback_requires_opt_in() {
+        let e = parse_module_body("  route-source bmp 192.0.2.5:6543\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("not loopback") && message.contains("allow-remote"),
+                    "msg was: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_allow_remote_with_peer_from_parses() {
+        let s = "  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1 allow-remote peer-from 10.0.0.0/24\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp {
+                addr,
+                allow_remote,
+                peer_from,
+                peer_ip,
+                ..
+            } => {
+                assert_eq!(addr, "0.0.0.0");
+                assert!(allow_remote);
+                assert_eq!(peer_from.len(), 1);
+                assert_eq!(peer_from[0], "10.0.0.0/24".parse::<ipnet::IpNet>().unwrap());
+                assert!(peer_ip.is_none());
+            }
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_allow_remote_multiple_peer_from_parses() {
+        let s = "  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1 \
+                 allow-remote peer-from 10.0.0.0/24 peer-from 10.1.0.0/16\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp { peer_from, .. } => {
+                assert_eq!(peer_from.len(), 2);
+            }
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_allow_remote_without_peer_from_errors() {
+        let e = parse_module_body(
+            "  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1 allow-remote\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("peer-from"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_peer_from_without_allow_remote_on_loopback_errors() {
+        // Loopback listen + peer-from is a config contradiction — the
+        // ACL has no work to do because all accepted connections come
+        // from 127.x. Catching this at parse-time tells the operator
+        // their intent is unclear before the daemon starts.
+        let e = parse_module_body(
+            "  route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1 peer-from 10.0.0.0/24\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("peer-from"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_allow_remote_on_loopback_errors() {
+        let e = parse_module_body(
+            "  route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1 allow-remote\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("allow-remote"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_peer_ip_pin_parses() {
+        let s = "  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1 \
+                 allow-remote peer-from 10.0.0.0/24 peer-ip 10.0.0.5\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp { peer_ip, .. } => {
+                assert_eq!(peer_ip, Some("10.0.0.5".parse().unwrap()));
+            }
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_bad_peer_from_errors() {
+        let e = parse_module_body(
+            "  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1 \
+             allow-remote peer-from not-a-cidr\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("peer-from"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_bad_peer_ip_errors() {
+        let e = parse_module_body(
+            "  route-source bgp 0.0.0.0:1179 local-as 1 peer-as 1 \
+             allow-remote peer-from 10.0.0.0/24 peer-ip not-an-ip\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("peer-ip"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bmp_allow_remote_with_peer_from_parses() {
+        let s =
+            "  route-source bmp 0.0.0.0:6543 allow-remote peer-from 10.0.0.0/24 require-loc-rib\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bmp {
+                addr,
+                require_loc_rib,
+                allow_remote,
+                peer_from,
+                ..
+            } => {
+                assert_eq!(addr, "0.0.0.0");
+                assert!(require_loc_rib);
+                assert!(allow_remote);
+                assert_eq!(peer_from.len(), 1);
+            }
+            other => panic!("expected Bmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_ipv6_loopback_accepts_default() {
+        // The IPv6 loopback (::1) must round-trip the same as 127.x —
+        // a default-permissive bind that doesn't need allow-remote.
+        match extract_route_source("  route-source bgp [::1]:1179 local-as 1 peer-as 1\n") {
+            RouteSourceSpec::Bgp { addr, .. } => assert_eq!(addr, "[::1]"),
+            other => panic!("expected Bgp, got {other:?}"),
         }
     }
 

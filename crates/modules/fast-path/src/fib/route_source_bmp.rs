@@ -45,7 +45,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -102,6 +102,12 @@ pub struct BmpStation {
     /// Required for safe forwarding use against bird 2.x / bird 3.x
     /// (which only emit pre/post-policy frames).
     require_loc_rib: bool,
+    /// CIDR ACL applied at `accept()` time. Empty means "loopback
+    /// only" — the config parser only permits empty when
+    /// `listen_addr` is loopback. When non-empty, every accepted
+    /// source IP must fall within at least one entry or the
+    /// connection is dropped before the BMP framing starts.
+    peer_acl: Vec<ipnet::IpNet>,
 }
 
 /// Re-export for callers building the station.
@@ -129,6 +135,7 @@ impl BmpStation {
             last_rm_unix: Arc::new(AtomicI64::new(0)),
             stall_gate: None,
             require_loc_rib: false,
+            peer_acl: Vec::new(),
         }
     }
 
@@ -150,6 +157,16 @@ impl BmpStation {
         self
     }
 
+    /// Set the CIDR ACL applied at `accept()` time. Empty (the
+    /// default) means loopback-only. The config parser enforces the
+    /// "non-loopback listen requires non-empty ACL" invariant; this
+    /// builder is the runtime path the controller uses to thread the
+    /// parsed ACL through.
+    pub fn with_peer_acl(mut self, peer_acl: Vec<ipnet::IpNet>) -> Self {
+        self.peer_acl = peer_acl;
+        self
+    }
+
     /// Main loop: bind, accept, handle one connection at a time.
     /// On disconnect (clean or error), emit Resync so the programmer
     /// marks all mirrored routes unseen — the next `RouteEvent::Add`
@@ -159,7 +176,13 @@ impl BmpStation {
     pub async fn run(self) -> Result<(), RouteSourceError> {
         let listener = bind_with_reuseaddr(self.listen_addr)
             .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.listen_addr)))?;
-        info!(addr = %self.listen_addr, "BMP station listening");
+        let loopback_only = self.listen_addr.ip().is_loopback() && self.peer_acl.is_empty();
+        info!(
+            addr = %self.listen_addr,
+            peer_acl_entries = self.peer_acl.len(),
+            auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
+            "BMP station listening"
+        );
 
         // Optional stall monitor. Fires a warning log when no ROUTE
         // MONITORING frame arrives for `STALL_THRESHOLD` *and* the
@@ -188,6 +211,19 @@ impl BmpStation {
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, addr)) => {
+                            // Source-IP gate runs before any BMP byte
+                            // is read. Same audit (May 2026) rationale
+                            // as the matching gate in
+                            // `route_source_bgp::run`.
+                            if !source_ip_permitted(addr.ip(), &self.peer_acl) {
+                                warn!(
+                                    %addr,
+                                    peer_acl_entries = self.peer_acl.len(),
+                                    "BMP accept rejected: source IP outside peer-from ACL"
+                                );
+                                drop(stream);
+                                continue;
+                            }
                             info!(%addr, "BMP client connected");
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
@@ -620,6 +656,19 @@ fn network_prefix_to_ip_prefix(np: &NetworkPrefix) -> Option<IpPrefix> {
 fn asn_to_u32(asn: bgpkit_parser::models::Asn) -> u32 {
     // `Asn` impls `Display` as the decimal integer.
     asn.to_string().parse().unwrap_or(0)
+}
+
+/// Whether `addr` is permitted by the listener's `peer_acl`. Empty
+/// ACL means "loopback only" — the config parser already enforces
+/// that empty + non-loopback listen is rejected, so an empty ACL
+/// implies loopback bind. The defensive `is_loopback()` check covers
+/// a misconstructed in-process config.
+fn source_ip_permitted(addr: IpAddr, peer_acl: &[ipnet::IpNet]) -> bool {
+    if peer_acl.is_empty() {
+        addr.is_loopback()
+    } else {
+        peer_acl.iter().any(|net| net.contains(&addr))
+    }
 }
 
 /// Bind a `TcpListener` with `SO_REUSEADDR` enabled (v0.2.2 fix). See

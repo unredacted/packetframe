@@ -865,12 +865,20 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 addr,
                 port,
                 require_loc_rib,
+                peer_from,
+                // `allow_remote` is informational here — the config
+                // parser already rejected the unsafe shape (non-loopback
+                // bind without opt-in), so by the time we see the spec
+                // the `peer_from` ACL is either non-empty or the listen
+                // is loopback.
+                allow_remote: _,
             }) => format!("{addr}:{port}")
                 .parse::<std::net::SocketAddr>()
                 .ok()
                 .map(|listen| crate::fib::controller::RouteSourceConfig::Bmp {
                     listen,
                     require_loc_rib: *require_loc_rib,
+                    peer_acl: peer_from.clone(),
                 }),
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
                 addr,
@@ -878,6 +886,9 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 local_as,
                 peer_as,
                 router_id,
+                peer_from,
+                peer_ip,
+                allow_remote: _,
             }) => {
                 let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
                 // Default router-id: lowest 32 bits of the listen
@@ -893,6 +904,8 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                     local_as: *local_as,
                     peer_as: *peer_as,
                     router_id: rid,
+                    peer_acl: peer_from.clone(),
+                    expected_peer_ip: *peer_ip,
                 })
             }
             _ => None,
