@@ -683,6 +683,14 @@ pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8
     let opt_params_len = 2 + caps.len(); // [type=2, len=...] + caps
     let mut opt_params: Vec<u8> = Vec::with_capacity(opt_params_len);
     opt_params.push(2); // param type: Capability
+                        // Audit Slice 5 hardening: today `caps` is fixed at ~30 bytes
+                        // so the u8 fits comfortably, but a future capability that
+                        // pushes the total over 255 would silently truncate and emit a
+                        // malformed OPEN. Catch the regression at dev-build time.
+    debug_assert!(
+        caps.len() <= u8::MAX as usize,
+        "BGP OPEN capability TLV exceeds 255 bytes; u8 length field truncates"
+    );
     opt_params.push(caps.len() as u8);
     opt_params.extend_from_slice(&caps);
 
@@ -703,6 +711,10 @@ pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8
     out.extend_from_slice(&my_as_2.to_be_bytes());
     out.extend_from_slice(&hold_time.to_be_bytes());
     out.extend_from_slice(&router_id.octets());
+    debug_assert!(
+        opt_params.len() <= u8::MAX as usize,
+        "BGP OPEN opt-params section exceeds 255 bytes; u8 length field truncates"
+    );
     out.push(opt_params.len() as u8);
     out.extend_from_slice(&opt_params);
     out
