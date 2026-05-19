@@ -429,6 +429,28 @@ fn reconfigure_from_signal(
     }
 }
 
+/// Scrub ASCII control bytes (< 0x20) other than tab/newline from a
+/// string that's about to be written to the reconfigure marker file
+/// (and from there read back by `packetframe reconfigure` and
+/// echoed via `tracing::error!` to an operator's terminal). The
+/// failure-side `status` ultimately includes per-module error
+/// messages that can carry parser bytes from external sources
+/// (config text, BGP/BMP error text propagated up); a stray ANSI
+/// escape sequence in the marker would corrupt the operator's TTY
+/// when they run `packetframe reconfigure`. Audit Slice 5 hardening.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn scrub_control_chars(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\t' || c == '\n' || !c.is_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// Append a timestamp + status line to the reconfigure marker file.
 /// Non-fatal on I/O error — the SIGHUP handler still completed its
 /// real work; the marker is just a hint to the CLI ack-poller.
@@ -445,7 +467,7 @@ fn write_reconfigure_marker(path: &Path, status: &str) {
         return;
     }
     let tmp = path.with_extension("timestamp.tmp");
-    let body = format!("{status} {now_ns}\n");
+    let body = format!("{} {}\n", scrub_control_chars(status), now_ns);
     let r = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(body.as_bytes())?;

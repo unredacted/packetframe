@@ -566,10 +566,38 @@ mod humantime_serde_compat {
     }
 }
 
+/// Cap on the size of a config file `from_file` will read. The
+/// audit Slice 5 finding: `fs::read_to_string` was unbounded, so a
+/// pathological or hostile config file could drag the process into
+/// a multi-GiB heap allocation at startup. Real packetframe configs
+/// are well under 50 KiB; 1 MiB is 20× headroom for the operator
+/// adding comments and still 4 orders of magnitude smaller than the
+/// memory primitive the previous behavior exposed.
+pub const MAX_CONFIG_FILE_SIZE: u64 = 1 << 20;
+
 impl Config {
     /// Parse a config from a file path.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
+        // Pre-flight size check via metadata so we never `read_to_string`
+        // a runaway file. Symlinks are followed deliberately — operators
+        // do symlink configs in deploy layouts — but a deeply nested
+        // attacker-pointed symlink chain bottoms out at a real file
+        // whose size we can still measure here.
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.len() > MAX_CONFIG_FILE_SIZE {
+                return Err(ConfigError::Parse {
+                    line: 0,
+                    message: format!(
+                        "config file {} is {} bytes; cap is {} bytes (audit Slice 5: \
+                         bounded read prevents memory DoS via a runaway config)",
+                        path.display(),
+                        meta.len(),
+                        MAX_CONFIG_FILE_SIZE
+                    ),
+                });
+            }
+        }
         let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
@@ -700,6 +728,98 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
     })
 }
 
+/// Max iface name length the Linux kernel accepts (`IFNAMSIZ - 1`,
+/// where `IFNAMSIZ = 16` reserves a trailing NUL byte). `if_nametoindex`
+/// rejects anything longer at attach time, but parse-time validation
+/// catches the typo earlier and gives a better error.
+const MAX_IFACE_LEN: usize = 15;
+
+/// Reject iface names that contain shell / path / NUL metacharacters.
+/// `if_nametoindex` rejects most of these anyway, but the audit Slice
+/// 5 hardening prefers a clear config-time error to a deep-runtime
+/// `ENODEV`. The list mirrors the kernel's `dev_valid_name()` and
+/// adds the path-traversal `..` case for our own iface-keyed maps.
+fn validate_iface_name(line: usize, key: &str, iface: &str) -> Result<(), ConfigError> {
+    if iface.is_empty() {
+        return Err(ConfigError::parse(
+            line,
+            format!("{key}: interface name is empty"),
+        ));
+    }
+    if iface.len() > MAX_IFACE_LEN {
+        return Err(ConfigError::parse(
+            line,
+            format!(
+                "{key}: interface name `{iface}` is {} bytes; kernel cap is {} (IFNAMSIZ - 1)",
+                iface.len(),
+                MAX_IFACE_LEN
+            ),
+        ));
+    }
+    if iface == "." || iface == ".." {
+        return Err(ConfigError::parse(
+            line,
+            format!("{key}: interface name `{iface}` is reserved"),
+        ));
+    }
+    for ch in iface.chars() {
+        match ch {
+            '/' | '\\' | '\0' => {
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "{key}: interface name `{iface}` contains a forbidden character (`/`, `\\`, or NUL)"
+                    ),
+                ));
+            }
+            c if c.is_whitespace() => {
+                return Err(ConfigError::parse(
+                    line,
+                    format!("{key}: interface name `{iface}` contains whitespace"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Cross-check a path value the operator supplied for a daemon-
+/// trusted destination (metrics-textfile, bpffs-root, state-dir).
+/// Rejects: relative paths, embedded NUL bytes, any `..` component.
+/// These three fields are consumed by the daemon to create
+/// directories and write files; without validation a malicious or
+/// careless config could redirect the privileged daemon's
+/// `create_dir_all` / write into any path the parent of which is
+/// world-writable. Audit Slice 5 hardening.
+fn validate_safe_path(line: usize, key: &str, raw: &str) -> Result<PathBuf, ConfigError> {
+    if raw.is_empty() {
+        return Err(ConfigError::parse(line, format!("{key}: path is empty")));
+    }
+    if raw.contains('\0') {
+        return Err(ConfigError::parse(
+            line,
+            format!("{key}: path contains NUL"),
+        ));
+    }
+    let p = PathBuf::from(raw);
+    if !p.is_absolute() {
+        return Err(ConfigError::parse(
+            line,
+            format!("{key}: `{raw}` is relative; daemon paths must be absolute"),
+        ));
+    }
+    for c in p.components() {
+        if matches!(c, std::path::Component::ParentDir) {
+            return Err(ConfigError::parse(
+                line,
+                format!("{key}: `{raw}` contains `..` (path traversal)"),
+            ));
+        }
+    }
+    Ok(p)
+}
+
 fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<(), ConfigError> {
     let head = first_token(s);
     let mut rest = rest_tokens(s);
@@ -714,7 +834,7 @@ fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<
                     "metrics-textfile takes exactly one argument",
                 ));
             }
-            g.metrics_textfile = Some(PathBuf::from(path));
+            g.metrics_textfile = Some(validate_safe_path(line, "metrics-textfile", path)?);
         }
         "log-level" => {
             let lvl = rest
@@ -740,7 +860,7 @@ fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<
                     "bpffs-root takes exactly one argument",
                 ));
             }
-            g.bpffs_root = PathBuf::from(path);
+            g.bpffs_root = validate_safe_path(line, "bpffs-root", path)?;
         }
         "state-dir" => {
             let path = rest
@@ -752,7 +872,7 @@ fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<
                     "state-dir takes exactly one argument",
                 ));
             }
-            g.state_dir = PathBuf::from(path);
+            g.state_dir = validate_safe_path(line, "state-dir", path)?;
         }
         "attach-settle-time" => {
             let tok = rest.next().ok_or_else(|| {
@@ -796,6 +916,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                     "attach takes exactly two arguments: <iface> <mode>",
                 ));
             }
+            validate_iface_name(line, "attach", iface)?;
             let mode: AttachMode = mode_tok
                 .parse()
                 .map_err(|e: String| ConfigError::parse(line, e))?;
@@ -849,6 +970,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let iface = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "local-prefix: expected an interface name after `via`")
             })?;
+            validate_iface_name(line, "local-prefix", iface)?;
             // v0.2.1 issue #32: optional `arp-scavenge` tail flag.
             let mut arp_scavenge = false;
             for tail in rest {
@@ -909,6 +1031,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let iface = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "fallback-default: expected an iface name after `via`")
             })?;
+            validate_iface_name(line, "fallback-default", iface)?;
             let nh_kw = rest.next().ok_or_else(|| {
                 ConfigError::parse(
                     line,
@@ -2384,6 +2507,110 @@ module fast-path
         match extract_route_source("  route-source bgp [::1]:1179 local-as 1 peer-as 1\n") {
             RouteSourceSpec::Bgp { addr, .. } => assert_eq!(addr, "[::1]"),
             other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    // --- Path validation (audit Slice 5) ----------------------------
+
+    #[test]
+    fn global_path_relative_rejected() {
+        for key in ["metrics-textfile", "bpffs-root", "state-dir"] {
+            let body = format!("global\n  {key} relative/path\n");
+            let e = Config::parse(&body).unwrap_err();
+            match e {
+                ConfigError::Parse { message, .. } => {
+                    assert!(
+                        message.contains(key) && message.contains("relative"),
+                        "{key} → {message}"
+                    );
+                }
+                other => panic!("expected Parse for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn global_path_traversal_rejected() {
+        let body = "global\n  bpffs-root /sys/fs/bpf/../../../etc\n";
+        let e = Config::parse(body).unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains(".."), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // --- Iface name validation --------------------------------------
+
+    #[test]
+    fn attach_iface_with_slash_rejected() {
+        let e = parse_module_body("  attach eth0/foo native\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("forbidden"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_iface_too_long_rejected() {
+        let too_long = "x".repeat(MAX_IFACE_LEN + 1);
+        let e = parse_module_body(&format!("  attach {too_long} native\n")).unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("IFNAMSIZ"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_iface_double_dot_rejected() {
+        let e = parse_module_body("  attach .. native\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("reserved"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_prefix_iface_sanitized() {
+        let e = parse_module_body("  local-prefix 10.0.0.0/24 via has space\n").unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                // "has space" — the parser splits on whitespace so the
+                // second token is `space`. Either error is acceptable;
+                // they both flag a problem.
+                assert!(
+                    message.contains("local-prefix")
+                        || message.contains("whitespace")
+                        || message.contains("unknown tail flag"),
+                    "msg was: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // --- Config file size cap ---------------------------------------
+
+    #[test]
+    fn config_file_size_cap_rejects_runaway() {
+        let td = TempDir::new("config_size_cap");
+        let path = td.path.join("packetframe.conf");
+        // Write > 1 MiB of comment lines.
+        let big = "# pad\n".repeat(200_000);
+        std::fs::write(&path, &big).unwrap();
+        let e = Config::from_file(&path).unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("cap"), "msg was: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 
