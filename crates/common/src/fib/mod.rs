@@ -94,7 +94,12 @@ pub enum RouteEvent {
 /// negligible. `is_local_arp` recovers the per-iface scope so the
 /// programmer can withdraw a single iface's worth of /32s on
 /// `RTM_DELLINK`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` / `PartialOrd` are derived (lexicographic on the wrapped
+/// `u64`) so `PeerId` can key a `BTreeMap` / `BTreeSet`. The
+/// FibProgrammer uses `BTreeMap<(PeerId, Option<u32>), _>` for its
+/// per-advertisement state so iteration order is stable across
+/// process runs without an explicit sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId(pub u64);
 
 impl PeerId {
