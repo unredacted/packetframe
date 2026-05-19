@@ -137,6 +137,20 @@ pub struct BgpListenerConfig {
     pub peer_as: u32,
     pub router_id: Ipv4Addr,
     pub hold_time: u16,
+    /// CIDR ACL applied at `accept()`. Empty means "loopback only" —
+    /// the config parser only permits empty when `listen_addr` is
+    /// loopback. When non-empty, every accepted source IP must fall
+    /// within at least one entry or the connection is dropped before
+    /// the BGP OPEN exchange.
+    pub peer_acl: Vec<ipnet::IpNet>,
+    /// Optional pin on the peer's source IP. When `Some(_)`, an
+    /// accepted connection whose source IP differs is closed
+    /// immediately. The pre-existing `peer_as` cross-check inside
+    /// `handle_connection` then closes any session whose OPEN ASN
+    /// disagrees with the configured value. Together these two
+    /// checks are the only identity binding available in the
+    /// absence of TCP-MD5 / TCP-AO.
+    pub expected_peer_ip: Option<IpAddr>,
 }
 
 impl BgpListenerConfig {
@@ -147,7 +161,24 @@ impl BgpListenerConfig {
             peer_as,
             router_id,
             hold_time: DEFAULT_HOLD_TIME,
+            peer_acl: Vec::new(),
+            expected_peer_ip: None,
         }
+    }
+}
+
+/// Whether `addr` is permitted by the listener's `peer_acl`. An empty
+/// ACL means "loopback only" — the config parser already enforces
+/// that empty + non-loopback listen is rejected, so an empty ACL
+/// implies the listener bound to loopback and only loopback sources
+/// can reach `accept()` in the first place. We still defensively
+/// double-check `is_loopback()` here so a misconstructed in-process
+/// config can't slip past.
+fn source_ip_permitted(addr: IpAddr, peer_acl: &[ipnet::IpNet]) -> bool {
+    if peer_acl.is_empty() {
+        addr.is_loopback()
+    } else {
+        peer_acl.iter().any(|net| net.contains(&addr))
     }
 }
 
@@ -187,7 +218,18 @@ impl BgpListener {
     pub async fn run(self) -> Result<(), RouteSourceError> {
         let listener = bind_with_reuseaddr(self.cfg.listen_addr)
             .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.cfg.listen_addr)))?;
-        info!(addr = %self.cfg.listen_addr, local_as = self.cfg.local_as, peer_as = self.cfg.peer_as, "BGP listener started");
+        let loopback_only = self.cfg.listen_addr.ip().is_loopback()
+            && self.cfg.peer_acl.is_empty()
+            && self.cfg.expected_peer_ip.is_none();
+        info!(
+            addr = %self.cfg.listen_addr,
+            local_as = self.cfg.local_as,
+            peer_as = self.cfg.peer_as,
+            peer_acl_entries = self.cfg.peer_acl.len(),
+            peer_ip_pin = ?self.cfg.expected_peer_ip,
+            auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
+            "BGP listener started"
+        );
 
         loop {
             tokio::select! {
@@ -198,6 +240,31 @@ impl BgpListener {
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, addr)) => {
+                            // Source-IP gating runs before any byte is
+                            // read: an unauthorized peer must not reach
+                            // BGP framing because that's the surface the
+                            // audit (May 2026) flagged as the
+                            // arbitrary-route-injection primitive.
+                            if !source_ip_permitted(addr.ip(), &self.cfg.peer_acl) {
+                                warn!(
+                                    %addr,
+                                    peer_acl_entries = self.cfg.peer_acl.len(),
+                                    "BGP accept rejected: source IP outside peer-from ACL"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            if let Some(expected) = self.cfg.expected_peer_ip {
+                                if addr.ip() != expected {
+                                    warn!(
+                                        %addr,
+                                        %expected,
+                                        "BGP accept rejected: source IP does not match peer-ip pin"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            }
                             info!(%addr, "BGP client connected");
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BGP connection handler exited with error");
@@ -244,25 +311,28 @@ impl BgpListener {
                         o.version
                     )));
                 }
-                let peer_asn = asn_to_u32(o.asn);
-                // bgpkit may decode AS_TRANS (23456) as the 2-byte
-                // ASN when the 4-byte ASN capability is present. The
-                // real ASN comes via the capability. For an iBGP
-                // session with bird, the peer's effective ASN should
-                // match our `peer_as` config; if it doesn't, that's
-                // a misconfiguration worth surfacing.
-                if peer_asn != self.cfg.peer_as && peer_asn != AS_TRANS as u32 {
-                    warn!(
-                        observed = peer_asn,
-                        expected = self.cfg.peer_as,
-                        "peer ASN mismatch in OPEN (continuing — capability ASN may override)"
-                    );
+                let peer_asn_2byte = asn_to_u32(o.asn);
+                let negotiated = walk_open_capabilities(&o.opt_params);
+                // RFC 6793: when the peer supports 4-octet ASNs, the
+                // 2-byte field carries AS_TRANS (23456) and the real
+                // ASN comes via capability 65. Resolve the effective
+                // ASN by preferring the capability when present, then
+                // cross-check against the operator-configured
+                // `peer_as`. Pre-audit this was a soft warning; the
+                // audit (May 2026) flagged it as the second leg of
+                // the "anyone-can-speak-iBGP" Critical finding, so
+                // it's now a session-fatal close.
+                let effective_peer_asn = negotiated.four_octet_asn.unwrap_or(peer_asn_2byte);
+                if effective_peer_asn != self.cfg.peer_as {
+                    return Err(RouteSourceError::recoverable(format!(
+                        "peer ASN mismatch in OPEN: observed {effective_peer_asn} (2-byte field {peer_asn_2byte}, 4-octet cap {:?}), expected {} — closing session",
+                        negotiated.four_octet_asn, self.cfg.peer_as
+                    )));
                 }
                 let effective_hold = self.cfg.hold_time.min(o.hold_time).max(3);
-                let negotiated = walk_open_capabilities(&o.opt_params);
                 let add_path_in_effect = negotiated.add_path_in_effect();
                 info!(
-                    peer_asn = peer_asn,
+                    peer_asn = effective_peer_asn,
                     peer_router_id = %o.bgp_identifier,
                     effective_hold,
                     add_path_in_effect,
@@ -270,7 +340,7 @@ impl BgpListener {
                     add_path_v6 = negotiated.add_path_v6_recv,
                     "received peer OPEN"
                 );
-                (effective_hold, peer_asn, add_path_in_effect)
+                (effective_hold, effective_peer_asn, add_path_in_effect)
             }
             other => {
                 return Err(RouteSourceError::recoverable(format!(
@@ -632,6 +702,12 @@ struct NegotiatedCapabilities {
     add_path_v4_recv: bool,
     /// Peer advertised ADD-PATH Send (or both) for (IPv6, unicast).
     add_path_v6_recv: bool,
+    /// Peer's 4-octet ASN (RFC 6793) if it advertised the capability.
+    /// When `Some(_)`, this is the authoritative ASN — the 2-byte
+    /// `My AS` field in OPEN carries AS_TRANS (23456) and the real
+    /// ASN comes through here. Used by the peer-AS gate in
+    /// `handle_connection` (the audit-flagged identity check).
+    four_octet_asn: Option<u32>,
 }
 
 impl NegotiatedCapabilities {
@@ -665,26 +741,36 @@ fn walk_open_capabilities(
             continue;
         };
         for c in cap_list {
-            let CapabilityValue::AddPath(ap) = &c.value else {
-                continue;
-            };
-            for af in &ap.address_families {
-                // Peer Send => we Receive. Receive-only on the peer
-                // side means the peer wants to receive multipath from
-                // us, which we never originate, so it is not useful
-                // for our decoding state.
-                let peer_sends = matches!(
-                    af.send_receive,
-                    AddPathSendReceive::Send | AddPathSendReceive::SendReceive
-                );
-                if !peer_sends {
-                    continue;
+            match &c.value {
+                CapabilityValue::AddPath(ap) => {
+                    for af in &ap.address_families {
+                        // Peer Send => we Receive. Receive-only on the
+                        // peer side means the peer wants to receive
+                        // multipath from us, which we never originate,
+                        // so it is not useful for our decoding state.
+                        let peer_sends = matches!(
+                            af.send_receive,
+                            AddPathSendReceive::Send | AddPathSendReceive::SendReceive
+                        );
+                        if !peer_sends {
+                            continue;
+                        }
+                        match (af.afi, af.safi) {
+                            (Afi::Ipv4, Safi::Unicast) => caps.add_path_v4_recv = true,
+                            (Afi::Ipv6, Safi::Unicast) => caps.add_path_v6_recv = true,
+                            _ => {}
+                        }
+                    }
                 }
-                match (af.afi, af.safi) {
-                    (Afi::Ipv4, Safi::Unicast) => caps.add_path_v4_recv = true,
-                    (Afi::Ipv6, Safi::Unicast) => caps.add_path_v6_recv = true,
-                    _ => {}
+                CapabilityValue::FourOctetAs(foa) => {
+                    // RFC 6793: when present, this carries the peer's
+                    // real ASN. The 2-byte field in OPEN holds AS_TRANS
+                    // (23456) and the audit-flagged peer-AS check in
+                    // `handle_connection` compares this value against
+                    // the operator-configured `peer_as`.
+                    caps.four_octet_asn = Some(foa.asn);
                 }
+                _ => {}
             }
         }
     }

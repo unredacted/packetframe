@@ -19,7 +19,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -40,6 +40,13 @@ use crate::fib::route_source_bmp::BmpStation;
 /// source: operators pick `bmp` or `bgp` via `route-source ...`.
 /// `Bgp` is the recommended choice today because bird lacks RFC 9069
 /// Loc-RIB BMP — see `route_source_bgp.rs` module docs.
+///
+/// The `peer_acl` / `expected_peer_ip` fields carry the
+/// authorization opt-in declared in the operator config. The config
+/// parser already enforces "loopback default-allow, non-loopback
+/// requires opt-in"; the controller passes the parsed ACL into the
+/// listener so the runtime `accept()` filter can reject sources
+/// outside the declared CIDRs before any BMP/BGP framing starts.
 #[derive(Debug, Clone)]
 pub enum RouteSourceConfig {
     Bmp {
@@ -49,12 +56,23 @@ pub enum RouteSourceConfig {
         /// type 3). Required for safe forwarding use against
         /// emitters that send pre/post-policy streams.
         require_loc_rib: bool,
+        /// CIDR ACL applied to the source IP of every accepted TCP
+        /// connection. Empty means "loopback-only" (the config
+        /// parser only permits empty when the listen address is
+        /// itself loopback).
+        peer_acl: Vec<ipnet::IpNet>,
     },
     Bgp {
         listen: SocketAddr,
         local_as: u32,
         peer_as: u32,
         router_id: Ipv4Addr,
+        /// CIDR ACL — same semantics as the BMP variant.
+        peer_acl: Vec<ipnet::IpNet>,
+        /// Optional pin on the peer's source IP. When set, an
+        /// accepted connection whose source IP differs is closed
+        /// before the BGP OPEN exchange.
+        expected_peer_ip: Option<IpAddr>,
     },
 }
 
@@ -185,6 +203,7 @@ impl RouteController {
             Some(RouteSourceConfig::Bmp {
                 listen,
                 require_loc_rib,
+                peer_acl,
             }) => {
                 let snapshot = shared_snapshot();
                 let checker = IntegrityChecker::new(
@@ -206,11 +225,13 @@ impl RouteController {
                 let prog = prog_handle.clone();
                 let shut = shutdown_token.clone();
                 let stall = snapshot.clone();
+                let peer_acl_for_spawn = peer_acl.clone();
                 tasks.push(runtime.spawn(async move {
                     let mut backoff = LISTENER_BACKOFF_INITIAL;
                     loop {
                         let mut station = BmpStation::new(listen, prog.clone(), shut.clone())
-                            .with_stall_gate(stall.clone());
+                            .with_stall_gate(stall.clone())
+                            .with_peer_acl(peer_acl_for_spawn.clone());
                         if require_loc_rib {
                             station = station.with_require_loc_rib();
                         }
@@ -233,9 +254,12 @@ impl RouteController {
                 }));
                 integrity = Some(snapshot);
 
+                let loopback_only = listen.ip().is_loopback() && peer_acl.is_empty();
                 info!(
                     bmp_addr = %listen,
                     require_loc_rib,
+                    peer_acl_entries = peer_acl.len(),
+                    auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
                 );
             }
@@ -244,6 +268,8 @@ impl RouteController {
                 local_as,
                 peer_as,
                 router_id,
+                peer_acl,
+                expected_peer_ip,
             }) => {
                 let snapshot = shared_snapshot();
                 let checker = IntegrityChecker::new(
@@ -256,7 +282,17 @@ impl RouteController {
 
                 // v0.2.2: same retry-with-backoff pattern as BmpStation
                 // above. See that comment for rationale.
-                let cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
+                let mut cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
+                cfg.peer_acl = peer_acl;
+                cfg.expected_peer_ip = expected_peer_ip;
+                // Capture the auth-posture fields before the spawn
+                // moves `cfg` into the retry loop's coroutine — the
+                // post-spawn `info!` reads them and can't share with
+                // the move.
+                let peer_acl_entries = cfg.peer_acl.len();
+                let peer_ip_log = cfg.expected_peer_ip;
+                let loopback_only =
+                    listen.ip().is_loopback() && peer_acl_entries == 0 && peer_ip_log.is_none();
                 let prog = prog_handle.clone();
                 let shut = shutdown_token.clone();
                 let stall = snapshot.clone();
@@ -288,6 +324,9 @@ impl RouteController {
                     bgp_addr = %listen,
                     local_as,
                     peer_as,
+                    peer_acl_entries,
+                    peer_ip = ?peer_ip_log,
+                    auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BgpListener + IntegrityChecker"
                 );
             }
