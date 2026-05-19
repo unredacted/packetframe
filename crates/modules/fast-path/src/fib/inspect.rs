@@ -2,7 +2,7 @@
 //! Powers `packetframe fib dump / lookup / stats`.
 //!
 //! All functions open the bpffs pins directly so they work
-//! without the daemon running — an operator can query the FIB
+//! without the daemon running, an operator can query the FIB
 //! state any time the pins are alive, including after `systemctl
 //! stop packetframe` as long as `detach --all` hasn't removed
 //! them.
@@ -140,7 +140,7 @@ pub fn dump_v6(bpffs_root: &Path) -> Result<Vec<FibEntry>, String> {
 }
 
 /// LPM-lookup a single IP. `Ok(None)` means the trie is open and
-/// readable but has no covering prefix — i.e., the data plane
+/// readable but has no covering prefix, i.e., the data plane
 /// would have XDP_PASS'd this address.
 pub fn lookup(bpffs_root: &Path, ip: IpAddr) -> Result<Option<FibEntry>, String> {
     let nexthops = FibProgrammer::open_nexthops(bpffs_root).map_err(|e| e.to_string())?;

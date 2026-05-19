@@ -14,7 +14,7 @@
 //!
 //! v0.1 refuses startup when pins already exist from a prior
 //! invocation. Full adoption (zero-disruption daemon restart) is
-//! deferred — the operator runs `packetframe detach --all` to clean
+//! deferred, the operator runs `packetframe detach --all` to clean
 //! up before restarting.
 
 use std::path::{Path, PathBuf};
@@ -104,7 +104,7 @@ pub fn link_path(bpffs_root: &Path, iface: &str) -> PathBuf {
 }
 
 /// Create the module's pin subdirectories if missing. The bpffs root
-/// itself must already be mounted — [`packetframe_common::probe`]'s
+/// itself must already be mounted, [`packetframe_common::probe`]'s
 /// `bpffs` probe checks that.
 pub fn ensure_dirs(bpffs_root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(progs_dir(bpffs_root))?;
@@ -114,7 +114,7 @@ pub fn ensure_dirs(bpffs_root: &Path) -> std::io::Result<()> {
 }
 
 /// True when any pinned object exists under the module's pin root.
-/// Startup checks this before fresh-loading — pinned state from a prior
+/// Startup checks this before fresh-loading, pinned state from a prior
 /// invocation must be cleaned via `packetframe detach --all` first.
 pub fn has_existing_pins(bpffs_root: &Path) -> bool {
     for sub in [
@@ -135,12 +135,12 @@ pub fn has_existing_pins(bpffs_root: &Path) -> bool {
 
 /// Remove every pin under the module's pin root. Called by
 /// `packetframe detach`. Missing files and missing directories are
-/// not errors — the post-condition is "no pins", regardless of
+/// not errors, the post-condition is "no pins", regardless of
 /// starting state.
 ///
 /// Removing a link pin causes the kernel to detach the XDP program
 /// from the iface. Removing the program and map pins is housekeeping
-/// — their kernel-side objects disappear once no FDs or links
+/// their kernel-side objects disappear once no FDs or links
 /// reference them.
 pub fn remove_all(bpffs_root: &Path) -> std::io::Result<()> {
     remove_all_paced(bpffs_root, std::time::Duration::ZERO)
@@ -151,7 +151,7 @@ pub fn remove_all(bpffs_root: &Path) -> std::io::Result<()> {
 ///
 /// **Why this exists.** Removing a link pin causes the kernel to
 /// detach the XDP program from the iface. On certain drivers (rvu-
-/// nicpf in particular — observed during Phase 4 cutover testing),
+/// nicpf in particular, observed during Phase 4 cutover testing),
 /// detach briefly bounces the link, which the bridge stack treats as
 /// a port-state change. Bouncing multiple bridge members inside one
 /// STP/RSTP reconvergence window can wedge the bridge into a brief
@@ -159,7 +159,7 @@ pub fn remove_all(bpffs_root: &Path) -> std::io::Result<()> {
 /// a kernel panic + full reboot.
 ///
 /// SPEC.md §11.8 documents this for the attach side. The detach side
-/// is symmetric and was missing — pre-rc5 `pin::remove_all` deleted
+/// is symmetric and was missing, pre-rc5 `pin::remove_all` deleted
 /// every link inode in a tight loop with no spacing. This function
 /// fixes that by sleeping `settle_time` between consecutive bridge-
 /// member detaches.
@@ -173,7 +173,7 @@ pub fn remove_all_paced(
     settle_time: std::time::Duration,
 ) -> std::io::Result<()> {
     // Remove links first so the kernel-side attach is gone before the
-    // program is unreferenced. Order is defensive — the kernel copes
+    // program is unreferenced. Order is defensive, the kernel copes
     // with reverse order too.
     let links = links_dir(bpffs_root);
     let link_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&links) {
@@ -194,7 +194,7 @@ pub fn remove_all_paced(
 
     for (idx, path) in link_files.iter().enumerate() {
         if idx > 0 && bridged_count >= 2 && !settle_time.is_zero() {
-            // Only pace once we've removed at least one — the first
+            // Only pace once we've removed at least one, the first
             // removal doesn't need a preceding sleep.
             std::thread::sleep(settle_time);
         }
@@ -227,7 +227,7 @@ pub fn remove_all_paced(
 /// Count how many of the given link-pin paths refer to interfaces
 /// that share a bridge master. Returns 0 if none are bridged, the
 /// total count of bridge members otherwise. Used to gate detach
-/// pacing — paying the per-iface settle cost only matters when a
+/// pacing, paying the per-iface settle cost only matters when a
 /// bridge is actually involved.
 fn count_shared_bridge_masters(link_files: &[std::path::PathBuf]) -> usize {
     use std::collections::HashMap;
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn remove_all_paced_zero_duration_matches_unpaced() {
-        // settle_time=ZERO must behave identically to remove_all —
+        // settle_time=ZERO must behave identically to remove_all
         // tests rely on this and the cli `detach --all` without
         // config defaults to the standard 2 s, but should still
         // function with zero in unit-test context.
@@ -341,7 +341,7 @@ mod tests {
         // /sys/class/net lookups will fail for our fake "eth0"
         // pin (it's not a real interface), so `count_shared_bridge_masters`
         // returns 0 and pacing is skipped. The point of this test is
-        // to confirm pacing-when-no-bridge doesn't slow tests down —
+        // to confirm pacing-when-no-bridge doesn't slow tests down
         // a 5 s settle must NOT be slept here.
         let dir = tempdir();
         ensure_dirs(&dir).unwrap();

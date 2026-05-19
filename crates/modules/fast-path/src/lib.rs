@@ -7,7 +7,7 @@
 //! with the trial-attach fallback behavior from SPEC.md §2.3, `detach`
 //! tears everything down. The real logic lives in [`linux_impl`] and
 //! is cfg-gated to `target_os = "linux"` so macOS dev loops still
-//! compile — non-Linux builds return [`ModuleError::NotImplemented`]
+//! compile, non-Linux builds return [`ModuleError::NotImplemented`]
 //! from every lifecycle method.
 
 use packetframe_common::module::{
@@ -41,13 +41,13 @@ pub const FAST_PATH_PRIORITY: u16 = 1000;
 
 /// The compiled fast-path BPF ELF, staged by `build.rs` and embedded at
 /// crate-compile time. Empty (zero bytes) when the BPF toolchain isn't
-/// available — see [`FAST_PATH_BPF_AVAILABLE`].
+/// available, see [`FAST_PATH_BPF_AVAILABLE`].
 ///
 /// Note: `include_bytes!` returns a 1-byte-aligned slice. Passing it
 /// directly to `aya::Ebpf::load` fails with "Invalid ELF header size
 /// or alignment" because the `object` crate's ELF parser does
 /// unaligned u32/u64 reads into the header. Callers must copy to an
-/// aligned buffer — use [`FastPathModule::new`] + `Module::load`,
+/// aligned buffer, use [`FastPathModule::new`] + `Module::load`,
 /// which handles this internally, or call [`aligned_bpf_copy`] to
 /// get a heap-allocated 16-byte-aligned `Vec<u8>` suitable for
 /// `aya::Ebpf::load`.
@@ -193,7 +193,7 @@ impl Module for FastPathModule {
 
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
         // Phase 1 (Option F): structured health reporting is now the
-        // trait surface, but fast-path has no live subsystems yet —
+        // trait surface, but fast-path has no live subsystems yet
         // RouteController / BmpStation / NeighborResolver land in
         // Phase 2-3 and will populate `subsystems`. For now, always
         // report healthy with no subsystems. Circuit-breaker wiring
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn lifecycle_stubs_safe_to_call() {
         let mut m = FastPathModule::new();
-        // detach on an unloaded module must succeed — teardown paths
+        // detach on an unloaded module must succeed, teardown paths
         // call it unconditionally.
         assert!(m.detach().is_ok());
         let mut buf = String::new();

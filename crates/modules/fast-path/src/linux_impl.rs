@@ -29,11 +29,11 @@ use crate::{aligned_bpf_copy, pin, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs` (PR #3). `#[repr(C)]`
 /// with all-bit-patterns-valid primitive fields, so `aya::Pod` is safe
-/// to impl — the marker tells aya the struct is safe to byte-copy into
+/// to impl, the marker tells aya the struct is safe to byte-copy into
 /// the kernel's map buffer. Bytes-for-bytes match the BPF-side struct.
 ///
 /// Layout V2 (v0.2.4): the formerly-`_reserved [u8; 2]` slot is now
-/// `mss_clamp_global: u16` — a global MSS clamp ceiling for matched
+/// `mss_clamp_global: u16`, a global MSS clamp ceiling for matched
 /// TCP SYN/SYN-ACK packets. 0 = unset. Per-prefix and per-iface clamp
 /// maps take precedence over this fallback.
 #[repr(C)]
@@ -61,7 +61,7 @@ pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 /// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_CUSTOM_FIB` (Option F).
 /// Set when `forwarding-mode` is `custom-fib` or `compare`; routes
 /// the XDP program to consult `FIB_V4`/`FIB_V6` instead of
-/// `bpf_fib_lookup()`. Not yet read from the XDP program — Phase 1
+/// `bpf_fib_lookup()`. Not yet read from the XDP program, Phase 1
 /// Slice 1B lands the dispatch gate. Kept in lockstep with the BPF
 /// side so userspace writes the right bit.
 #[allow(dead_code)]
@@ -85,11 +85,11 @@ const RVU_NICPF_FIXED_IN_KERNEL: (u32, u32) = (6, 8);
 
 /// Kernel driver names that trigger the head-shift workaround.
 /// `/sys/class/net/<iface>/device/driver` is a symlink into
-/// `/sys/bus/pci/drivers/<module_name>` — for this driver the kernel
+/// `/sys/bus/pci/drivers/<module_name>`, for this driver the kernel
 /// module is `rvu_nicpf.ko`, so the sysfs leaf is `rvu_nicpf` (with
 /// an underscore). `ethtool -i` happens to print the pci_driver's
 /// `name` field as `rvu-nicpf` (with a hyphen) on the reference
-/// hardware, which had us matching the wrong spelling in v0.1.3 —
+/// hardware, which had us matching the wrong spelling in v0.1.3
 /// confirmed empirically via `readlink /sys/class/net/ethN/device/driver`
 /// on 5.15.72-ui-cn9670. Accepting both spellings is cheap and keeps
 /// us correct even if a distro one day canonicalises differently.
@@ -132,7 +132,7 @@ unsafe impl aya::Pod for MssClampValue {}
 /// After `attach`, the XDP program, every §4.5 map, and each per-iface
 /// link is pinned under `<bpffs-root>/fast-path/`. Dropping
 /// `ActiveState` closes our userspace FDs but the bpffs inodes hold
-/// the kernel references — SPEC.md §8.5 "exit without detach" works as
+/// the kernel references, SPEC.md §8.5 "exit without detach" works as
 /// soon as pinning is in place. `Module::detach` unlinks the pins,
 /// which is when the kernel actually tears everything down.
 pub struct ActiveState {
@@ -149,18 +149,18 @@ pub struct ActiveState {
     /// `detach` so we can pace link-pin removals symmetrically with
     /// the attach path. Removing all link pins inside one STP
     /// reconvergence window has been observed to wedge the bridge
-    /// stack on rvu-nicpf hardware (kernel panic, full reboot)
-    /// — the same class of bug §11.8 calls out for attach.
+    /// stack on rvu-nicpf hardware (kernel panic, full reboot);
+    /// this is the same class of bug §11.8 calls out for attach.
     pub attach_settle_time: std::time::Duration,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
 /// `Auto` mode so `status` can report it. `link` is either:
 ///
-/// - `Pinned(PinnedLink)` — the happy path; dropping closes the
+/// - `Pinned(PinnedLink)`, the happy path; dropping closes the
 ///   userspace FD but leaves the bpffs inode, so the kernel attach
 ///   survives process exit (§8.5).
-/// - `Transient(FdLink)` — pin syscall was rejected (e.g. EPERM on
+/// - `Transient(FdLink)`, pin syscall was rejected (e.g. EPERM on
 ///   generic-mode XDP links on some kernels). The attach still works,
 ///   but dropping the FdLink detaches the kernel-side XDP program.
 ///   SIGTERM will detach these interfaces; native-mode ones persist.
@@ -186,20 +186,20 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
     if !FAST_PATH_BPF_AVAILABLE {
         return Err(ModuleError::other(
             MODULE_NAME,
-            "no BPF ELF embedded in the binary — build with rustup + nightly + bpf-linker (see CLAUDE.md)",
+            "no BPF ELF embedded in the binary, build with rustup + nightly + bpf-linker (see CLAUDE.md)",
         ));
     }
 
     // Refuse startup when pins from a prior invocation survive.
     // SPEC.md §8.5 "exit without detach" leaves pins in bpffs after
-    // SIGTERM; v0.1 does not adopt those — operator must run
+    // SIGTERM; v0.1 does not adopt those, operator must run
     // `packetframe detach --all` first. Full adoption (zero-disruption
     // restart) is deferred.
     if pin::has_existing_pins(ctx.bpffs_root) {
         return Err(ModuleError::other(
             MODULE_NAME,
             format!(
-                "existing pins under {} from a prior invocation — \
+                "existing pins under {} from a prior invocation, \
                  run `packetframe detach --all` before restarting \
                  (v0.1 does not yet adopt in-place)",
                 pin::module_root(ctx.bpffs_root).display()
@@ -212,7 +212,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 
     // aya doesn't expose an `Ebpf::load_with_options` that'd let us
     // skip BTF lookup; on the reference EFG (§2.2) BTF is absent but
-    // aya handles that path internally. Use an aligned copy — the
+    // aya handles that path internally. Use an aligned copy, the
     // embedded `include_bytes!` slice is 1-byte-aligned which the
     // object crate's ELF parser rejects.
     let bytes = aligned_bpf_copy();
@@ -313,7 +313,7 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
 /// mode so the XDP program reads consistent config even if an
 /// operator flips to `custom-fib` via `packetframe reconfigure`
 /// later. Fail-soft: if the map is missing from the ELF (older build
-/// during development), log and continue — the BPF program reads the
+/// during development), log and continue, the BPF program reads the
 /// map defensively and falls back to built-in defaults.
 fn populate_fib_config(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
     let hash_mode = mcfg
@@ -335,7 +335,7 @@ fn populate_fib_config(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
     let map = match ebpf.map_mut("FIB_CONFIG") {
         Some(m) => m,
         None => {
-            info!("FIB_CONFIG map missing from ELF — skipping (older build?)");
+            info!("FIB_CONFIG map missing from ELF, skipping (older build?)");
             return Ok(());
         }
     };
@@ -424,7 +424,7 @@ fn populate_blocklists(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
         return Ok(());
     }
     // Sanity-guard: refuse to start if a block-prefix overlaps an
-    // allow-prefix or local-prefix. Operator config bug — they almost
+    // allow-prefix or local-prefix. Operator config bug, they almost
     // certainly didn't mean to block traffic to their own customer
     // /24.
     let allow_v4: Vec<Ipv4Prefix> = mcfg
@@ -452,7 +452,7 @@ fn populate_blocklists(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
                     MODULE_NAME,
                     format!(
                         "block-prefix {}/{} overlaps with allow-prefix or local-prefix \
-                         {}/{} — refusing to start (operator config bug; would silently \
+                         {}/{}, refusing to start (operator config bug; would silently \
                          drop traffic to declared customer prefixes)",
                         b.addr, b.prefix_len, a.addr, a.prefix_len
                     ),
@@ -518,7 +518,7 @@ pub(crate) fn mss_clamp_global_value(directives: &[ModuleDirective]) -> Option<u
 /// from any `mss-clamp` directives in the module config. The global
 /// (`mss-clamp <mtu>`) form is handled in `populate_cfg` via the
 /// `FpCfg.mss_clamp_global` field; this function handles the three
-/// scoped forms — per-prefix, per-iface, and per-prefix-+-iface.
+/// scoped forms, per-prefix, per-iface, and per-prefix-+-iface.
 /// Empty / no directives → all maps stay empty (LPM lookups miss
 /// cheaply, no per-packet overhead).
 fn populate_mss_clamp(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
@@ -540,7 +540,7 @@ fn populate_mss_clamp(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<
             continue;
         };
         // Resolve `via <iface>` to ifindex if present. Missing ifaces
-        // are fatal at load — the operator declared a clamp on an
+        // are fatal at load, the operator declared a clamp on an
         // iface that doesn't exist, which is almost certainly a typo.
         let iface_filter: u32 = match iface {
             Some(name) => if_nametoindex(name).map_err(|e| {
@@ -562,7 +562,7 @@ fn populate_mss_clamp(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<
                 iface_entries.push((name.clone(), *mss));
             }
             (None, None) => {
-                // Global — handled by populate_cfg; skip here.
+                // Global, handled by populate_cfg; skip here.
             }
         }
     }
@@ -725,7 +725,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // fixes two bugs in one patch: (1) the xdp.data_hard_start offset
     // bug that v0.1.3 worked around via head-shift; (2) a
     // `non_qos_queues` leak at `otx2_xdp_setup` that is *not* fixable
-    // from userspace — every native XDP attach leaks the count, and
+    // from userspace, every native XDP attach leaks the count, and
     // after enough attach/detach cycles the driver's queue sizing
     // drifts and the page allocator's freelist gets a NULL write,
     // producing the `get_page_from_freelist` NULL deref crash signature
@@ -749,7 +749,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // (e.g. EPERM on some kernels for generic-XDP links) the attach
     // still succeeds but that specific link won't outlive the process.
     //
-    // SPEC.md §11.8 — XDP attach on some drivers (rvu-nicpf observed)
+    // SPEC.md §11.8, XDP attach on some drivers (rvu-nicpf observed)
     // briefly bounces the link. If multiple attach ifaces share a
     // bridge master, attaching them inside one STP reconvergence
     // window risks an L2 loop and packet storm. Sleep
@@ -796,7 +796,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // defensive devmap pre-check in the BPF program (§4.4 step 9d)
     // recognizes them as valid redirect targets. The value ifindex
     // matches the key ifindex for a simple "redirect back to the
-    // physical port the FIB resolved to" — aya accepts this.
+    // physical port the FIB resolved to", aya accepts this.
     let devmap_map = state
         .ebpf
         .map_mut("REDIRECT_DEVMAP")
@@ -805,13 +805,13 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("REDIRECT_DEVMAP try_from: {e}")))?;
 
     // Populate REDIRECT_DEVMAP with every UP Ethernet-type iface on the
-    // host, not just the attach ifaces. The FIB lookup is dynamic — on
+    // host, not just the attach ifaces. The FIB lookup is dynamic, on
     // a BGP edge, routes change and the egress iface for any given
     // packet is determined at lookup time. Hardcoding the attach list
     // as the egress allowlist breaks any topology where ingress ≠
     // egress (classic edge router: trunks in, WAN out).
     //
-    // Filter: `/sys/class/net/<iface>/type == 1` (ARPHRD_ETHER — covers
+    // Filter: `/sys/class/net/<iface>/type == 1` (ARPHRD_ETHER, covers
     // physical NICs, bridges, VLAN subifs, veth) AND operstate is `up`
     // or `unknown` (some virtual ifaces never report operstate). Skip
     // loopback (type 772) + tunnels (various non-1 types).
@@ -866,7 +866,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 port,
                 require_loc_rib,
                 peer_from,
-                // `allow_remote` is informational here — the config
+                // `allow_remote` is informational here, the config
                 // parser already rejected the unsafe shape (non-loopback
                 // bind without opt-in), so by the time we see the spec
                 // the `peer_from` ACL is either non-empty or the listen
@@ -979,7 +979,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     }
 
     // Build Attachment records for the pin registry. `pinned_path`
-    // points at the real link pin — when `packetframe detach` runs,
+    // points at the real link pin, when `packetframe detach` runs,
     // it unlinks this path, which is how the kernel-side attach tears
     // down.
     Ok(state
@@ -1006,7 +1006,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
 /// hits the rvu-nicpf native-mode delivery bug (SPEC §11.1(c),
 /// upstream-fixed in Linux v6.8 commit `04f647c8e456` but absent
 /// from many downstream kernels). Safe and idempotent on fixed
-/// kernels — set `off` via config override once the operator
+/// kernels, set `off` via config override once the operator
 /// confirms the backport (future PR; for v0.1.3 the detection is
 /// purely driver-name-based).
 ///
@@ -1044,14 +1044,14 @@ fn apply_driver_quirks_cfg(state: &mut ActiveState, mcfg: &ModuleConfig<'_>) -> 
         if matches!(toggle, ToggleAutoOnOff::Off) {
             info!(
                 "rvu-nicpf head-shift workaround disabled by config (`driver-workaround \
-                 rvu-nicpf-head-shift off`) — assuming Linux v6.8+ or backported fix"
+                 rvu-nicpf-head-shift off`), assuming Linux v6.8+ or backported fix"
             );
         }
         return Ok(());
     }
 
-    // Read current FpCfg, OR in the flag, write back. We only set —
-    // never clear — so we don't clobber the IPv4/IPv6 enable bits
+    // Read current FpCfg, OR in the flag, write back. We only set
+    // never clear, so we don't clobber the IPv4/IPv6 enable bits
     // that `populate_cfg` wrote at load time.
     let map = state
         .ebpf
@@ -1082,7 +1082,7 @@ fn apply_driver_quirks_cfg(state: &mut ActiveState, mcfg: &ModuleConfig<'_>) -> 
         ifaces = ?affected,
         upstream_fix_commit = "04f647c8e456",
         fixed_in_kernel = "v6.8",
-        "enabling pre-v6.8 rvu-nicpf head-shift workaround (SPEC §11.1(c)) — fast-path will \
+        "enabling pre-v6.8 rvu-nicpf head-shift workaround (SPEC §11.1(c)), fast-path will \
          bpf_xdp_adjust_head(+128) + bpf_xdp_adjust_tail(+128) on every packet to expose the \
          real frame. Set `driver-workaround rvu-nicpf-head-shift off` in the config once the \
          kernel backport lands."
@@ -1092,7 +1092,7 @@ fn apply_driver_quirks_cfg(state: &mut ActiveState, mcfg: &ModuleConfig<'_>) -> 
 
 /// Read `/proc/sys/kernel/osrelease` (= `uname -r`) and parse the
 /// leading `major.minor`. Returns `None` if the file is unreadable
-/// or the format is unrecognizable — callers treat that as "can't
+/// or the format is unrecognizable, callers treat that as "can't
 /// prove the fix is present", i.e. the conservative path.
 fn kernel_version() -> Option<(u32, u32)> {
     let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
@@ -1196,7 +1196,7 @@ fn rvu_nicpf_version_gate(
 /// `/sys/class/net/<iface>/device/driver` (a symlink into
 /// `/sys/bus/*/drivers/<driver>`). Returns `None` for netdevs that
 /// have no underlying device (veth pairs, bridges, loopback) or when
-/// the file isn't present. Doesn't try ethtool — sysfs is
+/// the file isn't present. Doesn't try ethtool, sysfs is
 /// netns-aware when mounted per-netns and avoids another
 /// capability-gated syscall just for a name.
 fn read_iface_driver(iface: &str) -> Option<String> {
@@ -1292,7 +1292,7 @@ fn populate_mutation_progs(ebpf: &mut Ebpf) -> ModuleResult<()> {
 /// §2.3: per-interface trial-attach. `Native` and `Generic` are explicit
 /// (no fallback); `Auto` tries native first, falls back to generic on
 /// any error. The spec calls out that `bpftool feature probe` is
-/// unreliable — we find out what works by actually trying. Each
+/// unreliable, we find out what works by actually trying. Each
 /// successful attach immediately pins its link under
 /// `<bpffs-root>/fast-path/links/<iface>` so the kernel attach
 /// survives process exit (§8.5).
@@ -1352,7 +1352,7 @@ fn try_attach_with_fallback(
 
 /// Attach + `take_link`, then try to pin. Returns:
 ///
-/// - `LinkHandle::Pinned` on success — the kernel attach survives
+/// - `LinkHandle::Pinned` on success, the kernel attach survives
 ///   process exit via the bpffs inode.
 /// - `LinkHandle::Transient` if pinning was rejected (EPERM on
 ///   generic-mode XDP links on some kernels, for instance). The
@@ -1360,7 +1360,7 @@ fn try_attach_with_fallback(
 ///   the kernel-side program.
 ///
 /// Hard errors (attach fails, `take_link` fails, link isn't
-/// bpf_link_create-backed) remain hard errors — the caller bubbles
+/// bpf_link_create-backed) remain hard errors, the caller bubbles
 /// them up.
 fn attach_and_pin(
     prog: &mut Xdp,
@@ -1387,7 +1387,7 @@ fn attach_and_pin(
             MODULE_NAME,
             // SPEC.md requires kernel ≥5.15; ≥5.9 gives us bpf_link_create
             // + FdLink. On older kernels aya returns an NlLink which can't
-            // pin — that path is reachable only if someone runs on a
+            // pin, that path is reachable only if someone runs on a
             // kernel the probe missed.
             format!(
                 "XDP link for {iface} is netlink-backed (kernel too old for bpf_link_create?): {e}",
@@ -1412,7 +1412,7 @@ fn attach_and_pin(
             // Re-attach so we have an FdLink to hold. `attach_to_if_index`
             // was already called; calling it again would double-attach
             // which the kernel rejects. Fortunately `FdLink::pin`
-            // consumes `self` even on error — the link FD is already
+            // consumes `self` even on error, the link FD is already
             // gone. Re-attach from scratch:
             let link_id = prog.attach_to_if_index(ifindex, flags).map_err(|e| {
                 ModuleError::other(
@@ -1438,7 +1438,7 @@ fn attach_and_pin(
 }
 
 /// Walk a std::error::Error's source chain and join into one display
-/// string — aya's `SyscallError` hides the underlying `io::Error`
+/// string, aya's `SyscallError` hides the underlying `io::Error`
 /// behind `#[source]`, so plain `{}` drops the errno. This matters on
 /// any BPF syscall where the errno is the whole diagnostic.
 fn format_error_chain(err: &dyn std::error::Error) -> String {
@@ -1455,12 +1455,12 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
 /// subinterface maps its ifindex → (physical parent ifindex, VID) so
 /// the BPF program can push/pop/rewrite per SPEC §4.7 when the FIB
 /// resolves to a subif. Missing `/proc/net/vlan/config` (no 8021q
-/// kernel module loaded) is not an error — we just insert nothing.
+/// kernel module loaded) is not an error, we just insert nothing.
 fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
     let entries = match read_vlan_config() {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!("/proc/net/vlan/config missing — no VLAN subifs to resolve");
+            info!("/proc/net/vlan/config missing, no VLAN subifs to resolve");
             return Ok(());
         }
         Err(e) => {
@@ -1472,7 +1472,7 @@ fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
     };
 
     if entries.is_empty() {
-        info!("/proc/net/vlan/config empty — no VLAN subifs configured");
+        info!("/proc/net/vlan/config empty, no VLAN subifs configured");
         return Ok(());
     }
 
@@ -1553,7 +1553,7 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
 
     // Drop every PinnedLink next: this closes our userspace FDs but
     // the kernel keeps the attach alive via the bpffs inodes. Drain
-    // in reverse attach order — no practical consequence here, matches
+    // in reverse attach order, no practical consequence here, matches
     // typical lifecycle expectations.
     while let Some(link) = state.links.pop() {
         info!(iface = %link.iface, "fast-path detaching");
@@ -1562,7 +1562,7 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
 
     // Unlink every pin under the module's pin root. Pace the link-pin
     // removals by `attach_settle_time` so we don't trigger an STP
-    // reconvergence storm on shared bridge masters — same hazard
+    // reconvergence storm on shared bridge masters, same hazard
     // §11.8 calls out for the attach path. Removing all link pins in
     // ~1 ms (the pre-rc5 behavior) wedged the bridge stack on rvu-
     // nicpf with eth0/eth4/eth5 all bridged on switch0, kernel-
@@ -1579,7 +1579,7 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
 /// Walk `/sys/class/net` and return the `(name, ifindex)` of every
 /// iface that's a viable XDP redirect target:
 ///
-/// - `type == 1` (ARPHRD_ETHER) — covers physical NICs, bridges,
+/// - `type == 1` (ARPHRD_ETHER), covers physical NICs, bridges,
 ///   VLAN subifs, veth, bonded masters. Excludes loopback (772),
 ///   PPP, SLIP, tunnels (`ip_vti`, `ip6tnl`, `ip_tunnel`, tailscale,
 ///   WireGuard, etc. which use ARPHRD_NONE or similar).
@@ -1625,7 +1625,7 @@ pub(crate) fn enumerate_redirect_targets() -> Vec<(String, u32)> {
 }
 
 /// Emit a warning if two or more of the attach ifaces share a bridge
-/// master. SPEC.md §11.8 — on drivers that bounce the link at attach
+/// master. SPEC.md §11.8, on drivers that bounce the link at attach
 /// time, bouncing multiple bridge members inside one STP reconvergence
 /// window has been observed to trigger L2 loops. `attach_settle_time`
 /// between per-iface attaches mitigates but does not eliminate this.
@@ -1653,7 +1653,7 @@ fn warn_shared_bridge_masters(ifaces: &[&str], settle_time: std::time::Duration)
             bridge = %master,
             members = ?members,
             settle_secs = settle_time.as_secs_f64(),
-            "multiple attach ifaces share bridge master — XDP attach can cause L2 loops \
+            "multiple attach ifaces share bridge master, XDP attach can cause L2 loops \
              during STP reconvergence (§11.8). `attach-settle-time` spaces the attaches; \
              ensure it is long enough for your bridge to reconverge (default 2s)."
         );
@@ -1679,7 +1679,7 @@ pub(crate) fn if_nametoindex(name: &str) -> ModuleResult<u32> {
 /// Per-interface native-XDP trial-attach probe for the feasibility
 /// report (§2.3). Loads a minimal no-op XDP program and tries to
 /// attach it to each interface in native mode, reporting per-interface
-/// verdict. The no-op program is the `fast_path` program itself —
+/// verdict. The no-op program is the `fast_path` program itself
 /// any attached program's load/attach path is the same.
 pub fn trial_attach_native(iface: &str) -> TrialResult {
     if !FAST_PATH_BPF_AVAILABLE {
@@ -1706,7 +1706,7 @@ pub fn trial_attach_native(iface: &str) -> TrialResult {
     }
     match prog.attach_to_if_index(ifindex, XdpFlags::DRV_MODE) {
         Ok(link_id) => {
-            // Detach immediately — this was a probe.
+            // Detach immediately, this was a probe.
             let _ = prog.detach(link_id);
             TrialResult::NativeOk
         }
@@ -1748,7 +1748,7 @@ pub fn snapshot_links(state: &ActiveState) -> Vec<(String, u32, AttachMode)> {
         .collect()
 }
 
-// Read current stats — aggregated across all CPUs.
+// Read current stats, aggregated across all CPUs.
 pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     use aya::maps::PerCpuArray;
 
@@ -1764,7 +1764,7 @@ pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
 }
 
 /// Snapshot of the custom-FIB control-plane state that's readable
-/// from a separate process via the bpffs pins — i.e., no live
+/// from a separate process via the bpffs pins, i.e., no live
 /// `FibProgrammer` handle required. Used by `packetframe status` to
 /// surface an operator-facing summary during and after cutover.
 ///
@@ -1794,7 +1794,7 @@ pub struct FibStatusSnapshot {
     pub nh_stale: u32,
     pub nh_unwritten_or_incomplete: u32,
     pub nh_max_entries: u32,
-    /// ECMP groups where `nh_count > 0` — a conservative estimate
+    /// ECMP groups where `nh_count > 0`, a conservative estimate
     /// of "how many groups are actively in use." Slots with nh_count=0
     /// are either unwritten or tombstoned; we can't distinguish
     /// without programmer state.
@@ -1804,7 +1804,7 @@ pub struct FibStatusSnapshot {
 
 /// Read the custom-FIB snapshot from the bpffs pins. Best-effort:
 /// missing or malformed pins produce warnings and default values
-/// rather than hard errors — `packetframe status` should still
+/// rather than hard errors, `packetframe status` should still
 /// show whatever it can even if a subset of the custom-FIB maps
 /// aren't pinned yet (e.g., kernel-fib mode).
 pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
@@ -1900,7 +1900,7 @@ fn read_nexthops_state_distribution(bpffs_root: &Path) -> ModuleResult<(NhStateD
 
     let mut dist = NhStateDistribution::default();
     // Walk up to NEXTHOPS_CAP (8192). At ~100ns per Array::get syscall
-    // this is ~1ms on a modern box — fine for status on demand.
+    // this is ~1ms on a modern box, fine for status on demand.
     for idx in 0..NEXTHOPS_CAP {
         let entry = match arr.get(&idx, 0) {
             Ok(e) => e,
@@ -1940,7 +1940,7 @@ fn read_ecmp_groups_active(bpffs_root: &Path) -> ModuleResult<(u32, u32)> {
     Ok((active, ECMP_GROUPS_CAP))
 }
 
-/// Read STATS directly from the bpffs pin — no live module required.
+/// Read STATS directly from the bpffs pin, no live module required.
 /// Used by `packetframe status` when the loader isn't running.
 pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
     use aya::maps::{Map, MapData, PerCpuArray};
@@ -1987,7 +1987,7 @@ fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
 /// fast-pathed packet.
 ///
 /// aya 0.13's ProgramArray exposes `indices()` (which keys are set)
-/// but not a getter that returns the populated `ProgramFd`/prog_id —
+/// but not a getter that returns the populated `ProgramFd`/prog_id
 /// the BPF_MAP_TYPE_PROG_ARRAY value is a kernel RawFd that becomes
 /// invalid outside the loader's process. We just report populated/
 /// empty here; operators can confirm prog_id via

@@ -2,8 +2,8 @@
 //! (SPEC.md §7.3, §4.6).
 //!
 //! Counter names mirror the `StatIdx` discriminants in
-//! `bpf/src/maps.rs`. The order is append-only once v0.1 ships —
-//! renumbering `StatIdx` would break operator dashboards — so this
+//! `bpf/src/maps.rs`. The order is append-only once v0.1 ships
+//! renumbering `StatIdx` would break operator dashboards, so this
 //! table is implicitly ordered by discriminant. Runtime formatting
 //! depends on both lists matching: the zipping loop in
 //! `render_textfile` assumes `NAMES` and `stats` line up.
@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 /// Wire-format counter names, index-aligned with `StatIdx` in
 /// `bpf/src/maps.rs`. These become the `packetframe_<name>_total`
 /// metric names; changing any value changes the operator-facing
-/// metric name. Append-only — renumbering breaks dashboards.
+/// metric name. Append-only, renumbering breaks dashboards.
 ///
 /// Phase 1 (Option F custom FIB): length grew from 19 → 32. The
 /// pre-existing 19 was already off-by-one (`err_head_shift` at
@@ -66,7 +66,7 @@ pub const COUNTER_NAMES: [&str; 33] = [
 /// Render a Prometheus textfile body from stat values + module uptime.
 /// Every counter gets `# TYPE` and `# HELP` headers so Prometheus's
 /// textfile collector categorizes it correctly. Counter names that
-/// already end in `_total` (e.g. `rx_total`) get emitted as-is —
+/// already end in `_total` (e.g. `rx_total`) get emitted as-is
 /// Prometheus convention requires one `_total` suffix, not two.
 pub fn render_textfile(stats: &[u64], uptime_seconds: u64) -> String {
     let mut out = String::with_capacity(4096);
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn counter_names_match_stats_count() {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
-        // drift, the zip() in render_textfile silently truncates —
+        // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
         assert_eq!(COUNTER_NAMES.len(), 33);
     }
@@ -290,7 +290,7 @@ mod tests {
             ecmp_max_entries: 0,
         };
         let body = render_fib_gauges(&snap);
-        // With `forwarding_mode: None`, no mode is "active" — every
+        // With `forwarding_mode: None`, no mode is "active", every
         // one-hot emits 0.
         assert!(body.contains(
             "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"custom-fib\"} 0"
@@ -298,7 +298,7 @@ mod tests {
         assert!(body.contains(
             "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"kernel-fib\"} 0"
         ));
-        // default_hash_mode absent when the CFG pin isn't readable —
+        // default_hash_mode absent when the CFG pin isn't readable
         // scrapers see the metric simply not emitted.
         assert!(!body.contains("packetframe_fib_default_hash_mode"));
         assert!(body.contains("packetframe_nexthops_max{module=\"fast-path\"} 0"));

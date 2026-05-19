@@ -18,7 +18,7 @@
 //! scope here because `bpf_prog_test_run` doesn't run a real
 //! `bpf_fib_lookup` against configured kernel routes.
 //!
-//! Every test is `#[ignore]` — it needs CAP_BPF + a BPF build. CI
+//! Every test is `#[ignore]`, it needs CAP_BPF + a BPF build. CI
 //! runs the full set under sudo via `cargo test --tests -- --ignored`.
 
 #![cfg(target_os = "linux")]
@@ -128,7 +128,7 @@ fn custom_fib_v6_single_nexthop_hit_redirects() {
 fn custom_fib_v4_incomplete_nexthop_returns_noneigh() {
     let mut h = prep_custom_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
-    // Write the nexthop resolved first, then flip to incomplete — this
+    // Write the nexthop resolved first, then flip to incomplete, this
     // exercises the code path where the seqlock discipline is
     // respected (even `seq`) but `state != Resolved`.
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -210,7 +210,7 @@ fn custom_fib_v4_ecmp_dead_leg_falls_over() {
     let dmac_dead: [u8; 6] = [0xbb, 0, 0, 0, 0, 0x02];
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, dmac_live);
     h.add_nexthop_v4(2, LO_IFINDEX, EGRESS_MAC, dmac_dead);
-    // Mark nexthop 2 as incomplete — fallover should walk to NH 1.
+    // Mark nexthop 2 as incomplete, fallover should walk to NH 1.
     h.set_nexthop_state(2, NH_STATE_INCOMPLETE);
     h.add_ecmp_group(0, 5, &[1, 2]);
     h.add_fib_v4_ecmp("10.0.0.0/24", 0);
@@ -219,7 +219,7 @@ fn custom_fib_v4_ecmp_dead_leg_falls_over() {
 
     // Feed 32 5-tuples. With 2 legs and one dead, every packet must
     // land on NH 1 after the fallover. `EcmpDeadLegFallback` bumps
-    // only when we *advance past index 0* — i.e. when the hash picked
+    // only when we *advance past index 0*, i.e. when the hash picked
     // the dead leg first. With uniform hashing, that's ~50% of packets.
     let mut live = 0;
     for sport in 1000u16..1032u16 {
@@ -257,7 +257,7 @@ fn custom_fib_seqlock_permanent_odd_drains_retries() {
     let mut h = prep_custom_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
-    // Force seq to an odd value and leave it there — no even follow-up.
+    // Force seq to an odd value and leave it there, no even follow-up.
     set_nexthop_seq_permanent_odd(&mut h, 1);
     h.add_fib_v4_single("10.0.0.0/24", 1);
 
@@ -286,7 +286,7 @@ fn custom_fib_seqlock_permanent_odd_drains_retries() {
     );
 }
 
-/// Force `NEXTHOPS[idx].seq` to stay odd across userspace writes —
+/// Force `NEXTHOPS[idx].seq` to stay odd across userspace writes
 /// simulates a writer that's stuck mid-update. Uses the raw Array
 /// handle so we can poke `seq` without the `add_nexthop_*` helpers'
 /// odd→even finalization.

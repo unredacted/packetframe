@@ -4,7 +4,7 @@
 //!   persist the pin registry, block on SIGTERM/SIGINT (SPEC.md §7.3).
 //! - `detach`: read the pin registry and report what's recorded.
 //!   Actual in-kernel detach without an active loader requires pinning,
-//!   which lands with PR #6 — this subcommand graduates then.
+//!   which lands with PR #6, this subcommand graduates then.
 //! - `status`: read the pin registry and (when a loader is running with
 //!   a pinned stats map) the counter values. v0.1 reports the registry
 //!   alone.
@@ -27,10 +27,10 @@ use packetframe_fast_path::registry::HookTypeRecord;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
-    /// Config parse / interface-missing / capability fail — exit 1.
+    /// Config parse / interface-missing / capability fail, exit 1.
     #[error("{0}")]
     Startup(String),
-    /// Post-attach errors or unexpected runtime failures — exit 2.
+    /// Post-attach errors or unexpected runtime failures, exit 2.
     /// Only constructed on Linux (the non-Linux path returns Startup
     /// immediately), so non-Linux builds flag this as dead code.
     #[cfg_attr(not(all(target_os = "linux", feature = "fast-path")), allow(dead_code))]
@@ -40,17 +40,17 @@ pub enum RunError {
 
 /// Errors from `packetframe reconfigure`. Kept separate from
 /// [`RunError`] because the CLI maps each variant to a different exit
-/// code + log message — distinguishing "no daemon" from "daemon
+/// code + log message, distinguishing "no daemon" from "daemon
 /// rejected the new config" matters for operator scripts. Most
 /// variants are Linux-only since the underlying signal/PID-file flow
 /// is Linux-only; the macOS dev build gates them behind a generic
 /// stub.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconfigureError {
-    /// Config / pidfile / proc IO error — exit 2 (runtime).
+    /// Config / pidfile / proc IO error, exit 2 (runtime).
     #[error("{0}")]
     Io(String),
-    /// PID file absent or stale — exit 1 (startup-style).
+    /// PID file absent or stale, exit 1 (startup-style).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[error("{0}")]
     DaemonNotRunning(String),
@@ -96,7 +96,7 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
 
-    // Fail fast if metrics-textfile can't be written — the exporter
+    // Fail fast if metrics-textfile can't be written, the exporter
     // would retry silently every 15s otherwise.
     if let Some(path) = &config.global.metrics_textfile {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -110,7 +110,7 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
 
     // Refuse startup if a circuit-breaker trip flag from a prior
     // invocation is still present. The flag is sticky across kernel
-    // reboots — SPEC §8.3 — and must be cleared by an operator.
+    // reboots, SPEC §8.3, and must be cleared by an operator.
     #[cfg(feature = "fast-path")]
     {
         let flag_path = packetframe_fast_path::breaker::trip_flag_path(&config.global.state_dir);
@@ -125,7 +125,7 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
 
     // Feasibility gate: refuse to attach if any required capability is
     // missing. The per-interface trial-attach probe (§2.3) runs here
-    // too — if a specific iface can't receive an XDP program at all,
+    // too, if a specific iface can't receive an XDP program at all,
     // the user finds out before we try to actually attach.
     let attach_ifaces = crate::feasibility::attach_ifaces_from_config(&config);
     let report = run_probes(&config.global.bpffs_root);
@@ -246,7 +246,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         );
     }
 
-    tracing::info!("fast-path running — SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
+    tracing::info!("fast-path running, SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
     let termination = drive_signal_loop(config_path, &config.global.state_dir, &mut modules)
         .map_err(RunError::Runtime)?;
@@ -273,7 +273,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             // Breaker fired (SIGUSR1). Tear down pins so the kernel
             // detaches; the sticky trip flag is already on disk so
             // subsequent `run` invocations refuse to re-attach.
-            tracing::error!("circuit breaker tripped — detaching every module");
+            tracing::error!("circuit breaker tripped, detaching every module");
             for (name, module) in modules.iter_mut() {
                 if let Err(e) = module.detach() {
                     tracing::error!(module = %name, error = %e, "detach failed");
@@ -282,7 +282,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             drop(modules);
         }
     }
-    // Best-effort PID file cleanup. Non-fatal — the file is harmless
+    // Best-effort PID file cleanup. Non-fatal, the file is harmless
     // if left behind (PID will be unrecognized on re-validate).
     if let Err(e) = std::fs::remove_file(&pid_file_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -297,7 +297,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 }
 
 /// Open `path` for writing with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600`
-/// — the symlink-safe atomic-write primitive both pidfile / marker
+/// the symlink-safe atomic-write primitive both pidfile / marker
 /// writes (here) and the metrics-textfile writer ([`crate::metrics`])
 /// use for their `.tmp` staging files.
 ///
@@ -307,7 +307,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 /// privileged daemon's write target. `O_EXCL` makes the open fail
 /// (`EEXIST`) when the path already exists, so a stale `.tmp`
 /// leftover from a crashed run is also surfaced rather than silently
-/// truncated and overwritten — callers handle that one-shot with
+/// truncated and overwritten, callers handle that one-shot with
 /// `unlink-and-retry`.
 ///
 /// The May 2026 audit Slice 4 finding flagged the previous use of
@@ -370,7 +370,7 @@ fn write_pid_file(path: &Path) -> std::io::Result<()> {
 
 /// Look through a module section's directives and return its
 /// `CircuitBreakerSpec`, if present. Multiple directives of the same
-/// kind aren't rejected by the parser — take the last one if so.
+/// kind aren't rejected by the parser, take the last one if so.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn extract_breaker_spec(
     section: &packetframe_common::config::ModuleSection,
@@ -419,7 +419,7 @@ fn drive_signal_loop(
                 return Ok(Termination::ExitPreserveAttach);
             }
             SIGUSR1 => {
-                tracing::warn!("SIGUSR1 received — breaker-triggered shutdown");
+                tracing::warn!("SIGUSR1 received, breaker-triggered shutdown");
                 return Ok(Termination::BreakerTrip);
             }
             _ => {}
@@ -430,7 +430,7 @@ fn drive_signal_loop(
 
 /// SIGHUP handler. Re-parses the config from `config_path` and calls
 /// `Module::reconfigure` on each loaded module. Parse failures and
-/// per-module reconfigure errors are logged and swallowed — a bad
+/// per-module reconfigure errors are logged and swallowed, a bad
 /// SIGHUP never kills the running data plane. Writes an ack marker
 /// to `state_dir/last-reconfigure.timestamp` for the
 /// `packetframe reconfigure` CLI to poll.
@@ -508,7 +508,7 @@ fn scrub_control_chars(s: &str) -> String {
 }
 
 /// Append a timestamp + status line to the reconfigure marker file.
-/// Non-fatal on I/O error — the SIGHUP handler still completed its
+/// Non-fatal on I/O error, the SIGHUP handler still completed its
 /// real work; the marker is just a hint to the CLI ack-poller.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn write_reconfigure_marker(path: &Path, status: &str) {
@@ -549,7 +549,7 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
 
     let pid = read_pid_file(&pid_path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => ReconfigureError::DaemonNotRunning(format!(
-            "PID file not found at {} — daemon doesn't appear to be running",
+            "PID file not found at {}, daemon doesn't appear to be running",
             pid_path.display()
         )),
         _ => ReconfigureError::Io(format!("read PID file {}: {e}", pid_path.display())),
@@ -558,7 +558,7 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     // /proc/<pid>/exe cross-check defends against a stale PID file
     // pointing at a recycled PID. We previously consulted
     // /proc/<pid>/comm, but `comm` is user-settable via
-    // `prctl(PR_SET_NAME)` — any local user could rename a process
+    // `prctl(PR_SET_NAME)`, any local user could rename a process
     // to "packetframe" and be the target of the SIGHUP a root
     // reconfigure issues. The kernel publishes /proc/<pid>/exe as a
     // symlink to the process's executable inode and that link is not
@@ -615,7 +615,7 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
 #[cfg(not(target_os = "linux"))]
 pub fn reconfigure(_config_path: &Path) -> Result<(), ReconfigureError> {
     Err(ReconfigureError::Io(
-        "reconfigure is Linux-only — the daemon cannot run on this host".into(),
+        "reconfigure is Linux-only, the daemon cannot run on this host".into(),
     ))
 }
 
@@ -640,9 +640,9 @@ fn read_pid_file(path: &Path) -> std::io::Result<libc::pid_t> {
 ///
 /// Handles the `(deleted)` suffix the kernel appends when the
 /// executable file has been unlinked after the process started
-/// (rolling upgrade) — we accept the match if the prefix agrees.
+/// (rolling upgrade), we accept the match if the prefix agrees.
 ///
-/// Returns false on any I/O error or mismatch — the caller treats
+/// Returns false on any I/O error or mismatch, the caller treats
 /// that as "PID is not our process."
 #[cfg(target_os = "linux")]
 fn proc_exe_matches_current(pid: libc::pid_t) -> bool {
@@ -653,7 +653,7 @@ fn proc_exe_matches_current(pid: libc::pid_t) -> bool {
         return false;
     };
     let current = current.canonicalize().unwrap_or(current);
-    // Strip a trailing ` (deleted)` from the target — the kernel
+    // Strip a trailing ` (deleted)` from the target, the kernel
     // appends that when the inode has been unlinked since exec, e.g.
     // during a `cargo install --force` upgrade.
     let target_str = target.to_string_lossy();
@@ -662,7 +662,7 @@ fn proc_exe_matches_current(pid: libc::pid_t) -> bool {
 }
 
 /// Modified time of the marker file, in (secs, nanos). `None` if the
-/// file doesn't exist — used to detect "freshly written since
+/// file doesn't exist, used to detect "freshly written since
 /// SIGHUP." Any non-NotFound error is treated as "no observation,"
 /// which causes the poller to keep waiting until timeout.
 #[cfg(target_os = "linux")]
@@ -673,7 +673,7 @@ fn marker_mtime(path: &Path) -> Option<(i64, u32)> {
     Some((dur.as_secs() as i64, dur.subsec_nanos()))
 }
 
-/// Parse the marker body — `OK <ns>` or `ERR <category>: <message>`.
+/// Parse the marker body, `OK <ns>` or `ERR <category>: <message>`.
 #[cfg(target_os = "linux")]
 fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
     let trimmed = body.trim();
@@ -744,7 +744,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // paths alone doesn't drop the kernel-side bpf_link refcount, so
     // the XDP program stays attached even after `detach` claims
     // success. The operator needs to SIGTERM/kill the daemon first.
-    // Confirmed outage-adjacent on the reference EFG 2026-04-21 — the
+    // Confirmed outage-adjacent on the reference EFG 2026-04-21, the
     // detach ran, reported clean, but `ip link show` still had
     // `xdpgeneric` attached.
     if let Some(pid) = daemon_pid() {
@@ -752,7 +752,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             "a `packetframe run` daemon is still running (pid {pid}); \
              stop it first (e.g. `kill {pid}`) before detaching. \
              Detach unlinks bpffs pins, but the kernel-side bpf_link \
-             holds refs through the daemon's open FDs — both have to \
+             holds refs through the daemon's open FDs, both have to \
              be released for the iface to actually detach."
         ));
     }
@@ -774,7 +774,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     };
 
     // v0.1 has one module (fast-path), so `--all` and the default case
-    // behave identically — both tear down every pin under the module's
+    // behave identically, both tear down every pin under the module's
     // pin root. `--all` becomes meaningful once a second module ships.
     let _ = all;
 
@@ -798,7 +798,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
                 }
             }
             Ok(None) => {
-                tracing::info!("no pin registry found — sweeping bpffs pin root anyway");
+                tracing::info!("no pin registry found, sweeping bpffs pin root anyway");
             }
             Err(e) => return Err(format!("registry read: {e}")),
         }
@@ -806,7 +806,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         // Unlink every pin under `<bpffs-root>/fast-path/`. Removing
         // link pins triggers the kernel-side XDP detach (§8.5). Pace
         // by `attach_settle_time` so bridge-member detaches don't
-        // pile up inside one STP reconvergence window — that's the
+        // pile up inside one STP reconvergence window, that's the
         // post-rc5 fix for the EFG kernel-panic-on-detach observed
         // during Phase 4 cutover testing. Map + program pins are
         // housekeeping with no kernel-link side effects, no pacing.
@@ -866,7 +866,7 @@ pub fn status(config_path: &Path) -> Result<(), String> {
         print_tail_call_chain(&config.global.bpffs_root);
 
         // Live counter readback from the pinned STATS map. Works
-        // whether or not the loader is running — the pin survives
+        // whether or not the loader is running, the pin survives
         // process exit (§8.5).
         #[cfg(target_os = "linux")]
         print_stats(&config.global.bpffs_root);
@@ -882,11 +882,11 @@ fn print_tail_call_chain(bpffs_root: &Path) {
     println!("tail-call chain (from {}):", bpffs_root.display());
     match tail_call_chain_from_pin(bpffs_root) {
         Ok(true) => println!(
-            "  MUTATION_PROGS[0]: populated (finalize) — \
+            "  MUTATION_PROGS[0]: populated (finalize), \
              confirm prog_id via `bpftool prog show name finalize`"
         ),
         Ok(false) => println!(
-            "  MUTATION_PROGS[0]: <EMPTY> — fast_path's tail_call will fail; traffic \
+            "  MUTATION_PROGS[0]: <EMPTY>, fast_path's tail_call will fail; traffic \
              falls to kernel slow-path. Restart packetframe to repopulate."
         ),
         Err(e) => eprintln!("  MUTATION_PROGS pin unavailable ({e}); loader may not be attached"),
@@ -897,7 +897,7 @@ fn print_tail_call_chain(bpffs_root: &Path) {
 fn print_stats(bpffs_root: &Path) {
     // §4.6 counter names, indexed by `StatIdx` discriminants. Order
     // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
-    // Append-only — adding new entries at the end is fine; renumbering
+    // Append-only, adding new entries at the end is fine; renumbering
     // breaks dashboards. Indices 0-19 are the kernel-fib counter set;
     // 20-31 were appended in the Option F custom-FIB rollout (§4.11).
     const NAMES: [&str; 37] = [
@@ -960,7 +960,7 @@ fn print_stats(bpffs_root: &Path) {
     }
 }
 
-/// Print the Option F custom-FIB status — map occupancies, nexthop
+/// Print the Option F custom-FIB status, map occupancies, nexthop
 /// state distribution, default hash mode. Best-effort: prints
 /// whatever readable slice of the FIB pins returns. Runs regardless
 /// of forwarding-mode so operators can verify pins exist and the

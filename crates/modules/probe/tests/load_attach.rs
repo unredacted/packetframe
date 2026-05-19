@@ -3,12 +3,12 @@
 
 //! Integration test: load the probe BPF ELF, create a veth pair,
 //! attach the probe XDP program, detach, and clean up. Mirrors
-//! `packetframe-fast-path/tests/attach.rs` — we're testing that the
+//! `packetframe-fast-path/tests/attach.rs`, we're testing that the
 //! ELF has a valid program named `probe` + a ringbuf map named
 //! `EVENTS`, that aya accepts it, the verifier accepts it, and the
 //! kernel accepts the XDP attach.
 //!
-//! Does NOT inject packets or drain the ringbuf — the probe's
+//! Does NOT inject packets or drain the ringbuf, the probe's
 //! ringbuf consumer is exercised by operators against real interfaces
 //! (SPEC §11.1(c)). Extending this test with packet injection would
 //! largely duplicate `fast-path/tests/netns.rs`'s AF_PACKET scaffolding
@@ -68,7 +68,7 @@ fn load_attach_detach_roundtrip_on_veth() {
         idx
     };
 
-    // Use the aligned copy, same as production — passing the raw
+    // Use the aligned copy, same as production, passing the raw
     // `PROBE_BPF` static trips aya's ELF header alignment check on
     // unlucky placements (see v0.1.1 regression).
     let bytes = aligned_bpf_copy();

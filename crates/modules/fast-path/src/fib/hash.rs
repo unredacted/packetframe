@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn hash_v4_distribution_is_nontrivial() {
         // Ten distinct src IPs into the same dst should produce at
-        // least 8 unique hashes — guard against "hash returns same
+        // least 8 unique hashes, guard against "hash returns same
         // value for all inputs" regressions. Not a statistical test;
         // just a sanity check.
         let mut hashes = std::collections::HashSet::new();

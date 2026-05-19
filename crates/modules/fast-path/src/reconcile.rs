@@ -7,7 +7,7 @@
 //! state and applies adds + removes without reloading the BPF
 //! program.
 //!
-//! Map updates aren't transactional — if an individual insert or
+//! Map updates aren't transactional, if an individual insert or
 //! delete fails we log it and continue. Partial-update state is
 //! strictly better than halting mid-reconcile. Attach-set changes
 //! (new iface or iface removed from the config) are **not** handled
@@ -209,7 +209,7 @@ where
 
 fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
     // Rebuild the desired set from /proc/net/vlan/config. Missing file
-    // means no VLAN subifs — desired is empty, which will remove any
+    // means no VLAN subifs, desired is empty, which will remove any
     // stale entries.
     let vlan_entries = match read_vlan_config() {
         Ok(e) => e,
@@ -225,7 +225,7 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
     let desired: HashSet<(u32, u32, u16)> = vlan_entries
         .iter()
         .filter_map(|(subif, vid, parent)| {
-            // Skip entries whose ifindexes don't resolve — the proc
+            // Skip entries whose ifindexes don't resolve, the proc
             // file is a snapshot; an iface may have disappeared between
             // read and here.
             let subif_idx = if_nametoindex(subif).ok()?;
@@ -241,7 +241,7 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
     let mut hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("VLAN_RESOLVE try_from: {e}")))?;
 
-    // Gather current state — value is VlanResolve { phys_ifindex, vid }.
+    // Gather current state, value is VlanResolve { phys_ifindex, vid }.
     let current: HashSet<(u32, u32, u16)> = hm
         .iter()
         .filter_map(Result::ok)
@@ -465,7 +465,7 @@ fn reconcile_mss_clamp(
                 desired_iface.insert(iface_filter, *mss);
             }
             (None, None) => {
-                // Global — handled by reconcile_cfg.
+                // Global, handled by reconcile_cfg.
             }
         }
     }
@@ -508,7 +508,7 @@ where
         let key = LpmKey::new(*len, *data);
         // Treat any insert as either an add (key not present) or an
         // update (key present, value possibly changed). The delta
-        // counts adds only; updates are silent — operators see them
+        // counts adds only; updates are silent, operators see them
         // as "0 added, 0 removed" and have to look at counters to
         // confirm new values landed.
         let was_present = current_keys.contains(&(*len, *data));

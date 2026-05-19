@@ -8,7 +8,7 @@
 //! breaker trips: writes a sticky flag under the state directory and
 //! raises SIGUSR1 so the main loop can detach the module.
 //!
-//! The state-dir flag survives a kernel reboot — that's deliberate.
+//! The state-dir flag survives a kernel reboot, that's deliberate.
 //! A tripped breaker refuses to re-attach on subsequent `packetframe
 //! run` invocations until an operator clears it. This matches SPEC
 //! §8.3's "sticky detach" requirement.
@@ -38,7 +38,7 @@ pub fn is_tripped(state_dir: &Path) -> bool {
 /// Write the sticky trip flag. Best-effort: if the write fails,
 /// the main-loop detach still proceeds; the worst case is that the
 /// next restart re-attaches a breaker whose condition may have
-/// cleared — operator sees the same trip again.
+/// cleared, operator sees the same trip again.
 pub fn write_trip_flag(
     state_dir: &Path,
     ratio: f64,
@@ -65,13 +65,13 @@ pub fn write_trip_flag(
 /// What the sampler observed, minus I/O on STATS itself.
 #[derive(Debug)]
 pub enum Decision {
-    /// No matched traffic since last sample — can't divide.
+    /// No matched traffic since last sample, can't divide.
     NoData,
     /// Under threshold.
     Ok { ratio: f64 },
     /// Over threshold but streak hasn't reached `threshold` samples yet.
     Bad { ratio: f64, streak: u32 },
-    /// Streak reached `threshold` — trip.
+    /// Streak reached `threshold`, trip.
     Trip {
         ratio: f64,
         window_drops: u64,
@@ -168,7 +168,7 @@ mod tests {
 
     fn stats(matched_v4: u64, drops: u64) -> Vec<u64> {
         // Matches STATS_COUNT in bpf/src/maps.rs (32 after the Option F
-        // Phase 1 additions). Was 19 pre-Phase-1 — that was already
+        // Phase 1 additions). Was 19 pre-Phase-1, that was already
         // off-by-one against the 20-variant StatIdx enum; fixed in
         // passing by the custom-FIB work that bumped STATS_COUNT.
         let mut s = vec![0u64; crate::metrics::COUNTER_NAMES.len()];

@@ -3,13 +3,13 @@
 //! Exercises the programmer's route-side write path end-to-end
 //! against real BPF maps: Add / Del / PeerDown / ECMP dedup /
 //! refcounted nexthop recycling. Not a "BMP mock test" as originally
-//! scoped — constructing valid BMP byte streams from scratch is its
+//! scoped, constructing valid BMP byte streams from scratch is its
 //! own sub-project, and the real value is proving the programmer
 //! writes the right bits into the BPF maps when fed RouteEvents,
 //! which is exactly what the `apply_route_event` handle does.
 //!
 //! **Map-handle duplication.** The programmer takes ownership of
-//! `Array<MapData, _>` handles via `Ebpf::take_map` — after which
+//! `Array<MapData, _>` handles via `Ebpf::take_map`, after which
 //! the test can't read those maps via the same `Ebpf`. Solution:
 //! pin each map to a bpffs tempdir first, then have both the
 //! programmer and the test open independent `MapData::from_pin`
@@ -50,7 +50,7 @@ static BPFFS_MOUNT: Once = Once::new();
 
 /// Ensure `/sys/fs/bpf` exists and has bpffs mounted on it. GitHub's
 /// hosted Ubuntu runner already has this; virtme-ng's VM does not, so
-/// we mount it ourselves. Best-effort: errors are tolerated — the
+/// we mount it ourselves. Best-effort: errors are tolerated, the
 /// subsequent `create_dir_all` / `pin` call will surface the real
 /// problem with a clearer message.
 fn ensure_bpffs_mounted() {

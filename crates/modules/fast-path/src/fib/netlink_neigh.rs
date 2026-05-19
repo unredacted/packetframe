@@ -18,9 +18,9 @@
 //! ifindex for a given nexthop IP, which couples this module to
 //! `rtnetlink::RouteHandle`. First-packet kernel ARP/ND already
 //! triggers resolution on its own, so skipping proactive kicks only
-//! adds a single-packet latency — not a correctness concern.
+//! adds a single-packet latency, not a correctness concern.
 //!
-//! No direct BPF-map writes happen here — the
+//! No direct BPF-map writes happen here, the
 //! [`FibProgrammer`](super::programmer) consumes `NeighEvent` and
 //! owns the `NEXTHOPS` seqlock write path.
 
@@ -73,7 +73,7 @@ pub struct LocalPrefixSpec {
     /// avoid kernel `gc_thresh3` overflow + ARP storms). Useful for
     /// quiet LANs (storage networks like Ceph) where hosts don't
     /// communicate L3 with the gateway and therefore never appear in
-    /// `ip neigh show <iface>`. Off by default — generates noticeable
+    /// `ip neigh show <iface>`. Off by default, generates noticeable
     /// ARP traffic during startup.
     pub arp_scavenge: bool,
 }
@@ -85,7 +85,7 @@ pub struct LocalPrefixSpec {
 /// CGNAT, test-net, anything not in DFZ). Otherwise those packets
 /// miss LPM, fall to slow-path through netfilter / conntrack, and
 /// get dropped upstream anyway. With this directive they XDP-redirect
-/// to upstream — same upstream behavior, conntrack stays out of it.
+/// to upstream, same upstream behavior, conntrack stays out of it.
 ///
 /// `iface` is validated at startup against `/sys/class/net` (same
 /// as `attach`/`local-prefix`); `nexthop` is the IPv4 address of an
@@ -112,7 +112,7 @@ impl LocalPrefixSpec {
 /// Outbound `NeighEvent` queue capacity. Sized to absorb a full-table
 /// neighbor-churn storm without blocking the netlink reader. If the
 /// programmer can't drain fast enough we apply backpressure, which is
-/// fine — the kernel re-broadcasts neighbor state on the next event
+/// fine, the kernel re-broadcasts neighbor state on the next event
 /// and the programmer catches up.
 const EVENTS_CAPACITY: usize = 8192;
 
@@ -178,7 +178,7 @@ pub struct NetlinkNeighborResolver {
     /// **Why we need this** (Phase 3.9 fix): if the kernel already
     /// has a stable `REACHABLE` entry for a BGP nexthop when
     /// packetframe starts, the multicast subscription will never see
-    /// it — multicast only fires on state *transitions*. Without this
+    /// it, multicast only fires on state *transitions*. Without this
     /// cache, `request_resolve(ip)` would issue an `RTM_NEWNEIGH
     /// NUD_NONE` probe for an entry the kernel already has, which
     /// the kernel correctly treats as a no-op and produces no event,
@@ -197,7 +197,7 @@ pub struct NetlinkNeighborResolver {
     /// v0.2.1: handle to the FibProgrammer for local-prefix /32
     /// emission. `None` when no local-prefix is configured (or when
     /// running under a test harness that doesn't drive a programmer
-    /// — e.g., the existing netns ARP-walk tests).
+    /// e.g., the existing netns ARP-walk tests).
     prog_handle: Option<FibProgrammerHandle>,
     /// v0.2.1 issue #31: optional synthetic 0.0.0.0/0 catch-all.
     /// `None` = no fallback (default). `Some(spec)` = inject a /0
@@ -323,7 +323,7 @@ impl NetlinkNeighborResolver {
                 warn!(
                     error = %e,
                     "RTM_GETNEIGH dump failed; pre-existing kernel neighbour entries \
-                     won't be visible until they transition (degraded perf only — first-packet \
+                     won't be visible until they transition (degraded perf only, first-packet \
                      ARP is the fallback)"
                 );
             }
@@ -361,7 +361,7 @@ impl NetlinkNeighborResolver {
                 local_prefixes = self.local_prefixes.len(),
                 has_fallback = self.fallback_default.is_some(),
                 "v0.2.1 directives configured but no FibProgrammer handle wired through; \
-                 fast-path features will not be enabled — file a bug if you see this on a \
+                 fast-path features will not be enabled, file a bug if you see this on a \
                  production deploy"
             );
         }
@@ -427,7 +427,7 @@ impl NetlinkNeighborResolver {
                             } else {
                                 self.cache_misses += 1;
                                 if self.cache_misses <= 20 {
-                                    // First few misses — log explicitly so
+                                    // First few misses, log explicitly so
                                     // the operator can see *which* IPs the
                                     // dump didn't capture.
                                     info!(?ip, "neighbour cache miss; proactive probe");
@@ -448,7 +448,7 @@ impl NetlinkNeighborResolver {
                 _ = stats_tick.tick() => {
                     // Periodic resolver stats. Helps diagnose whether
                     // register_nexthop calls are landing on cache hits
-                    // (good — synthetic Learned fired) or misses (kernel
+                    // (good, synthetic Learned fired) or misses (kernel
                     // didn't have an ARP entry; relying on proactive
                     // probe).
                     info!(
@@ -484,7 +484,7 @@ impl NetlinkNeighborResolver {
                     // Mirror Learned events into the local cache so
                     // a later request_resolve for the same IP hits
                     // synchronously (Phase 3.9 fix). Cache misses on
-                    // Failed/Gone — those don't carry a usable MAC.
+                    // Failed/Gone, those don't carry a usable MAC.
                     if let NeighEvent::Learned {
                         ip, mac, ifindex, ..
                     } = &evt
@@ -494,7 +494,7 @@ impl NetlinkNeighborResolver {
                         // local-prefix and is reachable via the matching
                         // iface, emit a /32 RouteEvent::Add. The
                         // FibProgrammer takes it from there; we don't
-                        // need to track per-/32 state ourselves —
+                        // need to track per-/32 state ourselves
                         // RouteEvent::Del on RTM_DELNEIGH is the symmetric
                         // cleanup, and PeerDown on RTM_DELLINK handles
                         // the iface-disappears case.
@@ -537,8 +537,8 @@ impl NetlinkNeighborResolver {
                     }
                 }
                 // v0.2.1: keep iface_to_ifindex current. An iface that
-                // came up after packetframe started — covered by a
-                // local-prefix that the operator staged in config —
+                // came up after packetframe started, covered by a
+                // local-prefix that the operator staged in config
                 // becomes resolvable now.
                 if let Some(name) = extract_link_name(&msg) {
                     self.iface_to_ifindex.insert(name, ifindex);
@@ -611,7 +611,7 @@ impl NetlinkNeighborResolver {
         // v0.2.1 issue #32: ARP-scavenge any prefix the operator
         // flagged. For each IP in the CIDR (excluding network and
         // broadcast), call NeighborResolveHandle::request_resolve via
-        // the resolve_tx channel — the proactive-resolve path then
+        // the resolve_tx channel, the proactive-resolve path then
         // issues an RTM_NEWNEIGH NUD_NONE which the kernel turns into
         // an ARP request. Hosts that respond land in the L3 ARP cache,
         // RTM_NEWNEIGH multicasts back to us, and our existing
@@ -628,7 +628,7 @@ impl NetlinkNeighborResolver {
     /// v0.2.1 issue #32, with v0.2.2 broadcast-storm safety (#34).
     /// For every `local-prefix` flagged with `arp-scavenge`, ARP-probe
     /// every host IP in the CIDR via the **operator-declared iface**
-    /// (NOT the kernel's routing-table OIF — see safety rationale below).
+    /// (NOT the kernel's routing-table OIF, see safety rationale below).
     /// Capped at /22 (1024 hosts) per config-parse validation.
     ///
     /// **Safety: why we use the operator's declared iface, not the
@@ -653,7 +653,7 @@ impl NetlinkNeighborResolver {
     async fn scavenge_local_prefix_arp(&mut self) {
         // Snapshot the specs (filter to arp-scavenge enabled) AND
         // resolve each spec's iface to ifindex up-front. If an iface
-        // doesn't resolve, we refuse the sweep entirely — that's
+        // doesn't resolve, we refuse the sweep entirely, that's
         // safer than falling back to kernel-OIF behavior.
         let specs: Vec<(LocalPrefixSpec, u32)> = self
             .local_prefixes
@@ -687,7 +687,7 @@ impl NetlinkNeighborResolver {
                 1u32 << host_bits
             };
             // Mask off any host bits the operator left set in the
-            // declared CIDR — treat 23.191.200.5/24 as 23.191.200.0/24.
+            // declared CIDR, treat 23.191.200.5/24 as 23.191.200.0/24.
             let mask: u32 = if plen == 0 {
                 0
             } else {
@@ -710,7 +710,7 @@ impl NetlinkNeighborResolver {
                 probed += 1;
                 // Rate-limit at ~500 probes/sec (50 per 100ms). Without
                 // pacing, a /22 sweep (1024 hosts) issues 1024 ARP
-                // requests in milliseconds — saturates the kernel
+                // requests in milliseconds, saturates the kernel
                 // neighbour queue and triggers `Neighbour table
                 // overflow` warnings. 500/s is comfortably under the
                 // default `gc_thresh3` (1024) replenishment rate and
@@ -805,7 +805,7 @@ impl NetlinkNeighborResolver {
     }
 
     /// Same as [`Self::seed_local_prefix_routes`] but for a single
-    /// (ip, ifindex) pair — called from the multicast event handler
+    /// (ip, ifindex) pair, called from the multicast event handler
     /// on RTM_NEWNEIGH. Idempotent against the FibProgrammer side
     /// (multiple Adds for the same /32 just bump a refcount).
     async fn maybe_emit_local_arp_add(&mut self, ip: IpAddr, ifindex: u32) {
@@ -814,7 +814,7 @@ impl NetlinkNeighborResolver {
             return;
         };
         // Clone to release the &self borrow on prog_handle before the
-        // mutable counter update below — same pattern as
+        // mutable counter update below, same pattern as
         // seed_local_prefix_routes. FibProgrammerHandle is cheap to
         // clone (mpsc Sender wrapper).
         let Some(prog) = self.prog_handle.clone() else {
@@ -879,10 +879,10 @@ impl NetlinkNeighborResolver {
                 .unwrap_or(false)
         });
         // After the iface_to_ifindex purge above, we may have already
-        // lost the entry — fall back to comparing against any cached
+        // lost the entry, fall back to comparing against any cached
         // matching done in seed time. For now the simpler heuristic is
         // "always emit a PeerDown if local-prefixes are configured at
-        // all" — wasteful for ifaces that weren't local-prefix targets,
+        // all", wasteful for ifaces that weren't local-prefix targets,
         // but safe (programmer's PeerDown handler is a HashMap walk
         // that does nothing for an unknown peer_id).
         if !was_local && self.local_prefixes.is_empty() {
@@ -931,7 +931,7 @@ impl NetlinkNeighborResolver {
 /// message shape), or the neighbor add fails (EEXIST because the
 /// neighbor already exists, permission issues, etc.), we log at debug
 /// and return. The fallback is "kernel resolves when real traffic
-/// arrives" — exactly what we'd get without proactive resolve, so
+/// arrives", exactly what we'd get without proactive resolve, so
 /// the only cost of a proactive-resolve failure is one-packet latency
 /// on first forward.
 async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
@@ -964,7 +964,7 @@ async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
     };
     // Issue the RTM_NEWNEIGH with NUD_NONE. The kernel interprets
     // "state NONE + no lladdr" as "initialize this neighbor and start
-    // resolving." Replace lets the call be idempotent — if the
+    // resolving." Replace lets the call be idempotent, if the
     // neighbor already exists, we quietly succeed.
     match handle
         .neighbours()
@@ -981,7 +981,7 @@ async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
 
 /// Query the main routing table for `msg`, return the OIF of the
 /// first route returned. Kernel answers via a stream; we only care
-/// about the first entry — subsequent entries for multipath routes
+/// about the first entry, subsequent entries for multipath routes
 /// are handled at the programmer level via ECMP groups.
 async fn lookup_oif(
     handle: &Handle,
@@ -1003,7 +1003,7 @@ async fn lookup_oif(
 
 /// Dump every link on the box via a single RTM_GETLINK-dump request;
 /// return both an `ifindex → MAC` map and a `name → ifindex` map.
-/// Uses a dedicated unicast netlink connection — the main multicast
+/// Uses a dedicated unicast netlink connection, the main multicast
 /// one is owned by the select! loop.
 ///
 /// Links without a usable MAC (e.g., tunnels, loopback, bridge masters
@@ -1037,7 +1037,7 @@ async fn dump_link_info() -> Result<(HashMap<u32, [u8; 6]>, HashMap<String, u32>
 }
 
 /// Pull the `IfName` (IFLA_IFNAME) attribute out of a `LinkMessage`.
-/// Returns `None` if the attribute is absent (rare — the kernel sets
+/// Returns `None` if the attribute is absent (rare, the kernel sets
 /// it on every iface) or non-UTF-8 (effectively never on Linux).
 fn extract_link_name(msg: &LinkMessage) -> Option<String> {
     for attr in &msg.attributes {
@@ -1054,14 +1054,14 @@ fn extract_link_name(msg: &LinkMessage) -> Option<String> {
 /// **Why this exists** (Phase 3.9): the multicast subscription only
 /// observes neighbour state *transitions*, not the steady state at
 /// the moment we subscribe. If the kernel already has REACHABLE
-/// entries for BGP peers when packetframe starts (typical — bird's
+/// entries for BGP peers when packetframe starts (typical, bird's
 /// been ARPing them for hours), we'd never see them. This dump
 /// gives us a one-time snapshot to seed the cache, and the
 /// multicast subscription keeps it current from then on.
 ///
 /// Skips entries whose state isn't usable for forwarding
 /// (Incomplete/None/Failed) and entries without a Link-Layer
-/// Address attribute. STALE/DELAY/PROBE are kept — same policy as
+/// Address attribute. STALE/DELAY/PROBE are kept, same policy as
 /// `parse_neighbour_add` for the multicast path.
 async fn dump_neighbours() -> Result<HashMap<IpAddr, (u32, [u8; 6])>, NeighError> {
     let (connection, handle, _) =
@@ -1091,7 +1091,7 @@ async fn dump_neighbours() -> Result<HashMap<IpAddr, (u32, [u8; 6])>, NeighError
 
 /// Pull the `Address` (IFLA_ADDRESS) attribute out of a LinkMessage
 /// if it's a plausible Ethernet MAC. Returns None for non-Ethernet
-/// links — tunnels encode the peer address in `Address` with varying
+/// links, tunnels encode the peer address in `Address` with varying
 /// widths, and a 6-byte address on a tunnel isn't semantically what
 /// we want as src_mac anyway.
 fn extract_link_mac(msg: &LinkMessage) -> Option<[u8; 6]> {
@@ -1101,7 +1101,7 @@ fn extract_link_mac(msg: &LinkMessage) -> Option<[u8; 6]> {
                 let mut mac = [0u8; 6];
                 mac.copy_from_slice(bytes);
                 // Skip the all-zero MAC some virtual ifaces present
-                // before they're configured — that would be worse than
+                // before they're configured, that would be worse than
                 // not providing one (looks like a real address).
                 if mac != [0; 6] {
                     return Some(mac);
@@ -1114,7 +1114,7 @@ fn extract_link_mac(msg: &LinkMessage) -> Option<[u8; 6]> {
 
 /// Build a [`NeighEvent`] from an RTM_NEWNEIGH message. Returns
 /// `None` for transient or uninteresting states (`Incomplete` / `None`
-/// — no MAC yet; `Other` — unknown variant). `src_mac` is the cached
+/// no MAC yet; `Other`, unknown variant). `src_mac` is the cached
 /// egress iface MAC (Phase 3.6); `[0; 6]` when the cache hasn't been
 /// populated for this ifindex yet.
 fn parse_neighbour_add(msg: &NeighbourMessage, src_mac: [u8; 6]) -> Option<NeighEvent> {
@@ -1319,7 +1319,7 @@ mod tests {
     #[test]
     fn local_prefix_contains_misalignment_is_treated_as_aligned() {
         // Operator wrote `local-prefix 23.191.200.5/24` (host bits
-        // set). The mask logic ignores host bits when comparing —
+        // set). The mask logic ignores host bits when comparing
         // semantically the prefix is still 23.191.200.0/24.
         let spec = LocalPrefixSpec {
             addr: "23.191.200.5".parse().unwrap(),

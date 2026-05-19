@@ -2,10 +2,10 @@
 #![cfg(target_os = "linux")]
 
 //! Integration test: load the fast-path BPF ELF, create a veth pair,
-//! attach to one end (native XDP, falling back to generic — veth
+//! attach to one end (native XDP, falling back to generic, veth
 //! supports native on modern kernels), detach, and clean up.
 //!
-//! This is the lightweight version of a full netns routing test — the
+//! This is the lightweight version of a full netns routing test, the
 //! point is to exercise the aya attach/detach round-trip against a real
 //! ifindex, which `bpf_prog_test_run` can't do. Full end-to-end
 //! forwarding (packet in → redirect → packet out) lands in a later PR

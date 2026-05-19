@@ -3,7 +3,7 @@
 //! The loader refuses to start if any *required* capability is missing; the
 //! feasibility subcommand (`packetframe feasibility`) renders the full
 //! report. Per-interface native-XDP trial-attach (§2.3) is deferred to v0.1,
-//! since it requires a real program to attach — reported here as Deferred.
+//! since it requires a real program to attach, reported here as Deferred.
 
 pub mod bpf;
 
@@ -112,7 +112,7 @@ impl FeasibilityReport {
 /// will use for pins (matches the `bpffs-root` config directive, default
 /// `/sys/fs/bpf/packetframe`).
 pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
-    // Helpers — probed by loading minimal XDP programs and inspecting the
+    // Helpers, probed by loading minimal XDP programs and inspecting the
     // verifier log. Any log substring matching "unknown func" /
     // "unrecognized bpf_func_id" / "invalid func" means the helper is not
     // compiled into this kernel.
@@ -164,7 +164,7 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     ));
     caps.push(probe_memlock());
 
-    // §2.3 per-interface native-XDP trial-attach — deferred. The probe needs
+    // §2.3 per-interface native-XDP trial-attach, deferred. The probe needs
     // a real attachable program, which doesn't exist in v0.0.1.
     caps.push(Capability::deferred(
         "xdp.per_interface_attach_probe",
@@ -270,29 +270,29 @@ fn probe_bpf_syscall_available() -> Capability {
         ),
         BpfSyscallStatus::NotImplemented => Capability::fail(
             "syscall.bpf",
-            "bpf() syscall not implemented (ENOSYS) — kernel lacks BPF support",
+            "bpf() syscall not implemented (ENOSYS), kernel lacks BPF support",
             true,
         ),
         BpfSyscallStatus::Permission => Capability::fail(
             "syscall.bpf",
-            "bpf() returned EPERM — run as root (kernel.unprivileged_bpf_disabled likely set)",
+            "bpf() returned EPERM, run as root (kernel.unprivileged_bpf_disabled likely set)",
             true,
         ),
         BpfSyscallStatus::UnexpectedOk => Capability::unknown(
             "syscall.bpf",
-            "bpf() returned OK for a bogus cmd — unexpected, kernel version mismatch?",
+            "bpf() returned OK for a bogus cmd, unexpected, kernel version mismatch?",
             true,
         ),
         BpfSyscallStatus::UnknownError => Capability::unknown(
             "syscall.bpf",
-            "bpf() returned an error without errno — unexpected",
+            "bpf() returned an error without errno, unexpected",
             true,
         ),
     }
 }
 
 fn probe_prog_type(name: &str, prog_type: u32, required: bool) -> Capability {
-    // mov r0, 0; exit — a valid trivial program for any prog_type we care
+    // mov r0, 0; exit, a valid trivial program for any prog_type we care
     // about (XDP returns XDP_ABORTED=0, sched_cls returns TC_ACT_OK=0).
     let insns = [mov64_imm(0, 0), exit_insn()];
     match prog_load(prog_type, &insns, "GPL") {
@@ -323,25 +323,25 @@ fn probe_helper(name: &str, helper_id: i32, required: bool) -> Capability {
             if out.fd.is_some() {
                 return Capability::pass(name, "helper present (program accepted)", required);
             }
-            // ENOSYS means the bpf() syscall itself is unavailable — not a
+            // ENOSYS means the bpf() syscall itself is unavailable, not a
             // helper verdict. Without a verifier run we can't say anything
             // about helper presence; defer to the syscall.bpf cap for the
             // real signal.
             if out.errno == Some(libc::ENOSYS) {
                 return Capability::fail(
                     name,
-                    "bpf() syscall unavailable (ENOSYS) — see syscall.bpf",
+                    "bpf() syscall unavailable (ENOSYS), see syscall.bpf",
                     required,
                 );
             }
             // EPERM typically means we're not root and the kernel is
             // hardened (SPEC.md §2.2 on `unprivileged_bpf_disabled=2`). The
-            // verifier doesn't run, so there's no log — we can't tell
+            // verifier doesn't run, so there's no log, we can't tell
             // whether the helper exists or not.
             if out.errno == Some(libc::EPERM) {
                 return Capability::unknown(
                     name,
-                    "prog_load returned EPERM — run as root to probe helpers",
+                    "prog_load returned EPERM, run as root to probe helpers",
                     required,
                 );
             }
@@ -459,8 +459,8 @@ fn map_probe(
         Ok(_fd) => Capability::pass(name, "map_create succeeded", required),
         Err(e) => {
             let hint = match e.raw_os_error() {
-                Some(libc::EPERM) => " (EPERM — run as root)",
-                Some(libc::EINVAL) => " (EINVAL — map type likely unsupported)",
+                Some(libc::EPERM) => " (EPERM, run as root)",
+                Some(libc::EINVAL) => " (EINVAL, map type likely unsupported)",
                 _ => "",
             };
             Capability::fail(name, format!("map_create failed: {e}{hint}"), required)
@@ -512,7 +512,7 @@ fn probe_bpffs(path: &Path) -> Capability {
     // `statfs.f_type` varies by platform/libc: `i64` on glibc Linux x86_64,
     // `u32` on macOS, `u64` on some musl configs. Normalize to `i64` for
     // the comparison; clippy will call this unnecessary on whichever
-    // platform already has `i64` — the cast is still correct on every other.
+    // platform already has `i64`, the cast is still correct on every other.
     #[allow(clippy::unnecessary_cast)]
     let f_type = statfs.f_type as i64;
     if f_type == BPF_FS_MAGIC {

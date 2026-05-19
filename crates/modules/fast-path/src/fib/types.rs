@@ -172,7 +172,7 @@ unsafe impl aya::Pod for FpFibCfg {}
 // --- Layout assertions -------------------------------------------------
 //
 // These match the layouts declared in `bpf/src/maps.rs`. Any drift on
-// either side breaks the build — safer than waiting for a field
+// either side breaks the build, safer than waiting for a field
 // misalignment to cause an XDP map write to corrupt the wrong bytes.
 
 const _: () = assert!(core::mem::size_of::<FibValue>() == 8);

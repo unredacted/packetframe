@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PacketFrame XDP probe — diagnostic BPF program for inspecting raw ingress frames per driver (SPEC.md §11.1(c))"
+description = "PacketFrame XDP probe: diagnostic BPF program for inspecting raw ingress frames per driver"
 build = "build.rs"
 
 [lib]
@@ -19,7 +19,7 @@ tracing.workspace = true
 libc.workspace = true
 
 # aya is Linux-only. The probe's userspace path compiles out entirely
-# on non-Linux — the CLI subcommand returns an error on macOS dev.
+# on non-Linux, the CLI subcommand returns an error on macOS dev.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya.workspace = true
 

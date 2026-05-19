@@ -47,7 +47,7 @@ pub struct AttachmentRecord {
 }
 
 /// Serde-compatible mirror of [`HookType`]. Doesn't derive
-/// Serialize/Deserialize on the trait type itself — that's
+/// Serialize/Deserialize on the trait type itself, that's
 /// `packetframe-common`'s concern, and we'd rather not widen its
 /// public surface just for this one consumer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

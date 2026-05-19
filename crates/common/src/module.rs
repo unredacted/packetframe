@@ -47,7 +47,7 @@ pub enum HookType {
 
 /// A single hook use declared by a module. Priority ordering per SPEC.md §3.2
 /// (lower = runs earlier under the future dispatcher). In v0.0.1 with a
-/// single-module deployment, priorities are recorded but not consulted —
+/// single-module deployment, priorities are recorded but not consulted
 /// SPEC.md §3.4.
 #[derive(Debug, Clone, Copy)]
 pub struct HookUse {
@@ -91,7 +91,7 @@ pub struct LoaderCtx<'a> {
 }
 
 /// Context supplied to `Module::health_check` when circuit breakers evaluate.
-/// v0.0.1 is empty — populated with per-counter deltas in v0.1.
+/// v0.0.1 is empty, populated with per-counter deltas in v0.1.
 #[derive(Debug, Default)]
 pub struct HealthCtx {
     // Deliberately empty until v0.1 wires in counter samples.
@@ -142,7 +142,7 @@ pub struct SubsystemHealth {
 /// Structured health report returned by `Module::health_check`.
 ///
 /// Carries an overall state plus a `Vec<SubsystemHealth>` for
-/// modules with internal subsystems — e.g. fast-path's
+/// modules with internal subsystems, e.g. fast-path's
 /// RouteController, which can report BMP + netlink + FibProgrammer
 /// freshness independently. Modules without subsystems return
 /// `HealthReport::default()` (an empty, healthy report).
@@ -157,7 +157,7 @@ pub struct HealthReport {
 }
 
 impl HealthReport {
-    /// An empty, healthy report — the default any module with no
+    /// An empty, healthy report, the default any module with no
     /// subsystems to report on can return.
     pub fn healthy() -> Self {
         Self::default()
@@ -183,7 +183,7 @@ impl<'a> MetricsWriter<'a> {
 /// Every PacketFrame module implements this. The shape is stable across
 /// modules so the loader can drive them polymorphically; see SPEC.md §3.2 for
 /// the per-method contract (notably: `detach` must complete in under 1s, and
-/// `reconfigure` must not reload programs — only mutate maps).
+/// `reconfigure` must not reload programs, only mutate maps).
 pub trait Module: Send + Sync {
     fn name(&self) -> &'static str;
 

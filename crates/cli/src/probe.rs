@@ -1,4 +1,4 @@
-//! `packetframe probe` subcommand — one-shot XDP diagnostic.
+//! `packetframe probe` subcommand, one-shot XDP diagnostic.
 //!
 //! Purpose per SPEC.md §11.1(c): let operators answer "what does this
 //! driver actually hand to XDP?" without editing and redeploying a
@@ -7,7 +7,7 @@
 //! and prints the collected samples.
 //!
 //! The formatted output is deliberately plain text keyed on the first
-//! 16 bytes of each sample — an operator scanning for `01 23 45 67 89
+//! 16 bytes of each sample, an operator scanning for `01 23 45 67 89
 //! ab 0b 16 17 c8 52 01 08 00` (six dst MAC, six src MAC, Ethernet
 //! type = IPv4) is the happy path; seeing a consistent 16-byte header
 //! that doesn't match that shape is the §11.1(c) smoking gun.
@@ -71,7 +71,7 @@ fn print_report(iface: &str, duration: Duration, out: &ProbeOutput) {
         return;
     }
     if !out.saw_traffic {
-        println!("(ringbuf was empty throughout — duration exceeded packet arrival)");
+        println!("(ringbuf was empty throughout, duration exceeded packet arrival)");
     }
 
     println!();
@@ -112,9 +112,9 @@ fn format_head_hex(head: &[u8; 16]) -> String {
 
 /// Heuristic summary: tries to tell the operator in one line whether
 /// the head bytes look like a standard Ethernet frame. False positives
-/// are fine — the operator still has the raw bytes above to inspect.
+/// are fine, the operator still has the raw bytes above to inspect.
 /// False negatives would be worse, but given we only flag "definitely
-/// looks like Ethernet" positively, the fallback is just "unknown" —
+/// looks like Ethernet" positively, the fallback is just "unknown"
 /// which is the honest thing to say on a non-conformant driver.
 fn summarize(samples: &[ProbeEvent]) -> String {
     if samples.is_empty() {
@@ -124,11 +124,11 @@ fn summarize(samples: &[ProbeEvent]) -> String {
     let n = samples.len();
 
     // Count how many samples have a plausible Ethernet ethertype at
-    // bytes 12..14 — 0x0800 (IPv4), 0x86dd (IPv6), 0x8100 (802.1Q),
+    // bytes 12..14, 0x0800 (IPv4), 0x86dd (IPv6), 0x8100 (802.1Q),
     // 0x88a8 (802.1ad), 0x0806 (ARP). If most samples match, the
     // driver is probably conformant. If almost none match, the first
     // 16 bytes likely include a descriptor prefix rather than the
-    // Ethernet header — the §11.1(c) signature.
+    // Ethernet header, the §11.1(c) signature.
     let ethertype_plausible = samples
         .iter()
         .filter(|s| {
@@ -142,7 +142,7 @@ fn summarize(samples: &[ProbeEvent]) -> String {
 
     // Check for a common-prefix signature: if all N samples share a
     // fixed first-k-bytes prefix, that prefix is almost certainly a
-    // driver descriptor and not a variable MAC address — which would
+    // driver descriptor and not a variable MAC address, which would
     // differ per-flow. k of 8 is enough to distinguish (two hosts
     // rarely share the whole first 8 bytes of an Ethernet frame).
     let common_prefix_len = common_prefix_len(samples);
@@ -179,7 +179,7 @@ fn summarize(samples: &[ProbeEvent]) -> String {
             .join(" ");
         lines.push(format!(
             "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
-             — unusual for real Ethernet (MACs would vary); suggests a driver descriptor."
+            , unusual for real Ethernet (MACs would vary); suggests a driver descriptor."
         ));
     }
 

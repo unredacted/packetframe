@@ -10,7 +10,7 @@
 //! Purpose: SPEC.md §11.1(c). On rvu-nicpf (Marvell CN10K) native XDP,
 //! attach succeeds and `bpftool net show` reports `xdpdrv`, but
 //! `ctx->data` apparently doesn't point at the standard Ethernet
-//! header — every packet classifies as `pass_not_ip` in the fast-path
+//! header, every packet classifies as `pass_not_ip` in the fast-path
 //! program. The canonical way to answer "what does this driver hand
 //! to XDP?" is to dump the raw head bytes, which this tool does
 //! without touching the packet or disturbing traffic.
@@ -31,7 +31,7 @@ use core::mem;
 /// reader can cast incoming ringbuf bytes directly into this layout;
 /// changing the layout requires bumping a version field and updating
 /// the userspace `ProbeEvent` in sync. `u64 + u32 + [u8;16] + [u8;4]`
-/// packs to a flat 32 bytes with no compiler-inserted padding — the
+/// packs to a flat 32 bytes with no compiler-inserted padding, the
 /// kernel insists `align_of::<T>() ≤ 8` for `RingBuf::reserve`, which
 /// this struct satisfies.
 ///
@@ -46,7 +46,7 @@ use core::mem;
 /// padding that `RingBuf::reserve` (returning `MaybeUninit<T>` over
 /// a kernel-allocated slot that the kernel does NOT zero) would
 /// publish to userspace carrying whatever the ringbuf cell last
-/// held — a 4-byte information leak per sample. See SPEC.md §11.1(c)
+/// held, a 4-byte information leak per sample. See SPEC.md §11.1(c)
 /// + the May 2026 audit Slice 3 fix for the longer rationale.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -77,7 +77,7 @@ pub static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 ///
 /// `offset` is the byte offset at which the BPF program samples the
 /// 16-byte head. Normally `0`, but some broken drivers point
-/// `xdp->data` into headroom instead of at the packet — the CLI
+/// `xdp->data` into headroom instead of at the packet, the CLI
 /// surfaces `--offset N` so the operator can confirm where the packet
 /// really starts. `OTX2_HEAD_ROOM = 128` is the interesting value for
 /// rvu-nicpf on pre-upstream-v6.8 kernels; see SPEC.md §11.1(c).
@@ -110,7 +110,7 @@ pub fn probe(ctx: XdpContext) -> u32 {
         .unwrap_or(0)
         .min(MAX_OFFSET) as usize;
 
-    // Reserve a slot before reading packet bytes — keeps the hot path
+    // Reserve a slot before reading packet bytes, keeps the hot path
     // cheap when the ringbuf is full (no reads, no work). Rust's
     // `#[must_use]` on `RingBufEntry` enforces that we either submit
     // or discard before returning, which is also the BPF verifier's
@@ -127,7 +127,7 @@ pub fn probe(ctx: XdpContext) -> u32 {
 
     // Verifier-friendly bounds check for the 16-byte head read at
     // `start + offset`. Short packets (or a too-large offset on a
-    // small frame) discard the sample rather than fault — the probe
+    // small frame) discard the sample rather than fault, the probe
     // is diagnostic; frames that don't fit just aren't interesting
     // evidence and we keep forwarding.
     if start + offset + mem::size_of::<[u8; 16]>() > end {
@@ -140,7 +140,7 @@ pub fn probe(ctx: XdpContext) -> u32 {
 
     // SAFETY: `RingBufEntry::as_mut_ptr` gives a valid, 8-aligned,
     // `mem::size_of::<ProbeEvent>()`-sized slot. **The kernel does
-    // NOT zero the reservation** — `RingBuf::reserve` returns
+    // NOT zero the reservation**, `RingBuf::reserve` returns
     // `MaybeUninit<T>` over whatever bytes the ringbuf cell last
     // held. Every byte of the slot must be written before `submit`
     // or the leftover content goes out to userspace as kernel-memory
@@ -162,7 +162,7 @@ pub fn probe(ctx: XdpContext) -> u32 {
 
     entry.submit(0);
 
-    // Diagnostic only — never perturb traffic.
+    // Diagnostic only, never perturb traffic.
     xdp_action::XDP_PASS
 }
 

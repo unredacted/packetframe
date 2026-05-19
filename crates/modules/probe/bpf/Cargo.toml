@@ -3,7 +3,7 @@ name = "packetframe-probe-bpf"
 version = "0.0.1"
 edition = "2021"
 # See crates/modules/fast-path/bpf/Cargo.toml for the rationale behind
-# this field — documents the stable MSRV even though the BPF build runs
+# this field, documents the stable MSRV even though the BPF build runs
 # on nightly (pinned in ./rust-toolchain.toml).
 rust-version = "1.95"
 license = "GPL-3.0-or-later"

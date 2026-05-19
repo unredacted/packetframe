@@ -1,4 +1,4 @@
-//! PacketFrame probe — userspace wrapper.
+//! PacketFrame probe, userspace wrapper.
 //!
 //! Embeds the probe BPF ELF (via [`build.rs`](../build.rs)) and
 //! exposes a tiny [`run`] helper that attaches the XDP program to an
@@ -7,24 +7,24 @@
 //! formatting; nothing else in the workspace uses it.
 //!
 //! Unlike [`crate::fast-path`], the probe is not a [`Module`]
-//! implementation. It's a one-shot diagnostic — load, attach, drain,
-//! detach — so it never participates in the daemon lifecycle, pin
+//! implementation. It's a one-shot diagnostic, load, attach, drain,
+//! detach, so it never participates in the daemon lifecycle, pin
 //! registry, or reconcile flow.
 
 pub const MODULE_NAME: &str = "probe";
 
 /// The compiled probe BPF ELF, staged by `build.rs` and embedded at
 /// crate-compile time. Empty (zero bytes) when the BPF toolchain
-/// isn't available — see [`PROBE_BPF_AVAILABLE`].
+/// isn't available, see [`PROBE_BPF_AVAILABLE`].
 ///
 /// Note: `include_bytes!` returns a 1-byte-aligned slice. Passing it
 /// directly to `aya::Ebpf::load` fails with "Invalid ELF header size
-/// or alignment" on every non-8-byte-aligned placement — which is
+/// or alignment" on every non-8-byte-aligned placement, which is
 /// wherever the linker happens to drop a `.rodata` blob of the
 /// current size. v0.1.1's probe ELF grew from 1432 → 1608 bytes (CFG
 /// map added) and its in-binary address flipped from aligned to
 /// unaligned, which is how that release shipped broken. Callers must
-/// copy to an aligned buffer — use [`aligned_bpf_copy`].
+/// copy to an aligned buffer, use [`aligned_bpf_copy`].
 pub const PROBE_BPF: &[u8] = include_bytes!(env!("PROBE_BPF_OBJ"));
 
 /// `true` when `build.rs` produced a real probe BPF ELF; `false` when
@@ -42,7 +42,7 @@ pub fn aligned_bpf_copy() -> Vec<u8> {
 }
 
 /// One packet sample. `#[repr(C)]` and layout-identical to the BPF
-/// program's `ProbeEvent` struct — the ringbuf delivers these bytes
+/// program's `ProbeEvent` struct, the ringbuf delivers these bytes
 /// unchanged. Changing the layout here requires the BPF side to
 /// change in lockstep (and vice versa). The pinned size (32 bytes)
 /// is asserted at compile time below.
@@ -96,7 +96,7 @@ pub const MAX_OFFSET: u16 = 512;
 /// `Generic` is SKB XDP, `Auto` tries native then falls back. The
 /// probe exposes all three so operators can confirm whether a
 /// non-conformant head in native mode becomes conformant in generic
-/// mode — which it should, since generic runs after the kernel has
+/// mode, which it should, since generic runs after the kernel has
 /// already built an skb with a standard Ethernet frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AttachMode {
@@ -123,7 +123,7 @@ pub struct ProbeOutput {
     /// Samples collected during the probe window. Ordered by arrival.
     pub samples: Vec<ProbeEvent>,
     /// Offset (bytes) at which the BPF program sampled each packet's
-    /// head. Echoed back so the CLI can label the output — e.g. an
+    /// head. Echoed back so the CLI can label the output, e.g. an
     /// rvu-nicpf pre-v6.8 trace at `offset=128` shows the real frame
     /// while `offset=0` shows the headroom zeros.
     pub offset: u16,
@@ -133,7 +133,7 @@ pub struct ProbeOutput {
     /// "bump your duration" vs. "your iface is quiet".
     pub saw_traffic: bool,
     /// Packet count lost to reserve-failures on the BPF side. Always
-    /// 0 in v0.1 — the reserve-failure path isn't counted separately
+    /// 0 in v0.1, the reserve-failure path isn't counted separately
     /// yet. Placeholder so adding a counter doesn't change the API.
     pub dropped_samples: u64,
 }
@@ -168,7 +168,7 @@ mod linux_impl {
     };
 
     /// Layout mirror of `ProbeCfg` in `bpf/src/main.rs`. Bytes-for-
-    /// bytes equal — if you change one, change the other. `u16` +
+    /// bytes equal, if you change one, change the other. `u16` +
     /// `[u8; 6]` packs to 8 bytes; `repr(C)` with all-bit-patterns-
     /// valid primitives makes `aya::Pod` safe to impl.
     #[repr(C)]
@@ -187,10 +187,10 @@ mod linux_impl {
     /// samples in arrival order.
     ///
     /// `offset` selects the byte offset at which the BPF program
-    /// samples each packet's head — normally `0` (real frame start).
+    /// samples each packet's head, normally `0` (real frame start).
     /// Non-zero values are for diagnosing drivers that point
     /// `xdp->data` into headroom (e.g. `128` on rvu-nicpf pre-v6.8,
-    /// see SPEC.md §11.1(c)). Clamped to [`MAX_OFFSET`] — past that,
+    /// see SPEC.md §11.1(c)). Clamped to [`MAX_OFFSET`], past that,
     /// the function rejects rather than silently truncate.
     ///
     /// Uses a short (~50ms) poll interval on the ringbuf fd so
@@ -213,7 +213,7 @@ mod linux_impl {
 
         let ifindex = if_nametoindex(iface)?;
 
-        // Heap-copy PROBE_BPF into an aligned `Vec<u8>` — passing the
+        // Heap-copy PROBE_BPF into an aligned `Vec<u8>`, passing the
         // raw `include_bytes!` static to `Ebpf::load` fails on
         // unaligned placements (v0.1.1 regression). The alignment
         // pattern mirrors `packetframe-fast-path::aligned_bpf_copy`.
@@ -246,7 +246,7 @@ mod linux_impl {
         }
 
         // Attach in the requested mode, with the same "auto" semantics
-        // that the fast-path module uses — try native, fall back to
+        // that the fast-path module uses, try native, fall back to
         // generic if the driver refuses the native attach. `Auto` is
         // the operator-friendly default; explicit `native` / `generic`
         // are for deliberate A/B testing of native vs skb delivery.
@@ -261,7 +261,7 @@ mod linux_impl {
 
             prog.load().map_err(|e| {
                 ProbeError::Other(format!(
-                    "verifier rejected probe program: {e} — this is a PacketFrame bug; file an issue"
+                    "verifier rejected probe program: {e}, this is a PacketFrame bug; file an issue"
                 ))
             })?;
 
@@ -270,7 +270,7 @@ mod linux_impl {
                     prog.attach_to_if_index(ifindex, XdpFlags::DRV_MODE)
                         .map_err(|e| {
                             ProbeError::Other(format!(
-                                "native XDP attach on {iface}: {e} — \
+                                "native XDP attach on {iface}: {e}, \
                                  driver may not support native XDP; try `--mode generic`"
                             ))
                         })?,
@@ -353,7 +353,7 @@ mod linux_impl {
         let mut any = false;
 
         loop {
-            // Drain whatever is already queued before we poll — keeps
+            // Drain whatever is already queued before we poll, keeps
             // us from sleeping with samples sitting in the ringbuf.
             while let Some(item) = ring.next() {
                 let bytes: &[u8] = &item;
@@ -414,7 +414,7 @@ mod linux_impl {
         if idx == 0 {
             let e = std::io::Error::last_os_error();
             return Err(ProbeError::Other(format!(
-                "if_nametoindex({name}): {e} — iface does not exist in current netns"
+                "if_nametoindex({name}): {e}, iface does not exist in current netns"
             )));
         }
         Ok(idx)
@@ -422,7 +422,7 @@ mod linux_impl {
 
     /// Render an error's full source chain into one string. aya's
     /// `EbpfError::ParseError` display drops the inner `object`
-    /// error — so a bare `{e}` emits only `"error parsing ELF data"`
+    /// error, so a bare `{e}` emits only `"error parsing ELF data"`
     /// with no indication whether the cause is alignment, a truncated
     /// header, a malformed section, etc. Walking `Error::source()`
     /// picks up what the outer formatter skipped.

@@ -15,7 +15,7 @@ use aya_ebpf::{
 /// Runtime flags poked by userspace via the `cfg` map. `version` is a
 /// reserved byte carved out now so future fields can be added without
 /// breaking userspace reads of older-layout BPF objects (SPEC §4.5 note:
-/// the `fp_cfg` struct has `...` — we enumerate exactly the fields
+/// the `fp_cfg` struct has `...`, we enumerate exactly the fields
 /// plus a version discriminator).
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -48,7 +48,7 @@ impl FpCfg {
     }
 }
 
-/// §4.6 counters. Discriminants are wire format — they are **append-only**
+/// §4.6 counters. Discriminants are wire format, they are **append-only**
 /// once v0.1 ships, since operator dashboards consume them by index. Do
 /// not renumber; add new counters to the end.
 #[repr(u32)]
@@ -76,7 +76,7 @@ pub enum StatIdx {
     /// `bpf_xdp_adjust_head` or `bpf_xdp_adjust_tail` failed while
     /// applying the `FP_CFG_FLAG_HEAD_SHIFT_128` workaround (SPEC
     /// §11.1(c)). Typically means the ingress frame is smaller than
-    /// the 128-byte shift — e.g. a 64-byte TCP ACK on a buggy-kernel
+    /// the 128-byte shift, e.g. a 64-byte TCP ACK on a buggy-kernel
     /// rvu-nicpf iface, which the workaround can't expose in full
     /// because the driver's `data_end` is 128 bytes short. The packet
     /// returns `XDP_PASS` unmodified; the counter tells operators how
@@ -125,11 +125,11 @@ pub enum StatIdx {
     /// the bogon-block is catching.
     BogonDropped = 32,
     /// v0.2.4: matched TCP SYN/SYN-ACK whose MSS option was rewritten
-    /// down to the configured clamp value (SPEC §4.x — closes §11.4
+    /// down to the configured clamp value (SPEC §4.x, closes §11.4
     /// gap). Bumped per packet, not per flow.
     MssClampApplied = 33,
     /// v0.2.4: matched TCP SYN/SYN-ACK that hit a clamp lookup but was
-    /// NOT rewritten — either the existing MSS option was already ≤ the
+    /// NOT rewritten, either the existing MSS option was already ≤ the
     /// clamp value (no-op), there was no MSS option in the SYN, or the
     /// TCP-options walk hit its bounded cap before finding one. Useful
     /// to gauge how often clamps are firing vs being skipped on existing
@@ -139,10 +139,10 @@ pub enum StatIdx {
     /// returned an error (slot empty / invalid). Should be 0 in steady
     /// state; non-zero means `populate_mutation_progs` failed at attach
     /// time. fast_path falls back to XDP_PASS so traffic still flows
-    /// (kernel slow path) — the chain is fail-safe.
+    /// (kernel slow path), the chain is fail-safe.
     ErrTailCall = 35,
     /// v0.2.5: finalize couldn't read the per-CPU `MUTATION_CTX`
-    /// scratch slot. Shouldn't happen — fast_path always writes before
+    /// scratch slot. Shouldn't happen, fast_path always writes before
     /// tail_call. Diagnostic; finalize XDP_PASSes on this error.
     ErrMutationCtx = 36,
 }
@@ -187,14 +187,14 @@ const REDIRECT_DEVMAP_MAX_ENTRIES: u32 = 64;
 const LOG_RINGBUF_BYTES: u32 = 256 * 1024;
 
 /// Max VLAN-subif entries. The reference EFG's agg-switch trunk carries
-/// VIDs 1/66/88/99/1337 + 3996..4040 — ~50. 256 is headroom.
+/// VIDs 1/66/88/99/1337 + 3996..4040, ~50. 256 is headroom.
 const VLAN_RESOLVE_MAX_ENTRIES: u32 = 256;
 
 /// Max prefixes per mss-clamp LPM trie. Sized like the allowlist; each
 /// `mss-clamp <cidr> [via <iface>] <mtu>` directive becomes one entry.
 const MSS_CLAMP_PREFIX_MAX_ENTRIES: u32 = 1024;
 
-/// Max per-egress mss-clamp entries. Sized like the redirect devmap —
+/// Max per-egress mss-clamp entries. Sized like the redirect devmap
 /// one entry per attached egress iface that has a `mss-clamp via X N`
 /// rule. 64 is comfortable for any non-container deployment.
 const MSS_CLAMP_IFACE_MAX_ENTRIES: u32 = 64;
@@ -203,13 +203,13 @@ const MSS_CLAMP_IFACE_MAX_ENTRIES: u32 = 64;
 //
 // Sized to accommodate the full IPv4 + IPv6 BGP tables plus headroom.
 // Kernel allocates at load time regardless of whether `forwarding-mode
-// custom-fib` is selected — the maps live in the same ELF. Approximate
+// custom-fib` is selected, the maps live in the same ELF. Approximate
 // memory cost at defaults: ~50-80 MB v4 + ~40-50 MB v6 + small NH + ECMP.
 // Changing `max_entries` requires an ELF rebuild (aya/kernel limitation);
 // config-level `fib-v4-max-entries` directives are accepted but documented
 // as "rebuild required" in Phase 1.
 //
-// Phase 1 keeps these empty — the BPF program never reads them while
+// Phase 1 keeps these empty, the BPF program never reads them while
 // `FP_CFG_FLAG_CUSTOM_FIB` is clear, so the allocation is all the load
 // cost. Phase 3's FibProgrammer populates them.
 
@@ -248,7 +248,7 @@ pub struct VlanResolve {
 /// explicit padding so userspace layout matches byte-for-byte.
 ///
 /// Why a struct rather than a bare u16: lets a single LPM lookup
-/// answer both "prefix only" and "prefix + via iface" queries — the
+/// answer both "prefix only" and "prefix + via iface" queries, the
 /// XDP path checks `iface_filter == 0 || iface_filter == egress_ifindex`
 /// without needing two separate tries. Userspace splats one entry per
 /// `mss-clamp <cidr> [via <iface>] <mtu>` directive.
@@ -302,7 +302,7 @@ pub struct MutationCtx {
     /// Stored as `u32` (not `u8`) so the struct has no padding bytes.
     /// With padding, LLVM's "merge stores" optimization recognizes the
     /// 3 unwritten bytes between `is_v4: u8` and the end of the struct
-    /// as a zero-init block and lowers them into a `memset` libcall —
+    /// as a zero-init block and lowers them into a `memset` libcall
     /// emitted by the BPF backend as a separate bpf-to-bpf subprogram,
     /// which then trips the kernel verifier's
     ///   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
@@ -328,7 +328,7 @@ pub const FIB_KIND_ECMP: u8 = 1;
 
 /// Value stored in `FIB_V4` / `FIB_V6` LPM tries. Points at either
 /// a single nexthop (`NEXTHOPS[idx]`) or an ECMP group
-/// (`ECMP_GROUPS[idx]`). 8 bytes — single aligned write from
+/// (`ECMP_GROUPS[idx]`). 8 bytes, single aligned write from
 /// userspace is torn-read-free.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -389,7 +389,7 @@ pub struct NexthopEntry {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct EcmpGroup {
-    /// `3`, `4`, or `5` — the tuple width the XDP program hashes on
+    /// `3`, `4`, or `5`, the tuple width the XDP program hashes on
     /// for this group. 3 = (src IP, dst IP, proto); 4 = + one port;
     /// 5 = + src port + dst port. Non-TCP/UDP + ICMP + fragments
     /// fall back to 3 regardless.
@@ -446,7 +446,7 @@ pub static ALLOW_V6: LpmTrie<[u8; 16], u8> =
 
 /// v0.2.1 issue #33: IPv4 destination block list. Matched packets
 /// whose dst falls in this LPM trie return `XDP_DROP` (counter
-/// `BogonDropped` bumped). Empty by default — operator opts in by
+/// `BogonDropped` bumped). Empty by default, operator opts in by
 /// declaring `block-prefix <cidr>` lines in config. Sized the same
 /// as the allowlist; expected entries are a handful of bogon ranges
 /// (RFC 1918, CGNAT, test-net) so 1024 is generous.
@@ -475,7 +475,7 @@ pub static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(STATS_COUNT, 
 pub static LOG: RingBuf = RingBuf::with_byte_size(LOG_RINGBUF_BYTES, 0);
 
 /// Redirect target devmap (SPEC §4.5). Hash-keyed by ifindex so size
-/// doesn't scale with the host's highest ifindex — matters on container
+/// doesn't scale with the host's highest ifindex, matters on container
 /// hosts with sparse, high ifindex numbers.
 #[map]
 pub static REDIRECT_DEVMAP: DevMapHash =
@@ -524,7 +524,7 @@ pub static MUTATION_CTX: PerCpuArray<MutationCtx> = PerCpuArray::with_max_entrie
 
 /// Per-CPU scratch buffer for `bpf_fib_lookup` calls. Per-CPU array
 /// elements are pre-zeroed at map creation by the kernel and remain
-/// accessible at a stable address — fast_path writes the input fields
+/// accessible at a stable address, fast_path writes the input fields
 /// (family, l4_protocol, sport/dport, addrs, etc.), the kernel helper
 /// fills `smac`/`dmac` on success, and the value persists per-CPU
 /// between calls.
@@ -533,7 +533,7 @@ pub static MUTATION_CTX: PerCpuArray<MutationCtx> = PerCpuArray::with_max_entrie
 /// triggers LLVM's "merge stores" optimization on the unwritten union
 /// trailing bytes (`__bindgen_anon_3.ipv6_src[1..4]` in the IPv4 path,
 /// `__bindgen_anon_5.tbid`, etc.), which then lowers into a `memset`
-/// libcall — emitted by the BPF backend as a separate bpf-to-bpf
+/// libcall, emitted by the BPF backend as a separate bpf-to-bpf
 /// subprogram. Combined with `bpf_tail_call`, that violates the kernel
 /// verifier's
 ///   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
@@ -549,7 +549,7 @@ pub static FIB_LOOKUP_SCRATCH: PerCpuArray<bpf_fib_lookup> =
 /// Tail-call jump table (v0.2.5+). fast_path tail_calls into slot 0 after
 /// classification + L2/TTL mutations. Slot 0 holds `finalize` today.
 /// Sized for 8 future stages (chained finalizers, alternate clamp
-/// strategies, future packet transforms) — slot count is BPF-load-time-
+/// strategies, future packet transforms), slot count is BPF-load-time-
 /// fixed, so headroom here is cheap.
 ///
 /// Tail-call into an empty slot returns an error to the caller; fast_path
@@ -596,7 +596,7 @@ pub static FIB_CONFIG: Array<FpFibCfg> = Array::with_max_entries(1, 0);
 
 // --- Stat increment helper ---------------------------------------------
 
-/// Bump the per-CPU counter at `idx` by 1. Safe on the hot path — the
+/// Bump the per-CPU counter at `idx` by 1. Safe on the hot path, the
 /// verifier tolerates the single get_ptr_mut + deref, and on miss we
 /// simply skip the increment (a map hit is guaranteed iff `idx <
 /// STATS_COUNT`, which we enforce via the [`StatIdx`] enum).

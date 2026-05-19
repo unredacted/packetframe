@@ -1,6 +1,6 @@
 //! Build the probe BPF crate at `./bpf/` and stage its ELF for
 //! `include_bytes!` in the userspace crate. Mirror of the fast-path
-//! module's build.rs — when one is updated, the other likely needs the
+//! module's build.rs, when one is updated, the other likely needs the
 //! same change. Separate file (not a shared helper) because the
 //! `PROBE_BPF_OBJ` / `PACKETFRAME_PROBE_BPF_OBJ_PATH` env var names
 //! differ per crate and there's not enough other logic to factor out.
@@ -40,7 +40,7 @@ fn main() {
         );
     }
 
-    // Pre-built ELF override — release workflow staging. See fast-path
+    // Pre-built ELF override, release workflow staging. See fast-path
     // build.rs for the full rationale.
     if let Some(path) = bpf_obj_override {
         let src = PathBuf::from(&path);
@@ -139,7 +139,7 @@ fn main() {
         Ok(out) => {
             forward_output(&[], &out.stderr);
             let msg = format!(
-                "probe BPF build failed (exit {}) — see cargo:warning lines above for the real error, or run `(cd crates/modules/probe/bpf && cargo build --release)` directly",
+                "probe BPF build failed (exit {}), see cargo:warning lines above for the real error, or run `(cd crates/modules/probe/bpf && cargo build --release)` directly",
                 out.status.code().unwrap_or(-1)
             );
             fail_or_stub(&obj_out, bpf_required, &msg);
@@ -177,7 +177,7 @@ fn find_artifact(stdout: &[u8]) -> Option<PathBuf> {
 fn fail_or_stub(obj_out: &std::path::Path, required: bool, msg: &str) {
     if required {
         panic!(
-            "PACKETFRAME_BPF_REQUIRED is set but {msg}. Refusing to stub the ELF — that would make every BPF-dependent test a silent no-op."
+            "PACKETFRAME_BPF_REQUIRED is set but {msg}. Refusing to stub the ELF, that would make every BPF-dependent test a silent no-op."
         );
     }
     println!(
