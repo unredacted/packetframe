@@ -11,7 +11,7 @@ combined stack size of 3 calls is 544. Too large
 stack depth 0+480+0+0
 ```
 
-UniFi's BPF patches plus the aarch64 JIT account stack ~120 bytes higher than vanilla 5.15 on x86_64 — same bytecode, different verifier accounting.
+UniFi's BPF patches plus the aarch64 JIT account stack ~120 bytes higher than vanilla 5.15 on x86_64: same bytecode, different verifier accounting.
 
 Tail-calling into a second program gives that program its own fresh 512-byte stack. Beyond fixing the immediate budget issue, it establishes the pattern for future fast-path stages without re-bisecting stack bytes every time.
 
@@ -47,7 +47,7 @@ This is **not** the multi-module dispatcher (SPEC §3.4 / §5.0). The dispatcher
                       egress NIC TX
 ```
 
-The packet itself is preserved across the tail-call — `bpf_tail_call` doesn't touch `xdp_buff`, so any in-place mutations from fast_path (TTL, L2, etc.) carry over. What does NOT carry are the program's local variables, which is why we need a side channel.
+The packet itself is preserved across the tail-call. `bpf_tail_call` doesn't touch `xdp_buff`, so any in-place mutations from fast_path (TTL, L2, etc.) carry over. What does NOT carry are the program's local variables, which is why we need a side channel.
 
 ## MUTATION_CTX wire format
 
@@ -71,7 +71,7 @@ pub struct MutationCtx {
 
 `MUTATION_PROGS` is a `ProgramArray` sized for 8 slots. Slot 0 holds `finalize`'s file descriptor. Slots 1–7 are reserved for future stages (see "Adding new stages" below).
 
-Userspace populates slot 0 at attach time, in `crates/modules/fast-path/src/linux_impl.rs::populate_mutation_progs`. Order is: load `finalize` → populate slot 0 → load + attach `fast_path` to ifaces. If the order is wrong, fast_path's first packet hits an empty slot, `bpf_tail_call` returns an error, and fast_path falls through to `XDP_PASS` (kernel slow-path) while bumping `ErrTailCall`.
+Userspace populates slot 0 at attach time, in `crates/modules/fast-path/src/linux_impl.rs::populate_mutation_progs`. Order is: load `finalize`, populate slot 0, load + attach `fast_path` to ifaces. If the order is wrong, fast_path's first packet hits an empty slot, `bpf_tail_call` returns an error, and fast_path falls through to `XDP_PASS` (kernel slow-path) while bumping `ErrTailCall`.
 
 ## Diagnostic commands
 
@@ -87,7 +87,7 @@ sudo bpftool map dump name MUTATION_PROGS
 # packetframe status reports the same:
 sudo packetframe status
 # tail-call chain (from /sys/fs/bpf/packetframe):
-#   MUTATION_PROGS[0]: populated (finalize) — confirm prog_id via ...
+#   MUTATION_PROGS[0]: populated (finalize); confirm prog_id via ...
 
 # Watch the diagnostic counters:
 sudo packetframe status | grep -E 'err_tail_call|err_mutation_ctx'
@@ -103,10 +103,10 @@ sudo bpftool map dump name MUTATION_CTX
 
 Two new diagnostic counters at indices 35 and 36:
 
-- `err_tail_call`: fast_path called `MUTATION_PROGS.tail_call(ctx, 0)` and got an error back. Almost always means slot 0 is empty (attach-order bug). fast_path falls through to `XDP_PASS` so traffic still flows via kernel slow-path.
+- `err_tail_call`: fast_path called `MUTATION_PROGS.tail_call(ctx, 0)` and got an error back. Almost always means slot 0 is empty (attach-order bug). fast_path falls through to `XDP_PASS`, so traffic still flows via kernel slow-path.
 - `err_mutation_ctx`: finalize couldn't read `MUTATION_CTX[0]`. Per-CPU array index 0 is always present, so this should be 0; non-zero indicates a kernel/aya bug worth filing.
 
-Both are append-only per CLAUDE.md guardrail — operator dashboards keying on counter index keep working.
+Both are append-only per CLAUDE.md guardrail. Operator dashboards keying on counter index keep working.
 
 ## Pin lifecycle
 
@@ -144,6 +144,6 @@ In both patterns, all stages share the same `MUTATION_CTX` and `STATS` maps (one
 
 ## See also
 
-- [docs/runbooks/mss-clamp.md](mss-clamp.md) — operator guide for the mss-clamp directive (which now lives inside `finalize`)
-- [docs/runbooks/reconfigure.md](reconfigure.md) — SIGHUP / `packetframe reconfigure` semantics; both maps update through the same reconcile path regardless of which program reads them
+- [docs/runbooks/mss-clamp.md](mss-clamp.md): operator guide for the mss-clamp directive (which now lives inside `finalize`)
+- [docs/runbooks/reconfigure.md](reconfigure.md): SIGHUP / `packetframe reconfigure` semantics; both maps update through the same reconcile path regardless of which program reads them
 - SPEC.md §3.2 (priority taxonomy), §3.4 (multi-program composition), §4.x (BPF map layouts), §11.x (kernel compatibility notes)
