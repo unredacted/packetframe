@@ -16,7 +16,7 @@ Operator guide for `mss-clamp` directives in `module fast-path`. Closes the [SPE
 Add `mss-clamp` directives if any of these are true on your edge:
 
 - A downstream peer's path MTU is less than the local link MTU (typical: PPPoE, GRE, IPsec, WireGuard, MPLS overlays). Without clamping, large segments arrive at the bottleneck, get fragmented or PMTUD-discovered-then-dropped, and TCP throughput collapses.
-- You currently rely on `iptables -A FORWARD ... TCPMSS --set-mss <N>` rules and one or more of the `-s` / `-d` prefixes overlaps an `allow-prefix`. Those iptables rules do not fire for fast-pathed traffic — adding a matching `mss-clamp` directive moves the mutation into XDP.
+- You currently rely on `iptables -A FORWARD ... TCPMSS --set-mss <N>` rules and one or more of the `-s` / `-d` prefixes overlaps an `allow-prefix`. Those iptables rules do not fire for fast-pathed traffic. Adding a matching `mss-clamp` directive moves the mutation into XDP.
 - You deploy onto a host where you don't control upstream MTU but want to defend against MTU-blackhole-induced TCP stalls.
 
 If none of those apply, you don't need this. PacketFrame doesn't insert any clamp by default.
@@ -42,25 +42,25 @@ mss-clamp 23.191.201.0/24 1360                # customer 23.191.201.0/24, any eg
 
 Prefix matches **src OR dst** (same semantic as `allow-prefix`), so one rule covers both directions of a flow.
 
-CIDR ranges work for both IPv4 and IPv6 — the parser dispatches on the address family. `mss-clamp 2001:db8::/48 1280` is valid.
+CIDR ranges work for both IPv4 and IPv6; the parser dispatches on the address family. `mss-clamp 2001:db8::/48 1280` is valid.
 
-`<mtu>` is the clamp ceiling in bytes. Range: 88–65495. The clamp is **lower-if-higher** — if the SYN's existing MSS is already ≤ the configured value, the packet is left untouched and `mss_clamp_skipped` is bumped instead of `mss_clamp_applied`.
+`<mtu>` is the clamp ceiling in bytes. Range: 88–65495. The clamp is **lower-if-higher**: if the SYN's existing MSS is already ≤ the configured value, the packet is left untouched and `mss_clamp_skipped` is bumped instead of `mss_clamp_applied`.
 
 ## What gets clamped
 
 - Only **matched** traffic (i.e. `allow-prefix` / `allow-prefix6` already hit). Non-matched traffic flows through the kernel where existing iptables `TCPMSS` rules still fire normally.
 - Only **TCP SYN and SYN-ACK** packets. Established-connection packets don't carry an MSS option, so there's nothing to mutate.
-- Both directions: a SYN egressing eth2 from a clamped prefix, AND the responder's SYN-ACK egressing back into the customer LAN. TCP's per-direction MSS is independent — clamping both ensures both endpoints respect the constraint.
+- Both directions: a SYN egressing eth2 from a clamped prefix, AND the responder's SYN-ACK egressing back into the customer LAN. TCP's per-direction MSS is independent; clamping both ensures both endpoints respect the constraint.
 - Only when a clamp value > 0 applies. A packet whose lookup returns no policy is forwarded with no counter activity.
 
-What is **not** touched: the original packet's TCP timestamp, SACK, window-scale, or any other option. Only the MSS option's 2 bytes change. Checksum is recomputed via RFC 1624 incremental update — no full TCP-segment re-fold.
+What is **not** touched: the original packet's TCP timestamp, SACK, window-scale, or any other option. Only the MSS option's 2 bytes change. Checksum is recomputed via RFC 1624 incremental update, with no full TCP-segment re-fold.
 
 ## Troubleshooting
 
 The two relevant counters (SPEC §4.6 indices 33–34, exposed via `packetframe status` and the metrics textfile):
 
-- `mss_clamp_applied` — packets where the MSS option was rewritten. Climbs with new TCP sessions on clamped prefixes; flat means either no SYNs are arriving on those prefixes or your existing SYNs already announce ≤ clamp.
-- `mss_clamp_skipped` — packets matched + with a clamp policy active, but no rewrite. Common reasons:
+- `mss_clamp_applied`: packets where the MSS option was rewritten. Climbs with new TCP sessions on clamped prefixes; flat means either no SYNs are arriving on those prefixes or your existing SYNs already announce ≤ clamp.
+- `mss_clamp_skipped`: packets matched + with a clamp policy active, but no rewrite. Common reasons:
   - Existing MSS already ≤ clamp value (working as intended; you can ignore unless you expect *every* SYN to need adjustment).
   - SYN had no MSS option (rare; some old/embedded stacks).
   - Malformed TCP options block (very rare; would also break the kernel's processing).
@@ -84,11 +84,11 @@ If `mss_clamp_applied` is climbing but downstream still shows MTU-blackhole symp
 
 ## Why no `from <iface>` (ingress) form?
 
-PacketFrame's XDP runs at ingress on attached physical NICs. The directional concept that matters operationally is "what egress will this fast-pathed packet take" — resolved by `bpf_fib_lookup` before redirect. `via <iface>` always means **egress**, matching the `local-prefix via X` and `fallback-default via X` grammar.
+PacketFrame's XDP runs at ingress on attached physical NICs. The directional concept that matters operationally is "what egress will this fast-pathed packet take", resolved by `bpf_fib_lookup` before redirect. `via <iface>` always means **egress**, matching the `local-prefix via X` and `fallback-default via X` grammar.
 
-For the cases where iptables operators reach for `-i <iface>` (e.g. "clamp packets coming in on this tunnel"), the realistic need is "clamp this customer's traffic" — better expressed via prefix scoping. Prefix scoping is route-stable; ingress-iface scoping depends on which physical bridge member happened to receive the packet.
+For the cases where iptables operators reach for `-i <iface>` (e.g. "clamp packets coming in on this tunnel"), the realistic need is "clamp this customer's traffic", better expressed via prefix scoping. Prefix scoping is route-stable; ingress-iface scoping depends on which physical bridge member happened to receive the packet.
 
-If a future use case needs strict ingress scoping, the grammar is append-only — adding `from <iface>` later is straightforward.
+If a future use case needs strict ingress scoping, the grammar is append-only. Adding `from <iface>` later is straightforward.
 
 ## Hot-reload semantics
 
@@ -99,6 +99,6 @@ Changes to `mss-clamp` directives are applied via SIGHUP without re-attaching XD
 sudo packetframe reconfigure       # or `systemctl reload packetframe`
 ```
 
-The reconcile path performs delta updates against the LPM tries (`MSS_CLAMP_V4`, `MSS_CLAMP_V6`) and the per-iface table — adds, removes, and value updates all happen in place. The global `mss-clamp <mtu>` form lives in the `CFG` array and is updated atomically.
+The reconcile path performs delta updates against the LPM tries (`MSS_CLAMP_V4`, `MSS_CLAMP_V6`) and the per-iface table: adds, removes, and value updates all happen in place. The global `mss-clamp <mtu>` form lives in the `CFG` array and is updated atomically.
 
 A bad config (e.g. value out of range, malformed CIDR) is rejected at parse time; the CLI exits non-zero with the parse error, the running daemon keeps the old policy in effect.

@@ -44,7 +44,7 @@ how to roll back to the kernel-FIB path if something goes wrong.
   with bird's chosen nexthop. Translated to
   `RouteEvent::Add`/`Del`. **BmpStation** is also available behind
   the `RouteSource` trait but bird's BMP doesn't ship RFC 9069
-  Loc-RIB — see the section "When to use `route-source bmp`
+  Loc-RIB. See the section "When to use `route-source bmp`
   instead" near the bottom.
 - **FibProgrammer** owns the BPF map write path. Allocates `NexthopId`s
   and `EcmpGroupId`s with refcount + free-list dedup.
@@ -65,7 +65,7 @@ Indicators that the custom-FIB path is working:
 - `custom_fib_hit` counter climbs; `custom_fib_miss` is low relative
   to it (misses indicate prefixes that arrived in XDP before bird
   announced them, or prefixes in the allowlist that bird doesn't cover).
-- `fwd_ok` climbs (the shared success counter — custom and kernel FIB
+- `fwd_ok` climbs (the shared success counter; custom and kernel FIB
   both increment it on redirect).
 - `pass_no_neigh` stays below ~0.01% of matched traffic after the
   first few seconds (first-packet ARP is expected; sustained-high
@@ -91,9 +91,9 @@ sudo packetframe status --config /etc/packetframe/packetframe.conf
 
 Look at:
 
-- `custom-FIB status:` block — `forwarding-mode`, nexthop resolution
+- `custom-FIB status:` block: `forwarding-mode`, nexthop resolution
   counts, ECMP group count.
-- counter block — especially the `custom_fib_*` family.
+- counter block, especially the `custom_fib_*` family.
 
 ### Is the route-source session live?
 
@@ -158,8 +158,8 @@ post-first-update quiescence) or the next Resync.
 
 ### Inspecting the FIB programmatically
 
-The `packetframe fib` subcommand opens the pinned BPF maps directly
-— no daemon IPC. Works as long as the pins exist (i.e., after
+The `packetframe fib` subcommand opens the pinned BPF maps directly.
+No daemon IPC. Works as long as the pins exist (i.e., after
 `systemctl stop packetframe` but before `detach --all`).
 
 ```sh
@@ -169,7 +169,7 @@ sudo packetframe fib lookup 8.8.8.8
 # Walk the whole FIB (O(N); slow on a 1M-route table).
 sudo packetframe fib dump-v4
 
-# Occupancy / mode / hash block only — scriptable.
+# Occupancy / mode / hash block only (scriptable).
 sudo packetframe fib stats
 ```
 
@@ -177,13 +177,13 @@ sudo packetframe fib stats
 
 Alongside the existing counter family, the textfile exporter emits:
 
-- `packetframe_fib_forwarding_mode{mode="kernel-fib|custom-fib|compare"}`
-  — one-hot gauge; alert on unexpected transitions.
-- `packetframe_nexthops{state="resolved|failed|stale|unwritten_or_incomplete"}`
-  — NEXTHOPS state bucket counts.
-- `packetframe_nexthops_max` — configured NEXTHOPS capacity.
+- `packetframe_fib_forwarding_mode{mode="kernel-fib|custom-fib|compare"}`:
+  one-hot gauge; alert on unexpected transitions.
+- `packetframe_nexthops{state="resolved|failed|stale|unwritten_or_incomplete"}`:
+  NEXTHOPS state bucket counts.
+- `packetframe_nexthops_max`: configured NEXTHOPS capacity.
 - `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`.
-- `packetframe_fib_default_hash_mode` — 3/4/5-tuple.
+- `packetframe_fib_default_hash_mode`: 3/4/5-tuple.
 
 Example alerts:
 
@@ -228,13 +228,13 @@ bird outages.
 Bird's iBGP feed gives us the connected /24 (e.g. `23.191.200.0/24`
 on `br1337`) with a self-referential BGP NEXT_HOP (the device's local
 IP). The neighbour resolver can't map that to a useful destination
-MAC — it's our own IP. Without the connected fast-path, the LPM
+MAC: it's our own IP. Without the connected fast-path, the LPM
 lookup hits the /24 with `state=Incomplete` and returns
 `custom_fib_no_neigh` (or, pre-v0.2.1, `custom_fib_miss` because the
 listener silently dropped the announce). Either way, the packet
-falls through XDP_PASS to kernel slow-path — through netfilter,
+falls through XDP_PASS to kernel slow-path: through netfilter,
 conntrack, the FIB walk, and finally out the bridge. That's exactly
-the load fast-path was built to remove.
+the load fast-path exists to remove.
 
 The connected fast-path inverts this: NetlinkNeighborResolver walks
 the kernel ARP table for hosts within an operator-declared CIDR
@@ -269,7 +269,7 @@ hosting the prefix. Validate at startup the same way `attach`
 directives validate (must exist under `/sys/class/net`); a missing
 iface is a startup-fatal error.
 
-The directive set is additive — declare as many as you have
+The directive set is additive. Declare as many as you have
 connected destinations to fast-path. Each adds one hashmap-walk
 of the kernel's neighbour table at startup and one match per
 multicast neighbour event. Match cost is O(N) over the local-prefix
@@ -287,7 +287,7 @@ sudo packetframe fib dump-v4 | grep -E '^10\.88\.1\.[0-9]+/32'   | head
 # host's actual MAC and the iface's ifindex.
 sudo packetframe fib lookup 23.191.200.10
 
-# 3. Watch the resolver stats — `local_arp_routes_added` climbs as
+# 3. Watch the resolver stats. `local_arp_routes_added` climbs as
 # the kernel ARPs new hosts; `_removed` climbs on RTM_DELNEIGH
 # (typical aging churn).
 journalctl -u packetframe -f | grep 'neighbour resolver stats'
@@ -321,23 +321,23 @@ the directive on that prefix and accept the slow-path fallback.
   FIB does nothing if the parent prefix isn't matched. Add the
   customer /24 to `allow-prefix` first.
 - **Tunnels and weirdness.** Don't declare local-prefix on a tunnel
-  iface (WireGuard, GRE, IPSec) — the BPF program can't redirect
+  iface (WireGuard, GRE, IPSec). The BPF program can't redirect
   to non-XDP-capable interfaces, so the /32 just sits unused.
   Stick to physical and bridge interfaces.
 
 ### Disabling
 
 Remove (or comment out) the `local-prefix` lines and restart
-packetframe. SIGHUP doesn't reconcile this directive in v0.2.1
-— a future version may add live add/remove via SIGHUP, but for
+packetframe. SIGHUP doesn't reconcile this directive in v0.2.1.
+A future version may add live add/remove via SIGHUP, but for
 now it's a startup-time-only configuration. The /32 entries get
 flushed on detach and don't reappear at next startup without the
 directive.
 
 ### `arp-scavenge` for quiet LANs (v0.2.1, issue #32)
 
-Some LANs — Ceph clusters, monitoring networks, anything where
-hosts only do intra-/24 L2 traffic — never appear in the kernel's
+Some LANs (Ceph clusters, monitoring networks, anything where
+hosts only do intra-/24 L2 traffic) never appear in the kernel's
 L3 ARP cache. Without entries to feed from, the per-/32 emission
 finds nothing.
 
@@ -353,7 +353,7 @@ multicast event lands the /32. Operator opt-in (default off) because
 it generates noticeable ARP traffic.
 
 **Safety guarantee (v0.2.2+).** ARP probes are issued ONLY on the
-operator-declared `via <iface>` — the resolver does NOT consult the
+operator-declared `via <iface>`. The resolver does NOT consult the
 kernel's routing table when picking the egress iface for the probe.
 This is a deliberate v0.2.2 safety fix: pre-v0.2.2 the code used
 kernel route lookup, which on a multi-VID bridge box (e.g. EFG's
@@ -366,10 +366,10 @@ that iface's L2 broadcast domain.
 **Critical: do NOT declare `arp-scavenge` on an IX-attached iface.**
 Even with the safety scoping, declaring `local-prefix <ix-subnet> via
 <ix-bridge> arp-scavenge` would still broadcast ARP into the IX
-fabric — which violates IX ToS (MANRS, anti-DoS) on most exchanges.
+fabric, which violates IX ToS (MANRS, anti-DoS) on most exchanges.
 `arp-scavenge` is for INTERNAL LANs only (storage, management,
 customer LAN). For IX peer subnets, rely on bird's natural ARP
-behavior — bird already maintains ARP for active BGP peers, so
+behavior: bird already maintains ARP for active BGP peers, so
 their /32s will land via the normal nexthop-resolution path.
 
 ### `fallback-default` synthetic /0 (v0.2.1, issue #31)
@@ -377,7 +377,7 @@ their /32s will land via the normal nexthop-resolution path.
 Custom-FIB only has prefixes bird's iBGP feed advertised. Destinations
 bird doesn't have specific routes for (RFC 1918, CGNAT, test-net,
 anything outside DFZ) miss LPM, fall to kernel slow path through
-netfilter / conntrack, and get dropped upstream anyway — wasting
+netfilter / conntrack, and get dropped upstream anyway, wasting
 kernel CPU + conntrack table capacity.
 
 ```
@@ -386,7 +386,7 @@ fallback-default via eth3 nexthop 194.110.60.50
 
 Injects a `0.0.0.0/0` into FIB_V4 at startup. Every more-specific
 bird-fed route still wins LPM; the /0 catches bogon-bound traffic.
-XDP redirects directly to upstream — same upstream rejection behavior,
+XDP redirects directly to upstream: same upstream rejection behavior,
 just no kernel / conntrack involvement. Measured ~25% reduction in
 steady-state conntrack pressure on a busy Tor exit relay.
 
@@ -407,12 +407,12 @@ fast-path), if dst is in any `block-prefix` the program returns
 `XDP_DROP` and bumps `bogon_dropped`. Saves skb allocation +
 netfilter walk + conntrack entry per dropped packet.
 
-dst-only match — we never block by src, because that would silently
+dst-only match: we never block by src, because that would silently
 drop reply traffic for asymmetric flows where the *peer* happens to
 be in a bogon range.
 
 Refuses to start if a `block-prefix` overlaps any `allow-prefix` or
-`local-prefix` (operator config bug — would silently drop traffic to
+`local-prefix` (operator config bug; would silently drop traffic to
 declared customer prefixes).
 
 ## Cutover and rollback
@@ -431,7 +431,7 @@ declared customer prefixes).
    fast-path` in `/etc/packetframe/packetframe.conf`.
 4. Confirm bird's `kernel.export: false` (or equivalent) so no BGP
    routes flow to the kernel FIB. Customer /32s, connected, static
-   default still flow via non-BGP mechanisms — udapi parses those
+   default still flow via non-BGP mechanisms; udapi parses those
    fine.
 
 **Cutover sequence:**
@@ -478,7 +478,7 @@ sudo sed -i '/^  forwarding-mode /d; /^  route-source bmp /d' \
 sudo systemctl start packetframe
 ```
 
-**Rollback re-exposes the original udapi bug** — BGP routes flow to
+**Rollback re-exposes the original udapi bug.** BGP routes flow to
 the kernel FIB again, udapi parses them, parse-error window opens up.
 Rollback is "restore service now," not a steady state. Follow it with
 same-day diagnosis and a forward-fix plan.
@@ -490,7 +490,7 @@ a feed of bird's selected best paths, and bird's kernel-protocol
 export needs to stay off so udapi never sees BGP routes.
 
 **Why iBGP and not BMP for the forwarding feed.** Bird (2.x and
-3.x master) does not ship RFC 9069 Loc-RIB BMP — only
+3.x master) does not ship RFC 9069 Loc-RIB BMP, only
 `monitoring rib in pre_policy / post_policy`, which deliver
 per-peer Adj-RIB-In streams. That's wrong for forwarding: a
 prefix announced by N peers becomes N RouteMonitoring frames
@@ -501,14 +501,14 @@ one UPDATE per prefix carrying bird's chosen path. See
 `crates/modules/fast-path/src/fib/route_source_bgp.rs` for the
 full design rationale.
 
-**Bird config — inject via pathvector's `global-config`.**
+**Bird config: inject via pathvector's `global-config`.**
 Pathvector ships `global-config` verbatim into the rendered bird
 config (no template fork needed). Add to `pathvector.yml`:
 
 ```yaml
 global-config: |
   # iBGP feed to packetframe's BgpListener. AS 401401 is our own
-  # AS — replace with yours. `passive` ensures bird only initiates;
+  # AS; replace with yours. `passive` ensures bird only initiates;
   # we listen on 1179 (NOT 179, to avoid clashing with anyone else
   # who happens to bind 179 on the loopback).
   protocol bgp packetframe {
@@ -576,7 +576,7 @@ syntax expressed against documentation placeholders; substitute
 your actual peer names and source addresses.
 
 ```
-# Upstream eBGP — keep alternate paths in the local RIB instead of
+# Upstream eBGP: keep alternate paths in the local RIB instead of
 # dropping non-best after best-path selection.
 protocol bgp UPSTREAM_A {
   ipv4 {
@@ -584,7 +584,7 @@ protocol bgp UPSTREAM_A {
   };
 }
 
-# iBGP channel to packetframe — transmit all paths with path_ids.
+# iBGP channel to packetframe: transmit all paths with path_ids.
 protocol bgp packetframe {
   ipv4 { add paths tx; };
   ipv6 { add paths tx; };
@@ -639,7 +639,7 @@ module fast-path
   route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 103.17.154.7
 ```
 
-`router-id` is optional — defaults to the listen-address (v4) or
+`router-id` is optional; defaults to the listen-address (v4) or
 the local AS (v6 listen).
 
 **Validate after pushing:**
@@ -679,7 +679,7 @@ Wants=bird.service
 ```ini
 [Unit]
 After=packetframe.service
-# Cheap guard against races at boot — wait up to 30 s for the BGP
+# Cheap guard against races at boot: wait up to 30 s for the BGP
 # listener to be reachable before dialing.
 [Service]
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ss -Htnl sport = :1179 | grep -q . && exit 0; sleep 1; done; exit 0'
@@ -698,7 +698,7 @@ The BMP route source is useful when:
 
 - Your routing daemon emits **RFC 9069 Loc-RIB BMP** (peer_type 3).
   FRR has this today; bird does not. Set `require-loc-rib` on the
-  `route-source bmp` line — the BmpStation will refuse any
+  `route-source bmp` line; the BmpStation will refuse any
   non-Loc-RIB frame and tear the session down with an error,
   preventing silent wrong-forwarding from pre/post-policy streams:
 
@@ -709,7 +709,7 @@ The BMP route source is useful when:
 - You want a **pure observability** feed (analytics, anomaly
   detection on per-peer Adj-RIB-In streams) running alongside
   the BGP forwarding feed. This isn't wired into the controller
-  yet — the current build accepts exactly one `route-source`
+  yet; the current build accepts exactly one `route-source`
   per fast-path module.
 
 ## Triage by symptom
@@ -722,12 +722,12 @@ writing), or the allowlist matches traffic bird doesn't cover.
 
 Check:
 
-- `packetframe status` — is `nexthops (resolved)` ≥ your expected
+- `packetframe status`: is `nexthops (resolved)` ≥ your expected
   peer count?
-- `journalctl -u packetframe | grep -iE 'bgp|bmp'` — any errors from
+- `journalctl -u packetframe | grep -iE 'bgp|bmp'`: any errors from
   the route-source handler?
-- `birdc show protocols packetframe` (or your BMP protocol name)
-  — is the session established and propagating routes?
+- `birdc show protocols packetframe` (or your BMP protocol name):
+  is the session established and propagating routes?
 
 ### Symptom: `pass_no_neigh` climbs sustainedly
 
@@ -737,8 +737,8 @@ packet; expected briefly), or the nexthop is genuinely unreachable.
 
 Check:
 
-- `ip neigh show <nexthop-ip>` — what state does the kernel report?
-- `packetframe status` — is `nexthops (failed)` > 0?
+- `ip neigh show <nexthop-ip>`: what state does the kernel report?
+- `packetframe status`: is `nexthops (failed)` > 0?
 - Proactive resolve is currently relying on first-packet kernel ARP
   (Phase 3.5+ adds proactive `RTM_NEWNEIGH NUD_NONE`). If
   `pass_no_neigh` only spikes for a few packets per new destination
@@ -752,8 +752,8 @@ maintenance windows; alarming during stable state.
 
 Check:
 
-- `birdc show protocols | grep -v Established` — what's down?
-- `journalctl | grep bird` — why?
+- `birdc show protocols | grep -v Established`: what's down?
+- `journalctl | grep bird`: why?
 
 ### Symptom: `nexthop_seq_retry` climbs
 
@@ -764,7 +764,7 @@ outside the programmer.
 
 Check:
 
-- `ip monitor neigh` in a separate terminal — is there a neighbor
+- `ip monitor neigh` in a separate terminal: is there a neighbor
   storm?
 - No process other than packetframe should be writing to
   `/sys/fs/bpf/packetframe/fast-path/maps/NEXTHOPS`.
@@ -772,23 +772,23 @@ Check:
 ### Symptom: route-source session stays up but routes stop flowing
 
 What it means: bird is connected and idle. No new BGP churn, no new
-routes. Usually benign — BGP in stable state just doesn't send much.
+routes. Usually benign; BGP in stable state just doesn't send much.
 
 Check:
 
 - `custom_fib_hit` still climbing (existing routes are still
   forwarding). If yes, this is fine.
-- If forwarding has stopped entirely, that's a different problem —
-  look at `fwd_ok`, `pass_not_in_devmap`, `drop_unreachable`.
+- If forwarding has stopped entirely, that's a different problem.
+  Look at `fwd_ok`, `pass_not_in_devmap`, `drop_unreachable`.
 
-### Symptom: Daemon won't start — "LPM trie create failed / ENOMEM"
+### Symptom: Daemon won't start, "LPM trie create failed / ENOMEM"
 
 What it means: kernel rejected a 2M-entry LPM trie allocation. Either
 `rlimit.memlock` is too low, or the kernel has per-map caps.
 
 Check:
 
-- `ulimit -l` — is it `unlimited`? If not, set it in
+- `ulimit -l`: is it `unlimited`? If not, set it in
   `/etc/systemd/system/packetframe.service.d/memlock.conf`:
   `[Service]\nLimitMEMLOCK=infinity`.
 - If `unlimited` and still failing: reduce `FIB_V4_MAX_ENTRIES` in
@@ -820,7 +820,7 @@ landed since the runbook was first written.
   and `packetframe_fib_default_hash_mode` on the usual 15 s cadence.
 - ✅ **Offline comparison harness** (Phase 3.8). `tests/fib_comparison.rs`
   drives a synthetic RIB through the programmer and asserts the LPM
-  lookups resolve correctly — runs in every qemu-verifier CI job.
+  lookups resolve correctly. Runs in every qemu-verifier CI job.
 - ✅ **Integrity check + BmpStalled alert** (Phase 3.8). When BMP is
   configured, the RouteController spawns a 5-minute periodic job
   that cross-checks `birdc show route count` against the mirror size
@@ -841,14 +841,14 @@ landed since the runbook was first written.
   BMP path is for Loc-RIB-emitting daemons (FRR; future bird).
 - ✅ **BgpListener direct-origin fallback + connected fast-path**
   (v0.2.1). Pre-v0.2.1 the BgpListener silently dropped iBGP UPDATEs
-  whose decoded NEXT_HOP was None — exactly what bird emits for
+  whose decoded NEXT_HOP was None: exactly what bird emits for
   `protocol direct` (and static-origin) routes when the BGP block has
   no `next hop self`. Connected /24s never landed in FIB_V4, so every
   inbound packet to a customer host bumped `custom_fib_miss` and fell
   through to slow path. v0.2.1 makes the listener fall back to its
   own listen address; the route lands with `state=Incomplete` so
   counters reflect reality. The `local-prefix <cidr> via <iface>`
-  directive turns those /24s into per-/32 fast-paths — see the
+  directive turns those /24s into per-/32 fast-paths. See the
   [Connected fast-path](#connected-fast-path-v021) section above.
 - ✅ **`fallback-default` synthetic /0** (v0.2.1, issue #31). Inject
   a catch-all default into the custom-FIB so bogon-bound traffic
