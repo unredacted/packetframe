@@ -12,7 +12,7 @@ how to roll back to the kernel-FIB path if something goes wrong.
 - [Connected fast-path (v0.2.1)](#connected-fast-path-v021)
 - [Cutover and rollback](#cutover-and-rollback)
 - [Triage by symptom](#triage-by-symptom)
-- [Known gaps](#known-gaps)
+- [Resolved items](#resolved-items)
 
 ## Architecture at a glance
 
@@ -794,44 +794,44 @@ Check:
 - If `unlimited` and still failing: reduce `FIB_V4_MAX_ENTRIES` in
   `crates/modules/fast-path/bpf/src/maps.rs`, rebuild.
 
-## Known gaps
+## Resolved items
 
-The following are known limitations. Listed here so you don't spend
-time debugging behaviors that are known-missing. Items marked ✅
-landed since the runbook was first written.
+This section tracks features that landed since the runbook was first
+written. They were originally listed as known gaps; the entries are
+retained as a changelog of what shipped and when.
 
-- ✅ **Proactive resolve** (Phase 3.6). `request_resolve(ip)` now
+- **Proactive resolve** (Phase 3.6). `request_resolve(ip)` now
   issues `RTM_NEWNEIGH NUD_NONE` after looking up the route to find
   the egress ifindex. Best-effort: if route lookup or neighbor add
   fails, first-packet kernel ARP remains the fallback.
-- ✅ **`src_mac` via RTM_GETLINK** (Phase 3.6). The NeighborResolver
+- **`src_mac` via RTM_GETLINK** (Phase 3.6). The NeighborResolver
   now caches `ifindex → MAC` from an RTM_GETLINK dump at startup and
   RTM_NEWLINK / RTM_DELLINK multicast events thereafter.
   `NEXTHOPS[id].src_mac` is the egress iface MAC, not zero.
-- ✅ **InitiationComplete quiescence timer** (Phase 3.5). Fires once
+- **InitiationComplete quiescence timer** (Phase 3.5). Fires once
   per BMP connection after 5 s of no RouteMonitoring frames.
-- ✅ **`packetframe fib` subcommands** (Phase 3.8). `dump-v4 / dump-v6
+- **`packetframe fib` subcommands** (Phase 3.8). `dump-v4 / dump-v6
   / lookup <ip> / stats` ship in the main binary. Opens the pinned
   maps directly; works without the daemon running.
-- ✅ **Custom-FIB Prometheus metrics** (Phase 3.8). The textfile
+- **Custom-FIB Prometheus metrics** (Phase 3.8). The textfile
   exporter now emits `packetframe_fib_forwarding_mode{mode="..."}`,
   `packetframe_nexthops{state="..."}`, `packetframe_nexthops_max`,
   `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`,
   and `packetframe_fib_default_hash_mode` on the usual 15 s cadence.
-- ✅ **Offline comparison harness** (Phase 3.8). `tests/fib_comparison.rs`
+- **Offline comparison harness** (Phase 3.8). `tests/fib_comparison.rs`
   drives a synthetic RIB through the programmer and asserts the LPM
   lookups resolve correctly. Runs in every qemu-verifier CI job.
-- ✅ **Integrity check + BmpStalled alert** (Phase 3.8). When BMP is
+- **Integrity check + BmpStalled alert** (Phase 3.8). When BMP is
   configured, the RouteController spawns a 5-minute periodic job
   that cross-checks `birdc show route count` against the mirror size
   and logs a warning on ≥1% drift. BmpStalled fires (warning log)
   when no ROUTE MONITORING in 5 min AND bird reports ≥1 Established
   peer AND process uptime > 10 min.
-- ✅ **Netns integration test + BMP integration test** (Phase 3.7).
+- **Netns integration test + BMP integration test** (Phase 3.7).
   `tests/neigh_resolver_netns.rs` + `tests/fib_programmer_integration.rs`
   cover the resolver and programmer paths end-to-end under sudo in
   CI's qemu-verifier jobs.
-- ✅ **BGP route source + BMP Loc-RIB safety mode** (Phase 3.9).
+- **BGP route source + BMP Loc-RIB safety mode** (Phase 3.9).
   `route-source bgp <addr>:<port> local-as <asn> peer-as <asn>`
   spawns an iBGP listener that receives bird's selected best paths;
   bird's `protocol bgp` export filter runs after best-path so we
@@ -839,7 +839,7 @@ landed since the runbook was first written.
   `require-loc-rib` which hard-rejects non-Loc-RIB frames. The
   iBGP feed is the recommended forwarding path for bird; the
   BMP path is for Loc-RIB-emitting daemons (FRR; future bird).
-- ✅ **BgpListener direct-origin fallback + connected fast-path**
+- **BgpListener direct-origin fallback + connected fast-path**
   (v0.2.1). Pre-v0.2.1 the BgpListener silently dropped iBGP UPDATEs
   whose decoded NEXT_HOP was None: exactly what bird emits for
   `protocol direct` (and static-origin) routes when the BGP block has
@@ -850,12 +850,12 @@ landed since the runbook was first written.
   counters reflect reality. The `local-prefix <cidr> via <iface>`
   directive turns those /24s into per-/32 fast-paths. See the
   [Connected fast-path](#connected-fast-path-v021) section above.
-- ✅ **`fallback-default` synthetic /0** (v0.2.1, issue #31). Inject
+- **`fallback-default` synthetic /0** (v0.2.1, issue #31). Inject
   a catch-all default into the custom-FIB so bogon-bound traffic
   XDP-redirects to upstream instead of slow-pathing.
-- ✅ **`arp-scavenge` for quiet LANs** (v0.2.1, issue #32). One-shot
+- **`arp-scavenge` for quiet LANs** (v0.2.1, issue #32). One-shot
   ARP sweep of declared local-prefix CIDRs at startup so storage
   networks (Ceph) get fast-path coverage even when their hosts don't
   voluntarily talk to the gateway.
-- ✅ **`block-prefix` XDP-time drop** (v0.2.1, issue #33). Bogon
+- **`block-prefix` XDP-time drop** (v0.2.1, issue #33). Bogon
   destinations dropped at XDP instead of forwarded-and-failed.
