@@ -534,15 +534,84 @@ global-config: |
 keeps BGP routes off the kernel FIB; no further kernel-filter
 changes needed.
 
-**ADD-PATH (RFC 7911) caveat.** PacketFrame advertises capability
-69 in its OPEN with Receive direction for IPv4 and IPv6 unicast.
-NLRI decoding for ADD-PATH is not yet wired through the listener
-and the FIB programmer does not yet aggregate multi-path
-advertisements into ECMP groups. Do not configure peer-side
-`add paths tx` on the iBGP channel until a release CHANGELOG
-announces RFC 7911 support end to end. Enabling `add paths tx`
-before that point causes path-id-prefixed UPDATEs to misdecode
-and the session to flap.
+### Multi-NH ECMP from BGP
+
+PacketFrame supports RFC 7911 ADD-PATH end to end. With ADD-PATH
+mutually negotiated on the iBGP session to packetframe, the BGP
+daemon transmits one UPDATE per kept path (typically the equal-cost
+multipath set from upstream eBGP), each NLRI prefixed with a 4-byte
+`path_id`. The FibProgrammer aggregates the resulting per-prefix
+advertisements into an ECMP group, dedup'd against any prior group
+with the same nexthop set.
+
+The session-level decode is all-or-nothing across IPv4 unicast and
+IPv6 unicast: if the peer advertises ADD-PATH for only one AFI, the
+listener falls back to non-ADD-PATH decoding for both. Symmetric
+negotiation is the common case in practice for the BGP daemons this
+runbook targets.
+
+**Peer-side configuration.** Two pieces are needed on the daemon
+that talks to packetframe: retain alternate paths in the local RIB
+so there is more than one to send, and enable transmit-side
+ADD-PATH on the channel to packetframe. The example below is bird
+syntax expressed against documentation placeholders; substitute
+your actual peer names and source addresses.
+
+```
+# Upstream eBGP — keep alternate paths in the local RIB instead of
+# dropping non-best after best-path selection.
+protocol bgp UPSTREAM_A {
+  ipv4 {
+    secondary on;
+  };
+}
+
+# iBGP channel to packetframe — transmit all paths with path_ids.
+protocol bgp packetframe {
+  ipv4 { add paths tx; };
+  ipv6 { add paths tx; };
+}
+```
+
+**Validate after enabling.** After reloading the BGP daemon:
+
+```sh
+# Negotiation success: the protocol status should report tx-send
+# (or equivalent) for ADD-PATH on the packetframe session.
+birdc show protocols all packetframe | grep -i 'add path'
+
+# ECMP groups populate as multi-path prefixes converge. Starts at
+# zero before ADD-PATH is enabled; rises when the peer begins
+# transmitting per-path UPDATEs.
+sudo packetframe fib stats | grep ecmp-groups
+
+# Spot-check a prefix that should have multiple paths.
+sudo packetframe fib lookup <addr>
+```
+
+**Triage: ADD-PATH negotiated but no ECMP groups appearing.** If
+`packetframe fib stats` keeps `ecmp-groups: active=0` after the
+peer's session is established with ADD-PATH:
+
+- Confirm the peer is actually retaining multi-path. Compare the
+  daemon's total route count against the post-best-path table size;
+  on bird this is `birdc show route count` versus
+  `birdc show route table master4 primary count`. If they match,
+  the daemon has no alternate paths to advertise.
+- Confirm `add paths tx` is set on the packetframe-facing channel.
+  If `add paths` was set only on the upstream eBGP channel, the
+  daemon retains alternates locally but does not transmit them to
+  packetframe.
+- Confirm capability negotiation succeeded. The listener logs an
+  `add_path_in_effect=true` field on the `received peer OPEN`
+  message when both AFIs negotiated; if it logs `false`, the peer
+  advertised an asymmetric capability or no capability at all.
+
+**Rollback.** Removing `add paths tx` from the iBGP channel returns
+to single-best-path semantics with no listener-side changes. The
+listener still advertises capability 69 in its OPEN but the
+absence of peer-side Send keeps `add_path_in_effect` false and
+NLRI decodes without `path_id`.
 
 **Packetframe config:**
 

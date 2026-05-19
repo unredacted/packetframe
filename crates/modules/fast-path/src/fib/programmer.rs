@@ -1104,8 +1104,8 @@ impl FibProgrammer {
         let new_fib_value = if nh_ids.len() == 1 {
             FibValue::single(nh_ids[0])
         } else {
-            // Mode 5 (5-tuple) — default from FIB_CONFIG. Per-group
-            // override is a future refinement.
+            // Mode 5 (5-tuple), the default from FIB_CONFIG.
+            // Per-group override is a future refinement.
             let hash_mode = 5;
             match self.alloc_ecmp_group(&nh_ids, hash_mode) {
                 Ok(id) => FibValue::ecmp(id),

@@ -10,10 +10,16 @@
 //! N different nexthops, leaving the FibProgrammer to either
 //! re-implement bird's best-path selection (drift risk forever) or
 //! pick wrong. iBGP, by contrast, has bird's `protocol bgp` export
-//! filter run after best-path selection — we receive exactly one
-//! UPDATE per prefix, with the path bird picked. See
+//! filter run after best-path selection. Without ADD-PATH the export
+//! emits exactly one UPDATE per prefix with the path bird picked;
+//! with ADD-PATH negotiated, the export emits one UPDATE per path
+//! bird kept (typically equal-cost multipath), each tagged with a
+//! distinct `path_id` per RFC 7911 §3, and the FibProgrammer
+//! aggregates them into an ECMP group on the prefix. See
 //! `docs/runbooks/custom-fib.md` "Phase 4 bird config" for the
-//! `protocol bgp packetframe { ... }` snippet.
+//! `protocol bgp packetframe { ... }` snippet and the
+//! "Multi-NH ECMP from BGP" section for the ADD-PATH enablement
+//! steps.
 //!
 //! **Direction.** This is a *passive* BGP speaker: packetframe
 //! listens, bird connects out (configurable via bird's
@@ -25,7 +31,17 @@
 //!   IPv6 unicast — without this bird only sends v4 routes over
 //!   the session.
 //! - Four-octet ASN (RFC 6793) — required for any modern AS
-//!   numbering, ours is 401401 which is > 65535.
+//!   numbering when the local AS is greater than 65535.
+//! - ADD-PATH (RFC 7911) with Receive direction (Send/Receive
+//!   value 1) for both IPv4 unicast and IPv6 unicast. Peer-side
+//!   capability negotiation is decoded by
+//!   [`walk_open_capabilities`]; mutual negotiation flips the
+//!   per-message `add_path` flag in [`parse_bgp_message`] for the
+//!   session. ADD-PATH is treated all-or-nothing across the two
+//!   AFIs because `bgpkit_parser::parse_bgp_message` takes one
+//!   per-message `add_path: bool` rather than a per-AFI flag; an
+//!   asymmetric advertisement falls back to non-ADD-PATH decoding
+//!   for both AFIs.
 //! - Route Refresh is **not** advertised. We never originate routes,
 //!   so bird has nothing to ask us to refresh.
 //!
