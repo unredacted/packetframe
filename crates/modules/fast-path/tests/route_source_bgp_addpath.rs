@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use aya::maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
-use packetframe_common::fib::IpPrefix;
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::programmer::FibProgrammer;
 use packetframe_fast_path::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
