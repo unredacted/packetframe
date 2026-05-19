@@ -279,17 +279,48 @@ async fn run_birdc_protocols(birdc: &std::path::Path) -> Result<usize, String> {
     parse_established_peers(&output)
 }
 
+/// Cap on bytes read from birdc's stdout and stderr. The May 2026
+/// audit Slice 4 finding: `Command::output()` reads stdout into
+/// memory uncapped, so a misbehaving or compromised `birdc` could
+/// emit gigabytes inside the 10s timeout and consume daemon memory.
+/// 1 MiB is two orders of magnitude above legitimate output (`birdc
+/// show route count` is ~100 bytes; `birdc show protocols` on a
+/// 2K-peer router is single-digit KB).
+const BIRDC_OUTPUT_CAP: usize = 1024 * 1024;
+
 async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let birdc = birdc.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    // Stringify the args before the blocking task takes ownership; we
-    // still want to name them in the timeout-error message.
     let args_display = format!("{args:?}");
-    let join = tokio::task::spawn_blocking(move || {
-        Command::new(&birdc)
+    let join = tokio::task::spawn_blocking(move || -> Result<BirdcOutput, String> {
+        // `Read` is in scope inside `read_capped` via its `R: Read`
+        // bound — no need to pull it in here.
+        use std::process::Stdio;
+        let mut child = Command::new(&birdc)
             .args(&args)
-            .output()
-            .map_err(|e| format!("spawn {}: {e}", birdc.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn {}: {e}", birdc.display()))?;
+        // SAFETY: `stdout`/`stderr` are Some because we configured
+        // both as `Stdio::piped()` above. Unwrap-on-piped is the
+        // standard pattern; the `.take()` removes them from the
+        // child so `wait()` doesn't block on us.
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let mut stdout_buf = Vec::with_capacity(4096);
+        let mut stderr_buf = Vec::with_capacity(1024);
+        let stdout_truncated = read_capped(&mut stdout, &mut stdout_buf, BIRDC_OUTPUT_CAP)
+            .map_err(|e| format!("read birdc stdout: {e}"))?;
+        let _ = read_capped(&mut stderr, &mut stderr_buf, BIRDC_OUTPUT_CAP);
+        let status = child.wait().map_err(|e| format!("birdc wait: {e}"))?;
+        Ok(BirdcOutput {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+            stdout_truncated,
+        })
     });
     let result = tokio::time::timeout(BIRDC_TIMEOUT, join)
         .await
@@ -302,7 +333,50 @@ async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, Str
             String::from_utf8_lossy(&result.stderr)
         ));
     }
+    if result.stdout_truncated {
+        return Err(format!(
+            "birdc {args_display} stdout exceeded {BIRDC_OUTPUT_CAP} bytes — refusing to parse a runaway response"
+        ));
+    }
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())
+}
+
+/// Spawn result for [`run_birdc`]. Carries the captured streams plus
+/// a flag signalling whether stdout hit the size cap.
+struct BirdcOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+}
+
+/// Read from `r` into `buf` up to `cap` bytes. Returns true when the
+/// reader had more data than the cap (the caller surfaces this as a
+/// hard error rather than parsing a runaway stream).
+fn read_capped<R: std::io::Read>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<bool> {
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match r.read(&mut chunk) {
+            Ok(0) => return Ok(false),
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let allowed = cap.saturating_sub(buf.len());
+        if n > allowed {
+            buf.extend_from_slice(&chunk[..allowed]);
+            // Drain the rest of the reader so the child's write end
+            // doesn't block on a full pipe buffer once we return.
+            let mut sink = [0u8; 4096];
+            while r.read(&mut sink).unwrap_or(0) > 0 {}
+            return Ok(true);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
 }
 
 #[cfg(test)]
