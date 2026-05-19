@@ -92,6 +92,11 @@ fn write_once(textfile_path: &Path, bpffs_root: &Path, uptime_seconds: u64) -> R
 /// Write-then-rename. The rename is atomic on POSIX when source and
 /// dest are on the same filesystem — node_exporter's textfile
 /// collector relies on this to never read a half-written file.
+///
+/// The `.tmp` open uses `O_NOFOLLOW | O_EXCL | O_CREAT | 0600` (see
+/// [`crate::loader::create_excl_no_follow`]) so a pre-existing
+/// symlink at the temp path cannot redirect the privileged write —
+/// the May 2026 audit Slice 4 finding.
 fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     // Use the same filename with `.tmp` appended so we stay on the
     // same filesystem as the target (`with_extension("tmp")` would
@@ -104,6 +109,22 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             .unwrap_or("packetframe.prom"),
     ));
     {
+        #[cfg(target_os = "linux")]
+        let mut f = crate::loader::create_excl_no_follow(&tmp).or_else(|e| {
+            // Symmetry with the loader helper's retry path. On a
+            // crashed predecessor, the .tmp leftover is a regular
+            // file — unlink and retry once. A symlink (attacker
+            // pre-creation) trips O_NOFOLLOW on the retry too.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                let meta = std::fs::symlink_metadata(&tmp)?;
+                if meta.file_type().is_file() {
+                    std::fs::remove_file(&tmp)?;
+                    return crate::loader::create_excl_no_follow(&tmp);
+                }
+            }
+            Err(e)
+        })?;
+        #[cfg(not(target_os = "linux"))]
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;

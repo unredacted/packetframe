@@ -296,8 +296,64 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Open `path` for writing with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600`
+/// — the symlink-safe atomic-write primitive both pidfile / marker
+/// writes (here) and the metrics-textfile writer ([`crate::metrics`])
+/// use for their `.tmp` staging files.
+///
+/// `O_NOFOLLOW` makes the open fail (`ELOOP`) when `path` is a
+/// symlink, so an attacker who can pre-create `<...>.tmp` as a
+/// symlink pointing at e.g. `/etc/passwd` cannot redirect the
+/// privileged daemon's write target. `O_EXCL` makes the open fail
+/// (`EEXIST`) when the path already exists, so a stale `.tmp`
+/// leftover from a crashed run is also surfaced rather than silently
+/// truncated and overwritten — callers handle that one-shot with
+/// `unlink-and-retry`.
+///
+/// The May 2026 audit Slice 4 finding flagged the previous use of
+/// `File::create` (which both follows symlinks and `O_TRUNC`s) on
+/// these temp paths as a privileged-write redirection primitive any
+/// time the parent directory is writable to a non-root user.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_excl_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Same shape but with one stale-`.tmp` retry. The retry runs only
+/// when `create_excl_no_follow` returns `AlreadyExists` and the
+/// existing path is a regular file (a leftover from a crashed run);
+/// a `.tmp` that's a symlink hits `ELOOP` on the retried open and
+/// the function gives up. A second `EEXIST` is treated as a real
+/// race between competing writers and errors out.
+#[cfg(target_os = "linux")]
+fn create_excl_no_follow_with_retry(path: &Path) -> std::io::Result<std::fs::File> {
+    match create_excl_no_follow(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // unlink-and-retry, but only if the leftover is a plain
+            // file. symlink_metadata avoids following the symlink so
+            // we don't misclassify an attacker's symlink as a file.
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.file_type().is_file() {
+                return Err(e);
+            }
+            std::fs::remove_file(path)?;
+            create_excl_no_follow(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Atomically write the current PID to `path`. Uses write-then-rename
-/// so a half-written file is never observed.
+/// so a half-written file is never observed; the temp file is opened
+/// with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600` so a pre-existing
+/// symlink at `<path>.tmp` cannot redirect the write.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn write_pid_file(path: &Path) -> std::io::Result<()> {
     use std::io::Write;
@@ -305,7 +361,7 @@ fn write_pid_file(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("pid.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_excl_no_follow_with_retry(&tmp)?;
         writeln!(f, "{}", std::process::id())?;
         f.sync_all()?;
     }
@@ -447,7 +503,7 @@ fn write_reconfigure_marker(path: &Path, status: &str) {
     let tmp = path.with_extension("timestamp.tmp");
     let body = format!("{status} {now_ns}\n");
     let r = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_excl_no_follow_with_retry(&tmp)?;
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -477,10 +533,17 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
         _ => ReconfigureError::Io(format!("read PID file {}: {e}", pid_path.display())),
     })?;
 
-    // /proc/<pid>/comm cross-check defends against a stale PID file
-    // pointing at a recycled PID. The kernel truncates `comm` to 15
-    // chars + NUL; "packetframe" fits comfortably.
-    if !proc_comm_matches(pid, "packetframe") {
+    // /proc/<pid>/exe cross-check defends against a stale PID file
+    // pointing at a recycled PID. We previously consulted
+    // /proc/<pid>/comm, but `comm` is user-settable via
+    // `prctl(PR_SET_NAME)` — any local user could rename a process
+    // to "packetframe" and be the target of the SIGHUP a root
+    // reconfigure issues. The kernel publishes /proc/<pid>/exe as a
+    // symlink to the process's executable inode and that link is not
+    // user-writable; readlink-comparing it against our own
+    // current_exe is a real identity check rather than a name match.
+    // See the May 2026 audit Slice 4 finding.
+    if !proc_exe_matches_current(pid) {
         return Err(ReconfigureError::DaemonNotRunning(format!(
             "PID {pid} from {} is not a packetframe process (stale pidfile?)",
             pid_path.display()
@@ -545,16 +608,35 @@ fn read_pid_file(path: &Path) -> std::io::Result<libc::pid_t> {
     })
 }
 
-/// Read /proc/<pid>/comm and check that it matches `expected`.
-/// Returns false on any I/O error or mismatch — caller treats as
-/// "PID is not our process."
+/// Read /proc/<pid>/exe as a symlink and compare against the
+/// canonicalized path of the currently running `packetframe`
+/// executable. The kernel sets /proc/<pid>/exe to point at the
+/// process's executable inode; the link is not writable from
+/// userspace, which makes this a real identity check (unlike
+/// /proc/<pid>/comm which any local user can spoof via
+/// `prctl(PR_SET_NAME)`).
+///
+/// Handles the `(deleted)` suffix the kernel appends when the
+/// executable file has been unlinked after the process started
+/// (rolling upgrade) — we accept the match if the prefix agrees.
+///
+/// Returns false on any I/O error or mismatch — the caller treats
+/// that as "PID is not our process."
 #[cfg(target_os = "linux")]
-fn proc_comm_matches(pid: libc::pid_t, expected: &str) -> bool {
-    let path = format!("/proc/{pid}/comm");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => s.trim() == expected,
-        Err(_) => false,
-    }
+fn proc_exe_matches_current(pid: libc::pid_t) -> bool {
+    let Ok(target) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    let current = current.canonicalize().unwrap_or(current);
+    // Strip a trailing ` (deleted)` from the target — the kernel
+    // appends that when the inode has been unlinked since exec, e.g.
+    // during a `cargo install --force` upgrade.
+    let target_str = target.to_string_lossy();
+    let target_clean = target_str.strip_suffix(" (deleted)").unwrap_or(&target_str);
+    Path::new(target_clean) == current.as_path()
 }
 
 /// Modified time of the marker file, in (secs, nanos). `None` if the
@@ -604,19 +686,25 @@ fn daemon_pid() -> Option<u32> {
         if pid == self_pid {
             continue;
         }
-        let comm_path = format!("/proc/{pid}/comm");
-        let comm = match std::fs::read_to_string(&comm_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if comm.trim() == "packetframe" {
-            // Confirm it's actually the `run` subcommand, not e.g.
-            // `packetframe detach` from another shell.
-            let cmdline_path = format!("/proc/{pid}/cmdline");
-            if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-                if cmdline.split('\0').any(|a| a == "run") {
-                    return Some(pid);
-                }
+        // /proc/<pid>/exe is the kernel-managed identity check (the
+        // May 2026 audit Slice 4 finding). The `comm` field used to
+        // gate this is user-settable via prctl(PR_SET_NAME), so a
+        // local user could rename their own process to "packetframe"
+        // and block the operator's `packetframe detach`. The exe
+        // symlink resolves to the inode the kernel actually exec'd,
+        // and is not user-writable.
+        if !proc_exe_matches_current(pid as libc::pid_t) {
+            continue;
+        }
+        // Confirm it's actually the `run` subcommand, not e.g.
+        // `packetframe detach` from another shell. argv IS still
+        // user-settable, but the exe match above pins identity; a
+        // spoofed argv "run" entry only sources a self-match against
+        // the very same binary.
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+            if cmdline.split('\0').any(|a| a == "run") {
+                return Some(pid);
             }
         }
     }
