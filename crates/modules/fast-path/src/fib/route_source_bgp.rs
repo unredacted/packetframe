@@ -214,7 +214,9 @@ impl BgpListener {
         debug!("sent OPEN");
 
         // Step 2: read peer's OPEN within OPEN_TIMEOUT and validate.
-        let peer_open = tokio::time::timeout(OPEN_TIMEOUT, read_one_message(&mut stream))
+        // OPEN itself is always decoded with add_path=false; capability
+        // 69 negotiation completes only after OPEN parsing succeeds.
+        let peer_open = tokio::time::timeout(OPEN_TIMEOUT, read_one_message(&mut stream, false))
             .await
             .map_err(|_| RouteSourceError::recoverable("peer OPEN timeout".to_string()))?
             .map_err(|e| RouteSourceError::recoverable(format!("read peer OPEN: {e}")))?;
@@ -432,12 +434,10 @@ impl BgpListener {
 /// pattern as `BmpStation::reader_task`.
 ///
 /// `add_path` carries the result of OPEN-time RFC 7911 capability
-/// negotiation (computed by [`walk_open_capabilities`]). It is
-/// threaded here so that the per-message decode flag can be set
-/// per-session in a subsequent change; today the value is captured
-/// but `read_one_message` still passes a hardcoded `false` to the
-/// parser.
-#[allow(unused_variables)]
+/// negotiation (computed by [`walk_open_capabilities`]). It controls
+/// the per-message NLRI decode in [`read_one_message`]: when true,
+/// every prefix in MP_REACH / MP_UNREACH / legacy NLRI is prefixed
+/// by a 4-byte path_id.
 async fn reader_task<R>(
     mut stream: R,
     tx: mpsc::Sender<BgpMessage>,
@@ -448,7 +448,7 @@ where
 {
     let mut messages_parsed = 0usize;
     loop {
-        let msg = match read_one_message(&mut stream).await {
+        let msg = match read_one_message(&mut stream, add_path).await {
             Ok(m) => m,
             Err(e) if is_clean_eof(&e) => {
                 debug!(messages_parsed, "BGP stream EOF (reader)");
@@ -472,7 +472,16 @@ where
 /// pulls the declared length, reads the rest, and parses with
 /// bgpkit-parser. Filters ROUTE-REFRESH (type 5) before parsing
 /// because bgpkit-parser doesn't model it.
-async fn read_one_message<R>(stream: &mut R) -> std::io::Result<BgpMessage>
+///
+/// `add_path` selects RFC 7911 NLRI decoding for this message. The
+/// flag must reflect what was negotiated in OPEN: the BGP wire format
+/// for NLRI differs depending on whether path_id is present, so a
+/// mismatch desynchronizes the parser and corrupts every subsequent
+/// prefix in the UPDATE. The OPEN itself is always read with
+/// `add_path = false` (negotiation cannot have completed yet);
+/// post-OPEN messages use the value computed by
+/// [`walk_open_capabilities`].
+async fn read_one_message<R>(stream: &mut R, add_path: bool) -> std::io::Result<BgpMessage>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -514,7 +523,7 @@ where
     full.extend_from_slice(&body);
     let mut bytes: Bytes = full.freeze();
 
-    parse_bgp_message(&mut bytes, false, &AsnLength::Bits32)
+    parse_bgp_message(&mut bytes, add_path, &AsnLength::Bits32)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))
 }
 
@@ -761,6 +770,11 @@ fn elem_to_route_event(
     fallback_nh: IpAddr,
 ) -> Option<RouteEvent> {
     let prefix = network_prefix_to_ip_prefix(&elem.prefix)?;
+    // When ADD-PATH was negotiated for the session, bgpkit-parser
+    // populates `prefix.path_id` with the wire-decoded 4-byte ID.
+    // Otherwise it remains None, matching the existing single-path
+    // semantics expected by non-ADD-PATH sources (BMP, netlink).
+    let path_id = elem.prefix.path_id;
     Some(match elem.elem_type {
         ElemType::ANNOUNCE => {
             let nh = elem.next_hop.unwrap_or(fallback_nh);
@@ -768,15 +782,13 @@ fn elem_to_route_event(
                 peer_id,
                 prefix,
                 nexthops: vec![nh],
-                // Slice 1: ADD-PATH not yet parsed from UPDATE NLRI; populated
-                // in slice 3 once `read_one_message` threads `add_path_in_effect`.
-                path_id: None,
+                path_id,
             }
         }
         ElemType::WITHDRAW => RouteEvent::Del {
             peer_id,
             prefix,
-            path_id: None,
+            path_id,
         },
     })
 }
@@ -1073,6 +1085,123 @@ mod tests {
         );
         assert!(!caps.add_path_v6_recv);
         assert!(!caps.add_path_in_effect());
+    }
+
+    // --- ADD-PATH (RFC 7911) NLRI decoding --------------------------
+
+    #[test]
+    fn parse_update_with_path_id_surfaces_to_elem_and_route_event() {
+        use bgpkit_parser::models::Asn;
+        use std::net::Ipv4Addr;
+
+        // Synthetic IPv4-unicast UPDATE containing one ADD-PATH
+        // announce for 192.0.2.0/24 with path_id=42, NEXT_HOP
+        // 10.0.0.1, empty AS_PATH, ORIGIN IGP. NLRI is encoded per
+        // RFC 7911 §3 with the 4-byte Path Identifier preceding the
+        // length-prefixed prefix.
+        #[rustfmt::skip]
+        let bytes: [u8; 45] = [
+            // BGP header
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x2D, // total length = 45
+            0x02,       // type = UPDATE
+            // Withdrawn Routes Length = 0
+            0x00, 0x00,
+            // Total Path Attribute Length = 14
+            0x00, 0x0E,
+            // ORIGIN (transitive): flags=0x40, type=1, len=1, IGP=0
+            0x40, 0x01, 0x01, 0x00,
+            // AS_PATH (transitive, empty): flags=0x40, type=2, len=0
+            0x40, 0x02, 0x00,
+            // NEXT_HOP (transitive): flags=0x40, type=3, len=4, 10.0.0.1
+            0x40, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x01,
+            // NLRI: path_id=42, prefix_len=24, 192.0.2 (3 bytes)
+            0x00, 0x00, 0x00, 0x2A,
+            0x18,
+            0xC0, 0x00, 0x02,
+        ];
+
+        let mut b = Bytes::copy_from_slice(&bytes);
+        let parsed = parse_bgp_message(&mut b, true, &AsnLength::Bits32)
+            .expect("ADD-PATH UPDATE parses cleanly");
+        let update = match parsed {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected UPDATE, got {:?}", other.msg_type()),
+        };
+
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let peer_asn = Asn::new_32bit(65000);
+        let elems = Elementor::bgp_update_to_elems(update, 0.0, &peer_ip, &peer_asn);
+        assert_eq!(elems.len(), 1, "exactly one elem from the single NLRI");
+        let elem = &elems[0];
+        assert_eq!(
+            elem.prefix.path_id,
+            Some(42),
+            "path_id round-trips through bgpkit-parser when add_path=true"
+        );
+
+        let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ev = elem_to_route_event(elem, PeerId(0), fallback).expect("elem yields a RouteEvent");
+        match ev {
+            RouteEvent::Add { path_id, .. } => assert_eq!(path_id, Some(42)),
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_without_addpath_leaves_path_id_none() {
+        use bgpkit_parser::models::Asn;
+        use std::net::Ipv4Addr;
+
+        // Same UPDATE shape as the test above but with no path_id
+        // prefix on the NLRI. Length adjusts down by 4 bytes.
+        #[rustfmt::skip]
+        let bytes: [u8; 41] = [
+            // BGP header
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x29, // total length = 41
+            0x02,       // type = UPDATE
+            // Withdrawn Routes Length = 0
+            0x00, 0x00,
+            // Total Path Attribute Length = 14
+            0x00, 0x0E,
+            // ORIGIN (transitive)
+            0x40, 0x01, 0x01, 0x00,
+            // AS_PATH (transitive, empty)
+            0x40, 0x02, 0x00,
+            // NEXT_HOP (transitive): 10.0.0.1
+            0x40, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x01,
+            // NLRI: prefix_len=24, 192.0.2 (3 bytes), no path_id
+            0x18,
+            0xC0, 0x00, 0x02,
+        ];
+
+        let mut b = Bytes::copy_from_slice(&bytes);
+        let parsed = parse_bgp_message(&mut b, false, &AsnLength::Bits32)
+            .expect("non-ADD-PATH UPDATE parses cleanly");
+        let update = match parsed {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected UPDATE, got {:?}", other.msg_type()),
+        };
+
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let peer_asn = Asn::new_32bit(65000);
+        let elems = Elementor::bgp_update_to_elems(update, 0.0, &peer_ip, &peer_asn);
+        assert_eq!(elems.len(), 1);
+        assert!(
+            elems[0].prefix.path_id.is_none(),
+            "non-ADD-PATH NLRI must yield path_id=None"
+        );
+
+        let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ev =
+            elem_to_route_event(&elems[0], PeerId(0), fallback).expect("elem yields a RouteEvent");
+        match ev {
+            RouteEvent::Add { path_id, .. } => assert!(path_id.is_none()),
+            other => panic!("expected Add, got {:?}", other),
+        }
     }
 
     /// v0.2.1 regression guard. Pre-fix, `elem_to_route_event` (then
