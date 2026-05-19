@@ -457,3 +457,302 @@ fn ecmp_groups_dedup_by_signature() {
         "prefixes sharing nexthop set should dedup to same ECMP group"
     );
 }
+
+// --- RFC 7911 ADD-PATH aggregation (slice 4) -----------------------
+
+/// Two `RouteEvent::Add`s for the same prefix with distinct
+/// `(peer_id, path_id)` and different next-hops should aggregate
+/// into one ECMP group on that prefix. The data plane writes a
+/// `FIB_KIND_ECMP` entry whose group contains both next-hops; the
+/// new path_id-keyed aggregation in `FibProgrammer` is what surfaces
+/// this from independent BGP UPDATEs.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_two_paths_one_prefix_yields_ecmp() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [192, 0, 2, 0],
+        prefix_len: 24,
+    };
+    let nh_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let nh_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    let peer = PeerId(0x1111);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh_a],
+                path_id: Some(1),
+            })
+            .await
+            .expect("apply Add path 1");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh_b],
+                path_id: Some(2),
+            })
+            .await
+            .expect("apply Add path 2");
+    });
+
+    let fib = h.read_fib_v4([192, 0, 2, 0], 24).expect("FIB entry");
+    assert_eq!(
+        fib.kind, FIB_KIND_ECMP,
+        "two distinct (peer, path_id) advertisements should yield ECMP"
+    );
+    let group = h.read_ecmp_group(fib.idx);
+    assert_eq!(group.nh_count, 2);
+}
+
+/// Add two ADD-PATH advertisements that result in an ECMP group;
+/// withdrawing one should collapse the FIB entry back to a single-NH
+/// `FIB_KIND_SINGLE` entry. The ECMP group's slot is freed for reuse.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_withdrawal_collapses_to_single_nh() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    };
+    let nh_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11));
+    let nh_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 12));
+    let peer = PeerId(0x2222);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh_a],
+                path_id: Some(1),
+            })
+            .await
+            .expect("apply Add A");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh_b],
+                path_id: Some(2),
+            })
+            .await
+            .expect("apply Add B");
+    });
+
+    let fib_ecmp = h
+        .read_fib_v4([198, 51, 100, 0], 24)
+        .expect("FIB after both Adds");
+    assert_eq!(fib_ecmp.kind, FIB_KIND_ECMP);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix,
+                path_id: Some(2),
+            })
+            .await
+            .expect("apply Del B");
+    });
+
+    let fib_single = h
+        .read_fib_v4([198, 51, 100, 0], 24)
+        .expect("FIB after one withdrawal");
+    assert_eq!(
+        fib_single.kind, FIB_KIND_SINGLE,
+        "collapsing to one advertisement should produce single-NH"
+    );
+}
+
+/// ADD-PATH-style advertisements from two distinct peers contributing
+/// one next-hop each should merge into a single ECMP group on the
+/// shared prefix. This is the multi-transit aggregation scenario
+/// that motivates RFC 7911 in PacketFrame: bird emits separate
+/// UPDATEs per upstream peer, each tagged with its own path_id;
+/// the programmer composes them into one multi-NH FIB entry.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_two_peers_two_paths_merge() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let nh_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 21));
+    let nh_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 22));
+    let peer_a = PeerId(0x3333);
+    let peer_b = PeerId(0x4444);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_a,
+                prefix,
+                nexthops: vec![nh_a],
+                path_id: Some(1),
+            })
+            .await
+            .expect("apply Add peer_a");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_b,
+                prefix,
+                nexthops: vec![nh_b],
+                path_id: Some(1),
+            })
+            .await
+            .expect("apply Add peer_b");
+    });
+
+    let fib = h.read_fib_v4([203, 0, 113, 0], 24).expect("FIB entry");
+    assert_eq!(
+        fib.kind, FIB_KIND_ECMP,
+        "advertisements from two peers should merge into ECMP"
+    );
+    let group = h.read_ecmp_group(fib.idx);
+    assert_eq!(group.nh_count, 2);
+}
+
+/// `PeerDown` for a peer that contributed multiple ADD-PATH
+/// advertisements to a prefix should drop only that peer's
+/// contributions. The prefix survives if any other peer still
+/// advertises it, with a recomputed NH set; the prefix is torn
+/// down only when no advertisements remain.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_peer_down_clears_all_paths_for_peer() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [192, 0, 2, 0],
+        prefix_len: 24,
+    };
+    let nh_a1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 31));
+    let nh_a2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 32));
+    let nh_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 33));
+    let peer_a = PeerId(0x5555);
+    let peer_b = PeerId(0x6666);
+
+    h.run(async {
+        // peer_a contributes two advertisements; peer_b contributes one.
+        for (path_id, nh) in [(Some(1), nh_a1), (Some(2), nh_a2)] {
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer_a,
+                    prefix,
+                    nexthops: vec![nh],
+                    path_id,
+                })
+                .await
+                .expect("apply Add peer_a");
+        }
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_b,
+                prefix,
+                nexthops: vec![nh_b],
+                path_id: Some(1),
+            })
+            .await
+            .expect("apply Add peer_b");
+    });
+
+    // Three contributing advertisements; FIB should be a 3-NH ECMP.
+    let fib_before = h.read_fib_v4([192, 0, 2, 0], 24).expect("FIB after Adds");
+    assert_eq!(fib_before.kind, FIB_KIND_ECMP);
+    let group_before = h.read_ecmp_group(fib_before.idx);
+    assert_eq!(group_before.nh_count, 3);
+
+    // PeerDown peer_a sweeps both of its advertisements. peer_b's
+    // single advertisement survives, so the prefix collapses to
+    // single-NH.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::PeerDown { peer_id: peer_a })
+            .await
+            .expect("apply PeerDown peer_a");
+    });
+
+    let fib_after = h
+        .read_fib_v4([192, 0, 2, 0], 24)
+        .expect("FIB survives with peer_b's advertisement");
+    assert_eq!(
+        fib_after.kind, FIB_KIND_SINGLE,
+        "remaining single advertisement should be single-NH"
+    );
+}
+
+/// Back-compat guard: a non-ADD-PATH session emits `path_id: None`
+/// on every Add. Two such Adds from the same peer for the same
+/// prefix must REPLACE rather than aggregate. This preserves the
+/// pre-ADD-PATH semantics for BMP, netlink, and any iBGP session
+/// where capability 69 was not mutually negotiated.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn non_add_path_session_still_replaces() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    };
+    let nh_first = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 41));
+    let nh_second = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42));
+    let peer = PeerId(0x7777);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh_first],
+                path_id: None,
+            })
+            .await
+            .expect("apply first Add");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh_second],
+                path_id: None,
+            })
+            .await
+            .expect("apply second Add");
+    });
+
+    let fib = h.read_fib_v4([198, 51, 100, 0], 24).expect("FIB entry");
+    assert_eq!(
+        fib.kind, FIB_KIND_SINGLE,
+        "two Adds with path_id=None from same peer must replace, not aggregate"
+    );
+
+    // A single Del under the same (peer, None) key should remove the
+    // prefix entirely. If the second Add had aggregated instead of
+    // replaced, the prefix would still hold the first advertisement
+    // after this withdrawal.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix,
+                path_id: None,
+            })
+            .await
+            .expect("apply Del");
+    });
+
+    assert!(
+        h.read_fib_v4([198, 51, 100, 0], 24).is_none(),
+        "Del under same (peer, None) key removes the prefix; \
+         confirms only one advertisement existed after the replace"
+    );
+
+    // Silence unused-binding warnings; the literal values are part
+    // of the test's intent even though we no longer read them back
+    // from NEXTHOPS to verify identity.
+    let _ = (nh_first, nh_second);
+}
