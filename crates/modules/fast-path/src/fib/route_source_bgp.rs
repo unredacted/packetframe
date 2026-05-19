@@ -657,7 +657,8 @@ impl NegotiatedCapabilities {
 fn walk_open_capabilities(
     opt_params: &[bgpkit_parser::models::OptParam],
 ) -> NegotiatedCapabilities {
-    use bgpkit_parser::models::{AddPathSendReceive, Afi, CapabilityValue, ParamValue, Safi};
+    use bgpkit_parser::models::capabilities::AddPathSendReceive;
+    use bgpkit_parser::models::{Afi, CapabilityValue, ParamValue, Safi};
     let mut caps = NegotiatedCapabilities::default();
     for op in opt_params {
         let ParamValue::Capacities(cap_list) = &op.param_value else {
@@ -976,11 +977,10 @@ mod tests {
     /// capability with the provided address-family entries. Mirrors
     /// what bgpkit-parser produces from a peer OPEN.
     fn build_add_path_opt_param(
-        entries: Vec<bgpkit_parser::models::AddPathAddressFamily>,
+        entries: Vec<bgpkit_parser::models::capabilities::AddPathAddressFamily>,
     ) -> bgpkit_parser::models::OptParam {
-        use bgpkit_parser::models::{
-            AddPathCapability, BgpCapabilityType, Capability, CapabilityValue, OptParam, ParamValue,
-        };
+        use bgpkit_parser::models::capabilities::{AddPathCapability, BgpCapabilityType};
+        use bgpkit_parser::models::{Capability, CapabilityValue, OptParam, ParamValue};
         let cap = Capability {
             ty: BgpCapabilityType::ADD_PATH_CAPABILITY,
             value: CapabilityValue::AddPath(AddPathCapability::new(entries)),
@@ -996,7 +996,8 @@ mod tests {
 
     #[test]
     fn walk_open_capabilities_detects_both_afis_when_peer_sends() {
-        use bgpkit_parser::models::{AddPathAddressFamily, AddPathSendReceive, Afi, Safi};
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
         let op = build_add_path_opt_param(vec![
             AddPathAddressFamily {
                 afi: Afi::Ipv4,
@@ -1017,7 +1018,8 @@ mod tests {
 
     #[test]
     fn walk_open_capabilities_all_or_nothing_when_only_one_afi_negotiated() {
-        use bgpkit_parser::models::{AddPathAddressFamily, AddPathSendReceive, Afi, Safi};
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
         let op = build_add_path_opt_param(vec![AddPathAddressFamily {
             afi: Afi::Ipv4,
             safi: Safi::Unicast,
@@ -1034,7 +1036,8 @@ mod tests {
 
     #[test]
     fn walk_open_capabilities_peer_receive_only_does_not_negotiate_recv() {
-        use bgpkit_parser::models::{AddPathAddressFamily, AddPathSendReceive, Afi, Safi};
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
         // Peer Receive-only means the peer can RECEIVE multipath from
         // us; PacketFrame never originates, so this does not enable us
         // to receive anything from the peer.
@@ -1058,7 +1061,8 @@ mod tests {
 
     #[test]
     fn walk_open_capabilities_ignores_non_unicast_safi() {
-        use bgpkit_parser::models::{AddPathAddressFamily, AddPathSendReceive, Afi, Safi};
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
         let op = build_add_path_opt_param(vec![AddPathAddressFamily {
             afi: Afi::Ipv4,
             safi: Safi::Multicast,
