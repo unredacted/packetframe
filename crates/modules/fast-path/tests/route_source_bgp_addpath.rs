@@ -16,7 +16,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
@@ -352,7 +352,7 @@ fn add_path_two_updates_yield_ecmp_via_bgp_listener() {
         let key = LpmKey::new(24, [192, 0, 2, 0]);
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut last_seen: Option<FibValue> = None;
-        let mut last_count: u32 = 0;
+        let mut last_count: u8 = 0;
         loop {
             // Fresh handle each poll so we observe the programmer's
             // writes via a separate FD.
