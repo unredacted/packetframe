@@ -81,6 +81,23 @@ const INIT_COMPLETE_QUIESCENCE: Duration = Duration::from_secs(5);
 /// second tick wakeups without backpressuring bird.
 const FRAME_CHANNEL_CAPACITY: usize = 256;
 
+/// Per-`read_exact` timeout on the BMP TCP stream. The reader task
+/// otherwise blocks forever on a peer that completed TCP handshake
+/// but never sent bytes (or sent a header but no body) — the
+/// audit-flagged slowloris primitive (Slice 2). 60 s is comfortable
+/// for legitimate bird (which sends initial RIB dumps in < 5 s) and
+/// tight enough to give the operator's stuck-session detection a
+/// chance to recover.
+const BMP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cap on per-RouteMonitoring `BgpElem` count. Same rationale as
+/// the matching constant in `route_source_bgp.rs`: a single
+/// RouteMonitoring frame embeds one BGP UPDATE, which `Elementor`
+/// fans out into N elems, each costing one `apply_route_event`
+/// `.await`. 8192 is above any realistic bird best-path dump per
+/// frame.
+const MAX_ELEMS_PER_UPDATE: usize = 8192;
+
 pub struct BmpStation {
     listen_addr: SocketAddr,
     prog_handle: FibProgrammerHandle,
@@ -430,6 +447,13 @@ impl BmpStation {
                     &pph.peer_ip,
                     &pph.peer_asn,
                 );
+                if elems.len() > MAX_ELEMS_PER_UPDATE {
+                    return Err(RouteSourceError::recoverable(format!(
+                        "BMP RouteMonitoring fanned out to {} elems (cap {}); closing session",
+                        elems.len(),
+                        MAX_ELEMS_PER_UPDATE
+                    )));
+                }
                 for elem in elems {
                     let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {
                         Some(p) => p,
@@ -568,14 +592,25 @@ async fn reader_task(
     let mut frames_parsed = 0usize;
     loop {
         let mut header_buf = [0u8; 6];
-        match stream.read_exact(&mut header_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        // tokio::time::timeout wrapping read_exact bounds the
+        // slowloris primitive: a peer that completes TCP handshake
+        // and stops sending bytes can no longer hold the
+        // single-connection BMP listener idle forever (audit
+        // Slice 2). On timeout we surface a recoverable error so
+        // the accept loop closes the stream and re-listens.
+        match tokio::time::timeout(BMP_READ_TIMEOUT, stream.read_exact(&mut header_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!(frames_parsed, "BMP stream EOF (reader)");
                 return Ok(());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Err(RouteSourceError::recoverable(format!("read header: {e}")));
+            }
+            Err(_) => {
+                return Err(RouteSourceError::recoverable(format!(
+                    "BMP read header exceeded {BMP_READ_TIMEOUT:?} (peer stalled)"
+                )));
             }
         }
         // BMP common header: version(1) + msg_len(4) + msg_type(1).
@@ -591,10 +626,17 @@ async fn reader_task(
         let body_len = msg_len - 6;
         let mut body_buf = vec![0u8; body_len];
         if body_len > 0 {
-            stream
-                .read_exact(&mut body_buf)
-                .await
-                .map_err(|e| RouteSourceError::recoverable(format!("read body: {e}")))?;
+            match tokio::time::timeout(BMP_READ_TIMEOUT, stream.read_exact(&mut body_buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    return Err(RouteSourceError::recoverable(format!("read body: {e}")));
+                }
+                Err(_) => {
+                    return Err(RouteSourceError::recoverable(format!(
+                        "BMP read body exceeded {BMP_READ_TIMEOUT:?} (peer stalled mid-frame)"
+                    )));
+                }
+            }
         }
 
         // Reconstruct the full frame. `parse_bmp_msg` expects the
