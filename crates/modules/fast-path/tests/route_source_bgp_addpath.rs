@@ -299,7 +299,7 @@ fn add_path_two_updates_yield_ecmp_via_bgp_listener() {
     let listener = BgpListener::new(bgp_cfg, prog_handle.clone(), shutdown.clone());
     let listener_task = rt.spawn(listener.run());
 
-    let test_result = rt.block_on(async move {
+    rt.block_on(async move {
         // Give the listener a moment to bind.
         for _ in 0..50 {
             if TcpStream::connect(listen_addr).await.is_ok() {
@@ -389,6 +389,4 @@ fn add_path_two_updates_yield_ecmp_via_bgp_listener() {
         let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), prog_task).await;
     });
-
-    test_result
 }
