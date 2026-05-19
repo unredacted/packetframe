@@ -30,22 +30,36 @@ use core::mem;
 /// One sample published per packet. `#[repr(C)]` so the userspace
 /// reader can cast incoming ringbuf bytes directly into this layout;
 /// changing the layout requires bumping a version field and updating
-/// the userspace `ProbeEvent` in sync. Tail-padded by the compiler to
-/// 8-byte alignment (8 + 4 + 16 = 28 → 32 bytes) — the kernel also
-/// insists `align_of::<T>() ≤ 8` for `RingBuf::reserve`, which this
-/// struct satisfies.
+/// the userspace `ProbeEvent` in sync. `u64 + u32 + [u8;16] + [u8;4]`
+/// packs to a flat 32 bytes with no compiler-inserted padding — the
+/// kernel insists `align_of::<T>() ≤ 8` for `RingBuf::reserve`, which
+/// this struct satisfies.
 ///
 /// `pkt_len` is the on-the-wire packet length as observed by the XDP
 /// hook (`data_end - data`); useful for distinguishing truncated
 /// frames from full ones, and for confirming that a non-conformant
 /// head prefix is correlated with a suspicious total length.
+///
+/// `_pad` exists so the trailing 4 bytes of the 32-byte slot are an
+/// explicit, addressable field that the BPF program zeros before
+/// submit. Without it, the layout would have compiler-inserted tail
+/// padding that `RingBuf::reserve` (returning `MaybeUninit<T>` over
+/// a kernel-allocated slot that the kernel does NOT zero) would
+/// publish to userspace carrying whatever the ringbuf cell last
+/// held — a 4-byte information leak per sample. See SPEC.md §11.1(c)
+/// + the May 2026 audit Slice 3 fix for the longer rationale.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ProbeEvent {
     pub ts_ns: u64,
     pub pkt_len: u32,
     pub head: [u8; 16],
+    pub _pad: [u8; 4],
 }
+
+// Pin the layout: any change here must update the userspace mirror
+// in `crates/modules/probe/src/lib.rs` in lockstep.
+const _: () = assert!(core::mem::size_of::<ProbeEvent>() == 32);
 
 /// 256 KiB works across 4-KiB and 16-KiB page hosts (some ARM
 /// kernels use 16K pages; ringbuf size must be a power-of-two page
@@ -125,9 +139,14 @@ pub fn probe(ctx: XdpContext) -> u32 {
     let ts = unsafe { bpf_ktime_get_ns() };
 
     // SAFETY: `RingBufEntry::as_mut_ptr` gives a valid, 8-aligned,
-    // `mem::size_of::<ProbeEvent>()`-sized slot that the kernel has
-    // reserved for us. We write every field before calling `submit`;
-    // the tail padding stays at whatever the kernel zeroed it to.
+    // `mem::size_of::<ProbeEvent>()`-sized slot. **The kernel does
+    // NOT zero the reservation** — `RingBuf::reserve` returns
+    // `MaybeUninit<T>` over whatever bytes the ringbuf cell last
+    // held. Every byte of the slot must be written before `submit`
+    // or the leftover content goes out to userspace as kernel-memory
+    // leakage. We write each named field below; `_pad` is the
+    // explicit zero-fill of the trailing 4 bytes that closes the
+    // padding-leak path the May 2026 audit (Slice 3) flagged.
     unsafe {
         let e = entry.as_mut_ptr();
         (*e).ts_ns = ts;
@@ -138,6 +157,7 @@ pub fn probe(ctx: XdpContext) -> u32 {
         // well-defined in-range pointer.
         let p = (start + offset) as *const [u8; 16];
         (*e).head = core::ptr::read_unaligned(p);
+        (*e)._pad = [0u8; 4];
     }
 
     entry.submit(0);

@@ -44,7 +44,8 @@ pub fn aligned_bpf_copy() -> Vec<u8> {
 /// One packet sample. `#[repr(C)]` and layout-identical to the BPF
 /// program's `ProbeEvent` struct — the ringbuf delivers these bytes
 /// unchanged. Changing the layout here requires the BPF side to
-/// change in lockstep (and vice versa).
+/// change in lockstep (and vice versa). The pinned size (32 bytes)
+/// is asserted at compile time below.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ProbeEvent {
@@ -58,7 +59,17 @@ pub struct ProbeEvent {
     /// rvu-nicpf native, §11.1(c)), this is what actually lands and
     /// is the evidence for what to do about it.
     pub head: [u8; 16],
+    /// Explicit trailing pad that the BPF side zeros before
+    /// `submit`. Closes the May 2026 audit Slice 3 finding: without
+    /// an explicit field here the compiler-inserted tail padding
+    /// would be `RingBuf::reserve`'s uninitialized bytes, publishing
+    /// 4 bytes of kernel memory per sample to userspace.
+    pub _pad: [u8; 4],
 }
+
+// Pin the layout: any change to ProbeEvent here must keep the
+// BPF-side struct in `bpf/src/main.rs` in lockstep.
+const _: () = assert!(std::mem::size_of::<ProbeEvent>() == 32);
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::run;
