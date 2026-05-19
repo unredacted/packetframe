@@ -155,10 +155,16 @@ fn print_entry(entry: &FibEntry) {
 }
 
 fn format_nh(nh: &NexthopSummary) -> String {
+    // No width-padded fields. Numeric IDs and ifindex render as-is
+    // (no leading spaces), and `state=` takes only as much horizontal
+    // space as the value needs. The trailing-pad on `state` previously
+    // landed as visible double/triple gaps before `family=v4` in normal
+    // output; readability beats column alignment here because nh_ids
+    // and ifindexes are short and the row is single-line anyway.
     format!(
-        "nh_id={:>4} state={:<10} family=v{} ifindex={:>3} dst_mac={} src_mac={}",
+        "nh_id={} state={} family=v{} ifindex={} dst_mac={} src_mac={}",
         nh.id,
-        nh.state.to_string(),
+        nh.state,
         nh.family,
         nh.ifindex,
         mac_fmt(nh.dst_mac),
