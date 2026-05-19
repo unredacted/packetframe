@@ -657,6 +657,7 @@ fn add_path_peer_down_clears_all_paths_for_peer() {
                     prefix,
                     nexthops: vec![nh],
                     path_id,
+                    local_pref: None,
                 })
                 .await
                 .expect("apply Add peer_a");

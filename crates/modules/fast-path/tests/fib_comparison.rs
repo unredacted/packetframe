@@ -424,7 +424,6 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
                     prefix_len: 32,
                 },
                 path_id: None,
-                local_pref: None,
             })
             .await
     })
