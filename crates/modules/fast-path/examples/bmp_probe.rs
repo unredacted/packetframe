@@ -2,7 +2,7 @@
 //!
 //! Reads a captured BMP byte stream (file or stdin), parses each
 //! message via `bgpkit-parser`, and prints a structured summary.
-//! This is the **Phase 1 deferred deliverable** — it proves the
+//! This is the **Phase 1 deferred deliverable**, it proves the
 //! library handles bird's wire format (especially RFC 9069 Loc-RIB /
 //! peer type 3) before the real RouteSource in Slice 3C builds on it.
 //!
@@ -17,7 +17,7 @@
 //!
 //! Output is plain text, one line per message. A closing summary
 //! prints message-type counts, per-peer-type counts, and per-peer
-//! route-monitoring counts — enough to spot a library regression
+//! route-monitoring counts, enough to spot a library regression
 //! (e.g., Loc-RIB frames silently misparsed as something else).
 //!
 //! Not a production binary; not shipped in the release tarball.
@@ -65,7 +65,7 @@ fn main() {
 
     while !bytes.is_empty() {
         // `parse_bmp_msg` advances `bytes` past the message on success.
-        // On error we bail — a malformed frame past this point means
+        // On error we bail, a malformed frame past this point means
         // we've lost sync with the stream framing and further parsing
         // would produce garbage.
         match parse_bmp_msg(&mut bytes) {

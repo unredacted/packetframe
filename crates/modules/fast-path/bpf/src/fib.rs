@@ -130,7 +130,7 @@ pub fn lookup_v4(
     }
 }
 
-/// IPv6 custom-FIB lookup. See [`lookup_v4`] — same byte-order
+/// IPv6 custom-FIB lookup. See [`lookup_v4`], same byte-order
 /// contract on `sport` / `dport`.
 #[inline(always)]
 pub fn lookup_v6(
@@ -221,7 +221,7 @@ fn resolve_fib_value_v6(
 ///
 /// If the starting slot is resolved, returns immediately (the common
 /// case). If we walked past the starting slot, bump
-/// `EcmpDeadLegFallback` — that's diagnostic signal that a leg is
+/// `EcmpDeadLegFallback`, that's diagnostic signal that a leg is
 /// down and we're compensating.
 #[inline(always)]
 fn pick_ecmp_leg(group: &EcmpGroup, hash: u32) -> Option<u32> {
@@ -353,7 +353,7 @@ const JHASH_INITVAL: u32 = 0xdeadbeef;
 
 /// Jenkins 3-word mix (the `__jhash_mix` primitive). Six rounds of
 /// sub / xor / rot / add on three u32 lanes. Verifier-cost is 18
-/// integer ops + register pressure for 3 live values — comfortably
+/// integer ops + register pressure for 3 live values, comfortably
 /// under any realistic BPF instruction budget.
 #[inline(always)]
 fn jhash_mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
@@ -408,7 +408,7 @@ fn jhash_final(mut a: u32, mut b: u32, mut c: u32) -> u32 {
 /// - mode 5 (L4): proto + sport + dport fully mixed.
 ///
 /// Fragmented / ICMP / non-TCP-UDP callers pass `sport = dport = 0`,
-/// which collapses mode 5 to effectively mode 3 for those packets —
+/// which collapses mode 5 to effectively mode 3 for those packets
 /// no port bits to distinguish. The layer above (main.rs) is what
 /// actually ensures the ports-zero case for non-L4 packets.
 #[inline(always)]

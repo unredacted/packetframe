@@ -7,7 +7,7 @@
 //!
 //! All operations open the bpffs pins directly via
 //! `packetframe_fast_path::fib::inspect`; no daemon IPC, no pin-
-//! registry dependency. Works as long as the pins are alive —
+//! registry dependency. Works as long as the pins are alive
 //! after `systemctl stop packetframe` but before `detach --all`.
 
 #![cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -46,7 +46,7 @@ pub enum FibOp {
         ip: IpAddr,
     },
     /// Print just the FIB occupancy / hash-mode / forwarding-mode
-    /// block from `packetframe status` — useful for scripting.
+    /// block from `packetframe status`, useful for scripting.
     Stats {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -83,7 +83,7 @@ pub fn run(op: FibOp) -> ExitCode {
                     ExitCode::from(EXIT_OK)
                 }
                 Ok(None) => {
-                    println!("NO MATCH — {ip} has no covering prefix in FIB");
+                    println!("NO MATCH, {ip} has no covering prefix in FIB");
                     ExitCode::from(EXIT_OK)
                 }
                 Err(e) => {

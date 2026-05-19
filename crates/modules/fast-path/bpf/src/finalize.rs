@@ -11,7 +11,7 @@
 //! Communication from `fast_path` is via two side channels:
 //! - The packet itself (preserved across `bpf_tail_call`).
 //! - `MUTATION_CTX` per-CPU scratch (egress info, ingress VID, IP offset,
-//!   v4/v6 discriminator) — written by fast_path, read here.
+//!   v4/v6 discriminator), written by fast_path, read here.
 //!
 //! See SPEC.md §4.x "Two-stage BPF datapath" and
 //! `docs/runbooks/tail-call-architecture.md`.
@@ -34,7 +34,7 @@ use crate::maps::{
 /// is self-contained.
 const TPID_8021Q: u16 = 0x8100;
 
-/// Sentinel for "no VLAN" — mirror of `main::VLAN_NONE`.
+/// Sentinel for "no VLAN", mirror of `main::VLAN_NONE`.
 const VLAN_NONE: u16 = 0;
 
 /// SYN flag in TCP byte 13.
@@ -46,7 +46,7 @@ const PROTO_TCP: u8 = IpProto::Tcp as u8;
 
 /// Upper bound on `ip_offset` post-VLAN-parse. Used to give the BPF
 /// verifier a tight `umax` so range propagation through packet-pointer
-/// arithmetic works — see commentary on the `ip_offset > MAX_IP_OFFSET`
+/// arithmetic works, see commentary on the `ip_offset > MAX_IP_OFFSET`
 /// check in `finalize`.
 const MAX_IP_OFFSET: usize = 64;
 
@@ -72,7 +72,7 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     // Clamp ip_offset to MAX_IP_OFFSET (64). The BPF verifier's
     // `find_good_pkt_pointers` refuses to propagate range information
     // through packet-pointer arithmetic when the scalar offset's
-    // umax_value exceeds MAX_PACKET_OFF (0xffff) — which is the case
+    // umax_value exceeds MAX_PACKET_OFF (0xffff), which is the case
     // for `mctx.ip_offset` since it's read from a map and the verifier
     // sees its full u32 range. Capping the offset gives the verifier
     // a tight umax it can reason about, so the subsequent
@@ -89,7 +89,7 @@ pub fn finalize(ctx: XdpContext) -> u32 {
 
     // mss-clamp first, then VLAN choreography (which can shift bytes
     // via bpf_xdp_adjust_head). mss-clamp's TCP-options walk relies on
-    // ip_offset being valid relative to ctx.data() — true until VLAN
+    // ip_offset being valid relative to ctx.data(), true until VLAN
     // push/pop changes the layout.
     mss_clamp_inline(&ctx, ip_offset, is_v4, egress_ifindex);
 
@@ -114,13 +114,13 @@ pub fn finalize(ctx: XdpContext) -> u32 {
 
 /// Top-level entry: dispatch into the v4 or v6 path with a constant-sized
 /// bounds check. Splitting upfront (rather than threading `is_v4` through
-/// a single function) is what satisfies the BPF verifier — the bounds
+/// a single function) is what satisfies the BPF verifier, the bounds
 /// check needs to use a compile-time-known size so the verifier can
 /// track that subsequent reads via `*const Ipv4Hdr` / `*const Ipv6Hdr`
 /// stay within the checked region.
 ///
-/// The ergonomic alternative — `let size = if is_v4 { 20 } else { 40 };
-/// if start + offset + size > end { ... }; ip_addr as *const Ipv4Hdr` —
+/// The ergonomic alternative, `let size = if is_v4 { 20 } else { 40 };
+/// if start + offset + size > end { ... }; ip_addr as *const Ipv4Hdr`
 /// loses the verifier's bound-tracking when the cast is reached: see
 /// `R9 offset is outside of the packet` from the v0.2.5 prerelease build.
 #[inline(always)]
@@ -228,7 +228,7 @@ fn mss_clamp_tcp(ctx: &XdpContext, ip_ptr: *const u8, ip_hdr_size: usize, clamp:
         return;
     }
 
-    // Walk options. Cap at 8 — real SYN packets put MSS in the first
+    // Walk options. Cap at 8, real SYN packets put MSS in the first
     // 1-4 options (Linux's tcp_options_write emits MSS very early); 8
     // is comfortable headroom while keeping verifier state-space bounded.
     let opts_start_off = tcp_offset + 20;
@@ -392,7 +392,7 @@ fn apply_vlan_egress(ctx: &XdpContext, ingress_vid: u16, egress_vid: u16) -> Res
 /// rejects programs that combine tail-calls with bpf-to-bpf calls.
 /// Reading all 12 source bytes into local variables before any store
 /// also handles the source/destination overlap that `core::ptr::copy`
-/// (memmove) handles for us — without the libcall.
+/// (memmove) handles for us, without the libcall.
 #[inline(always)]
 fn vlan_push(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
     let rc = unsafe { bpf_xdp_adjust_head(ctx.ctx as *mut _, -4) };
@@ -406,9 +406,9 @@ fn vlan_push(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
     }
     unsafe {
         let base = start as *mut u8;
-        // Read all 12 source bytes (offsets 4..16 — the original MAC
+        // Read all 12 source bytes (offsets 4..16, the original MAC
         // pair, now shifted right by 4 from adjust_head) before writing
-        // anything. Then write to offsets 0..12. No overlap concern —
+        // anything. Then write to offsets 0..12. No overlap concern
         // source and dest don't co-exist in memory at the same time.
         let m0 = *base.add(4);
         let m1 = *base.add(5);
@@ -446,7 +446,7 @@ fn vlan_push(ctx: &XdpContext, vid: u16) -> Result<(), ()> {
 
 /// Tagged → untagged. Shifts the MAC pair right by 4 over the about-to-
 /// be-discarded TPID+TCI slot, then shrinks headroom by 4. Same
-/// byte-by-byte pattern as `vlan_push` — see commentary there for the
+/// byte-by-byte pattern as `vlan_push`, see commentary there for the
 /// `core::ptr::copy` libcall avoidance rationale.
 #[inline(always)]
 fn vlan_pop(ctx: &XdpContext) -> Result<(), ()> {
@@ -457,7 +457,7 @@ fn vlan_pop(ctx: &XdpContext) -> Result<(), ()> {
     }
     unsafe {
         let base = start as *mut u8;
-        // Read all 12 source bytes (offsets 0..12 — the MAC pair before
+        // Read all 12 source bytes (offsets 0..12, the MAC pair before
         // the 4-byte VLAN tag at offsets 12..16) before writing.
         let m0 = *base;
         let m1 = *base.add(1);

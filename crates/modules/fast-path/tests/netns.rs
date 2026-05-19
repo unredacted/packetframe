@@ -12,7 +12,7 @@
 //! black-holed every matched-and-not-in-devmap packet for several
 //! minutes before the rollback. See SPEC.md §11.13.
 //!
-//! `bpf_prog_test_run` can't reach the bug — it returns verdict and
+//! `bpf_prog_test_run` can't reach the bug, it returns verdict and
 //! output bytes but doesn't perform a real `bpf_fib_lookup` against
 //! configured routes. This test sets up:
 //!
@@ -95,7 +95,7 @@ const ROUTED_NEIGH_LLADDR: &str = "de:ad:be:ef:00:01";
 const ALLOW_PREFIX: ([u8; 4], u32) = ([10, 77, 0, 0], 16);
 
 /// RAII wrapper around `ip netns add` / `ip netns del`. Drop tears the
-/// whole namespace down — that also destroys every iface we made
+/// whole namespace down, that also destroys every iface we made
 /// inside it, so we don't need per-iface cleanup.
 struct NetnsGuard {
     name: String,
@@ -110,7 +110,7 @@ impl NetnsGuard {
 
         run(&["ip", "netns", "add", &names.netns]);
 
-        // Sysctls first — `default.*` is a template for ifaces created
+        // Sysctls first, `default.*` is a template for ifaces created
         // after the set, so this needs to run before `ip link add`.
         //
         // `ip_forward=1`: mainline kernels boot with forwarding off,
@@ -172,7 +172,7 @@ impl NetnsGuard {
             &["ip", "route", "add", ROUTED_PREFIX, "dev", &names.dum],
         );
         // Permanent neighbor so `bpf_fib_lookup` resolves without
-        // triggering kernel ARP/ND — returns SUCCESS with `dmac` set
+        // triggering kernel ARP/ND, returns SUCCESS with `dmac` set
         // to `ROUTED_NEIGH_LLADDR` directly.
         ns_run(
             &names.netns,
@@ -212,7 +212,7 @@ fn run(cmd: &[&str]) {
 }
 
 /// Run `cmd` inside the given netns via `ip netns exec`. Simpler than
-/// calling `setns` for every setup step — only the test thread itself
+/// calling `setns` for every setup step, only the test thread itself
 /// needs to enter the netns (it does so once, below).
 fn ns_run(netns: &str, cmd: &[&str]) {
     let mut args = vec!["netns", "exec", netns];
@@ -225,7 +225,7 @@ fn ns_run(netns: &str, cmd: &[&str]) {
 }
 
 /// Move the current thread into the netns. `setns(2)` on a single
-/// thread is safe in a multithreaded process — it only re-associates
+/// thread is safe in a multithreaded process, it only re-associates
 /// the calling thread, per the man page.
 fn enter_netns(netns: &str) -> OwnedFd {
     // `ip netns add` bind-mounts the created ns at this path.
@@ -247,7 +247,7 @@ fn if_nametoindex(name: &str) -> u32 {
 
 /// Read an iface's MAC via `SIOCGIFHWADDR` ioctl on a scratch socket.
 /// `/sys/class/net` would be simpler but isn't reliably re-mounted for
-/// the new netns on every distro — the sysfs view is frozen to
+/// the new netns on every distro, the sysfs view is frozen to
 /// whichever netns held it at mount time, which is usually init. The
 /// ioctl goes through a socket and so is properly netns-scoped.
 fn mac_of(iface: &str) -> [u8; 6] {
@@ -291,7 +291,7 @@ fn mac_of(iface: &str) -> [u8; 6] {
 }
 
 /// Open a `PF_PACKET` `SOCK_RAW` socket bound to `ifindex` with
-/// `ETH_P_ALL`. Used both for injection (send) and capture (recv) — the
+/// `ETH_P_ALL`. Used both for injection (send) and capture (recv), the
 /// kernel behavior matches whichever direction we use it for.
 fn open_packet_socket(ifindex: u32) -> OwnedFd {
     // Both socket()'s `protocol` arg and sockaddr_ll.sll_protocol are in
@@ -415,7 +415,7 @@ fn recv_matching(
     }
 }
 
-/// Recognise our test packet by IPv4 src+dst — these bytes survive
+/// Recognise our test packet by IPv4 src+dst, these bytes survive
 /// the pre-PR #11 mutation (which only touched L2 MACs and TTL/csum),
 /// so the filter catches both the correct (unmutated) case and the
 /// regression case. We want the byte-equality assertion to fire on
@@ -479,14 +479,14 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
         .expect("CFG set");
     }
 
-    // REDIRECT_DEVMAP intentionally left empty — the dummy ifindex is
+    // REDIRECT_DEVMAP intentionally left empty, the dummy ifindex is
     // therefore NOT in it, which is what drives the pre-check miss.
 
     // Scoped so the `&mut bpf` borrow held by `prog` ends before we
     // read stats via shared `&bpf`. `link_id` is a plain value and
     // stays live for the subsequent detach.
     //
-    // Generic XDP is enough — veth supports it across every kernel we
+    // Generic XDP is enough, veth supports it across every kernel we
     // target, and we're testing logic not performance. Sticking to
     // SKB_MODE also keeps this test from being flaky on kernels where
     // native veth XDP has quirks.
@@ -506,7 +506,7 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
 
     // Craft a matched packet. Src in the allowlist (10.77.0.2 covered
     // by 10.77.0.0/16), dst routed via dummy (198.51.100.1). TTL is
-    // the builder default (64) — the mutation check is easier to read
+    // the builder default (64), the mutation check is easier to read
     // if the ingress TTL is distinctive from 1 (low-ttl branch).
     let frame = Ipv4TcpBuilder {
         src_mac: mac_b,
@@ -523,10 +523,10 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
 
     // Capture. Filter on IPv4 src+dst (bytes the fast path never
     // touches) so a MAC- or TTL-mutated frame is still captured and
-    // then rejected by the byte-equality assertion below — we want
+    // then rejected by the byte-equality assertion below, we want
     // the assertion to fire on mutation, not a capture timeout.
     let captured = recv_matching(&cap_fd, Duration::from_millis(1000), is_test_packet).expect(
-        "no frame captured on XDP-attached veth within 1s — \
+        "no frame captured on XDP-attached veth within 1s, \
              did the fast path XDP_REDIRECT (devmap leak?) or \
              XDP_DROP the matched frame?",
     );
@@ -552,33 +552,33 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
     // another push-and-wait cycle.
     let dump = format!("delta: {deltas:?}");
 
-    // Counter assertions first — if these fail, the byte-equality
+    // Counter assertions first, if these fail, the byte-equality
     // assertion is academic.
     assert_eq!(
         after[StatIdx::RxTotal as usize] - before[StatIdx::RxTotal as usize],
         1,
-        "expected exactly one rx_total increment — {dump}"
+        "expected exactly one rx_total increment, {dump}"
     );
     assert_eq!(
         after[StatIdx::MatchedV4 as usize] - before[StatIdx::MatchedV4 as usize],
         1,
-        "packet should have matched the IPv4 allowlist — {dump}"
+        "packet should have matched the IPv4 allowlist, {dump}"
     );
     assert_eq!(
         after[StatIdx::PassNotInDevmap as usize] - before[StatIdx::PassNotInDevmap as usize],
         1,
         "FIB egress (dummy) is not in REDIRECT_DEVMAP; \
-         pass_not_in_devmap should bump — {dump}"
+         pass_not_in_devmap should bump, {dump}"
     );
     assert_eq!(
         after[StatIdx::FwdOk as usize] - before[StatIdx::FwdOk as usize],
         0,
-        "no redirect should have happened — {dump}"
+        "no redirect should have happened, {dump}"
     );
 
     // §11.13 invariant: the frame the kernel slow path received must
     // be the frame we injected, byte-for-byte. Mutation before the
-    // devmap pre-check would make this assertion trip — captured TTL
+    // devmap pre-check would make this assertion trip, captured TTL
     // would be 63, IP checksum patched, L2 MACs rewritten to the
     // neighbor's lladdr.
     assert_eq!(
@@ -588,7 +588,7 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
     );
     assert_eq!(
         captured, frame,
-        "packet bytes mutated on pass path — §11.13 invariant violation \
+        "packet bytes mutated on pass path, §11.13 invariant violation \
          (compare captured[14..] against frame[14..] for the IP+TCP diff)"
     );
 }

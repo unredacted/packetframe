@@ -1,4 +1,4 @@
-//! RouteController — owns the tokio runtime, spawns the
+//! RouteController, owns the tokio runtime, spawns the
 //! NeighborResolver and FibProgrammer tasks, and exposes a clean
 //! `start()` / `shutdown()` lifecycle that mirrors the
 //! `BreakerSampler` and `MetricsExporter` pattern in
@@ -6,7 +6,7 @@
 //!
 //! **Phase 2 scope.** Starts the netlink resolver + the programmer
 //! (neigh-side). The RouteSource (BMP station) and its integration
-//! into this controller land in Phase 3 — the tokio runtime shape
+//! into this controller land in Phase 3, the tokio runtime shape
 //! here accommodates that expansion without rework: spawning a
 //! third long-lived task is an additive change.
 //!
@@ -39,7 +39,7 @@ use crate::fib::route_source_bmp::BmpStation;
 /// Forwarding-feed source. The controller spawns at most one route
 /// source: operators pick `bmp` or `bgp` via `route-source ...`.
 /// `Bgp` is the recommended choice today because bird lacks RFC 9069
-/// Loc-RIB BMP — see `route_source_bgp.rs` module docs.
+/// Loc-RIB BMP, see `route_source_bgp.rs` module docs.
 ///
 /// The `peer_acl` / `expected_peer_ip` fields carry the
 /// authorization opt-in declared in the operator config. The config
@@ -67,7 +67,7 @@ pub enum RouteSourceConfig {
         local_as: u32,
         peer_as: u32,
         router_id: Ipv4Addr,
-        /// CIDR ACL — same semantics as the BMP variant.
+        /// CIDR ACL, same semantics as the BMP variant.
         peer_acl: Vec<ipnet::IpNet>,
         /// Optional pin on the peer's source IP. When set, an
         /// accepted connection whose source IP differs is closed
@@ -87,7 +87,7 @@ const LISTENER_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 /// v0.2.2: ceiling on the listener restart backoff. After a transient
 /// bind failure (TIME_WAIT, port held by orphan, etc.), we want to
 /// retry promptly. After a sustained failure (real port conflict), we
-/// don't want to spam the kernel — 60 s is operator-readable in the
+/// don't want to spam the kernel, 60 s is operator-readable in the
 /// log without being too loud.
 const LISTENER_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
@@ -124,7 +124,7 @@ impl RouteController {
     /// `route-source bmp ...` or `route-source bgp ...`; the
     /// controller then spawns the matching listener as a third task
     /// alongside the resolver + programmer. `None` runs without a
-    /// live route source — useful for test harnesses that drive the
+    /// live route source, useful for test harnesses that drive the
     /// programmer directly via its `FibProgrammerHandle`.
     pub fn start(
         bpffs_root: &Path,
@@ -286,7 +286,7 @@ impl RouteController {
                 cfg.peer_acl = peer_acl;
                 cfg.expected_peer_ip = expected_peer_ip;
                 // Capture the auth-posture fields before the spawn
-                // moves `cfg` into the retry loop's coroutine — the
+                // moves `cfg` into the retry loop's coroutine, the
                 // post-spawn `info!` reads them and can't share with
                 // the move.
                 let peer_acl_entries = cfg.peer_acl.len();
@@ -333,7 +333,7 @@ impl RouteController {
             None => {
                 info!(
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer \
-                     (no route source — `route-source` not configured)"
+                     (no route source, `route-source` not configured)"
                 );
             }
         }
@@ -358,7 +358,7 @@ impl RouteController {
 
     /// Cooperative shutdown. Signals the cancellation token, awaits
     /// each task up to [`SHUTDOWN_TIMEOUT`], then tears down the
-    /// runtime. Drops any tasks that blow past the timeout — they'd
+    /// runtime. Drops any tasks that blow past the timeout, they'd
     /// leak otherwise when the runtime finalizes.
     pub fn shutdown(mut self) {
         self.shutdown_token.cancel();

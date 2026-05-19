@@ -13,7 +13,7 @@ publish = false
 # An empty `[workspace]` table makes this crate its own workspace root
 # so a nested `cargo build` (invoked from our parent's build.rs) does
 # not walk up and find the outer workspace. Without this, cargo errors
-# "current package believes it's in a workspace when it's not" — the
+# "current package believes it's in a workspace when it's not", the
 # outer `workspace.exclude` list alone is not sufficient when cargo is
 # invoked from within the excluded directory. See the companion note
 # in the root Cargo.toml's `[workspace].exclude`.
@@ -28,7 +28,7 @@ aya-ebpf = "=0.1.1"
 network-types = "=0.2.0"
 
 [profile.release]
-# BPF programs typically only pass the verifier in release mode — dev-mode
+# BPF programs typically only pass the verifier in release mode, dev-mode
 # debuginfo and lack of optimization produce instruction sequences the
 # verifier rejects as too long / loopy.
 opt-level = 3

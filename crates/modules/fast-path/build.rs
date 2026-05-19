@@ -6,8 +6,8 @@
 //! `.github/workflows/ci.yml`); local dev on macOS typically has none of
 //! them and that is deliberate per the PR #3 plan ("CI-only BPF builds").
 //!
-//! If the nested build fails for any reason — no rustup, no nightly, no
-//! bpf-linker, missing target, or a real compile error — we emit an
+//! If the nested build fails for any reason, no rustup, no nightly, no
+//! bpf-linker, missing target, or a real compile error, we emit an
 //! empty stub ELF and skip setting the `packetframe_bpf_built` cfg.
 //! Userspace code uses that cfg to gate tests and error clearly at
 //! runtime if someone tries to load the empty object.
@@ -29,7 +29,7 @@ fn main() {
     let obj_out = out_dir.join("fast-path.bpf.o");
 
     // Rerun triggers. `src/**/*.rs` is covered by `rerun-if-changed` on
-    // the directory — cargo walks it recursively.
+    // the directory, cargo walks it recursively.
     for rel in [
         "src",
         "Cargo.toml",
@@ -52,7 +52,7 @@ fn main() {
         );
     }
 
-    // Pre-built ELF override — used by release.yml to build BPF once on
+    // Pre-built ELF override, used by release.yml to build BPF once on
     // the host runner (where nightly + bpf-linker exist), upload as an
     // artifact, and hand the path to every cross-build job. Cross
     // containers lack rustup entirely, so nested cargo would fail and
@@ -102,7 +102,7 @@ fn main() {
     // will fail and we fall through to the stub path.
     //
     // Capture stderr + stdout so we can re-emit the real cargo error
-    // as cargo:warning lines on failure — otherwise the outer cargo
+    // as cargo:warning lines on failure, otherwise the outer cargo
     // swallows this build.rs process's output and users see only our
     // opaque "BPF build failed (exit N)" warning, which is useless
     // for diagnosing toolchain or compile errors in the BPF crate.
@@ -116,7 +116,7 @@ fn main() {
     // only activates under nightly.
     // Build with `--message-format=json` so we can parse cargo's
     // structured output and locate the compiler-artifact filename.
-    // That's more robust than hardcoding the target/ path — cargo and
+    // That's more robust than hardcoding the target/ path, cargo and
     // bpf-linker have both moved artifact locations across versions.
     let output = Command::new("cargo")
         .current_dir(&bpf_dir)
@@ -185,7 +185,7 @@ fn main() {
             forward_rendered_diagnostics(&out.stdout);
             forward_output(&[], &out.stderr);
             let msg = format!(
-                "BPF build failed (exit {}) — see cargo:warning lines above for the real error, or run `(cd crates/modules/fast-path/bpf && cargo build --release)` directly",
+                "BPF build failed (exit {}), see cargo:warning lines above for the real error, or run `(cd crates/modules/fast-path/bpf && cargo build --release)` directly",
                 out.status.code().unwrap_or(-1)
             );
             fail_or_stub(&obj_out, bpf_required, &msg);
@@ -232,7 +232,7 @@ fn find_artifact(stdout: &[u8]) -> Option<PathBuf> {
 fn fail_or_stub(obj_out: &std::path::Path, required: bool, msg: &str) {
     if required {
         panic!(
-            "PACKETFRAME_BPF_REQUIRED is set but {msg}. Refusing to stub the ELF — that would make every BPF-dependent test a silent no-op."
+            "PACKETFRAME_BPF_REQUIRED is set but {msg}. Refusing to stub the ELF, that would make every BPF-dependent test a silent no-op."
         );
     }
     println!(
@@ -243,7 +243,7 @@ fn fail_or_stub(obj_out: &std::path::Path, required: bool, msg: &str) {
 
 /// Re-emit the nested cargo's stdout + stderr as `cargo:warning` lines
 /// so the outer cargo shows them. Each source line becomes a separate
-/// warning — cargo prints one warning per line anyway, and this way
+/// warning, cargo prints one warning per line anyway, and this way
 /// the user doesn't have to `cargo build -vv` to diagnose a BPF build
 /// failure.
 fn forward_output(stdout: &[u8], stderr: &[u8]) {
@@ -265,7 +265,7 @@ fn write_stub(path: &std::path::Path) {
 /// Walk cargo's `--message-format=json` stdout, find each
 /// `"reason":"compiler-message"` line, and forward its rendered
 /// diagnostic body. This is what makes BPF compile errors visible in
-/// the parent cargo's warning stream — they're emitted as JSON on
+/// the parent cargo's warning stream, they're emitted as JSON on
 /// stdout (not stderr), so without this they're invisible when
 /// `forward_output(&[], ...)` is called.
 fn forward_rendered_diagnostics(stdout: &[u8]) {

@@ -4,7 +4,7 @@
 //! Integration test: load the fast-path BPF ELF through aya.
 //!
 //! aya's `Xdp::load()` round-trips the program through the kernel
-//! verifier — if it succeeds the verifier accepted our §4.4 program,
+//! verifier, if it succeeds the verifier accepted our §4.4 program,
 //! and that's the single most valuable guard we can ship in PR #3.
 //!
 //! Packet-level `bpf_prog_test_run` fixtures (for parse errors,

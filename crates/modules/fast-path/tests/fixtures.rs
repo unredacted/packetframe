@@ -1,6 +1,6 @@
 //! Packet-level fixtures via `bpf_prog_test_run`. Covers the
-//! non-FIB §9 Phase 1 cases — parse errors, fragments, low TTL,
-//! allowlist misses, complex headers — deferred from PR #3 where aya
+//! non-FIB §9 Phase 1 cases, parse errors, fragments, low TTL,
+//! allowlist misses, complex headers, deferred from PR #3 where aya
 //! 0.13.1 didn't wrap `BPF_PROG_TEST_RUN`. The raw-syscall harness in
 //! `tests/common/mod.rs` bridges that gap.
 //!
@@ -9,7 +9,7 @@
 //! `redirect_devmap`; those belong in a netns-backed integration test,
 //! a separate slice.
 //!
-//! Every test is `#[ignore]` — it needs CAP_BPF + BPF build. CI runs
+//! Every test is `#[ignore]`, it needs CAP_BPF + BPF build. CI runs
 //! the full set under sudo via `cargo test --tests -- --ignored`.
 
 #![cfg(target_os = "linux")]
@@ -29,7 +29,7 @@ fn rx_total_delta(before: u64, h: &Harness) -> u64 {
 fn arp_passes_with_pass_not_ip() {
     let h = Harness::new();
 
-    // ARP (ethertype 0x0806) — plausibly-shaped but not IP.
+    // ARP (ethertype 0x0806), plausibly-shaped but not IP.
     let mut pkt = vec![0u8; 64];
     pkt[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
     pkt[6..12].copy_from_slice(&[0xaa, 0, 0, 0, 0, 1]); // src
@@ -155,7 +155,7 @@ fn ipv4_neither_in_allowlist_passes_silently() {
     assert_eq!(verdict, xdp_action::XDP_PASS);
     // No matched counter bumped.
     assert_eq!(h.stat(StatIdx::MatchedV4), before_matched);
-    // But rx_total did bump — every packet is counted at the hook.
+    // But rx_total did bump, every packet is counted at the hook.
     assert_eq!(rx_total_delta(before_rx, &h), 1);
 }
 
@@ -168,7 +168,7 @@ fn ipv6_fragment_extension_passes_with_complex_header() {
     h.add_allow_v6("2001:db8::/32");
 
     // IPv6 Fragment header next_hdr = 44. Our impl XDP_PASSes on any
-    // non-{TCP, UDP, ICMPv6} next_hdr and bumps pass_complex_header —
+    // non-{TCP, UDP, ICMPv6} next_hdr and bumps pass_complex_header
     // per our interpretation of the SPEC §4.4 step 4 ambiguity (see
     // audit in PR #3).
     let pkt = Ipv6TcpBuilder {
@@ -333,7 +333,7 @@ fn every_packet_bumps_rx_total() {
     h.run(&p);
     assert_eq!(h.stat(StatIdx::RxTotal), before + 2);
 
-    // IPv4 match (dry-run off — would try FIB, but that likely NO_NEIGH
+    // IPv4 match (dry-run off, would try FIB, but that likely NO_NEIGH
     // in our no-netns test env; we only check rx_total).
     h.add_allow_v4("10.0.0.0/8");
     h.run(&p);
@@ -344,7 +344,7 @@ fn every_packet_bumps_rx_total() {
 //
 // `bpf_prog_test_run` can't exercise the §4.7 egress push/pop/rewrite
 // directly because that path sits behind a `bpf_fib_lookup` SUCCESS
-// which needs real routes configured — that's netns-integration-test
+// which needs real routes configured, that's netns-integration-test
 // territory, deferred. What the tests below *do* cover:
 //
 // - Tagged packets are recognized as 802.1Q and the inner ethertype
@@ -412,7 +412,7 @@ fn vlan_tagged_ipv4_with_options_routes_to_complex_header() {
     h.add_allow_v4("10.0.0.0/8");
 
     let base = Ipv4TcpBuilder {
-        ihl: 6, // IPv4 options — routed to pass_complex_header
+        ihl: 6, // IPv4 options, routed to pass_complex_header
         ..Default::default()
     }
     .build();
@@ -448,7 +448,7 @@ fn vlan_tagged_ipv4_fragment_routes_to_pass_fragment() {
 fn vlan_tagged_non_ip_inner_passes_with_pass_not_ip() {
     let h = Harness::new();
 
-    // Tagged ARP — inner ethertype after VLAN tag is 0x0806 (not v4/v6).
+    // Tagged ARP, inner ethertype after VLAN tag is 0x0806 (not v4/v6).
     let mut base = vec![0u8; 64];
     base[0..6].copy_from_slice(&[0xff; 6]);
     base[6..12].copy_from_slice(&[0xaa, 0, 0, 0, 0, 1]);
@@ -464,7 +464,7 @@ fn vlan_tagged_non_ip_inner_passes_with_pass_not_ip() {
 // ========== Jumbo frames (SPEC §11.5) =====================================
 //
 // Reference EFG has 9182-byte MTU on VLAN trunks. Test with a 4K-class
-// TCP payload — XDP_PACKET_HEADROOM (256) + 4K body + slab tailroom
+// TCP payload, XDP_PACKET_HEADROOM (256) + 4K body + slab tailroom
 // fits comfortably under the kernel's ~4096-byte `max_data_sz` cap for
 // test_run without LIVE_FRAMES. A true 9K frame needs LIVE_FRAMES mode
 // (5.18+) which is netns-integration-test territory. This fixture

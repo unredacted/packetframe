@@ -1,8 +1,8 @@
 //! Offline FIB comparison harness (Option F, Phase 3.8).
 //!
-//! Drives the programmer with a data-driven synthetic RIB — mixed
+//! Drives the programmer with a data-driven synthetic RIB, mixed
 //! V4/V6, single-nexthop + ECMP + overlapping prefixes + default
-//! route — then runs LPM lookups for a curated set of query IPs
+//! route, then runs LPM lookups for a curated set of query IPs
 //! and asserts each resolves to the prefix we expect.
 //!
 //! Positioned as the "offline comparison harness" called out in
@@ -27,7 +27,7 @@
 //! Runs under CAP_BPF. `#[ignore]`-gated; CI qemu jobs run it via
 //! `sudo -E cargo test -- --ignored`.
 //!
-//! Setup is duplicated from `fib_programmer_integration.rs` —
+//! Setup is duplicated from `fib_programmer_integration.rs`
 //! each `tests/*.rs` is its own crate so cross-file imports aren't
 //! possible. Factoring into `tests/common/` is a separate refactor.
 
@@ -252,7 +252,7 @@ fn synthetic_rib_v4() -> Vec<(IpPrefix, Vec<IpAddr>)> {
             },
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6))],
         ),
-        // Another ECMP with *same* nexthop set as 192.0.2.0/24 —
+        // Another ECMP with *same* nexthop set as 192.0.2.0/24
         // must dedup to the same EcmpGroupId.
         (
             IpPrefix::V4 {
@@ -304,7 +304,7 @@ fn synthetic_rib_v6() -> Vec<(IpPrefix, Vec<IpAddr>)> {
             },
             vec![IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2))],
         ),
-        // 2001:db8:1::/48 — nested under the above.
+        // 2001:db8:1::/48, nested under the above.
         (
             IpPrefix::V6 {
                 addr: [
@@ -353,7 +353,7 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
     // Each query IP → expected (prefix_addr_str, kind, nh_count).
     // Verifies longest-prefix-match + correct FibValue encoding.
 
-    // IPv4: 192.0.2.200 — host route wins over /25 wins over /24.
+    // IPv4: 192.0.2.200, host route wins over /25 wins over /24.
     let v = h.lookup_v4([192, 0, 2, 200]).expect("FIB_V4[host-route]");
     assert_eq!(v.kind, FIB_KIND_SINGLE);
 
@@ -361,12 +361,12 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
     let v = h.lookup_v4([192, 0, 2, 130]).expect("FIB_V4[/25 scope]");
     assert_eq!(v.kind, FIB_KIND_SINGLE);
 
-    // 192.0.2.10 — no more-specific; /24 ECMP wins.
+    // 192.0.2.10, no more-specific; /24 ECMP wins.
     let v = h.lookup_v4([192, 0, 2, 10]).expect("FIB_V4[/24 scope]");
     assert_eq!(v.kind, FIB_KIND_ECMP);
     let ecmp_192 = v.idx;
 
-    // 198.51.100.5 — same nexthop set as 192.0.2.0/24; must share
+    // 198.51.100.5, same nexthop set as 192.0.2.0/24; must share
     // group_id (ECMP dedup).
     let v = h.lookup_v4([198, 51, 100, 5]).expect("FIB_V4[dedup]");
     assert_eq!(v.kind, FIB_KIND_ECMP);
@@ -375,29 +375,29 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
         "ECMP groups with identical nexthop sets should share id"
     );
 
-    // 203.0.113.5 — different nexthop set; different group.
+    // 203.0.113.5, different nexthop set; different group.
     let v = h
         .lookup_v4([203, 0, 113, 5])
         .expect("FIB_V4[different-ecmp]");
     assert_eq!(v.kind, FIB_KIND_ECMP);
     assert_ne!(v.idx, ecmp_192, "different nexthop set → different group");
 
-    // 10.0.0.42 — /8.
+    // 10.0.0.42, /8.
     let v = h.lookup_v4([10, 0, 0, 42]).expect("FIB_V4[/8 scope]");
     assert_eq!(v.kind, FIB_KIND_SINGLE);
 
-    // 1.1.1.1 — nothing more-specific; default route.
+    // 1.1.1.1, nothing more-specific; default route.
     let v = h.lookup_v4([1, 1, 1, 1]).expect("FIB_V4[default]");
     assert_eq!(v.kind, FIB_KIND_SINGLE);
 
-    // IPv6: 2001:db8:1:: — /48 wins over /32.
+    // IPv6: 2001:db8:1::, /48 wins over /32.
     let mut v6_a = [0u8; 16];
     v6_a[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
     v6_a[5] = 0x01;
     let v = h.lookup_v6(v6_a).expect("FIB_V6[/48 scope]");
     assert_eq!(v.kind, FIB_KIND_SINGLE);
 
-    // 2001:db8:ff::1 — /32 covers.
+    // 2001:db8:ff::1, /32 covers.
     let mut v6_b = [0u8; 16];
     v6_b[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
     v6_b[5] = 0xff;
@@ -405,7 +405,7 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
     let v = h.lookup_v6(v6_b).expect("FIB_V6[/32 scope]");
     assert_eq!(v.kind, FIB_KIND_SINGLE);
 
-    // fe80::1 — default route (no more-specific /32 or /48 match).
+    // fe80::1, default route (no more-specific /32 or /48 match).
     let mut v6_c = [0u8; 16];
     v6_c[..2].copy_from_slice(&[0xfe, 0x80]);
     v6_c[15] = 1;

@@ -1,11 +1,11 @@
-//! `packetframe` — PacketFrame CLI.
+//! `packetframe`, PacketFrame CLI.
 //!
 //! See SPEC.md §7.4 for the subcommand surface. `run` loads + attaches
 //! the fast-path module via aya, persists the pin registry, and blocks
 //! on SIGTERM/SIGINT for graceful exit. `detach` and `status` read the
 //! pin registry and the live stats map respectively. SIGHUP triggers a
 //! delta-only reconcile (allowlists, VLAN-resolve, devmap) without
-//! detaching. `fib` (Option F, Phase 3.8 — see SPEC.md §4.11) opens
+//! detaching. `fib` (Option F, Phase 3.8, see SPEC.md §4.11) opens
 //! the pinned custom-FIB maps directly for inspection.
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -39,7 +39,7 @@ pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/packetframe/packetframe.conf"
 
 /// Resolve a caller-supplied `Option<PathBuf>` against the default.
 /// Returns the caller's value if `Some`; otherwise returns the default
-/// path unchanged. We deliberately don't stat the path here — the
+/// path unchanged. We deliberately don't stat the path here, the
 /// config parser emits a clear "I/O error reading {path}" if the
 /// default file is missing, which is a more actionable error than a
 /// generic "provide --config".
@@ -51,7 +51,7 @@ pub(crate) fn config_path_or_default(caller: Option<PathBuf>) -> PathBuf {
 #[command(
     name = "packetframe",
     version,
-    about = "Modular eBPF data plane (see SPEC.md for the full spec).",
+    about = "Modular eBPF data plane.",
     long_about = None,
 )]
 struct Cli {
@@ -61,12 +61,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Probe the host kernel for PacketFrame's capability requirements (SPEC.md §2.1).
+    /// Probe the host kernel for PacketFrame's capability requirements.
     Feasibility {
         /// Optional config path. When supplied, `bpffs-root` from config is
         /// probed instead of the default, and configured interfaces are
         /// checked against /sys/class/net. Also enables the per-interface
-        /// XDP trial-attach probe (SPEC.md §2.3) for every `attach`ed iface.
+        /// XDP trial-attach probe for every `attach`ed iface.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Emit a human-readable table instead of JSON.
@@ -84,16 +84,15 @@ enum Command {
 
     /// Detach attached programs by removing every pin under the
     /// module's bpffs pin root. Removing a link pin triggers the
-    /// kernel-side XDP detach (SPEC.md §8.5); removing map + program
-    /// pins is housekeeping.
+    /// kernel-side XDP detach; removing map and program pins is
+    /// housekeeping.
     Detach {
         /// Path to the config file. Defaults to
         /// `/etc/packetframe/packetframe.conf`.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Tear down every PacketFrame pin across every module, not
-        /// just the one in the supplied config. v0.1 has one module
-        /// so this is equivalent to the default.
+        /// just the one in the supplied config.
         #[arg(long)]
         all: bool,
     },
@@ -113,8 +112,8 @@ enum Command {
     /// `last-reconfigure.timestamp` marker for confirmation.
     /// Equivalent to `systemctl reload packetframe` under systemd.
     /// Attach-set changes (interfaces added/removed) require a full
-    /// restart and are silently skipped — `packetframe status` after
-    /// the reload shows what's currently attached.
+    /// restart and are silently skipped; run `packetframe status`
+    /// after the reload to see what's currently attached.
     Reconfigure {
         /// Path to the config file. Defaults to
         /// `/etc/packetframe/packetframe.conf`. Used to discover the
@@ -123,8 +122,9 @@ enum Command {
         config: Option<PathBuf>,
     },
 
-    /// Direct BPF map ops for debugging. Lands in PR #6 alongside
-    /// reconfigure (both need live map handles from the running loader).
+    /// Direct BPF map ops for debugging. Not yet implemented; both
+    /// this and `reconfigure` need live map handles from the running
+    /// loader.
     Map {
         module: String,
         map: String,
@@ -132,9 +132,8 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Inspect the custom-FIB maps (Option F, Phase 3.8). Opens the
-    /// pinned LPM tries / nexthop arrays directly — works without the
-    /// daemon running.
+    /// Inspect the custom-FIB maps. Opens the pinned LPM tries and
+    /// nexthop arrays directly; works without the daemon running.
     #[cfg(all(target_os = "linux", feature = "fast-path"))]
     Fib {
         #[command(subcommand)]
@@ -143,8 +142,9 @@ enum Command {
 
     /// Attach a diagnostic XDP program, dump the first 16 bytes of a
     /// sample of incoming packets, detach. Built to answer "what does
-    /// this driver hand to XDP?" — see SPEC.md §11.1(c) for the
-    /// rvu-nicpf native-delivery investigation that motivated it.
+    /// this driver hand to XDP?" when an interface's counters suggest
+    /// the driver is delivering something other than Ethernet-shaped
+    /// frames to native XDP.
     #[cfg(feature = "probe")]
     Probe {
         /// Interface to probe.
@@ -165,7 +165,7 @@ enum Command {
         /// Byte offset at which the BPF program samples each packet's
         /// head. Default `0` (start of `xdp->data`). Non-zero values
         /// are for diagnosing drivers that point `xdp->data` into
-        /// headroom instead of at the packet — e.g. `--offset 128`
+        /// headroom instead of at the packet, e.g. `--offset 128`
         /// on rvu-nicpf pre-Linux-v6.8 to see the real Ethernet
         /// header. Capped at 512.
         #[arg(long, default_value_t = 0)]
@@ -175,7 +175,7 @@ enum Command {
 
 #[cfg(feature = "probe")]
 fn parse_duration(s: &str) -> Result<Duration, String> {
-    // Unit suffixes: `ms`, `s`, `m` — parsed in longest-match order so
+    // Unit suffixes: `ms`, `s`, `m`, parsed in longest-match order so
     // `ms` wins over `s`. Bare integers are treated as seconds, which
     // matches the feel of most "how long" CLI flags.
     if let Some(num) = s.strip_suffix("ms") {
@@ -214,7 +214,7 @@ fn main() -> ExitCode {
         // Default: info from our crates, plus suppress one upstream
         // noise source. `bgpkit_parser::parser::bgp::messages`
         // emits a `WARN seeing strange one-byte NLRI field` whenever
-        // a BGP UPDATE arrives with a 1-byte NLRI section — which is
+        // a BGP UPDATE arrives with a 1-byte NLRI section, which is
         // the valid wire encoding of a default route (`0.0.0.0/0`:
         // prefix-length byte = 0, zero prefix bytes follow).
         // bgpkit-parser conservatively treats it as malformed and
@@ -301,7 +301,7 @@ fn main() -> ExitCode {
                 }
                 Err(loader::ReconfigureError::Timeout) => {
                     tracing::error!(
-                        "reconfigure: no acknowledgment from the daemon within 5s — \
+                        "reconfigure: no acknowledgment from the daemon within 5s, \
                          daemon may be wedged. Check `journalctl -u packetframe`."
                     );
                     ExitCode::from(EXIT_RUNTIME_ERROR)
@@ -357,7 +357,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
 fn not_implemented(name: &str) -> ExitCode {
     tracing::warn!(
         subcommand = name,
-        "not implemented in this release — tracked in the v0.1 plan"
+        "not implemented in this release, tracked in the v0.1 plan"
     );
     ExitCode::from(EXIT_RUNTIME_ERROR)
 }

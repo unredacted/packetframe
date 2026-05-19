@@ -6,7 +6,7 @@
 //! peers in `Established` state so the BMP stall detector can gate
 //! its alert on "bird says there are peers to hear from."
 //!
-//! Scope: diagnostic safety net. Not on the feed path — if this
+//! Scope: diagnostic safety net. Not on the feed path, if this
 //! crashes or `birdc` is uninstallable, forwarding is unaffected;
 //! only the integrity alert goes dark. The 5-minute cadence is
 //! deliberately slow because this is a drift-catch job, not a
@@ -14,7 +14,7 @@
 //!
 //! Parsing bird's text output is inherently brittle; version drift
 //! can break the parser. Treating that as "integrity check stops
-//! working" is fine — forwarding keeps going, the operator gets a
+//! working" is fine, forwarding keeps going, the operator gets a
 //! warning log, and we update the parser. The plan explicitly
 //! accepts this fragility as the price of having the check at all.
 
@@ -69,8 +69,8 @@ impl Default for IntegrityConfig {
     }
 }
 
-/// Snapshot of the most recent integrity-check result. Readers —
-/// specifically the BmpStalled gate — consult this to decide whether
+/// Snapshot of the most recent integrity-check result. Readers
+/// specifically the BmpStalled gate, consult this to decide whether
 /// a stall warrants an alert.
 #[derive(Debug, Clone, Default)]
 pub struct IntegritySnapshot {
@@ -111,7 +111,7 @@ impl IntegrityChecker {
     }
 
     /// Main loop. Sleeps `config.interval`, runs one check, repeats.
-    /// Each tick is independent — a failure writes `last_error` into
+    /// Each tick is independent, a failure writes `last_error` into
     /// the snapshot and continues.
     pub async fn run(self) {
         info!(
@@ -200,21 +200,21 @@ impl IntegrityChecker {
 /// followed by a `Total: ...` summary across ALL tables in
 /// multi-table outputs. The `Total:` line includes RPKI tables (and
 /// any other custom tables operators have configured), which is NOT
-/// what we want — packetframe's mirror only ever holds master4/master6
+/// what we want, packetframe's mirror only ever holds master4/master6
 /// content.
 ///
 /// **v0.2.2 fix.** The rc5 fix preferred the `Total:` line over per-
 /// table sums to avoid double-counting when bird emitted both. But
 /// on operators with RPKI enabled (including the reference EFG via
 /// pathvector's `rtr-server` directive), the Total includes the
-/// RPKI tables — observed `bird_routes = 2,120,822` (sum of master4
+/// RPKI tables, observed `bird_routes = 2,120,822` (sum of master4
 /// 1.04M, master6 0.24M, rpki4 0.66M, rpki6 0.19M) where the operator
 /// expected 1.27M (master4 plus master6). The drift warning fired
 /// every 5 minutes for a non-existent drift.
 ///
 /// Now we explicitly filter for `in table master4` / `in table master6`
 /// per-table lines and sum those, ignoring `Total:` and any other
-/// table names. Single-table outputs (just `master4`) still work — we
+/// table names. Single-table outputs (just `master4`) still work, we
 /// pick up that one line.
 ///
 /// **rc5 fix retained**: pre-rc5 we summed every line containing
@@ -294,7 +294,7 @@ async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, Str
     let args_display = format!("{args:?}");
     let join = tokio::task::spawn_blocking(move || -> Result<BirdcOutput, String> {
         // `Read` is in scope inside `read_capped` via its `R: Read`
-        // bound — no need to pull it in here.
+        // bound, no need to pull it in here.
         use std::process::Stdio;
         let mut child = Command::new(&birdc)
             .args(&args)
@@ -335,7 +335,7 @@ async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, Str
     }
     if result.stdout_truncated {
         return Err(format!(
-            "birdc {args_display} stdout exceeded {BIRDC_OUTPUT_CAP} bytes — refusing to parse a runaway response"
+            "birdc {args_display} stdout exceeded {BIRDC_OUTPUT_CAP} bytes, refusing to parse a runaway response"
         ));
     }
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())

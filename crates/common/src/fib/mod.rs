@@ -2,7 +2,7 @@
 //!
 //! Phase 1 defines only the trait surfaces so Phase 2-3 can land
 //! concrete implementations (BMP station, netlink neighbor listener,
-//! FibProgrammer) without churning the shape. No impls here — the
+//! FibProgrammer) without churning the shape. No impls here, the
 //! fast-path module owns its own concrete impls under
 //! `crates/modules/fast-path/src/fib/`.
 
@@ -23,7 +23,7 @@ pub trait RouteSource: Send {
     /// shutdown.
     ///
     /// Phase 1 sink / shutdown types are intentionally unspecified
-    /// at the trait level — Phase 3 lands a concrete channel pair
+    /// at the trait level, Phase 3 lands a concrete channel pair
     /// under `crates/modules/fast-path/src/fib/` along with the
     /// BMP station impl.
     fn run(&mut self) -> Result<(), RouteSourceError>;
@@ -245,7 +245,7 @@ pub enum NeighEvent {
     /// redirected frames). Added in Phase 3.6; pre-3.6 the programmer
     /// wrote `0x00…00` here, which works on most switches but breaks
     /// policy tools that inspect src_mac. `[0; 6]` is still a valid
-    /// value when the resolver couldn't look up the egress MAC — the
+    /// value when the resolver couldn't look up the egress MAC, the
     /// programmer writes whatever's provided.
     Learned {
         ip: IpAddr,

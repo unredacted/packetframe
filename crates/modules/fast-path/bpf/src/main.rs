@@ -55,7 +55,7 @@ const PROTO_ICMPV6: u8 = IpProto::Ipv6Icmp as u8;
 /// 802.1Q reserves VID 0 for priority-only tagging, so `vid == 0`
 /// means absent from the fast-path's perspective. Using a single u16
 /// instead of `Option<u16>` keeps the value in one register across
-/// function-call boundaries — the verifier chokes on Option<u16>
+/// function-call boundaries, the verifier chokes on Option<u16>
 /// because the inner-value register is uninitialized on the None
 /// branch, failing with `Rn !read_ok` after argument spills.
 const VLAN_NONE: u16 = 0;
@@ -79,7 +79,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     // bug (SPEC §11.1(c)). The driver passes
     // `xdp_prepare_buff(&xdp, hard_start, data - hard_start, seg_size, false)`
     // with `data` pointing at `buffer_start`, 128 bytes before the
-    // actual packet — so `xdp->data` is headroom and `xdp->data_end`
+    // actual packet, so `xdp->data` is headroom and `xdp->data_end`
     // is `seg_size` bytes past `buffer_start`, which cuts off the
     // last 128 bytes of the frame. Rebalance both pointers: skip 128
     // bytes of leading headroom and extend the tail 128 bytes to
@@ -97,7 +97,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
             return xdp_action::XDP_PASS;
         }
         // `adjust_tail(+128)` can fail if the current frame is close
-        // to `xdp->frame_sz` — unlikely on rvu-nicpf (rbsize is 2048+)
+        // to `xdp->frame_sz`, unlikely on rvu-nicpf (rbsize is 2048+)
         // for MTU-sized traffic. `XDP_PASS` on failure preserves the
         // invariant that the kernel never sees a frame the fast path
         // has half-mutated (SPEC §11.13).
@@ -119,7 +119,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
 
 /// Read the `FpCfg.flags` byte via the CFG array map and check
 /// whether `bit` is set. Returns `false` if the map is somehow empty
-/// (shouldn't happen — userspace always populates it before attach).
+/// (shouldn't happen, userspace always populates it before attach).
 #[inline(always)]
 unsafe fn cfg_has_flag(bit: u8) -> bool {
     CFG.get(0).map(|c| c.flags & bit != 0).unwrap_or(false)
@@ -144,7 +144,7 @@ fn try_fast_path(ctx: &XdpContext) -> Result<u32, ()> {
         // Low 12 bits are the VID. Legal VIDs are 1..4094; 0 and 4095
         // are reserved. A VID of 0 here would collide with VLAN_NONE,
         // so treat it as absent (matches 802.1Q's "priority-only" tag
-        // semantics — we don't fast-path those either).
+        // semantics, we don't fast-path those either).
         let vid = tci & 0x0fff;
         let inner = unsafe { (*vlan).inner_ether_type };
         (inner, EthHdr::LEN + VLAN_HDR_LEN, vid)
@@ -210,7 +210,7 @@ fn handle_ipv4(
 
     // v0.2.1 issue #33: bogon block. After allowlist match (so we only
     // affect traffic we'd otherwise touch), check if dst falls in any
-    // operator-declared `block-prefix`. If so, drop here — saves the
+    // operator-declared `block-prefix`. If so, drop here, saves the
     // skb allocation, netfilter walk, and conntrack entry that this
     // packet would otherwise burn just to be RST'd by upstream. Empty
     // map (default config) → LPM lookup misses cheaply, no perf impact.
@@ -255,7 +255,7 @@ fn handle_ipv4(
     // elements are pre-zeroed at map creation by the kernel; we only
     // ever write the input fields the kernel reads. This sidesteps
     // LLVM's stack zero-init optimization that lowers adjacent zero
-    // stores into `memset` libcalls — those become bpf-to-bpf
+    // stores into `memset` libcalls, those become bpf-to-bpf
     // subprogram calls, which combined with `bpf_tail_call` violates
     // the kernel verifier's
     //   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
@@ -368,7 +368,7 @@ fn handle_ipv6(
 
     let (sport, dport) = l4_ports(ctx, ip_offset + Ipv6Hdr::LEN, next);
 
-    // Option F dispatch — see handle_ipv4 for commentary, including the
+    // Option F dispatch, see handle_ipv4 for commentary, including the
     // port byte-swap rationale.
     let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
     let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
@@ -480,7 +480,7 @@ fn forward_success(
     ingress_vid: u16,
 ) -> Result<u32, ()> {
     // Resolve the egress port's expected tagging. If `ifindex` is
-    // recorded in `vlan_resolve`, it's a VLAN subif — redirect to the
+    // recorded in `vlan_resolve`, it's a VLAN subif, redirect to the
     // physical parent and push/rewrite to the recorded VID. Otherwise
     // the target is physical/untagged.
     let (egress_ifindex, egress_vid) = match unsafe { VLAN_RESOLVE.get(&ifindex) } {
@@ -488,7 +488,7 @@ fn forward_success(
         None => (ifindex, VLAN_NONE),
     };
 
-    // Defensive devmap pre-check (§4.4 step 9d) — **before any packet
+    // Defensive devmap pre-check (§4.4 step 9d), **before any packet
     // mutation**. A prior version rewrote L2 + ran VLAN choreography
     // first, then decided to XDP_PASS when the egress ifindex wasn't
     // in REDIRECT_DEVMAP. That handed the kernel a mangled packet
@@ -501,7 +501,7 @@ fn forward_success(
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // TTL/hop_limit + csum — IP header's position in memory doesn't
+    // TTL/hop_limit + csum, IP header's position in memory doesn't
     // change with adjust_head, only its offset from `data`. Safe to do
     // before VLAN choreography (which lives in finalize).
     if is_v4 {
@@ -529,7 +529,7 @@ fn forward_success(
             (*mctx_ptr).ingress_vid = ingress_vid;
             (*mctx_ptr).ip_offset = ip_offset as u32;
             // is_v4 is u32 (no padding); low byte holds the bool.
-            // Single u32 store — LLVM has no adjacent zero stores to
+            // Single u32 store, LLVM has no adjacent zero stores to
             // merge into a memset libcall.
             (*mctx_ptr).is_v4 = u32::from(u8::from(is_v4));
         }
@@ -543,7 +543,7 @@ fn forward_success(
 
     // tail_call returns Err on slot-empty / invalid; on success it
     // doesn't return at all (control transfers to finalize). The Err
-    // branch is fail-safe — if userspace's populate_mutation_progs
+    // branch is fail-safe, if userspace's populate_mutation_progs
     // somehow skipped slot 0, traffic falls through to kernel rather
     // than getting silently dropped.
     let _ = unsafe { MUTATION_PROGS.tail_call(ctx, 0) };
@@ -553,7 +553,7 @@ fn forward_success(
 
 /// Dispatch on a [`fib::CustomFibResult`] returned by the custom-FIB
 /// path. Maps the four action codes into the same XDP verdicts
-/// `dispatch_fib` returns for the equivalent kernel-FIB outcomes —
+/// `dispatch_fib` returns for the equivalent kernel-FIB outcomes
 /// so the allowlist / dry-run / VLAN-resolve plumbing upstream and
 /// downstream is unchanged whether we took the kernel or custom path.
 #[inline(always)]
@@ -604,11 +604,11 @@ fn compare_and_bump(
     let kernel_forwards = kernel_ret == BPF_FIB_LKUP_RET_SUCCESS;
     let custom_forwards = custom.action == fib::FIB_ACTION_FORWARD;
     let agree = if kernel_forwards && custom_forwards {
-        // Both forward — compare the decision tuple.
+        // Both forward, compare the decision tuple.
         kernel_fib.ifindex == custom.egress_ifindex && kernel_fib.dmac == custom.dmac
     } else {
         // Both non-forward is "agree" (both defer upstream). Any
-        // mix — one forwards while the other doesn't — is disagree.
+        // mix, one forwards while the other doesn't, is disagree.
         !kernel_forwards && !custom_forwards
     };
     if agree {

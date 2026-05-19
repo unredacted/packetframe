@@ -6,7 +6,7 @@
 //! section until the next section header. Unknown directives are fatal.
 //!
 //! Interface-existence checks for `attach` directives are performed by
-//! [`Config::validate_interfaces`] rather than the parser — the parser stays
+//! [`Config::validate_interfaces`] rather than the parser, the parser stays
 //! pure so it can run in contexts without `/sys/class/net` (tests, non-root,
 //! cross-host audit).
 
@@ -70,7 +70,7 @@ pub struct GlobalConfig {
     pub state_dir: PathBuf,
     /// Pause between per-iface attaches during `packetframe run` to let
     /// each link settle before the next attach touches the driver. See
-    /// SPEC.md §11.8 — on some drivers (rvu-nicpf observed) XDP attach
+    /// SPEC.md §11.8, on some drivers (rvu-nicpf observed) XDP attach
     /// briefly bounces the link, and attaching two bridge slaves of the
     /// same bridge inside one STP reconvergence window can trigger an
     /// L2 loop. Default 2s. `0s` disables.
@@ -151,14 +151,14 @@ pub enum ModuleDirective {
     /// /24 with an unresolvable next-hop (a self-IP for direct-origin
     /// routes), so without per-host /32 entries the LPM lookup hits
     /// the /24 with `state=Incomplete` and bumps `custom_fib_no_neigh`
-    /// — XDP_PASS to kernel for every packet. With a `local-prefix`
+    /// XDP_PASS to kernel for every packet. With a `local-prefix`
     /// directive, [`NetlinkNeighborResolver`] walks the kernel's
     /// neighbour table for IPs within `cidr` reachable via `iface`
     /// and synthesizes per-/32 `RouteEvent::Add { peer_id: LocalArp,
     /// prefix: /32, nexthops: [host_ip] }` events into FibProgrammer.
     /// The host's own MAC (already in the kernel ARP cache) is what
     /// `state=Resolved` writes into `NEXTHOPS[id].dst_mac`, and the
-    /// /32 wins in the LPM walk over the /24 from the BGP feed —
+    /// /32 wins in the LPM walk over the /24 from the BGP feed
     /// inbound packets to that customer fast-path via `bpf_redirect_map`.
     /// New in v0.2.1; complements the BgpListener fallback fix.
     LocalPrefix {
@@ -186,7 +186,7 @@ pub enum ModuleDirective {
     /// know (RFC 1918, CGNAT, test-net, anything outside DFZ) misses
     /// LPM, falls to slow path, and clogs conntrack with flows that
     /// just get dropped upstream anyway. With this fallback, those
-    /// packets XDP-redirect to upstream — same upstream behavior,
+    /// packets XDP-redirect to upstream, same upstream behavior,
     /// but conntrack stays out of it.
     FallbackDefault {
         iface: String,
@@ -197,7 +197,7 @@ pub enum ModuleDirective {
     /// falls in `block-prefix <cidr>` AND the packet is otherwise
     /// allowlist-matched, the program returns `XDP_DROP` rather than
     /// XDP_PASS-to-kernel. Used to drop traffic toward bogons /
-    /// RFC 1918 / CGNAT — destinations that would just get RST'd
+    /// RFC 1918 / CGNAT, destinations that would just get RST'd
     /// upstream anyway, but currently waste skb allocation +
     /// netfilter walk + conntrack capacity. Operator opt-in: empty
     /// list = no behavior change.
@@ -210,15 +210,15 @@ pub enum ModuleDirective {
     /// fire on fast-pathed flows because XDP redirect bypasses
     /// netfilter. Four grammars:
     ///
-    /// - `mss-clamp <mtu>` — global default for all matched TCP SYNs
-    /// - `mss-clamp via <iface> <mtu>` — per-egress-iface
-    /// - `mss-clamp <cidr> <mtu>` — per-src-or-dst-prefix (any egress)
-    /// - `mss-clamp <cidr> via <iface> <mtu>` — most specific
+    /// - `mss-clamp <mtu>`, global default for all matched TCP SYNs
+    /// - `mss-clamp via <iface> <mtu>`, per-egress-iface
+    /// - `mss-clamp <cidr> <mtu>`, per-src-or-dst-prefix (any egress)
+    /// - `mss-clamp <cidr> via <iface> <mtu>`, most specific
     ///
     /// Lookup precedence at XDP runtime, most specific wins:
     /// `(prefix + iface)` then `prefix` then `iface` then `global`.
     /// Prefix matches on src OR dst (mirrors `allow-prefix`).
-    /// Lower-if-higher policy — only rewrites when the SYN's existing
+    /// Lower-if-higher policy, only rewrites when the SYN's existing
     /// MSS is greater than the configured clamp (matches iptables
     /// `TCPMSS --set-mss` semantics).
     MssClamp {
@@ -231,7 +231,7 @@ pub enum ModuleDirective {
     CircuitBreaker(CircuitBreakerSpec),
     /// Operator override for a driver-specific workaround. Currently
     /// the only defined knob is `rvu-nicpf-head-shift` (SPEC
-    /// §11.1(c)) — see [`DriverWorkaround`] for the axes.
+    /// §11.1(c)), see [`DriverWorkaround`] for the axes.
     DriverWorkaround(DriverWorkaround),
     // --- Custom FIB (Option F, Phase 1) ---
     /// Selects the forwarding lookup path. `kernel-fib` (default)
@@ -240,14 +240,14 @@ pub enum ModuleDirective {
     /// runs both and bumps CompareAgree/CompareDisagree (pre-cutover
     /// validation, temporary).
     ForwardingMode(ForwardingMode),
-    /// RouteSource configuration — where the custom FIB gets its
+    /// RouteSource configuration, where the custom FIB gets its
     /// routes. Two kinds: `bmp <addr>:<port>` and `bgp <addr>:<port>
     /// local-as <asn> peer-as <asn>`. Spawned by the RouteController
     /// when this is set and `forwarding-mode` is `custom-fib` or
     /// `compare`. See [`RouteSourceSpec`] for the per-kind shape.
     RouteSource(RouteSourceSpec),
     /// Max entries for the custom-FIB LPM tries and side arrays.
-    /// Accepted but **not yet runtime-applied** — aya / kernel
+    /// Accepted but **not yet runtime-applied**, aya / kernel
     /// allocate maps at compile-time sizes set in
     /// `crates/modules/fast-path/bpf/src/maps.rs`. The directive is
     /// preserved for operator config forward-compatibility; actual
@@ -259,7 +259,7 @@ pub enum ModuleDirective {
     EcmpDefaultHashMode(EcmpHashMode),
 }
 
-/// One side of the [`ModuleDirective::MssClamp`] discriminator —
+/// One side of the [`ModuleDirective::MssClamp`] discriminator
 /// either an IPv4 or IPv6 prefix. Userspace dispatches on this when
 /// populating the `MSS_CLAMP_V4` / `MSS_CLAMP_V6` LPM tries.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -269,7 +269,7 @@ pub enum MssClampPrefix {
     V6(Ipv6Prefix),
 }
 
-/// Forwarding-path selector. `KernelFib` keeps today's behavior —
+/// Forwarding-path selector. `KernelFib` keeps today's behavior
 /// bpf_fib_lookup() and the legacy success path. `CustomFib` routes
 /// through the Option-F LPM trie + nexthop cache. `Compare` runs
 /// both and bumps disagreement counters; the kernel result is
@@ -299,7 +299,7 @@ impl FromStr for ForwardingMode {
 
 /// RouteSource configuration. Two impls today: BMP and iBGP. BGP
 /// is the recommended forwarding feed because bird's BMP
-/// implementation lacks RFC 9069 Loc-RIB — see
+/// implementation lacks RFC 9069 Loc-RIB, see
 /// `route_source_bgp.rs` module docs and
 /// `docs/runbooks/custom-fib.md` for the rationale.
 ///
@@ -323,7 +323,7 @@ pub enum RouteSourceSpec {
     /// with peer_type = 3 (RFC 9069 Loc-RIB Instance Peer) are
     /// accepted; pre/post-policy frames cause the session to be
     /// torn down with an error. **This is required for safe use
-    /// against pre/post-policy emitters** like bird 2.x — without
+    /// against pre/post-policy emitters** like bird 2.x, without
     /// it, multiple peers' Adj-RIB-In streams would race-overwrite
     /// per-prefix nexthops in the FIB and produce silent
     /// wrong-forwarding. See module docs in
@@ -344,7 +344,7 @@ pub enum RouteSourceSpec {
         /// (must be empty) when `allow_remote` is false.
         peer_from: Vec<ipnet::IpNet>,
     },
-    /// iBGP listener — packetframe accepts an iBGP session from
+    /// iBGP listener, packetframe accepts an iBGP session from
     /// bird and ingests UPDATEs as bird's selected best paths.
     /// `local_as`/`peer_as` are typically equal (iBGP within one AS);
     /// `router_id` defaults to `addr` when not specified.
@@ -371,7 +371,7 @@ pub enum RouteSourceSpec {
 }
 
 /// One `fib-*-max-entries` directive. Parsed but not runtime-applied
-/// — see the doc on [`ModuleDirective::FibSize`].
+/// see the doc on [`ModuleDirective::FibSize`].
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum FibSizeDirective {
     FibV4MaxEntries(u32),
@@ -540,7 +540,7 @@ pub struct CircuitBreakerSpec {
     pub threshold: u32,
 }
 
-// CircuitBreakerSpec is Eq-by-bit-pattern if you squint at the f64 — but we
+// CircuitBreakerSpec is Eq-by-bit-pattern if you squint at the f64, but we
 // don't rely on it. Implement a tolerant Eq for tests without going through
 // f64::total_cmp.
 impl Eq for CircuitBreakerSpec {}
@@ -549,7 +549,7 @@ impl Eq for CircuitBreakerSpec {}
 #[serde(rename_all = "lowercase")]
 pub enum CircuitBreakerDenominator {
     Matched,
-    // Rx — reserved, parser rejects with a clear error in v0.0.1.
+    // Rx, reserved, parser rejects with a clear error in v0.0.1.
 }
 
 /// Minimal humantime-like serializer for Duration, so the report JSON shows
@@ -580,8 +580,8 @@ impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         // Pre-flight size check via metadata so we never `read_to_string`
-        // a runaway file. Symlinks are followed deliberately — operators
-        // do symlink configs in deploy layouts — but a deeply nested
+        // a runaway file. Symlinks are followed deliberately, operators
+        // do symlink configs in deploy layouts, but a deeply nested
         // attacker-pointed symlink chain bottoms out at a real file
         // whose size we can still measure here.
         if let Ok(meta) = fs::metadata(path) {
@@ -654,7 +654,7 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
     // `global` and `module` are reserved keywords: they are always parsed as
     // section headers regardless of indentation. Per SPEC.md §6, leading
     // whitespace is ignored, so we can't use indent to disambiguate. Module
-    // directives must therefore never be named "global" or "module" — fine,
+    // directives must therefore never be named "global" or "module", fine,
     // since the grammar enumerates them and does neither.
     for (idx, raw_line) in input.lines().enumerate() {
         let line = idx + 1;
@@ -1079,7 +1079,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::BlockPrefix { cidr: p, line })
         }
         "mss-clamp" => {
-            // v0.2.4+ — four grammars accepted:
+            // v0.2.4+, four grammars accepted:
             //   mss-clamp <mtu>
             //   mss-clamp via <iface> <mtu>
             //   mss-clamp <cidr> <mtu>
@@ -1154,7 +1154,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let mss: u16 = mss_tok.parse().map_err(|e| {
                 ConfigError::parse(line, format!("mss-clamp: bad MTU `{mss_tok}`: {e}"))
             })?;
-            // 88 = TCP/IP minimum (RFC 879/1122 — 40-byte v4+TCP
+            // 88 = TCP/IP minimum (RFC 879/1122, 40-byte v4+TCP
             // header on a 128-byte frame, less than 88 starts breaking
             // assumptions). 65495 = max ethernet payload minus a v4 +
             // TCP header (65535 - 40). Outside this range is almost
@@ -1463,7 +1463,7 @@ fn parse_route_source<'a>(
 }
 
 /// Cross-check that the listen address and the authorization opt-in
-/// agree. The rules — same shape for both kinds:
+/// agree. The rules, same shape for both kinds:
 ///
 /// - Loopback address (127.0.0.0/8, ::1): default-allow with no
 ///   extra keywords. `allow-remote`, `peer-from`, and `peer-ip` are
@@ -1471,7 +1471,7 @@ fn parse_route_source<'a>(
 ///   ::1 to gate on.
 /// - Non-loopback address: requires `allow-remote` AND at least one
 ///   `peer-from <cidr>`. Without those, the listener would accept
-///   any TCP connection that reaches the port and inject routes —
+///   any TCP connection that reaches the port and inject routes
 ///   which the audit (May 2026) flagged as the highest-severity
 ///   finding.
 ///
@@ -2327,7 +2327,7 @@ module fast-path
     #[test]
     fn route_source_bgp_non_loopback_requires_opt_in() {
         // Binding 0.0.0.0 without `allow-remote` is the failure mode
-        // the audit (May 2026) flagged as Critical — any TCP-reachable
+        // the audit (May 2026) flagged as Critical, any TCP-reachable
         // host could speak iBGP and inject routes. Reject at parse
         // time so the operator can't silently misconfigure into the
         // unsafe state.
@@ -2407,7 +2407,7 @@ module fast-path
 
     #[test]
     fn route_source_bgp_peer_from_without_allow_remote_on_loopback_errors() {
-        // Loopback listen + peer-from is a config contradiction — the
+        // Loopback listen + peer-from is a config contradiction, the
         // ACL has no work to do because all accepted connections come
         // from 127.x. Catching this at parse-time tells the operator
         // their intent is unclear before the daemon starts.
@@ -2502,7 +2502,7 @@ module fast-path
 
     #[test]
     fn route_source_ipv6_loopback_accepts_default() {
-        // The IPv6 loopback (::1) must round-trip the same as 127.x —
+        // The IPv6 loopback (::1) must round-trip the same as 127.x
         // a default-permissive bind that doesn't need allow-remote.
         match extract_route_source("  route-source bgp [::1]:1179 local-as 1 peer-as 1\n") {
             RouteSourceSpec::Bgp { addr, .. } => assert_eq!(addr, "[::1]"),
@@ -2582,7 +2582,7 @@ module fast-path
         let e = parse_module_body("  local-prefix 10.0.0.0/24 via has space\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
-                // "has space" — the parser splits on whitespace so the
+                // "has space", the parser splits on whitespace so the
                 // second token is `space`. Either error is acceptable;
                 // they both flag a problem.
                 assert!(
@@ -2777,7 +2777,7 @@ module fast-path
 
     #[test]
     fn local_prefix_arp_scavenge_accepts_slash22_boundary() {
-        // /22 = 1024 hosts is the boundary — should be allowed.
+        // /22 = 1024 hosts is the boundary, should be allowed.
         let m =
             parse_module_body("  local-prefix 10.0.0.0/22 via br0 arp-scavenge\n").expect("parse");
         assert_eq!(m.directives.len(), 1);

@@ -36,7 +36,7 @@ use packetframe_fast_path::{
 };
 
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs`. Must track
-/// `linux_impl::FpCfg` — if you change one, change both (and both's
+/// `linux_impl::FpCfg`, if you change one, change both (and both's
 /// ordering in the StatIdx enum at the same time).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -121,7 +121,7 @@ impl Harness {
     /// jumps into finalize. Panics if BPF isn't built or the verifier
     /// rejects either program.
     ///
-    /// `bpf_prog_test_run` follows tail-calls — the kernel re-enters
+    /// `bpf_prog_test_run` follows tail-calls, the kernel re-enters
     /// its BPF dispatcher for the target program, so tests that issue
     /// `harness.run(&packet)` see the verdict + mutations from the full
     /// chain (fast_path → finalize) when the packet is a successful
@@ -266,7 +266,7 @@ impl Harness {
     }
 
     /// Set a nexthop entry's state to something other than `Resolved`
-    /// — tests exercising the `NoNeigh` path use this.
+    /// tests exercising the `NoNeigh` path use this.
     pub fn set_nexthop_state(&mut self, idx: u32, state: u8) {
         let map = self.bpf.map_mut("NEXTHOPS").expect("NEXTHOPS map");
         let mut arr: Array<_, NexthopEntry> = Array::try_from(map).expect("NEXTHOPS try_from");
@@ -445,7 +445,7 @@ fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
     // `mem::zeroed` over a struct-literal init: the kernel's CHECK_ATTR
     // macro validates that bytes past `batch_size` (the last field of
     // the TEST_RUN variant) are zero. A `#[derive(Default)]` init only
-    // zeros named fields — the 4 bytes of trailing padding we carry to
+    // zeros named fields, the 4 bytes of trailing padding we carry to
     // hit 8-byte alignment stay uninitialized and land as garbage in
     // the attr buffer → kernel 6.0+ returns EINVAL with no log. Zeroing
     // the whole buffer first is the fix.
@@ -662,7 +662,7 @@ impl Ipv6TcpBuilder {
                 pkt.extend_from_slice(&self.payload);
             }
             _ => {
-                // Extension header or unknown — caller-supplied payload only.
+                // Extension header or unknown, caller-supplied payload only.
                 pkt.extend_from_slice(&self.payload);
             }
         }

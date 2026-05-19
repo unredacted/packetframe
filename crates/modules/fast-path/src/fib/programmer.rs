@@ -1,4 +1,4 @@
-//! FibProgrammer — owns the BPF FIB write path (NEXTHOPS seqlock,
+//! FibProgrammer, owns the BPF FIB write path (NEXTHOPS seqlock,
 //! FIB_V4 / FIB_V6 LPM tries, ECMP_GROUPS dedup) and the userspace
 //! mirror state.
 //!
@@ -38,7 +38,7 @@
 //!      NeighEvents, Commands, the default-route reclaim tick, and
 //!      shutdown.
 //!
-//! All mirror state lives inside the run task — no mutex on the hot
+//! All mirror state lives inside the run task, no mutex on the hot
 //! path. Commands are serialized through a command mpsc; replies
 //! travel back via oneshot channels.
 
@@ -158,7 +158,7 @@ impl FibProgrammerHandle {
 
     /// Blocking variant for callers not already on the tokio runtime
     /// (e.g., integration tests driving the programmer from a sync
-    /// thread). Panics if called from within a tokio context — use
+    /// thread). Panics if called from within a tokio context, use
     /// `register_nexthop` there instead.
     pub fn register_nexthop_blocking(&self, ip: IpAddr) -> Result<NexthopId, ProgrammerError> {
         let (tx, rx) = oneshot::channel();
@@ -195,7 +195,7 @@ impl FibProgrammerHandle {
 
     /// Return the current `(v4, v6)` route mirror counts. Used by the
     /// integrity checker to diff against bird's `show route count`.
-    /// Reads the programmer's in-memory mirror, not the BPF maps —
+    /// Reads the programmer's in-memory mirror, not the BPF maps
     /// the mirror is the authoritative record of what the programmer
     /// believes it has written.
     pub async fn mirror_counts(&self) -> Result<(usize, usize), ProgrammerError> {
@@ -329,7 +329,7 @@ struct EcmpSignature {
 
 /// Reclaim queue entry for the default-route replace-by-swap path.
 /// `release_at` is the earliest instant at which it's safe to free
-/// the ID — an in-flight XDP program invocation may have read the
+/// the ID, an in-flight XDP program invocation may have read the
 /// old FibValue and be about to dereference this nexthop / group.
 #[derive(Debug)]
 struct PendingReclaim {
@@ -375,7 +375,7 @@ pub struct FibProgrammer {
     routes_v4: HashMap<([u8; 4], u8), RouteRecord>,
     routes_v6: HashMap<([u8; 16], u8), RouteRecord>,
     /// Per-peer index for O(1) PeerDown traversal. Values are keys
-    /// into `routes_v4` / `routes_v6` — the bool discriminates.
+    /// into `routes_v4` / `routes_v6`, the bool discriminates.
     /// `true` = v4, `false` = v6.
     routes_by_peer: HashMap<PeerId, HashSet<(bool, [u8; 16], u8)>>,
 
@@ -638,7 +638,7 @@ impl FibProgrammer {
         // Resolved. On miss it falls back to RTM_NEWNEIGH NUD_NONE
         // (proactive probe). Without this call, the only thing that
         // resolves a nexthop is a kernel ARP state-transition
-        // multicast — which never fires for entries that are
+        // multicast, which never fires for entries that are
         // already-stable REACHABLE. Pre-fix, ~95 % of BGP nexthops
         // stayed `incomplete` forever and forwarding silently fell
         // back to XDP_PASS for those routes.
@@ -1396,7 +1396,7 @@ impl FibProgrammer {
         if rec.refcount > 0 {
             return;
         }
-        // Fully freed — remove from mirror, push ID to free-list,
+        // Fully freed, remove from mirror, push ID to free-list,
         // tombstone the BPF slot.
         let signature = EcmpSignature {
             nh_ids_sorted: rec.nh_ids_sorted.clone(),

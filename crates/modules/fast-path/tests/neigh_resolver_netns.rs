@@ -8,7 +8,7 @@
 //!
 //! Not covered here:
 //!   - Proactive resolve (`request_resolve`): validating kernel ARP kick
-//!     from a netns test is fragile — would require an unresolved
+//!     from a netns test is fragile, would require an unresolved
 //!     nexthop on an interface with routed connectivity. The existing
 //!     best-effort fallback (first-packet kernel ARP) is validated by
 //!     the fact that `Add`-without-pre-seeded-neigh test below still
@@ -162,7 +162,7 @@ fn ns_run(netns: &str, cmd: &[&str]) {
 
 /// Move the current thread into the netns and return the owned
 /// /var/run/netns/<name> fd. Dropping the fd after the test is fine
-/// — the netns itself is torn down via `ip netns del` in NetnsGuard.
+/// the netns itself is torn down via `ip netns del` in NetnsGuard.
 fn enter_netns(netns: &str) -> OwnedFd {
     let path = format!("/var/run/netns/{netns}");
     let fd: OwnedFd = File::open(&path)
@@ -180,7 +180,7 @@ fn if_nametoindex(name: &str) -> u32 {
     idx
 }
 
-/// Read an iface's MAC via SIOCGIFHWADDR ioctl — netns-scoped because
+/// Read an iface's MAC via SIOCGIFHWADDR ioctl, netns-scoped because
 /// it goes through a socket (sysfs is not reliably remounted per-netns
 /// on every distro).
 fn mac_of(iface: &str) -> [u8; 6] {
@@ -223,7 +223,7 @@ fn resolver_emits_learned_with_src_mac_and_ifindex() {
     let names = Names::new();
     let _guard = NetnsGuard::setup(&names);
 
-    // Enter the netns on this thread — tokio's current-thread runtime
+    // Enter the netns on this thread, tokio's current-thread runtime
     // we build below runs on this thread, so all tokio-spawned tasks
     // inherit the netns. `setns` on a single thread is safe in a
     // multithreaded process per `man 2 setns`.

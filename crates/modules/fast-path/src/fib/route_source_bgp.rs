@@ -1,10 +1,10 @@
-//! BGP route source — receives bird's selected best paths over an
+//! BGP route source, receives bird's selected best paths over an
 //! iBGP session and translates UPDATEs into [`RouteEvent`]s for the
 //! FibProgrammer.
 //!
 //! **Why BGP and not BMP for the forwarding feed.** Bird's BMP
 //! implementation (as of bird master, April 2026) does not implement
-//! RFC 9069 Loc-RIB — only `monitoring rib in pre_policy` /
+//! RFC 9069 Loc-RIB, only `monitoring rib in pre_policy` /
 //! `post_policy`, which deliver per-peer Adj-RIB-In streams. For a
 //! prefix announced by N peers, that's N RouteMonitoring frames with
 //! N different nexthops, leaving the FibProgrammer to either
@@ -28,9 +28,9 @@
 //!
 //! **Capabilities advertised in OPEN.**
 //! - Multi-Protocol Extensions (RFC 4760) for IPv4 unicast and
-//!   IPv6 unicast — without this bird only sends v4 routes over
+//!   IPv6 unicast, without this bird only sends v4 routes over
 //!   the session.
-//! - Four-octet ASN (RFC 6793) — required for any modern AS
+//! - Four-octet ASN (RFC 6793), required for any modern AS
 //!   numbering when the local AS is greater than 65535.
 //! - ADD-PATH (RFC 7911) with Receive direction (Send/Receive
 //!   value 1) for both IPv4 unicast and IPv6 unicast. Peer-side
@@ -50,7 +50,7 @@
 //! KEEPALIVEs are sent at `effective_hold / 3`.
 //!
 //! **What we never send.** No UPDATE, no NOTIFICATION (we close on
-//! protocol error rather than send a structured NOTIFICATION — bird
+//! protocol error rather than send a structured NOTIFICATION, bird
 //! reconnects either way), no ROUTE-REFRESH (we don't advertise the
 //! capability).
 //!
@@ -82,7 +82,7 @@ use crate::fib::route_source_bmp::SharedIntegritySnapshot;
 
 // --- Wire constants ---------------------------------------------------------
 
-/// BGP message marker — 16 bytes of 0xFF per RFC 4271 §4.1.
+/// BGP message marker, 16 bytes of 0xFF per RFC 4271 §4.1.
 const BGP_MARKER: [u8; 16] = [0xFF; 16];
 
 /// Minimum BGP message length (header only, KEEPALIVE).
@@ -125,7 +125,7 @@ const FRAME_CHANNEL_CAPACITY: usize = 256;
 
 /// Cap on time spent waiting for the peer's OPEN after we send
 /// ours. RFC 4271's 120s ConnectRetry default applies to the
-/// *active* connector waiting for TCP to come up — we're the
+/// *active* connector waiting for TCP to come up, we're the
 /// passive side with TCP already established, where real peers
 /// send OPEN within milliseconds. 10s is comfortable headroom that
 /// still bounds the slowloris primitive a misconfigured (or
@@ -136,7 +136,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on iterations through one UPDATE's per-prefix elems. A
 /// single attacker-controlled UPDATE can encode tens of thousands
 /// of NLRI entries that bgpkit-parser's `Elementor` fans out into
-/// `BgpElem`s, each of which `apply_route_event().await`s — a
+/// `BgpElem`s, each of which `apply_route_event().await`s, a
 /// control-plane amplification primitive flagged by the audit
 /// (Slice 2). 8192 leaves comfortable headroom above any
 /// realistic bird best-path stream (a full v4 table is ~960K
@@ -153,7 +153,7 @@ pub struct BgpListenerConfig {
     pub peer_as: u32,
     pub router_id: Ipv4Addr,
     pub hold_time: u16,
-    /// CIDR ACL applied at `accept()`. Empty means "loopback only" —
+    /// CIDR ACL applied at `accept()`. Empty means "loopback only"
     /// the config parser only permits empty when `listen_addr` is
     /// loopback. When non-empty, every accepted source IP must fall
     /// within at least one entry or the connection is dropped before
@@ -184,7 +184,7 @@ impl BgpListenerConfig {
 }
 
 /// Whether `addr` is permitted by the listener's `peer_acl`. An empty
-/// ACL means "loopback only" — the config parser already enforces
+/// ACL means "loopback only", the config parser already enforces
 /// that empty + non-loopback listen is rejected, so an empty ACL
 /// implies the listener bound to loopback and only loopback sources
 /// can reach `accept()` in the first place. We still defensively
@@ -204,7 +204,7 @@ pub struct BgpListener {
     shutdown: CancellationToken,
     /// Shared atomic updated on each UPDATE frame. Unix seconds; 0 =
     /// none seen since process start. Read by the same stall monitor
-    /// that BmpStation uses — both feeds publish to the same signal.
+    /// that BmpStation uses, both feeds publish to the same signal.
     last_update_unix: Arc<AtomicI64>,
     stall_gate: Option<SharedIntegritySnapshot>,
 }
@@ -341,7 +341,7 @@ impl BgpListener {
                 let effective_peer_asn = negotiated.four_octet_asn.unwrap_or(peer_asn_2byte);
                 if effective_peer_asn != self.cfg.peer_as {
                     return Err(RouteSourceError::recoverable(format!(
-                        "peer ASN mismatch in OPEN: observed {effective_peer_asn} (2-byte field {peer_asn_2byte}, 4-octet cap {:?}), expected {} — closing session",
+                        "peer ASN mismatch in OPEN: observed {effective_peer_asn} (2-byte field {peer_asn_2byte}, 4-octet cap {:?}), expected {}, closing session",
                         negotiated.four_octet_asn, self.cfg.peer_as
                     )));
                 }
@@ -373,7 +373,7 @@ impl BgpListener {
             .await
             .map_err(|e| RouteSourceError::recoverable(format!("send KEEPALIVE: {e}")))?;
 
-        // Step 4: established — drain UPDATEs, send periodic
+        // Step 4: established, drain UPDATEs, send periodic
         // KEEPALIVEs, watch hold timer. Reader/writer split so the
         // main `select!` can interleave the keepalive timer without
         // cancel-safety issues on `read_exact`.
@@ -410,7 +410,7 @@ impl BgpListener {
                             self.process_msg(m, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await;
                         }
                         None => {
-                            // Reader exited — surface the result.
+                            // Reader exited, surface the result.
                             return match reader.await {
                                 Ok(Ok(())) => {
                                     debug!(updates_seen, "BGP stream done");
@@ -433,7 +433,7 @@ impl BgpListener {
                 }
                 _ = quiescence_tick.tick() => {
                     // Hold-timer expiry → tear down. RFC 4271: peer
-                    // dead, send NOTIFICATION (we skip — close
+                    // dead, send NOTIFICATION (we skip, close
                     // suffices; bird reconnects).
                     if Instant::now() >= hold_deadline {
                         return Err(RouteSourceError::recoverable(format!(
@@ -476,7 +476,7 @@ impl BgpListener {
     ) {
         match msg {
             BgpMessage::Open(_) => {
-                // Spurious post-handshake OPEN — bird shouldn't do
+                // Spurious post-handshake OPEN, bird shouldn't do
                 // this. Log + ignore.
                 warn!("unexpected OPEN after handshake");
             }
@@ -486,7 +486,7 @@ impl BgpListener {
             BgpMessage::Notification(n) => {
                 // BgpError is a typed enum (MessageHeaderError,
                 // OpenError, UpdateError, HoldTimerExpired, Cease, ...);
-                // log the Debug repr — operator can grep on it.
+                // log the Debug repr, operator can grep on it.
                 warn!(error = ?n.error, "received NOTIFICATION; closing session");
                 // Reader will see EOF after bird closes; that path
                 // emits Resync via the accept loop.
@@ -502,7 +502,7 @@ impl BgpListener {
 
                 // Pretend the peer-IP for Elementor is the listen
                 // address (bird-side IP isn't carried in BGP UPDATE
-                // — we know it from the connection, but Elementor
+                // we know it from the connection, but Elementor
                 // doesn't need an accurate value, just something
                 // stable for elem.peer_ip). For peer_asn we pass
                 // bird's observed ASN.
@@ -626,7 +626,7 @@ where
     }
 
     // ROUTE-REFRESH (type 5) is RFC 2918, optional. bgpkit-parser
-    // doesn't model it; skip silently — bird shouldn't send refresh
+    // doesn't model it; skip silently, bird shouldn't send refresh
     // requests to us anyway since we don't advertise the capability.
     if msg_type == MSG_TYPE_ROUTE_REFRESH {
         debug!("ignoring ROUTE-REFRESH");
@@ -720,7 +720,7 @@ pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8
     out
 }
 
-/// Build a KEEPALIVE — header only, 19 bytes.
+/// Build a KEEPALIVE, header only, 19 bytes.
 pub fn encode_keepalive() -> Vec<u8> {
     let mut out = Vec::with_capacity(BGP_HEADER_LEN);
     out.extend_from_slice(&BGP_MARKER);
@@ -745,7 +745,7 @@ struct NegotiatedCapabilities {
     /// Peer advertised ADD-PATH Send (or both) for (IPv6, unicast).
     add_path_v6_recv: bool,
     /// Peer's 4-octet ASN (RFC 6793) if it advertised the capability.
-    /// When `Some(_)`, this is the authoritative ASN — the 2-byte
+    /// When `Some(_)`, this is the authoritative ASN, the 2-byte
     /// `My AS` field in OPEN carries AS_TRANS (23456) and the real
     /// ASN comes through here. Used by the peer-AS gate in
     /// `handle_connection` (the audit-flagged identity check).
@@ -840,7 +840,7 @@ fn synthetic_peer_id(listen: SocketAddr, peer_asn: u32) -> PeerId {
 /// in `TIME_WAIT` for ~60 s, and the default `tokio::net::TcpListener::bind`
 /// fails the new bind during that window. The error currently propagates
 /// out of `BgpListener::run` and the controller's `JoinHandle` swallows
-/// it — leaving the rest of packetframe running with a dead BGP feed
+/// it, leaving the rest of packetframe running with a dead BGP feed
 /// and no operator-visible signal short of bird's "Connection refused"
 /// state. `SO_REUSEADDR` lets the new bind succeed even with lingering
 /// TIME_WAIT state.
@@ -880,7 +880,7 @@ fn asn_to_u32(asn: Asn) -> u32 {
 /// Translate one parsed BGP element (announce or withdraw of a single
 /// prefix) into a [`RouteEvent`] for the FibProgrammer. Returns `None`
 /// when the element's prefix can't be represented in our [`IpPrefix`]
-/// type — graceful skip; bgpkit-parser's [`Elementor`] occasionally
+/// type, graceful skip; bgpkit-parser's [`Elementor`] occasionally
 /// emits malformed prefixes from withdraw NLRIs and we don't want
 /// those to crash the session.
 ///
@@ -888,13 +888,13 @@ fn asn_to_u32(asn: Asn) -> u32 {
 /// dropping bird's `protocol direct` exports. Direct-origin (and
 /// static-origin) routes go out via iBGP without an explicit BGP
 /// NEXT_HOP attribute when the bird-side BGP block has no
-/// `next hop self` directive — there's no upstream eBGP next-hop
+/// `next hop self` directive, there's no upstream eBGP next-hop
 /// to preserve, and bird doesn't synthesize one. bgpkit-parser's
 /// `Elementor::bgp_update_to_elems` returns `next_hop = None` for
 /// those announces.
 ///
 /// Pre-v0.2.1 we silently `continue`d on `None`, so connected /24s
-/// bird was correctly exporting never landed in `FIB_V4` at all —
+/// bird was correctly exporting never landed in `FIB_V4` at all
 /// the prefix wasn't present for XDP to LPM-match. Operator-visible
 /// symptom: `matched_dst_only` inbound to customer /24s all bumped
 /// `custom_fib_miss` instead of `custom_fib_no_neigh`, and the FIB
@@ -904,7 +904,7 @@ fn asn_to_u32(asn: Asn) -> u32 {
 /// The chosen fallback is the BGP session's listen address (typically
 /// `127.0.0.1` for the loopback iBGP setup). The neighbor resolver
 /// can't get a useful MAC for loopback, so the route lands with
-/// `state=Incomplete` — operationally the same XDP_PASS-to-kernel as
+/// `state=Incomplete`, operationally the same XDP_PASS-to-kernel as
 /// the silent-drop, but now the prefix exists in `FIB_V4`, the
 /// nexthop counter (`custom_fib_no_neigh`) reflects reality, and
 /// integrity drift goes away. Phase B (`local-prefix` ARP-walk)

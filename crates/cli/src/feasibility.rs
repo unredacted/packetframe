@@ -1,7 +1,8 @@
 //! Feasibility subcommand glue: run SPEC.md §2.1 probes and render the
-//! report either as JSON (default) or as a human table. PR #4 adds the
-//! per-interface XDP trial-attach probe (§2.3) for each `attach`ed iface
-//! in the config — graduates from Deferred to a real check.
+//! report either as JSON (default) or as a human table. A per-interface
+//! XDP trial-attach probe (§2.3) runs for each `attach`ed iface in the
+//! config; it graduates the per-iface attach feasibility from Deferred
+//! to a real pass/fail check.
 
 use std::path::Path;
 
@@ -32,7 +33,7 @@ pub fn attach_ifaces_from_config(config: &Config) -> Vec<String> {
 pub fn probe_and_render(bpffs_root: &Path, attach_ifaces: &[String], human: bool) -> Rendered {
     let mut report = run_probes(bpffs_root);
 
-    // Graduate §2.3 per-interface trial-attach probe from Deferred —
+    // Graduate §2.3 per-interface trial-attach probe from Deferred
     // remove the placeholder entry and replace with real per-iface
     // verdicts.
     report
@@ -176,7 +177,7 @@ fn print_human(report: &FeasibilityReport) {
 
     println!();
     if report.passed {
-        println!("Result: PASS — all required capabilities present.");
+        println!("Result: PASS, all required capabilities present.");
     } else {
         let failing: Vec<&Capability> = report
             .capabilities
@@ -184,7 +185,7 @@ fn print_human(report: &FeasibilityReport) {
             .filter(|c| c.required && c.status != CapabilityStatus::Pass)
             .collect();
         println!(
-            "Result: FAIL — {} required capabilit{} missing or unknown:",
+            "Result: FAIL, {} required capabilit{} missing or unknown:",
             failing.len(),
             if failing.len() == 1 { "y" } else { "ies" },
         );

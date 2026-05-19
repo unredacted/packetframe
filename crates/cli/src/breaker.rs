@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use packetframe_common::config::CircuitBreakerSpec;
 use packetframe_fast_path::breaker::{CircuitBreaker, Decision};
 
-/// Shutdown-check granularity — how often the sampler wakes between
+/// Shutdown-check granularity, how often the sampler wakes between
 /// window ticks to check for shutdown.
 const POLL: Duration = Duration::from_millis(250);
 

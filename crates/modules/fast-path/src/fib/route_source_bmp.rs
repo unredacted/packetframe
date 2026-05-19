@@ -1,4 +1,4 @@
-//! BMP station — the concrete `RouteSource` that receives bird's
+//! BMP station, the concrete `RouteSource` that receives bird's
 //! Loc-RIB (RFC 9069) over a BMP session and translates it into
 //! [`RouteEvent`]s delivered to the FibProgrammer.
 //!
@@ -19,7 +19,7 @@
 //! `length - 6` bytes of body, hand the whole frame to
 //! `parse_bmp_msg`. Framing runs in a dedicated task so the main
 //! event loop's `select!` can interleave a quiescence timer without
-//! cancel-safety issues — `read_exact` isn't cancel-safe, so running
+//! cancel-safety issues, `read_exact` isn't cancel-safe, so running
 //! it under a `select!` arm would desync the stream whenever the
 //! timer arm fired mid-read.
 //!
@@ -38,7 +38,7 @@
 //! False-positive risk: if bird is dumping so slowly that individual
 //! peers quiesce for > 5 s between batches, we fire early and GC
 //! mid-dump routes. Mitigation: the next Add events after InitComplete
-//! simply re-populate them — the programmer mirror gets rewritten.
+//! simply re-populate them, the programmer mirror gets rewritten.
 //! Operationally benign.
 
 #![cfg(target_os = "linux")]
@@ -83,7 +83,7 @@ const FRAME_CHANNEL_CAPACITY: usize = 256;
 
 /// Per-`read_exact` timeout on the BMP TCP stream. The reader task
 /// otherwise blocks forever on a peer that completed TCP handshake
-/// but never sent bytes (or sent a header but no body) — the
+/// but never sent bytes (or sent a header but no body), the
 /// audit-flagged slowloris primitive (Slice 2). 60 s is comfortable
 /// for legitimate bird (which sends initial RIB dumps in < 5 s) and
 /// tight enough to give the operator's stuck-session detection a
@@ -120,7 +120,7 @@ pub struct BmpStation {
     /// (which only emit pre/post-policy frames).
     require_loc_rib: bool,
     /// CIDR ACL applied at `accept()` time. Empty means "loopback
-    /// only" — the config parser only permits empty when
+    /// only", the config parser only permits empty when
     /// `listen_addr` is loopback. When non-empty, every accepted
     /// source IP must fall within at least one entry or the
     /// connection is dropped before the BMP framing starts.
@@ -158,7 +158,7 @@ impl BmpStation {
 
     /// Attach the integrity checker's snapshot so `run()` spawns a
     /// stall monitor alongside the accept loop. Without this, stall
-    /// detection is silent — appropriate for test harnesses that
+    /// detection is silent, appropriate for test harnesses that
     /// don't care about the alert path.
     pub fn with_stall_gate(mut self, snapshot: SharedIntegritySnapshot) -> Self {
         self.stall_gate = Some(snapshot);
@@ -168,7 +168,7 @@ impl BmpStation {
     /// Enable Loc-RIB-only safety mode: any RouteMonitoring frame
     /// with `peer_type != LocalRib` tears the session down with an
     /// error. Required when running against pre/post-policy emitters
-    /// like bird 2.x — see the `require_loc_rib` field doc.
+    /// like bird 2.x, see the `require_loc_rib` field doc.
     pub fn with_require_loc_rib(mut self) -> Self {
         self.require_loc_rib = true;
         self
@@ -186,7 +186,7 @@ impl BmpStation {
 
     /// Main loop: bind, accept, handle one connection at a time.
     /// On disconnect (clean or error), emit Resync so the programmer
-    /// marks all mirrored routes unseen — the next `RouteEvent::Add`
+    /// marks all mirrored routes unseen, the next `RouteEvent::Add`
     /// storm from the reconnect clears the marks; InitiationComplete
     /// (emitted by a quiescence timer inside `handle_connection`)
     /// GCs whatever never reappeared.
@@ -319,7 +319,7 @@ impl BmpStation {
                             }
                         }
                         None => {
-                            // Reader task exited — EOF or error. Join it
+                            // Reader task exited, EOF or error. Join it
                             // to surface any error, then return.
                             match reader.await {
                                 Ok(Ok(())) => {
@@ -364,11 +364,11 @@ impl BmpStation {
     }
 
     /// Dispatch on the BMP message body and fan out the appropriate
-    /// RouteEvents. Programmer errors are logged but not propagated —
+    /// RouteEvents. Programmer errors are logged but not propagated
     /// a single bad map write shouldn't kill the BMP connection when
     /// the next route might succeed.
     ///
-    /// **Returns Err only on session-fatal protocol violations** —
+    /// **Returns Err only on session-fatal protocol violations**
     /// today that's a RouteMonitoring frame whose peer_type isn't
     /// `LocalRib` while `require_loc_rib` is set. The caller closes
     /// the session and lets the peer reconnect.
@@ -464,7 +464,7 @@ impl BmpStation {
                             let nh = match elem.next_hop {
                                 Some(h) => h,
                                 None => {
-                                    debug!(?prefix, "announce without next_hop — skipping");
+                                    debug!(?prefix, "announce without next_hop, skipping");
                                     continue;
                                 }
                             };
@@ -508,7 +508,7 @@ impl BmpStation {
 /// Stall monitor: fires a warning log if no ROUTE MONITORING frame
 /// has arrived for [`STALL_THRESHOLD`] *and* the integrity check
 /// reports ≥1 Established BGP peer. The cross-check avoids a
-/// false-positive during a global bird outage — in that case the
+/// false-positive during a global bird outage, in that case the
 /// alert we'd actually want is "bird down," not "BMP stalled."
 ///
 /// Startup suppression: first [`STALL_STARTUP_SUPPRESSION`] of
@@ -517,7 +517,7 @@ impl BmpStation {
 /// here (and because the function has no other access to a clock
 /// reference point).
 ///
-/// Evaluation cadence is [`STALL_TICK`] — a real stall sits long
+/// Evaluation cadence is [`STALL_TICK`], a real stall sits long
 /// enough for any reasonable poll interval.
 async fn stall_monitor(
     last_rm_unix: Arc<AtomicI64>,
@@ -559,13 +559,13 @@ async fn stall_monitor(
                         // false-positives during bird downtime.
                         debug!(
                             quiet_seconds,
-                            "BMP quiet but integrity cache is cold — stall alert suppressed"
+                            "BMP quiet but integrity cache is cold, stall alert suppressed"
                         );
                     }
                     Some(0) => {
                         debug!(
                             quiet_seconds,
-                            "BMP quiet but bird reports zero Established peers — stall alert suppressed"
+                            "BMP quiet but bird reports zero Established peers, stall alert suppressed"
                         );
                     }
                     Some(n) => {
@@ -640,7 +640,7 @@ async fn reader_task(
         }
 
         // Reconstruct the full frame. `parse_bmp_msg` expects the
-        // header bytes at the front of the buffer — it re-reads
+        // header bytes at the front of the buffer, it re-reads
         // them to validate the version / type.
         let mut full = Vec::with_capacity(msg_len);
         full.extend_from_slice(&header_buf);
@@ -651,7 +651,7 @@ async fn reader_task(
             Ok(msg) => {
                 frames_parsed += 1;
                 if tx.send(msg).await.is_err() {
-                    // Main loop dropped the receiver — shutdown.
+                    // Main loop dropped the receiver, shutdown.
                     debug!(frames_parsed, "frame receiver closed; reader exiting");
                     return Ok(());
                 }
@@ -667,7 +667,7 @@ async fn reader_task(
 
 /// Derive a stable [`PeerId`] from a BMP per-peer header.
 /// `peer_ip + peer_distinguisher + peer_type` together uniquely
-/// identify one peer — two BGP sessions to the same peer IP that
+/// identify one peer, two BGP sessions to the same peer IP that
 /// differ in RD or peer-type hash to distinct IDs.
 fn peer_id_from_header(pph: &BmpPerPeerHeader) -> PeerId {
     let mut hasher = DefaultHasher::new();
@@ -701,7 +701,7 @@ fn asn_to_u32(asn: bgpkit_parser::models::Asn) -> u32 {
 }
 
 /// Whether `addr` is permitted by the listener's `peer_acl`. Empty
-/// ACL means "loopback only" — the config parser already enforces
+/// ACL means "loopback only", the config parser already enforces
 /// that empty + non-loopback listen is rejected, so an empty ACL
 /// implies loopback bind. The defensive `is_loopback()` check covers
 /// a misconstructed in-process config.
@@ -715,7 +715,7 @@ fn source_ip_permitted(addr: IpAddr, peer_acl: &[ipnet::IpNet]) -> bool {
 
 /// Bind a `TcpListener` with `SO_REUSEADDR` enabled (v0.2.2 fix). See
 /// the `bind_with_reuseaddr` doc in `route_source_bgp.rs` for the
-/// rationale — same problem class on both listeners.
+/// rationale, same problem class on both listeners.
 fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,

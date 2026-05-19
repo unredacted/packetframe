@@ -214,7 +214,7 @@ pub unsafe fn bpf_syscall(cmd: u32, attr: *const u8, size: u32) -> io::Result<i6
 /// host as unsupported without a build failure on dev laptops.
 ///
 /// # Safety
-/// Trivially safe — ignores all arguments.
+/// Trivially safe, ignores all arguments.
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_unsafe)]
 pub unsafe fn bpf_syscall(_cmd: u32, _attr: *const u8, _size: u32) -> io::Result<i64> {
@@ -259,7 +259,7 @@ pub struct ProgLoadOutcome {
 }
 
 /// Attempt to load a BPF program with a verifier log buffer. Returns outcome
-/// including the log content regardless of success — callers use the log to
+/// including the log content regardless of success, callers use the log to
 /// distinguish "helper unknown" vs "other verifier rejection".
 pub fn prog_load(prog_type: u32, insns: &[BpfInsn], license: &str) -> io::Result<ProgLoadOutcome> {
     let license_c = CString::new(license).expect("license has no NUL");
@@ -278,7 +278,7 @@ pub fn prog_load(prog_type: u32, insns: &[BpfInsn], license: &str) -> io::Result
     attr.insn_cnt = insns.len() as u32;
     attr.insns = insns.as_ptr() as u64;
     attr.license = license_c.as_ptr() as u64;
-    attr.log_level = 1; // BPF_LOG_LEVEL1 — emit verifier log
+    attr.log_level = 1; // BPF_LOG_LEVEL1, emit verifier log
     attr.log_size = log_buf.len() as u32;
     attr.log_buf = log_buf.as_mut_ptr() as u64;
 
