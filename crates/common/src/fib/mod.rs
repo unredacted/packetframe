@@ -52,14 +52,28 @@ pub enum RouteEvent {
     /// keys its per-advertisement state by `(peer_id, path_id)` so that
     /// multiple paths per prefix can coexist and be aggregated into an
     /// ECMP group.
+    ///
+    /// `local_pref` carries the BGP LOCAL_PREF attribute when the source
+    /// is a BGP-like protocol; `None` for non-BGP sources (netlink,
+    /// connected-fast-path seeding) and for BGP UPDATEs that omit the
+    /// attribute. The FibProgrammer filters the per-prefix NH union to
+    /// the maximum local-pref tier across the prefix's advertisements,
+    /// so operator-encoded preferences (e.g., IX peers at LP 150 vs
+    /// transit at LP 100) survive ADD-PATH aggregation: ECMP forms
+    /// within a tier, not across tiers. Missing local_pref is treated
+    /// as RFC 4271's default of 100.
     Add {
         peer_id: PeerId,
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
         path_id: Option<u32>,
+        local_pref: Option<u32>,
     },
     /// Route withdrawal. `path_id` matches the `Add` it pairs with;
-    /// see [`RouteEvent::Add`] for semantics.
+    /// see [`RouteEvent::Add`] for semantics. `local_pref` is not part
+    /// of the withdrawal key because the FibProgrammer looks up the
+    /// advertisement by `(peer_id, path_id)` and removes it regardless
+    /// of its stored LP.
     Del {
         peer_id: PeerId,
         prefix: IpPrefix,

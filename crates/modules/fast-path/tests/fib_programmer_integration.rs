@@ -265,6 +265,7 @@ fn add_single_nexthop_route_writes_fib_v4() {
                 prefix,
                 nexthops: vec![nh],
                 path_id: None,
+                local_pref: None,
             })
             .await
     })
@@ -304,6 +305,7 @@ fn add_multi_nexthop_route_allocates_ecmp_group() {
                 prefix,
                 nexthops: nhs.clone(),
                 path_id: None,
+                local_pref: None,
             })
             .await
     })
@@ -351,6 +353,7 @@ fn del_removes_fib_entry() {
                 prefix,
                 nexthops: vec![nh],
                 path_id: None,
+                local_pref: None,
             })
             .await
     })
@@ -397,6 +400,7 @@ fn peer_down_withdraws_all_peer_routes() {
                     },
                     nexthops: vec![nh],
                     path_id: None,
+                    local_pref: None,
                 })
                 .await
                 .expect("apply Add");
@@ -441,6 +445,7 @@ fn ecmp_groups_dedup_by_signature() {
                     },
                     nexthops: nhs.clone(),
                     path_id: None,
+                    local_pref: None,
                 })
                 .await
                 .expect("apply Add");
@@ -485,6 +490,7 @@ fn add_path_two_paths_one_prefix_yields_ecmp() {
                 prefix,
                 nexthops: vec![nh_a],
                 path_id: Some(1),
+                local_pref: None,
             })
             .await
             .expect("apply Add path 1");
@@ -494,6 +500,7 @@ fn add_path_two_paths_one_prefix_yields_ecmp() {
                 prefix,
                 nexthops: vec![nh_b],
                 path_id: Some(2),
+                local_pref: None,
             })
             .await
             .expect("apply Add path 2");
@@ -530,6 +537,7 @@ fn add_path_withdrawal_collapses_to_single_nh() {
                 prefix,
                 nexthops: vec![nh_a],
                 path_id: Some(1),
+                local_pref: None,
             })
             .await
             .expect("apply Add A");
@@ -539,6 +547,7 @@ fn add_path_withdrawal_collapses_to_single_nh() {
                 prefix,
                 nexthops: vec![nh_b],
                 path_id: Some(2),
+                local_pref: None,
             })
             .await
             .expect("apply Add B");
@@ -595,6 +604,7 @@ fn add_path_two_peers_two_paths_merge() {
                 prefix,
                 nexthops: vec![nh_a],
                 path_id: Some(1),
+                local_pref: None,
             })
             .await
             .expect("apply Add peer_a");
@@ -604,6 +614,7 @@ fn add_path_two_peers_two_paths_merge() {
                 prefix,
                 nexthops: vec![nh_b],
                 path_id: Some(1),
+                local_pref: None,
             })
             .await
             .expect("apply Add peer_b");
@@ -656,6 +667,7 @@ fn add_path_peer_down_clears_all_paths_for_peer() {
                 prefix,
                 nexthops: vec![nh_b],
                 path_id: Some(1),
+                local_pref: None,
             })
             .await
             .expect("apply Add peer_b");
@@ -710,6 +722,7 @@ fn non_add_path_session_still_replaces() {
                 prefix,
                 nexthops: vec![nh_first],
                 path_id: None,
+                local_pref: None,
             })
             .await
             .expect("apply first Add");
@@ -719,6 +732,7 @@ fn non_add_path_session_still_replaces() {
                 prefix,
                 nexthops: vec![nh_second],
                 path_id: None,
+                local_pref: None,
             })
             .await
             .expect("apply second Add");
@@ -755,4 +769,232 @@ fn non_add_path_session_still_replaces() {
     // of the test's intent even though we no longer read them back
     // from NEXTHOPS to verify identity.
     let _ = (nh_first, nh_second);
+}
+
+// --- Local-pref-tier filtering (slice 6) ---------------------------
+
+/// Two advertisements for the same prefix at different local-pref
+/// tiers (e.g., an IX peer at 150 and a transit at 100): only the
+/// higher-LP advertisement contributes to the installed FIB entry.
+/// Lower-tier advertisements stay in the per-prefix mirror so that a
+/// subsequent withdrawal of the higher-tier path promotes them
+/// without a fresh announce, but they do not affect forwarding while
+/// a higher tier is present.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_higher_lp_tier_wins_over_lower() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [192, 0, 2, 0],
+        prefix_len: 24,
+    };
+    let nh_ix = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let nh_transit = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let peer_ix = PeerId(0x8001);
+    let peer_transit = PeerId(0x8002);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_ix,
+                prefix,
+                nexthops: vec![nh_ix],
+                path_id: Some(1),
+                local_pref: Some(150),
+            })
+            .await
+            .expect("apply IX-tier Add");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_transit,
+                prefix,
+                nexthops: vec![nh_transit],
+                path_id: Some(1),
+                local_pref: Some(100),
+            })
+            .await
+            .expect("apply transit-tier Add");
+    });
+
+    let fib = h.read_fib_v4([192, 0, 2, 0], 24).expect("FIB entry");
+    assert_eq!(
+        fib.kind, FIB_KIND_SINGLE,
+        "higher LP-tier (150) wins; transit (100) suppressed under LP filter"
+    );
+    // Read the NH that's actually installed: the entry's idx points at
+    // NEXTHOPS[idx] which we can spot-check is a resolved-state slot.
+    let entry = h.read_nexthop(fib.idx);
+    assert_eq!(
+        entry.state, NH_STATE_INCOMPLETE,
+        "single-NH installed (LP filter selected the IX path)"
+    );
+}
+
+/// Three advertisements: two at the top tier (LP 150) and one at a
+/// lower tier (LP 100). The FIB entry must ECMP across the two LP-150
+/// next-hops only; the LP-100 path stays masked while the IX tier has
+/// any path present.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_ecmp_within_top_lp_tier() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    };
+    let nh_ix_a = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let nh_ix_b = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
+    let nh_transit = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let peer_ix_a = PeerId(0x9001);
+    let peer_ix_b = PeerId(0x9002);
+    let peer_transit = PeerId(0x9003);
+
+    h.run(async {
+        for (peer, nh, lp) in [
+            (peer_ix_a, nh_ix_a, 150),
+            (peer_ix_b, nh_ix_b, 150),
+            (peer_transit, nh_transit, 100),
+        ] {
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer,
+                    prefix,
+                    nexthops: vec![nh],
+                    path_id: Some(1),
+                    local_pref: Some(lp),
+                })
+                .await
+                .expect("apply Add");
+        }
+    });
+
+    let fib = h.read_fib_v4([198, 51, 100, 0], 24).expect("FIB entry");
+    assert_eq!(
+        fib.kind, FIB_KIND_ECMP,
+        "two LP-150 advertisements ECMP; LP-100 advertisement does not contribute"
+    );
+    let group = h.read_ecmp_group(fib.idx);
+    assert_eq!(
+        group.nh_count, 2,
+        "ECMP group spans only the top-LP-tier paths (2 of 3)"
+    );
+}
+
+/// LP demotion: when the top-tier advertisement is withdrawn, the
+/// next-best tier's advertisements promote into the FIB entry. The
+/// LP-100 path that was masked behind LP-150 takes over without
+/// requiring a fresh announce; its advertisement record was retained
+/// throughout.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_lp_demotion_promotes_lower_tier_on_top_tier_withdrawal() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let nh_ix = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let nh_transit = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let peer_ix = PeerId(0xa001);
+    let peer_transit = PeerId(0xa002);
+
+    h.run(async {
+        // Both tiers present; top tier wins.
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_ix,
+                prefix,
+                nexthops: vec![nh_ix],
+                path_id: Some(1),
+                local_pref: Some(150),
+            })
+            .await
+            .expect("apply IX Add");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_transit,
+                prefix,
+                nexthops: vec![nh_transit],
+                path_id: Some(1),
+                local_pref: Some(100),
+            })
+            .await
+            .expect("apply transit Add");
+    });
+
+    let fib_with_ix = h
+        .read_fib_v4([203, 0, 113, 0], 24)
+        .expect("FIB after both Adds");
+    assert_eq!(fib_with_ix.kind, FIB_KIND_SINGLE);
+
+    h.run(async {
+        // Withdraw the IX advertisement. The transit advertisement
+        // stays in the mirror and now becomes the top tier.
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer_ix,
+                prefix,
+                path_id: Some(1),
+            })
+            .await
+            .expect("apply IX Del");
+    });
+
+    let fib_after_demotion = h
+        .read_fib_v4([203, 0, 113, 0], 24)
+        .expect("FIB still present via transit");
+    assert_eq!(
+        fib_after_demotion.kind, FIB_KIND_SINGLE,
+        "transit advertisement promotes to top tier when IX path is withdrawn"
+    );
+}
+
+/// Back-compat: `local_pref: None` is treated as the RFC 4271 default
+/// of 100. An advertisement with explicit LP 100 and an advertisement
+/// with `None` are at the same tier and ECMP together. This guards
+/// non-BGP sources (netlink seeding, BMP elements without LOCAL_PREF)
+/// from being inadvertently suppressed by the LP filter.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_path_lp_none_treated_as_default_100() {
+    let h = ProgrammerHarness::new();
+    let prefix = IpPrefix::V4 {
+        addr: [192, 0, 2, 0],
+        prefix_len: 24,
+    };
+    let nh_explicit = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let nh_implicit = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    let peer_explicit = PeerId(0xb001);
+    let peer_implicit = PeerId(0xb002);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_explicit,
+                prefix,
+                nexthops: vec![nh_explicit],
+                path_id: None,
+                local_pref: Some(100),
+            })
+            .await
+            .expect("apply explicit-100 Add");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer_implicit,
+                prefix,
+                nexthops: vec![nh_implicit],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("apply None-LP Add");
+    });
+
+    let fib = h.read_fib_v4([192, 0, 2, 0], 24).expect("FIB entry");
+    assert_eq!(
+        fib.kind, FIB_KIND_ECMP,
+        "LP=None defaults to 100 and ECMPs with explicit-LP=100 advertisement"
+    );
+    let group = h.read_ecmp_group(fib.idx);
+    assert_eq!(group.nh_count, 2);
 }

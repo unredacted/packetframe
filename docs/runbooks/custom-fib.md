@@ -544,6 +544,24 @@ multipath set from upstream eBGP), each NLRI prefixed with a 4-byte
 advertisements into an ECMP group, dedup'd against any prior group
 with the same nexthop set.
 
+**Local-pref-tier filter.** Operator-encoded BGP preferences are
+respected client-side. For each prefix the FibProgrammer computes
+the maximum LOCAL_PREF across the advertisements it holds and forms
+the ECMP group only from advertisements at that top tier. Lower-tier
+advertisements are retained but masked while a higher tier is
+present. When the top tier is withdrawn, the next-best tier's
+advertisements promote into the FIB entry without requiring a fresh
+announce.
+
+This means an LP scheme like `IX peers = 150, transit = 100` works
+as written: prefixes with any IX coverage forward over IX only (with
+within-IX ECMP if more than one IX peer announced); prefixes without
+IX coverage fall back to the transit tier (with within-transit ECMP
+if multiple transits advertise the same prefix at the same LP and
+AS_PATH length). Advertisements without a LOCAL_PREF attribute
+(non-BGP sources, malformed UPDATEs) are normalized to the RFC 4271
+default of 100.
+
 The session-level decode is all-or-nothing across IPv4 unicast and
 IPv6 unicast: if the peer advertises ADD-PATH for only one AFI, the
 listener falls back to non-ADD-PATH decoding for both. Symmetric

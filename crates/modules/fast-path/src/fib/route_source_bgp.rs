@@ -792,6 +792,10 @@ fn elem_to_route_event(
     // Otherwise it remains None, matching the existing single-path
     // semantics expected by non-ADD-PATH sources (BMP, netlink).
     let path_id = elem.prefix.path_id;
+    // local_pref is mandatory on iBGP UPDATEs (RFC 4271 §5.1.5) and
+    // bgpkit-parser surfaces it. Withdrawals have no attributes so
+    // local_pref does not apply to RouteEvent::Del.
+    let local_pref = elem.local_pref;
     Some(match elem.elem_type {
         ElemType::ANNOUNCE => {
             let nh = elem.next_hop.unwrap_or(fallback_nh);
@@ -800,6 +804,7 @@ fn elem_to_route_event(
                 prefix,
                 nexthops: vec![nh],
                 path_id,
+                local_pref,
             }
         }
         ElemType::WITHDRAW => RouteEvent::Del {
@@ -1272,6 +1277,7 @@ mod tests {
                 prefix,
                 nexthops,
                 path_id: _,
+                local_pref: _,
             } => {
                 assert_eq!(pid, peer_id);
                 assert!(matches!(

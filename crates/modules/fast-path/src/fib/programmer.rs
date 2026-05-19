@@ -279,9 +279,17 @@ struct RouteRecord {
 /// netlink-injected ECMP), but ADD-PATH sources emit one NH per
 /// advertisement and let the per-prefix union recompose the ECMP
 /// group.
+///
+/// `local_pref` carries the BGP LOCAL_PREF attribute when supplied
+/// by the source. The per-prefix recompute filters the NH union to
+/// the maximum local-pref tier across the prefix's advertisements,
+/// so an operator-encoded preference (e.g., IX peers at LP 150 vs
+/// transit at LP 100) survives ADD-PATH aggregation. `None` is
+/// treated as RFC 4271's default of 100 for the comparison.
 #[derive(Debug, Clone)]
 struct Advertisement {
     nexthops: Vec<IpAddr>,
+    local_pref: Option<u32>,
     /// Resync-reconcile bookkeeping: true when this advertisement
     /// was freshly Add'd (or refreshed) after the most recent
     /// Resync; false when it was inherited from a prior session and
@@ -290,6 +298,12 @@ struct Advertisement {
     /// entry is then recomputed.
     seen_this_session: bool,
 }
+
+/// RFC 4271 §5.1.5: when LOCAL_PREF is absent, treat as the
+/// implementation-defined default. Bird (and most others) use 100.
+/// PacketFrame matches that for advertisements where the source did
+/// not supply a value (non-BGP sources, malformed UPDATEs, etc.).
+const DEFAULT_LOCAL_PREF: u32 = 100;
 
 /// Per-ECMP-group state. Refcount lets many prefixes share one
 /// group. The `id` is always the HashMap key we found this record
@@ -804,7 +818,8 @@ impl FibProgrammer {
                 prefix,
                 nexthops,
                 path_id,
-            } => self.add_route(peer_id, prefix, nexthops, path_id),
+                local_pref,
+            } => self.add_route(peer_id, prefix, nexthops, path_id, local_pref),
             RouteEvent::Del {
                 peer_id,
                 prefix,
@@ -832,12 +847,13 @@ impl FibProgrammer {
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
         path_id: Option<u32>,
+        local_pref: Option<u32>,
     ) -> Result<(), ProgrammerError> {
         if nexthops.is_empty() {
             // Defensive. An empty announce should arrive as Del.
             return Ok(());
         }
-        self.upsert_advertisement(peer_id, prefix, path_id, nexthops);
+        self.upsert_advertisement(peer_id, prefix, path_id, nexthops, local_pref);
         self.recompute_fib_entry(prefix)
     }
 
@@ -971,10 +987,12 @@ impl FibProgrammer {
         prefix: IpPrefix,
         path_id: Option<u32>,
         nexthops: Vec<IpAddr>,
+        local_pref: Option<u32>,
     ) {
         let key = (peer_id, path_id);
         let adv = Advertisement {
             nexthops,
+            local_pref,
             seen_this_session: true,
         };
         let rec = self.upsert_empty_record(prefix);
@@ -1050,11 +1068,26 @@ impl FibProgrammer {
     /// immediately because the BPF LPM entry is gone and no new
     /// lookup can land on the prior IDs.
     fn recompute_fib_entry(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
-        // 1. Compute the desired sorted, deduplicated NH set.
+        // 1. Compute the desired sorted, deduplicated NH set, restricted
+        // to advertisements at the maximum local-pref tier present on
+        // this prefix. This preserves operator-encoded BGP preferences
+        // (e.g., IX peers at LP 150 vs transit at LP 100) under ADD-PATH
+        // aggregation: ECMP forms within a tier, not across tiers.
+        // Advertisements with no `local_pref` are normalized to
+        // DEFAULT_LOCAL_PREF (RFC 4271 §5.1.5).
         let desired_nhs: Vec<IpAddr> = match self.lookup_mirror(&prefix) {
             Some(rec) => {
+                let max_lp = rec
+                    .advertisements
+                    .values()
+                    .map(|adv| adv.local_pref.unwrap_or(DEFAULT_LOCAL_PREF))
+                    .max()
+                    .unwrap_or(DEFAULT_LOCAL_PREF);
                 let mut set: BTreeSet<IpAddr> = BTreeSet::new();
                 for adv in rec.advertisements.values() {
+                    if adv.local_pref.unwrap_or(DEFAULT_LOCAL_PREF) != max_lp {
+                        continue;
+                    }
                     for nh in &adv.nexthops {
                         set.insert(*nh);
                     }
