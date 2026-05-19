@@ -10,10 +10,16 @@
 //! N different nexthops, leaving the FibProgrammer to either
 //! re-implement bird's best-path selection (drift risk forever) or
 //! pick wrong. iBGP, by contrast, has bird's `protocol bgp` export
-//! filter run after best-path selection — we receive exactly one
-//! UPDATE per prefix, with the path bird picked. See
+//! filter run after best-path selection. Without ADD-PATH the export
+//! emits exactly one UPDATE per prefix with the path bird picked;
+//! with ADD-PATH negotiated, the export emits one UPDATE per path
+//! bird kept (typically equal-cost multipath), each tagged with a
+//! distinct `path_id` per RFC 7911 §3, and the FibProgrammer
+//! aggregates them into an ECMP group on the prefix. See
 //! `docs/runbooks/custom-fib.md` "Phase 4 bird config" for the
-//! `protocol bgp packetframe { ... }` snippet.
+//! `protocol bgp packetframe { ... }` snippet and the
+//! "Multi-NH ECMP from BGP" section for the ADD-PATH enablement
+//! steps.
 //!
 //! **Direction.** This is a *passive* BGP speaker: packetframe
 //! listens, bird connects out (configurable via bird's
@@ -25,7 +31,17 @@
 //!   IPv6 unicast — without this bird only sends v4 routes over
 //!   the session.
 //! - Four-octet ASN (RFC 6793) — required for any modern AS
-//!   numbering, ours is 401401 which is > 65535.
+//!   numbering when the local AS is greater than 65535.
+//! - ADD-PATH (RFC 7911) with Receive direction (Send/Receive
+//!   value 1) for both IPv4 unicast and IPv6 unicast. Peer-side
+//!   capability negotiation is decoded by
+//!   [`walk_open_capabilities`]; mutual negotiation flips the
+//!   per-message `add_path` flag in [`parse_bgp_message`] for the
+//!   session. ADD-PATH is treated all-or-nothing across the two
+//!   AFIs because `bgpkit_parser::parse_bgp_message` takes one
+//!   per-message `add_path: bool` rather than a per-AFI flag; an
+//!   asymmetric advertisement falls back to non-ADD-PATH decoding
+//!   for both AFIs.
 //! - Route Refresh is **not** advertised. We never originate routes,
 //!   so bird has nothing to ask us to refresh.
 //!
@@ -214,11 +230,13 @@ impl BgpListener {
         debug!("sent OPEN");
 
         // Step 2: read peer's OPEN within OPEN_TIMEOUT and validate.
-        let peer_open = tokio::time::timeout(OPEN_TIMEOUT, read_one_message(&mut stream))
+        // OPEN itself is always decoded with add_path=false; capability
+        // 69 negotiation completes only after OPEN parsing succeeds.
+        let peer_open = tokio::time::timeout(OPEN_TIMEOUT, read_one_message(&mut stream, false))
             .await
             .map_err(|_| RouteSourceError::recoverable("peer OPEN timeout".to_string()))?
             .map_err(|e| RouteSourceError::recoverable(format!("read peer OPEN: {e}")))?;
-        let (effective_hold, peer_asn_observed) = match peer_open {
+        let (effective_hold, peer_asn_observed, add_path_in_effect) = match peer_open {
             BgpMessage::Open(o) => {
                 if o.version != 4 {
                     return Err(RouteSourceError::recoverable(format!(
@@ -241,13 +259,18 @@ impl BgpListener {
                     );
                 }
                 let effective_hold = self.cfg.hold_time.min(o.hold_time).max(3);
+                let negotiated = walk_open_capabilities(&o.opt_params);
+                let add_path_in_effect = negotiated.add_path_in_effect();
                 info!(
                     peer_asn = peer_asn,
                     peer_router_id = %o.bgp_identifier,
                     effective_hold,
+                    add_path_in_effect,
+                    add_path_v4 = negotiated.add_path_v4_recv,
+                    add_path_v6 = negotiated.add_path_v6_recv,
                     "received peer OPEN"
                 );
-                (effective_hold, peer_asn)
+                (effective_hold, peer_asn, add_path_in_effect)
             }
             other => {
                 return Err(RouteSourceError::recoverable(format!(
@@ -270,7 +293,7 @@ impl BgpListener {
         // cancel-safety issues on `read_exact`.
         let (read_half, mut write_half) = stream.into_split();
         let (frame_tx, mut frame_rx) = mpsc::channel::<BgpMessage>(FRAME_CHANNEL_CAPACITY);
-        let reader = tokio::spawn(reader_task(read_half, frame_tx));
+        let reader = tokio::spawn(reader_task(read_half, frame_tx, add_path_in_effect));
 
         let mut keepalive_tick =
             tokio::time::interval(Duration::from_secs(effective_hold.max(3) as u64 / 3));
@@ -425,13 +448,23 @@ impl BgpListener {
 /// Drains the TCP stream, parses BGP messages, and forwards them to
 /// the main `select!` loop via a bounded channel. Same cancel-safety
 /// pattern as `BmpStation::reader_task`.
-async fn reader_task<R>(mut stream: R, tx: mpsc::Sender<BgpMessage>) -> Result<(), RouteSourceError>
+///
+/// `add_path` carries the result of OPEN-time RFC 7911 capability
+/// negotiation (computed by [`walk_open_capabilities`]). It controls
+/// the per-message NLRI decode in [`read_one_message`]: when true,
+/// every prefix in MP_REACH / MP_UNREACH / legacy NLRI is prefixed
+/// by a 4-byte path_id.
+async fn reader_task<R>(
+    mut stream: R,
+    tx: mpsc::Sender<BgpMessage>,
+    add_path: bool,
+) -> Result<(), RouteSourceError>
 where
     R: AsyncReadExt + Unpin + Send,
 {
     let mut messages_parsed = 0usize;
     loop {
-        let msg = match read_one_message(&mut stream).await {
+        let msg = match read_one_message(&mut stream, add_path).await {
             Ok(m) => m,
             Err(e) if is_clean_eof(&e) => {
                 debug!(messages_parsed, "BGP stream EOF (reader)");
@@ -455,7 +488,16 @@ where
 /// pulls the declared length, reads the rest, and parses with
 /// bgpkit-parser. Filters ROUTE-REFRESH (type 5) before parsing
 /// because bgpkit-parser doesn't model it.
-async fn read_one_message<R>(stream: &mut R) -> std::io::Result<BgpMessage>
+///
+/// `add_path` selects RFC 7911 NLRI decoding for this message. The
+/// flag must reflect what was negotiated in OPEN: the BGP wire format
+/// for NLRI differs depending on whether path_id is present, so a
+/// mismatch desynchronizes the parser and corrupts every subsequent
+/// prefix in the UPDATE. The OPEN itself is always read with
+/// `add_path = false` (negotiation cannot have completed yet);
+/// post-OPEN messages use the value computed by
+/// [`walk_open_capabilities`].
+async fn read_one_message<R>(stream: &mut R, add_path: bool) -> std::io::Result<BgpMessage>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -497,7 +539,7 @@ where
     full.extend_from_slice(&body);
     let mut bytes: Bytes = full.freeze();
 
-    parse_bgp_message(&mut bytes, false, &AsnLength::Bits32)
+    parse_bgp_message(&mut bytes, add_path, &AsnLength::Bits32)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))
 }
 
@@ -510,6 +552,13 @@ fn is_clean_eof(e: &std::io::Error) -> bool {
 /// Build the OPEN message. Capabilities advertised:
 /// - MP-BGP IPv4 unicast (AFI=1, SAFI=1)
 /// - MP-BGP IPv6 unicast (AFI=2, SAFI=1)
+/// - ADD-PATH (RFC 7911, capability code 69) for IPv4 unicast and
+///   IPv6 unicast, Send/Receive value `1` (Receive). PacketFrame never
+///   originates routes, so only the Receive direction is advertised.
+///   A peer that also wishes to send multiple paths must advertise
+///   capability 69 with Send (value `2`) or both (value `3`) for the
+///   matching AFI/SAFI; mutual negotiation is decoded in the OPEN
+///   parser (slice 2) and acted on in UPDATE parsing (slice 3).
 /// - 4-octet ASN (RFC 6793) carrying the real `local_as`
 pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8> {
     // Capabilities (each: code u8, len u8, value [u8])
@@ -518,6 +567,12 @@ pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8
     caps.extend_from_slice(&[1, 4, 0x00, 0x01, 0x00, 0x01]);
     // MP IPv6 unicast: AFI=2, Reserved=0, SAFI=1
     caps.extend_from_slice(&[1, 4, 0x00, 0x02, 0x00, 0x01]);
+    // ADD-PATH (RFC 7911 §4): code=69, len=8 covers two
+    // (AFI:2, SAFI:1, Send/Receive:1) tuples.
+    //   tuple #1: AFI=1 (IPv4), SAFI=1 (unicast), 1 = Receive
+    //   tuple #2: AFI=2 (IPv6), SAFI=1 (unicast), 1 = Receive
+    // RFC 7911 §4 permits multiple tuples in a single capability TLV.
+    caps.extend_from_slice(&[69, 8, 0x00, 0x01, 0x01, 0x01, 0x00, 0x02, 0x01, 0x01]);
     // 4-octet ASN
     caps.extend_from_slice(&[65, 4]);
     caps.extend_from_slice(&local_as.to_be_bytes());
@@ -560,6 +615,80 @@ pub fn encode_keepalive() -> Vec<u8> {
     out.extend_from_slice(&(BGP_HEADER_LEN as u16).to_be_bytes());
     out.push(MSG_TYPE_KEEPALIVE);
     out
+}
+
+/// Capabilities mutually negotiated for the current session.
+///
+/// Populated by [`walk_open_capabilities`] from the peer's OPEN after
+/// our OPEN has been sent. For each `add_path_*_recv` flag, `true`
+/// means **the peer** advertised RFC 7911 capability 69 with `Send`
+/// (value `2`) or `SendReceive` (value `3`) for that AFI/SAFI. The
+/// directional flip (peer-Send => we-Receive) reflects that the peer
+/// is the side that transmits path-id-prefixed NLRI; PacketFrame
+/// never originates routes, so only the receive side matters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NegotiatedCapabilities {
+    /// Peer advertised ADD-PATH Send (or both) for (IPv4, unicast).
+    add_path_v4_recv: bool,
+    /// Peer advertised ADD-PATH Send (or both) for (IPv6, unicast).
+    add_path_v6_recv: bool,
+}
+
+impl NegotiatedCapabilities {
+    /// Whether ADD-PATH NLRI decoding is in effect for this session.
+    ///
+    /// All-or-nothing across IPv4 unicast + IPv6 unicast.
+    /// `bgpkit_parser::parse_bgp_message` takes a single per-message
+    /// `add_path: bool`, not a per-AFI flag; if the peer asymmetrically
+    /// advertised ADD-PATH for one AFI but not the other, the session
+    /// falls back to non-ADD-PATH decoding for both. Symmetric
+    /// negotiation is the common case in practice.
+    fn add_path_in_effect(&self) -> bool {
+        self.add_path_v4_recv && self.add_path_v6_recv
+    }
+}
+
+/// Walk the peer's OPEN optional parameters and surface mutually
+/// negotiated capabilities relevant to PacketFrame.
+///
+/// Today the only surfaced capability is RFC 7911 ADD-PATH. Extend
+/// here as new capabilities become relevant; the struct is the single
+/// place call sites consult to decide per-session behavior.
+fn walk_open_capabilities(
+    opt_params: &[bgpkit_parser::models::OptParam],
+) -> NegotiatedCapabilities {
+    use bgpkit_parser::models::capabilities::AddPathSendReceive;
+    use bgpkit_parser::models::{Afi, CapabilityValue, ParamValue, Safi};
+    let mut caps = NegotiatedCapabilities::default();
+    for op in opt_params {
+        let ParamValue::Capacities(cap_list) = &op.param_value else {
+            continue;
+        };
+        for c in cap_list {
+            let CapabilityValue::AddPath(ap) = &c.value else {
+                continue;
+            };
+            for af in &ap.address_families {
+                // Peer Send => we Receive. Receive-only on the peer
+                // side means the peer wants to receive multipath from
+                // us, which we never originate, so it is not useful
+                // for our decoding state.
+                let peer_sends = matches!(
+                    af.send_receive,
+                    AddPathSendReceive::Send | AddPathSendReceive::SendReceive
+                );
+                if !peer_sends {
+                    continue;
+                }
+                match (af.afi, af.safi) {
+                    (Afi::Ipv4, Safi::Unicast) => caps.add_path_v4_recv = true,
+                    (Afi::Ipv6, Safi::Unicast) => caps.add_path_v6_recv = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    caps
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -658,6 +787,11 @@ fn elem_to_route_event(
     fallback_nh: IpAddr,
 ) -> Option<RouteEvent> {
     let prefix = network_prefix_to_ip_prefix(&elem.prefix)?;
+    // When ADD-PATH was negotiated for the session, bgpkit-parser
+    // populates `prefix.path_id` with the wire-decoded 4-byte ID.
+    // Otherwise it remains None, matching the existing single-path
+    // semantics expected by non-ADD-PATH sources (BMP, netlink).
+    let path_id = elem.prefix.path_id;
     Some(match elem.elem_type {
         ElemType::ANNOUNCE => {
             let nh = elem.next_hop.unwrap_or(fallback_nh);
@@ -665,9 +799,14 @@ fn elem_to_route_event(
                 peer_id,
                 prefix,
                 nexthops: vec![nh],
+                path_id,
             }
         }
-        ElemType::WITHDRAW => RouteEvent::Del { peer_id, prefix },
+        ElemType::WITHDRAW => RouteEvent::Del {
+            peer_id,
+            prefix,
+            path_id,
+        },
     })
 }
 
@@ -743,6 +882,8 @@ mod tests {
         let mut saw_mp_v4 = false;
         let mut saw_mp_v6 = false;
         let mut saw_4byte_asn = None;
+        let mut add_path_v4_recv = false;
+        let mut add_path_v6_recv = false;
         while i + 2 <= caps.len() {
             let code = caps[i];
             let clen = caps[i + 1] as usize;
@@ -763,6 +904,25 @@ mod tests {
                     saw_4byte_asn =
                         Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
                 }
+                69 => {
+                    // ADD-PATH per RFC 7911 §4: one or more 4-byte
+                    // tuples of (AFI:2, SAFI:1, Send/Receive:1). Values
+                    // for Send/Receive: 1 = Receive, 2 = Send, 3 = both.
+                    let mut j = 0;
+                    while j + 4 <= clen {
+                        let afi = u16::from_be_bytes([value[j], value[j + 1]]);
+                        let safi = value[j + 2];
+                        let sr = value[j + 3];
+                        let has_recv = sr & 0x01 != 0;
+                        if afi == 1 && safi == 1 && has_recv {
+                            add_path_v4_recv = true;
+                        }
+                        if afi == 2 && safi == 1 && has_recv {
+                            add_path_v6_recv = true;
+                        }
+                        j += 4;
+                    }
+                }
                 _ => {}
             }
             i += 2 + clen;
@@ -773,6 +933,14 @@ mod tests {
             saw_4byte_asn,
             Some(401401),
             "missing or wrong 4-octet ASN capability"
+        );
+        assert!(
+            add_path_v4_recv,
+            "missing ADD-PATH capability (RFC 7911) with Receive for IPv4 unicast"
+        );
+        assert!(
+            add_path_v6_recv,
+            "missing ADD-PATH capability (RFC 7911) with Receive for IPv6 unicast"
         );
     }
 
@@ -801,6 +969,259 @@ mod tests {
         assert_eq!(a, b);
         let c = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 64512);
         assert_ne!(a, c);
+    }
+
+    // --- ADD-PATH (RFC 7911) capability negotiation -----------------
+
+    /// Build a single Capability-bearing OptParam holding one ADD-PATH
+    /// capability with the provided address-family entries. Mirrors
+    /// what bgpkit-parser produces from a peer OPEN.
+    fn build_add_path_opt_param(
+        entries: Vec<bgpkit_parser::models::capabilities::AddPathAddressFamily>,
+    ) -> bgpkit_parser::models::OptParam {
+        use bgpkit_parser::models::capabilities::{AddPathCapability, BgpCapabilityType};
+        use bgpkit_parser::models::{Capability, CapabilityValue, OptParam, ParamValue};
+        let cap = Capability {
+            ty: BgpCapabilityType::ADD_PATH_CAPABILITY,
+            value: CapabilityValue::AddPath(AddPathCapability::new(entries)),
+        };
+        OptParam {
+            param_type: 2,
+            // param_len is informational here; walk_open_capabilities
+            // does not consult it (it walks the structured Vec).
+            param_len: 0,
+            param_value: ParamValue::Capacities(vec![cap]),
+        }
+    }
+
+    #[test]
+    fn walk_open_capabilities_detects_both_afis_when_peer_sends() {
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
+        let op = build_add_path_opt_param(vec![
+            AddPathAddressFamily {
+                afi: Afi::Ipv4,
+                safi: Safi::Unicast,
+                send_receive: AddPathSendReceive::Send,
+            },
+            AddPathAddressFamily {
+                afi: Afi::Ipv6,
+                safi: Safi::Unicast,
+                send_receive: AddPathSendReceive::SendReceive,
+            },
+        ]);
+        let caps = walk_open_capabilities(&[op]);
+        assert!(caps.add_path_v4_recv);
+        assert!(caps.add_path_v6_recv);
+        assert!(caps.add_path_in_effect());
+    }
+
+    #[test]
+    fn walk_open_capabilities_all_or_nothing_when_only_one_afi_negotiated() {
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
+        let op = build_add_path_opt_param(vec![AddPathAddressFamily {
+            afi: Afi::Ipv4,
+            safi: Safi::Unicast,
+            send_receive: AddPathSendReceive::Send,
+        }]);
+        let caps = walk_open_capabilities(&[op]);
+        assert!(caps.add_path_v4_recv);
+        assert!(!caps.add_path_v6_recv);
+        // bgpkit-parser 0.16's parse_bgp_message takes a single per-
+        // message add_path bool; symmetric all-or-nothing avoids the
+        // mixed-AFI decoder mismatch.
+        assert!(!caps.add_path_in_effect());
+    }
+
+    #[test]
+    fn walk_open_capabilities_peer_receive_only_does_not_negotiate_recv() {
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
+        // Peer Receive-only means the peer can RECEIVE multipath from
+        // us; PacketFrame never originates, so this does not enable us
+        // to receive anything from the peer.
+        let op = build_add_path_opt_param(vec![
+            AddPathAddressFamily {
+                afi: Afi::Ipv4,
+                safi: Safi::Unicast,
+                send_receive: AddPathSendReceive::Receive,
+            },
+            AddPathAddressFamily {
+                afi: Afi::Ipv6,
+                safi: Safi::Unicast,
+                send_receive: AddPathSendReceive::Receive,
+            },
+        ]);
+        let caps = walk_open_capabilities(&[op]);
+        assert!(!caps.add_path_v4_recv);
+        assert!(!caps.add_path_v6_recv);
+        assert!(!caps.add_path_in_effect());
+    }
+
+    #[test]
+    fn walk_open_capabilities_ignores_non_unicast_safi() {
+        use bgpkit_parser::models::capabilities::{AddPathAddressFamily, AddPathSendReceive};
+        use bgpkit_parser::models::{Afi, Safi};
+        let op = build_add_path_opt_param(vec![AddPathAddressFamily {
+            afi: Afi::Ipv4,
+            safi: Safi::Multicast,
+            send_receive: AddPathSendReceive::SendReceive,
+        }]);
+        let caps = walk_open_capabilities(&[op]);
+        assert!(!caps.add_path_v4_recv);
+        assert!(!caps.add_path_v6_recv);
+    }
+
+    #[test]
+    fn walk_open_capabilities_empty_opt_params_yields_default() {
+        let caps = walk_open_capabilities(&[]);
+        assert!(!caps.add_path_v4_recv);
+        assert!(!caps.add_path_v6_recv);
+        assert!(!caps.add_path_in_effect());
+        assert_eq!(caps, NegotiatedCapabilities::default());
+    }
+
+    #[test]
+    fn walk_open_capabilities_round_trips_our_own_open_as_recv_only() {
+        // Our OPEN advertises ADD-PATH with Receive direction (we
+        // never originate). If a hypothetical peer ever parsed our
+        // OPEN and ran walk_open_capabilities on it, they would see
+        // Receive-only on our side and conclude that WE will not Send
+        // multipath, so add_path_in_effect must be false. This guards
+        // against accidentally flipping the encoded direction to Send.
+        let bytes = encode_open(401401, 90, Ipv4Addr::new(1, 2, 3, 4));
+        let mut b = Bytes::copy_from_slice(&bytes);
+        let parsed =
+            parse_bgp_message(&mut b, false, &AsnLength::Bits32).expect("OPEN parses cleanly");
+        let open = match parsed {
+            BgpMessage::Open(o) => o,
+            other => panic!("expected OPEN, got {:?}", other),
+        };
+        let caps = walk_open_capabilities(&open.opt_params);
+        assert!(
+            !caps.add_path_v4_recv,
+            "our own OPEN encodes Receive; walker must not treat it as peer-Send"
+        );
+        assert!(!caps.add_path_v6_recv);
+        assert!(!caps.add_path_in_effect());
+    }
+
+    // --- ADD-PATH (RFC 7911) NLRI decoding --------------------------
+
+    #[test]
+    fn parse_update_with_path_id_surfaces_to_elem_and_route_event() {
+        use bgpkit_parser::models::Asn;
+        use std::net::Ipv4Addr;
+
+        // Synthetic IPv4-unicast UPDATE containing one ADD-PATH
+        // announce for 192.0.2.0/24 with path_id=42, NEXT_HOP
+        // 10.0.0.1, empty AS_PATH, ORIGIN IGP. NLRI is encoded per
+        // RFC 7911 §3 with the 4-byte Path Identifier preceding the
+        // length-prefixed prefix.
+        #[rustfmt::skip]
+        let bytes: [u8; 45] = [
+            // BGP header
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x2D, // total length = 45
+            0x02,       // type = UPDATE
+            // Withdrawn Routes Length = 0
+            0x00, 0x00,
+            // Total Path Attribute Length = 14
+            0x00, 0x0E,
+            // ORIGIN (transitive): flags=0x40, type=1, len=1, IGP=0
+            0x40, 0x01, 0x01, 0x00,
+            // AS_PATH (transitive, empty): flags=0x40, type=2, len=0
+            0x40, 0x02, 0x00,
+            // NEXT_HOP (transitive): flags=0x40, type=3, len=4, 10.0.0.1
+            0x40, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x01,
+            // NLRI: path_id=42, prefix_len=24, 192.0.2 (3 bytes)
+            0x00, 0x00, 0x00, 0x2A,
+            0x18,
+            0xC0, 0x00, 0x02,
+        ];
+
+        let mut b = Bytes::copy_from_slice(&bytes);
+        let parsed = parse_bgp_message(&mut b, true, &AsnLength::Bits32)
+            .expect("ADD-PATH UPDATE parses cleanly");
+        let update = match parsed {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected UPDATE, got {:?}", other.msg_type()),
+        };
+
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let peer_asn = Asn::new_32bit(65000);
+        let elems = Elementor::bgp_update_to_elems(update, 0.0, &peer_ip, &peer_asn);
+        assert_eq!(elems.len(), 1, "exactly one elem from the single NLRI");
+        let elem = &elems[0];
+        assert_eq!(
+            elem.prefix.path_id,
+            Some(42),
+            "path_id round-trips through bgpkit-parser when add_path=true"
+        );
+
+        let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ev = elem_to_route_event(elem, PeerId(0), fallback).expect("elem yields a RouteEvent");
+        match ev {
+            RouteEvent::Add { path_id, .. } => assert_eq!(path_id, Some(42)),
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_without_addpath_leaves_path_id_none() {
+        use bgpkit_parser::models::Asn;
+        use std::net::Ipv4Addr;
+
+        // Same UPDATE shape as the test above but with no path_id
+        // prefix on the NLRI. Length adjusts down by 4 bytes.
+        #[rustfmt::skip]
+        let bytes: [u8; 41] = [
+            // BGP header
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x29, // total length = 41
+            0x02,       // type = UPDATE
+            // Withdrawn Routes Length = 0
+            0x00, 0x00,
+            // Total Path Attribute Length = 14
+            0x00, 0x0E,
+            // ORIGIN (transitive)
+            0x40, 0x01, 0x01, 0x00,
+            // AS_PATH (transitive, empty)
+            0x40, 0x02, 0x00,
+            // NEXT_HOP (transitive): 10.0.0.1
+            0x40, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x01,
+            // NLRI: prefix_len=24, 192.0.2 (3 bytes), no path_id
+            0x18,
+            0xC0, 0x00, 0x02,
+        ];
+
+        let mut b = Bytes::copy_from_slice(&bytes);
+        let parsed = parse_bgp_message(&mut b, false, &AsnLength::Bits32)
+            .expect("non-ADD-PATH UPDATE parses cleanly");
+        let update = match parsed {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected UPDATE, got {:?}", other.msg_type()),
+        };
+
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let peer_asn = Asn::new_32bit(65000);
+        let elems = Elementor::bgp_update_to_elems(update, 0.0, &peer_ip, &peer_asn);
+        assert_eq!(elems.len(), 1);
+        assert!(
+            elems[0].prefix.path_id.is_none(),
+            "non-ADD-PATH NLRI must yield path_id=None"
+        );
+
+        let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ev =
+            elem_to_route_event(&elems[0], PeerId(0), fallback).expect("elem yields a RouteEvent");
+        match ev {
+            RouteEvent::Add { path_id, .. } => assert!(path_id.is_none()),
+            other => panic!("expected Add, got {:?}", other),
+        }
     }
 
     /// v0.2.1 regression guard. Pre-fix, `elem_to_route_event` (then
@@ -850,6 +1271,7 @@ mod tests {
                 peer_id: pid,
                 prefix,
                 nexthops,
+                path_id: _,
             } => {
                 assert_eq!(pid, peer_id);
                 assert!(matches!(

@@ -45,13 +45,26 @@ pub enum RouteEvent {
     /// with this `peer_id`.
     PeerDown { peer_id: PeerId },
     /// Route announcement.
+    ///
+    /// `path_id` is `Some(_)` only when RFC 7911 ADD-PATH has been
+    /// negotiated on the source session; `None` otherwise. Sources that
+    /// never negotiate ADD-PATH always emit `None`. The FibProgrammer
+    /// keys its per-advertisement state by `(peer_id, path_id)` so that
+    /// multiple paths per prefix can coexist and be aggregated into an
+    /// ECMP group.
     Add {
         peer_id: PeerId,
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
+        path_id: Option<u32>,
     },
-    /// Route withdrawal.
-    Del { peer_id: PeerId, prefix: IpPrefix },
+    /// Route withdrawal. `path_id` matches the `Add` it pairs with;
+    /// see [`RouteEvent::Add`] for semantics.
+    Del {
+        peer_id: PeerId,
+        prefix: IpPrefix,
+        path_id: Option<u32>,
+    },
     /// The RouteSource finished its initial RIB dump (all known
     /// peers have quiesced). The programmer uses this to garbage-
     /// collect entries left over from a prior session.
@@ -81,7 +94,12 @@ pub enum RouteEvent {
 /// negligible. `is_local_arp` recovers the per-iface scope so the
 /// programmer can withdraw a single iface's worth of /32s on
 /// `RTM_DELLINK`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` / `PartialOrd` are derived (lexicographic on the wrapped
+/// `u64`) so `PeerId` can key a `BTreeMap` / `BTreeSet`. The
+/// FibProgrammer uses `BTreeMap<(PeerId, Option<u32>), _>` for its
+/// per-advertisement state so iteration order is stable across
+/// process runs without an explicit sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId(pub u64);
 
 impl PeerId {

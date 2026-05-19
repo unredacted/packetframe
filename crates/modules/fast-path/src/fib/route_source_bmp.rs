@@ -412,9 +412,16 @@ impl BmpStation {
                                 peer_id,
                                 prefix,
                                 nexthops: vec![nh],
+                                // BMP Loc-RIB is a post-best-path stream; ADD-PATH
+                                // semantics do not apply at this layer.
+                                path_id: None,
                             }
                         }
-                        ElemType::WITHDRAW => RouteEvent::Del { peer_id, prefix },
+                        ElemType::WITHDRAW => RouteEvent::Del {
+                            peer_id,
+                            prefix,
+                            path_id: None,
+                        },
                     };
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
                         warn!(?peer_id, error = %e, "route event dispatch failed");

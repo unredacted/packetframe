@@ -44,7 +44,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -59,8 +59,8 @@ use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
 
 use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::types::{
-    EcmpGroup, FibValue, NexthopEntry, ECMP_NH_UNUSED, MAX_ECMP_PATHS, NH_FAMILY_V4, NH_FAMILY_V6,
-    NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED,
+    EcmpGroup, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, MAX_ECMP_PATHS, NH_FAMILY_V4,
+    NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED,
 };
 use crate::pin;
 
@@ -244,19 +244,50 @@ struct NexthopRecord {
 /// Per-route state tracked in userspace. The `fib_value` lets
 /// us unwind the BPF map entry on Del without a read-modify-write
 /// dance; `nexthop_ips` lets us decrement refcounts on the right
-/// nexthops; `peer_id` lets PeerDown walk by peer.
+/// nexthops; the advertisements map lets PeerDown identify all of a
+/// peer's contributions to this prefix without scanning every
+/// advertisement on the system.
+///
+/// The aggregated model: a prefix can carry contributions from
+/// multiple `(peer_id, path_id)` advertisements simultaneously. The
+/// installed FIB entry is recomputed as the union of next-hops
+/// across all advertisements after each mutation, and dedup'd via
+/// `alloc_ecmp_group`'s signature index.
 #[derive(Debug)]
 struct RouteRecord {
-    peer_id: PeerId,
+    /// Per-advertisement nexthop, keyed by `(peer_id, path_id)`. A
+    /// non-ADD-PATH source contributes one entry with `path_id =
+    /// None`; an ADD-PATH-negotiated source contributes one entry
+    /// per `path_id` the peer transmitted. `BTreeMap` gives stable
+    /// iteration order so deterministic union computation feeds a
+    /// stable ECMP-group signature.
+    advertisements: BTreeMap<(PeerId, Option<u32>), Advertisement>,
+    /// Currently-installed FibValue in the BPF FIB map; mirrors
+    /// what the data plane is reading.
     fib_value: FibValue,
-    /// Nexthop IPs this route references. On Del we unregister each
-    /// (decrement refcount, free NexthopId when it hits zero).
+    /// Currently-installed nexthop IPs (sorted, deduplicated).
+    /// Mirrors what `fib_value` points at. Used to release refcounts
+    /// when the union changes or the prefix is torn down.
     nexthop_ips: Vec<IpAddr>,
-    /// Resync-reconcile bookkeeping: true when this route was
-    /// freshly Add'd (or refreshed) after the most recent Resync;
-    /// false when it was inherited from a prior session and hasn't
-    /// been re-announced yet. InitiationComplete GCs routes whose
-    /// flag is still false.
+}
+
+/// A single advertisement contributing to a prefix's FIB entry.
+///
+/// One `RouteEvent::Add` produces one `Advertisement`; the
+/// per-advertisement nexthop set may be multi-element when the
+/// source is the legacy multi-NH `RouteEvent::Add` shape (e.g.,
+/// netlink-injected ECMP), but ADD-PATH sources emit one NH per
+/// advertisement and let the per-prefix union recompose the ECMP
+/// group.
+#[derive(Debug, Clone)]
+struct Advertisement {
+    nexthops: Vec<IpAddr>,
+    /// Resync-reconcile bookkeeping: true when this advertisement
+    /// was freshly Add'd (or refreshed) after the most recent
+    /// Resync; false when it was inherited from a prior session and
+    /// hasn't been re-announced. `InitiationComplete` GCs
+    /// advertisements whose flag is still false; the prefix's FIB
+    /// entry is then recomputed.
     seen_this_session: bool,
 }
 
@@ -757,15 +788,13 @@ impl FibProgrammer {
         Ok(())
     }
 
-    // --- Route event handling (Phase 3) ---------------------------------
+    // --- Route event handling (Phase 3, RFC 7911 aggregation) ----------
 
     fn on_route_event(&mut self, event: RouteEvent) -> Result<(), ProgrammerError> {
         match event {
             RouteEvent::PeerUp { peer_id, .. } => {
-                // PeerUp is informational for the programmer; we start
-                // tracking routes by peer_id as soon as the first
-                // RouteEvent::Add { peer_id } arrives. Nothing to do
-                // until then.
+                // Informational. Per-peer state is initialized lazily
+                // when the first advertisement from `peer_id` arrives.
                 debug!(?peer_id, "PeerUp received");
                 Ok(())
             }
@@ -774,18 +803,23 @@ impl FibProgrammer {
                 peer_id,
                 prefix,
                 nexthops,
-            } => self.add_route(peer_id, prefix, nexthops),
-            RouteEvent::Del { peer_id: _, prefix } => self.del_route(prefix),
+                path_id,
+            } => self.add_route(peer_id, prefix, nexthops, path_id),
+            RouteEvent::Del {
+                peer_id,
+                prefix,
+                path_id,
+            } => self.del_route(peer_id, prefix, path_id),
             RouteEvent::Resync => {
                 self.mark_all_unseen();
-                info!("Resync: all routes marked not-seen-this-session");
+                info!("Resync: all advertisements marked not-seen-this-session");
                 Ok(())
             }
             RouteEvent::InitiationComplete => {
-                let gc_count = self.gc_unseen();
+                let gc_count = self.gc_unseen()?;
                 info!(
                     gc_count,
-                    "InitiationComplete: garbage-collected unseen routes"
+                    "InitiationComplete: garbage-collected unseen advertisements"
                 );
                 Ok(())
             }
@@ -797,96 +831,42 @@ impl FibProgrammer {
         peer_id: PeerId,
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
+        path_id: Option<u32>,
     ) -> Result<(), ProgrammerError> {
         if nexthops.is_empty() {
-            // Empty nexthop set ⇒ refuse. BMP should never surface
-            // this for a non-withdraw; defensive.
+            // Defensive. An empty announce should arrive as Del.
             return Ok(());
         }
-
-        // Allocate nexthop IDs (bumps refcount on existing IPs).
-        let mut nh_ids: Vec<NexthopId> = Vec::with_capacity(nexthops.len());
-        let mut allocated_ips: Vec<IpAddr> = Vec::with_capacity(nexthops.len());
-        for ip in &nexthops {
-            match self.register(*ip) {
-                Ok(id) => {
-                    nh_ids.push(id);
-                    allocated_ips.push(*ip);
-                }
-                Err(e) => {
-                    // Unwind partial allocations so the error leaves
-                    // no lingering refcount state.
-                    for done in &allocated_ips {
-                        let _ = self.unregister(*done);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        let fib_value = if nh_ids.len() == 1 {
-            FibValue::single(nh_ids[0])
-        } else {
-            // ECMP group. hash_mode comes from FIB_CONFIG's default
-            // for now; per-group override is a Phase 3+ refinement
-            // once bird surfaces per-peer hash policy via community
-            // or similar.
-            let hash_mode = 5; // Mode 5 (5-tuple) — default from FIB_CONFIG.
-            match self.alloc_ecmp_group(&nh_ids, hash_mode) {
-                Ok(id) => FibValue::ecmp(id),
-                Err(e) => {
-                    // Unwind allocated nexthop refcounts.
-                    for ip in &allocated_ips {
-                        let _ = self.unregister(*ip);
-                    }
-                    return Err(e);
-                }
-            }
-        };
-
-        // Detect default-route replace: if a prior entry exists at
-        // this prefix, swap with grace-period reclaim. Otherwise,
-        // straight write + mirror insert.
-        let replace = self.lookup_mirror(&prefix).is_some();
-        if replace {
-            let old = self.remove_mirror(&prefix);
-            self.write_fib_entry(&prefix, fib_value)?;
-            if let Some(old_rec) = old {
-                self.enqueue_reclaim(old_rec);
-            }
-        } else {
-            self.write_fib_entry(&prefix, fib_value)?;
-        }
-
-        // Record in mirror.
-        let record = RouteRecord {
-            peer_id,
-            fib_value,
-            nexthop_ips: nexthops,
-            seen_this_session: true,
-        };
-        self.insert_mirror(prefix, record);
-        Ok(())
+        self.upsert_advertisement(peer_id, prefix, path_id, nexthops);
+        self.recompute_fib_entry(prefix)
     }
 
-    fn del_route(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
-        let old = match self.remove_mirror(&prefix) {
-            Some(r) => r,
-            None => return Ok(()), // idempotent
-        };
-        self.delete_fib_entry(&prefix)?;
-        self.release_route_record(old);
-        Ok(())
+    fn del_route(
+        &mut self,
+        peer_id: PeerId,
+        prefix: IpPrefix,
+        path_id: Option<u32>,
+    ) -> Result<(), ProgrammerError> {
+        if !self.remove_advertisement(peer_id, &prefix, path_id) {
+            // Idempotent: nothing was advertised under this key.
+            return Ok(());
+        }
+        self.recompute_fib_entry(prefix)
     }
 
-    /// Drop every route mirrored under `peer_id`. Called on PeerDown.
+    /// Drop every advertisement contributed by `peer_id`. Called on
+    /// `PeerDown`. Each affected prefix is recomputed; prefixes whose
+    /// only remaining advertisements were from this peer are torn
+    /// down entirely. Prefixes still carrying advertisements from
+    /// other peers keep their FIB entries, possibly with a narrowed
+    /// NH set.
     fn drop_routes_for_peer(&mut self, peer_id: PeerId) -> Result<(), ProgrammerError> {
-        let prefixes = match self.routes_by_peer.remove(&peer_id) {
-            Some(s) => s,
+        let prefixes_for_peer = match self.routes_by_peer.remove(&peer_id) {
+            Some(set) => set,
             None => return Ok(()),
         };
-        let count = prefixes.len();
-        for (is_v4, addr, plen) in prefixes {
+        let prefix_count = prefixes_for_peer.len();
+        for (is_v4, addr, plen) in prefixes_for_peer {
             let prefix = if is_v4 {
                 let mut a = [0u8; 4];
                 a.copy_from_slice(&addr[..4]);
@@ -900,62 +880,305 @@ impl FibProgrammer {
                     prefix_len: plen,
                 }
             };
-            let rec = match self.remove_mirror_direct(&prefix) {
-                Some(r) => r,
-                None => continue,
-            };
-            if let Err(e) = self.delete_fib_entry(&prefix) {
-                warn!(?peer_id, ?prefix, error = %e, "FIB delete during PeerDown failed");
+            let drained = self.drain_peer_advertisements(peer_id, &prefix);
+            if drained == 0 {
+                continue;
             }
-            self.release_route_record(rec);
+            if let Err(e) = self.recompute_fib_entry(prefix) {
+                warn!(?peer_id, ?prefix, error = %e, "recompute after PeerDown failed");
+            }
         }
-        info!(?peer_id, count, "PeerDown: withdrew routes");
+        info!(
+            ?peer_id,
+            prefix_count, "PeerDown: withdrew peer's advertisements"
+        );
         Ok(())
     }
 
-    /// Mark every mirrored route as `seen_this_session = false`. Live
+    /// Mark every advertisement as `seen_this_session = false`. Live
     /// `Add` events clear the mark; `InitiationComplete` GCs what's
     /// left.
     fn mark_all_unseen(&mut self) {
         for rec in self.routes_v4.values_mut() {
-            rec.seen_this_session = false;
+            for adv in rec.advertisements.values_mut() {
+                adv.seen_this_session = false;
+            }
         }
         for rec in self.routes_v6.values_mut() {
-            rec.seen_this_session = false;
+            for adv in rec.advertisements.values_mut() {
+                adv.seen_this_session = false;
+            }
         }
     }
 
-    /// GC routes still marked `seen_this_session = false` after an
-    /// InitiationComplete. Returns the count removed.
-    fn gc_unseen(&mut self) -> usize {
-        let mut unseen_v4: Vec<([u8; 4], u8)> = Vec::new();
-        for (k, r) in &self.routes_v4 {
-            if !r.seen_this_session {
-                unseen_v4.push(*k);
+    /// GC advertisements still marked `seen_this_session = false`
+    /// after an InitiationComplete. Returns the count of
+    /// advertisements (not prefixes) removed. Affected prefixes are
+    /// recomputed; those whose every advertisement was unseen are
+    /// torn down entirely.
+    fn gc_unseen(&mut self) -> Result<usize, ProgrammerError> {
+        // Collect victims out-of-band so the borrow checker is happy
+        // while we mutate during recompute.
+        let mut victims: Vec<(IpPrefix, (PeerId, Option<u32>))> = Vec::new();
+        for ((addr, prefix_len), rec) in &self.routes_v4 {
+            for (key, adv) in &rec.advertisements {
+                if !adv.seen_this_session {
+                    victims.push((
+                        IpPrefix::V4 {
+                            addr: *addr,
+                            prefix_len: *prefix_len,
+                        },
+                        *key,
+                    ));
+                }
             }
         }
-        let mut unseen_v6: Vec<([u8; 16], u8)> = Vec::new();
-        for (k, r) in &self.routes_v6 {
-            if !r.seen_this_session {
-                unseen_v6.push(*k);
+        for ((addr, prefix_len), rec) in &self.routes_v6 {
+            for (key, adv) in &rec.advertisements {
+                if !adv.seen_this_session {
+                    victims.push((
+                        IpPrefix::V6 {
+                            addr: *addr,
+                            prefix_len: *prefix_len,
+                        },
+                        *key,
+                    ));
+                }
             }
         }
-        let count = unseen_v4.len() + unseen_v6.len();
-        for (addr, plen) in unseen_v4 {
-            let p = IpPrefix::V4 {
-                addr,
-                prefix_len: plen,
-            };
-            let _ = self.del_route(p);
+        let count = victims.len();
+        let mut touched: HashSet<IpPrefix> = HashSet::new();
+        for (prefix, (peer_id, path_id)) in victims {
+            if self.remove_advertisement(peer_id, &prefix, path_id) {
+                touched.insert(prefix);
+            }
         }
-        for (addr, plen) in unseen_v6 {
-            let p = IpPrefix::V6 {
-                addr,
-                prefix_len: plen,
-            };
-            let _ = self.del_route(p);
+        for prefix in touched {
+            self.recompute_fib_entry(prefix)?;
         }
-        count
+        Ok(count)
+    }
+
+    // --- Advertisement bookkeeping (slice 4) ---
+
+    /// Insert or replace `advertisements[(peer_id, path_id)]` on
+    /// `prefix`'s record, creating the record if absent. Keeps the
+    /// `routes_by_peer` index in sync. Recompute is the caller's
+    /// responsibility.
+    fn upsert_advertisement(
+        &mut self,
+        peer_id: PeerId,
+        prefix: IpPrefix,
+        path_id: Option<u32>,
+        nexthops: Vec<IpAddr>,
+    ) {
+        let key = (peer_id, path_id);
+        let adv = Advertisement {
+            nexthops,
+            seen_this_session: true,
+        };
+        let rec = self.upsert_empty_record(prefix);
+        rec.advertisements.insert(key, adv);
+        self.routes_by_peer
+            .entry(peer_id)
+            .or_default()
+            .insert(prefix_peer_key(&prefix));
+    }
+
+    /// Remove a single advertisement. Returns `true` when an entry
+    /// existed. Clears the per-peer index if the peer has no more
+    /// advertisements on this prefix. Recompute is the caller's
+    /// responsibility.
+    fn remove_advertisement(
+        &mut self,
+        peer_id: PeerId,
+        prefix: &IpPrefix,
+        path_id: Option<u32>,
+    ) -> bool {
+        let removed = match self.lookup_mirror_mut(prefix) {
+            Some(rec) => rec.advertisements.remove(&(peer_id, path_id)).is_some(),
+            None => false,
+        };
+        if removed {
+            self.maybe_clear_peer_index(peer_id, prefix);
+        }
+        removed
+    }
+
+    /// Remove every advertisement on `prefix` that originated from
+    /// `peer_id`. Returns the number removed. `routes_by_peer`
+    /// cleanup is the caller's responsibility (typically a bulk
+    /// `drop_routes_for_peer`).
+    fn drain_peer_advertisements(&mut self, peer_id: PeerId, prefix: &IpPrefix) -> usize {
+        match self.lookup_mirror_mut(prefix) {
+            Some(rec) => {
+                let before = rec.advertisements.len();
+                rec.advertisements.retain(|(p, _), _| *p != peer_id);
+                before - rec.advertisements.len()
+            }
+            None => 0,
+        }
+    }
+
+    /// Drop `prefix` from `routes_by_peer[peer_id]` when the peer has
+    /// no remaining advertisements for it; also drops the per-peer
+    /// entry when the peer's set is empty.
+    fn maybe_clear_peer_index(&mut self, peer_id: PeerId, prefix: &IpPrefix) {
+        let peer_still_has_prefix = self
+            .lookup_mirror(prefix)
+            .map(|r| r.advertisements.keys().any(|(p, _)| *p == peer_id))
+            .unwrap_or(false);
+        if peer_still_has_prefix {
+            return;
+        }
+        if let Some(set) = self.routes_by_peer.get_mut(&peer_id) {
+            set.remove(&prefix_peer_key(prefix));
+            if set.is_empty() {
+                self.routes_by_peer.remove(&peer_id);
+            }
+        }
+    }
+
+    /// Recompute the FIB entry for `prefix` from its current
+    /// advertisements. Empty advertisements tear the prefix down.
+    /// Otherwise the union of next-hops across all advertisements
+    /// determines the new FibValue (single when one NH, ECMP when
+    /// many); writes through to the BPF FIB map only when the
+    /// installed NH set actually changes. Prior resources are
+    /// reclaimed via the grace-deferred queue so concurrent XDP reads
+    /// stay safe across the transition; full tear-downs free
+    /// immediately because the BPF LPM entry is gone and no new
+    /// lookup can land on the prior IDs.
+    fn recompute_fib_entry(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
+        // 1. Compute the desired sorted, deduplicated NH set.
+        let desired_nhs: Vec<IpAddr> = match self.lookup_mirror(&prefix) {
+            Some(rec) => {
+                let mut set: BTreeSet<IpAddr> = BTreeSet::new();
+                for adv in rec.advertisements.values() {
+                    for nh in &adv.nexthops {
+                        set.insert(*nh);
+                    }
+                }
+                set.into_iter().collect()
+            }
+            None => Vec::new(),
+        };
+
+        // 2. Empty desired set: tear the prefix down.
+        if desired_nhs.is_empty() {
+            let rec = match self.remove_mirror_direct(&prefix) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
+            self.delete_fib_entry(&prefix)?;
+            self.reclaim_immediate(rec.fib_value, rec.nexthop_ips);
+            return Ok(());
+        }
+
+        // 3. No-change shortcut: identical NH set already installed.
+        let prior_state = self
+            .lookup_mirror(&prefix)
+            .map(|r| (r.fib_value, r.nexthop_ips.clone()));
+        let unchanged = matches!(&prior_state, Some((_, ips)) if *ips == desired_nhs);
+        if unchanged {
+            return Ok(());
+        }
+
+        // 4. Allocate the new FibValue.
+        let mut nh_ids: Vec<NexthopId> = Vec::with_capacity(desired_nhs.len());
+        let mut allocated_ips: Vec<IpAddr> = Vec::with_capacity(desired_nhs.len());
+        for ip in &desired_nhs {
+            match self.register(*ip) {
+                Ok(id) => {
+                    nh_ids.push(id);
+                    allocated_ips.push(*ip);
+                }
+                Err(e) => {
+                    for done in &allocated_ips {
+                        let _ = self.unregister(*done);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let new_fib_value = if nh_ids.len() == 1 {
+            FibValue::single(nh_ids[0])
+        } else {
+            // Mode 5 (5-tuple), the default from FIB_CONFIG.
+            // Per-group override is a future refinement.
+            let hash_mode = 5;
+            match self.alloc_ecmp_group(&nh_ids, hash_mode) {
+                Ok(id) => FibValue::ecmp(id),
+                Err(e) => {
+                    for ip in &allocated_ips {
+                        let _ = self.unregister(*ip);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+
+        // 5. Write through; unwind the new allocation if the write
+        // fails so the error path leaves no lingering refcounts.
+        if let Err(e) = self.write_fib_entry(&prefix, new_fib_value) {
+            if new_fib_value.kind == FIB_KIND_ECMP {
+                self.free_ecmp_group(new_fib_value.idx);
+            }
+            for ip in &allocated_ips {
+                let _ = self.unregister(*ip);
+            }
+            return Err(e);
+        }
+
+        // 6. Commit the swap in the mirror and reclaim prior
+        // resources with the grace queue.
+        let (prior_fib, prior_nh_ips) = match prior_state {
+            Some((fv, ips)) => (Some(fv), ips),
+            None => (None, Vec::new()),
+        };
+        {
+            let rec = self
+                .lookup_mirror_mut(&prefix)
+                .expect("record present after upsert");
+            rec.fib_value = new_fib_value;
+            rec.nexthop_ips = allocated_ips;
+        }
+        self.reclaim_prior(prior_fib, prior_nh_ips);
+        Ok(())
+    }
+
+    /// Reclaim the prior FibValue and NH set after a FIB-entry
+    /// in-place rewrite. Routes through the grace queue so
+    /// concurrent XDP reads can finish dereferencing the old IDs.
+    fn reclaim_prior(&mut self, prior_fib: Option<FibValue>, prior_nh_ips: Vec<IpAddr>) {
+        let release_at = Instant::now() + DEFAULT_ROUTE_GRACE;
+        if let Some(fv) = prior_fib {
+            if fv.kind == FIB_KIND_ECMP {
+                self.reclaim_queue.push_back(PendingReclaim {
+                    release_at,
+                    kind: ReclaimKind::Ecmp(fv.idx),
+                });
+            }
+        }
+        for ip in prior_nh_ips {
+            self.reclaim_queue.push_back(PendingReclaim {
+                release_at,
+                kind: ReclaimKind::Nexthop(ip),
+            });
+        }
+    }
+
+    /// Free a torn-down prefix's resources immediately. Safe because
+    /// the BPF LPM entry has already been removed; lookups return
+    /// no-match right away, so no in-flight reader can dereference
+    /// these IDs after the deletion.
+    fn reclaim_immediate(&mut self, fib: FibValue, nh_ips: Vec<IpAddr>) {
+        if fib.kind == FIB_KIND_ECMP {
+            self.free_ecmp_group(fib.idx);
+        }
+        for ip in nh_ips {
+            let _ = self.unregister(ip);
+        }
     }
 
     // --- Mirror ops ---
@@ -967,49 +1190,54 @@ impl FibProgrammer {
         }
     }
 
-    fn insert_mirror(&mut self, prefix: IpPrefix, record: RouteRecord) {
-        let peer_id = record.peer_id;
+    fn lookup_mirror_mut(&mut self, prefix: &IpPrefix) -> Option<&mut RouteRecord> {
         match prefix {
-            IpPrefix::V4 { addr, prefix_len } => {
-                self.routes_v4.insert((addr, prefix_len), record);
-                let mut padded = [0u8; 16];
-                padded[..4].copy_from_slice(&addr);
-                self.routes_by_peer
-                    .entry(peer_id)
-                    .or_default()
-                    .insert((true, padded, prefix_len));
-            }
-            IpPrefix::V6 { addr, prefix_len } => {
-                self.routes_v6.insert((addr, prefix_len), record);
-                self.routes_by_peer
-                    .entry(peer_id)
-                    .or_default()
-                    .insert((false, addr, prefix_len));
-            }
+            IpPrefix::V4 { addr, prefix_len } => self.routes_v4.get_mut(&(*addr, *prefix_len)),
+            IpPrefix::V6 { addr, prefix_len } => self.routes_v6.get_mut(&(*addr, *prefix_len)),
         }
     }
 
-    fn remove_mirror(&mut self, prefix: &IpPrefix) -> Option<RouteRecord> {
-        self.remove_mirror_direct(prefix)
+    /// Get-or-insert an empty record for `prefix`. The placeholder
+    /// FibValue and `nexthop_ips` are populated by the subsequent
+    /// `recompute_fib_entry`; nothing reads them between insertion
+    /// and recompute.
+    fn upsert_empty_record(&mut self, prefix: IpPrefix) -> &mut RouteRecord {
+        match prefix {
+            IpPrefix::V4 { addr, prefix_len } => self
+                .routes_v4
+                .entry((addr, prefix_len))
+                .or_insert_with(|| RouteRecord {
+                    advertisements: BTreeMap::new(),
+                    fib_value: FibValue::single(0),
+                    nexthop_ips: Vec::new(),
+                }),
+            IpPrefix::V6 { addr, prefix_len } => self
+                .routes_v6
+                .entry((addr, prefix_len))
+                .or_insert_with(|| RouteRecord {
+                    advertisements: BTreeMap::new(),
+                    fib_value: FibValue::single(0),
+                    nexthop_ips: Vec::new(),
+                }),
+        }
     }
 
     fn remove_mirror_direct(&mut self, prefix: &IpPrefix) -> Option<RouteRecord> {
-        let (rec, peer_key) = match prefix {
-            IpPrefix::V4 { addr, prefix_len } => {
-                let rec = self.routes_v4.remove(&(*addr, *prefix_len))?;
-                let mut padded = [0u8; 16];
-                padded[..4].copy_from_slice(addr);
-                (rec, (true, padded, *prefix_len))
-            }
-            IpPrefix::V6 { addr, prefix_len } => {
-                let rec = self.routes_v6.remove(&(*addr, *prefix_len))?;
-                (rec, (false, *addr, *prefix_len))
-            }
+        let rec = match prefix {
+            IpPrefix::V4 { addr, prefix_len } => self.routes_v4.remove(&(*addr, *prefix_len))?,
+            IpPrefix::V6 { addr, prefix_len } => self.routes_v6.remove(&(*addr, *prefix_len))?,
         };
-        if let Some(set) = self.routes_by_peer.get_mut(&rec.peer_id) {
-            set.remove(&peer_key);
-            if set.is_empty() {
-                self.routes_by_peer.remove(&rec.peer_id);
+        // Clean the per-peer index for every peer that contributed to
+        // this prefix. Dedup by peer with a BTreeSet so we touch each
+        // peer's bucket once.
+        let peers: BTreeSet<PeerId> = rec.advertisements.keys().map(|(p, _)| *p).collect();
+        let key = prefix_peer_key(prefix);
+        for peer in peers {
+            if let Some(set) = self.routes_by_peer.get_mut(&peer) {
+                set.remove(&key);
+                if set.is_empty() {
+                    self.routes_by_peer.remove(&peer);
+                }
             }
         }
         Some(rec)
@@ -1164,37 +1392,7 @@ impl FibProgrammer {
         }
     }
 
-    // --- Reclaim queue (default-route grace period) ---
-
-    fn enqueue_reclaim(&mut self, rec: RouteRecord) {
-        let release_at = Instant::now() + DEFAULT_ROUTE_GRACE;
-        match rec.fib_value.kind {
-            k if k == crate::fib::types::FIB_KIND_SINGLE => {
-                // Single nexthop: reclaim the nexthop IP after grace.
-                for ip in rec.nexthop_ips {
-                    self.reclaim_queue.push_back(PendingReclaim {
-                        release_at,
-                        kind: ReclaimKind::Nexthop(ip),
-                    });
-                }
-            }
-            k if k == crate::fib::types::FIB_KIND_ECMP => {
-                // ECMP: reclaim the group (which cascades to its NHs
-                // when refcount hits zero) plus the explicit NH IPs.
-                self.reclaim_queue.push_back(PendingReclaim {
-                    release_at,
-                    kind: ReclaimKind::Ecmp(rec.fib_value.idx),
-                });
-                for ip in rec.nexthop_ips {
-                    self.reclaim_queue.push_back(PendingReclaim {
-                        release_at,
-                        kind: ReclaimKind::Nexthop(ip),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
+    // --- Reclaim queue drain (grace-period release) ---
 
     fn drain_reclaim_queue(&mut self) {
         let now = Instant::now();
@@ -1213,24 +1411,19 @@ impl FibProgrammer {
             }
         }
     }
+}
 
-    /// Release the resources a RouteRecord refs: for non-default
-    /// prefixes, unwind immediately; for default routes, enqueue
-    /// a grace-delayed reclaim. Called from del_route +
-    /// drop_routes_for_peer.
-    fn release_route_record(&mut self, rec: RouteRecord) {
-        // For default-route replaces we route through enqueue_reclaim
-        // at the call site (add_route path). For straight deletes we
-        // can free immediately because the BPF LPM entry is already
-        // gone and no new lookup can land on these IDs.
-        match rec.fib_value.kind {
-            k if k == crate::fib::types::FIB_KIND_ECMP => {
-                self.free_ecmp_group(rec.fib_value.idx);
-            }
-            _ => {}
+/// Encode an `IpPrefix` to the `(is_v4, addr-padded-to-16, plen)`
+/// shape used by `routes_by_peer`. The 16-byte addr buffer holds the
+/// 4-byte v4 address in the low octets (high 12 are zero) so both
+/// families share the same `HashSet` key type.
+fn prefix_peer_key(prefix: &IpPrefix) -> (bool, [u8; 16], u8) {
+    match prefix {
+        IpPrefix::V4 { addr, prefix_len } => {
+            let mut padded = [0u8; 16];
+            padded[..4].copy_from_slice(addr);
+            (true, padded, *prefix_len)
         }
-        for ip in rec.nexthop_ips {
-            let _ = self.unregister(ip);
-        }
+        IpPrefix::V6 { addr, prefix_len } => (false, *addr, *prefix_len),
     }
 }
