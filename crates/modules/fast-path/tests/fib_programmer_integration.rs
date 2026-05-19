@@ -264,6 +264,7 @@ fn add_single_nexthop_route_writes_fib_v4() {
                 peer_id: PeerId(0xaaaa),
                 prefix,
                 nexthops: vec![nh],
+                path_id: None,
             })
             .await
     })
@@ -302,6 +303,7 @@ fn add_multi_nexthop_route_allocates_ecmp_group() {
                 peer_id: PeerId(0xbbbb),
                 prefix,
                 nexthops: nhs.clone(),
+                path_id: None,
             })
             .await
     })
@@ -348,6 +350,7 @@ fn del_removes_fib_entry() {
                 peer_id: peer,
                 prefix,
                 nexthops: vec![nh],
+                path_id: None,
             })
             .await
     })
@@ -363,6 +366,7 @@ fn del_removes_fib_entry() {
             .apply_route_event(RouteEvent::Del {
                 peer_id: peer,
                 prefix,
+                path_id: None,
             })
             .await
     })
@@ -392,6 +396,7 @@ fn peer_down_withdraws_all_peer_routes() {
                         prefix_len: 24,
                     },
                     nexthops: vec![nh],
+                    path_id: None,
                 })
                 .await
                 .expect("apply Add");
@@ -435,6 +440,7 @@ fn ecmp_groups_dedup_by_signature() {
                         prefix_len: 24,
                     },
                     nexthops: nhs.clone(),
+                    path_id: None,
                 })
                 .await
                 .expect("apply Add");

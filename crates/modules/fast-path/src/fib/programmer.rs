@@ -774,8 +774,13 @@ impl FibProgrammer {
                 peer_id,
                 prefix,
                 nexthops,
+                path_id: _,
             } => self.add_route(peer_id, prefix, nexthops),
-            RouteEvent::Del { peer_id: _, prefix } => self.del_route(prefix),
+            RouteEvent::Del {
+                peer_id: _,
+                prefix,
+                path_id: _,
+            } => self.del_route(prefix),
             RouteEvent::Resync => {
                 self.mark_all_unseen();
                 info!("Resync: all routes marked not-seen-this-session");

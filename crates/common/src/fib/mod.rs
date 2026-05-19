@@ -45,13 +45,26 @@ pub enum RouteEvent {
     /// with this `peer_id`.
     PeerDown { peer_id: PeerId },
     /// Route announcement.
+    ///
+    /// `path_id` is `Some(_)` only when RFC 7911 ADD-PATH has been
+    /// negotiated on the source session; `None` otherwise. Sources that
+    /// never negotiate ADD-PATH always emit `None`. The FibProgrammer
+    /// keys its per-advertisement state by `(peer_id, path_id)` so that
+    /// multiple paths per prefix can coexist and be aggregated into an
+    /// ECMP group.
     Add {
         peer_id: PeerId,
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
+        path_id: Option<u32>,
     },
-    /// Route withdrawal.
-    Del { peer_id: PeerId, prefix: IpPrefix },
+    /// Route withdrawal. `path_id` matches the `Add` it pairs with;
+    /// see [`RouteEvent::Add`] for semantics.
+    Del {
+        peer_id: PeerId,
+        prefix: IpPrefix,
+        path_id: Option<u32>,
+    },
     /// The RouteSource finished its initial RIB dump (all known
     /// peers have quiesced). The programmer uses this to garbage-
     /// collect entries left over from a prior session.

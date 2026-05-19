@@ -510,6 +510,13 @@ fn is_clean_eof(e: &std::io::Error) -> bool {
 /// Build the OPEN message. Capabilities advertised:
 /// - MP-BGP IPv4 unicast (AFI=1, SAFI=1)
 /// - MP-BGP IPv6 unicast (AFI=2, SAFI=1)
+/// - ADD-PATH (RFC 7911, capability code 69) for IPv4 unicast and
+///   IPv6 unicast, Send/Receive value `1` (Receive). PacketFrame never
+///   originates routes, so only the Receive direction is advertised.
+///   A peer that also wishes to send multiple paths must advertise
+///   capability 69 with Send (value `2`) or both (value `3`) for the
+///   matching AFI/SAFI; mutual negotiation is decoded in the OPEN
+///   parser (slice 2) and acted on in UPDATE parsing (slice 3).
 /// - 4-octet ASN (RFC 6793) carrying the real `local_as`
 pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8> {
     // Capabilities (each: code u8, len u8, value [u8])
@@ -518,6 +525,12 @@ pub fn encode_open(local_as: u32, hold_time: u16, router_id: Ipv4Addr) -> Vec<u8
     caps.extend_from_slice(&[1, 4, 0x00, 0x01, 0x00, 0x01]);
     // MP IPv6 unicast: AFI=2, Reserved=0, SAFI=1
     caps.extend_from_slice(&[1, 4, 0x00, 0x02, 0x00, 0x01]);
+    // ADD-PATH (RFC 7911 §4): code=69, len=8 covers two
+    // (AFI:2, SAFI:1, Send/Receive:1) tuples.
+    //   tuple #1: AFI=1 (IPv4), SAFI=1 (unicast), 1 = Receive
+    //   tuple #2: AFI=2 (IPv6), SAFI=1 (unicast), 1 = Receive
+    // RFC 7911 §4 permits multiple tuples in a single capability TLV.
+    caps.extend_from_slice(&[69, 8, 0x00, 0x01, 0x01, 0x01, 0x00, 0x02, 0x01, 0x01]);
     // 4-octet ASN
     caps.extend_from_slice(&[65, 4]);
     caps.extend_from_slice(&local_as.to_be_bytes());
@@ -665,9 +678,16 @@ fn elem_to_route_event(
                 peer_id,
                 prefix,
                 nexthops: vec![nh],
+                // Slice 1: ADD-PATH not yet parsed from UPDATE NLRI; populated
+                // in slice 3 once `read_one_message` threads `add_path_in_effect`.
+                path_id: None,
             }
         }
-        ElemType::WITHDRAW => RouteEvent::Del { peer_id, prefix },
+        ElemType::WITHDRAW => RouteEvent::Del {
+            peer_id,
+            prefix,
+            path_id: None,
+        },
     })
 }
 
@@ -743,6 +763,8 @@ mod tests {
         let mut saw_mp_v4 = false;
         let mut saw_mp_v6 = false;
         let mut saw_4byte_asn = None;
+        let mut add_path_v4_recv = false;
+        let mut add_path_v6_recv = false;
         while i + 2 <= caps.len() {
             let code = caps[i];
             let clen = caps[i + 1] as usize;
@@ -763,6 +785,25 @@ mod tests {
                     saw_4byte_asn =
                         Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
                 }
+                69 => {
+                    // ADD-PATH per RFC 7911 §4: one or more 4-byte
+                    // tuples of (AFI:2, SAFI:1, Send/Receive:1). Values
+                    // for Send/Receive: 1 = Receive, 2 = Send, 3 = both.
+                    let mut j = 0;
+                    while j + 4 <= clen {
+                        let afi = u16::from_be_bytes([value[j], value[j + 1]]);
+                        let safi = value[j + 2];
+                        let sr = value[j + 3];
+                        let has_recv = sr & 0x01 != 0;
+                        if afi == 1 && safi == 1 && has_recv {
+                            add_path_v4_recv = true;
+                        }
+                        if afi == 2 && safi == 1 && has_recv {
+                            add_path_v6_recv = true;
+                        }
+                        j += 4;
+                    }
+                }
                 _ => {}
             }
             i += 2 + clen;
@@ -773,6 +814,14 @@ mod tests {
             saw_4byte_asn,
             Some(401401),
             "missing or wrong 4-octet ASN capability"
+        );
+        assert!(
+            add_path_v4_recv,
+            "missing ADD-PATH capability (RFC 7911) with Receive for IPv4 unicast"
+        );
+        assert!(
+            add_path_v6_recv,
+            "missing ADD-PATH capability (RFC 7911) with Receive for IPv6 unicast"
         );
     }
 
@@ -850,6 +899,7 @@ mod tests {
                 peer_id: pid,
                 prefix,
                 nexthops,
+                path_id: _,
             } => {
                 assert_eq!(pid, peer_id);
                 assert!(matches!(

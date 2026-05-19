@@ -590,6 +590,7 @@ impl NetlinkNeighborResolver {
                             prefix_len: 32,
                         },
                         nexthops: vec![ip],
+                        path_id: None,
                     })
                     .await
                 {
@@ -788,6 +789,7 @@ impl NetlinkNeighborResolver {
                 prefix_len: 0,
             },
             nexthops: vec![IpAddr::V4(spec.nexthop)],
+            path_id: None,
         };
         match prog.apply_route_event(event).await {
             Ok(()) => info!(
@@ -824,6 +826,7 @@ impl NetlinkNeighborResolver {
                     prefix_len: 32,
                 },
                 nexthops: vec![ip],
+                path_id: None,
             })
             .await
         {
@@ -849,6 +852,7 @@ impl NetlinkNeighborResolver {
                     addr: v4.octets(),
                     prefix_len: 32,
                 },
+                path_id: None,
             })
             .await
         {

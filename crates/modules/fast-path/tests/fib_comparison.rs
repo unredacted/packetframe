@@ -336,6 +336,7 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
                     peer_id: PeerId(0xabcd),
                     prefix: *prefix,
                     nexthops: nhs.clone(),
+                    path_id: None,
                 })
                 .await
         })
@@ -421,6 +422,7 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
                     addr: [192, 0, 2, 200],
                     prefix_len: 32,
                 },
+                path_id: None,
             })
             .await
     })

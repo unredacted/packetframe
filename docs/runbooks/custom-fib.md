@@ -534,6 +534,16 @@ global-config: |
 keeps BGP routes off the kernel FIB; no further kernel-filter
 changes needed.
 
+**ADD-PATH (RFC 7911) caveat.** PacketFrame advertises capability
+69 in its OPEN with Receive direction for IPv4 and IPv6 unicast.
+NLRI decoding for ADD-PATH is not yet wired through the listener
+and the FIB programmer does not yet aggregate multi-path
+advertisements into ECMP groups. Do not configure peer-side
+`add paths tx` on the iBGP channel until a release CHANGELOG
+announces RFC 7911 support end to end. Enabling `add paths tx`
+before that point causes path-id-prefixed UPDATEs to misdecode
+and the session to flap.
+
 **Packetframe config:**
 
 ```
