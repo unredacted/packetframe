@@ -683,7 +683,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "packetframe-cli"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-common"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "flate2",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-fast-path"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "aya",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-probe"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "aya",
