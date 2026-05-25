@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "bgpkit-parser"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16c75d6bbca72449abb3d1e585fa85fa1eef3bd37f87dc3ab3ad9bcbe6d41e43"
+checksum = "d116abb02b510d8c97a5e62929bc2293f541dc97786083f6c61b1ca2027ce791"
 dependencies = [
  "bitflags",
  "bytes",
@@ -145,6 +145,7 @@ dependencies = [
  "log",
  "num_enum",
  "regex",
+ "smallvec",
  "zerocopy",
 ]
 
@@ -934,6 +935,9 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "socket2"
