@@ -70,7 +70,7 @@ tokio-util = { version = "0.7", default-features = false }
 # cover what we need. Both pinned tight — rtnetlink has had message-
 # shape changes across minor versions and we rely on specific constants.
 rtnetlink = "0.21"
-netlink-packet-route = "0.30"
+netlink-packet-route = "0.31"
 netlink-packet-core = "0.8"
 futures = "0.3"
 # BMP parser for Option F Phase 3's RouteSource. Supports RFC 7854
