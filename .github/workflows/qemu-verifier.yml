@@ -33,7 +33,7 @@ jobs:
         # vary per version) from the directory listing.
         kernel_tag: ["v5.15", "v6.6"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # GitHub's `ubuntu-latest` runners ship with ~14 GB free after
       # the preinstalled toolchains (CodeQL, Android SDK, .NET, etc.).

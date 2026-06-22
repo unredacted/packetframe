@@ -31,7 +31,7 @@ jobs:
       # effect" + reports `ok`, masking real regressions.
       PACKETFRAME_BPF_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + nightly for BPF)
         # `bpfel-unknown-none` is a tier-3 target with no prebuilt
@@ -111,7 +111,7 @@ jobs:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + target)
         run: |

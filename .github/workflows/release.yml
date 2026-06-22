@@ -32,7 +32,7 @@ jobs:
     env:
       PACKETFRAME_BPF_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + nightly for BPF)
         run: |
@@ -115,7 +115,7 @@ jobs:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # `git log -1 --pretty=%ct <ref>` below needs the tagged commit
           # in history. Default fetch-depth=1 is fine for tag pushes (the
@@ -251,7 +251,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
