@@ -24,7 +24,7 @@ name = "fast-path"
 path = "src/main.rs"
 
 [dependencies]
-aya-ebpf = "=0.1.1"
+aya-ebpf = "=0.2.0"
 network-types = "=0.2.0"
 
 [profile.release]
