@@ -18,7 +18,7 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::gen::bpf_xdp_adjust_head,
+    helpers::bpf_xdp_adjust_head,
     macros::xdp,
     maps::lpm_trie::Key,
     programs::XdpContext,

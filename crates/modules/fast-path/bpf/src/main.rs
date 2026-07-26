@@ -17,7 +17,7 @@ use aya_ebpf::{
         BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LKUP_RET_PROHIBIT, BPF_FIB_LKUP_RET_SUCCESS,
         BPF_FIB_LKUP_RET_UNREACHABLE,
     },
-    helpers::gen::{
+    helpers::{
         bpf_fib_lookup as fib_lookup_helper, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
     },
     macros::xdp,
