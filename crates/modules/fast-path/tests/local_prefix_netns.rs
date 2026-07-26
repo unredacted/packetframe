@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent};
+use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
 use packetframe_fast_path::fib::netlink_neigh::{LocalPrefixSpec, NetlinkNeighborResolver};
 use packetframe_fast_path::fib::programmer::{recording_handle, RouteEventLog};
 
@@ -206,7 +206,7 @@ fn collect_events(
     netns: &str,
     specs: Vec<LocalPrefixSpec>,
     body: impl FnOnce(&str),
-) -> Vec<RouteEvent> {
+) -> (Vec<RouteEvent>, Vec<NeighEvent>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -214,7 +214,7 @@ fn collect_events(
 
     rt.block_on(async move {
         let shutdown = CancellationToken::new();
-        let (resolver, _events_rx, _resolve_handle) =
+        let (resolver, mut events_rx, _resolve_handle) =
             NetlinkNeighborResolver::new(shutdown.clone());
         let (prog, log): (_, RouteEventLog) = recording_handle();
         let resolver = resolver.with_local_prefixes(specs, prog);
@@ -235,7 +235,17 @@ fn collect_events(
 
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
-        log.events()
+
+        // Drain whatever NeighEvents the resolver produced. Nothing
+        // consumed the channel during the run (the tests replace the
+        // programmer with a recording handle), so the buffered backlog
+        // is the complete stream — EVENTS_CAPACITY is 8192, far above
+        // anything these single-digit-neighbour tests generate.
+        let mut neigh_events = Vec::new();
+        while let Ok(e) = events_rx.try_recv() {
+            neigh_events.push(e);
+        }
+        (log.events(), neigh_events)
     })
 }
 
@@ -288,7 +298,7 @@ fn local_prefix6_emits_slash128_for_kernel_neighbour() {
     let host: IpAddr = "2001:db8:0:1::7".parse().unwrap();
 
     let veth_a = names.veth_a.clone();
-    let events = collect_events(
+    let (events, _) = collect_events(
         &names.netns,
         vec![spec("2001:db8:0:1::", 64, &names.veth_a)],
         |ns| {
@@ -346,7 +356,7 @@ fn local_prefix6_withdraws_slash128_on_neigh_delete() {
     let host: IpAddr = "2001:db8:0:1::8".parse().unwrap();
 
     let veth_a = names.veth_a.clone();
-    let events = collect_events(
+    let (events, _) = collect_events(
         &names.netns,
         vec![spec("2001:db8:0:1::", 64, &names.veth_a)],
         |ns| {
@@ -411,7 +421,7 @@ fn local_prefix6_slash0_does_not_harvest_multicast_or_link_local() {
     let host: IpAddr = "2001:db8:0:1::9".parse().unwrap();
 
     let veth_a = names.veth_a.clone();
-    let events = collect_events(&names.netns, vec![spec("::", 0, &names.veth_a)], |ns| {
+    let (events, _) = collect_events(&names.netns, vec![spec("::", 0, &names.veth_a)], |ns| {
         // Force the kernel to create multicast and link-local neighbour
         // entries on the interface.
         ns_run_ok(
@@ -486,7 +496,7 @@ fn local_prefix_v4_still_emits_slash32() {
     let host: IpAddr = "198.51.100.7".parse().unwrap();
 
     let veth_a = names.veth_a.clone();
-    let events = collect_events(
+    let (events, _) = collect_events(
         &names.netns,
         vec![spec("198.51.100.0", 24, &names.veth_a)],
         |ns| {
@@ -536,7 +546,7 @@ fn local_prefix_peer_down_on_dellink_covers_both_families() {
     let ifindex = if_nametoindex(&names.veth_a);
 
     let veth_a = names.veth_a.clone();
-    let events = collect_events(
+    let (events, _) = collect_events(
         &names.netns,
         vec![
             spec("198.51.100.0", 24, &names.veth_a),
@@ -601,5 +611,75 @@ fn local_prefix_peer_down_on_dellink_covers_both_families() {
     assert!(
         peer_downs.contains(&PeerId::local_arp(ifindex)),
         "expected PeerDown for local_arp({ifindex}); got {peer_downs:?}"
+    );
+}
+
+/// The startup-seed path, as opposed to the incremental RTM_NEWNEIGH
+/// path every other test here exercises: the neighbour exists *before*
+/// the resolver starts, so it arrives via the RTM_GETNEIGH dump and
+/// `seed_local_prefix_routes`.
+///
+/// Asserts the two halves of seeding independently: the RouteEvent::Add
+/// that installs the /128, and the synthetic NeighEvent::Learned that
+/// resolves it. The Learned must come directly from the dump snapshot —
+/// not via the bounded resolve queue, which nothing drains during
+/// seeding, so past RESOLVE_QUEUE_CAPACITY matching neighbours the
+/// queue-dependent design left routes Incomplete (flagged by review on
+/// PR #72). A stable pre-existing neighbour may never multicast again,
+/// making the direct emission the only reliable resolution source.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn local_prefix6_seed_resolves_preexisting_neighbour_without_resolve_queue() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let _nsfd = enter_netns(&names.netns);
+    let ifindex = if_nametoindex(&names.veth_a);
+    let host: IpAddr = "2001:db8:0:1::42".parse().unwrap();
+    let host_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x42];
+
+    // Neighbour exists BEFORE the resolver starts.
+    ns_run(
+        &names.netns,
+        &[
+            "ip",
+            "-6",
+            "neigh",
+            "replace",
+            "2001:db8:0:1::42",
+            "dev",
+            &names.veth_a,
+            "lladdr",
+            "de:ad:be:ef:00:42",
+            "nud",
+            "permanent",
+        ],
+    );
+
+    let (events, neigh_events) = collect_events(
+        &names.netns,
+        vec![spec("2001:db8:0:1::", 64, &names.veth_a)],
+        |_ns| {}, // no mutations after startup; everything comes from the seed
+    );
+
+    // Half one: the /128 was installed from the dump.
+    assert!(
+        added_prefixes(&events).contains(&(host, 128)),
+        "seed must install the /128 for a pre-existing neighbour; got {events:?}"
+    );
+
+    // Half two: the seed itself emitted the synthetic Learned with the
+    // kernel-cached MAC, so resolution never depended on the resolve
+    // queue round-trip.
+    let learned = neigh_events.iter().any(|e| {
+        matches!(
+            e,
+            NeighEvent::Learned { ip, mac, ifindex: ifi, .. }
+                if *ip == host && *mac == host_mac && *ifi == ifindex
+        )
+    });
+    assert!(
+        learned,
+        "seed must emit a synthetic Learned for {host} with {host_mac:02x?}; \
+         got {neigh_events:?}"
     );
 }

@@ -405,20 +405,20 @@ impl NetlinkNeighborResolver {
             }
         }
 
-        // v0.2.1: seed the FibProgrammer with one /32 RouteEvent::Add
-        // per kernel ARP entry that lives within an operator-declared
-        // local-prefix CIDR + iface. The /32 wins in LPM over the /24
+        // v0.2.1: seed the FibProgrammer with one host route
+        // (/32 for v4, /128 for v6) per kernel neighbour entry that
+        // lives within an operator-declared local-prefix CIDR + iface.
+        // The host route wins in LPM over the covering prefix from
         // bird's iBGP exports (with state=Incomplete from the v0.2.1-A
         // listen-addr fallback), so inbound traffic to those hosts
         // fast-paths via XDP redirect. Without local-prefix configured
         // (`local_prefixes` empty), this loop is a no-op.
         //
-        // The neigh_cache lookup inside FibProgrammer's register_nexthop
-        // ↔ NeighborResolver ↔ programmer feedback path does the heavy
-        // lifting once the route lands: registering nexthop=host_ip
-        // calls request_resolve, which (post-rc4) consults this same
-        // neigh_cache and synthesizes a Learned event back to the
-        // programmer with the kernel-cached MAC. State flips Resolved.
+        // Each Add is followed by a synthetic Learned emitted directly
+        // from the dump snapshot, so seeding does not depend on the
+        // bounded resolve queue — which nothing drains until the
+        // select loop below starts; see seed_local_prefix_routes for
+        // the full rationale.
         // Clone the handle so the &self borrow on `prog_handle` is
         // released before the call below takes &mut self for counter
         // updates. FibProgrammerHandle is `Clone` (cheap mpsc sender
@@ -642,23 +642,41 @@ impl NetlinkNeighborResolver {
         }
     }
 
-    /// Walk the seeded `neigh_cache` once at startup and emit a
-    /// `RouteEvent::Add` for each entry that falls in a configured
-    /// local-prefix CIDR + ifindex pair. v0.2.1.
+    /// Walk the seeded `neigh_cache` once at startup and, for each
+    /// entry that falls in a configured local-prefix CIDR + ifindex
+    /// pair, emit a `RouteEvent::Add` followed directly by a synthetic
+    /// `NeighEvent::Learned` carrying the cached MAC. v0.2.1.
+    ///
+    /// The direct `Learned` is load-bearing, not an optimization. The
+    /// Add makes the programmer register the nexthop, which fires a
+    /// `request_resolve` into the bounded resolve queue
+    /// (`RESOLVE_QUEUE_CAPACITY` = 1024, `try_send`) — but this method
+    /// runs *before* `run()` enters its select loop, so nothing drains
+    /// that queue while we seed. Past 1024 matching neighbours the
+    /// overflow requests would drop silently, and since these are
+    /// already-stable cached entries that may emit no further
+    /// multicast event, their host routes would sit `Incomplete`
+    /// (slow-path fallback) until NUD churn happened to touch them.
+    /// Emitting the `Learned` here uses the MAC we already hold from
+    /// the dump, mirrors what the resolve queue's cache-hit arm would
+    /// have done, and scales to any snapshot size: `events_tx` applies
+    /// backpressure and the programmer drains it concurrently. The
+    /// queued resolve requests that do survive become harmless
+    /// duplicate cache-hits once the select loop starts.
     async fn seed_local_prefix_routes(&mut self, prog: &FibProgrammerHandle) {
         // Snapshot the cache under a copy so the iteration doesn't
         // borrow self while we call &mut self below for counter
         // updates. Cache is small (low thousands at most on the
         // reference EFG); allocation cost is irrelevant against the
         // single-shot startup work.
-        let snapshot: Vec<(IpAddr, u32)> = self
+        let snapshot: Vec<(IpAddr, u32, [u8; 6])> = self
             .neigh_cache
             .iter()
-            .map(|(ip, (ifindex, _mac))| (*ip, *ifindex))
+            .map(|(ip, (ifindex, mac))| (*ip, *ifindex, *mac))
             .collect();
         let mut emitted_v4 = 0usize;
         let mut emitted_v6 = 0usize;
-        for (ip, ifindex) in snapshot {
+        for (ip, ifindex, mac) in snapshot {
             if !may_synthesize(ip) {
                 continue;
             }
@@ -674,12 +692,30 @@ impl NetlinkNeighborResolver {
                     .await
                 {
                     warn!(?ip, error = %e, "local-prefix seed RouteEvent::Add dispatch failed");
-                } else if ip.is_ipv4() {
+                    continue;
+                }
+                if ip.is_ipv4() {
                     emitted_v4 += 1;
                     self.local_arp_routes_added += 1;
                 } else {
                     emitted_v6 += 1;
                     self.local_nd_routes_added += 1;
+                }
+                // Same construction as the resolve queue's cache-hit
+                // arm, including the zeroed src_mac fallback for
+                // MAC-less ifaces.
+                let src_mac = self.iface_mac.get(&ifindex).copied().unwrap_or([0; 6]);
+                let evt = NeighEvent::Learned {
+                    ip,
+                    mac,
+                    ifindex,
+                    src_mac,
+                };
+                match self.events_tx.send(evt).await {
+                    Ok(()) => self.synth_learned_emitted += 1,
+                    Err(e) => {
+                        warn!(?ip, error = %e, "seed synthetic Learned send failed");
+                    }
                 }
             }
         }
