@@ -65,6 +65,9 @@ pub const FP_CFG_FLAG_IPV6: u8 = 0b0000_0010;
 pub const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 pub const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
 pub const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
+pub const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
+pub const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
+pub const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
 
 /// Wire-format counter indices (SPEC.md §4.6). Append-only once v0.1
 /// ships; never renumber.
@@ -207,6 +210,60 @@ impl Harness {
             mss_clamp_global: 0,
             version: FP_CFG_VERSION_V2,
         });
+    }
+
+    /// Write an arbitrary `FpCfg.flags` byte (dry-run off, no global
+    /// clamp). Tests exercising the feature-presence gate bits (5-7)
+    /// compose exactly the flag combination they need.
+    pub fn set_cfg_flags(&mut self, flags: u8) {
+        self.set_cfg(FpCfg {
+            dry_run: 0,
+            flags,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
+        });
+    }
+
+    /// Insert an IPv4 prefix into the BLOCK_V4 trie. Callers must also
+    /// set `FP_CFG_FLAG_BLOCK_PRESENT` for the XDP program to consult
+    /// it — mirroring the userspace invariant that the bit is derived
+    /// from the same directives that populate the map.
+    pub fn add_block_v4(&mut self, prefix: &str) {
+        let (addr, plen) = parse_v4_prefix(prefix);
+        let map = self.bpf.map_mut("BLOCK_V4").expect("BLOCK_V4 map");
+        let mut trie: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(map).expect("LpmTrie try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(&key, 1u8, 0).expect("BLOCK_V4 insert");
+    }
+
+    /// Insert a VLAN-subif mapping: `subif_ifindex` → (physical parent
+    /// ifindex, VID). Callers must also set `FP_CFG_FLAG_VLAN_PRESENT`.
+    pub fn add_vlan_resolve(&mut self, subif_ifindex: u32, phys_ifindex: u32, vid: u16) {
+        use aya::maps::HashMap as AyaHashMap;
+
+        /// Layout mirror of `VlanResolve` in `bpf/src/maps.rs`.
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct VlanResolve {
+            phys_ifindex: u32,
+            vid: u16,
+            _pad: u16,
+        }
+        unsafe impl Pod for VlanResolve {}
+
+        let map = self.bpf.map_mut("VLAN_RESOLVE").expect("VLAN_RESOLVE map");
+        let mut hm: AyaHashMap<_, u32, VlanResolve> =
+            AyaHashMap::try_from(map).expect("VLAN_RESOLVE try_from");
+        hm.insert(
+            subif_ifindex,
+            VlanResolve {
+                phys_ifindex,
+                vid,
+                _pad: 0,
+            },
+            0,
+        )
+        .expect("VLAN_RESOLVE insert");
     }
 
     /// Insert an IPv4 prefix into the allowlist. `prefix` is

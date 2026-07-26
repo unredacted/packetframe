@@ -195,6 +195,26 @@ pub const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
 /// `FP_CFG_FLAG_CUSTOM_FIB`; userspace rejects compare-mode without
 /// it. Temporary validation mode; removed in Phase 5.
 pub const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
+/// At least one `block-prefix` directive is configured, i.e. BLOCK_V4
+/// / BLOCK_V6 contain entries worth looking up. Clear (the default
+/// deployment) skips one LPM helper call per matched packet. Set by
+/// userspace from the config directives; semantics are identical
+/// either way because an empty trie can never hit.
+pub const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
+/// VLAN_RESOLVE has entries (host has VLAN subifs). Clear skips the
+/// per-forwarded-packet hash lookup; the egress is then always
+/// treated as physical/untagged, which is exactly what an empty map
+/// lookup would conclude. Set by userspace after VLAN discovery
+/// (populate/reconcile), not from directives.
+pub const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
+/// At least one mss-clamp source is configured (any `mss-clamp`
+/// directive: global, per-prefix, or per-iface). Consumed by
+/// `finalize` (via `MutationCtx.cfg_flags`) to skip the entire clamp
+/// lookup chain for TCP packets when no clamp exists. Reserved here
+/// in the same change that gates BLOCK/VLAN so the bit layout is
+/// settled; the finalize-side gate lands with the MutationCtx
+/// widening.
+pub const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
 
 /// Max prefixes per allowlist trie. Sized generously: SPEC.md §4.5
 /// scales to /24-range tries comfortably. `1024` entries covers the

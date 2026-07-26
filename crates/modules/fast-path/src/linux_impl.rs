@@ -76,6 +76,81 @@ pub(crate) const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
 #[allow(dead_code)]
 pub(crate) const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 
+/// Mirrors of the `bpf/src/maps.rs` feature-presence bits (keep in
+/// lockstep). Each gates a per-packet map lookup the XDP program can
+/// skip when the feature is unconfigured; the invariant userspace must
+/// uphold is "bit set whenever the corresponding map/config has
+/// entries" — the bits are derived from the same directives that
+/// populate the maps (via [`feature_flags_from_config`]) so they can't
+/// drift, and every writer of CFG.flags goes through that helper (the
+/// `reconcile_cfg` flag rebuild included; a bit missing there would be
+/// silently wiped on SIGHUP, the head-shift-bug pattern).
+pub(crate) const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
+pub(crate) const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
+pub(crate) const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
+
+/// Compute the feature-presence bits (5-7) of `FpCfg.flags` from the
+/// module directives plus the VLAN-subif discovery result. Shared by
+/// `populate_cfg` (initial load) and `reconcile::reconcile_cfg`
+/// (SIGHUP) so both agree — any new presence bit MUST be added here,
+/// never inline at one call site.
+///
+/// `vlan_subifs_present` comes from `/proc/net/vlan/config` rather
+/// than directives (VLAN_RESOLVE is discovery-populated); callers pass
+/// the current read. `populate_vlan_resolve` / `reconcile_vlan_resolve`
+/// additionally RMW-fix bit 6 after actually converging the map, which
+/// covers subifs appearing between the CFG write and VLAN discovery.
+pub(crate) fn feature_flags_from_config(
+    directives: &[ModuleDirective],
+    vlan_subifs_present: bool,
+) -> u8 {
+    let mut flags = 0u8;
+    if directives
+        .iter()
+        .any(|d| matches!(d, ModuleDirective::BlockPrefix { .. }))
+    {
+        flags |= FP_CFG_FLAG_BLOCK_PRESENT;
+    }
+    if directives
+        .iter()
+        .any(|d| matches!(d, ModuleDirective::MssClamp { .. }))
+    {
+        flags |= FP_CFG_FLAG_MSS_CLAMP_PRESENT;
+    }
+    if vlan_subifs_present {
+        flags |= FP_CFG_FLAG_VLAN_PRESENT;
+    }
+    flags
+}
+
+/// Whether `/proc/net/vlan/config` currently lists any VLAN subifs.
+/// Unreadable (module not loaded, non-Linux procfs oddity) counts as
+/// "none", matching `populate_vlan_resolve`'s NotFound handling.
+pub(crate) fn vlan_subifs_present() -> bool {
+    read_vlan_config().map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Read-modify-write one `FpCfg.flags` bit on the live CFG map.
+/// Same pattern as `apply_driver_quirks_cfg`'s head-shift OR: preserve
+/// every other bit and field.
+pub(crate) fn set_cfg_flag(ebpf: &mut Ebpf, bit: u8, on: bool) -> ModuleResult<()> {
+    let map = ebpf
+        .map_mut("CFG")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "CFG map missing from ELF"))?;
+    let mut arr: Array<_, FpCfg> = Array::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG Array::try_from: {e}")))?;
+    let mut cur: FpCfg = arr
+        .get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
+    if on {
+        cur.flags |= bit;
+    } else {
+        cur.flags &= !bit;
+    }
+    arr.set(0, cur, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))
+}
+
 /// Minimum mainline Linux version that ships the rvu-nicpf XDP fix
 /// (commit 04f647c8e456). Kernels below this expose both the
 /// xdp.data_hard_start offset bug (workaroundable via head-shift) AND
@@ -289,9 +364,12 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         dry_run: u8::from(dry_run),
         // bits 0-1: IPv4/IPv6 enabled (historical, load-bearing for
         // dashboards). bits 3-4: custom-FIB / compare (Option F).
+        // bits 5-7: feature-presence gates (block / vlan / mss-clamp).
         // bit 2 (HEAD_SHIFT_128) is OR'd on later in
         // apply_driver_quirks_cfg for rvu-nicpf attaches.
-        flags: 0b11 | fib_flags,
+        flags: 0b11
+            | fib_flags
+            | feature_flags_from_config(&mcfg.section.directives, vlan_subifs_present()),
         mss_clamp_global,
         version: FP_CFG_VERSION_V2,
     };
@@ -1574,6 +1652,12 @@ fn populate_vlan_resolve(state: &mut ActiveState) -> ModuleResult<()> {
             "vlan_resolve populated"
         );
     }
+
+    // Entries landed → make sure the VLAN_PRESENT gate bit is on, even
+    // if a subif appeared between populate_cfg's proc read and now.
+    // (The reverse case — bit set but map ended empty — is harmless:
+    // the gated lookup just misses, exactly like the ungated code did.)
+    set_cfg_flag(&mut state.ebpf, FP_CFG_FLAG_VLAN_PRESENT, true)?;
     Ok(())
 }
 
@@ -2106,6 +2190,63 @@ pub fn state_dir(state: &ActiveState) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::gc_thresh3_capacity_warning;
+    use super::{
+        feature_flags_from_config, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_MSS_CLAMP_PRESENT,
+        FP_CFG_FLAG_VLAN_PRESENT,
+    };
+    use packetframe_common::config::ModuleDirective;
+
+    #[test]
+    fn feature_flags_truth_table() {
+        let block = ModuleDirective::BlockPrefix {
+            cidr: "192.0.2.0/24".parse().unwrap(),
+            line: 1,
+        };
+        let clamp_global = ModuleDirective::MssClamp {
+            prefix: None,
+            iface: None,
+            mss: 1360,
+            line: 2,
+        };
+        let unrelated = ModuleDirective::DryRun(false);
+
+        assert_eq!(feature_flags_from_config(&[], false), 0);
+        assert_eq!(
+            feature_flags_from_config(std::slice::from_ref(&unrelated), false),
+            0,
+            "non-feature directives must not set presence bits"
+        );
+        assert_eq!(
+            feature_flags_from_config(std::slice::from_ref(&block), false),
+            FP_CFG_FLAG_BLOCK_PRESENT
+        );
+        assert_eq!(
+            feature_flags_from_config(std::slice::from_ref(&clamp_global), false),
+            FP_CFG_FLAG_MSS_CLAMP_PRESENT,
+            "any mss-clamp grammar (global included) sets the presence bit"
+        );
+        assert_eq!(
+            feature_flags_from_config(&[], true),
+            FP_CFG_FLAG_VLAN_PRESENT
+        );
+        assert_eq!(
+            feature_flags_from_config(&[block, clamp_global, unrelated], true),
+            FP_CFG_FLAG_BLOCK_PRESENT | FP_CFG_FLAG_MSS_CLAMP_PRESENT | FP_CFG_FLAG_VLAN_PRESENT
+        );
+    }
+
+    /// Bits 5-7 must never collide with the established bits 0-4.
+    #[test]
+    fn presence_bits_are_disjoint_from_legacy_bits() {
+        let legacy = 0b0001_1111u8; // ipv4|ipv6|head-shift|custom-fib|compare
+        for bit in [
+            FP_CFG_FLAG_BLOCK_PRESENT,
+            FP_CFG_FLAG_VLAN_PRESENT,
+            FP_CFG_FLAG_MSS_CLAMP_PRESENT,
+        ] {
+            assert_eq!(bit & legacy, 0);
+        }
+    }
 
     #[test]
     fn default_sysctls_do_not_warn() {

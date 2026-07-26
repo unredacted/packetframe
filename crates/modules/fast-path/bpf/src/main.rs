@@ -34,8 +34,9 @@ mod maps;
 
 use maps::{
     bump, stats_base, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
-    FIB_LOOKUP_SCRATCH, FP_CFG_FLAG_COMPARE_MODE, FP_CFG_FLAG_CUSTOM_FIB,
-    FP_CFG_FLAG_HEAD_SHIFT_128, MUTATION_CTX, MUTATION_PROGS, REDIRECT_DEVMAP, VLAN_RESOLVE,
+    FIB_LOOKUP_SCRATCH, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_COMPARE_MODE,
+    FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, MUTATION_CTX,
+    MUTATION_PROGS, REDIRECT_DEVMAP, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -90,6 +91,18 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     };
     bump(stats, StatIdx::RxTotal);
 
+    // Single CFG read for the whole stage. Prior versions re-read
+    // CFG.get(0) once per flag test (head-shift, dry-run, custom-fib,
+    // compare — four opaque bpf_map_lookup_elem calls per packet that
+    // LLVM cannot CSE); the two scalars now travel in registers.
+    // Absent map (never happens; userspace populates before attach)
+    // degrades to "no flags, no dry-run", matching the old per-call
+    // `unwrap_or(false)` defaults.
+    let (cfg_flags, dry_run) = match CFG.get(0) {
+        Some(c) => (c.flags, c.dry_run != 0),
+        None => (0u8, false),
+    };
+
     // Pre-parse workaround for the pre-Linux-v6.8 rvu-nicpf XDP path
     // bug (SPEC §11.1(c)). The driver passes
     // `xdp_prepare_buff(&xdp, hard_start, data - hard_start, seg_size, false)`
@@ -105,7 +118,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     // Scoped behind a CFG flag so correct drivers pay zero runtime
     // cost. Userspace sets the flag per attach iface's driver
     // (§11.12 compat matrix).
-    if unsafe { cfg_has_flag(FP_CFG_FLAG_HEAD_SHIFT_128) } {
+    if cfg_flags & FP_CFG_FLAG_HEAD_SHIFT_128 != 0 {
         let rc = unsafe { bpf_xdp_adjust_head(ctx.ctx as *mut _, 128) };
         if rc != 0 {
             bump(stats, StatIdx::ErrHeadShift);
@@ -123,7 +136,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
         }
     }
 
-    match try_fast_path(&ctx, stats) {
+    match try_fast_path(&ctx, stats, cfg_flags, dry_run) {
         Ok(action) => action,
         Err(()) => {
             bump(stats, StatIdx::ErrParse);
@@ -132,18 +145,15 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     }
 }
 
-/// Read the `FpCfg.flags` byte via the CFG array map and check
-/// whether `bit` is set. Returns `false` if the map is somehow empty
-/// (shouldn't happen, userspace always populates it before attach).
-#[inline(always)]
-unsafe fn cfg_has_flag(bit: u8) -> bool {
-    CFG.get(0).map(|c| c.flags & bit != 0).unwrap_or(false)
-}
-
 /// Returns Err(()) on bounds-check failure (always counted as
 /// `err_parse` → `XDP_PASS`), Ok(action) for everything else.
 #[inline(always)]
-fn try_fast_path(ctx: &XdpContext, stats: StatsPtr) -> Result<u32, ()> {
+fn try_fast_path(
+    ctx: &XdpContext,
+    stats: StatsPtr,
+    cfg_flags: u8,
+    dry_run: bool,
+) -> Result<u32, ()> {
     let eth: *mut EthHdr = ptr_mut_at(ctx, 0)?;
     let outer_ether = unsafe { (*eth).ether_type };
 
@@ -168,9 +178,9 @@ fn try_fast_path(ctx: &XdpContext, stats: StatsPtr) -> Result<u32, ()> {
     };
 
     if inner_ether == EtherType::Ipv4 as u16 {
-        handle_ipv4(ctx, stats, eth, ip_offset, ingress_vid)
+        handle_ipv4(ctx, stats, cfg_flags, dry_run, eth, ip_offset, ingress_vid)
     } else if inner_ether == EtherType::Ipv6 as u16 {
-        handle_ipv6(ctx, stats, eth, ip_offset, ingress_vid)
+        handle_ipv6(ctx, stats, cfg_flags, dry_run, eth, ip_offset, ingress_vid)
     } else {
         bump(stats, StatIdx::PassNotIp);
         Ok(xdp_action::XDP_PASS)
@@ -178,9 +188,12 @@ fn try_fast_path(ctx: &XdpContext, stats: StatsPtr) -> Result<u32, ()> {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn handle_ipv4(
     ctx: &XdpContext,
     stats: StatsPtr,
+    cfg_flags: u8,
+    dry_run: bool,
     eth: *mut EthHdr,
     ip_offset: usize,
     ingress_vid: u16,
@@ -235,12 +248,16 @@ fn handle_ipv4(
     // drop reply traffic (asymmetric flows where the *other* side is
     // in the bogon range, e.g. Tailscale DERP relay responses) which
     // is worse than the operator's intent.
-    if BLOCK_V4.get(&dst_key).is_some() {
+    //
+    // Gated on BLOCK_PRESENT: with no `block-prefix` configured the
+    // trie is empty and can never hit, so skipping the lookup is
+    // semantics-free and saves one LPM helper call per matched packet.
+    if cfg_flags & FP_CFG_FLAG_BLOCK_PRESENT != 0 && BLOCK_V4.get(&dst_key).is_some() {
         bump(stats, StatIdx::BogonDropped);
         return Ok(xdp_action::XDP_DROP);
     }
 
-    if is_dry_run() {
+    if dry_run {
         bump(stats, StatIdx::FwdDryRun);
         return Ok(xdp_action::XDP_PASS);
     }
@@ -256,14 +273,23 @@ fn handle_ipv4(
     // `__be16` contract wants. Our own hash operates on native u16
     // values so it's byte-order-agnostic between BPF and the userspace
     // reference. Byte-swap once at the handoff.
-    let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
-    let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
+    let use_custom = cfg_flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
+    let compare = cfg_flags & FP_CFG_FLAG_COMPARE_MODE != 0;
     let sport_h = u16::from_be(sport);
     let dport_h = u16::from_be(dport);
 
     if use_custom && !compare {
         let custom = fib::lookup_v4(stats, src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
-        return dispatch_custom_fib(custom, ctx, stats, eth, ip as *mut u8, true, ingress_vid);
+        return dispatch_custom_fib(
+            custom,
+            ctx,
+            stats,
+            cfg_flags,
+            eth,
+            ip as *mut u8,
+            true,
+            ingress_vid,
+        );
     }
 
     // Use the per-CPU `FIB_LOOKUP_SCRATCH` map for the bpf_fib_lookup
@@ -333,6 +359,7 @@ fn handle_ipv4(
         ret as u32,
         ctx,
         stats,
+        cfg_flags,
         eth,
         ip as *mut u8,
         true,
@@ -342,9 +369,12 @@ fn handle_ipv4(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn handle_ipv6(
     ctx: &XdpContext,
     stats: StatsPtr,
+    cfg_flags: u8,
+    dry_run: bool,
     eth: *mut EthHdr,
     ip_offset: usize,
     ingress_vid: u16,
@@ -408,13 +438,14 @@ fn handle_ipv6(
     bump(stats, StatIdx::MatchedV6);
     bump_match_subset(stats, src_hit, dst_hit);
 
-    // v0.2.1 issue #33: bogon block (IPv6 side).
-    if BLOCK_V6.get(&dst_key).is_some() {
+    // v0.2.1 issue #33: bogon block (IPv6 side). Gated on
+    // BLOCK_PRESENT, see handle_ipv4.
+    if cfg_flags & FP_CFG_FLAG_BLOCK_PRESENT != 0 && BLOCK_V6.get(&dst_key).is_some() {
         bump(stats, StatIdx::BogonDropped);
         return Ok(xdp_action::XDP_DROP);
     }
 
-    if is_dry_run() {
+    if dry_run {
         bump(stats, StatIdx::FwdDryRun);
         return Ok(xdp_action::XDP_PASS);
     }
@@ -423,14 +454,23 @@ fn handle_ipv6(
 
     // Option F dispatch, see handle_ipv4 for commentary, including the
     // port byte-swap rationale.
-    let use_custom = unsafe { cfg_has_flag(FP_CFG_FLAG_CUSTOM_FIB) };
-    let compare = unsafe { cfg_has_flag(FP_CFG_FLAG_COMPARE_MODE) };
+    let use_custom = cfg_flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
+    let compare = cfg_flags & FP_CFG_FLAG_COMPARE_MODE != 0;
     let sport_h = u16::from_be(sport);
     let dport_h = u16::from_be(dport);
 
     if use_custom && !compare {
         let custom = fib::lookup_v6(stats, src_bytes, dst_bytes, next as u8, sport_h, dport_h);
-        return dispatch_custom_fib(custom, ctx, stats, eth, ip as *mut u8, false, ingress_vid);
+        return dispatch_custom_fib(
+            custom,
+            ctx,
+            stats,
+            cfg_flags,
+            eth,
+            ip as *mut u8,
+            false,
+            ingress_vid,
+        );
     }
 
     // See handle_ipv4 for the rationale behind using FIB_LOOKUP_SCRATCH
@@ -476,6 +516,7 @@ fn handle_ipv6(
         ret as u32,
         ctx,
         stats,
+        cfg_flags,
         eth,
         ip as *mut u8,
         false,
@@ -490,6 +531,7 @@ fn dispatch_fib(
     ret: u32,
     ctx: &XdpContext,
     stats: StatsPtr,
+    cfg_flags: u8,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -500,6 +542,7 @@ fn dispatch_fib(
         BPF_FIB_LKUP_RET_SUCCESS => forward_success(
             ctx,
             stats,
+            cfg_flags,
             eth,
             ip,
             is_v4,
@@ -543,6 +586,7 @@ fn dispatch_fib(
 fn forward_success(
     ctx: &XdpContext,
     stats: StatsPtr,
+    cfg_flags: u8,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -555,9 +599,17 @@ fn forward_success(
     // recorded in `vlan_resolve`, it's a VLAN subif, redirect to the
     // physical parent and push/rewrite to the recorded VID. Otherwise
     // the target is physical/untagged.
-    let (egress_ifindex, egress_vid) = match unsafe { VLAN_RESOLVE.get(&ifindex) } {
-        Some(vi) => (vi.phys_ifindex, vi.vid),
-        None => (ifindex, VLAN_NONE),
+    //
+    // Gated on VLAN_PRESENT: with no VLAN subifs on the host the map
+    // is empty and every lookup would miss, so the gate skips one hash
+    // helper call per forwarded packet with identical semantics.
+    let (egress_ifindex, egress_vid) = if cfg_flags & FP_CFG_FLAG_VLAN_PRESENT != 0 {
+        match unsafe { VLAN_RESOLVE.get(&ifindex) } {
+            Some(vi) => (vi.phys_ifindex, vi.vid),
+            None => (ifindex, VLAN_NONE),
+        }
+    } else {
+        (ifindex, VLAN_NONE)
     };
 
     // Defensive devmap pre-check (§4.4 step 9d), **before any packet
@@ -629,10 +681,12 @@ fn forward_success(
 /// so the allowlist / dry-run / VLAN-resolve plumbing upstream and
 /// downstream is unchanged whether we took the kernel or custom path.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_custom_fib(
     result: fib::CustomFibResult,
     ctx: &XdpContext,
     stats: StatsPtr,
+    cfg_flags: u8,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -642,6 +696,7 @@ fn dispatch_custom_fib(
         fib::FIB_ACTION_FORWARD => forward_success(
             ctx,
             stats,
+            cfg_flags,
             eth,
             ip,
             is_v4,
@@ -725,11 +780,6 @@ fn bump_match_subset(stats: StatsPtr, src_hit: bool, dst_hit: bool) {
         (false, true) => bump(stats, StatIdx::MatchedDstOnly),
         (false, false) => {}
     }
-}
-
-#[inline(always)]
-fn is_dry_run() -> bool {
-    CFG.get(0).map(|c| c.dry_run != 0).unwrap_or(false)
 }
 
 #[inline(always)]

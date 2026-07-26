@@ -23,8 +23,10 @@ use packetframe_common::{
 use tracing::{info, warn};
 
 use crate::linux_impl::{
-    fib_flags_from_forwarding_mode, if_nametoindex, mss_clamp_global_value, read_vlan_config,
-    ActiveState, FpCfg, MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_VERSION_V2,
+    feature_flags_from_config, fib_flags_from_forwarding_mode, if_nametoindex,
+    mss_clamp_global_value, read_vlan_config, set_cfg_flag, vlan_subifs_present, ActiveState,
+    FpCfg, MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT,
+    FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -109,9 +111,17 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
 
     let mss_clamp_global = mss_clamp_global_value(&cfg.section.directives).unwrap_or(0);
 
+    // Feature-presence bits (5-7) are rebuilt through the same shared
+    // helper populate_cfg uses; a bit computed inline here (or
+    // forgotten) would be wiped on every SIGHUP — the head-shift-bug
+    // pattern the `head_shift` preservation above guards against.
+    // `reconcile_vlan_resolve` re-fixes bit 6 after map convergence.
     let new_cfg = FpCfg {
         dry_run: u8::from(dry_run),
-        flags: 0b11 | head_shift | fib_flags_from_forwarding_mode(forwarding),
+        flags: 0b11
+            | head_shift
+            | fib_flags_from_forwarding_mode(forwarding)
+            | feature_flags_from_config(&cfg.section.directives, vlan_subifs_present()),
         mss_clamp_global,
         version: FP_CFG_VERSION_V2,
     };
@@ -272,6 +282,15 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
             Err(e) => warn!(subif_idx, error = %e, "VLAN_RESOLVE remove failed"),
         }
     }
+
+    // Authoritative post-convergence fix of the VLAN_PRESENT gate bit:
+    // set iff the map has (desired) entries. Covers subifs appearing
+    // or disappearing between reconcile_cfg's proc read and here.
+    set_cfg_flag(
+        &mut state.ebpf,
+        FP_CFG_FLAG_VLAN_PRESENT,
+        !desired.is_empty(),
+    )?;
     Ok(delta)
 }
 
