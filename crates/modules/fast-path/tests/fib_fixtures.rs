@@ -349,10 +349,23 @@ fn custom_fib_v4_incomplete_nexthop_returns_noneigh() {
 
     let before_no_neigh = h.stat(StatIdx::CustomFibNoNeigh);
     let before_fwd = h.stat(StatIdx::FwdOk);
+    let before_retry = h.stat(StatIdx::NexthopSeqRetry);
+    let before_cache_miss = h.stat(StatIdx::NeighCacheMiss);
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_PASS, "incomplete → PASS");
     assert_eq!(h.stat(StatIdx::CustomFibNoNeigh), before_no_neigh + 1);
     assert_eq!(h.stat(StatIdx::FwdOk), before_fwd, "no forward on NoNeigh");
+    // A stably-unresolved entry is NOT a torn read: the seqlock split
+    // must short-circuit without burning the retry budget. Earlier
+    // versions bumped NexthopSeqRetry 4× here, inflating the counter
+    // to ~4× the custom_fib_no_neigh rate in production and masking
+    // genuine churn.
+    assert_eq!(
+        h.stat(StatIdx::NexthopSeqRetry),
+        before_retry,
+        "stable not-Resolved read must not count as a seqlock retry"
+    );
+    assert_eq!(h.stat(StatIdx::NeighCacheMiss), before_cache_miss + 1);
 }
 
 // ========== ECMP distribution =============================================

@@ -18,8 +18,9 @@
 //! asserts agreement. If the two sides drift, the test fails before
 //! any XDP packet is ever forwarded.
 
-use aya_ebpf::maps::lpm_trie::Key;
+use aya_ebpf::{maps::lpm_trie::Key, programs::XdpContext};
 
+use crate::l4_ports;
 use crate::maps::{
     bump, EcmpGroup, FibValue, NexthopEntry, StatIdx, StatsPtr, ECMP_GROUPS, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, FIB_V4, FIB_V6, MAX_ECMP_PATHS, NEXTHOPS, NH_STATE_RESOLVED,
@@ -82,24 +83,21 @@ impl CustomFibResult {
 
 // --- Top-level lookup -------------------------------------------------
 
-/// IPv4 custom-FIB lookup. Caller passes the parsed src/dst/proto +
-/// L4 ports from the packet. Returns a [`CustomFibResult`] the caller
-/// feeds into the existing `dispatch_fib` success / miss paths in
-/// `main.rs`.
-///
-/// `sport` / `dport` are **native-order u16** (host byte order). The
-/// caller is responsible for byte-swapping from the BE-in-memory
-/// representation that `l4_ports` returns for the kernel-FIB's
-/// `__be16` contract. This keeps the hash byte-order-agnostic
-/// between BPF and the userspace reference in `src/fib/hash.rs`.
+/// IPv4 custom-FIB lookup. Caller passes the parsed src/dst/proto plus
+/// the L4 header offset; **port extraction is deferred** into the ECMP
+/// arm (`resolve_fib_value_v4`), because ports feed only the ECMP flow
+/// hash — on the single-nexthop path (the common case on deployments
+/// with no ECMP groups) no port bytes are read at all. Returns a
+/// [`CustomFibResult`] the caller feeds into the existing
+/// `dispatch_fib` success / miss paths in `main.rs`.
 #[inline(always)]
 pub fn lookup_v4(
     stats: StatsPtr,
+    ctx: &XdpContext,
+    l4_off: usize,
     src: [u8; 4],
     dst: [u8; 4],
     proto: u8,
-    sport: u16,
-    dport: u16,
 ) -> CustomFibResult {
     let key = Key::new(32, dst);
     let fib = match FIB_V4.get(&key) {
@@ -110,16 +108,17 @@ pub fn lookup_v4(
         }
     };
 
-    let nh_idx = match resolve_fib_value_v4(stats, &fib, src, dst, proto, sport, dport) {
-        Some(idx) => idx,
+    let nh_ptr = match resolve_fib_value_v4(stats, ctx, l4_off, &fib, src, dst, proto) {
+        Some(p) => p,
         None => {
-            // ECMP walked every leg; none resolved.
+            // ECMP walked every leg and none resolved, or the single
+            // nexthop index was out of range.
             bump(stats, StatIdx::CustomFibNoNeigh);
             return CustomFibResult::no_neigh();
         }
     };
 
-    match read_nexthop(stats, nh_idx) {
+    match read_nexthop_ptr(stats, nh_ptr) {
         Some((ifindex, smac, dmac)) => {
             bump(stats, StatIdx::CustomFibHit);
             CustomFibResult::forward(ifindex, smac, dmac)
@@ -131,16 +130,16 @@ pub fn lookup_v4(
     }
 }
 
-/// IPv6 custom-FIB lookup. See [`lookup_v4`], same byte-order
-/// contract on `sport` / `dport`.
+/// IPv6 custom-FIB lookup. See [`lookup_v4`]; same deferred-port
+/// contract.
 #[inline(always)]
 pub fn lookup_v6(
     stats: StatsPtr,
+    ctx: &XdpContext,
+    l4_off: usize,
     src: [u8; 16],
     dst: [u8; 16],
     proto: u8,
-    sport: u16,
-    dport: u16,
 ) -> CustomFibResult {
     let key = Key::new(128, dst);
     let fib = match FIB_V6.get(&key) {
@@ -151,15 +150,15 @@ pub fn lookup_v6(
         }
     };
 
-    let nh_idx = match resolve_fib_value_v6(stats, &fib, src, dst, proto, sport, dport) {
-        Some(idx) => idx,
+    let nh_ptr = match resolve_fib_value_v6(stats, ctx, l4_off, &fib, src, dst, proto) {
+        Some(p) => p,
         None => {
             bump(stats, StatIdx::CustomFibNoNeigh);
             return CustomFibResult::no_neigh();
         }
     };
 
-    match read_nexthop(stats, nh_idx) {
+    match read_nexthop_ptr(stats, nh_ptr) {
         Some((ifindex, smac, dmac)) => {
             bump(stats, StatIdx::CustomFibHit);
             CustomFibResult::forward(ifindex, smac, dmac)
@@ -171,24 +170,37 @@ pub fn lookup_v6(
     }
 }
 
-// --- FibValue → NexthopId ---------------------------------------------
+// --- FibValue → NexthopEntry pointer ------------------------------------
 
 #[inline(always)]
 fn resolve_fib_value_v4(
     stats: StatsPtr,
+    ctx: &XdpContext,
+    l4_off: usize,
     fib: &FibValue,
     src: [u8; 4],
     dst: [u8; 4],
     proto: u8,
-    sport: u16,
-    dport: u16,
-) -> Option<u32> {
+) -> Option<*const NexthopEntry> {
     match fib.kind {
-        FIB_KIND_SINGLE => Some(fib.idx),
+        FIB_KIND_SINGLE => NEXTHOPS.get_ptr(fib.idx),
         FIB_KIND_ECMP => {
             bump(stats, StatIdx::EcmpHashV4);
             let group = ECMP_GROUPS.get(fib.idx)?;
-            let h = hash_v4(src, dst, proto, sport, dport, group.hash_mode);
+            // Deferred port parse: only ECMP destinations hash on
+            // ports. `l4_ports` returns BE-in-memory u16s (the
+            // kernel-FIB `__be16` shape); the hash contract is
+            // native-order, so swap here — same values the caller
+            // used to compute, just only when actually needed.
+            let (sport_be, dport_be) = l4_ports(ctx, l4_off, proto);
+            let h = hash_v4(
+                src,
+                dst,
+                proto,
+                u16::from_be(sport_be),
+                u16::from_be(dport_be),
+                group.hash_mode,
+            );
             pick_ecmp_leg(stats, group, h)
         }
         _ => None,
@@ -198,19 +210,28 @@ fn resolve_fib_value_v4(
 #[inline(always)]
 fn resolve_fib_value_v6(
     stats: StatsPtr,
+    ctx: &XdpContext,
+    l4_off: usize,
     fib: &FibValue,
     src: [u8; 16],
     dst: [u8; 16],
     proto: u8,
-    sport: u16,
-    dport: u16,
-) -> Option<u32> {
+) -> Option<*const NexthopEntry> {
     match fib.kind {
-        FIB_KIND_SINGLE => Some(fib.idx),
+        FIB_KIND_SINGLE => NEXTHOPS.get_ptr(fib.idx),
         FIB_KIND_ECMP => {
             bump(stats, StatIdx::EcmpHashV6);
             let group = ECMP_GROUPS.get(fib.idx)?;
-            let h = hash_v6(src, dst, proto, sport, dport, group.hash_mode);
+            // See resolve_fib_value_v4 for the deferred-port rationale.
+            let (sport_be, dport_be) = l4_ports(ctx, l4_off, proto);
+            let h = hash_v6(
+                src,
+                dst,
+                proto,
+                u16::from_be(sport_be),
+                u16::from_be(dport_be),
+                group.hash_mode,
+            );
             pick_ecmp_leg(stats, group, h)
         }
         _ => None,
@@ -223,12 +244,19 @@ fn resolve_fib_value_v6(
 /// bound is a compile-time constant; the verifier sees a straight-line
 /// walk.
 ///
+/// Returns the entry *pointer* (from the walk's own `get_ptr`) so the
+/// caller's seqlock read doesn't repeat the NEXTHOPS lookup — the walk
+/// previously used `.get()` and the caller re-fetched by index, one
+/// redundant map op per ECMP packet. The state peek here is a plain
+/// racy read; the caller's seqlock discipline is what validates the
+/// final tuple.
+///
 /// If the starting slot is resolved, returns immediately (the common
 /// case). If we walked past the starting slot, bump
 /// `EcmpDeadLegFallback`, that's diagnostic signal that a leg is
 /// down and we're compensating.
 #[inline(always)]
-fn pick_ecmp_leg(stats: StatsPtr, group: &EcmpGroup, hash: u32) -> Option<u32> {
+fn pick_ecmp_leg(stats: StatsPtr, group: &EcmpGroup, hash: u32) -> Option<*const NexthopEntry> {
     let nh_count = group.nh_count as u32;
     if nh_count == 0 {
         return None;
@@ -251,12 +279,13 @@ fn pick_ecmp_leg(stats: StatsPtr, group: &EcmpGroup, hash: u32) -> Option<u32> {
         if slot < MAX_ECMP_PATHS {
             let nh_idx = group.nh_idx[slot];
             if nh_idx != u32::MAX {
-                if let Some(entry) = NEXTHOPS.get(nh_idx) {
-                    if entry.state == NH_STATE_RESOLVED {
+                if let Some(ptr) = NEXTHOPS.get_ptr(nh_idx) {
+                    let state = unsafe { core::ptr::read_volatile(&(*ptr).state) };
+                    if state == NH_STATE_RESOLVED {
                         if walked > 0 {
                             bump(stats, StatIdx::EcmpDeadLegFallback);
                         }
-                        return Some(nh_idx);
+                        return Some(ptr);
                     }
                 }
             }
@@ -270,75 +299,100 @@ fn pick_ecmp_leg(stats: StatsPtr, group: &EcmpGroup, hash: u32) -> Option<u32> {
 
 // --- Seqlock-aware nexthop read ---------------------------------------
 
-/// Read `NEXTHOPS[idx]` under the seqlock discipline. Returns
+/// Seqlock attempt outcomes. Integer codes rather than an enum for
+/// the same verifier-predictability reason as `FIB_ACTION_*`.
+const SEQ_OK: u8 = 0;
+/// Torn read: writer in progress (odd `seq`) or `seq` changed across
+/// the field reads. Retrying can succeed.
+const SEQ_RETRY: u8 = 1;
+/// Stable read of an entry whose `state != Resolved`. This cannot
+/// change within one program invocation — retrying is pointless.
+const SEQ_NOT_RESOLVED: u8 = 2;
+
+/// Read a `NEXTHOPS` entry under the seqlock discipline. Returns
 /// `Some((ifindex, smac, dmac))` on a stable even-`seq` read with
 /// `state == Resolved`, `None` otherwise.
 ///
-/// **Bounded retry.** Up to 4 attempts, manually unrolled so the
-/// verifier sees fixed instruction count. On every attempt:
-/// 1. Read `seq_before` volatile. If odd, the writer is in progress;
-///    skip to next attempt.
-/// 2. Read the fields volatile.
-/// 3. Read `seq_after` volatile. If it differs from `seq_before`,
-///    the writer mutated mid-read; skip to next attempt.
-/// 4. Check `state == NH_STATE_RESOLVED`. If so, return the tuple.
-///
-/// After 4 attempts, give up. Every retry bumps `NexthopSeqRetry` so
-/// sustained-high values expose hot neighbor churn.
+/// **Bounded retry, torn reads only.** Up to 4 attempts, manually
+/// unrolled so the verifier sees fixed instruction count. A stable
+/// read of a not-Resolved entry short-circuits immediately: earlier
+/// versions retried (and bumped `NexthopSeqRetry`) on that stable
+/// condition too, which burned up to 3 extra attempts per packet on
+/// unresolved nexthops and inflated the retry counter to ~4× the
+/// `custom_fib_no_neigh` rate — masking the genuine-churn signal the
+/// counter is documented to carry. `NexthopSeqRetry` now counts only
+/// real torn reads; `NeighCacheMiss` still counts every failed read.
 #[inline(always)]
-fn read_nexthop(stats: StatsPtr, idx: u32) -> Option<(u32, [u8; 6], [u8; 6])> {
-    let ptr = NEXTHOPS.get_ptr(idx)?;
+fn read_nexthop_ptr(stats: StatsPtr, ptr: *const NexthopEntry) -> Option<(u32, [u8; 6], [u8; 6])> {
+    let mut ifindex = 0u32;
+    let mut smac = [0u8; 6];
+    let mut dmac = [0u8; 6];
 
-    // Manual 4-retry unroll. Each block is identical; we could
-    // express this as a macro but the verifier reads every instruction
-    // so clarity > DRY here.
+    // Manual 4-attempt unroll; each retry is taken only on SEQ_RETRY.
+    let mut status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+    if status == SEQ_RETRY {
+        bump(stats, StatIdx::NexthopSeqRetry);
+        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+    }
+    if status == SEQ_RETRY {
+        bump(stats, StatIdx::NexthopSeqRetry);
+        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+    }
+    if status == SEQ_RETRY {
+        bump(stats, StatIdx::NexthopSeqRetry);
+        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+    }
+    if status == SEQ_RETRY {
+        bump(stats, StatIdx::NexthopSeqRetry);
+    }
 
-    if let Some(result) = try_read_seqlock(ptr) {
-        return Some(result);
+    if status == SEQ_OK {
+        return Some((ifindex, smac, dmac));
     }
-    bump(stats, StatIdx::NexthopSeqRetry);
-    if let Some(result) = try_read_seqlock(ptr) {
-        return Some(result);
-    }
-    bump(stats, StatIdx::NexthopSeqRetry);
-    if let Some(result) = try_read_seqlock(ptr) {
-        return Some(result);
-    }
-    bump(stats, StatIdx::NexthopSeqRetry);
-    if let Some(result) = try_read_seqlock(ptr) {
-        return Some(result);
-    }
-    bump(stats, StatIdx::NexthopSeqRetry);
-
     bump(stats, StatIdx::NeighCacheMiss);
     None
 }
 
-/// One seqlock attempt. Extracted to its own inlined function so the
-/// 4-retry unroll above reads cleanly.
+/// One seqlock attempt. Outputs travel through caller-stack out-params
+/// (~16 bytes, well within budget) with a status-code return: the
+/// historic `Option<(u32, [u8;6], [u8;6])>` shape is fine, but a
+/// three-way outcome needs the RETRY/NOT_RESOLVED distinction and
+/// nested enums with niche payloads are exactly what this codebase
+/// avoids handing the verifier. Everything stays `#[inline(always)]`,
+/// so no argument spill crosses a real call boundary.
 #[inline(always)]
-fn try_read_seqlock(ptr: *const NexthopEntry) -> Option<(u32, [u8; 6], [u8; 6])> {
-    // SAFETY: `ptr` came from `NEXTHOPS.get_ptr(idx)` which bounds-
-    // checked the index and returned a pointer into kernel map memory
-    // valid for the duration of the program run. `read_volatile`
-    // prevents the compiler from CSE'ing reads across the seq checks.
+fn try_read_seqlock(
+    ptr: *const NexthopEntry,
+    out_ifindex: &mut u32,
+    out_smac: &mut [u8; 6],
+    out_dmac: &mut [u8; 6],
+) -> u8 {
+    // SAFETY: `ptr` came from `NEXTHOPS.get_ptr` which bounds-checked
+    // the index and returned a pointer into kernel map memory valid
+    // for the duration of the program run. `read_volatile` prevents
+    // the compiler from CSE'ing reads across the seq checks.
     unsafe {
         let seq_before = core::ptr::read_volatile(&(*ptr).seq);
         if seq_before & 1 != 0 {
-            return None;
+            return SEQ_RETRY;
         }
         let state = core::ptr::read_volatile(&(*ptr).state);
-        if state != NH_STATE_RESOLVED {
-            return None;
-        }
         let ifindex = core::ptr::read_volatile(&(*ptr).ifindex);
         let dmac = core::ptr::read_volatile(&(*ptr).dst_mac);
         let smac = core::ptr::read_volatile(&(*ptr).src_mac);
         let seq_after = core::ptr::read_volatile(&(*ptr).seq);
         if seq_after != seq_before {
-            return None;
+            return SEQ_RETRY;
         }
-        Some((ifindex, smac, dmac))
+        // Only a seq-stable read can classify the entry: an unstable
+        // `state` byte could be mid-write.
+        if state != NH_STATE_RESOLVED {
+            return SEQ_NOT_RESOLVED;
+        }
+        *out_ifindex = ifindex;
+        *out_smac = smac;
+        *out_dmac = dmac;
+        SEQ_OK
     }
 }
 

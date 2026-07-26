@@ -284,24 +284,21 @@ fn handle_ipv4(
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let (sport, dport) = l4_ports(ctx, ip_offset + Ipv4Hdr::LEN, proto);
-
     // Option F: select between custom-FIB (LPM trie + NEXTHOPS) and
     // kernel-FIB (bpf_fib_lookup) based on runtime flags. Compare mode
     // runs both and forwards via the kernel result.
     //
-    // `l4_ports` returns BE-in-memory u16s (read_unaligned of BE wire
-    // bytes on an LE host) because that's what bpf_fib_lookup's
-    // `__be16` contract wants. Our own hash operates on native u16
-    // values so it's byte-order-agnostic between BPF and the userspace
-    // reference. Byte-swap once at the handoff.
+    // L4 port extraction is deferred to the consumers: the kernel-FIB
+    // scratch fill below (BE `__be16` contract) and the ECMP hash arm
+    // inside fib::lookup_* (native order, swapped there). The
+    // custom-fib single-nexthop path — the common case — never reads
+    // a port byte.
     let use_custom = cfg_flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
     let compare = cfg_flags & FP_CFG_FLAG_COMPARE_MODE != 0;
-    let sport_h = u16::from_be(sport);
-    let dport_h = u16::from_be(dport);
+    let l4_off = ip_offset + Ipv4Hdr::LEN;
 
     if use_custom && !compare {
-        let custom = fib::lookup_v4(stats, src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
+        let custom = fib::lookup_v4(stats, ctx, l4_off, src_bytes, dst_bytes, proto);
         return dispatch_custom_fib(
             custom,
             ctx,
@@ -314,6 +311,10 @@ fn handle_ipv4(
             ingress_vid,
         );
     }
+
+    // Kernel-FIB path: bpf_fib_lookup wants BE-in-memory `__be16`
+    // ports, which is exactly what `l4_ports` returns.
+    let (sport, dport) = l4_ports(ctx, l4_off, proto);
 
     // Use the per-CPU `FIB_LOOKUP_SCRATCH` map for the bpf_fib_lookup
     // struct rather than allocating it on the stack. Per-CPU array
@@ -374,7 +375,7 @@ fn handle_ipv4(
         // the operator managed to set COMPARE without CUSTOM_FIB (bug
         // or manual map poke), the branch above is unreachable and
         // we still do only the kernel lookup here.
-        let custom = fib::lookup_v4(stats, src_bytes, dst_bytes, proto, sport_h, dport_h);
+        let custom = fib::lookup_v4(stats, ctx, l4_off, src_bytes, dst_bytes, proto);
         compare_and_bump(stats, ret as u32, fib_ref, &custom);
     }
 
@@ -475,17 +476,14 @@ fn handle_ipv6(
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let (sport, dport) = l4_ports(ctx, ip_offset + Ipv6Hdr::LEN, next);
-
     // Option F dispatch, see handle_ipv4 for commentary, including the
-    // port byte-swap rationale.
+    // deferred-port rationale.
     let use_custom = cfg_flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
     let compare = cfg_flags & FP_CFG_FLAG_COMPARE_MODE != 0;
-    let sport_h = u16::from_be(sport);
-    let dport_h = u16::from_be(dport);
+    let l4_off = ip_offset + Ipv6Hdr::LEN;
 
     if use_custom && !compare {
-        let custom = fib::lookup_v6(stats, src_bytes, dst_bytes, next as u8, sport_h, dport_h);
+        let custom = fib::lookup_v6(stats, ctx, l4_off, src_bytes, dst_bytes, next);
         return dispatch_custom_fib(
             custom,
             ctx,
@@ -498,6 +496,8 @@ fn handle_ipv6(
             ingress_vid,
         );
     }
+
+    let (sport, dport) = l4_ports(ctx, l4_off, next);
 
     // See handle_ipv4 for the rationale behind using FIB_LOOKUP_SCRATCH
     // (per-CPU map) instead of stack-allocated bpf_fib_lookup.
@@ -534,7 +534,7 @@ fn handle_ipv6(
     let fib_ref = unsafe { &*fib_ptr };
 
     if compare {
-        let custom = fib::lookup_v6(stats, src_bytes, dst_bytes, next, sport_h, dport_h);
+        let custom = fib::lookup_v6(stats, ctx, l4_off, src_bytes, dst_bytes, next);
         compare_and_bump(stats, ret as u32, fib_ref, &custom);
     }
 
@@ -839,8 +839,9 @@ fn ptr_mut_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
 /// network-order u16 bytes (via `read_unaligned`) matching what the
 /// kernel's `bpf_fib_lookup` expects for its `__be16` sport/dport
 /// fields on an LE host. (0, 0) for ICMP / ICMPv6 or truncated L4.
+/// `pub(crate)` so fib.rs's ECMP arm can call it at its point of use.
 #[inline(always)]
-fn l4_ports(ctx: &XdpContext, offset: usize, proto: u8) -> (u16, u16) {
+pub(crate) fn l4_ports(ctx: &XdpContext, offset: usize, proto: u8) -> (u16, u16) {
     if !matches!(proto, PROTO_TCP | PROTO_UDP) {
         return (0, 0);
     }
