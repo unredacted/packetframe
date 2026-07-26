@@ -321,9 +321,15 @@ pub struct MssClampValue {
 /// Per-CPU because the NAPI cycle is single-CPU; the read in finalize is
 /// guaranteed to see the write in fast_path with no synchronization.
 ///
-/// 16 bytes, naturally aligned. Size + alignment is asserted in a
-/// userspace test (see `crates/modules/fast-path/src/linux_impl.rs`'s
-/// `MutationCtx` mirror).
+/// 20 bytes, naturally aligned, ZERO padding — asserted at compile
+/// time below. The no-padding property is load-bearing: any padding
+/// gives LLVM's "merge stores" optimization a zero-init block to
+/// lower into a `memset` libcall, which the BPF backend emits as a
+/// bpf-to-bpf subprogram, tripping the kernel verifier's
+///   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
+/// guard on UniFi-style kernels (5.15-ui-cn9670 aarch64). Every field
+/// is written individually in `forward_success`; never write this
+/// struct wholesale.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct MutationCtx {
@@ -343,18 +349,25 @@ pub struct MutationCtx {
     /// 1 = IPv4 packet, 0 = IPv6. Determines which IP-header struct
     /// finalize casts to and which MSS_CLAMP map to consult.
     ///
-    /// Stored as `u32` (not `u8`) so the struct has no padding bytes.
-    /// With padding, LLVM's "merge stores" optimization recognizes the
-    /// 3 unwritten bytes between `is_v4: u8` and the end of the struct
-    /// as a zero-init block and lowers them into a `memset` libcall
-    /// emitted by the BPF backend as a separate bpf-to-bpf subprogram,
-    /// which then trips the kernel verifier's
-    ///   "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls"
-    /// guard on UniFi-style kernels (5.15-ui-cn9670 aarch64). Single
-    /// `u32` field = single store, no padding, no merge-able zero
-    /// pattern. Low byte holds the boolean.
+    /// Stored as `u32` (not `u8`) per the no-padding rule above; the
+    /// low byte holds the boolean.
     pub is_v4: u32,
+    /// Low byte = `FpCfg.flags` as read once at fast_path entry.
+    /// Carries the feature-presence bits (notably
+    /// `FP_CFG_FLAG_MSS_CLAMP_PRESENT`) across the tail call so
+    /// finalize never re-reads the CFG map. u16 so the struct stays
+    /// padding-free; upper byte is explicitly zero-stored.
+    pub cfg_flags: u16,
+    /// `FpCfg.mss_clamp_global` from the same single CFG read; the
+    /// clamp chain's final fallback. 0 = unset.
+    pub mss_clamp_global: u16,
 }
+
+// The layout contract: 20 bytes means no padding (4+2+2+4+4+2+2), so
+// LLVM has no zero-block to merge into a memset libcall (see struct
+// docs). If a field change reintroduces padding, this fails the build
+// instead of the UniFi 5.15 verifier failing the load.
+const _: () = assert!(core::mem::size_of::<MutationCtx>() == 20);
 
 // --- Custom FIB value layouts (Option F) -------------------------------
 

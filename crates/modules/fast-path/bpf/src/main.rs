@@ -94,13 +94,15 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     // Single CFG read for the whole stage. Prior versions re-read
     // CFG.get(0) once per flag test (head-shift, dry-run, custom-fib,
     // compare — four opaque bpf_map_lookup_elem calls per packet that
-    // LLVM cannot CSE); the two scalars now travel in registers.
-    // Absent map (never happens; userspace populates before attach)
-    // degrades to "no flags, no dry-run", matching the old per-call
-    // `unwrap_or(false)` defaults.
-    let (cfg_flags, dry_run) = match CFG.get(0) {
-        Some(c) => (c.flags, c.dry_run != 0),
-        None => (0u8, false),
+    // LLVM cannot CSE); the three scalars now travel in registers.
+    // `mss_clamp_global` rides along so `forward_success` can stash it
+    // (plus the flags byte) in MUTATION_CTX for finalize, which then
+    // never reads CFG at all. Absent map (never happens; userspace
+    // populates before attach) degrades to "no flags, no dry-run",
+    // matching the old per-call `unwrap_or(false)` defaults.
+    let (cfg_flags, dry_run, mss_clamp_global) = match CFG.get(0) {
+        Some(c) => (c.flags, c.dry_run != 0, c.mss_clamp_global),
+        None => (0u8, false, 0u16),
     };
 
     // Pre-parse workaround for the pre-Linux-v6.8 rvu-nicpf XDP path
@@ -136,7 +138,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
         }
     }
 
-    match try_fast_path(&ctx, stats, cfg_flags, dry_run) {
+    match try_fast_path(&ctx, stats, cfg_flags, dry_run, mss_clamp_global) {
         Ok(action) => action,
         Err(()) => {
             bump(stats, StatIdx::ErrParse);
@@ -153,6 +155,7 @@ fn try_fast_path(
     stats: StatsPtr,
     cfg_flags: u8,
     dry_run: bool,
+    mss_clamp_global: u16,
 ) -> Result<u32, ()> {
     let eth: *mut EthHdr = ptr_mut_at(ctx, 0)?;
     let outer_ether = unsafe { (*eth).ether_type };
@@ -178,9 +181,27 @@ fn try_fast_path(
     };
 
     if inner_ether == EtherType::Ipv4 as u16 {
-        handle_ipv4(ctx, stats, cfg_flags, dry_run, eth, ip_offset, ingress_vid)
+        handle_ipv4(
+            ctx,
+            stats,
+            cfg_flags,
+            dry_run,
+            mss_clamp_global,
+            eth,
+            ip_offset,
+            ingress_vid,
+        )
     } else if inner_ether == EtherType::Ipv6 as u16 {
-        handle_ipv6(ctx, stats, cfg_flags, dry_run, eth, ip_offset, ingress_vid)
+        handle_ipv6(
+            ctx,
+            stats,
+            cfg_flags,
+            dry_run,
+            mss_clamp_global,
+            eth,
+            ip_offset,
+            ingress_vid,
+        )
     } else {
         bump(stats, StatIdx::PassNotIp);
         Ok(xdp_action::XDP_PASS)
@@ -194,6 +215,7 @@ fn handle_ipv4(
     stats: StatsPtr,
     cfg_flags: u8,
     dry_run: bool,
+    mss_clamp_global: u16,
     eth: *mut EthHdr,
     ip_offset: usize,
     ingress_vid: u16,
@@ -285,6 +307,7 @@ fn handle_ipv4(
             ctx,
             stats,
             cfg_flags,
+            mss_clamp_global,
             eth,
             ip as *mut u8,
             true,
@@ -360,6 +383,7 @@ fn handle_ipv4(
         ctx,
         stats,
         cfg_flags,
+        mss_clamp_global,
         eth,
         ip as *mut u8,
         true,
@@ -375,6 +399,7 @@ fn handle_ipv6(
     stats: StatsPtr,
     cfg_flags: u8,
     dry_run: bool,
+    mss_clamp_global: u16,
     eth: *mut EthHdr,
     ip_offset: usize,
     ingress_vid: u16,
@@ -466,6 +491,7 @@ fn handle_ipv6(
             ctx,
             stats,
             cfg_flags,
+            mss_clamp_global,
             eth,
             ip as *mut u8,
             false,
@@ -517,6 +543,7 @@ fn handle_ipv6(
         ctx,
         stats,
         cfg_flags,
+        mss_clamp_global,
         eth,
         ip as *mut u8,
         false,
@@ -532,6 +559,7 @@ fn dispatch_fib(
     ctx: &XdpContext,
     stats: StatsPtr,
     cfg_flags: u8,
+    mss_clamp_global: u16,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -543,6 +571,7 @@ fn dispatch_fib(
             ctx,
             stats,
             cfg_flags,
+            mss_clamp_global,
             eth,
             ip,
             is_v4,
@@ -587,6 +616,7 @@ fn forward_success(
     ctx: &XdpContext,
     stats: StatsPtr,
     cfg_flags: u8,
+    mss_clamp_global: u16,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -656,6 +686,11 @@ fn forward_success(
             // Single u32 store, LLVM has no adjacent zero stores to
             // merge into a memset libcall.
             (*mctx_ptr).is_v4 = u32::from(u8::from(is_v4));
+            // CFG state for finalize: flags byte widened into the u16
+            // slot (upper byte explicitly zero via the From) + the
+            // global clamp fallback. Individual stores, no memset bait.
+            (*mctx_ptr).cfg_flags = u16::from(cfg_flags);
+            (*mctx_ptr).mss_clamp_global = mss_clamp_global;
         }
     } else {
         // Per-CPU array index 0 is always present; this branch should
@@ -687,6 +722,7 @@ fn dispatch_custom_fib(
     ctx: &XdpContext,
     stats: StatsPtr,
     cfg_flags: u8,
+    mss_clamp_global: u16,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -697,6 +733,7 @@ fn dispatch_custom_fib(
             ctx,
             stats,
             cfg_flags,
+            mss_clamp_global,
             eth,
             ip,
             is_v4,

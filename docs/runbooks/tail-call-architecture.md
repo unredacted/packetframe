@@ -60,12 +60,13 @@ pub struct MutationCtx {
     egress_vid: u16,       // VLAN_RESOLVE result; 0 = untagged
     ingress_vid: u16,      // From packet parse; 0 = untagged
     ip_offset: u32,        // Bytes from ctx.data() to IP header
-    is_v4: u8,             // 1 = IPv4, 0 = IPv6
-    _pad: [u8; 3],
+    is_v4: u32,            // 1 = IPv4, 0 = IPv6 (u32: no-padding rule)
+    cfg_flags: u16,        // Low byte = FpCfg.flags at fast_path entry
+    mss_clamp_global: u16, // Global clamp fallback; 0 = unset
 }
 ```
 
-16 bytes, naturally aligned. Per-CPU because the NAPI cycle is single-CPU; the read in finalize sees the most recent write in fast_path with no synchronization.
+20 bytes, naturally aligned, zero padding (compile-time asserted in `bpf/src/maps.rs` — padding would let LLVM merge zero-stores into a `memset` libcall, which becomes a bpf-to-bpf subprogram and trips the tail-call exclusion on UniFi 5.15). `cfg_flags` + `mss_clamp_global` carry fast_path's single CFG read across the tail call so finalize never touches the CFG map. Per-CPU because the NAPI cycle is single-CPU; the read in finalize sees the most recent write in fast_path with no synchronization.
 
 ## MUTATION_PROGS jump table
 

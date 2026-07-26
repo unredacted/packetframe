@@ -236,6 +236,36 @@ impl Harness {
         trie.insert(&key, 1u8, 0).expect("BLOCK_V4 insert");
     }
 
+    /// Insert an IPv4 mss-clamp prefix rule. `iface_filter` 0 = any
+    /// egress. Callers must also set `FP_CFG_FLAG_MSS_CLAMP_PRESENT`.
+    pub fn add_mss_clamp_v4(&mut self, prefix: &str, mss: u16, iface_filter: u32) {
+        /// Layout mirror of `MssClampValue` in `bpf/src/maps.rs`.
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct MssClampValue {
+            mss: u16,
+            _pad: u16,
+            iface_filter: u32,
+        }
+        unsafe impl Pod for MssClampValue {}
+
+        let (addr, plen) = parse_v4_prefix(prefix);
+        let map = self.bpf.map_mut("MSS_CLAMP_V4").expect("MSS_CLAMP_V4 map");
+        let mut trie: LpmTrie<_, [u8; 4], MssClampValue> =
+            LpmTrie::try_from(map).expect("MSS_CLAMP_V4 try_from");
+        let key = LpmKey::new(u32::from(plen), addr);
+        trie.insert(
+            &key,
+            MssClampValue {
+                mss,
+                _pad: 0,
+                iface_filter,
+            },
+            0,
+        )
+        .expect("MSS_CLAMP_V4 insert");
+    }
+
     /// Insert a VLAN-subif mapping: `subif_ifindex` → (physical parent
     /// ifindex, VID). Callers must also set `FP_CFG_FLAG_VLAN_PRESENT`.
     pub fn add_vlan_resolve(&mut self, subif_ifindex: u32, phys_ifindex: u32, vid: u16) {
@@ -601,6 +631,11 @@ pub struct Ipv4TcpBuilder {
     pub frag_flags: u16, // network byte order: bit 15=res, 14=DF, 13=MF, 12..0=offset
     pub ihl: u8,         // normally 5; set >5 to produce IHL>5 via header option bytes
     pub tcp_flags: u8,   // TCP header byte 13; default SYN (0x02)
+    /// Raw TCP option bytes appended after the fixed 20-byte header.
+    /// Must be a multiple of 4 (padded with NOPs/EOL by the caller);
+    /// data offset is derived. E.g. an MSS option for 1460:
+    /// `vec![2, 4, 0x05, 0xb4]`.
+    pub tcp_options: Vec<u8>,
     pub payload: Vec<u8>,
 }
 
@@ -618,6 +653,7 @@ impl Default for Ipv4TcpBuilder {
             frag_flags: 0,
             ihl: 5,
             tcp_flags: 0x02, // SYN, the historical builder default
+            tcp_options: Vec::new(),
             payload: Vec::new(),
         }
     }
@@ -638,8 +674,13 @@ pub fn insert_vlan_tag(base: &[u8], vid: u16) -> Vec<u8> {
 
 impl Ipv4TcpBuilder {
     pub fn build(&self) -> Vec<u8> {
+        assert!(
+            self.tcp_options.len() % 4 == 0 && self.tcp_options.len() <= 40,
+            "tcp_options must be 4-byte padded and fit the doff field"
+        );
         let ip_header_len = (self.ihl as usize) * 4;
-        let total_len = (ip_header_len + 20 + self.payload.len()) as u16; // +TCP hdr
+        let tcp_header_len = 20 + self.tcp_options.len();
+        let total_len = (ip_header_len + tcp_header_len + self.payload.len()) as u16;
         let mut pkt = Vec::with_capacity(14 + total_len as usize);
 
         // Ethernet
@@ -670,15 +711,18 @@ impl Ipv4TcpBuilder {
         let csum = ipv4_checksum(ip_header);
         pkt[check_offset..check_offset + 2].copy_from_slice(&csum.to_be_bytes());
 
-        // TCP (minimal 20-byte header; flags from `tcp_flags`; no options)
+        // TCP header; flags from `tcp_flags`, options from `tcp_options`.
         pkt.extend_from_slice(&self.src_port.to_be_bytes());
         pkt.extend_from_slice(&self.dst_port.to_be_bytes());
         pkt.extend_from_slice(&[0, 0, 0, 1]); // seq
         pkt.extend_from_slice(&[0, 0, 0, 0]); // ack
-        pkt.push(0x50); // data offset 5 in upper nibble
+        let doff_words = (tcp_header_len / 4) as u8;
+        pkt.push(doff_words << 4); // data offset in upper nibble
         pkt.push(self.tcp_flags);
         pkt.extend_from_slice(&[0xff, 0xff]); // window
-        pkt.extend_from_slice(&[0, 0, 0, 0]); // checksum (zero - bpf doesn't care for fixtures)
+        pkt.extend_from_slice(&[0, 0]); // checksum (zero - bpf recomputes incrementally)
+        pkt.extend_from_slice(&[0, 0]); // urgent pointer
+        pkt.extend_from_slice(&self.tcp_options);
 
         pkt.extend_from_slice(&self.payload);
         pkt
