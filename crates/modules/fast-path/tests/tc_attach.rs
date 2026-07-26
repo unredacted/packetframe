@@ -149,11 +149,20 @@ fn tc_detach_clears_records_for_vanished_ifaces() {
     // opposite case (detach FAILS with the iface alive) retains the
     // record; that branch needs an induced netlink failure and is
     // covered by review-level reasoning rather than a fixture.
+    //
+    // State-dir-only guard, NOT the shared `Cleanup`: that one also
+    // deletes PEER_A, and cargo runs tests in parallel — this test
+    // finishing first would yank the veth out from under
+    // `tc_attach_persists_and_detaches_from_state_dir` mid-setup.
+    struct DirCleanup(std::path::PathBuf);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let state_dir =
         std::env::temp_dir().join(format!("pf-tc-vanished-test-{}", std::process::id()));
-    let _cleanup = Cleanup {
-        state_dir: state_dir.clone(),
-    };
+    let _cleanup = DirCleanup(state_dir.clone());
 
     tc_links::save(
         &state_dir,
