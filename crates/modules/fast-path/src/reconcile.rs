@@ -356,6 +356,36 @@ fn reconcile_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
             Err(e) => warn!(ifindex, error = %e, "REDIRECT_DEVMAP remove failed"),
         }
     }
+
+    // Converge the tc datapath's membership mirror against the same
+    // desired set (Phase T; devmaps are XDP-only so tc_fast_path's
+    // pristine-packet pre-check reads this plain hash map instead).
+    // Same stale-purge policy; deltas fold into the devmap's counts.
+    {
+        let map = state
+            .ebpf
+            .map_mut("TC_REDIRECT_TARGETS")
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "TC_REDIRECT_TARGETS missing"))?;
+        let mut hm: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(map).map_err(|e| {
+            ModuleError::other(MODULE_NAME, format!("TC_REDIRECT_TARGETS try_from: {e}"))
+        })?;
+        let tc_current: HashSet<u32> = hm.keys().filter_map(Result::ok).collect();
+        for ifindex in desired.difference(&tc_current) {
+            match hm.insert(*ifindex, *ifindex, 0) {
+                Ok(()) => info!(ifindex, "TC_REDIRECT_TARGETS added (iface came up)"),
+                Err(e) => warn!(ifindex, error = %e, "TC_REDIRECT_TARGETS insert failed"),
+            }
+        }
+        for ifindex in tc_current.difference(&desired) {
+            if ifindex_exists(*ifindex) {
+                continue;
+            }
+            match hm.remove(ifindex) {
+                Ok(()) => info!(ifindex, "TC_REDIRECT_TARGETS stale entry purged"),
+                Err(e) => warn!(ifindex, error = %e, "TC_REDIRECT_TARGETS remove failed"),
+            }
+        }
+    }
     Ok(delta)
 }
 

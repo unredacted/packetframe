@@ -255,11 +255,29 @@ pub struct LinkRecord {
 pub enum LinkHandle {
     Pinned(PinnedLink),
     Transient(FdLink),
+    /// tc datapath (Phase T): a netlink cls_bpf filter on the iface's
+    /// clsact ingress. No FD is held — the aya link was deliberately
+    /// forgotten after reading the kernel-assigned identifiers (a held
+    /// link would detach on Drop), so the kernel attach has qdisc
+    /// lifetime and survives process exit, like `Pinned`. Teardown
+    /// reconstructs the filter from `(priority, handle)` via
+    /// `SchedClassifierLink::attached()`; the same pair is persisted
+    /// in `<state-dir>/tc-links.json` for out-of-process `detach`.
+    Tc {
+        priority: u16,
+        handle: u32,
+    },
 }
 
 impl LinkHandle {
     pub fn is_pinned(&self) -> bool {
         matches!(self, LinkHandle::Pinned(_))
+    }
+
+    /// Whether the kernel-side attach outlives this process (bpffs pin
+    /// for XDP, qdisc-lifetime filter for tc).
+    pub fn persists_across_exit(&self) -> bool {
+        matches!(self, LinkHandle::Pinned(_) | LinkHandle::Tc { .. })
     }
 }
 
@@ -879,9 +897,34 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // `attach_settle_time` between attaches so each link stabilizes
     // before the next touches the driver. 0s disables (useful on
     // non-bridge topologies).
+    // Split tc-datapath attaches from the XDP ones: they use a
+    // different program pair, a different attach mechanism (netlink
+    // cls_bpf on clsact), and must run after the XDP loop because
+    // `prog` mutably borrows `state.ebpf` until its last use here.
+    let (tc_dirs, xdp_dirs): (Vec<_>, Vec<_>) = attach_dirs
+        .into_iter()
+        .partition(|(_, mode, _)| matches!(mode, AttachMode::Tc));
+
+    // The tc datapath is custom-fib only (the classifiers have no
+    // kernel-FIB arm; see bpf/src/tc.rs). Reject the pairing up front
+    // rather than silently passing all matched traffic to the kernel.
+    if !tc_dirs.is_empty()
+        && !matches!(
+            forwarding_mode_from_cfg(cfg),
+            packetframe_common::config::ForwardingMode::CustomFib
+        )
+    {
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            "`attach <iface> tc` requires `forwarding-mode custom-fib` \
+             (the tc datapath has no kernel-fib/compare arm)",
+        ));
+    }
+
     let settle_time = cfg.global.attach_settle_time;
-    for (idx, (iface, mode, ifindex)) in attach_dirs.iter().enumerate() {
-        if idx > 0 && !settle_time.is_zero() {
+    let mut attach_count = 0usize;
+    for (iface, mode, ifindex) in xdp_dirs.iter() {
+        if attach_count > 0 && !settle_time.is_zero() {
             info!(
                 settle_secs = settle_time.as_secs_f64(),
                 next_iface = %iface,
@@ -889,9 +932,10 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             );
             std::thread::sleep(settle_time);
         }
+        attach_count += 1;
         let (effective_mode, link) =
             try_attach_with_fallback(prog, *ifindex, iface, *mode, &state.bpffs_root)?;
-        let persist = link.is_pinned();
+        let persist = link.persists_across_exit();
         state.links.push(LinkRecord {
             iface: iface.clone(),
             ifindex: *ifindex,
@@ -905,6 +949,54 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             persists_across_exit = persist,
             "fast-path attached"
         );
+    }
+
+    // tc-datapath attaches. Load + wire the classifier pair first so
+    // tc_fast_path's tail_call into TC_MUTATION_PROGS[0] succeeds from
+    // the first packet (same ordering contract as finalize above);
+    // aya loads programs lazily, so XDP-only deployments never pay
+    // for the classifiers.
+    if !tc_dirs.is_empty() {
+        load_tc_programs(&mut state.ebpf)?;
+        populate_tc_mutation_progs(&mut state.ebpf)?;
+
+        let mut tc_records = Vec::with_capacity(tc_dirs.len());
+        for (iface, _mode, ifindex) in tc_dirs.iter() {
+            if attach_count > 0 && !settle_time.is_zero() {
+                info!(
+                    settle_secs = settle_time.as_secs_f64(),
+                    next_iface = %iface,
+                    "waiting for link to settle before next attach (§11.8)"
+                );
+                std::thread::sleep(settle_time);
+            }
+            attach_count += 1;
+            let (priority, handle) = tc_attach_iface(&mut state.ebpf, iface)?;
+            tc_records.push(crate::tc_links::TcLinkRecord {
+                iface: iface.clone(),
+                priority,
+                handle,
+            });
+            state.links.push(LinkRecord {
+                iface: iface.clone(),
+                ifindex: *ifindex,
+                effective_mode: AttachMode::Tc,
+                link: LinkHandle::Tc { priority, handle },
+            });
+            info!(
+                iface,
+                ifindex,
+                priority,
+                handle,
+                persists_across_exit = true,
+                "fast-path attached (tc-ingress datapath)"
+            );
+        }
+        crate::tc_links::save(
+            &state.state_dir,
+            &crate::tc_links::TcLinksFile { links: tc_records },
+        )
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json save: {e}")))?;
     }
 
     // Detect buggy-kernel rvu-nicpf native XDP delivery and flip the
@@ -952,6 +1044,25 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         "REDIRECT_DEVMAP populated from /sys/class/net (Ethernet-type, UP)"
     );
 
+    // Mirror the same membership into TC_REDIRECT_TARGETS (Phase T).
+    // Devmap types are XDP-only, so the tc datapath's pristine-packet
+    // pre-check consults this plain hash map instead. Populated
+    // unconditionally — it's a handful of entries and keeps reconcile
+    // symmetric whether or not any `attach <iface> tc` exists yet.
+    {
+        let map = state.ebpf.map_mut("TC_REDIRECT_TARGETS").ok_or_else(|| {
+            ModuleError::other(MODULE_NAME, "TC_REDIRECT_TARGETS map missing from ELF")
+        })?;
+        let mut hm: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(map).map_err(|e| {
+            ModuleError::other(MODULE_NAME, format!("TC_REDIRECT_TARGETS try_from: {e}"))
+        })?;
+        for (iface, ifindex) in &targets {
+            if let Err(e) = hm.insert(*ifindex, *ifindex, 0) {
+                warn!(iface = %iface, ifindex, error = %e, "TC_REDIRECT_TARGETS insert skipped");
+            }
+        }
+    }
+
     populate_vlan_resolve(state)?;
 
     // Pin program + every §4.5 map so `packetframe status` can read
@@ -965,15 +1076,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     // custom FIB path. Uses `MapData::from_pin` internally, so it
     // must run after `pin_program_and_maps`. Kernel-fib mode skips
     // this entirely and pays nothing for the feature.
-    let forwarding = cfg
-        .section
-        .directives
-        .iter()
-        .find_map(|d| match d {
-            ModuleDirective::ForwardingMode(m) => Some(*m),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let forwarding = forwarding_mode_from_cfg(cfg);
     if matches!(
         forwarding,
         packetframe_common::config::ForwardingMode::CustomFib
@@ -1141,9 +1244,15 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 AttachMode::Native => HookType::NativeXdp,
                 AttachMode::Generic => HookType::GenericXdp,
                 AttachMode::Auto => HookType::NativeXdp, // already resolved
+                AttachMode::Tc => HookType::TcIngress,
             },
             prog_id,
-            pinned_path: pin::link_path(&state.bpffs_root, &l.iface),
+            // tc attaches have no bpffs link pin; their persistent
+            // record is tc-links.json, so point the registry there.
+            pinned_path: match l.effective_mode {
+                AttachMode::Tc => crate::tc_links::file_path(&state.state_dir),
+                _ => pin::link_path(&state.bpffs_root, &l.iface),
+            },
         })
         .collect())
 }
@@ -1336,7 +1445,9 @@ fn rvu_nicpf_version_gate(
                 );
                 out.push((iface, AttachMode::Generic, ifindex));
             }
-            AttachMode::Generic => unreachable!("filtered by wants_native check above"),
+            AttachMode::Generic | AttachMode::Tc => {
+                unreachable!("filtered by wants_native check above")
+            }
         }
     }
     Ok(out)
@@ -1439,6 +1550,178 @@ fn populate_mutation_progs(ebpf: &mut Ebpf) -> ModuleResult<()> {
     Ok(())
 }
 
+/// The parsed `forwarding-mode` directive (default `kernel-fib`).
+fn forwarding_mode_from_cfg(cfg: &ModuleConfig<'_>) -> packetframe_common::config::ForwardingMode {
+    cfg.section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::ForwardingMode(m) => Some(*m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// tc-datapath program names in the shared BPF ELF (Phase T).
+const TC_FAST_PATH_PROGRAM_NAME: &str = "tc_fast_path";
+const TC_FINALIZE_PROGRAM_NAME: &str = "tc_finalize";
+
+/// Load the sched_cls pair. `tc_finalize` first, its FD feeds the
+/// TC_MUTATION_PROGS population before any tc filter attaches — the
+/// same contract as the XDP finalize/MUTATION_PROGS ordering.
+fn load_tc_programs(ebpf: &mut Ebpf) -> ModuleResult<()> {
+    use aya::programs::tc::SchedClassifier;
+    for name in [TC_FINALIZE_PROGRAM_NAME, TC_FAST_PATH_PROGRAM_NAME] {
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut(name)
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, format!("{name} missing from ELF")))?
+            .try_into()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("{name} not sched_cls: {e}")))?;
+        prog.load().map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("SchedClassifier::load({name}) failed (verifier rejection?): {e}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Populate TC_MUTATION_PROGS[0] with tc_finalize (mirror of
+/// `populate_mutation_progs`; PROG_ARRAYs bind to one owner program
+/// type, so the tc chain needs its own jump table).
+fn populate_tc_mutation_progs(ebpf: &mut Ebpf) -> ModuleResult<()> {
+    use aya::maps::ProgramArray;
+    use aya::programs::tc::SchedClassifier;
+    use aya::programs::ProgramFd;
+
+    let tc_finalize_fd: ProgramFd = {
+        let prog: &SchedClassifier = ebpf
+            .program(TC_FINALIZE_PROGRAM_NAME)
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "tc_finalize missing post-load"))?
+            .try_into()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc_finalize type: {e}")))?;
+        prog.fd()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc_finalize fd: {e}")))?
+            .try_clone()
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc_finalize fd clone: {e}")))?
+    };
+
+    let map = ebpf
+        .map_mut("TC_MUTATION_PROGS")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "TC_MUTATION_PROGS map missing"))?;
+    let mut prog_array: ProgramArray<_> = ProgramArray::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("TC_MUTATION_PROGS try_from: {e}")))?;
+    prog_array.set(0, &tc_finalize_fd, 0).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("TC_MUTATION_PROGS.set(0, tc_finalize): {e}"),
+        )
+    })?;
+    info!("TC_MUTATION_PROGS[0] populated with tc_finalize program FD");
+    Ok(())
+}
+
+/// Attach `tc_fast_path` to `iface`'s clsact ingress and return the
+/// kernel-assigned `(priority, handle)` identifying the filter.
+///
+/// **Explicitly netlink cls_bpf on every kernel** (not aya's
+/// version-picked TCX path): netlink filters have qdisc lifetime —
+/// the kernel attach survives process exit, matching the pinned-XDP
+/// posture — and yield the `(priority, handle)` pair that
+/// `SchedClassifierLink::attached()` needs for out-of-process detach.
+/// TCX (≥6.6) would hand us an FD-lifetime link that dies with the
+/// process; migrating to pinned TCX links is future work once the
+/// fleet baseline moves past 6.6.
+///
+/// The returned aya link is deliberately `mem::forget`-ed: dropping
+/// it would detach the filter.
+pub fn tc_attach_iface(ebpf: &mut Ebpf, iface: &str) -> ModuleResult<(u16, u32)> {
+    use aya::programs::tc::{
+        qdisc_add_clsact, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType,
+    };
+
+    match qdisc_add_clsact(iface) {
+        Ok(()) => info!(iface, "clsact qdisc added"),
+        // Already present (another tool, a prior run): attaching a
+        // filter to the existing clsact is exactly what we want.
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            info!(iface, "clsact qdisc already present");
+        }
+        Err(e) => {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!("qdisc_add_clsact({iface}): {e}"),
+            ));
+        }
+    }
+
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut(TC_FAST_PATH_PROGRAM_NAME)
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "tc_fast_path missing post-load"))?
+        .try_into()
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc_fast_path type: {e}")))?;
+    let link_id = prog
+        .attach_with_options(
+            iface,
+            TcAttachType::Ingress,
+            TcAttachOptions::Netlink(NlOptions::default()),
+        )
+        .map_err(|e| {
+            ModuleError::other(MODULE_NAME, format!("tc attach on {iface} failed: {e}"))
+        })?;
+    let link = prog
+        .take_link(link_id)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc take_link({iface}): {e}")))?;
+    let priority = link
+        .priority()
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc link priority({iface}): {e}")))?;
+    let handle = link
+        .handle()
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc link handle({iface}): {e}")))?;
+    // Keep the kernel attach alive past this scope; see fn docs.
+    std::mem::forget(link);
+    Ok((priority, handle))
+}
+
+/// Detach one recorded tc filter. Best-effort building block for both
+/// the in-process (`detach(state)`) and out-of-process
+/// ([`tc_detach_from_state_dir`]) teardown paths.
+fn tc_detach_one(iface: &str, priority: u16, handle: u32) -> Result<(), String> {
+    use aya::programs::tc::{SchedClassifierLink, TcAttachType};
+    use aya::programs::Link as _;
+    let link = SchedClassifierLink::attached(iface, TcAttachType::Ingress, priority, handle)
+        .map_err(|e| format!("reconstruct tc link on {iface}: {e}"))?;
+    link.detach()
+        .map_err(|e| format!("tc detach on {iface} (prio {priority}, handle {handle}): {e}"))
+}
+
+/// Tear down every tc filter recorded in `<state-dir>/tc-links.json`
+/// and remove the file. Used by `packetframe detach` (no live loader
+/// required — the filters have qdisc lifetime). Returns the number of
+/// filters detached; per-filter failures are logged and skipped so a
+/// vanished iface doesn't wedge the teardown (the qdisc died with it).
+pub fn tc_detach_from_state_dir(state_dir: &Path) -> ModuleResult<usize> {
+    let Some(file) = crate::tc_links::load(state_dir)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json read: {e}")))?
+    else {
+        return Ok(0);
+    };
+    let mut detached = 0usize;
+    for rec in &file.links {
+        match tc_detach_one(&rec.iface, rec.priority, rec.handle) {
+            Ok(()) => {
+                info!(iface = %rec.iface, rec.priority, rec.handle, "tc filter detached");
+                detached += 1;
+            }
+            Err(e) => warn!(iface = %rec.iface, error = %e, "tc filter detach skipped"),
+        }
+    }
+    crate::tc_links::remove(state_dir)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json remove: {e}")))?;
+    Ok(detached)
+}
+
 /// §2.3: per-interface trial-attach. `Native` and `Generic` are explicit
 /// (no fallback); `Auto` tries native first, falls back to generic on
 /// any error. The spec calls out that `bpftool feature probe` is
@@ -1454,6 +1737,12 @@ fn try_attach_with_fallback(
     bpffs_root: &Path,
 ) -> ModuleResult<(AttachMode, LinkHandle)> {
     match mode {
+        // tc attaches are partitioned out before the XDP loop and go
+        // through `tc_attach_iface`; reaching here is a caller bug.
+        AttachMode::Tc => Err(ModuleError::other(
+            MODULE_NAME,
+            format!("internal: tc attach for `{iface}` routed to the XDP attach path"),
+        )),
         AttachMode::Native => attach_and_pin(
             prog,
             ifindex,
@@ -1708,12 +1997,25 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
     }
 
     // Drop every PinnedLink next: this closes our userspace FDs but
-    // the kernel keeps the attach alive via the bpffs inodes. Drain
-    // in reverse attach order, no practical consequence here, matches
-    // typical lifecycle expectations.
-    while let Some(link) = state.links.pop() {
-        info!(iface = %link.iface, "fast-path detaching");
-        drop(link);
+    // the kernel keeps the attach alive via the bpffs inodes. tc
+    // records hold no FD at all — detach them explicitly via their
+    // recorded (priority, handle), best-effort (a vanished iface took
+    // its qdisc and filter with it). Drain in reverse attach order.
+    let mut had_tc = false;
+    while let Some(record) = state.links.pop() {
+        info!(iface = %record.iface, "fast-path detaching");
+        if let LinkHandle::Tc { priority, handle } = record.link {
+            had_tc = true;
+            if let Err(e) = tc_detach_one(&record.iface, priority, handle) {
+                warn!(iface = %record.iface, error = %e, "tc filter detach skipped");
+            }
+        }
+        drop(record);
+    }
+    if had_tc {
+        if let Err(e) = crate::tc_links::remove(&state.state_dir) {
+            warn!(error = %e, "tc-links.json remove failed");
+        }
     }
 
     // Unlink every pin under the module's pin root. Pace the link-pin

@@ -479,6 +479,14 @@ pub enum AttachMode {
     Native,
     Generic,
     Auto,
+    /// tc-ingress datapath (Phase T): sched_cls classifiers on a
+    /// clsact qdisc instead of XDP. For hosts forced into xdp-generic
+    /// (e.g. rvu-nicpf pre-6.8), this avoids generic XDP's per-packet
+    /// headroom realloc + GRO linearization. Requires
+    /// `forwarding-mode custom-fib` (enforced at attach time); `auto`
+    /// never selects tc — it is an explicit per-iface opt-in so
+    /// canary rollouts stay operator-controlled.
+    Tc,
 }
 
 impl FromStr for AttachMode {
@@ -488,8 +496,9 @@ impl FromStr for AttachMode {
             "native" => Ok(Self::Native),
             "generic" => Ok(Self::Generic),
             "auto" => Ok(Self::Auto),
+            "tc" => Ok(Self::Tc),
             other => Err(format!(
-                "unknown attach mode `{other}` (expected native|generic|auto)"
+                "unknown attach mode `{other}` (expected native|generic|auto|tc)"
             )),
         }
     }
@@ -2361,6 +2370,20 @@ module fast-path
         let s = "module fast-path\n  attach eth0\n";
         let e = Config::parse(s).unwrap_err();
         assert!(matches!(e, ConfigError::Parse { line: 2, .. }));
+    }
+
+    #[test]
+    fn attach_tc_mode_parses() {
+        let s = "module fast-path\n  attach eth5 tc\n";
+        let c = Config::parse(s).unwrap();
+        let d = &c.modules[0].directives[0];
+        match d {
+            ModuleDirective::Attach { iface, mode, .. } => {
+                assert_eq!(iface, "eth5");
+                assert_eq!(*mode, AttachMode::Tc);
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
     }
 
     #[test]

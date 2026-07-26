@@ -818,6 +818,18 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             "pins removed; kernel detached"
         );
 
+        // tc-datapath filters (Phase T) have qdisc lifetime rather
+        // than bpffs pins; tear them down from their own persistence
+        // record. No-op when tc-links.json doesn't exist.
+        #[cfg(target_os = "linux")]
+        {
+            let n = packetframe_fast_path::tc_detach_from_state_dir(&state_dir)
+                .map_err(|e| format!("tc filter teardown: {e}"))?;
+            if n > 0 {
+                tracing::info!(count = n, "tc filters detached");
+            }
+        }
+
         packetframe_fast_path::registry::remove(&state_dir)
             .map_err(|e| format!("registry remove: {e}"))?;
     }
