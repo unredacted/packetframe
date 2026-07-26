@@ -96,10 +96,14 @@ pub(crate) const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
 /// never inline at one call site.
 ///
 /// `vlan_subifs_present` comes from `/proc/net/vlan/config` rather
-/// than directives (VLAN_RESOLVE is discovery-populated); callers pass
-/// the current read. `populate_vlan_resolve` / `reconcile_vlan_resolve`
-/// additionally RMW-fix bit 6 after actually converging the map, which
-/// covers subifs appearing between the CFG write and VLAN discovery.
+/// than directives (VLAN_RESOLVE is discovery-populated). Ownership of
+/// bit 6 differs by caller: `populate_cfg` passes the current proc
+/// read (initial seed; a read failure later aborts load in
+/// `populate_vlan_resolve` anyway), while `reconcile_cfg` passes
+/// `false` and ORs in the bit *preserved from the live flags* — on
+/// SIGHUP the bit may only change via `reconcile_vlan_resolve`'s
+/// post-convergence RMW, so a transient proc-read failure can never
+/// clear the gate while VLAN_RESOLVE still holds entries.
 pub(crate) fn feature_flags_from_config(
     directives: &[ModuleDirective],
     vlan_subifs_present: bool,

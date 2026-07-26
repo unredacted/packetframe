@@ -24,9 +24,8 @@ use tracing::{info, warn};
 
 use crate::linux_impl::{
     feature_flags_from_config, fib_flags_from_forwarding_mode, if_nametoindex,
-    mss_clamp_global_value, read_vlan_config, set_cfg_flag, vlan_subifs_present, ActiveState,
-    FpCfg, MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT,
-    FP_CFG_VERSION_V2,
+    mss_clamp_global_value, read_vlan_config, set_cfg_flag, ActiveState, FpCfg, MssClampValue,
+    VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -104,24 +103,39 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     // driver detection; SIGHUP reconfigure must not wipe it. Without
     // this preservation, a SIGHUP on an rvu-nicpf box would silently
     // disable the head-shift workaround until the next full restart.
+    //
+    // Bit 6 (VLAN_PRESENT) is preserved for a related reason: it is
+    // owned by VLAN *discovery*, not directives, and its only writer
+    // is `reconcile_vlan_resolve`'s post-convergence RMW. Recomputing
+    // it here from a fresh /proc/net/vlan/config read would clear the
+    // gate whenever that read transiently fails (any error maps to
+    // "no subifs") — and since the same failure then aborts
+    // `reconcile_vlan_resolve` before its fixup, VLAN_RESOLVE would
+    // keep its entries while the datapath stopped consulting them,
+    // mistagging subif egress until the next successful reconcile.
+    // (Found by review on the original recompute-on-SIGHUP version.)
     let current: FpCfg = cfg_arr
         .get(&0, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
     let head_shift = current.flags & FP_CFG_FLAG_HEAD_SHIFT_128;
+    let vlan_present = current.flags & FP_CFG_FLAG_VLAN_PRESENT;
 
     let mss_clamp_global = mss_clamp_global_value(&cfg.section.directives).unwrap_or(0);
 
-    // Feature-presence bits (5-7) are rebuilt through the same shared
-    // helper populate_cfg uses; a bit computed inline here (or
-    // forgotten) would be wiped on every SIGHUP — the head-shift-bug
-    // pattern the `head_shift` preservation above guards against.
-    // `reconcile_vlan_resolve` re-fixes bit 6 after map convergence.
+    // Directive-derived presence bits (5, 7) are rebuilt through the
+    // same shared helper populate_cfg uses; a bit computed inline here
+    // (or forgotten) would be wiped on every SIGHUP — the
+    // head-shift-bug pattern the preservation above guards against.
+    // `vlan_subifs_present: false` because bit 6 is carried over from
+    // the live flags instead (see comment above); OR-ing the preserved
+    // bit keeps it exactly as `reconcile_vlan_resolve` last set it.
     let new_cfg = FpCfg {
         dry_run: u8::from(dry_run),
         flags: 0b11
             | head_shift
+            | vlan_present
             | fib_flags_from_forwarding_mode(forwarding)
-            | feature_flags_from_config(&cfg.section.directives, vlan_subifs_present()),
+            | feature_flags_from_config(&cfg.section.directives, false),
         mss_clamp_global,
         version: FP_CFG_VERSION_V2,
     };
