@@ -164,6 +164,22 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     ));
     caps.push(probe_memlock());
 
+    // CPU-performance probes (generic-XDP deployments are typically
+    // CPU-limited; these surface the host knobs that matter most).
+    // None are required: a JIT-off or harden-on host still *works*,
+    // just slower, and feasibility gating `packetframe run` on them
+    // would brick a functional deployment on restart.
+    caps.push(probe_bpf_jit_enable());
+    caps.push(probe_sysctl_any(
+        "sysctl.net.core.bpf_jit_harden",
+        "/proc/sys/net/core/bpf_jit_harden",
+        &["0"],
+        false,
+        "set `net.core.bpf_jit_harden = 0` unless constant blinding is a hard requirement; \
+         hardening adds per-instruction cost to every JITed program",
+    ));
+    caps.push(probe_kernel_version());
+
     // §2.3 per-interface native-XDP trial-attach, deferred. The probe needs
     // a real attachable program, which doesn't exist in v0.0.1.
     caps.push(Capability::deferred(
@@ -172,6 +188,20 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     ));
 
     FeasibilityReport::new(caps)
+}
+
+/// Per-attach-interface performance probes: GRO state and RPS masks.
+/// Called by the feasibility subcommand with the config's attach set
+/// (mirrors how the trial-attach probes graft in). All informational
+/// (`required = false`); see `docs/runbooks/generic-mode-performance.md`
+/// for what to do with the answers.
+pub fn run_iface_probes(ifaces: &[String]) -> Vec<Capability> {
+    let mut caps = Vec::with_capacity(ifaces.len() * 2);
+    for iface in ifaces {
+        caps.push(probe_iface_gro(iface));
+        caps.push(probe_iface_rps(iface));
+    }
+    caps
 }
 
 fn probe_kconfig() -> Capability {
@@ -546,20 +576,91 @@ fn probe_sysctl(
     required: bool,
     fix_hint: &str,
 ) -> Capability {
+    probe_sysctl_any(name, path, &[expected], required, fix_hint)
+}
+
+/// Like [`probe_sysctl`] but accepting any of several values, for
+/// sysctls where more than one setting is fine (e.g.
+/// `bpf_jit_enable` = 1 or 2, both of which mean "JIT on").
+fn probe_sysctl_any(
+    name: &str,
+    path: &str,
+    accepted: &[&str],
+    required: bool,
+    fix_hint: &str,
+) -> Capability {
     match fs::read_to_string(path) {
         Ok(raw) => {
             let val = raw.trim();
-            if val == expected {
+            if accepted.contains(&val) {
                 Capability::pass(name, format!("{path} = {val}"), required)
             } else {
                 Capability::fail(
                     name,
-                    format!("{path} = {val} (expected {expected}); fix: {fix_hint}"),
+                    format!(
+                        "{path} = {val} (expected {}); fix: {fix_hint}",
+                        accepted.join(" or ")
+                    ),
                     required,
                 )
             }
         }
         Err(e) => Capability::unknown(name, format!("could not read {path}: {e}"), required),
+    }
+}
+
+/// `net.core.bpf_jit_enable`: 1 (JIT on) or 2 (JIT on with debug
+/// output) both pass; 0 means every BPF program on the box runs in
+/// the interpreter, which on a CPU-limited generic-XDP router is the
+/// single most expensive misconfiguration possible.
+///
+/// Kernels built with `CONFIG_BPF_JIT_ALWAYS_ON=y` pin the sysctl to
+/// 1, but some hardened/embedded configs hide or restrict the file;
+/// when it's unreadable, fall back to the kconfig flag before
+/// reporting Unknown.
+fn probe_bpf_jit_enable() -> Capability {
+    const NAME: &str = "sysctl.net.core.bpf_jit_enable";
+    const PATH: &str = "/proc/sys/net/core/bpf_jit_enable";
+    match fs::read_to_string(PATH) {
+        Ok(raw) => {
+            let val = raw.trim();
+            if val == "1" || val == "2" {
+                Capability::pass(NAME, format!("{PATH} = {val} (JIT on)"), false)
+            } else {
+                Capability::fail(
+                    NAME,
+                    format!(
+                        "{PATH} = {val}: BPF runs INTERPRETED, expect several-fold higher \
+                         per-packet CPU; fix: sysctl -w net.core.bpf_jit_enable=1"
+                    ),
+                    false,
+                )
+            }
+        }
+        Err(read_err) => match read_kconfig() {
+            Ok(contents) if kconfig_flag_set(&contents, "CONFIG_BPF_JIT_ALWAYS_ON") => {
+                Capability::pass(
+                    NAME,
+                    "sysctl not readable but CONFIG_BPF_JIT_ALWAYS_ON=y (JIT compiled always-on)",
+                    false,
+                )
+            }
+            _ => Capability::unknown(
+                NAME,
+                format!("could not read {PATH}: {read_err}; JIT state undetermined"),
+                false,
+            ),
+        },
+    }
+}
+
+/// Informational kernel version report. Never fails; exists so a
+/// feasibility report captured from an operator includes the exact
+/// kernel without a second command.
+fn probe_kernel_version() -> Capability {
+    match uname_release() {
+        Ok(release) => Capability::pass("kernel.version", release, false),
+        Err(e) => Capability::unknown("kernel.version", format!("uname failed: {e}"), false),
     }
 }
 
@@ -608,6 +709,148 @@ fn probe_memlock() -> Capability {
             true,
         )
     }
+}
+
+// --- Per-interface performance probes ----------------------------------
+
+/// GRO state via the `SIOCETHTOOL`/`ETHTOOL_GGRO` ioctl (GRO is not
+/// exposed in sysfs). Informational either way: with generic XDP, GRO
+/// means the program sees aggregated super-skbs that the kernel must
+/// linearize (copy) before the program runs, but disabling it raises
+/// the per-packet count for any traffic that still traverses the
+/// kernel stack. The runbook covers the trade-off; this probe just
+/// reports the state.
+fn probe_iface_gro(iface: &str) -> Capability {
+    let name = format!("iface.{iface}.gro");
+    match iface_gro_state(iface) {
+        Ok(true) => Capability::pass(
+            &name,
+            "GRO on (generic XDP linearizes aggregated skbs; see generic-mode-performance runbook)",
+            false,
+        ),
+        Ok(false) => Capability::pass(&name, "GRO off", false),
+        Err(e) => Capability::unknown(&name, e, false),
+    }
+}
+
+/// RPS masks from `/sys/class/net/<iface>/queues/rx-*/rps_cpus`.
+/// Since v5.3, generic XDP runs *after* RPS steering, so a non-zero
+/// mask spreads the whole XDP + skb-prep workload across CPUs. An
+/// all-zeros mask on every queue is reported as a (non-required)
+/// failure because on a CPU-limited generic-XDP box it is the
+/// highest-leverage free tuning knob.
+fn probe_iface_rps(iface: &str) -> Capability {
+    let name = format!("iface.{iface}.rps");
+    let queues_dir = PathBuf::from(format!("/sys/class/net/{iface}/queues"));
+    let entries = match fs::read_dir(&queues_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return Capability::unknown(
+                &name,
+                format!("could not read {}: {e}", queues_dir.display()),
+                false,
+            );
+        }
+    };
+
+    let mut masks: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let qname = entry.file_name().to_string_lossy().into_owned();
+        if !qname.starts_with("rx-") {
+            continue;
+        }
+        if let Ok(raw) = fs::read_to_string(entry.path().join("rps_cpus")) {
+            masks.push((qname, raw.trim().to_string()));
+        }
+    }
+    masks.sort();
+
+    if masks.is_empty() {
+        return Capability::unknown(&name, "no rx queues with rps_cpus found", false);
+    }
+
+    let all_zero = masks.iter().all(|(_, m)| rps_mask_is_zero(m));
+    let rendered = masks
+        .iter()
+        .map(|(q, m)| format!("{q}={m}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if all_zero {
+        Capability::fail(
+            &name,
+            format!(
+                "rps_cpus all zero ({rendered}): all generic-XDP work runs on the NIC's IRQ \
+                 CPUs; set a spread mask, e.g. \
+                 `echo <cpumask> > /sys/class/net/{iface}/queues/rx-0/rps_cpus` \
+                 (see generic-mode-performance runbook)"
+            ),
+            false,
+        )
+    } else {
+        Capability::pass(&name, rendered, false)
+    }
+}
+
+/// An RPS cpumask is zero when every hex digit is `0` (commas are
+/// group separators on >32-CPU hosts).
+fn rps_mask_is_zero(mask: &str) -> bool {
+    mask.chars().all(|c| c == '0' || c == ',')
+}
+
+#[cfg(target_os = "linux")]
+fn iface_gro_state(iface: &str) -> Result<bool, String> {
+    // ethtool_value { cmd, data } with ETHTOOL_GGRO. A read-only get;
+    // no privileges required.
+    const ETHTOOL_GGRO: u32 = 0x0000_002b;
+    // Kept target-width-neutral: libc::ioctl's request parameter is
+    // `c_ulong` (u64) on glibc but `c_int` (i32) on musl, so the
+    // constant is a plain u32 and the call site casts with `as _` to
+    // whichever type the target's libc declares (the value fits both).
+    // Same targeted-cast pattern as `statfs.f_type` in probe_bpffs.
+    const SIOCETHTOOL: u32 = 0x8946;
+    #[repr(C)]
+    struct EthtoolValue {
+        cmd: u32,
+        data: u32,
+    }
+
+    let name_bytes = iface.as_bytes();
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name_bytes.len() >= ifr.ifr_name.len() {
+        return Err(format!("interface name `{iface}` exceeds IFNAMSIZ"));
+    }
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes) {
+        *dst = *src as libc::c_char;
+    }
+
+    let mut value = EthtoolValue {
+        cmd: ETHTOOL_GGRO,
+        data: 0,
+    };
+    ifr.ifr_ifru.ifru_data = &mut value as *mut EthtoolValue as *mut libc::c_char;
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(format!(
+            "socket(AF_INET, SOCK_DGRAM) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let r = unsafe { libc::ioctl(sock, SIOCETHTOOL as _, &mut ifr) };
+    let ioctl_err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+    if r != 0 {
+        return Err(format!(
+            "SIOCETHTOOL/ETHTOOL_GGRO on {iface} failed: {ioctl_err}"
+        ));
+    }
+    Ok(value.data != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn iface_gro_state(_iface: &str) -> Result<bool, String> {
+    Err("GRO probe is Linux-only".to_string())
 }
 
 #[cfg(test)]
@@ -677,5 +920,77 @@ CONFIG_HZ=250
             Capability::deferred("deferred_probe", "see v0.1"),
         ];
         assert!(FeasibilityReport::new(caps).passed);
+    }
+
+    #[test]
+    fn sysctl_any_accepts_each_listed_value() {
+        let dir = std::env::temp_dir().join(format!("pf-probe-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jit");
+        let path_str = path.to_str().unwrap();
+
+        for good in ["1", "2"] {
+            fs::write(&path, format!("{good}\n")).unwrap();
+            let cap = probe_sysctl_any("t", path_str, &["1", "2"], false, "hint");
+            assert_eq!(cap.status, CapabilityStatus::Pass, "value {good}");
+        }
+
+        fs::write(&path, "0\n").unwrap();
+        let cap = probe_sysctl_any("t", path_str, &["1", "2"], false, "hint");
+        assert_eq!(cap.status, CapabilityStatus::Fail);
+        assert!(cap.detail.contains("1 or 2"), "detail: {}", cap.detail);
+
+        let cap = probe_sysctl_any(
+            "t",
+            dir.join("absent").to_str().unwrap(),
+            &["1"],
+            false,
+            "h",
+        );
+        assert_eq!(cap.status, CapabilityStatus::Unknown);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rps_mask_zero_detection() {
+        assert!(rps_mask_is_zero("0"));
+        assert!(rps_mask_is_zero("00000000"));
+        assert!(rps_mask_is_zero("00000000,00000000"));
+        assert!(!rps_mask_is_zero("f"));
+        assert!(!rps_mask_is_zero("00000000,00000001"));
+    }
+
+    /// Loopback GRO smoke test: the probe must produce a clean verdict
+    /// (Pass or Unknown), never panic. Runs unprivileged; the get-side
+    /// ethtool ioctl needs no capabilities.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn iface_gro_probe_on_loopback() {
+        let cap = probe_iface_gro("lo");
+        assert!(
+            matches!(
+                cap.status,
+                CapabilityStatus::Pass | CapabilityStatus::Unknown
+            ),
+            "unexpected status {:?}: {}",
+            cap.status,
+            cap.detail
+        );
+        assert!(!cap.required);
+    }
+
+    #[test]
+    fn iface_probes_shape() {
+        // Two caps per iface, names prefixed with the iface. On
+        // non-Linux both come back Unknown, which is fine — the shape
+        // is what this asserts.
+        let caps = run_iface_probes(&["eth0".to_string(), "eth1".to_string()]);
+        assert_eq!(caps.len(), 4);
+        assert_eq!(caps[0].name, "iface.eth0.gro");
+        assert_eq!(caps[1].name, "iface.eth0.rps");
+        assert_eq!(caps[2].name, "iface.eth1.gro");
+        assert_eq!(caps[3].name, "iface.eth1.rps");
+        assert!(caps.iter().all(|c| !c.required));
     }
 }

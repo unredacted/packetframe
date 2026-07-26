@@ -8,7 +8,7 @@ use std::path::Path;
 
 use packetframe_common::{
     config::{Config, ModuleDirective},
-    probe::{run_probes, Capability, CapabilityStatus, FeasibilityReport},
+    probe::{run_iface_probes, run_probes, Capability, CapabilityStatus, FeasibilityReport},
 };
 
 pub struct Rendered {
@@ -40,6 +40,13 @@ pub fn probe_and_render(bpffs_root: &Path, attach_ifaces: &[String], human: bool
         .capabilities
         .retain(|c| c.name != "xdp.per_interface_attach_probe");
     for cap in trial_attach_caps(attach_ifaces) {
+        report.capabilities.push(cap);
+    }
+    // Per-iface performance probes (GRO state, RPS masks). All
+    // informational; they exist so a CPU-limited generic-XDP box
+    // surfaces its highest-leverage host tuning knobs in the same
+    // report operators already collect.
+    for cap in run_iface_probes(attach_ifaces) {
         report.capabilities.push(cap);
     }
     // `passed` needs recomputing after the iface probes; the trial
