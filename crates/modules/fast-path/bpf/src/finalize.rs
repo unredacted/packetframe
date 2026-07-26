@@ -43,7 +43,7 @@ const PROTO_TCP: u8 = IpProto::Tcp as u8;
 /// verifier a tight `umax` so range propagation through packet-pointer
 /// arithmetic works, see commentary on the `ip_offset > MAX_IP_OFFSET`
 /// check in `finalize`.
-const MAX_IP_OFFSET: usize = 64;
+pub(crate) const MAX_IP_OFFSET: usize = 64;
 
 #[xdp]
 pub fn finalize(ctx: XdpContext) -> u32 {
@@ -235,7 +235,11 @@ fn mss_clamp_v6(
 }
 
 #[inline(always)]
-fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32, global_clamp: u16) -> u16 {
+pub(crate) fn lookup_mss_clamp_v4(
+    ip: *const Ipv4Hdr,
+    egress_ifindex: u32,
+    global_clamp: u16,
+) -> u16 {
     {
         let key = Key::new(32, unsafe { (*ip).src_addr });
         if let Some(entry) = MSS_CLAMP_V4.get(&key) {
@@ -265,7 +269,11 @@ fn lookup_mss_clamp_v4(ip: *const Ipv4Hdr, egress_ifindex: u32, global_clamp: u1
 }
 
 #[inline(always)]
-fn lookup_mss_clamp_v6(ip: *const Ipv6Hdr, egress_ifindex: u32, global_clamp: u16) -> u16 {
+pub(crate) fn lookup_mss_clamp_v6(
+    ip: *const Ipv6Hdr,
+    egress_ifindex: u32,
+    global_clamp: u16,
+) -> u16 {
     {
         let key = Key::new(128, unsafe { (*ip).src_addr });
         if let Some(entry) = MSS_CLAMP_V6.get(&key) {

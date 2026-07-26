@@ -175,12 +175,20 @@ pub enum StatIdx {
     /// redirect-time failure indistinguishable from a FIB-lookup
     /// failure.
     ErrRedirectFailed = 39,
+    // --- Phase T: tc-ingress datapath. Append-only. -----------------
+    /// Packet entered `tc_fast_path` (bumped IN ADDITION to `RxTotal`,
+    /// which both datapaths share). During a mixed canary rollout,
+    /// `rx_total - rx_total_tc` attributes traffic to the XDP path.
+    RxTotalTc = 40,
+    /// Packet forwarded by `tc_finalize` via `bpf_redirect` (bumped in
+    /// addition to `FwdOk`). A/B attribution mirror of `RxTotalTc`.
+    FwdOkTc = 41,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 40;
+pub const STATS_COUNT: u32 = 42;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
@@ -635,6 +643,28 @@ pub static FIB_LOOKUP_SCRATCH: PerCpuArray<bpf_fib_lookup> = PerCpuArray::with_m
 /// fails open to kernel slow-path rather than getting blackholed.
 #[map]
 pub static MUTATION_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
+
+// --- tc-ingress datapath maps (Phase T) ---------------------------------
+
+/// Tail-call table for the tc datapath. Separate from MUTATION_PROGS
+/// because the kernel binds a PROG_ARRAY to one owner program type on
+/// first use — sched_cls cannot tail-call through the XDP-owned array.
+/// Slot 0 holds `tc_finalize`; same fail-open contract as the XDP
+/// table (empty slot → `ErrTailCall` + TC_ACT_OK to kernel slow path).
+#[map]
+pub static TC_MUTATION_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
+
+/// Redirect-target membership for the tc datapath: keyed and valued by
+/// ifindex, mirroring REDIRECT_DEVMAP (devmap types are XDP-only and
+/// unusable from sched_cls). Load-bearing for the §11.13 pristine-
+/// packet invariant: `bpf_redirect()` cannot pre-check — it always
+/// "succeeds" in-program and a bad ifindex DROPS the skb after return
+/// — so tc_fast_path consults this map BEFORE any mutation, exactly
+/// like the XDP devmap pre-check. Userspace populates it from the same
+/// `enumerate_redirect_targets()` walk that fills REDIRECT_DEVMAP.
+#[map]
+pub static TC_REDIRECT_TARGETS: HashMap<u32, u32> =
+    HashMap::with_max_entries(REDIRECT_DEVMAP_MAX_ENTRIES, 0);
 
 // --- Custom-FIB maps (Option F, Phase 1) -------------------------------
 //

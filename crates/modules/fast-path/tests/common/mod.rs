@@ -55,7 +55,7 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V2: u32 = 1;
-pub const STATS_COUNT: u32 = 40;
+pub const STATS_COUNT: u32 = 42;
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
 /// uses these to flip forwarding modes on the live BPF program.
@@ -115,6 +115,8 @@ pub enum StatIdx {
     PassNdp = 37,
     ErrCtxOffsetRange = 38,
     ErrRedirectFailed = 39,
+    RxTotalTc = 40,
+    FwdOkTc = 41,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a
@@ -125,6 +127,15 @@ pub mod xdp_action {
     pub const XDP_PASS: u32 = 2;
     pub const XDP_TX: u32 = 3;
     pub const XDP_REDIRECT: u32 = 4;
+}
+
+/// TC action constants (uapi pkt_cls.h) for the tc datapath fixtures.
+pub mod tc_action {
+    pub const TC_ACT_OK: u32 = 0;
+    pub const TC_ACT_SHOT: u32 = 2;
+    /// `bpf_redirect()`'s success return, passed through as the
+    /// classifier verdict.
+    pub const TC_ACT_REDIRECT: u32 = 7;
 }
 
 pub struct Harness {
@@ -186,6 +197,49 @@ impl Harness {
             prog_array
                 .set(0, &finalize_fd, 0)
                 .expect("MUTATION_PROGS.set(0, finalize)");
+        }
+
+        // tc datapath (Phase T): load both classifiers and populate
+        // TC_MUTATION_PROGS[0], mirroring the XDP chain setup, so every
+        // harness run also verifier-gates the sched_cls programs and
+        // `run_tc` exercises the full tc_fast_path → tc_finalize chain.
+        {
+            use aya::programs::tc::SchedClassifier;
+            {
+                let prog: &mut SchedClassifier = bpf
+                    .program_mut("tc_finalize")
+                    .expect("tc_finalize program present")
+                    .try_into()
+                    .expect("tc_finalize is sched_cls-typed");
+                prog.load().expect("verifier accepts tc_finalize");
+            }
+            {
+                let prog: &mut SchedClassifier = bpf
+                    .program_mut("tc_fast_path")
+                    .expect("tc_fast_path program present")
+                    .try_into()
+                    .expect("tc_fast_path is sched_cls-typed");
+                prog.load().expect("verifier accepts tc_fast_path");
+            }
+            let tc_finalize_fd: ProgramFd = {
+                let prog: &SchedClassifier = bpf
+                    .program("tc_finalize")
+                    .expect("tc_finalize present")
+                    .try_into()
+                    .expect("tc_finalize is sched_cls-typed");
+                prog.fd()
+                    .expect("tc_finalize loaded")
+                    .try_clone()
+                    .expect("tc_finalize fd dup")
+            };
+            let map = bpf
+                .map_mut("TC_MUTATION_PROGS")
+                .expect("TC_MUTATION_PROGS map");
+            let mut prog_array: ProgramArray<_> =
+                ProgramArray::try_from(map).expect("ProgramArray try_from");
+            prog_array
+                .set(0, &tc_finalize_fd, 0)
+                .expect("TC_MUTATION_PROGS.set(0, tc_finalize)");
         }
 
         // Set a default cfg with dry_run=off and both families enabled.
@@ -494,6 +548,43 @@ impl Harness {
     pub fn run(&self, packet: &[u8]) -> (u32, Vec<u8>) {
         let (retval, _duration, out) = test_run_xdp_repeat(self.fast_path_fd(), packet, 1);
         (retval, out)
+    }
+
+    /// Run the tc datapath (`tc_fast_path` → `tc_finalize` via the
+    /// TC_MUTATION_PROGS tail call) against `packet`. Returns
+    /// (tc action, output bytes). `BPF_PROG_TEST_RUN` for sched_cls
+    /// builds a real skb from the bytes (data at the MAC header, same
+    /// offsets as live clsact ingress) and does NOT lift an inline
+    /// 802.1Q tag into skb metadata — which is exactly why the program
+    /// keeps its inline-tag fallback parse.
+    pub fn run_tc(&self, packet: &[u8]) -> (u32, Vec<u8>) {
+        use aya::programs::tc::SchedClassifier;
+        let prog: &SchedClassifier = self
+            .bpf
+            .program("tc_fast_path")
+            .expect("tc_fast_path present")
+            .try_into()
+            .expect("program is sched_cls");
+        let prog_fd: &ProgramFd = prog.fd().expect("program loaded");
+        let (retval, _duration, out) = test_run_xdp_repeat(prog_fd.as_fd().as_raw_fd(), packet, 1);
+        (retval, out)
+    }
+
+    /// Insert an ifindex into `TC_REDIRECT_TARGETS` (the tc datapath's
+    /// devmap-membership mirror) so tc_forward_success's pre-check
+    /// passes. Tests use a REAL ifindex (loopback): unlike the XDP
+    /// path, tc's `bpf_check_mtu` resolves the ifindex against the
+    /// netns even under TEST_RUN, and a fake one fails the MTU check.
+    pub fn add_tc_redirect_target(&mut self, ifindex: u32) {
+        use aya::maps::HashMap as AyaHashMap;
+        let map = self
+            .bpf
+            .map_mut("TC_REDIRECT_TARGETS")
+            .expect("TC_REDIRECT_TARGETS map");
+        let mut hm: AyaHashMap<_, u32, u32> =
+            AyaHashMap::try_from(map).expect("TC_REDIRECT_TARGETS try_from");
+        hm.insert(ifindex, ifindex, 0)
+            .expect("TC_REDIRECT_TARGETS insert");
     }
 
     /// Run the BPF program `repeat` times against `packet` in a single

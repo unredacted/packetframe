@@ -32,6 +32,7 @@ mod datapath;
 mod fib;
 mod finalize;
 mod maps;
+mod tc;
 
 use datapath::{
     bump_match_subset, bytes_to_u32x4, decrement_ipv4_ttl, decrement_ipv6_hop_limit, icmpv6_type,
