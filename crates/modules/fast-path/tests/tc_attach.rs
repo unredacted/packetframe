@@ -138,3 +138,39 @@ fn tc_attach_persists_and_detaches_from_state_dir() {
     assert!(tc_links::load(&state_dir).expect("load").is_none());
     assert_eq!(tc_detach_from_state_dir(&state_dir).expect("idempotent"), 0);
 }
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn tc_detach_clears_records_for_vanished_ifaces() {
+    // A recorded filter whose iface no longer exists died with the
+    // device (qdisc lifetime): teardown must classify it as cleared —
+    // dropping the record and removing the file — rather than either
+    // erroring out or, worse, retaining a dead record forever. The
+    // opposite case (detach FAILS with the iface alive) retains the
+    // record; that branch needs an induced netlink failure and is
+    // covered by review-level reasoning rather than a fixture.
+    let state_dir =
+        std::env::temp_dir().join(format!("pf-tc-vanished-test-{}", std::process::id()));
+    let _cleanup = Cleanup {
+        state_dir: state_dir.clone(),
+    };
+
+    tc_links::save(
+        &state_dir,
+        &tc_links::TcLinksFile {
+            links: vec![tc_links::TcLinkRecord {
+                iface: "pf-gone0".to_string(), // never created
+                priority: 49152,
+                handle: 1,
+            }],
+        },
+    )
+    .expect("tc-links.json save");
+
+    let n = tc_detach_from_state_dir(&state_dir).expect("vanished iface must not error");
+    assert_eq!(n, 1, "vanished-iface record counts as cleared");
+    assert!(
+        tc_links::load(&state_dir).expect("load").is_none(),
+        "file must be removed once every record is cleared"
+    );
+}

@@ -977,6 +977,20 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 priority,
                 handle,
             });
+            // Persist IMMEDIATELY, not after the loop: the aya link
+            // for this filter is already forgotten, so if a later
+            // attach in this loop fails and aborts startup, this
+            // record is the ONLY way `packetframe detach` can find
+            // the live filter. A post-loop save would strand every
+            // earlier filter as an invisible orphan (review finding,
+            // PR #75).
+            crate::tc_links::save(
+                &state.state_dir,
+                &crate::tc_links::TcLinksFile {
+                    links: tc_records.clone(),
+                },
+            )
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json save: {e}")))?;
             state.links.push(LinkRecord {
                 iface: iface.clone(),
                 ifindex: *ifindex,
@@ -992,11 +1006,6 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                 "fast-path attached (tc-ingress datapath)"
             );
         }
-        crate::tc_links::save(
-            &state.state_dir,
-            &crate::tc_links::TcLinksFile { links: tc_records },
-        )
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json save: {e}")))?;
     }
 
     // Detect buggy-kernel rvu-nicpf native XDP delivery and flip the
@@ -1684,42 +1693,104 @@ pub fn tc_attach_iface(ebpf: &mut Ebpf, iface: &str) -> ModuleResult<(u16, u32)>
     Ok((priority, handle))
 }
 
-/// Detach one recorded tc filter. Best-effort building block for both
-/// the in-process (`detach(state)`) and out-of-process
-/// ([`tc_detach_from_state_dir`]) teardown paths.
-fn tc_detach_one(iface: &str, priority: u16, handle: u32) -> Result<(), String> {
-    use aya::programs::tc::{SchedClassifierLink, TcAttachType};
-    use aya::programs::Link as _;
-    let link = SchedClassifierLink::attached(iface, TcAttachType::Ingress, priority, handle)
-        .map_err(|e| format!("reconstruct tc link on {iface}: {e}"))?;
-    link.detach()
-        .map_err(|e| format!("tc detach on {iface} (prio {priority}, handle {handle}): {e}"))
+/// Outcome of one tc-filter detach attempt. The distinction decides
+/// whether the filter's `tc-links.json` record may be dropped — that
+/// record is the ONLY teardown metadata for a live filter (review
+/// finding, PR #75), so it must survive any failure that leaves the
+/// filter plausibly attached.
+enum TcDetachOutcome {
+    /// Goal state reached: the filter was detached, or is provably
+    /// gone already (iface no longer resolvable — the qdisc and its
+    /// filters died with the device — or the netlink delete reported
+    /// ENOENT/EINVAL, i.e. no such filter/qdisc). Record droppable.
+    Cleared,
+    /// The delete failed with the filter plausibly still live
+    /// (transient netlink error, EPERM, ...). Record must be retained
+    /// for retry.
+    Failed(String),
 }
 
-/// Tear down every tc filter recorded in `<state-dir>/tc-links.json`
-/// and remove the file. Used by `packetframe detach` (no live loader
-/// required — the filters have qdisc lifetime). Returns the number of
-/// filters detached; per-filter failures are logged and skipped so a
-/// vanished iface doesn't wedge the teardown (the qdisc died with it).
+/// Detach one recorded tc filter. Building block for both the
+/// in-process (`detach(state)`) and out-of-process
+/// ([`tc_detach_from_state_dir`]) teardown paths.
+fn tc_detach_one(iface: &str, priority: u16, handle: u32) -> TcDetachOutcome {
+    use aya::programs::tc::{SchedClassifierLink, TcAttachType, TcError};
+    use aya::programs::{Link as _, ProgramError};
+
+    // `attached()` only resolves the ifindex; failure means the iface
+    // is gone, and qdisc-lifetime filters go with their device.
+    let link = match SchedClassifierLink::attached(iface, TcAttachType::Ingress, priority, handle) {
+        Ok(l) => l,
+        Err(e) => {
+            info!(iface, error = %e, "iface gone; tc filter died with it");
+            return TcDetachOutcome::Cleared;
+        }
+    };
+    match link.detach() {
+        Ok(()) => TcDetachOutcome::Cleared,
+        // ENOENT: no such filter; EINVAL: no such qdisc. Either way
+        // nothing of ours is attached anymore — goal state.
+        Err(ProgramError::TcError(TcError::NetlinkError { io_error }))
+            if matches!(
+                io_error.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::EINVAL)
+            ) =>
+        {
+            info!(iface, priority, handle, "tc filter already absent");
+            TcDetachOutcome::Cleared
+        }
+        Err(e) => TcDetachOutcome::Failed(format!(
+            "tc detach on {iface} (prio {priority}, handle {handle}): {e}"
+        )),
+    }
+}
+
+/// Tear down every tc filter recorded in `<state-dir>/tc-links.json`.
+/// Used by `packetframe detach` (no live loader required — the
+/// filters have qdisc lifetime). Returns the number of filters
+/// cleared.
+///
+/// Records whose detach FAILED with the filter plausibly still live
+/// are written back to tc-links.json and the call errors: deleting
+/// their only teardown metadata would orphan active classifiers while
+/// reporting success (review finding, PR #75). Records for vanished
+/// ifaces / already-absent filters are dropped normally.
 pub fn tc_detach_from_state_dir(state_dir: &Path) -> ModuleResult<usize> {
     let Some(file) = crate::tc_links::load(state_dir)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json read: {e}")))?
     else {
         return Ok(0);
     };
-    let mut detached = 0usize;
-    for rec in &file.links {
+    let mut cleared = 0usize;
+    let mut retained = Vec::new();
+    for rec in file.links {
         match tc_detach_one(&rec.iface, rec.priority, rec.handle) {
-            Ok(()) => {
-                info!(iface = %rec.iface, rec.priority, rec.handle, "tc filter detached");
-                detached += 1;
+            TcDetachOutcome::Cleared => {
+                info!(iface = %rec.iface, rec.priority, rec.handle, "tc filter cleared");
+                cleared += 1;
             }
-            Err(e) => warn!(iface = %rec.iface, error = %e, "tc filter detach skipped"),
+            TcDetachOutcome::Failed(e) => {
+                warn!(iface = %rec.iface, error = %e, "tc filter detach failed; record retained");
+                retained.push(rec);
+            }
         }
     }
-    crate::tc_links::remove(state_dir)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json remove: {e}")))?;
-    Ok(detached)
+    if retained.is_empty() {
+        crate::tc_links::remove(state_dir)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json remove: {e}")))?;
+        return Ok(cleared);
+    }
+    let file = crate::tc_links::TcLinksFile { links: retained };
+    crate::tc_links::save(state_dir, &file)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json rewrite: {e}")))?;
+    let names: Vec<&str> = file.links.iter().map(|r| r.iface.as_str()).collect();
+    Err(ModuleError::other(
+        MODULE_NAME,
+        format!(
+            "tc filters still attached on {names:?}; records kept in tc-links.json — \
+             rerun `packetframe detach` (or `tc filter del dev <iface> ingress`) to retry"
+        ),
+    ))
 }
 
 /// §2.3: per-interface trial-attach. `Native` and `Generic` are explicit
@@ -1999,22 +2070,49 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
     // Drop every PinnedLink next: this closes our userspace FDs but
     // the kernel keeps the attach alive via the bpffs inodes. tc
     // records hold no FD at all — detach them explicitly via their
-    // recorded (priority, handle), best-effort (a vanished iface took
-    // its qdisc and filter with it). Drain in reverse attach order.
+    // recorded (priority, handle). Drain in reverse attach order.
+    //
+    // tc failures must not abort the rest of the teardown (a breaker
+    // trip still has to detach XDP + remove pins), but a filter whose
+    // delete failed with the iface still alive keeps its record in
+    // tc-links.json: that record is the only metadata a later
+    // `packetframe detach` retry has (review finding, PR #75).
     let mut had_tc = false;
+    let mut tc_retained: Vec<crate::tc_links::TcLinkRecord> = Vec::new();
     while let Some(record) = state.links.pop() {
         info!(iface = %record.iface, "fast-path detaching");
         if let LinkHandle::Tc { priority, handle } = record.link {
             had_tc = true;
-            if let Err(e) = tc_detach_one(&record.iface, priority, handle) {
-                warn!(iface = %record.iface, error = %e, "tc filter detach skipped");
+            match tc_detach_one(&record.iface, priority, handle) {
+                TcDetachOutcome::Cleared => {}
+                TcDetachOutcome::Failed(e) => {
+                    warn!(iface = %record.iface, error = %e, "tc filter detach failed; record retained");
+                    tc_retained.push(crate::tc_links::TcLinkRecord {
+                        iface: record.iface.clone(),
+                        priority,
+                        handle,
+                    });
+                }
             }
         }
         drop(record);
     }
     if had_tc {
-        if let Err(e) = crate::tc_links::remove(&state.state_dir) {
-            warn!(error = %e, "tc-links.json remove failed");
+        if tc_retained.is_empty() {
+            if let Err(e) = crate::tc_links::remove(&state.state_dir) {
+                warn!(error = %e, "tc-links.json remove failed");
+            }
+        } else {
+            warn!(
+                count = tc_retained.len(),
+                "tc filters still attached; records kept in tc-links.json for `packetframe detach` retry"
+            );
+            if let Err(e) = crate::tc_links::save(
+                &state.state_dir,
+                &crate::tc_links::TcLinksFile { links: tc_retained },
+            ) {
+                warn!(error = %e, "tc-links.json rewrite failed");
+            }
         }
     }
 
