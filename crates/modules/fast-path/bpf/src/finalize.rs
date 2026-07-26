@@ -22,6 +22,7 @@ use aya_ebpf::{
 };
 use network_types::ip::{IpProto, Ipv4Hdr, Ipv6Hdr};
 
+use crate::datapath::{mss_clamp_tcp, tcp_syn_flag_set};
 use crate::maps::{
     bump, stats_base, StatIdx, StatsPtr, FP_CFG_FLAG_MSS_CLAMP_PRESENT, MSS_CLAMP_BY_IFACE,
     MSS_CLAMP_V4, MSS_CLAMP_V6, MUTATION_CTX, REDIRECT_DEVMAP,
@@ -33,9 +34,6 @@ const TPID_8021Q: u16 = 0x8100;
 
 /// Sentinel for "no VLAN", mirror of `main::VLAN_NONE`.
 const VLAN_NONE: u16 = 0;
-
-/// SYN flag in TCP byte 13.
-const TCP_FLAG_SYN: u8 = 0x02;
 
 /// IANA TCP protocol number, materialized from `IpProto` (network-types
 /// 0.2 changed `proto`/`next_hdr` to raw `u8`).
@@ -203,7 +201,7 @@ fn mss_clamp_v4(
     if clamp == 0 {
         return;
     }
-    mss_clamp_tcp(ctx, stats, ip as *const u8, Ipv4Hdr::LEN, clamp);
+    mss_clamp_tcp(stats, start, end, ip as *const u8, Ipv4Hdr::LEN, clamp);
 }
 
 /// IPv6 path: same pattern as `mss_clamp_v4` but with a 40-byte bound.
@@ -233,158 +231,7 @@ fn mss_clamp_v6(
     if clamp == 0 {
         return;
     }
-    mss_clamp_tcp(ctx, stats, ip as *const u8, Ipv6Hdr::LEN, clamp);
-}
-
-/// Read TCP header byte 13 (flags) at `tcp_offset` and test SYN.
-/// Out-of-bounds → `false` (a truncated TCP header can't be a
-/// clampable SYN; mirrors the fail-open shape of `icmpv6_type` in
-/// main.rs). Bounds check uses the accepted `start + off + k > end`
-/// pattern; `tcp_offset` is `ip_offset + <const HDR>` where fast_path
-/// already clamped `ip_offset` ≤ MAX_IP_OFFSET.
-#[inline(always)]
-fn tcp_syn_flag_set(start: usize, end: usize, tcp_offset: usize) -> bool {
-    if start + tcp_offset + 14 > end {
-        return false;
-    }
-    let flags = unsafe { *((start + tcp_offset + 13) as *const u8) };
-    flags & TCP_FLAG_SYN != 0
-}
-
-/// Walk the TCP-options block of a matched SYN/SYN-ACK and mutate the MSS
-/// option in place if the existing MSS is greater than the clamp value.
-/// Recomputes the TCP checksum incrementally (RFC 1624). Bumps
-/// `MssClampApplied` on rewrite, `MssClampSkipped` on "policy applies but
-/// no rewrite needed."
-///
-/// Takes a typed `ip_ptr` (already bounds-checked for `ip_hdr_size` bytes)
-/// rather than a raw `tcp_offset` scalar. Inside, we recover ip_offset as
-/// `(ip_ptr as usize) - start`, which the BPF verifier tracks as a `pkt -
-/// pkt` subtraction with `umax = MAX_PACKET_OFF (0xffff)`. That tight bound
-/// is what makes subsequent `start + tcp_offset + N > end` checks
-/// propagate readable-range to the read site (mirrors v0.2.4's working
-/// pattern; passing `tcp_offset` directly as a `usize` from a map read
-/// loses verifier tracking and the post-bound-check pkt pointer ends up
-/// with `r=0`).
-///
-/// Bounds-checked at every read against `ctx.data_end()`. Options walk
-/// is fixed-bound at 8 iterations to keep BPF verifier state-space
-/// exploration tractable (a 40-iteration walk hit the verifier's
-/// 1M-instruction limit during v0.2.4 development).
-#[inline(always)]
-fn mss_clamp_tcp(
-    ctx: &XdpContext,
-    stats: StatsPtr,
-    ip_ptr: *const u8,
-    ip_hdr_size: usize,
-    clamp: u16,
-) {
-    let start = ctx.data();
-    let end = ctx.data_end();
-
-    // pkt-derived scalar; verifier tracks umax tightly.
-    let ip_offset = (ip_ptr as usize) - start;
-    let tcp_offset = ip_offset + ip_hdr_size;
-
-    // Need 20 bytes for the fixed TCP header before walking options.
-    if start + tcp_offset + 20 > end {
-        return;
-    }
-
-    // Bytes 12-13 of TCP header: data_offset:4 | reserved:4 | flags:8.
-    let doff_byte = unsafe { *((start + tcp_offset + 12) as *const u8) };
-    let flags = unsafe { *((start + tcp_offset + 13) as *const u8) };
-    if flags & TCP_FLAG_SYN == 0 {
-        return; // Not SYN/SYN-ACK.
-    }
-    let doff_words = (doff_byte >> 4) as usize;
-    if !(5..=15).contains(&doff_words) {
-        return;
-    }
-    let tcp_hdr_len = doff_words * 4;
-    let opts_len = tcp_hdr_len - 20;
-    if opts_len == 0 {
-        bump(stats, StatIdx::MssClampSkipped);
-        return;
-    }
-    if start + tcp_offset + tcp_hdr_len > end {
-        return;
-    }
-
-    // Walk options. Cap at 8, real SYN packets put MSS in the first
-    // 1-4 options (Linux's tcp_options_write emits MSS very early); 8
-    // is comfortable headroom while keeping verifier state-space bounded.
-    let opts_start_off = tcp_offset + 20;
-    let mut cursor: usize = 0;
-    let mut found = false;
-
-    for _ in 0..8 {
-        if cursor >= opts_len {
-            break;
-        }
-        let p_addr = start + opts_start_off + cursor;
-        if p_addr + 4 > end {
-            break;
-        }
-        let p = p_addr as *const u8;
-        let kind = unsafe { *p };
-        if kind == 0 {
-            break; // EOL.
-        }
-        if kind == 1 {
-            cursor += 1; // NOP.
-            continue;
-        }
-        let length = unsafe { *p.add(1) } as usize;
-        if length < 2 || cursor + length > opts_len {
-            break; // Malformed.
-        }
-        if kind == 2 && length == 4 {
-            // MSS option: [kind=2, length=4, mss_be:2].
-            let mss_be = unsafe { [*p.add(2), *p.add(3)] };
-            let mss = u16::from_be_bytes(mss_be);
-            if mss > clamp {
-                let new_mss_be = clamp.to_be_bytes();
-                unsafe {
-                    let pmut = p as *mut u8;
-                    *pmut.add(2) = new_mss_be[0];
-                    *pmut.add(3) = new_mss_be[1];
-                }
-                // RFC 1624 incremental TCP checksum update.
-                let csum_off = tcp_offset + 16;
-                if start + csum_off + 2 > end {
-                    return;
-                }
-                let csum_p = (start + csum_off) as *mut u8;
-                let old_csum_be = unsafe { [*csum_p, *csum_p.add(1)] };
-                let old_csum = u16::from_be_bytes(old_csum_be);
-                let new_csum = csum_replace_u16(old_csum, mss, clamp);
-                let new_csum_be = new_csum.to_be_bytes();
-                unsafe {
-                    *csum_p = new_csum_be[0];
-                    *csum_p.add(1) = new_csum_be[1];
-                }
-                bump(stats, StatIdx::MssClampApplied);
-            } else {
-                bump(stats, StatIdx::MssClampSkipped);
-            }
-            found = true;
-            break;
-        }
-        cursor += length;
-    }
-
-    if !found {
-        bump(stats, StatIdx::MssClampSkipped);
-    }
-}
-
-#[inline(always)]
-fn csum_replace_u16(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
-    let mut sum: u32 = (!old_csum) as u32 + (!old_val) as u32 + new_val as u32;
-    sum = (sum & 0xffff) + (sum >> 16);
-    sum = (sum & 0xffff) + (sum >> 16);
-    !(sum as u16)
+    mss_clamp_tcp(stats, start, end, ip as *const u8, Ipv6Hdr::LEN, clamp);
 }
 
 #[inline(always)]

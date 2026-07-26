@@ -28,10 +28,15 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
 };
 
+mod datapath;
 mod fib;
 mod finalize;
 mod maps;
 
+use datapath::{
+    bump_match_subset, bytes_to_u32x4, decrement_ipv4_ttl, decrement_ipv6_hop_limit, icmpv6_type,
+    l4_ports,
+};
 use maps::{
     bump, stats_base, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
     FIB_LOOKUP_SCRATCH, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_COMPARE_MODE,
@@ -298,7 +303,15 @@ fn handle_ipv4(
     let l4_off = ip_offset + Ipv4Hdr::LEN;
 
     if use_custom && !compare {
-        let custom = fib::lookup_v4(stats, ctx, l4_off, src_bytes, dst_bytes, proto);
+        let custom = fib::lookup_v4(
+            stats,
+            ctx.data(),
+            ctx.data_end(),
+            l4_off,
+            src_bytes,
+            dst_bytes,
+            proto,
+        );
         return dispatch_custom_fib(
             custom,
             ctx,
@@ -314,7 +327,7 @@ fn handle_ipv4(
 
     // Kernel-FIB path: bpf_fib_lookup wants BE-in-memory `__be16`
     // ports, which is exactly what `l4_ports` returns.
-    let (sport, dport) = l4_ports(ctx, l4_off, proto);
+    let (sport, dport) = l4_ports(ctx.data(), ctx.data_end(), l4_off, proto);
 
     // Use the per-CPU `FIB_LOOKUP_SCRATCH` map for the bpf_fib_lookup
     // struct rather than allocating it on the stack. Per-CPU array
@@ -375,7 +388,15 @@ fn handle_ipv4(
         // the operator managed to set COMPARE without CUSTOM_FIB (bug
         // or manual map poke), the branch above is unreachable and
         // we still do only the kernel lookup here.
-        let custom = fib::lookup_v4(stats, ctx, l4_off, src_bytes, dst_bytes, proto);
+        let custom = fib::lookup_v4(
+            stats,
+            ctx.data(),
+            ctx.data_end(),
+            l4_off,
+            src_bytes,
+            dst_bytes,
+            proto,
+        );
         compare_and_bump(stats, ret as u32, fib_ref, &custom);
     }
 
@@ -435,7 +456,7 @@ fn handle_ipv6(
     // MLD (types 130-132, 143) travels at hop limit 1 and is already
     // caught by the `hop_limit <= 1` check below.
     if next == PROTO_ICMPV6 {
-        if let Some(t) = icmpv6_type(ctx, ip_offset + Ipv6Hdr::LEN) {
+        if let Some(t) = icmpv6_type(ctx.data(), ctx.data_end(), ip_offset + Ipv6Hdr::LEN) {
             if t >= ICMPV6_ND_TYPE_MIN && t <= ICMPV6_ND_TYPE_MAX {
                 bump(stats, StatIdx::PassNdp);
                 return Ok(xdp_action::XDP_PASS);
@@ -483,7 +504,15 @@ fn handle_ipv6(
     let l4_off = ip_offset + Ipv6Hdr::LEN;
 
     if use_custom && !compare {
-        let custom = fib::lookup_v6(stats, ctx, l4_off, src_bytes, dst_bytes, next);
+        let custom = fib::lookup_v6(
+            stats,
+            ctx.data(),
+            ctx.data_end(),
+            l4_off,
+            src_bytes,
+            dst_bytes,
+            next,
+        );
         return dispatch_custom_fib(
             custom,
             ctx,
@@ -497,7 +526,7 @@ fn handle_ipv6(
         );
     }
 
-    let (sport, dport) = l4_ports(ctx, l4_off, next);
+    let (sport, dport) = l4_ports(ctx.data(), ctx.data_end(), l4_off, next);
 
     // See handle_ipv4 for the rationale behind using FIB_LOOKUP_SCRATCH
     // (per-CPU map) instead of stack-allocated bpf_fib_lookup.
@@ -534,7 +563,15 @@ fn handle_ipv6(
     let fib_ref = unsafe { &*fib_ptr };
 
     if compare {
-        let custom = fib::lookup_v6(stats, ctx, l4_off, src_bytes, dst_bytes, next);
+        let custom = fib::lookup_v6(
+            stats,
+            ctx.data(),
+            ctx.data_end(),
+            l4_off,
+            src_bytes,
+            dst_bytes,
+            next,
+        );
         compare_and_bump(stats, ret as u32, fib_ref, &custom);
     }
 
@@ -785,39 +822,12 @@ fn compare_and_bump(
     }
 }
 
-// --- TTL / csum / helpers -------------------------------------------------
-
-/// Decrement IPv4 TTL and patch the header checksum using RFC 1624
-/// incremental update: when TTL decreases by 1, the word at bytes 8-9
-/// (TTL:proto, network order) decreases by 0x0100 → the checksum
-/// increases by 0x0100 in one's-complement arithmetic.
-#[inline(always)]
-fn decrement_ipv4_ttl(ip: *mut Ipv4Hdr) {
-    unsafe {
-        (*ip).ttl -= 1;
-        let mut sum = u16::from_be_bytes((*ip).check) as u32;
-        sum = sum.wrapping_add(0x0100);
-        sum = (sum & 0xffff).wrapping_add(sum >> 16);
-        (*ip).check = (sum as u16).to_be_bytes();
-    }
-}
-
-#[inline(always)]
-fn decrement_ipv6_hop_limit(ip: *mut Ipv6Hdr) {
-    unsafe {
-        (*ip).hop_limit -= 1;
-    }
-}
-
-#[inline(always)]
-fn bump_match_subset(stats: StatsPtr, src_hit: bool, dst_hit: bool) {
-    match (src_hit, dst_hit) {
-        (true, true) => bump(stats, StatIdx::MatchedBoth),
-        (true, false) => bump(stats, StatIdx::MatchedSrcOnly),
-        (false, true) => bump(stats, StatIdx::MatchedDstOnly),
-        (false, false) => {}
-    }
-}
+// --- XDP-ctx-bound helpers -------------------------------------------------
+//
+// The ctx-free packet readers / mutators (TTL decrement, l4_ports,
+// icmpv6_type, mss-clamp walk, match-subset bookkeeping) live in
+// `datapath.rs` so the tc datapath (Phase T) reuses them verbatim.
+// Only the XdpContext-typed accessors stay here.
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
@@ -833,54 +843,6 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 #[inline(always)]
 fn ptr_mut_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     Ok(ptr_at::<T>(ctx, offset)? as *mut T)
-}
-
-/// Read sport/dport from the L4 header at `offset`. Returns raw BE
-/// network-order u16 bytes (via `read_unaligned`) matching what the
-/// kernel's `bpf_fib_lookup` expects for its `__be16` sport/dport
-/// fields on an LE host. (0, 0) for ICMP / ICMPv6 or truncated L4.
-/// `pub(crate)` so fib.rs's ECMP arm can call it at its point of use.
-#[inline(always)]
-pub(crate) fn l4_ports(ctx: &XdpContext, offset: usize, proto: u8) -> (u16, u16) {
-    if !matches!(proto, PROTO_TCP | PROTO_UDP) {
-        return (0, 0);
-    }
-    let start = ctx.data();
-    let end = ctx.data_end();
-    if start + offset + 4 > end {
-        return (0, 0);
-    }
-    unsafe {
-        let p = (start + offset) as *const u8;
-        let sport = core::ptr::read_unaligned(p as *const u16);
-        let dport = core::ptr::read_unaligned(p.add(2) as *const u16);
-        (sport, dport)
-    }
-}
-
-/// Read the ICMPv6 `type` field, the first octet of the ICMPv6 header.
-///
-/// `None` when the read would run past `data_end`; callers treat that as
-/// "not an NDP message" and fall through to the normal path, which is
-/// fail-safe (a truncated ICMPv6 header can't be a valid NS/NA anyway).
-/// Bounds-check shape mirrors [`l4_ports`].
-#[inline(always)]
-fn icmpv6_type(ctx: &XdpContext, offset: usize) -> Option<u8> {
-    let start = ctx.data();
-    if start + offset + 1 > ctx.data_end() {
-        return None;
-    }
-    Some(unsafe { core::ptr::read_unaligned((start + offset) as *const u8) })
-}
-
-#[inline(always)]
-fn bytes_to_u32x4(b: &[u8; 16]) -> [u32; 4] {
-    [
-        u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-        u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
-        u32::from_ne_bytes([b[8], b[9], b[10], b[11]]),
-        u32::from_ne_bytes([b[12], b[13], b[14], b[15]]),
-    ]
 }
 
 #[cfg(not(test))]

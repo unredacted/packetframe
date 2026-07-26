@@ -18,9 +18,9 @@
 //! asserts agreement. If the two sides drift, the test fails before
 //! any XDP packet is ever forwarded.
 
-use aya_ebpf::{maps::lpm_trie::Key, programs::XdpContext};
+use aya_ebpf::maps::lpm_trie::Key;
 
-use crate::l4_ports;
+use crate::datapath::l4_ports;
 use crate::maps::{
     bump, EcmpGroup, FibValue, NexthopEntry, StatIdx, StatsPtr, ECMP_GROUPS, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, FIB_V4, FIB_V6, MAX_ECMP_PATHS, NEXTHOPS, NH_STATE_RESOLVED,
@@ -84,16 +84,20 @@ impl CustomFibResult {
 // --- Top-level lookup -------------------------------------------------
 
 /// IPv4 custom-FIB lookup. Caller passes the parsed src/dst/proto plus
-/// the L4 header offset; **port extraction is deferred** into the ECMP
-/// arm (`resolve_fib_value_v4`), because ports feed only the ECMP flow
-/// hash — on the single-nexthop path (the common case on deployments
-/// with no ECMP groups) no port bytes are read at all. Returns a
-/// [`CustomFibResult`] the caller feeds into the existing
-/// `dispatch_fib` success / miss paths in `main.rs`.
+/// the packet bounds and L4 header offset; **port extraction is
+/// deferred** into the ECMP arm (`resolve_fib_value_v4`), because ports
+/// feed only the ECMP flow hash — on the single-nexthop path (the
+/// common case on deployments with no ECMP groups) no port bytes are
+/// read at all. `(start, end)` scalars rather than a ctx type keep the
+/// whole module hook-agnostic (shared with the tc datapath, Phase T).
+/// Returns a [`CustomFibResult`] the caller feeds into its own
+/// dispatch verdict mapping.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub fn lookup_v4(
     stats: StatsPtr,
-    ctx: &XdpContext,
+    start: usize,
+    end: usize,
     l4_off: usize,
     src: [u8; 4],
     dst: [u8; 4],
@@ -108,7 +112,7 @@ pub fn lookup_v4(
         }
     };
 
-    let nh_ptr = match resolve_fib_value_v4(stats, ctx, l4_off, &fib, src, dst, proto) {
+    let nh_ptr = match resolve_fib_value_v4(stats, start, end, l4_off, &fib, src, dst, proto) {
         Some(p) => p,
         None => {
             // ECMP walked every leg and none resolved, or the single
@@ -130,12 +134,14 @@ pub fn lookup_v4(
     }
 }
 
-/// IPv6 custom-FIB lookup. See [`lookup_v4`]; same deferred-port
-/// contract.
+/// IPv6 custom-FIB lookup. See [`lookup_v4`]; same deferred-port and
+/// scalar-bounds contracts.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub fn lookup_v6(
     stats: StatsPtr,
-    ctx: &XdpContext,
+    start: usize,
+    end: usize,
     l4_off: usize,
     src: [u8; 16],
     dst: [u8; 16],
@@ -150,7 +156,7 @@ pub fn lookup_v6(
         }
     };
 
-    let nh_ptr = match resolve_fib_value_v6(stats, ctx, l4_off, &fib, src, dst, proto) {
+    let nh_ptr = match resolve_fib_value_v6(stats, start, end, l4_off, &fib, src, dst, proto) {
         Some(p) => p,
         None => {
             bump(stats, StatIdx::CustomFibNoNeigh);
@@ -173,9 +179,11 @@ pub fn lookup_v6(
 // --- FibValue → NexthopEntry pointer ------------------------------------
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_fib_value_v4(
     stats: StatsPtr,
-    ctx: &XdpContext,
+    start: usize,
+    end: usize,
     l4_off: usize,
     fib: &FibValue,
     src: [u8; 4],
@@ -192,7 +200,7 @@ fn resolve_fib_value_v4(
             // kernel-FIB `__be16` shape); the hash contract is
             // native-order, so swap here — same values the caller
             // used to compute, just only when actually needed.
-            let (sport_be, dport_be) = l4_ports(ctx, l4_off, proto);
+            let (sport_be, dport_be) = l4_ports(start, end, l4_off, proto);
             let h = hash_v4(
                 src,
                 dst,
@@ -208,9 +216,11 @@ fn resolve_fib_value_v4(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_fib_value_v6(
     stats: StatsPtr,
-    ctx: &XdpContext,
+    start: usize,
+    end: usize,
     l4_off: usize,
     fib: &FibValue,
     src: [u8; 16],
@@ -223,7 +233,7 @@ fn resolve_fib_value_v6(
             bump(stats, StatIdx::EcmpHashV6);
             let group = ECMP_GROUPS.get(fib.idx)?;
             // See resolve_fib_value_v4 for the deferred-port rationale.
-            let (sport_be, dport_be) = l4_ports(ctx, l4_off, proto);
+            let (sport_be, dport_be) = l4_ports(start, end, l4_off, proto);
             let h = hash_v6(
                 src,
                 dst,
