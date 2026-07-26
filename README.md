@@ -75,6 +75,7 @@ PacketFrame complements existing routing daemons rather than replacing them. The
 | `packetframe reconfigure` / `systemctl reload packetframe` | Production (v0.2.4+) |
 | Two-stage BPF datapath (`fast_path` + `finalize` via `bpf_tail_call`) | Production (v0.2.5+); see [docs/runbooks/tail-call-architecture.md](docs/runbooks/tail-call-architecture.md) |
 | `probe` module (diagnostic XDP) | Production |
+| tc-ingress datapath (`attach <iface> tc`, custom-fib only) | Experimental (Phase T); see [docs/runbooks/tc-datapath.md](docs/runbooks/tc-datapath.md) |
 | `ddos` module (XDP-time SYN-flood + amplification filter) | Future; sketched in SPEC §5.2 (priority 0–999, security/admission) |
 | `sampler` module (per-flow ringbuf observability) | Future; sketched in SPEC §5.3 (priority 2000–2999, observation) |
 | `randomizer` module (TC egress jitter for NoiseNet anti-correlation) | Future; sketched in SPEC §5.1 (priority ~3000, egress) |
