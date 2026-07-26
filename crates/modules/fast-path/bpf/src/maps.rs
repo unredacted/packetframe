@@ -159,12 +159,28 @@ pub enum StatIdx {
     /// `local-prefix6`, since that installs the /128s that would
     /// otherwise make host-to-host NDP FIB-eligible.
     PassNdp = 37,
+    /// finalize read a `MUTATION_CTX.ip_offset` above `MAX_IP_OFFSET`
+    /// (64) and XDP_PASSed a packet fast_path had already mutated
+    /// (TTL decremented, MACs rewritten). Should be 0 in steady state
+    /// — fast_path only ever writes 14 or 18 — so any non-zero value
+    /// means fast_path/finalize disagree about the context layout.
+    /// This path previously passed with NO counter at all, making the
+    /// half-mutated-frame hazard invisible.
+    ErrCtxOffsetRange = 38,
+    /// `bpf_redirect_map` failed in finalize after the fast_path
+    /// devmap pre-check had passed (entry removed in the microscopic
+    /// window between the two, or a kernel-level redirect failure).
+    /// The packet XDP_PASSes to the kernel already mutated.
+    /// Previously mislabeled as `ErrFibOther`, which made a
+    /// redirect-time failure indistinguishable from a FIB-lookup
+    /// failure.
+    ErrRedirectFailed = 39,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 38;
+pub const STATS_COUNT: u32 = 40;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;

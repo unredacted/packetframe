@@ -89,6 +89,11 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     // for a future second VLAN tag without having to revisit this.
     let ip_offset = mctx.ip_offset as usize;
     if ip_offset > MAX_IP_OFFSET {
+        // Previously an uncounted XDP_PASS — and by finalize time the
+        // packet is already mutated (TTL, MACs), so this fail-open is
+        // a half-mutated frame handed to the kernel. Unreachable while
+        // fast_path writes only 14/18; count it so layout drift screams.
+        bump(stats, StatIdx::ErrCtxOffsetRange);
         return xdp_action::XDP_PASS;
     }
 
@@ -125,7 +130,11 @@ pub fn finalize(ctx: XdpContext) -> u32 {
             xdp_action::XDP_REDIRECT
         }
         Err(_) => {
-            bump(stats, StatIdx::ErrFibOther);
+            // Devmap entry vanished between fast_path's pre-check and
+            // here, or the kernel refused the redirect. Dedicated
+            // counter (v0.2.8): this used to bump ErrFibOther, hiding
+            // redirect-time failures inside the FIB-error bucket.
+            bump(stats, StatIdx::ErrRedirectFailed);
             xdp_action::XDP_PASS
         }
     }

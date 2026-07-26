@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 /// operators (19 hid `err_head_shift`; 33 hid the mss-clamp and
 /// tail-call diagnostics from the Prometheus export; a separate
 /// hardcoded 37 hid `pass_ndp` from `packetframe status`).
-pub const COUNTER_NAMES: [&str; 38] = [
+pub const COUNTER_NAMES: [&str; 40] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -74,6 +74,9 @@ pub const COUNTER_NAMES: [&str; 38] = [
     "err_mutation_ctx",
     // --- local-prefix6: NDP kept off the fast path ---
     "pass_ndp",
+    // --- v0.2.8: finalize error-path visibility ---
+    "err_ctx_offset_range",
+    "err_redirect_failed",
 ];
 
 /// `COUNTER_NAMES.len()` as a named const. Sizes the `[u64; N]` value
@@ -225,10 +228,12 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 38);
-        // The newest counter, as a canary that the tail of the list
+        assert_eq!(COUNTER_NAMES.len(), 40);
+        assert_eq!(COUNTER_NAMES.len(), COUNTER_COUNT);
+        // The newest counters, as a canary that the tail of the list
         // stayed aligned with the `StatIdx` discriminants.
-        assert_eq!(COUNTER_NAMES[37], "pass_ndp");
+        assert_eq!(COUNTER_NAMES[38], "err_ctx_offset_range");
+        assert_eq!(COUNTER_NAMES[39], "err_redirect_failed");
     }
 
     #[test]

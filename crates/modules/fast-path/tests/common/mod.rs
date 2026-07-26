@@ -55,7 +55,7 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V2: u32 = 1;
-pub const STATS_COUNT: u32 = 38;
+pub const STATS_COUNT: u32 = 40;
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
 /// uses these to flip forwarding modes on the live BPF program.
@@ -113,6 +113,8 @@ pub enum StatIdx {
     ErrTailCall = 35,
     ErrMutationCtx = 36,
     PassNdp = 37,
+    ErrCtxOffsetRange = 38,
+    ErrRedirectFailed = 39,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a
