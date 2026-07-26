@@ -145,11 +145,25 @@ pub enum StatIdx {
     /// scratch slot. Shouldn't happen, fast_path always writes before
     /// tail_call. Diagnostic; finalize XDP_PASSes on this error.
     ErrMutationCtx = 36,
+    /// ICMPv6 neighbor-discovery message (RFC 4861 types 133-137)
+    /// deliberately handed to the kernel instead of fast-pathed.
+    ///
+    /// NDP mandates a hop limit of 255 and requires receivers to
+    /// silently discard NS/NA/RS/RA arriving with anything else
+    /// (RFC 4861 §6.1.1, §7.1.1). `forward_success` decrements the hop
+    /// limit and rewrites the source MAC, so redirecting NDP would
+    /// break neighbor resolution on the segment. IPv4 has no analogue:
+    /// ARP is EtherType 0x0806, which never reaches `handle_ipv4`.
+    ///
+    /// Expected to be non-zero and climbing on any box with a
+    /// `local-prefix6`, since that installs the /128s that would
+    /// otherwise make host-to-host NDP FIB-eligible.
+    PassNdp = 37,
 }
 
 /// Total counter count. Used as `stats` map `max_entries`. New counters
 /// bump this; dashboards keying on indices keep working.
-pub const STATS_COUNT: u32 = 37;
+pub const STATS_COUNT: u32 = 38;
 
 /// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
 /// mask (historical, load-bearing for dashboards). Bit 2 is the

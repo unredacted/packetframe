@@ -22,11 +22,16 @@ use std::fmt::Write as _;
 /// metric names; changing any value changes the operator-facing
 /// metric name. Append-only, renumbering breaks dashboards.
 ///
-/// Phase 1 (Option F custom FIB): length grew from 19 → 32. The
-/// pre-existing 19 was already off-by-one (`err_head_shift` at
-/// index 19 silently dropped); fixed in passing. Indices 20-31 are
-/// the new custom-FIB counters.
-pub const COUNTER_NAMES: [&str; 33] = [
+/// This is the **single userspace mirror** of `StatIdx` /
+/// `STATS_COUNT`: `read_stats` in linux_impl sizes its map read from
+/// this list's length, and the CLI's `status` output prints these
+/// names. When a counter is appended to `StatIdx`, this list is the
+/// one place userspace must follow. It earned that role the hard way:
+/// three prior lengths each silently hid the newest counters from
+/// operators (19 hid `err_head_shift`; 33 hid the mss-clamp and
+/// tail-call diagnostics from the Prometheus export; a separate
+/// hardcoded 37 hid `pass_ndp` from `packetframe status`).
+pub const COUNTER_NAMES: [&str; 38] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -61,6 +66,14 @@ pub const COUNTER_NAMES: [&str; 33] = [
     "nexthop_seq_retry",
     "bmp_peer_down",
     "bogon_dropped",
+    // --- v0.2.4: mss-clamp ---
+    "mss_clamp_applied",
+    "mss_clamp_skipped",
+    // --- v0.2.5: two-stage datapath ---
+    "err_tail_call",
+    "err_mutation_ctx",
+    // --- local-prefix6: NDP kept off the fast path ---
+    "pass_ndp",
 ];
 
 /// Render a Prometheus textfile body from stat values + module uptime.
@@ -206,7 +219,10 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 33);
+        assert_eq!(COUNTER_NAMES.len(), 38);
+        // The newest counter, as a canary that the tail of the list
+        // stayed aligned with the `StatIdx` discriminants.
+        assert_eq!(COUNTER_NAMES[37], "pass_ndp");
     }
 
     #[test]

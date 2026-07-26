@@ -45,22 +45,31 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use packetframe_common::config::{is_harvestable_v6, Ipv4Prefix, Ipv6Prefix};
 use packetframe_common::fib::{IpPrefix, NeighError, NeighEvent, PeerId, RouteEvent};
 
 use crate::fib::programmer::FibProgrammerHandle;
 
 /// Operator-declared local prefix (v0.2.1 connected fast-path). The
-/// resolver walks the kernel ARP table for IPs falling in `cidr` that
-/// are reachable via `iface`, and synthesizes per-/32 `RouteEvent::Add`s
-/// into FibProgrammer so inbound traffic to those hosts fast-paths
-/// through XDP redirect instead of falling to kernel slow path. See
-/// [`packetframe_common::config::ModuleDirective::LocalPrefix`] for the
-/// config-side surface.
+/// resolver walks the kernel neighbour table for IPs falling in `cidr`
+/// that are reachable via `iface`, and synthesizes per-host
+/// `RouteEvent::Add`s (a /32 for IPv4, a /128 for IPv6) into
+/// FibProgrammer so inbound traffic to those hosts fast-paths through
+/// XDP redirect instead of falling to kernel slow path. See
+/// [`packetframe_common::config::ModuleDirective::LocalPrefix`] and
+/// [`packetframe_common::config::ModuleDirective::LocalPrefix6`] for the
+/// config-side surfaces.
+///
+/// Both families share this one type so the emission path
+/// ([`NetlinkNeighborResolver::seed_local_prefix_routes`],
+/// `maybe_emit_local_arp_add`/`_del`, `match_local_prefix`) is written
+/// once rather than duplicated per family.
 #[derive(Debug, Clone)]
 pub struct LocalPrefixSpec {
-    /// Network address (host bits zeroed) of the prefix.
-    pub addr: Ipv4Addr,
-    /// Prefix length in bits, 0..=32.
+    /// Network address of the prefix. Host bits need not be zeroed;
+    /// containment ignores them.
+    pub addr: IpAddr,
+    /// Prefix length in bits: 0..=32 for v4, 0..=128 for v6.
     pub prefix_len: u8,
     /// The kernel iface name (e.g., `br1337`). Resolved to ifindex
     /// once at resolver startup via the RTM_GETLINK dump; if the iface
@@ -75,6 +84,11 @@ pub struct LocalPrefixSpec {
     /// communicate L3 with the gateway and therefore never appear in
     /// `ip neigh show <iface>`. Off by default, generates noticeable
     /// ARP traffic during startup.
+    ///
+    /// **IPv4 only.** The config parser rejects `arp-scavenge` on
+    /// `local-prefix6`, so this is always `false` for a v6 spec; see
+    /// [`packetframe_common::config::ModuleDirective::LocalPrefix6`] for
+    /// why there is no v6 equivalent.
     pub arp_scavenge: bool,
 }
 
@@ -99,13 +113,66 @@ pub struct FallbackDefaultSpec {
 
 impl LocalPrefixSpec {
     /// True iff `ip` falls within this prefix.
-    fn contains(&self, ip: Ipv4Addr) -> bool {
-        if self.prefix_len == 0 {
-            return true;
+    ///
+    /// A family mismatch is `false`, not an error: a v4 spec must never
+    /// match a v6 neighbour and vice versa, and the resolver walks one
+    /// mixed-family list against every neighbour event.
+    ///
+    /// Mask arithmetic (including the `/0` and `/max` shift-overflow
+    /// guards) lives in the shared prefix helpers in `common` so it has
+    /// exactly one implementation.
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => Ipv4Prefix {
+                addr: net,
+                prefix_len: self.prefix_len,
+            }
+            .contains_addr(ip),
+            (IpAddr::V6(net), IpAddr::V6(ip)) => Ipv6Prefix {
+                addr: net,
+                prefix_len: self.prefix_len,
+            }
+            .contains_addr(ip),
+            _ => false,
         }
-        let mask: u32 = (!0u32) << (32 - self.prefix_len as u32);
-        let net = u32::from(self.addr) & mask;
-        u32::from(ip) & mask == net
+    }
+}
+
+/// The single-host prefix we synthesize for a connected neighbour: a /32
+/// for IPv4, a /128 for IPv6. Being maximally specific is the whole
+/// point — it wins the LPM walk over any covering route from the BGP
+/// feed, which is what routes the packet to this host's own MAC rather
+/// than to an upstream nexthop.
+fn host_prefix(ip: IpAddr) -> IpPrefix {
+    match ip {
+        IpAddr::V4(v4) => IpPrefix::V4 {
+            addr: v4.octets(),
+            prefix_len: 32,
+        },
+        IpAddr::V6(v6) => IpPrefix::V6 {
+            addr: v6.octets(),
+            prefix_len: 128,
+        },
+    }
+}
+
+/// Whether a neighbour address may be synthesized into a host route.
+///
+/// v4 is unconditional: the ARP table holds only unicast entries, and
+/// the scavenge sweep already skips network and broadcast addresses.
+///
+/// v6 needs a real gate. The kernel's neighbour table carries
+/// `NUD_NOARP` entries for multicast groups with a derived `33:33:xx`
+/// MAC, which are indistinguishable from resolved unicast neighbours at
+/// this layer, plus link-local addresses that are ambiguous across
+/// interfaces. See [`is_harvestable_v6`] for the full reasoning.
+///
+/// Applied symmetrically on add **and** delete: an asymmetric filter
+/// would leak routes that were installed before a config change.
+fn may_synthesize(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => true,
+        IpAddr::V6(v6) => is_harvestable_v6(v6),
     }
 }
 
@@ -159,6 +226,13 @@ pub struct NetlinkNeighborResolver {
     /// whether the local-prefix sweep is doing useful work.
     local_arp_routes_added: u64,
     local_arp_routes_removed: u64,
+    /// Same, for `local-prefix6` /128s resolved via NDP. Kept separate
+    /// from the ARP counters rather than summed: the runbook points
+    /// operators at `local_arp_routes_added` as the "is it working"
+    /// signal, and merging the families would make both numbers
+    /// unreadable on a dual-stack segment.
+    local_nd_routes_added: u64,
+    local_nd_routes_removed: u64,
     /// Cache mapping ifindex → egress MAC. Populated at startup via
     /// a single `RTM_GETLINK` dump; maintained by `RTM_NEWLINK` /
     /// `RTM_DELLINK` multicast events. Used to attach `src_mac` to
@@ -228,6 +302,8 @@ impl NetlinkNeighborResolver {
                 cache_misses: 0,
                 local_arp_routes_added: 0,
                 local_arp_routes_removed: 0,
+                local_nd_routes_added: 0,
+                local_nd_routes_removed: 0,
                 local_prefixes: Vec::new(),
                 prog_handle: None,
                 fallback_default: None,
@@ -457,6 +533,8 @@ impl NetlinkNeighborResolver {
                         cache_misses = self.cache_misses,
                         local_arp_routes_added = self.local_arp_routes_added,
                         local_arp_routes_removed = self.local_arp_routes_removed,
+                        local_nd_routes_added = self.local_nd_routes_added,
+                        local_nd_routes_removed = self.local_nd_routes_removed,
                         "neighbour resolver stats"
                     );
                 }
@@ -578,17 +656,17 @@ impl NetlinkNeighborResolver {
             .iter()
             .map(|(ip, (ifindex, _mac))| (*ip, *ifindex))
             .collect();
-        let mut emitted = 0usize;
+        let mut emitted_v4 = 0usize;
+        let mut emitted_v6 = 0usize;
         for (ip, ifindex) in snapshot {
-            let IpAddr::V4(v4) = ip else { continue };
-            if let Some(peer_id) = self.match_local_prefix(v4, ifindex) {
+            if !may_synthesize(ip) {
+                continue;
+            }
+            if let Some(peer_id) = self.match_local_prefix(ip, ifindex) {
                 if let Err(e) = prog
                     .apply_route_event(RouteEvent::Add {
                         peer_id,
-                        prefix: IpPrefix::V4 {
-                            addr: v4.octets(),
-                            prefix_len: 32,
-                        },
+                        prefix: host_prefix(ip),
                         nexthops: vec![ip],
                         path_id: None,
                         local_pref: None,
@@ -596,16 +674,20 @@ impl NetlinkNeighborResolver {
                     .await
                 {
                     warn!(?ip, error = %e, "local-prefix seed RouteEvent::Add dispatch failed");
-                } else {
-                    emitted += 1;
+                } else if ip.is_ipv4() {
+                    emitted_v4 += 1;
                     self.local_arp_routes_added += 1;
+                } else {
+                    emitted_v6 += 1;
+                    self.local_nd_routes_added += 1;
                 }
             }
         }
         info!(
-            emitted,
+            emitted_v4,
+            emitted_v6,
             local_prefixes = self.local_prefixes.len(),
-            "local-prefix /32 seed complete"
+            "local-prefix host-route seed complete (/32 for v4, /128 for v6)"
         );
 
         // v0.2.1 issue #32: ARP-scavenge any prefix the operator
@@ -677,7 +759,22 @@ impl NetlinkNeighborResolver {
         }
         let mut total_probed = 0usize;
         for (spec, oif) in specs {
-            let net_u32 = u32::from(spec.addr);
+            // Belt-and-braces: the config parser rejects `arp-scavenge`
+            // on `local-prefix6`, so a v6 spec can never have the flag
+            // set and this is unreachable. It guards against a future
+            // caller constructing LocalPrefixSpec directly — sweeping a
+            // v6 prefix is not merely unsupported but unrepresentable
+            // (a /64 is 2^64 addresses).
+            let IpAddr::V4(net_v4) = spec.addr else {
+                warn!(
+                    iface = %spec.iface,
+                    cidr = %format_args!("{}/{}", spec.addr, spec.prefix_len),
+                    "arp-scavenge is IPv4-only and should have been rejected at config \
+                     parse; ignoring this spec"
+                );
+                continue;
+            };
+            let net_u32 = u32::from(net_v4);
             let plen = spec.prefix_len;
             // Number of host bits + the host range.
             let host_bits = 32u8.saturating_sub(plen) as u32;
@@ -806,11 +903,20 @@ impl NetlinkNeighborResolver {
 
     /// Same as [`Self::seed_local_prefix_routes`] but for a single
     /// (ip, ifindex) pair, called from the multicast event handler
-    /// on RTM_NEWNEIGH. Idempotent against the FibProgrammer side
-    /// (multiple Adds for the same /32 just bump a refcount).
+    /// on RTM_NEWNEIGH.
+    ///
+    /// Idempotent against the FibProgrammer side: a repeated Add for an
+    /// unchanged nexthop set short-circuits in `recompute_fib_entry`
+    /// before any map write, so there is no churn and nothing to leak.
+    /// (This is a no-change comparison, not a refcount bump; refcounting
+    /// only engages when the nexthop set actually changes.) IPv6
+    /// exercises this path harder than v4 because SLAAC hosts hold
+    /// several addresses that go stale and get re-probed independently.
     async fn maybe_emit_local_arp_add(&mut self, ip: IpAddr, ifindex: u32) {
-        let IpAddr::V4(v4) = ip else { return };
-        let Some(peer_id) = self.match_local_prefix(v4, ifindex) else {
+        if !may_synthesize(ip) {
+            return;
+        }
+        let Some(peer_id) = self.match_local_prefix(ip, ifindex) else {
             return;
         };
         // Clone to release the &self borrow on prog_handle before the
@@ -823,10 +929,7 @@ impl NetlinkNeighborResolver {
         if let Err(e) = prog
             .apply_route_event(RouteEvent::Add {
                 peer_id,
-                prefix: IpPrefix::V4 {
-                    addr: v4.octets(),
-                    prefix_len: 32,
-                },
+                prefix: host_prefix(ip),
                 nexthops: vec![ip],
                 path_id: None,
                 local_pref: None,
@@ -834,15 +937,23 @@ impl NetlinkNeighborResolver {
             .await
         {
             warn!(?ip, error = %e, "local-prefix RouteEvent::Add dispatch failed");
-        } else {
+        } else if ip.is_ipv4() {
             self.local_arp_routes_added += 1;
+        } else {
+            self.local_nd_routes_added += 1;
         }
     }
 
     /// Symmetric withdrawal for a single (ip, ifindex) on RTM_DELNEIGH.
+    ///
+    /// The `may_synthesize` gate must match the add path exactly. An
+    /// asymmetric filter would strand host routes that were installed
+    /// before the gate changed, with no path to withdraw them.
     async fn maybe_emit_local_arp_del(&mut self, ip: IpAddr, ifindex: u32) {
-        let IpAddr::V4(v4) = ip else { return };
-        let Some(peer_id) = self.match_local_prefix(v4, ifindex) else {
+        if !may_synthesize(ip) {
+            return;
+        }
+        let Some(peer_id) = self.match_local_prefix(ip, ifindex) else {
             return;
         };
         let Some(prog) = self.prog_handle.clone() else {
@@ -851,17 +962,16 @@ impl NetlinkNeighborResolver {
         if let Err(e) = prog
             .apply_route_event(RouteEvent::Del {
                 peer_id,
-                prefix: IpPrefix::V4 {
-                    addr: v4.octets(),
-                    prefix_len: 32,
-                },
+                prefix: host_prefix(ip),
                 path_id: None,
             })
             .await
         {
             warn!(?ip, error = %e, "local-prefix RouteEvent::Del dispatch failed");
-        } else {
+        } else if ip.is_ipv4() {
             self.local_arp_routes_removed += 1;
+        } else {
+            self.local_nd_routes_removed += 1;
         }
     }
 
@@ -905,7 +1015,18 @@ impl NetlinkNeighborResolver {
     /// Linear scan; the operator-declared list is small (handful at
     /// most on the reference EFG) so this is cheap on every neighbour
     /// event.
-    fn match_local_prefix(&self, ip: Ipv4Addr, ifindex: u32) -> Option<PeerId> {
+    ///
+    /// The list holds both families and `LocalPrefixSpec::contains`
+    /// returns `false` on a family mismatch, so a v6 neighbour can only
+    /// ever match a `local-prefix6` spec.
+    ///
+    /// The returned `PeerId` is keyed on ifindex alone, deliberately
+    /// **not** on family: a v4 and a v6 local-prefix on the same
+    /// interface share one peer, so a single `RouteEvent::PeerDown` on
+    /// `RTM_DELLINK` withdraws both families' host routes in one sweep.
+    /// `FibProgrammer` keeps them distinct internally because
+    /// `prefix_peer_key` discriminates on an `is_v4` flag.
+    fn match_local_prefix(&self, ip: IpAddr, ifindex: u32) -> Option<PeerId> {
         for spec in &self.local_prefixes {
             if !spec.contains(ip) {
                 continue;
@@ -1328,5 +1449,206 @@ mod tests {
             arp_scavenge: false,
         };
         assert!(spec.contains("23.191.200.10".parse().unwrap()));
+    }
+
+    // --- local-prefix6 (IPv6 connected fast-path) ------------------------
+
+    fn spec6(cidr: &str, prefix_len: u8, iface: &str) -> LocalPrefixSpec {
+        LocalPrefixSpec {
+            addr: cidr.parse().unwrap(),
+            prefix_len,
+            iface: iface.into(),
+            arp_scavenge: false,
+        }
+    }
+
+    #[test]
+    fn local_prefix6_contains_basic() {
+        let spec = spec6("2602:f7d8:0:1337::", 64, "br1337");
+        assert!(spec.contains("2602:f7d8:0:1337::1".parse().unwrap()));
+        assert!(spec.contains("2602:f7d8:0:1337:dead:beef::42".parse().unwrap()));
+        assert!(!spec.contains("2602:f7d8:0:1338::1".parse().unwrap()));
+        // The adjacent /48 must not match: 2602:f7d8:1:: is a different
+        // allocation, not part of this segment.
+        assert!(!spec.contains("2602:f7d8:1::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn local_prefix6_contains_handles_slash128() {
+        let spec = spec6("2001:db8::2", 128, "br0");
+        assert!(spec.contains("2001:db8::2".parse().unwrap()));
+        assert!(!spec.contains("2001:db8::3".parse().unwrap()));
+    }
+
+    #[test]
+    fn local_prefix6_contains_handles_slash0() {
+        // Guards the u128 shift-by-128. In release that shift silently
+        // yields !0, which would make ::/0 match only :: — the
+        // directive would quietly do nothing rather than panic.
+        let spec = spec6("::", 0, "br0");
+        assert!(spec.contains("2001:db8::1".parse().unwrap()));
+        assert!(spec.contains("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()));
+    }
+
+    #[test]
+    fn local_prefix6_contains_misalignment_is_treated_as_aligned() {
+        let spec = spec6("2602:f7d8:0:1337::5", 64, "br1337");
+        assert!(spec.contains("2602:f7d8:0:1337::10".parse().unwrap()));
+    }
+
+    /// A spec must never match across families. The resolver walks one
+    /// mixed-family list against every neighbour event, so a v4 spec
+    /// seeing a v6 neighbour (and vice versa) is the normal case, not an
+    /// error case.
+    #[test]
+    fn local_prefix_contains_rejects_family_mismatch_both_ways() {
+        let v4 = LocalPrefixSpec {
+            addr: "23.191.200.0".parse().unwrap(),
+            prefix_len: 24,
+            iface: "br1337".into(),
+            arp_scavenge: false,
+        };
+        assert!(!v4.contains("2602:f7d8:0:1337::1".parse().unwrap()));
+
+        let v6 = spec6("2602:f7d8:0:1337::", 64, "br1337");
+        assert!(!v6.contains("23.191.200.10".parse().unwrap()));
+
+        // A v6 /0 spec still must not swallow v4 addresses, even though
+        // its mask matches everything within its own family.
+        let v6_default = spec6("::", 0, "br0");
+        assert!(!v6_default.contains("23.191.200.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn host_prefix_is_maximally_specific_per_family() {
+        match host_prefix("23.191.200.7".parse().unwrap()) {
+            IpPrefix::V4 { addr, prefix_len } => {
+                assert_eq!(prefix_len, 32);
+                assert_eq!(addr, [23, 191, 200, 7]);
+            }
+            other => panic!("expected V4, got {other:?}"),
+        }
+        match host_prefix("2602:f7d8:0:1337::7".parse().unwrap()) {
+            IpPrefix::V6 { addr, prefix_len } => {
+                assert_eq!(prefix_len, 128);
+                assert_eq!(
+                    addr,
+                    "2602:f7d8:0:1337::7"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets()
+                );
+            }
+            other => panic!("expected V6, got {other:?}"),
+        }
+    }
+
+    /// The emission gate. v4 is unconditional; v6 rejects the classes
+    /// the kernel keeps in its neighbour table that must never become
+    /// forwarding entries.
+    #[test]
+    fn may_synthesize_gates_v6_but_never_v4() {
+        // Every v4 address is fair game, including ones that look odd.
+        for a in ["23.191.200.7", "0.0.0.0", "255.255.255.255", "127.0.0.1"] {
+            assert!(may_synthesize(a.parse().unwrap()), "v4 {a}");
+        }
+        // v6 classes that must be filtered.
+        for a in [
+            "ff02::1",
+            "ff02::1:ff00:1", // solicited-node, NUD_NOARP with a 33:33 MAC
+            "fe80::1",
+            "::",
+            "::1",
+            "::ffff:192.0.2.1",
+        ] {
+            assert!(!may_synthesize(a.parse().unwrap()), "v6 {a}");
+        }
+        // v6 addresses that are legitimate connected hosts.
+        for a in [
+            "2602:f7d8:0:1337::42",
+            "2602:f7d8:0:1337::", // subnet-router anycast
+            "fd00:1::1",          // unique-local
+        ] {
+            assert!(may_synthesize(a.parse().unwrap()), "v6 {a}");
+        }
+    }
+
+    // --- match_local_prefix ---------------------------------------------
+    //
+    // Previously untested at any family. Needs a resolver with a
+    // populated `iface_to_ifindex`, which is why it had no coverage.
+
+    fn resolver_with(
+        specs: Vec<LocalPrefixSpec>,
+        ifaces: &[(&str, u32)],
+    ) -> NetlinkNeighborResolver {
+        let (mut r, _rx, _h) = NetlinkNeighborResolver::new(CancellationToken::new());
+        r.local_prefixes = specs;
+        for (name, idx) in ifaces {
+            r.iface_to_ifindex.insert((*name).to_string(), *idx);
+        }
+        r
+    }
+
+    #[test]
+    fn match_local_prefix_requires_prefix_and_ifindex_to_agree() {
+        let r = resolver_with(
+            vec![spec6("2602:f7d8:0:1337::", 64, "br1337")],
+            &[("br1337", 33)],
+        );
+        let inside: IpAddr = "2602:f7d8:0:1337::7".parse().unwrap();
+        let outside: IpAddr = "2602:f7d8:0:9999::7".parse().unwrap();
+
+        assert_eq!(
+            r.match_local_prefix(inside, 33),
+            Some(PeerId::local_arp(33)),
+            "right prefix + right ifindex must match"
+        );
+        assert_eq!(
+            r.match_local_prefix(inside, 34),
+            None,
+            "right prefix on the wrong iface must not match"
+        );
+        assert_eq!(
+            r.match_local_prefix(outside, 33),
+            None,
+            "wrong prefix on the right iface must not match"
+        );
+    }
+
+    #[test]
+    fn match_local_prefix_returns_none_when_iface_unresolvable() {
+        // Operator staged config before the bridge existed: the spec is
+        // kept but cannot match until RTM_NEWLINK fills in the ifindex.
+        let r = resolver_with(vec![spec6("2602:f7d8:0:1337::", 64, "br-later")], &[]);
+        assert_eq!(
+            r.match_local_prefix("2602:f7d8:0:1337::7".parse().unwrap(), 33),
+            None
+        );
+    }
+
+    /// Pins the design decision: one PeerId per ifindex, shared across
+    /// families, so a single PeerDown on RTM_DELLINK withdraws both the
+    /// v4 /32s and the v6 /128s behind that interface. Do not "fix" this
+    /// into a per-family PeerId.
+    #[test]
+    fn match_local_prefix_shares_peer_id_across_families_on_one_iface() {
+        let r = resolver_with(
+            vec![
+                LocalPrefixSpec {
+                    addr: "23.191.200.0".parse().unwrap(),
+                    prefix_len: 24,
+                    iface: "br1337".into(),
+                    arp_scavenge: false,
+                },
+                spec6("2602:f7d8:0:1337::", 64, "br1337"),
+            ],
+            &[("br1337", 33)],
+        );
+        let v4 = r.match_local_prefix("23.191.200.7".parse().unwrap(), 33);
+        let v6 = r.match_local_prefix("2602:f7d8:0:1337::7".parse().unwrap(), 33);
+        assert_eq!(v4, Some(PeerId::local_arp(33)));
+        assert_eq!(v6, Some(PeerId::local_arp(33)));
+        assert_eq!(v4, v6, "both families must resolve to the same peer");
     }
 }

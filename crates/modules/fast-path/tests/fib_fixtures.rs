@@ -121,6 +121,211 @@ fn custom_fib_v6_single_nexthop_hit_redirects() {
     assert_eq!(h.stat(StatIdx::CustomFibHit), before_hit + 1);
 }
 
+// ========== /128 vs covering route (local-prefix6 premise) ================
+//
+// The entire premise of `local-prefix6` is that a synthesized /128 for a
+// connected host wins the FIB_V6 LPM walk over any covering route from
+// the BGP feed. Without that, inbound traffic to the segment would be
+// redirected to an upstream nexthop instead of the host's own MAC.
+
+/// MAC behind the covering /64 — stands in for an upstream transit
+/// nexthop from the BGP feed.
+const COVERING_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x0c];
+/// MAC behind the more-specific /128 — stands in for the connected
+/// host's own MAC, learned via NDP.
+const HOST_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x0d];
+
+fn v6_dst(pkt_dst: &str) -> [u8; 16] {
+    pkt_dst.parse::<std::net::Ipv6Addr>().unwrap().octets()
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn custom_fib_v6_slash128_beats_covering_routes() {
+    let mut h = prep_custom_fib_harness();
+    h.add_allow_v6("2001:db8::/32");
+    h.add_nexthop_v6(1, LO_IFINDEX, EGRESS_MAC, COVERING_MAC);
+    h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
+    h.add_fib_v6_single("2001:db8::/64", 1);
+    h.add_fib_v6_single("2001:db8::2/128", 2);
+
+    // 1. The /128'd host: the more specific entry must win.
+    let pkt = Ipv6TcpBuilder {
+        dst_ip: v6_dst("2001:db8::2"),
+        ..Default::default()
+    }
+    .build();
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(
+        &out[0..6],
+        &HOST_MAC,
+        "/128 must win the LPM walk over the covering /64"
+    );
+
+    // 2. Negative control: a sibling address with no /128 falls to the
+    //    /64. Proves this is real longest-prefix matching and not
+    //    "whichever entry was written last".
+    let pkt = Ipv6TcpBuilder {
+        dst_ip: v6_dst("2001:db8::3"),
+        ..Default::default()
+    }
+    .build();
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(
+        &out[0..6],
+        &COVERING_MAC,
+        "address without a /128 must fall to the covering /64"
+    );
+
+    // 3. Adding a default route must not disturb the /128. Exercises
+    //    prefix_len == 0 in the v6 trie.
+    h.add_nexthop_v6(3, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v6_single("::/0", 3);
+    let pkt = Ipv6TcpBuilder {
+        dst_ip: v6_dst("2001:db8::2"),
+        ..Default::default()
+    }
+    .build();
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(&out[0..6], &HOST_MAC, "/128 must still win over ::/0");
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn custom_fib_v6_slash128_wins_regardless_of_insertion_order() {
+    // Same assertion as above with the inserts reversed, ruling out an
+    // ordering artifact in the LPM trie.
+    let mut h = prep_custom_fib_harness();
+    h.add_allow_v6("2001:db8::/32");
+    h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
+    h.add_fib_v6_single("2001:db8::2/128", 2);
+    h.add_nexthop_v6(1, LO_IFINDEX, EGRESS_MAC, COVERING_MAC);
+    h.add_fib_v6_single("2001:db8::/64", 1);
+
+    let pkt = Ipv6TcpBuilder {
+        dst_ip: v6_dst("2001:db8::2"),
+        ..Default::default()
+    }
+    .build();
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(&out[0..6], &HOST_MAC);
+}
+
+// ========== NDP must never be fast-pathed ================================
+//
+// RFC 4861 §6.1.1/§7.1.1: receivers silently discard NS/NA/RS/RA whose
+// hop limit is not 255. `forward_success` decrements the hop limit and
+// rewrites the source MAC, so redirecting NDP breaks neighbor resolution
+// on the segment. `local-prefix6` makes this reachable by installing the
+// /128s that let host-to-host NDP resolve in FIB_V6.
+
+const ICMPV6: u8 = 58;
+
+/// Build an ICMPv6 packet of `icmp_type` toward `dst`, hop limit 255,
+/// from an allowlisted source. Body is a plausible NS/NA shape:
+/// 4 reserved bytes + a 16-byte target address.
+fn icmpv6_pkt(icmp_type: u8, dst: &str) -> Vec<u8> {
+    let mut body = vec![icmp_type, 0, 0, 0]; // type, code, checksum (unchecked by XDP)
+    body.extend_from_slice(&[0, 0, 0, 0]); // reserved
+    body.extend_from_slice(&v6_dst(dst)); // target address
+    Ipv6TcpBuilder {
+        dst_ip: v6_dst(dst),
+        hop_limit: 255,
+        next_hdr: ICMPV6,
+        payload: body,
+        ..Default::default()
+    }
+    .build()
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn ndp_is_passed_untouched_even_when_fib_would_redirect() {
+    let mut h = prep_custom_fib_harness();
+    h.add_allow_v6("2001:db8::/32");
+    // A /128 for the destination: without the guard this would redirect.
+    h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
+    h.add_fib_v6_single("2001:db8::2/128", 2);
+
+    // 135 = Neighbor Solicitation, 136 = Neighbor Advertisement.
+    // 133/134 (RS/RA) and 137 (Redirect) take the same path.
+    for icmp_type in [133u8, 134, 135, 136, 137] {
+        let pkt = icmpv6_pkt(icmp_type, "2001:db8::2");
+        let before_ndp = h.stat(StatIdx::PassNdp);
+        let before_hit = h.stat(StatIdx::CustomFibHit);
+        let before_matched = h.stat(StatIdx::MatchedV6);
+
+        let (verdict, out) = h.run(&pkt);
+
+        assert_eq!(
+            verdict,
+            xdp_action::XDP_PASS,
+            "ICMPv6 type {icmp_type} must be passed to the kernel"
+        );
+        assert_eq!(
+            h.stat(StatIdx::PassNdp),
+            before_ndp + 1,
+            "type {icmp_type} must bump pass_ndp"
+        );
+        assert_eq!(
+            h.stat(StatIdx::CustomFibHit),
+            before_hit,
+            "type {icmp_type} must not reach the FIB"
+        );
+        assert_eq!(
+            h.stat(StatIdx::MatchedV6),
+            before_matched,
+            "type {icmp_type} is gated before the allowlist, so must not count as matched"
+        );
+        // Byte-identity is the assertion that actually matters: hop
+        // limit still 255 and MACs untouched, so the receiver will
+        // accept it.
+        assert_eq!(out, pkt, "type {icmp_type} must be delivered unmodified");
+        assert_eq!(out[21], 255, "hop limit must not be decremented");
+    }
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn ndp_guard_does_not_deoptimize_other_icmpv6_or_tcp() {
+    let mut h = prep_custom_fib_harness();
+    h.add_allow_v6("2001:db8::/32");
+    h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
+    h.add_fib_v6_single("2001:db8::2/128", 2);
+
+    // ICMPv6 echo request (128) is not an NDP type; it must still
+    // fast-path even at hop limit 255. This is why the guard keys on
+    // message type rather than `hop_limit == 255`.
+    let pkt = icmpv6_pkt(128, "2001:db8::2");
+    let before_ndp = h.stat(StatIdx::PassNdp);
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(
+        verdict,
+        xdp_action::XDP_REDIRECT,
+        "echo must still redirect"
+    );
+    assert_eq!(&out[0..6], &HOST_MAC);
+    assert_eq!(
+        h.stat(StatIdx::PassNdp),
+        before_ndp,
+        "echo must not bump pass_ndp"
+    );
+
+    // And ordinary TCP to the same destination is unaffected.
+    let pkt = Ipv6TcpBuilder {
+        dst_ip: v6_dst("2001:db8::2"),
+        ..Default::default()
+    }
+    .build();
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(&out[0..6], &HOST_MAC);
+}
+
 // ========== Custom-FIB hit with incomplete neighbor =======================
 
 #[test]

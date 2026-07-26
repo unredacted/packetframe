@@ -177,7 +177,7 @@ sudo packetframe reconfigure                # synchronous; exits non-zero on par
 sudo systemctl reload packetframe           # equivalent under systemd; both end up sending SIGHUP
 ```
 
-What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
+What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix`/`local-prefix6` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
 
 ### 6. Tear down
 
@@ -260,7 +260,8 @@ Quick directive index:
 - `forwarding-mode {kernel-fib|custom-fib|compare}`
 - `route-source bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]`
 - `route-source bmp <addr>:<port> [require-loc-rib]`
-- `local-prefix <cidr> via <iface> [arp-scavenge]`: per-host fast-path for connected destinations
+- `local-prefix <cidr> via <iface> [arp-scavenge]`: per-host /32 fast-path for connected IPv4 destinations
+- `local-prefix6 <cidr> via <iface>`: per-host /128 equivalent, resolved via NDP (no `arp-scavenge`; a /64 is not enumerable)
 - `fallback-default via <iface> nexthop <ipv4>`: synthetic 0.0.0.0/0 catch-all
 - `block-prefix <cidr>`: XDP-time drop for unrouteable destinations
 - `ecmp-default-hash-mode {3|4|5}`: tuple width for ECMP hashing
@@ -274,7 +275,7 @@ Quick directive index:
 **Module fast-path: driver opt-ins**
 - `driver-workaround rvu-nicpf-head-shift {auto|on|off}`
 
-`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, and forwarding-mode bits. Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, or editing `local-prefix` requires a restart.
+`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, and forwarding-mode bits. Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, or editing `local-prefix`/`local-prefix6` requires a restart.
 
 ## Operator tools
 

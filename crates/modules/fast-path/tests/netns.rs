@@ -613,43 +613,26 @@ fn snapshot_all_stats(bpf: &Ebpf) -> Vec<u64> {
 }
 
 /// Produce a vec of `(name, delta)` for every counter whose value
-/// changed between snapshots. Names match the `StatIdx` enum variants
-/// so the output is readable in CI failure logs.
+/// changed between snapshots, named from the authoritative
+/// `metrics::COUNTER_NAMES` mirror so the output is readable in CI
+/// failure logs.
 fn delta_labels(before: &[u64], after: &[u64]) -> Vec<(&'static str, u64)> {
-    const NAMES: &[&str] = &[
-        "rx_total",
-        "matched_v4",
-        "matched_v6",
-        "matched_src_only",
-        "matched_dst_only",
-        "matched_both",
-        "fwd_ok",
-        "fwd_dry_run",
-        "pass_fragment",
-        "pass_low_ttl",
-        "pass_no_neigh",
-        "pass_not_ip",
-        "pass_frag_needed",
-        "drop_unreachable",
-        "err_parse",
-        "err_fib_other",
-        "err_vlan",
-        "pass_not_in_devmap",
-        "pass_complex_header",
-        "err_head_shift",
-    ];
+    let names = &packetframe_fast_path::metrics::COUNTER_NAMES;
     before
         .iter()
         .zip(after.iter())
         .enumerate()
-        .filter_map(
-            |(i, (b, a))| {
-                if a > b {
-                    Some((NAMES[i], a - b))
-                } else {
-                    None
-                }
-            },
-        )
+        .filter_map(|(i, (b, a))| {
+            if a > b {
+                // `.get()` rather than `names[i]`: the snapshot is sized
+                // from the test-local STATS_COUNT, so a counter appended
+                // to StatIdx without a name landing here yet would
+                // otherwise panic the test instead of reporting the
+                // delta it was written to catch.
+                Some((names.get(i).copied().unwrap_or("unknown_stat"), a - b))
+            } else {
+                None
+            }
+        })
         .collect()
 }

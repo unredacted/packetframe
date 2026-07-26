@@ -173,6 +173,30 @@ pub enum ModuleDirective {
         arp_scavenge: bool,
         line: usize,
     },
+    /// IPv6 counterpart of [`Self::LocalPrefix`]: `local-prefix6 <cidr>
+    /// via <iface>`. The resolver synthesizes per-/128 routes from the
+    /// kernel's NDP neighbour table, nexthop = the host itself, so the
+    /// /128 wins the `FIB_V6` LPM walk over any covering route.
+    ///
+    /// Deliberately has **no** `arp-scavenge` counterpart. Enumeration
+    /// is the wrong tool for IPv6 at any cap: SLAAC (RFC 4862) and
+    /// stable-privacy addressing (RFC 7217) scatter host addresses
+    /// across the full 64-bit interface-identifier space, so a swept
+    /// range would match essentially no autoconfigured host. The hosts a
+    /// sweep *could* find (hand-numbered `::1..::ff` servers) are
+    /// statically configured and actively talking, which means they are
+    /// already in the neighbour table that reactive seeding reads. See
+    /// `docs/runbooks/custom-fib.md`.
+    ///
+    /// Requires a matching `allow-prefix6`: the allowlist is consulted
+    /// before the FIB lookup, so a /128 in `FIB_V6` does nothing if the
+    /// covering prefix isn't allowlisted. Restart-only, like its v4
+    /// sibling; SIGHUP does not reconcile it.
+    LocalPrefix6 {
+        cidr: Ipv6Prefix,
+        iface: String,
+        line: usize,
+    },
     /// Synthetic IPv4 default route for the custom FIB (v0.2.1). With
     /// `fallback-default via <iface> nexthop <ipv4>`, the resolver
     /// injects a `RouteEvent::Add { prefix: 0.0.0.0/0, nexthops: [nh] }`
@@ -483,6 +507,225 @@ pub struct Ipv6Prefix {
     pub prefix_len: u8,
 }
 
+impl Ipv4Prefix {
+    /// The prefix's network address, i.e. `addr` with host bits cleared.
+    ///
+    /// Declarations are not required to be aligned: `10.0.0.5/24` is
+    /// accepted and treated as `10.0.0.0/24`. Callers that need the
+    /// canonical form use this.
+    pub fn network(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.addr) & mask_v4(self.prefix_len))
+    }
+
+    /// True iff `ip` falls within this prefix. Host bits in the
+    /// declaration are ignored (see [`Self::network`]).
+    pub fn contains_addr(&self, ip: Ipv4Addr) -> bool {
+        let m = mask_v4(self.prefix_len);
+        u32::from(ip) & m == u32::from(self.addr) & m
+    }
+
+    /// True iff `inner` is equal to or wholly contained within `self`.
+    ///
+    /// A longer prefix can never contain a shorter one, so this is
+    /// `false` whenever `inner` is less specific than `self`.
+    pub fn contains_prefix(&self, inner: &Ipv4Prefix) -> bool {
+        self.prefix_len <= inner.prefix_len && self.contains_addr(inner.addr)
+    }
+}
+
+impl Ipv6Prefix {
+    /// The prefix's network address, i.e. `addr` with host bits cleared.
+    /// See [`Ipv4Prefix::network`] for the alignment convention.
+    pub fn network(&self) -> Ipv6Addr {
+        Ipv6Addr::from((u128::from(self.addr) & mask_v6(self.prefix_len)).to_be_bytes())
+    }
+
+    /// True iff `ip` falls within this prefix. Host bits in the
+    /// declaration are ignored.
+    pub fn contains_addr(&self, ip: Ipv6Addr) -> bool {
+        let m = mask_v6(self.prefix_len);
+        u128::from(ip) & m == u128::from(self.addr) & m
+    }
+
+    /// True iff `inner` is equal to or wholly contained within `self`.
+    pub fn contains_prefix(&self, inner: &Ipv6Prefix) -> bool {
+        self.prefix_len <= inner.prefix_len && self.contains_addr(inner.addr)
+    }
+}
+
+/// Host-bit mask for an IPv4 prefix length.
+///
+/// Both ends need guarding: `!0u32 << 32` is a shift-overflow panic in
+/// debug, and in release Rust masks the shift amount to `32 & 31 == 0`,
+/// yielding `!0` — so a `/0` would silently match only its own exact
+/// address instead of everything. The release behavior is the dangerous
+/// one because it fails silently.
+#[inline]
+fn mask_v4(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else if prefix_len >= 32 {
+        !0
+    } else {
+        (!0u32) << (32 - prefix_len as u32)
+    }
+}
+
+/// Host-bit mask for an IPv6 prefix length. Same shift-overflow
+/// reasoning as [`mask_v4`], with `!0u128 << 128` as the trap.
+#[inline]
+fn mask_v6(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else if prefix_len >= 128 {
+        !0
+    } else {
+        (!0u128) << (128 - prefix_len as u32)
+    }
+}
+
+/// True iff `a` could plausibly be a connected host we should
+/// synthesize a `/128` FIB entry for.
+///
+/// The rejected classes all share one property: forwarding a packet to
+/// them via `bpf_redirect_map` is either meaningless or actively wrong,
+/// so a `/128` naming one wastes a slot in the shared 8192-entry
+/// `NEXTHOPS` pool at best and misroutes at worst.
+///
+/// - **Multicast** (`ff00::/8`): the kernel keeps `NUD_NOARP` neighbour
+///   entries for multicast groups with a derived `33:33:xx` MAC, so they
+///   look exactly like resolved unicast neighbours to the resolver. They
+///   are never `NUD_GC`'d either, so a bad entry would persist for the
+///   process lifetime.
+/// - **Link-local** (`fe80::/10`): not a routed destination, and the
+///   resolver's neighbour cache is keyed by address alone — the same
+///   `fe80::` address legitimately exists on several interfaces with
+///   different MACs, so any entry would be ambiguous by construction.
+/// - **Unspecified / loopback / IPv4-mapped**: never valid on the wire
+///   as a forwarded destination. IPv4-mapped would additionally create a
+///   second, conflicting route for an address already covered by
+///   `FIB_V4`.
+///
+/// Unique-local (`fc00::/7`) is deliberately **allowed** — it is a
+/// legitimate choice for an internal connected segment.
+///
+/// Predicates are hand-rolled on the octets rather than using
+/// `Ipv6Addr::is_unicast_link_local` and friends: `is_global` and
+/// `is_unicast` are still nightly-only, so hand-rolling keeps this
+/// working on the pinned stable toolchain and testable without any
+/// toolchain-feature dependency.
+pub fn is_harvestable_v6(a: Ipv6Addr) -> bool {
+    let o = a.octets();
+    // ff00::/8 multicast
+    if o[0] == 0xff {
+        return false;
+    }
+    // fe80::/10 link-local unicast
+    if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
+        return false;
+    }
+    // ::ffff:0:0/96 IPv4-mapped
+    if o[..10].iter().all(|b| *b == 0) && o[10] == 0xff && o[11] == 0xff {
+        return false;
+    }
+    // :: and ::1
+    if a.is_unspecified() || a.is_loopback() {
+        return false;
+    }
+    true
+}
+
+/// The address classes [`is_harvestable_v6`] rejects, as prefixes, so a
+/// `local-prefix6` declaration can be screened for overlap at parse
+/// time. Paired with the operator-facing reason.
+const FORBIDDEN_V6_CLASSES: [(Ipv6Prefix, &str); 5] = [
+    (
+        Ipv6Prefix {
+            addr: Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
+            prefix_len: 8,
+        },
+        "multicast (ff00::/8)",
+    ),
+    (
+        Ipv6Prefix {
+            addr: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+            prefix_len: 10,
+        },
+        "link-local (fe80::/10)",
+    ),
+    (
+        Ipv6Prefix {
+            addr: Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0),
+            prefix_len: 96,
+        },
+        "IPv4-mapped (::ffff:0:0/96)",
+    ),
+    (
+        Ipv6Prefix {
+            addr: Ipv6Addr::UNSPECIFIED,
+            prefix_len: 128,
+        },
+        "the unspecified address (::/128)",
+    ),
+    (
+        Ipv6Prefix {
+            addr: Ipv6Addr::LOCALHOST,
+            prefix_len: 128,
+        },
+        "loopback (::1/128)",
+    ),
+];
+
+/// Reject a `local-prefix6` CIDR that is, or overlaps, an address class
+/// that must never be harvested into a `/128`.
+///
+/// A well-formed global `/64` excludes `ff02::` and `fe80::` on its own
+/// via containment, so this exists to catch the copy-paste cases (an
+/// operator building the directive from `ip -6 neigh show`, which is
+/// mostly `fe80::` addresses) and `::/0`, which would harvest the entire
+/// neighbour table.
+fn reject_non_harvestable_prefix(line: usize, p: &Ipv6Prefix) -> Result<(), ConfigError> {
+    if p.prefix_len == 0 {
+        return Err(ConfigError::parse(
+            line,
+            "local-prefix6: `::/0` is not a valid connected prefix. It would harvest every \
+             entry in the neighbour table, including multicast and link-local, and burn one \
+             NEXTHOPS slot each. Declare the connected prefix instead (e.g. \
+             `local-prefix6 2602:f7d8:0:1337::/64 via br1337`)",
+        ));
+    }
+    for (class, reason) in FORBIDDEN_V6_CLASSES {
+        if class.contains_prefix(p) || p.contains_prefix(&class) {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "local-prefix6 {}/{} is or overlaps {reason}, which can never be a \
+                     forwarded connected-host destination. Declare the global-unicast \
+                     prefix assigned to the segment instead",
+                    p.addr, p.prefix_len
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Append a "did you mean the other family?" hint when a CIDR fails to
+/// parse for one family but succeeds for the other.
+///
+/// `local-prefix` and `local-prefix6` are separate keywords, so pasting
+/// a v6 CIDR under the v4 directive is the obvious slip. The underlying
+/// `FromStr` message is preserved rather than replaced, so a genuinely
+/// malformed CIDR still reports precisely what was wrong with it.
+fn wrong_family_hint(err: String, tok: &str, directive: &str) -> String {
+    let other = match directive {
+        "local-prefix" if tok.parse::<Ipv6Prefix>().is_ok() => "local-prefix6",
+        "local-prefix6" if tok.parse::<Ipv4Prefix>().is_ok() => "local-prefix",
+        _ => return err,
+    };
+    format!("{err} (did you mean `{other}`?)")
+}
+
 impl FromStr for Ipv4Prefix {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -624,6 +867,7 @@ impl Config {
                 let (iface, line) = match d {
                     ModuleDirective::Attach { iface, line, .. } => (iface, line),
                     ModuleDirective::LocalPrefix { iface, line, .. } => (iface, line),
+                    ModuleDirective::LocalPrefix6 { iface, line, .. } => (iface, line),
                     ModuleDirective::FallbackDefault { iface, line, .. } => (iface, line),
                     _ => continue,
                 };
@@ -638,6 +882,68 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// One warning per `local-prefix` / `local-prefix6` directive that no
+/// same-family `allow-prefix` / `allow-prefix6` even overlaps.
+///
+/// The allowlist is consulted *before* the FIB lookup, so a synthesized
+/// host route does nothing when inbound traffic to it never matches the
+/// allowlist — the feature silently no-ops. The runbook names this the
+/// top operator footgun, and `local-prefix6` doubles the exposure
+/// because the v4 and v6 allowlists are declared separately.
+///
+/// Advisory only, never fatal: the check looks for *any overlap* rather
+/// than full coverage, so it fires only on the forgot-it-entirely case
+/// and cannot false-positive on a prefix jointly covered by several
+/// narrower allow entries. Callers log each returned string at WARN.
+pub fn uncovered_local_prefix_warnings(directives: &[ModuleDirective]) -> Vec<String> {
+    let mut allow_v4: Vec<Ipv4Prefix> = Vec::new();
+    let mut allow_v6: Vec<Ipv6Prefix> = Vec::new();
+    for d in directives {
+        match d {
+            ModuleDirective::AllowPrefix4(p) => allow_v4.push(*p),
+            ModuleDirective::AllowPrefix6(p) => allow_v6.push(*p),
+            _ => {}
+        }
+    }
+    let overlaps_v4 = |l: &Ipv4Prefix| {
+        allow_v4
+            .iter()
+            .any(|a| a.contains_prefix(l) || l.contains_prefix(a))
+    };
+    let overlaps_v6 = |l: &Ipv6Prefix| {
+        allow_v6
+            .iter()
+            .any(|a| a.contains_prefix(l) || l.contains_prefix(a))
+    };
+
+    let mut out = Vec::new();
+    for d in directives {
+        match d {
+            ModuleDirective::LocalPrefix {
+                cidr, iface, line, ..
+            } if !overlaps_v4(cidr) => {
+                out.push(format!(
+                    "local-prefix {}/{} via {iface} (line {line}) has no overlapping \
+                     allow-prefix; the allowlist is checked before the FIB lookup, so its \
+                     synthesized /32s will never be used. Add a covering `allow-prefix`",
+                    cidr.addr, cidr.prefix_len
+                ));
+            }
+            ModuleDirective::LocalPrefix6 { cidr, iface, line } if !overlaps_v6(cidr) => {
+                out.push(format!(
+                    "local-prefix6 {}/{} via {iface} (line {line}) has no overlapping \
+                     allow-prefix6; the allowlist is checked before the FIB lookup, so its \
+                     synthesized /128s will never be used. Add a covering `allow-prefix6` \
+                     (the v4 allowlist does not cover v6)",
+                    cidr.addr, cidr.prefix_len
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 enum Cursor {
@@ -987,9 +1293,9 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                     }
                 }
             }
-            let p: Ipv4Prefix = cidr_tok
-                .parse()
-                .map_err(|e: String| ConfigError::parse(line, e))?;
+            let p: Ipv4Prefix = cidr_tok.parse().map_err(|e: String| {
+                ConfigError::parse(line, wrong_family_hint(e, cidr_tok, "local-prefix"))
+            })?;
             // Cap arp-scavenge at /22 (≤ 1024 hosts) to avoid kernel
             // gc_thresh3 overflow. Larger prefixes silently fall back to
             // arp-scavenge=false with a config-error so the operator
@@ -1008,6 +1314,72 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 cidr: p,
                 iface: iface.to_string(),
                 arp_scavenge,
+                line,
+            })
+        }
+        "local-prefix6" => {
+            // Grammar: local-prefix6 <cidr> via <iface>
+            //
+            // Structure mirrors the `local-prefix` arm above, including
+            // the ordering: `via`/iface/tail-flag errors are reported
+            // before the CIDR is parsed. There are no valid tail flags
+            // here, so the tail loop only rejects.
+            let cidr_tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "local-prefix6 requires a CIDR (e.g. 2602:f7d8:0:1337::/64)",
+                )
+            })?;
+            let via_tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "local-prefix6 requires `via <iface>` after the CIDR")
+            })?;
+            if via_tok != "via" {
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "local-prefix6: expected `via` after the CIDR, got `{via_tok}` \
+                         (form: `local-prefix6 <cidr> via <iface>`)"
+                    ),
+                ));
+            }
+            let iface = rest.next().ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    "local-prefix6: expected an interface name after `via`",
+                )
+            })?;
+            validate_iface_name(line, "local-prefix6", iface)?;
+            // No valid tail flags in this grammar, so the first extra
+            // token is always an error. `arp-scavenge` gets a specific
+            // message because reaching for it here is the natural
+            // mistake once an operator knows the v4 form.
+            if let Some(tail) = rest.next() {
+                if tail == "arp-scavenge" {
+                    return Err(ConfigError::parse(
+                        line,
+                        "local-prefix6: arp-scavenge is IPv4-only. A /64 is not enumerable, \
+                         and SLAAC / RFC 7217 scatter host addresses across the whole \
+                         64-bit interface identifier, so a swept range would find almost \
+                         nothing. IPv6 relies on reactive seeding instead (startup \
+                         neighbour dump + RTM_NEWNEIGH), which already covers every host \
+                         the kernel has resolved",
+                    ));
+                }
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "local-prefix6: unknown tail flag `{tail}` \
+                         (form: `local-prefix6 <cidr> via <iface>`; no flags are recognized)"
+                    ),
+                ));
+            }
+            let p: Ipv6Prefix = cidr_tok.parse().map_err(|e: String| {
+                ConfigError::parse(line, wrong_family_hint(e, cidr_tok, "local-prefix6"))
+            })?;
+            reject_non_harvestable_prefix(line, &p)?;
+            Ok(ModuleDirective::LocalPrefix6 {
+                cidr: p,
+                iface: iface.to_string(),
                 line,
             })
         }
@@ -2120,6 +2492,109 @@ module fast-path
         assert_eq!(p.prefix_len, 48);
     }
 
+    // --- Prefix containment helpers -------------------------------------
+    //
+    // These back `LocalPrefixSpec::contains` in the fast-path resolver
+    // and `prefix_contains` in linux_impl, so the `/0` and `/max` cases
+    // are guarding real shift-overflow traps, not hypotheticals.
+
+    fn v4(s: &str) -> Ipv4Prefix {
+        s.parse().expect("v4 prefix")
+    }
+
+    fn v6(s: &str) -> Ipv6Prefix {
+        s.parse().expect("v6 prefix")
+    }
+
+    #[test]
+    fn v4_contains_addr_basic() {
+        let p = v4("23.191.200.0/24");
+        assert!(p.contains_addr("23.191.200.0".parse().unwrap()));
+        assert!(p.contains_addr("23.191.200.10".parse().unwrap()));
+        assert!(p.contains_addr("23.191.200.255".parse().unwrap()));
+        assert!(!p.contains_addr("23.191.201.0".parse().unwrap()));
+        assert!(!p.contains_addr("23.191.199.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn v4_contains_addr_slash32_is_exact() {
+        let p = v4("10.10.1.2/32");
+        assert!(p.contains_addr("10.10.1.2".parse().unwrap()));
+        assert!(!p.contains_addr("10.10.1.3".parse().unwrap()));
+        assert!(!p.contains_addr("10.10.1.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn v4_contains_addr_slash0_matches_everything() {
+        // Guards `!0u32 << 32`.
+        let p = v4("0.0.0.0/0");
+        assert!(p.contains_addr("1.2.3.4".parse().unwrap()));
+        assert!(p.contains_addr("255.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn v4_contains_addr_ignores_declared_host_bits() {
+        let p = v4("23.191.200.5/24");
+        assert!(p.contains_addr("23.191.200.10".parse().unwrap()));
+        assert_eq!(p.network(), "23.191.200.0".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn v6_contains_addr_basic() {
+        let p = v6("2602:f7d8:0:1337::/64");
+        assert!(p.contains_addr("2602:f7d8:0:1337::1".parse().unwrap()));
+        assert!(p.contains_addr("2602:f7d8:0:1337:dead:beef::42".parse().unwrap()));
+        assert!(!p.contains_addr("2602:f7d8:0:1338::1".parse().unwrap()));
+        assert!(!p.contains_addr("2602:f7d8:1::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_contains_addr_slash128_is_exact() {
+        let p = v6("2001:db8::2/128");
+        assert!(p.contains_addr("2001:db8::2".parse().unwrap()));
+        assert!(!p.contains_addr("2001:db8::3".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_contains_addr_slash0_matches_everything() {
+        // Guards `!0u128 << 128`. In release that shift silently yields
+        // `!0`, which would make `::/0` match only `::` — a quiet
+        // wrong-answer rather than a panic.
+        let p = v6("::/0");
+        assert!(p.contains_addr("2001:db8::1".parse().unwrap()));
+        assert!(p.contains_addr("::".parse().unwrap()));
+        assert!(p.contains_addr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_contains_addr_ignores_declared_host_bits() {
+        let p = v6("2602:f7d8:0:1337::5/64");
+        assert!(p.contains_addr("2602:f7d8:0:1337::10".parse().unwrap()));
+        assert_eq!(
+            p.network(),
+            "2602:f7d8:0:1337::".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn contains_prefix_rejects_less_specific_inner() {
+        // A /24 does not contain the /16 that covers it.
+        assert!(!v4("10.1.0.0/24").contains_prefix(&v4("10.1.0.0/16")));
+        assert!(v4("10.1.0.0/16").contains_prefix(&v4("10.1.0.0/24")));
+        // Equal prefixes contain each other.
+        assert!(v4("10.1.0.0/24").contains_prefix(&v4("10.1.0.0/24")));
+        // Disjoint.
+        assert!(!v4("10.1.0.0/16").contains_prefix(&v4("10.2.0.0/24")));
+    }
+
+    #[test]
+    fn contains_prefix_v6() {
+        assert!(v6("2602:f7d8::/48").contains_prefix(&v6("2602:f7d8:0:1337::/64")));
+        assert!(!v6("2602:f7d8::/48").contains_prefix(&v6("2602:f7d8:1::/48")));
+        assert!(!v6("2602:f7d8:0:1337::/64").contains_prefix(&v6("2602:f7d8::/48")));
+        assert!(v6("::/0").contains_prefix(&v6("2001:db8::/32")));
+    }
+
     // --- Option F config directive tests ---
 
     fn parse_module_body(body: &str) -> Result<ModuleSection, ConfigError> {
@@ -2811,6 +3286,299 @@ module fast-path
             other => panic!("expected InterfaceMissing, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- local-prefix6 (IPv6 connected fast-path) ------------------------
+
+    fn extract_local_prefixes6(body: &str) -> Vec<(Ipv6Prefix, String)> {
+        let m = parse_module_body(body).expect("parse");
+        m.directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::LocalPrefix6 { cidr, iface, .. } => Some((*cidr, iface.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_prefix6_parses_basic_form() {
+        let lp = extract_local_prefixes6("  local-prefix6 2602:f7d8:0:1337::/64 via br1337\n");
+        assert_eq!(lp.len(), 1);
+        assert_eq!(
+            lp[0].0.addr,
+            "2602:f7d8:0:1337::".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(lp[0].0.prefix_len, 64);
+        assert_eq!(lp[0].1, "br1337");
+    }
+
+    #[test]
+    fn local_prefix6_multiple_directives_accumulate() {
+        let body = "  local-prefix6 2602:f7d8:0:1337::/64 via br1337\n\
+                    local-prefix6 2602:f7d8:0:88::/64 via br88\n\
+                    local-prefix6 fd00:1::/64 via br0\n";
+        let lp = extract_local_prefixes6(body);
+        assert_eq!(lp.len(), 3);
+        let ifaces: Vec<&str> = lp.iter().map(|(_, i)| i.as_str()).collect();
+        assert_eq!(ifaces, ["br1337", "br88", "br0"]);
+    }
+
+    #[test]
+    fn local_prefix6_unique_local_is_allowed() {
+        // fc00::/7 is a legitimate connected segment; only the classes
+        // that can never be forwarded are rejected.
+        let lp = extract_local_prefixes6("  local-prefix6 fd00:1234::/64 via br0\n");
+        assert_eq!(lp.len(), 1);
+    }
+
+    #[test]
+    fn local_prefix6_and_v4_coexist_without_cross_contamination() {
+        let body = "  local-prefix 23.191.200.0/24 via br1337\n\
+                    local-prefix6 2602:f7d8:0:1337::/64 via br1337\n";
+        let v4 = extract_local_prefixes(body);
+        let v6 = extract_local_prefixes6(body);
+        assert_eq!(v4.len(), 1, "v4 extractor must see only the v4 directive");
+        assert_eq!(v6.len(), 1, "v6 extractor must see only the v6 directive");
+        assert_eq!(v4[0].0.prefix_len, 24);
+        assert_eq!(v6[0].0.prefix_len, 64);
+    }
+
+    #[test]
+    fn local_prefix6_rejects_default_route() {
+        // The highest-value rejection: ::/0 would harvest the entire
+        // neighbour table, multicast and link-local included.
+        let e = parse_module_body("  local-prefix6 ::/0 via br0\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("::/0"), "got: {msg}");
+    }
+
+    #[test]
+    fn local_prefix6_rejects_multicast_prefix() {
+        for cidr in ["ff00::/8", "ff02::/16", "ff02::1/128"] {
+            let e = parse_module_body(&format!("  local-prefix6 {cidr} via br0\n")).unwrap_err();
+            let msg = format!("{e}");
+            assert!(msg.contains("multicast"), "{cidr} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn local_prefix6_rejects_link_local_prefix() {
+        for cidr in ["fe80::/10", "fe80::/64", "fe80::1/128"] {
+            let e = parse_module_body(&format!("  local-prefix6 {cidr} via br0\n")).unwrap_err();
+            let msg = format!("{e}");
+            assert!(msg.contains("link-local"), "{cidr} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn local_prefix6_rejects_unspecified_loopback_and_ipv4_mapped() {
+        for (cidr, needle) in [
+            ("::/128", "unspecified"),
+            ("::1/128", "loopback"),
+            ("::ffff:0:0/96", "IPv4-mapped"),
+        ] {
+            let e = parse_module_body(&format!("  local-prefix6 {cidr} via br0\n")).unwrap_err();
+            let msg = format!("{e}");
+            assert!(msg.contains(needle), "{cidr} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn local_prefix6_rejects_arp_scavenge_with_reason() {
+        let e = parse_module_body("  local-prefix6 2602:f7d8:0:1337::/64 via br0 arp-scavenge\n")
+            .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("IPv4-only"), "got: {msg}");
+        assert!(msg.contains("not enumerable"), "got: {msg}");
+    }
+
+    #[test]
+    fn local_prefix6_missing_via_keyword_errors() {
+        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 br0\n").unwrap_err();
+        assert!(format!("{e}").contains("expected `via`"));
+    }
+
+    #[test]
+    fn local_prefix6_missing_iface_errors() {
+        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 via\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix6_missing_cidr_errors() {
+        let e = parse_module_body("  local-prefix6\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn local_prefix6_unknown_tail_flag_errors() {
+        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 via br0 garbage\n").unwrap_err();
+        assert!(format!("{e}").contains("unknown tail flag"));
+    }
+
+    #[test]
+    fn local_prefix6_iface_sanitized() {
+        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 via has space\n").unwrap_err();
+        assert!(matches!(e, ConfigError::Parse { .. }));
+    }
+
+    /// Regression guard for the paired-keyword design. A malformed v6
+    /// CIDR must still surface the precise `FromStr` diagnostic; a
+    /// try-v4-then-v6 polymorphic parser would collapse both into a
+    /// generic "cannot parse as IPv4 or IPv6".
+    #[test]
+    fn local_prefix6_bad_cidr_surfaces_precise_error() {
+        let e = parse_module_body("  local-prefix6 2001:db8::gg/64 via br0\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("bad IPv6"), "got: {msg}");
+
+        let e = parse_module_body("  local-prefix6 2001:db8::/129 via br0\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("0..=128"), "got: {msg}");
+    }
+
+    #[test]
+    fn local_prefix_family_mismatch_hints_at_other_directive() {
+        // v6 CIDR under the v4 keyword.
+        let e = parse_module_body("  local-prefix 2602:f7d8::/48 via br0\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("local-prefix6"), "got: {msg}");
+
+        // v4 CIDR under the v6 keyword.
+        let e = parse_module_body("  local-prefix6 23.191.200.0/24 via br0\n").unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("did you mean `local-prefix`"), "got: {msg}");
+    }
+
+    #[test]
+    fn local_prefix6_iface_validated_against_sysfs() {
+        let dir = std::env::temp_dir().join(format!(
+            "pf-cfg-local-prefix6-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("br1337")).unwrap();
+        // Note: br88 is deliberately missing.
+        let cfg = Config::parse(
+            "module fast-path\n  attach br1337 generic\n  \
+             local-prefix6 2602:f7d8:0:1337::/64 via br1337\n  \
+             local-prefix6 2602:f7d8:0:88::/64 via br88\n",
+        )
+        .expect("parse ok; validation runs separately");
+        let err = cfg.validate_interfaces_in(&dir).unwrap_err();
+        match err {
+            ConfigError::InterfaceMissing { iface, .. } => assert_eq!(iface, "br88"),
+            other => panic!("expected InterfaceMissing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_harvestable_v6_rejects_non_global_unicast() {
+        for a in [
+            "ff02::1",
+            "ff02::2",
+            "ff02::1:ff00:1", // solicited-node
+            "ff05::c",
+            "fe80::1",
+            "fe80::200:5eff:fe00:1",
+            "::",
+            "::1",
+            "::ffff:192.0.2.1",
+        ] {
+            assert!(
+                !is_harvestable_v6(a.parse().unwrap()),
+                "{a} must not be harvestable"
+            );
+        }
+        for a in [
+            "2602:f7d8:0:1337::42",
+            "2602:f7d8:0:1337::", // subnet-router anycast: a real address
+            "2001:db8::1",
+            "fd00:1::1", // unique-local is fine
+        ] {
+            assert!(
+                is_harvestable_v6(a.parse().unwrap()),
+                "{a} must be harvestable"
+            );
+        }
+    }
+
+    /// The per-address gate and the parse-time class table must agree,
+    /// or a prefix could pass validation and then have every address
+    /// inside it filtered at emission (or vice versa).
+    #[test]
+    fn harvestable_gate_agrees_with_forbidden_class_table() {
+        for (class, reason) in FORBIDDEN_V6_CLASSES {
+            assert!(
+                !is_harvestable_v6(class.addr),
+                "{reason}: class network address should be rejected by is_harvestable_v6"
+            );
+        }
+    }
+
+    // --- uncovered_local_prefix_warnings ---------------------------------
+
+    fn warnings_for(body: &str) -> Vec<String> {
+        let m = parse_module_body(body).expect("parse");
+        uncovered_local_prefix_warnings(&m.directives)
+    }
+
+    #[test]
+    fn covered_local_prefixes_produce_no_warnings() {
+        let w = warnings_for(
+            "  allow-prefix 23.191.200.0/24\n\
+             allow-prefix6 2602:f7d8::/48\n\
+             local-prefix 23.191.200.0/24 via br1337\n\
+             local-prefix6 2602:f7d8:0:1337::/64 via br1337\n",
+        );
+        assert!(w.is_empty(), "unexpected warnings: {w:?}");
+    }
+
+    /// The exact production slip this exists for: the operator carried
+    /// over the v4 pair but declared only half of the v6 pair.
+    #[test]
+    fn local_prefix6_without_allow_prefix6_warns() {
+        let w = warnings_for(
+            "  allow-prefix 23.191.200.0/24\n\
+             local-prefix 23.191.200.0/24 via br1337\n\
+             local-prefix6 2602:f7d8:0:1337::/64 via br1337\n",
+        );
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(w[0].contains("local-prefix6"), "got: {}", w[0]);
+        assert!(w[0].contains("allow-prefix6"), "got: {}", w[0]);
+    }
+
+    #[test]
+    fn local_prefix_v4_without_allow_warns() {
+        let w = warnings_for("  local-prefix 10.88.1.0/24 via br88\n");
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(w[0].contains("local-prefix 10.88.1.0/24"), "got: {}", w[0]);
+    }
+
+    #[test]
+    fn cross_family_allow_does_not_cover() {
+        // A v4 allowlist must not silence the v6 warning or vice versa.
+        let w = warnings_for(
+            "  allow-prefix6 2602:f7d8::/48\n\
+             local-prefix 23.191.200.0/24 via br1337\n",
+        );
+        assert_eq!(w.len(), 1, "got: {w:?}");
+    }
+
+    #[test]
+    fn overlap_counts_even_when_allow_is_narrower() {
+        // An allow entry narrower than the local prefix still means the
+        // operator wired the two together; only zero overlap warns.
+        let w = warnings_for(
+            "  allow-prefix 23.191.200.128/25\n\
+             local-prefix 23.191.200.0/24 via br1337\n",
+        );
+        assert!(w.is_empty(), "narrower allow overlaps, no warn: {w:?}");
     }
 
     // --- v0.2.1 fallback-default + block-prefix ---

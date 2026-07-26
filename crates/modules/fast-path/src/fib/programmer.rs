@@ -208,6 +208,73 @@ impl FibProgrammerHandle {
     }
 }
 
+/// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
+/// in dispatch order.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct RouteEventLog(std::sync::Arc<std::sync::Mutex<Vec<RouteEvent>>>);
+
+#[doc(hidden)]
+impl RouteEventLog {
+    /// Snapshot the events recorded so far.
+    pub fn events(&self) -> Vec<RouteEvent> {
+        self.0.lock().expect("RouteEventLog poisoned").clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.lock().expect("RouteEventLog poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Build a [`FibProgrammerHandle`] that records `RouteEvent`s instead of
+/// writing BPF maps, plus the log to inspect.
+///
+/// Exists so the neighbour resolver's `local-prefix` emission path can
+/// be tested against a real kernel neighbour table without also needing
+/// CAP_BPF, a bpffs mount, and a loaded ELF. That combination is why
+/// `with_local_prefixes` had no integration coverage at either family:
+/// the netns harness and the bpffs harness live in separate test crates
+/// that cannot import each other.
+///
+/// Replies `Ok` to everything. `Command` stays private; only the
+/// recorded events are observable.
+#[doc(hidden)]
+pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
+    let (tx, mut rx) = mpsc::channel::<Command>(256);
+    let log = RouteEventLog::default();
+    let sink = log.clone();
+    tokio::spawn(async move {
+        let mut next_id: NexthopId = 1;
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Command::ApplyRouteEvent { event, reply } => {
+                    sink.0
+                        .lock()
+                        .expect("RouteEventLog poisoned")
+                        .push(event.clone());
+                    let _ = reply.send(Ok(()));
+                }
+                Command::RegisterNexthop { reply, .. } => {
+                    let id = next_id;
+                    next_id = next_id.wrapping_add(1);
+                    let _ = reply.send(Ok(id));
+                }
+                Command::UnregisterNexthop { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+                Command::MirrorCounts { reply } => {
+                    let _ = reply.send((0, 0));
+                }
+            }
+        }
+    });
+    (FibProgrammerHandle { tx }, log)
+}
+
 enum Command {
     RegisterNexthop {
         ip: IpAddr,

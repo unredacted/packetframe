@@ -6,6 +6,7 @@
 //! stub (`stub_impl.rs`). macOS dev loops compile either way.
 
 use std::ffi::CString;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use aya::{
@@ -19,7 +20,8 @@ use aya::{
 };
 use packetframe_common::{
     config::{
-        AttachMode, DriverWorkaround, Ipv4Prefix, Ipv6Prefix, ModuleDirective, ToggleAutoOnOff,
+        uncovered_local_prefix_warnings, AttachMode, DriverWorkaround, Ipv4Prefix, Ipv6Prefix,
+        ModuleDirective, ToggleAutoOnOff,
     },
     module::{Attachment, HookType, LoaderCtx, ModuleConfig, ModuleError, ModuleResult},
 };
@@ -436,6 +438,11 @@ fn populate_blocklists(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
             _ => None,
         })
         .collect();
+    // v4-only by construction: the grammar has no `block-prefix6`, so
+    // `BLOCK_V6` is always empty and a `local-prefix6` has nothing to
+    // overlap against. TODO: if `block-prefix6` is ever added, this
+    // check must grow a v6 arm considering `LocalPrefix6` and
+    // `AllowPrefix6`, or v6 declarations will be silently unprotected.
     let local_v4: Vec<Ipv4Prefix> = mcfg
         .section
         .directives
@@ -485,16 +492,50 @@ fn populate_blocklists(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult
 /// True iff `outer` contains `inner` (inner's network is in outer
 /// AND inner's prefix_len is >= outer's). Used to detect overlap
 /// between block-prefix and allow-/local-prefix at startup.
+///
+/// Delegates to the shared helper so the mask arithmetic (and its
+/// shift-overflow guards) has one implementation.
 fn prefix_contains(outer: &Ipv4Prefix, inner: &Ipv4Prefix) -> bool {
-    if outer.prefix_len > inner.prefix_len {
-        return false;
+    outer.contains_prefix(inner)
+}
+
+/// Read `net.<family>.neigh.default.gc_thresh3` from procfs. `None` on
+/// any read/parse failure — the caller's check is advisory, so a
+/// missing sysctl (containers, exotic kernels) must not block startup.
+fn read_gc_thresh3(family: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/sys/net/{family}/neigh/default/gc_thresh3"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Startup capacity warning for the connected fast-path: the kernel's
+/// neighbour tables are the feed for local-prefix host routes, and each
+/// live neighbour inside a declared prefix consumes one slot in the
+/// shared `NEXTHOPS` pool (nexthop == destination, so no sharing).
+///
+/// On default sysctls (`gc_thresh3` = 1024 per family) the kernel caps
+/// the feed well below the pool and this never fires. Routers commonly
+/// raise `gc_thresh3`, though — and that moves the ceiling invisibly.
+/// Comparing the summed thresholds against the pool turns that cliff
+/// into a config-time diagnostic instead of a runtime surprise where
+/// dense segments starve BGP nexthops (`ProgrammerError::Full`).
+fn gc_thresh3_capacity_warning(v4: Option<u64>, v6: Option<u64>, cap: u32) -> Option<String> {
+    let total = v4.unwrap_or(0) + v6.unwrap_or(0);
+    if total <= u64::from(cap) {
+        return None;
     }
-    let mask: u32 = if outer.prefix_len == 0 {
-        0
-    } else {
-        (!0u32) << (32 - outer.prefix_len as u32)
-    };
-    (u32::from(outer.addr) & mask) == (u32::from(inner.addr) & mask)
+    Some(format!(
+        "kernel neighbour tables can hold {total} entries \
+         (net.ipv4/ipv6.neigh.default.gc_thresh3 = {} + {}), more than the shared \
+         NEXTHOPS pool ({cap}). Each neighbour inside a local-prefix consumes one \
+         slot, so dense segments can exhaust the pool and starve BGP nexthops; \
+         affected routes fall to the kernel slow path. See \
+         docs/runbooks/custom-fib.md (capacity considerations)",
+        v4.unwrap_or(0),
+        v6.unwrap_or(0),
+    ))
 }
 
 /// Extract the global `mss-clamp <mtu>` directive (the form with no
@@ -913,6 +954,9 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         // v0.2.1: collect operator-declared `local-prefix` directives
         // and pass them to the controller. Empty list = feature off
         // (back-compat with v0.2.0 configs that never had this).
+        //
+        // Both families land in one list; the resolver's spec type is
+        // IpAddr-based so its emission path handles them uniformly.
         let local_prefixes: Vec<crate::fib::netlink_neigh::LocalPrefixSpec> = cfg
             .section
             .directives
@@ -924,19 +968,43 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
                     arp_scavenge,
                     ..
                 } => Some(crate::fib::netlink_neigh::LocalPrefixSpec {
-                    addr: cidr.addr,
+                    addr: IpAddr::V4(cidr.addr),
                     prefix_len: cidr.prefix_len,
                     iface: iface.clone(),
                     arp_scavenge: *arp_scavenge,
                 }),
+                ModuleDirective::LocalPrefix6 { cidr, iface, .. } => {
+                    Some(crate::fib::netlink_neigh::LocalPrefixSpec {
+                        addr: IpAddr::V6(cidr.addr),
+                        prefix_len: cidr.prefix_len,
+                        iface: iface.clone(),
+                        // No v6 scavenge; parse-enforced.
+                        arp_scavenge: false,
+                    })
+                }
                 _ => None,
             })
             .collect();
         if !local_prefixes.is_empty() {
+            let v6_count = local_prefixes.iter().filter(|s| s.addr.is_ipv6()).count();
             info!(
-                count = local_prefixes.len(),
-                "v0.2.1 local-prefix connected fast-path enabled"
+                v4_count = local_prefixes.len() - v6_count,
+                v6_count, "local-prefix connected fast-path enabled"
             );
+            // Advisory startup checks for the two ways this feature
+            // silently no-ops or over-commits. Warn-only: an operator
+            // may stage config deliberately, and neither condition can
+            // corrupt anything.
+            for w in uncovered_local_prefix_warnings(&cfg.section.directives) {
+                warn!("{w}");
+            }
+            if let Some(w) = gc_thresh3_capacity_warning(
+                read_gc_thresh3("ipv4"),
+                read_gc_thresh3("ipv6"),
+                crate::fib::programmer::NEXTHOPS_CAP,
+            ) {
+                warn!("{w}");
+            }
         }
         // v0.2.1 issue #31: optional synthetic 0.0.0.0/0.
         let fallback_default: Option<crate::fib::netlink_neigh::FallbackDefaultSpec> =
@@ -1963,13 +2031,12 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
 fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
     stats: &aya::maps::PerCpuArray<T, u64>,
 ) -> ModuleResult<Vec<u64>> {
-    // `STATS_COUNT` in bpf/src/maps.rs. Keep in lockstep with the BPF
-    // side or the last counters show zero unfairly. Prior versions
-    // hardcoded an off-by-one (19 hid `err_head_shift`; 33 hid
-    // `mss_clamp_*`); v0.2.5 = 37 (32 + bogon + 2 mss-clamp + 2
-    // tail-call diagnostics).
-    const STATS_LEN: usize = 37;
-    let mut out = vec![0u64; STATS_LEN];
+    // Sized from `metrics::COUNTER_NAMES`, the single userspace mirror
+    // of `STATS_COUNT` in bpf/src/maps.rs. Prior versions hardcoded a
+    // separate length here, and it drifted three times (19 hid
+    // `err_head_shift`; 33 hid `mss_clamp_*`; 37 hid `pass_ndp`) —
+    // each time the newest counters silently read as absent.
+    let mut out = vec![0u64; crate::metrics::COUNTER_NAMES.len()];
     for (idx, slot) in out.iter_mut().enumerate() {
         let values = stats
             .get(&(idx as u32), 0)
@@ -2027,4 +2094,46 @@ pub fn bpffs_pin_root(state: &ActiveState) -> PathBuf {
 #[allow(dead_code)]
 pub fn state_dir(state: &ActiveState) -> &Path {
     &state.state_dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gc_thresh3_capacity_warning;
+
+    #[test]
+    fn default_sysctls_do_not_warn() {
+        // Kernel defaults: 1024 per family, far under the 8192 pool.
+        assert_eq!(
+            gc_thresh3_capacity_warning(Some(1024), Some(1024), 8192),
+            None
+        );
+    }
+
+    #[test]
+    fn raised_thresholds_warn_with_both_values() {
+        let w = gc_thresh3_capacity_warning(Some(8192), Some(16384), 8192)
+            .expect("must warn when the sum exceeds the pool");
+        assert!(w.contains("24576"), "total in message: {w}");
+        assert!(w.contains("8192 + 16384"), "per-family values: {w}");
+    }
+
+    #[test]
+    fn boundary_is_exclusive() {
+        // Exactly at the cap is not over-committed; only exceeding warns.
+        assert_eq!(
+            gc_thresh3_capacity_warning(Some(4096), Some(4096), 8192),
+            None
+        );
+        assert!(gc_thresh3_capacity_warning(Some(4096), Some(4097), 8192).is_some());
+    }
+
+    #[test]
+    fn unreadable_sysctls_never_warn() {
+        // Containers and exotic kernels may not expose the sysctl at
+        // all; the advisory check must stay silent rather than guess.
+        assert_eq!(gc_thresh3_capacity_warning(None, None, 8192), None);
+        // ...but a single readable family that alone exceeds the pool
+        // still warns.
+        assert!(gc_thresh3_capacity_warning(Some(65536), None, 8192).is_some());
+    }
 }

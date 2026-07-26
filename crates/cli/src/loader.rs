@@ -895,53 +895,11 @@ fn print_tail_call_chain(bpffs_root: &Path) {
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn print_stats(bpffs_root: &Path) {
-    // §4.6 counter names, indexed by `StatIdx` discriminants. Order
-    // matches `crates/modules/fast-path/bpf/src/maps.rs::StatIdx`.
-    // Append-only, adding new entries at the end is fine; renumbering
-    // breaks dashboards. Indices 0-19 are the kernel-fib counter set;
-    // 20-31 were appended in the Option F custom-FIB rollout (§4.11).
-    const NAMES: [&str; 37] = [
-        "rx_total",
-        "matched_v4",
-        "matched_v6",
-        "matched_src_only",
-        "matched_dst_only",
-        "matched_both",
-        "fwd_ok",
-        "fwd_dry_run",
-        "pass_fragment",
-        "pass_low_ttl",
-        "pass_no_neigh",
-        "pass_not_ip",
-        "pass_frag_needed",
-        "drop_unreachable",
-        "err_parse",
-        "err_fib_other",
-        "err_vlan",
-        "pass_not_in_devmap",
-        "pass_complex_header",
-        "err_head_shift",
-        // --- Custom FIB (Option F, Phase 1) ---
-        "custom_fib_hit",
-        "custom_fib_miss",
-        "custom_fib_no_neigh",
-        "compare_agree",
-        "compare_disagree",
-        "ecmp_hash_v4",
-        "ecmp_hash_v6",
-        "ecmp_dead_leg_fallback",
-        "route_source_resync",
-        "neigh_cache_miss",
-        "nexthop_seq_retry",
-        "bmp_peer_down",
-        "bogon_dropped",
-        // --- v0.2.4: mss-clamp ---
-        "mss_clamp_applied",
-        "mss_clamp_skipped",
-        // --- v0.2.5: two-stage datapath ---
-        "err_tail_call",
-        "err_mutation_ctx",
-    ];
+    // §4.6 counter names, indexed by `StatIdx` discriminants. The
+    // authoritative userspace mirror is
+    // `packetframe_fast_path::metrics::COUNTER_NAMES`; this used to be
+    // a third hand-copied list and drifted (see the comment there).
+    let names = &packetframe_fast_path::metrics::COUNTER_NAMES;
 
     print_fib_status(bpffs_root);
 
@@ -949,8 +907,8 @@ fn print_stats(bpffs_root: &Path) {
         Ok(values) => {
             println!();
             println!("counters (from {}):", bpffs_root.display());
-            let name_w = NAMES.iter().map(|n| n.len()).max().unwrap_or(20);
-            for (name, value) in NAMES.iter().zip(values.iter()) {
+            let name_w = names.iter().map(|n| n.len()).max().unwrap_or(20);
+            for (name, value) in names.iter().zip(values.iter()) {
                 println!("  {name:<name_w$}  {value}");
             }
         }

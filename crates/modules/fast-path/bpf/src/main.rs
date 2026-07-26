@@ -51,6 +51,15 @@ const PROTO_TCP: u8 = IpProto::Tcp as u8;
 const PROTO_UDP: u8 = IpProto::Udp as u8;
 const PROTO_ICMPV6: u8 = IpProto::Ipv6Icmp as u8;
 
+/// ICMPv6 neighbor-discovery message types (RFC 4861 §4): Router
+/// Solicitation (133), Router Advertisement (134), Neighbor Solicitation
+/// (135), Neighbor Advertisement (136), Redirect (137). All four of the
+/// first are hop-limit-255 messages whose receivers discard anything
+/// else; Redirect is likewise link-scoped. Contiguous, so the check is a
+/// range compare.
+const ICMPV6_ND_TYPE_MIN: u8 = 133;
+const ICMPV6_ND_TYPE_MAX: u8 = 137;
+
 /// Sentinel u16 representing "no VLAN" in the VID-passing API below.
 /// 802.1Q reserves VID 0 for priority-only tagging, so `vid == 0`
 /// means absent from the fast-path's perspective. Using a single u16
@@ -331,6 +340,33 @@ fn handle_ipv6(
         _ => {
             bump_stat(StatIdx::PassComplexHeader);
             return Ok(xdp_action::XDP_PASS);
+        }
+    }
+
+    // Neighbor discovery must never be fast-pathed. NDP mandates a hop
+    // limit of 255 and receivers silently discard NS/NA/RS/RA that
+    // arrive with anything else (RFC 4861 §6.1.1, §7.1.1), but
+    // `forward_success` decrements the hop limit and rewrites the
+    // source MAC. Redirecting NDP therefore breaks neighbor resolution
+    // on the segment: NUD fails and hosts fall back to permanent
+    // multicast re-resolution.
+    //
+    // This is reachable as soon as a `local-prefix6` installs /128s for
+    // connected hosts, because host-to-host unicast NDP (NUD probes,
+    // unsolicited NA) then matches the allowlist on src and resolves in
+    // FIB_V6 on dst. IPv4 never had this exposure: ARP is EtherType
+    // 0x0806, which is never dispatched into `handle_ipv4`.
+    //
+    // Gate on message type rather than `hop_limit == 255` so legitimate
+    // transit ICMPv6 (echo sent with a high hop limit) still fast-paths.
+    // MLD (types 130-132, 143) travels at hop limit 1 and is already
+    // caught by the `hop_limit <= 1` check below.
+    if next == PROTO_ICMPV6 {
+        if let Some(t) = icmpv6_type(ctx, ip_offset + Ipv6Hdr::LEN) {
+            if t >= ICMPV6_ND_TYPE_MIN && t <= ICMPV6_ND_TYPE_MAX {
+                bump_stat(StatIdx::PassNdp);
+                return Ok(xdp_action::XDP_PASS);
+            }
         }
     }
 
@@ -693,6 +729,21 @@ fn l4_ports(ctx: &XdpContext, offset: usize, proto: u8) -> (u16, u16) {
         let dport = core::ptr::read_unaligned(p.add(2) as *const u16);
         (sport, dport)
     }
+}
+
+/// Read the ICMPv6 `type` field, the first octet of the ICMPv6 header.
+///
+/// `None` when the read would run past `data_end`; callers treat that as
+/// "not an NDP message" and fall through to the normal path, which is
+/// fail-safe (a truncated ICMPv6 header can't be a valid NS/NA anyway).
+/// Bounds-check shape mirrors [`l4_ports`].
+#[inline(always)]
+fn icmpv6_type(ctx: &XdpContext, offset: usize) -> Option<u8> {
+    let start = ctx.data();
+    if start + offset + 1 > ctx.data_end() {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_unaligned((start + offset) as *const u8) })
 }
 
 #[inline(always)]

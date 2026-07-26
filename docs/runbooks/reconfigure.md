@@ -50,7 +50,7 @@ These need `systemctl restart packetframe` (or stop + run):
 - **`attach` directives (interface added or removed).** XDP attach mutates kernel-side state and risks brief link bounce on some drivers (SPEC §11.8). The reconcile path explicitly logs a warning and skips attach-set changes; your delta does not silently apply.
 - **`route-source` config (custom-FIB only).** The RouteController's runtime is started at attach. Editing the BGP/BMP listener address or peer-AS requires bringing the runtime down and back up.
 - **`circuit-breaker` thresholds.** The breaker sampler thread reads its config at thread start; it doesn't currently observe SIGHUP.
-- **`local-prefix` directives (custom-FIB only).** The connected-fast-path resolver is similarly attach-time-bound.
+- **`local-prefix` / `local-prefix6` directives (custom-FIB only).** The connected-fast-path resolver is similarly attach-time-bound. Both families are collected once at attach and handed to the resolver; editing either and reloading leaves the running set untouched with no warning.
 - **`bpffs-root`, `state-dir`.** Used at module load only; baked into the running daemon's pin paths and the metrics file location.
 
 If you change one of these in the config and reload, the daemon keeps using the old value silently (with a `WARN`-level log line for attach-set changes). Restart is the only way through.

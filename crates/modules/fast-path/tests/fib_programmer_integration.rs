@@ -34,7 +34,8 @@ use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::programmer::FibProgrammer;
 use packetframe_fast_path::fib::types::{
-    EcmpGroup, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_STATE_INCOMPLETE,
+    EcmpGroup, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_FAMILY_V4, NH_FAMILY_V6,
+    NH_STATE_INCOMPLETE,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -199,6 +200,15 @@ impl ProgrammerHarness {
     /// contend with the programmer's handle.
     fn read_fib_v4(&self, addr: [u8; 4], prefix_len: u8) -> Option<FibValue> {
         let trie = open_lpm_v4(&self.pins.path("FIB_V4"));
+        let key = LpmKey::new(u32::from(prefix_len), addr);
+        trie.get(&key, 0).ok()
+    }
+
+    /// FIB_V6 counterpart of [`Self::read_fib_v4`]. `open_lpm_v6` and
+    /// the `fib_v6` handle were already wired for the programmer; this
+    /// is the missing reader that lets tests assert on the v6 half.
+    fn read_fib_v6(&self, addr: [u8; 16], prefix_len: u8) -> Option<FibValue> {
+        let trie = open_lpm_v6(&self.pins.path("FIB_V6"));
         let key = LpmKey::new(u32::from(prefix_len), addr);
         trie.get(&key, 0).ok()
     }
@@ -423,6 +433,268 @@ fn peer_down_withdraws_all_peer_routes() {
     assert!(h.read_fib_v4([192, 0, 2, 0], 24).is_none());
     assert!(h.read_fib_v4([198, 51, 100, 0], 24).is_none());
     assert!(h.read_fib_v4([203, 0, 113, 0], 24).is_none());
+}
+
+// ========== IPv6 / local-prefix6 ==========
+//
+// The programmer's v6 write path had no integration coverage at all
+// before this, despite `open_lpm_v6` and the `fib_v6` handle being wired.
+
+fn v6(s: &str) -> [u8; 16] {
+    s.parse::<std::net::Ipv6Addr>().unwrap().octets()
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn add_single_nexthop_route_writes_fib_v6() {
+    let h = ProgrammerHarness::new();
+    let nh = IpAddr::V6("2001:db8::1".parse().unwrap());
+    let prefix = IpPrefix::V6 {
+        addr: v6("2001:db8:1::"),
+        prefix_len: 48,
+    };
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId(0xbbbb),
+                prefix,
+                nexthops: vec![nh],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+    })
+    .expect("apply Add");
+
+    let fib = h
+        .read_fib_v6(v6("2001:db8:1::"), 48)
+        .expect("FIB_V6[2001:db8:1::/48]");
+    assert_eq!(fib.kind, FIB_KIND_SINGLE, "single-nexthop route");
+    let entry = h.read_nexthop(fib.idx);
+    assert_eq!(entry.state, NH_STATE_INCOMPLETE);
+    // The family tag is set by the programmer but asserted nowhere else.
+    // XDP treats it as diagnostic-only, so a regression here would be
+    // invisible without this check.
+    assert_eq!(
+        entry.family, NH_FAMILY_V6,
+        "v6 nexthop must be tagged NH_FAMILY_V6"
+    );
+}
+
+/// The exact event shape `local-prefix6` emits: a /128 whose nexthop is
+/// the destination itself. Nexthop-equals-destination is unique to the
+/// connected fast-path and was untested at either family.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn local_prefix6_slash128_self_nexthop_round_trips() {
+    let h = ProgrammerHarness::new();
+    let host: std::net::Ipv6Addr = "2602:f7d8:0:1337::7".parse().unwrap();
+    let peer = PeerId::local_arp(33);
+    let prefix = IpPrefix::V6 {
+        addr: host.octets(),
+        prefix_len: 128,
+    };
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![IpAddr::V6(host)],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+    })
+    .expect("apply Add");
+
+    let fib = h
+        .read_fib_v6(host.octets(), 128)
+        .expect("FIB_V6 /128 present");
+    assert_eq!(fib.kind, FIB_KIND_SINGLE);
+    let idx = fib.idx;
+    assert_eq!(h.read_nexthop(idx).family, NH_FAMILY_V6);
+
+    // A repeated Add for an unchanged nexthop set must be a no-op
+    // rather than churning the map or leaking a slot. The resolver hits
+    // this constantly as v6 neighbours go stale and get re-probed.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![IpAddr::V6(host)],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+    })
+    .expect("apply duplicate Add");
+    let fib_again = h
+        .read_fib_v6(host.octets(), 128)
+        .expect("FIB_V6 /128 still present");
+    assert_eq!(fib_again.idx, idx, "duplicate Add must not reallocate");
+
+    // Withdrawal releases the entry.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix,
+                path_id: None,
+            })
+            .await
+    })
+    .expect("apply Del");
+    assert!(
+        h.read_fib_v6(host.octets(), 128).is_none(),
+        "Del must remove the /128"
+    );
+}
+
+/// One `PeerId::local_arp(ifindex)` covers both families, so a single
+/// PeerDown on RTM_DELLINK must sweep the v4 /32s and the v6 /128s
+/// together. This is the only exercise of that design decision.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn peer_down_withdraws_both_families_under_one_local_arp_peer_id() {
+    let h = ProgrammerHarness::new();
+    let peer = PeerId::local_arp(33);
+
+    let v4_hosts = [[23, 191, 200, 7], [23, 191, 200, 8], [23, 191, 200, 9]];
+    let v6_hosts = [
+        "2602:f7d8:0:1337::7",
+        "2602:f7d8:0:1337::8",
+        "2602:f7d8:0:1337::9",
+    ];
+
+    h.run(async {
+        for octets in v4_hosts {
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer,
+                    prefix: IpPrefix::V4 {
+                        addr: octets,
+                        prefix_len: 32,
+                    },
+                    nexthops: vec![IpAddr::V4(Ipv4Addr::from(octets))],
+                    path_id: None,
+                    local_pref: None,
+                })
+                .await
+                .expect("apply v4 Add");
+        }
+        for s in v6_hosts {
+            let a: std::net::Ipv6Addr = s.parse().unwrap();
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer,
+                    prefix: IpPrefix::V6 {
+                        addr: a.octets(),
+                        prefix_len: 128,
+                    },
+                    nexthops: vec![IpAddr::V6(a)],
+                    path_id: None,
+                    local_pref: None,
+                })
+                .await
+                .expect("apply v6 Add");
+        }
+    });
+
+    for octets in v4_hosts {
+        assert!(
+            h.read_fib_v4(octets, 32).is_some(),
+            "{octets:?} /32 present"
+        );
+    }
+    for s in v6_hosts {
+        assert!(h.read_fib_v6(v6(s), 128).is_some(), "{s} /128 present");
+    }
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::PeerDown { peer_id: peer })
+            .await
+    })
+    .expect("apply PeerDown");
+
+    for octets in v4_hosts {
+        assert!(
+            h.read_fib_v4(octets, 32).is_none(),
+            "{octets:?} /32 must be withdrawn"
+        );
+    }
+    for s in v6_hosts {
+        assert!(
+            h.read_fib_v6(v6(s), 128).is_none(),
+            "{s} /128 must be withdrawn by the same PeerDown"
+        );
+    }
+}
+
+/// The 8192-entry NEXTHOPS pool is shared across families and every BGP
+/// nexthop, and `local-prefix6` consumes one slot per connected host
+/// because nexthop == destination. Documents the single-pool invariant
+/// that capacity planning rests on.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn nexthop_pool_is_shared_across_families() {
+    let h = ProgrammerHarness::new();
+    let peer = PeerId(0xcccc);
+
+    h.run(async {
+        for i in 0..3u8 {
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer,
+                    prefix: IpPrefix::V4 {
+                        addr: [192, 0, 2, i],
+                        prefix_len: 32,
+                    },
+                    nexthops: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, i))],
+                    path_id: None,
+                    local_pref: None,
+                })
+                .await
+                .expect("v4 Add");
+            let a = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16);
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer,
+                    prefix: IpPrefix::V6 {
+                        addr: a.octets(),
+                        prefix_len: 128,
+                    },
+                    nexthops: vec![IpAddr::V6(a)],
+                    path_id: None,
+                    local_pref: None,
+                })
+                .await
+                .expect("v6 Add");
+        }
+    });
+
+    // Six distinct nexthops from one pool: no family partitioning, no
+    // id reuse across families.
+    let mut ids = Vec::new();
+    for i in 0..3u8 {
+        ids.push(h.read_fib_v4([192, 0, 2, i], 32).expect("v4 fib").idx);
+        let a = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16);
+        ids.push(h.read_fib_v6(a.octets(), 128).expect("v6 fib").idx);
+    }
+    let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), 6, "each host consumes its own slot: {ids:?}");
+
+    // Family tags still discriminate even though the pool is shared.
+    for i in 0..3u8 {
+        let v4_idx = h.read_fib_v4([192, 0, 2, i], 32).unwrap().idx;
+        assert_eq!(h.read_nexthop(v4_idx).family, NH_FAMILY_V4);
+        let a = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16);
+        let v6_idx = h.read_fib_v6(a.octets(), 128).unwrap().idx;
+        assert_eq!(h.read_nexthop(v6_idx).family, NH_FAMILY_V6);
+    }
 }
 
 #[test]

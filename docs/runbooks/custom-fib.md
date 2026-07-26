@@ -262,6 +262,10 @@ module fast-path
   local-prefix 23.191.200.0/24 via br1337    # customer LAN
   local-prefix 10.88.1.0/24    via br88      # Ceph internal
   local-prefix 10.10.1.0/24    via br0       # other LAN
+
+  # IPv6: same idea, one /128 per NDP neighbour. Declare the prefix
+  # actually configured on the iface, not the aggregate you announce.
+  local-prefix6 2602:f7d8:0:1337::/64 via br1337
 ```
 
 The `via <iface>` is required and must match the kernel iface
@@ -299,6 +303,37 @@ journalctl -u packetframe -f | grep 'neighbour resolver stats'
 sudo packetframe status | grep -E 'matched_v4|custom_fib_hit|custom_fib_miss|custom_fib_no_neigh'
 ```
 
+For `local-prefix6`, the same four checks with the v6 tools. Note
+`fib lookup` already accepts either family, so only the dump command
+differs:
+
+```sh
+# 1. One /128 per NDP neighbour inside each declared local-prefix6.
+sudo packetframe fib dump-v6 | grep '2602:f7d8:0:1337'
+
+# 2. A specific host: expect the connected iface's ifindex and that
+# host's own MAC, NOT one of your transit nexthops.
+sudo packetframe fib lookup 2602:f7d8:0:1337::7
+
+# 3. v6 has its own counters in the same stats line, kept separate so
+# a dual-stack segment stays readable.
+journalctl -u packetframe -f | grep 'neighbour resolver stats'
+#   ... local_nd_routes_added=12 local_nd_routes_removed=1
+
+# 4. pass_ndp should be non-zero and climbing: neighbor discovery is
+# deliberately handed to the kernel (see the NDP note below).
+sudo packetframe status | grep -E 'matched_v6|pass_ndp|custom_fib_hit|custom_fib_miss'
+```
+
+Cross-check the /128 set against the kernel. These two should agree,
+and the packetframe side must contain **no** `fe80::` or `ff02::`
+entries:
+
+```sh
+ip -6 neigh show dev br1337 | grep -v fe80
+sudo packetframe fib dump-v6 | grep '2602:f7d8:0:1337'
+```
+
 ### Capacity considerations
 
 Each declared local-prefix can register up to one /32 per active
@@ -308,6 +343,39 @@ under this (the reference EFG configured below uses ~500-1000 of
 8192). If you operate a *very* dense LAN where active hosts
 approach 8192, plan to either raise the cap (BPF rebuild) or skip
 the directive on that prefix and accept the slow-path fallback.
+
+**The pool is shared.** NEXTHOPS is one 8192-entry allocation covering
+v4 /32s, v6 /128s, *and* every BGP nexthop. Because these synthesized
+routes use nexthop == destination, there is no sharing: each connected
+host consumes its own slot. FIB_V6 itself holds 1,048,576 entries, so
+NEXTHOPS is always the binding constraint.
+
+**IPv6 multiplies this.** A host has one address in v4 and several in
+v6: a stable SLAAC address plus RFC 4941/8981 temporary addresses that
+rotate (Linux defaults give up to ~7 concurrently valid), plus possibly
+DHCPv6 and static. Only addresses that actually source traffic get
+learned, so 2-3 per host is typical and ~9 is the worst case — call it
+900-2700 hosts before the pool is the limit.
+
+In practice the kernel bounds this before packetframe does:
+`net.ipv6.neigh.default.gc_thresh3` defaults to 1024, and you cannot
+harvest more /128s than the kernel holds entries. **If you have raised
+`gc_thresh3`** (routers often do), that ceiling moves and the shared
+pool becomes reachable. packetframe checks this itself: at startup,
+when any local-prefix is configured, it compares the summed thresholds
+against the pool and logs a WARN when they exceed it. To check by hand:
+
+```sh
+cat /proc/sys/net/ipv4/neigh/default/gc_thresh3
+cat /proc/sys/net/ipv6/neigh/default/gc_thresh3
+```
+
+Exhaustion degrades cleanly rather than corrupting: the programmer
+returns `Full`, unwinds any partially-allocated nexthops, and the route
+simply isn't installed — one `WARN` per event, and that destination
+falls to the kernel. The risk worth watching is that a dense v6 segment
+starves *BGP* nexthops, which matters much more than losing a
+connected /128.
 
 ### When NOT to enable it
 
@@ -319,7 +387,24 @@ the directive on that prefix and accept the slow-path fallback.
 - **Operator hasn't declared the customer prefix in `allow-prefix`.**
   XDP filters on allowlist BEFORE the FIB lookup, so a /32 in the
   FIB does nothing if the parent prefix isn't matched. Add the
-  customer /24 to `allow-prefix` first.
+  customer /24 to `allow-prefix` first. Same for `local-prefix6`:
+  it needs a covering `allow-prefix6`, and that is a separate
+  directive — declaring only the v4 pair is the common slip.
+  packetframe logs a startup WARN for any local-prefix directive
+  with no overlapping same-family allow entry.
+- **The prefix isn't actually connected.** Declare what is configured
+  on the interface (`ip -6 addr show dev <iface>`), not the aggregate
+  you announce to the world. The announced aggregate is a null-routed
+  static in bird; it is not a connected prefix and must never reach
+  the FIB as a forwarding entry.
+- **Non-global-unicast v6 prefixes.** `local-prefix6` refuses
+  multicast (`ff00::/8`), link-local (`fe80::/10`), `::/0`, `::`,
+  `::1` and IPv4-mapped at parse time. None can be a forwarded
+  connected-host destination. `fe80::/10` is the tempting one, since
+  `ip -6 neigh show` is mostly link-local addresses — but they are
+  ambiguous across interfaces (the same `fe80::` address legitimately
+  exists on several with different MACs) and would burn a NEXTHOPS
+  slot each for routes that can never be used.
 - **Tunnels and weirdness.** Don't declare local-prefix on a tunnel
   iface (WireGuard, GRE, IPSec). The BPF program can't redirect
   to non-XDP-capable interfaces, so the /32 just sits unused.
@@ -327,11 +412,11 @@ the directive on that prefix and accept the slow-path fallback.
 
 ### Disabling
 
-Remove (or comment out) the `local-prefix` lines and restart
-packetframe. SIGHUP doesn't reconcile this directive in v0.2.1.
-A future version may add live add/remove via SIGHUP, but for
-now it's a startup-time-only configuration. The /32 entries get
-flushed on detach and don't reappear at next startup without the
+Remove (or comment out) the `local-prefix` / `local-prefix6` lines and
+restart packetframe. SIGHUP doesn't reconcile these directives in
+v0.2.1. A future version may add live add/remove via SIGHUP, but for
+now it's a startup-time-only configuration. The /32 and /128 entries
+get flushed on detach and don't reappear at next startup without the
 directive.
 
 ### `arp-scavenge` for quiet LANs (v0.2.1, issue #32)
@@ -371,6 +456,40 @@ fabric, which violates IX ToS (MANRS, anti-DoS) on most exchanges.
 customer LAN). For IX peer subnets, rely on bird's natural ARP
 behavior: bird already maintains ARP for active BGP peers, so
 their /32s will land via the normal nexthop-resolution path.
+
+#### There is no IPv6 equivalent, and there should not be
+
+`local-prefix6` rejects `arp-scavenge` at parse time. This is not a
+missing feature; enumeration is the wrong tool for IPv6 at any cap:
+
+- **A /64 is 2^64 addresses.** Even a "safe" cap of /118 (1024 hosts,
+  matching the v4 limit) only sweeps the bottom of the range.
+- **IPv6 hosts are not at the bottom of the range.** SLAAC (RFC 4862)
+  derives the interface identifier from the MAC, and stable-privacy
+  addressing (RFC 7217) hashes it. Both scatter hosts across the full
+  64-bit identifier space, so a swept range matches essentially no
+  autoconfigured host. The only hosts a sweep *could* find are
+  hand-numbered `::1..::ff` servers — and those are statically
+  configured and actively talking, which means they are already in the
+  neighbour table that reactive seeding reads.
+- **NS is noisier than ARP per probe.** Neighbor solicitation goes to
+  the target's solicited-node multicast group, so an N-address sweep
+  hits N *distinct* groups, defeating MLD-snooping caches, and
+  `mcast_solicit` retries each unanswered probe.
+
+So IPv6 relies entirely on reactive seeding: the startup neighbour dump
+plus `RTM_NEWNEIGH` events. In practice this is sufficient where the v4
+case was not, because v6 hosts announce themselves far more readily —
+DAD, router solicitation, and neighbor unreachability detection all put
+a host in the router's neighbour table without the router asking.
+
+If a v6 host is genuinely missing, force one round of resolution rather
+than reaching for a sweep:
+
+```sh
+ping6 -c1 -I br1337 ff02::1        # all-nodes on the segment
+ip -6 neigh show dev br1337        # then confirm it landed
+```
 
 ### `fallback-default` synthetic /0 (v0.2.1, issue #31)
 
@@ -713,6 +832,39 @@ The BMP route source is useful when:
   per fast-path module.
 
 ## Triage by symptom
+
+### Symptom: IPv4 is fine, IPv6 is flaky, and `ip -6 neigh` looks normal
+
+What it means: neighbor discovery is being disrupted on the segment.
+This is the signature to recognise, because nothing in `ip -6 neigh`
+output hints at it — entries look resolved, they just go stale and
+re-resolve constantly, and connections stall intermittently.
+
+The mechanism: NDP mandates a hop limit of 255, and RFC 4861 §6.1.1 /
+§7.1.1 require receivers to **silently discard** NS/NA/RS/RA that arrive
+with anything else. Fast-pathing decrements the hop limit and rewrites
+the source MAC, so a redirected neighbor solicitation is dropped by the
+host it was sent to. IPv4 never had this exposure: ARP is EtherType
+0x0806 and is never dispatched into the IPv4 path at all.
+
+packetframe guards against this by passing ICMPv6 types 133-137 (RS, RA,
+NS, NA, Redirect) straight to the kernel, before the allowlist and
+before any FIB lookup. Confirm the guard is active:
+
+```sh
+sudo packetframe status | grep pass_ndp
+```
+
+`pass_ndp` should be non-zero and climbing on any box with a
+`local-prefix6`. If it is flat at zero while v6 traffic is flowing and
+`matched_v6` is climbing, the running binary predates the guard —
+`local-prefix6` is unsafe on that build, and you should roll back to
+`forwarding-mode kernel-fib` or remove the `local-prefix6` lines until
+you can deploy a build that has it.
+
+Note that other ICMPv6 (echo, errors) is deliberately *not* gated: the
+guard keys on message type, not on hop limit, so ordinary ICMPv6 still
+fast-paths.
 
 ### Symptom: `custom_fib_miss` climbs without `custom_fib_hit` keeping pace
 
