@@ -58,7 +58,7 @@ use packetframe_fast_path::{aligned_bpf_copy, FAST_PATH_BPF_AVAILABLE};
 
 mod common;
 
-use common::{FpCfg, Ipv4TcpBuilder, StatIdx, FP_CFG_VERSION_V1};
+use common::{FpCfg, Ipv4TcpBuilder, StatIdx, FP_CFG_VERSION_V2};
 
 // Names are kept short + PID-suffixed so concurrent test runs don't
 // collide. Linux caps iface names at IFNAMSIZ=16; we stay well under.
@@ -471,8 +471,8 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
             FpCfg {
                 dry_run: 0,
                 flags: 0b11,
-                _reserved: [0; 2],
-                version: FP_CFG_VERSION_V1,
+                mss_clamp_global: 0,
+                version: FP_CFG_VERSION_V2,
             },
             0,
         )

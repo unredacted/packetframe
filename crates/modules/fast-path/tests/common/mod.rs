@@ -38,18 +38,23 @@ use packetframe_fast_path::{
 /// Layout mirror of `FpCfg` in `bpf/src/maps.rs`. Must track
 /// `linux_impl::FpCfg`, if you change one, change both (and both's
 /// ordering in the StatIdx enum at the same time).
+///
+/// Layout V2 (v0.2.4): the formerly-`_reserved [u8; 2]` slot is
+/// `mss_clamp_global: u16` (0 = unset), matching what production
+/// userspace writes. The pre-fix mirror only worked because both
+/// interpretations were all-zeroes in tests.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct FpCfg {
     pub dry_run: u8,
     pub flags: u8,
-    pub _reserved: [u8; 2],
+    pub mss_clamp_global: u16,
     pub version: u32,
 }
 
 unsafe impl Pod for FpCfg {}
 
-pub const FP_CFG_VERSION_V1: u32 = 0;
+pub const FP_CFG_VERSION_V2: u32 = 1;
 pub const STATS_COUNT: u32 = 38;
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
@@ -183,8 +188,8 @@ impl Harness {
         harness.set_cfg(FpCfg {
             dry_run: 0,
             flags: 0b11,
-            _reserved: [0; 2],
-            version: FP_CFG_VERSION_V1,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
         });
         harness
     }
@@ -199,8 +204,8 @@ impl Harness {
         self.set_cfg(FpCfg {
             dry_run: u8::from(on),
             flags: 0b11,
-            _reserved: [0; 2],
-            version: FP_CFG_VERSION_V1,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
         });
     }
 
@@ -239,8 +244,8 @@ impl Harness {
         self.set_cfg(FpCfg {
             dry_run: 0,
             flags,
-            _reserved: [0; 2],
-            version: FP_CFG_VERSION_V1,
+            mss_clamp_global: 0,
+            version: FP_CFG_VERSION_V2,
         });
     }
 
@@ -398,6 +403,29 @@ impl Harness {
     /// bytes). The kernel may have mutated the packet (L2 rewrite, TTL
     /// decrement) on XDP_REDIRECT; the output buffer reflects that.
     pub fn run(&self, packet: &[u8]) -> (u32, Vec<u8>) {
+        let (retval, _duration, out) = test_run_xdp_repeat(self.fast_path_fd(), packet, 1);
+        (retval, out)
+    }
+
+    /// Run the BPF program `repeat` times against `packet` in a single
+    /// `BPF_PROG_TEST_RUN` syscall and return `(verdict, avg_ns)`,
+    /// where `avg_ns` is the kernel-reported mean nanoseconds per
+    /// iteration (`bpf_attr.test.duration`). The verdict is from the
+    /// final iteration.
+    ///
+    /// **The kernel reuses one packet buffer across all `repeat`
+    /// iterations within a syscall**, so mutations accumulate: a
+    /// forwarded packet has its TTL decremented every pass. Benchmarks
+    /// of the forward path must build packets with a large TTL (255)
+    /// and keep `repeat` below 253, or later iterations silently
+    /// measure the `PassLowTtl` path instead. Each new syscall starts
+    /// from the pristine `packet` again.
+    pub fn run_timed(&self, packet: &[u8], repeat: u32) -> (u32, u32) {
+        let (retval, duration, _out) = test_run_xdp_repeat(self.fast_path_fd(), packet, repeat);
+        (retval, duration)
+    }
+
+    fn fast_path_fd(&self) -> i32 {
         let prog: &Xdp = self
             .bpf
             .program("fast_path")
@@ -405,7 +433,7 @@ impl Harness {
             .try_into()
             .expect("program is XDP");
         let prog_fd: &ProgramFd = prog.fd().expect("program loaded");
-        test_run_xdp(prog_fd.as_fd().as_raw_fd(), packet)
+        prog_fd.as_fd().as_raw_fd()
     }
 
     /// Aggregate a stat across all CPUs. v0.2.8+ STATS shape: one
@@ -446,7 +474,9 @@ struct TestRunAttr {
 
 const BPF_PROG_TEST_RUN: u32 = 10;
 
-fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
+/// Returns `(retval, duration_ns, data_out)`. `duration_ns` is the
+/// kernel's mean nanoseconds per iteration across `repeat` runs.
+fn test_run_xdp_repeat(prog_fd: i32, packet: &[u8], repeat: u32) -> (u32, u32, Vec<u8>) {
     // XDP programs may grow the packet (VLAN push: +4). Allocate
     // output with headroom so the kernel doesn't truncate.
     let mut data_out = vec![0u8; packet.len() + 256];
@@ -464,7 +494,7 @@ fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
     attr.data_size_out = data_out.len() as u32;
     attr.data_in = packet.as_ptr() as u64;
     attr.data_out = data_out.as_mut_ptr() as u64;
-    attr.repeat = 1;
+    attr.repeat = repeat;
 
     let ret = unsafe {
         libc::syscall(
@@ -481,7 +511,7 @@ fn test_run_xdp(prog_fd: i32, packet: &[u8]) -> (u32, Vec<u8>) {
     }
 
     data_out.truncate(attr.data_size_out as usize);
-    (attr.retval, data_out)
+    (attr.retval, attr.duration, data_out)
 }
 
 // --- Prefix parsing ---------------------------------------------------
@@ -513,6 +543,7 @@ pub struct Ipv4TcpBuilder {
     pub tos: u8,
     pub frag_flags: u16, // network byte order: bit 15=res, 14=DF, 13=MF, 12..0=offset
     pub ihl: u8,         // normally 5; set >5 to produce IHL>5 via header option bytes
+    pub tcp_flags: u8,   // TCP header byte 13; default SYN (0x02)
     pub payload: Vec<u8>,
 }
 
@@ -529,6 +560,7 @@ impl Default for Ipv4TcpBuilder {
             tos: 0,
             frag_flags: 0,
             ihl: 5,
+            tcp_flags: 0x02, // SYN, the historical builder default
             payload: Vec::new(),
         }
     }
@@ -581,13 +613,13 @@ impl Ipv4TcpBuilder {
         let csum = ipv4_checksum(ip_header);
         pkt[check_offset..check_offset + 2].copy_from_slice(&csum.to_be_bytes());
 
-        // TCP (minimal 20-byte header; flags = SYN; no options)
+        // TCP (minimal 20-byte header; flags from `tcp_flags`; no options)
         pkt.extend_from_slice(&self.src_port.to_be_bytes());
         pkt.extend_from_slice(&self.dst_port.to_be_bytes());
         pkt.extend_from_slice(&[0, 0, 0, 1]); // seq
         pkt.extend_from_slice(&[0, 0, 0, 0]); // ack
         pkt.push(0x50); // data offset 5 in upper nibble
-        pkt.push(0x02); // SYN
+        pkt.push(self.tcp_flags);
         pkt.extend_from_slice(&[0xff, 0xff]); // window
         pkt.extend_from_slice(&[0, 0, 0, 0]); // checksum (zero - bpf doesn't care for fixtures)
 
