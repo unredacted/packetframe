@@ -20,7 +20,7 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::gen::bpf_ktime_get_ns,
+    helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
     maps::{Array, RingBuf},
     programs::XdpContext,

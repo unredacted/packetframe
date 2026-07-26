@@ -18,7 +18,7 @@ name = "probe"
 path = "src/main.rs"
 
 [dependencies]
-aya-ebpf = "=0.1.1"
+aya-ebpf = "=0.2.1"
 
 [profile.release]
 opt-level = 3
