@@ -17,16 +17,14 @@ use aya_ebpf::{
         BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LKUP_RET_PROHIBIT, BPF_FIB_LKUP_RET_SUCCESS,
         BPF_FIB_LKUP_RET_UNREACHABLE,
     },
-    helpers::{
-        bpf_fib_lookup as fib_lookup_helper, bpf_xdp_adjust_head, bpf_xdp_adjust_tail,
-    },
+    helpers::{bpf_fib_lookup as fib_lookup_helper, bpf_xdp_adjust_head, bpf_xdp_adjust_tail},
     macros::xdp,
     maps::lpm_trie::Key,
     programs::XdpContext,
 };
 use core::mem;
 use network_types::{
-    eth::{EtherType, EthHdr},
+    eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
 };
 
@@ -35,9 +33,9 @@ mod finalize;
 mod maps;
 
 use maps::{
-    bump_stat, StatIdx, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG, FIB_LOOKUP_SCRATCH,
-    FP_CFG_FLAG_COMPARE_MODE, FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, MUTATION_CTX,
-    MUTATION_PROGS, REDIRECT_DEVMAP, VLAN_RESOLVE,
+    bump, stats_base, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
+    FIB_LOOKUP_SCRATCH, FP_CFG_FLAG_COMPARE_MODE, FP_CFG_FLAG_CUSTOM_FIB,
+    FP_CFG_FLAG_HEAD_SHIFT_128, MUTATION_CTX, MUTATION_PROGS, REDIRECT_DEVMAP, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -82,7 +80,15 @@ const VLAN_HDR_LEN: usize = 4;
 
 #[xdp]
 pub fn fast_path(ctx: XdpContext) -> u32 {
-    bump_stat(StatIdx::RxTotal);
+    // Single STATS lookup for this whole program stage; every counter
+    // bump below is a constant-offset increment on this pointer. The
+    // `None` branch is unreachable (index 0 of a 1-entry per-CPU array
+    // always exists); fail open so traffic falls to the kernel.
+    let stats = match stats_base() {
+        Some(s) => s,
+        None => return xdp_action::XDP_PASS,
+    };
+    bump(stats, StatIdx::RxTotal);
 
     // Pre-parse workaround for the pre-Linux-v6.8 rvu-nicpf XDP path
     // bug (SPEC §11.1(c)). The driver passes
@@ -102,7 +108,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     if unsafe { cfg_has_flag(FP_CFG_FLAG_HEAD_SHIFT_128) } {
         let rc = unsafe { bpf_xdp_adjust_head(ctx.ctx as *mut _, 128) };
         if rc != 0 {
-            bump_stat(StatIdx::ErrHeadShift);
+            bump(stats, StatIdx::ErrHeadShift);
             return xdp_action::XDP_PASS;
         }
         // `adjust_tail(+128)` can fail if the current frame is close
@@ -112,15 +118,15 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
         // has half-mutated (SPEC §11.13).
         let rc = unsafe { bpf_xdp_adjust_tail(ctx.ctx as *mut _, 128) };
         if rc != 0 {
-            bump_stat(StatIdx::ErrHeadShift);
+            bump(stats, StatIdx::ErrHeadShift);
             return xdp_action::XDP_PASS;
         }
     }
 
-    match try_fast_path(&ctx) {
+    match try_fast_path(&ctx, stats) {
         Ok(action) => action,
         Err(()) => {
-            bump_stat(StatIdx::ErrParse);
+            bump(stats, StatIdx::ErrParse);
             xdp_action::XDP_PASS
         }
     }
@@ -137,7 +143,7 @@ unsafe fn cfg_has_flag(bit: u8) -> bool {
 /// Returns Err(()) on bounds-check failure (always counted as
 /// `err_parse` → `XDP_PASS`), Ok(action) for everything else.
 #[inline(always)]
-fn try_fast_path(ctx: &XdpContext) -> Result<u32, ()> {
+fn try_fast_path(ctx: &XdpContext, stats: StatsPtr) -> Result<u32, ()> {
     let eth: *mut EthHdr = ptr_mut_at(ctx, 0)?;
     let outer_ether = unsafe { (*eth).ether_type };
 
@@ -162,11 +168,11 @@ fn try_fast_path(ctx: &XdpContext) -> Result<u32, ()> {
     };
 
     if inner_ether == EtherType::Ipv4 as u16 {
-        handle_ipv4(ctx, eth, ip_offset, ingress_vid)
+        handle_ipv4(ctx, stats, eth, ip_offset, ingress_vid)
     } else if inner_ether == EtherType::Ipv6 as u16 {
-        handle_ipv6(ctx, eth, ip_offset, ingress_vid)
+        handle_ipv6(ctx, stats, eth, ip_offset, ingress_vid)
     } else {
-        bump_stat(StatIdx::PassNotIp);
+        bump(stats, StatIdx::PassNotIp);
         Ok(xdp_action::XDP_PASS)
     }
 }
@@ -174,6 +180,7 @@ fn try_fast_path(ctx: &XdpContext) -> Result<u32, ()> {
 #[inline(always)]
 fn handle_ipv4(
     ctx: &XdpContext,
+    stats: StatsPtr,
     eth: *mut EthHdr,
     ip_offset: usize,
     ingress_vid: u16,
@@ -184,20 +191,20 @@ fn handle_ipv4(
     // anything else means options → kernel slow path.
     let ihl_bytes = unsafe { (*ip).ihl() };
     if ihl_bytes != 20 {
-        bump_stat(StatIdx::PassComplexHeader);
+        bump(stats, StatIdx::PassComplexHeader);
         return Ok(xdp_action::XDP_PASS);
     }
 
     // Fragment check: MF bit (0x2000) or non-zero offset (low 13 bits).
     let frags_be = u16::from_be_bytes(unsafe { (*ip).frags });
     if (frags_be & 0x3fff) != 0 {
-        bump_stat(StatIdx::PassFragment);
+        bump(stats, StatIdx::PassFragment);
         return Ok(xdp_action::XDP_PASS);
     }
 
     let ttl = unsafe { (*ip).ttl };
     if ttl <= 1 {
-        bump_stat(StatIdx::PassLowTtl);
+        bump(stats, StatIdx::PassLowTtl);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -214,8 +221,8 @@ fn handle_ipv4(
         return Ok(xdp_action::XDP_PASS);
     }
 
-    bump_stat(StatIdx::MatchedV4);
-    bump_match_subset(src_hit, dst_hit);
+    bump(stats, StatIdx::MatchedV4);
+    bump_match_subset(stats, src_hit, dst_hit);
 
     // v0.2.1 issue #33: bogon block. After allowlist match (so we only
     // affect traffic we'd otherwise touch), check if dst falls in any
@@ -229,12 +236,12 @@ fn handle_ipv4(
     // in the bogon range, e.g. Tailscale DERP relay responses) which
     // is worse than the operator's intent.
     if BLOCK_V4.get(&dst_key).is_some() {
-        bump_stat(StatIdx::BogonDropped);
+        bump(stats, StatIdx::BogonDropped);
         return Ok(xdp_action::XDP_DROP);
     }
 
     if is_dry_run() {
-        bump_stat(StatIdx::FwdDryRun);
+        bump(stats, StatIdx::FwdDryRun);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -255,8 +262,8 @@ fn handle_ipv4(
     let dport_h = u16::from_be(dport);
 
     if use_custom && !compare {
-        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
-        return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, true, ingress_vid);
+        let custom = fib::lookup_v4(stats, src_bytes, dst_bytes, proto as u8, sport_h, dport_h);
+        return dispatch_custom_fib(custom, ctx, stats, eth, ip as *mut u8, true, ingress_vid);
     }
 
     // Use the per-CPU `FIB_LOOKUP_SCRATCH` map for the bpf_fib_lookup
@@ -277,7 +284,7 @@ fn handle_ipv4(
             // Per-CPU array index 0 is always present; this branch is
             // unreachable in practice. Fail-safe XDP_PASS so traffic
             // falls to kernel slow-path rather than getting dropped.
-            bump_stat(StatIdx::ErrFibOther);
+            bump(stats, StatIdx::ErrFibOther);
             return Ok(xdp_action::XDP_PASS);
         }
     };
@@ -318,16 +325,26 @@ fn handle_ipv4(
         // the operator managed to set COMPARE without CUSTOM_FIB (bug
         // or manual map poke), the branch above is unreachable and
         // we still do only the kernel lookup here.
-        let custom = fib::lookup_v4(src_bytes, dst_bytes, proto, sport_h, dport_h);
-        compare_and_bump(ret as u32, fib_ref, &custom);
+        let custom = fib::lookup_v4(stats, src_bytes, dst_bytes, proto, sport_h, dport_h);
+        compare_and_bump(stats, ret as u32, fib_ref, &custom);
     }
 
-    dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, true, fib_ref, ingress_vid)
+    dispatch_fib(
+        ret as u32,
+        ctx,
+        stats,
+        eth,
+        ip as *mut u8,
+        true,
+        fib_ref,
+        ingress_vid,
+    )
 }
 
 #[inline(always)]
 fn handle_ipv6(
     ctx: &XdpContext,
+    stats: StatsPtr,
     eth: *mut EthHdr,
     ip_offset: usize,
     ingress_vid: u16,
@@ -338,7 +355,7 @@ fn handle_ipv6(
     match next {
         PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {}
         _ => {
-            bump_stat(StatIdx::PassComplexHeader);
+            bump(stats, StatIdx::PassComplexHeader);
             return Ok(xdp_action::XDP_PASS);
         }
     }
@@ -364,7 +381,7 @@ fn handle_ipv6(
     if next == PROTO_ICMPV6 {
         if let Some(t) = icmpv6_type(ctx, ip_offset + Ipv6Hdr::LEN) {
             if t >= ICMPV6_ND_TYPE_MIN && t <= ICMPV6_ND_TYPE_MAX {
-                bump_stat(StatIdx::PassNdp);
+                bump(stats, StatIdx::PassNdp);
                 return Ok(xdp_action::XDP_PASS);
             }
         }
@@ -372,7 +389,7 @@ fn handle_ipv6(
 
     let hop_limit = unsafe { (*ip).hop_limit };
     if hop_limit <= 1 {
-        bump_stat(StatIdx::PassLowTtl);
+        bump(stats, StatIdx::PassLowTtl);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -388,17 +405,17 @@ fn handle_ipv6(
         return Ok(xdp_action::XDP_PASS);
     }
 
-    bump_stat(StatIdx::MatchedV6);
-    bump_match_subset(src_hit, dst_hit);
+    bump(stats, StatIdx::MatchedV6);
+    bump_match_subset(stats, src_hit, dst_hit);
 
     // v0.2.1 issue #33: bogon block (IPv6 side).
     if BLOCK_V6.get(&dst_key).is_some() {
-        bump_stat(StatIdx::BogonDropped);
+        bump(stats, StatIdx::BogonDropped);
         return Ok(xdp_action::XDP_DROP);
     }
 
     if is_dry_run() {
-        bump_stat(StatIdx::FwdDryRun);
+        bump(stats, StatIdx::FwdDryRun);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -412,8 +429,8 @@ fn handle_ipv6(
     let dport_h = u16::from_be(dport);
 
     if use_custom && !compare {
-        let custom = fib::lookup_v6(src_bytes, dst_bytes, next as u8, sport_h, dport_h);
-        return dispatch_custom_fib(custom, ctx, eth, ip as *mut u8, false, ingress_vid);
+        let custom = fib::lookup_v6(stats, src_bytes, dst_bytes, next as u8, sport_h, dport_h);
+        return dispatch_custom_fib(custom, ctx, stats, eth, ip as *mut u8, false, ingress_vid);
     }
 
     // See handle_ipv4 for the rationale behind using FIB_LOOKUP_SCRATCH
@@ -421,7 +438,7 @@ fn handle_ipv6(
     let fib_ptr = match FIB_LOOKUP_SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
         None => {
-            bump_stat(StatIdx::ErrFibOther);
+            bump(stats, StatIdx::ErrFibOther);
             return Ok(xdp_action::XDP_PASS);
         }
     };
@@ -451,17 +468,28 @@ fn handle_ipv6(
     let fib_ref = unsafe { &*fib_ptr };
 
     if compare {
-        let custom = fib::lookup_v6(src_bytes, dst_bytes, next, sport_h, dport_h);
-        compare_and_bump(ret as u32, fib_ref, &custom);
+        let custom = fib::lookup_v6(stats, src_bytes, dst_bytes, next, sport_h, dport_h);
+        compare_and_bump(stats, ret as u32, fib_ref, &custom);
     }
 
-    dispatch_fib(ret as u32, ctx, eth, ip as *mut u8, false, fib_ref, ingress_vid)
+    dispatch_fib(
+        ret as u32,
+        ctx,
+        stats,
+        eth,
+        ip as *mut u8,
+        false,
+        fib_ref,
+        ingress_vid,
+    )
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_fib(
     ret: u32,
     ctx: &XdpContext,
+    stats: StatsPtr,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -469,25 +497,31 @@ fn dispatch_fib(
     ingress_vid: u16,
 ) -> Result<u32, ()> {
     match ret {
-        BPF_FIB_LKUP_RET_SUCCESS => {
-            forward_success(ctx, eth, ip, is_v4, fib.ifindex, fib.smac, fib.dmac, ingress_vid)
-        }
+        BPF_FIB_LKUP_RET_SUCCESS => forward_success(
+            ctx,
+            stats,
+            eth,
+            ip,
+            is_v4,
+            fib.ifindex,
+            fib.smac,
+            fib.dmac,
+            ingress_vid,
+        ),
         BPF_FIB_LKUP_RET_NO_NEIGH => {
-            bump_stat(StatIdx::PassNoNeigh);
+            bump(stats, StatIdx::PassNoNeigh);
             Ok(xdp_action::XDP_PASS)
         }
-        BPF_FIB_LKUP_RET_BLACKHOLE
-        | BPF_FIB_LKUP_RET_UNREACHABLE
-        | BPF_FIB_LKUP_RET_PROHIBIT => {
-            bump_stat(StatIdx::DropUnreachable);
+        BPF_FIB_LKUP_RET_BLACKHOLE | BPF_FIB_LKUP_RET_UNREACHABLE | BPF_FIB_LKUP_RET_PROHIBIT => {
+            bump(stats, StatIdx::DropUnreachable);
             Ok(xdp_action::XDP_DROP)
         }
         BPF_FIB_LKUP_RET_FRAG_NEEDED => {
-            bump_stat(StatIdx::PassFragNeeded);
+            bump(stats, StatIdx::PassFragNeeded);
             Ok(xdp_action::XDP_PASS)
         }
         _ => {
-            bump_stat(StatIdx::ErrFibOther);
+            bump(stats, StatIdx::ErrFibOther);
             Ok(xdp_action::XDP_PASS)
         }
     }
@@ -505,8 +539,10 @@ fn dispatch_fib(
 /// stricter accounting. Splitting gives finalize its own 512-byte
 /// stack budget. See SPEC §4.x "Two-stage BPF datapath."
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn forward_success(
     ctx: &XdpContext,
+    stats: StatsPtr,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -533,7 +569,7 @@ fn forward_success(
     // on the reference EFG 2026-04-21. If we can't redirect, we must
     // leave the packet pristine.
     if REDIRECT_DEVMAP.get(egress_ifindex).is_none() {
-        bump_stat(StatIdx::PassNotInDevmap);
+        bump(stats, StatIdx::PassNotInDevmap);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -573,7 +609,7 @@ fn forward_success(
         // Per-CPU array index 0 is always present; this branch should
         // be unreachable. Fail-safe XDP_PASS so traffic falls to kernel
         // rather than getting blackholed.
-        bump_stat(StatIdx::ErrMutationCtx);
+        bump(stats, StatIdx::ErrMutationCtx);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -583,7 +619,7 @@ fn forward_success(
     // somehow skipped slot 0, traffic falls through to kernel rather
     // than getting silently dropped.
     let _ = unsafe { MUTATION_PROGS.tail_call(ctx, 0) };
-    bump_stat(StatIdx::ErrTailCall);
+    bump(stats, StatIdx::ErrTailCall);
     Ok(xdp_action::XDP_PASS)
 }
 
@@ -596,6 +632,7 @@ fn forward_success(
 fn dispatch_custom_fib(
     result: fib::CustomFibResult,
     ctx: &XdpContext,
+    stats: StatsPtr,
     eth: *mut EthHdr,
     ip: *mut u8,
     is_v4: bool,
@@ -604,6 +641,7 @@ fn dispatch_custom_fib(
     match result.action {
         fib::FIB_ACTION_FORWARD => forward_success(
             ctx,
+            stats,
             eth,
             ip,
             is_v4,
@@ -613,11 +651,11 @@ fn dispatch_custom_fib(
             ingress_vid,
         ),
         fib::FIB_ACTION_NO_NEIGH => {
-            bump_stat(StatIdx::PassNoNeigh);
+            bump(stats, StatIdx::PassNoNeigh);
             Ok(xdp_action::XDP_PASS)
         }
         fib::FIB_ACTION_DROP => {
-            bump_stat(StatIdx::DropUnreachable);
+            bump(stats, StatIdx::DropUnreachable);
             Ok(xdp_action::XDP_DROP)
         }
         // FIB_ACTION_MISS or any unexpected action.
@@ -633,6 +671,7 @@ fn dispatch_custom_fib(
 /// expected; the userspace alert thresholds are set ratio-based.
 #[inline(always)]
 fn compare_and_bump(
+    stats: StatsPtr,
     kernel_ret: u32,
     kernel_fib: &bpf_fib_lookup,
     custom: &fib::CustomFibResult,
@@ -648,9 +687,9 @@ fn compare_and_bump(
         !kernel_forwards && !custom_forwards
     };
     if agree {
-        bump_stat(StatIdx::CompareAgree);
+        bump(stats, StatIdx::CompareAgree);
     } else {
-        bump_stat(StatIdx::CompareDisagree);
+        bump(stats, StatIdx::CompareDisagree);
     }
 }
 
@@ -679,11 +718,11 @@ fn decrement_ipv6_hop_limit(ip: *mut Ipv6Hdr) {
 }
 
 #[inline(always)]
-fn bump_match_subset(src_hit: bool, dst_hit: bool) {
+fn bump_match_subset(stats: StatsPtr, src_hit: bool, dst_hit: bool) {
     match (src_hit, dst_hit) {
-        (true, true) => bump_stat(StatIdx::MatchedBoth),
-        (true, false) => bump_stat(StatIdx::MatchedSrcOnly),
-        (false, true) => bump_stat(StatIdx::MatchedDstOnly),
+        (true, true) => bump(stats, StatIdx::MatchedBoth),
+        (true, false) => bump(stats, StatIdx::MatchedSrcOnly),
+        (false, true) => bump(stats, StatIdx::MatchedDstOnly),
         (false, false) => {}
     }
 }

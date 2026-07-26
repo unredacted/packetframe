@@ -595,21 +595,21 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
 
 /// Snapshot every counter in the STATS map, indexed by `StatIdx`
 /// discriminant. Length matches `common::STATS_COUNT`. Aggregates
-/// across CPUs via per-CPU sum.
+/// across CPUs via per-CPU sum. v0.2.8+ STATS shape: one per-CPU
+/// entry holding the whole `[u64; STATS_COUNT]` block.
 fn snapshot_all_stats(bpf: &Ebpf) -> Vec<u64> {
     use aya::maps::PerCpuArray;
     let map = bpf.map("STATS").expect("STATS map");
-    let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map).expect("PerCpuArray::try_from");
-    (0..common::STATS_COUNT)
-        .map(|i| {
-            stats
-                .get(&i, 0)
-                .expect("STATS get")
-                .iter()
-                .copied()
-                .sum::<u64>()
-        })
-        .collect()
+    let stats: PerCpuArray<_, [u64; common::STATS_COUNT as usize]> =
+        PerCpuArray::try_from(map).expect("PerCpuArray::try_from");
+    let per_cpu = stats.get(&0, 0).expect("STATS get");
+    let mut out = vec![0u64; common::STATS_COUNT as usize];
+    for block in per_cpu.iter() {
+        for (slot, v) in out.iter_mut().zip(block.iter()) {
+            *slot += *v;
+        }
+    }
+    out
 }
 
 /// Produce a vec of `(name, delta)` for every counter whose value

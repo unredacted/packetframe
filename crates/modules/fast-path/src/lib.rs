@@ -102,13 +102,15 @@ impl FastPathModule {
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
         match &self.state {
             Some(s) => linux_impl::snapshot_stats(s),
-            None => Ok(vec![0u64; 32]),
+            // Sized from COUNTER_NAMES like every other stats surface;
+            // a hardcoded length here previously drifted (32 < 38).
+            None => Ok(vec![0u64; metrics::COUNTER_COUNT]),
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn stats(&self) -> ModuleResult<Vec<u64>> {
-        Ok(vec![0u64; 32])
+        Ok(vec![0u64; metrics::COUNTER_COUNT])
     }
 }
 

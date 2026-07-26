@@ -21,7 +21,7 @@
 use aya_ebpf::maps::lpm_trie::Key;
 
 use crate::maps::{
-    bump_stat, EcmpGroup, FibValue, NexthopEntry, StatIdx, ECMP_GROUPS, FIB_KIND_ECMP,
+    bump, EcmpGroup, FibValue, NexthopEntry, StatIdx, StatsPtr, ECMP_GROUPS, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, FIB_V4, FIB_V6, MAX_ECMP_PATHS, NEXTHOPS, NH_STATE_RESOLVED,
 };
 
@@ -94,6 +94,7 @@ impl CustomFibResult {
 /// between BPF and the userspace reference in `src/fib/hash.rs`.
 #[inline(always)]
 pub fn lookup_v4(
+    stats: StatsPtr,
     src: [u8; 4],
     dst: [u8; 4],
     proto: u8,
@@ -104,27 +105,27 @@ pub fn lookup_v4(
     let fib = match FIB_V4.get(&key) {
         Some(v) => *v,
         None => {
-            bump_stat(StatIdx::CustomFibMiss);
+            bump(stats, StatIdx::CustomFibMiss);
             return CustomFibResult::miss();
         }
     };
 
-    let nh_idx = match resolve_fib_value_v4(&fib, src, dst, proto, sport, dport) {
+    let nh_idx = match resolve_fib_value_v4(stats, &fib, src, dst, proto, sport, dport) {
         Some(idx) => idx,
         None => {
             // ECMP walked every leg; none resolved.
-            bump_stat(StatIdx::CustomFibNoNeigh);
+            bump(stats, StatIdx::CustomFibNoNeigh);
             return CustomFibResult::no_neigh();
         }
     };
 
-    match read_nexthop(nh_idx) {
+    match read_nexthop(stats, nh_idx) {
         Some((ifindex, smac, dmac)) => {
-            bump_stat(StatIdx::CustomFibHit);
+            bump(stats, StatIdx::CustomFibHit);
             CustomFibResult::forward(ifindex, smac, dmac)
         }
         None => {
-            bump_stat(StatIdx::CustomFibNoNeigh);
+            bump(stats, StatIdx::CustomFibNoNeigh);
             CustomFibResult::no_neigh()
         }
     }
@@ -134,6 +135,7 @@ pub fn lookup_v4(
 /// contract on `sport` / `dport`.
 #[inline(always)]
 pub fn lookup_v6(
+    stats: StatsPtr,
     src: [u8; 16],
     dst: [u8; 16],
     proto: u8,
@@ -144,26 +146,26 @@ pub fn lookup_v6(
     let fib = match FIB_V6.get(&key) {
         Some(v) => *v,
         None => {
-            bump_stat(StatIdx::CustomFibMiss);
+            bump(stats, StatIdx::CustomFibMiss);
             return CustomFibResult::miss();
         }
     };
 
-    let nh_idx = match resolve_fib_value_v6(&fib, src, dst, proto, sport, dport) {
+    let nh_idx = match resolve_fib_value_v6(stats, &fib, src, dst, proto, sport, dport) {
         Some(idx) => idx,
         None => {
-            bump_stat(StatIdx::CustomFibNoNeigh);
+            bump(stats, StatIdx::CustomFibNoNeigh);
             return CustomFibResult::no_neigh();
         }
     };
 
-    match read_nexthop(nh_idx) {
+    match read_nexthop(stats, nh_idx) {
         Some((ifindex, smac, dmac)) => {
-            bump_stat(StatIdx::CustomFibHit);
+            bump(stats, StatIdx::CustomFibHit);
             CustomFibResult::forward(ifindex, smac, dmac)
         }
         None => {
-            bump_stat(StatIdx::CustomFibNoNeigh);
+            bump(stats, StatIdx::CustomFibNoNeigh);
             CustomFibResult::no_neigh()
         }
     }
@@ -173,6 +175,7 @@ pub fn lookup_v6(
 
 #[inline(always)]
 fn resolve_fib_value_v4(
+    stats: StatsPtr,
     fib: &FibValue,
     src: [u8; 4],
     dst: [u8; 4],
@@ -183,10 +186,10 @@ fn resolve_fib_value_v4(
     match fib.kind {
         FIB_KIND_SINGLE => Some(fib.idx),
         FIB_KIND_ECMP => {
-            bump_stat(StatIdx::EcmpHashV4);
+            bump(stats, StatIdx::EcmpHashV4);
             let group = ECMP_GROUPS.get(fib.idx)?;
             let h = hash_v4(src, dst, proto, sport, dport, group.hash_mode);
-            pick_ecmp_leg(group, h)
+            pick_ecmp_leg(stats, group, h)
         }
         _ => None,
     }
@@ -194,6 +197,7 @@ fn resolve_fib_value_v4(
 
 #[inline(always)]
 fn resolve_fib_value_v6(
+    stats: StatsPtr,
     fib: &FibValue,
     src: [u8; 16],
     dst: [u8; 16],
@@ -204,10 +208,10 @@ fn resolve_fib_value_v6(
     match fib.kind {
         FIB_KIND_SINGLE => Some(fib.idx),
         FIB_KIND_ECMP => {
-            bump_stat(StatIdx::EcmpHashV6);
+            bump(stats, StatIdx::EcmpHashV6);
             let group = ECMP_GROUPS.get(fib.idx)?;
             let h = hash_v6(src, dst, proto, sport, dport, group.hash_mode);
-            pick_ecmp_leg(group, h)
+            pick_ecmp_leg(stats, group, h)
         }
         _ => None,
     }
@@ -224,7 +228,7 @@ fn resolve_fib_value_v6(
 /// `EcmpDeadLegFallback`, that's diagnostic signal that a leg is
 /// down and we're compensating.
 #[inline(always)]
-fn pick_ecmp_leg(group: &EcmpGroup, hash: u32) -> Option<u32> {
+fn pick_ecmp_leg(stats: StatsPtr, group: &EcmpGroup, hash: u32) -> Option<u32> {
     let nh_count = group.nh_count as u32;
     if nh_count == 0 {
         return None;
@@ -250,7 +254,7 @@ fn pick_ecmp_leg(group: &EcmpGroup, hash: u32) -> Option<u32> {
                 if let Some(entry) = NEXTHOPS.get(nh_idx) {
                     if entry.state == NH_STATE_RESOLVED {
                         if walked > 0 {
-                            bump_stat(StatIdx::EcmpDeadLegFallback);
+                            bump(stats, StatIdx::EcmpDeadLegFallback);
                         }
                         return Some(nh_idx);
                     }
@@ -282,7 +286,7 @@ fn pick_ecmp_leg(group: &EcmpGroup, hash: u32) -> Option<u32> {
 /// After 4 attempts, give up. Every retry bumps `NexthopSeqRetry` so
 /// sustained-high values expose hot neighbor churn.
 #[inline(always)]
-fn read_nexthop(idx: u32) -> Option<(u32, [u8; 6], [u8; 6])> {
+fn read_nexthop(stats: StatsPtr, idx: u32) -> Option<(u32, [u8; 6], [u8; 6])> {
     let ptr = NEXTHOPS.get_ptr(idx)?;
 
     // Manual 4-retry unroll. Each block is identical; we could
@@ -292,21 +296,21 @@ fn read_nexthop(idx: u32) -> Option<(u32, [u8; 6], [u8; 6])> {
     if let Some(result) = try_read_seqlock(ptr) {
         return Some(result);
     }
-    bump_stat(StatIdx::NexthopSeqRetry);
+    bump(stats, StatIdx::NexthopSeqRetry);
     if let Some(result) = try_read_seqlock(ptr) {
         return Some(result);
     }
-    bump_stat(StatIdx::NexthopSeqRetry);
+    bump(stats, StatIdx::NexthopSeqRetry);
     if let Some(result) = try_read_seqlock(ptr) {
         return Some(result);
     }
-    bump_stat(StatIdx::NexthopSeqRetry);
+    bump(stats, StatIdx::NexthopSeqRetry);
     if let Some(result) = try_read_seqlock(ptr) {
         return Some(result);
     }
-    bump_stat(StatIdx::NexthopSeqRetry);
+    bump(stats, StatIdx::NexthopSeqRetry);
 
-    bump_stat(StatIdx::NeighCacheMiss);
+    bump(stats, StatIdx::NeighCacheMiss);
     None
 }
 
@@ -424,14 +428,7 @@ fn pack_ports(proto: u8, sport: u16, dport: u16, mode: u8) -> u32 {
 
 /// IPv4 flow hash. `mode` is 3 / 4 / 5; any other value falls back to 3.
 #[inline(always)]
-pub fn hash_v4(
-    src: [u8; 4],
-    dst: [u8; 4],
-    proto: u8,
-    sport: u16,
-    dport: u16,
-    mode: u8,
-) -> u32 {
+pub fn hash_v4(src: [u8; 4], dst: [u8; 4], proto: u8, sport: u16, dport: u16, mode: u8) -> u32 {
     let a = u32::from_be_bytes(src).wrapping_add(JHASH_INITVAL);
     let b = u32::from_be_bytes(dst).wrapping_add(JHASH_INITVAL);
     let c = pack_ports(proto, sport, dport, mode).wrapping_add(JHASH_INITVAL);
@@ -442,14 +439,7 @@ pub fn hash_v4(
 /// IPv6 flow hash. Absorbs the 8 × u32 words of the v6 addresses
 /// through three `jhash_mix` invocations before the final avalanche.
 #[inline(always)]
-pub fn hash_v6(
-    src: [u8; 16],
-    dst: [u8; 16],
-    proto: u8,
-    sport: u16,
-    dport: u16,
-    mode: u8,
-) -> u32 {
+pub fn hash_v6(src: [u8; 16], dst: [u8; 16], proto: u8, sport: u16, dport: u16, mode: u8) -> u32 {
     let s0 = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
     let s1 = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
     let s2 = u32::from_be_bytes([src[8], src[9], src[10], src[11]]);

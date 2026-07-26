@@ -408,12 +408,15 @@ impl Harness {
         test_run_xdp(prog_fd.as_fd().as_raw_fd(), packet)
     }
 
-    /// Aggregate a PerCpuArray stat across all CPUs.
+    /// Aggregate a stat across all CPUs. v0.2.8+ STATS shape: one
+    /// per-CPU entry holding the whole `[u64; STATS_COUNT]` block;
+    /// `StatIdx` discriminants are offsets into it.
     pub fn stat(&self, idx: StatIdx) -> u64 {
         let map = self.bpf.map("STATS").expect("STATS map");
-        let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map).expect("PerCpuArray try_from");
-        let per_cpu = stats.get(&(idx as u32), 0).expect("STATS get");
-        per_cpu.iter().copied().sum()
+        let stats: PerCpuArray<_, [u64; STATS_COUNT as usize]> =
+            PerCpuArray::try_from(map).expect("PerCpuArray try_from");
+        let per_cpu = stats.get(&0, 0).expect("STATS get");
+        per_cpu.iter().map(|block| block[idx as usize]).sum()
     }
 }
 

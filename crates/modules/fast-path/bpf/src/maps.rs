@@ -161,9 +161,19 @@ pub enum StatIdx {
     PassNdp = 37,
 }
 
-/// Total counter count. Used as `stats` map `max_entries`. New counters
-/// bump this; dashboards keying on indices keep working.
+/// Total counter count. Sizes the `[u64; N]` value of the single-entry
+/// `STATS` per-CPU map. New counters bump this; dashboards keying on
+/// indices keep working.
 pub const STATS_COUNT: u32 = 38;
+
+/// `STATS_COUNT` as usize, for the array-of-counters value type.
+pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
+
+/// Pointer to this CPU's counter block, fetched once per program stage
+/// via [`stats_base`]. Threaded through the (fully inlined) call chain
+/// so counter bumps are plain constant-offset increments instead of
+/// one `bpf_map_lookup_elem` helper call each.
+pub type StatsPtr = *mut [u64; STATS_COUNT_USIZE];
 
 /// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
 /// mask (historical, load-bearing for dashboards). Bit 2 is the
@@ -450,13 +460,11 @@ impl FpFibCfg {
 /// `{prefix_len: u32, addr: [u8;4]}` via `LpmTrie`'s `Key<T>`.
 /// Value is the truthiness byte; only presence is consulted.
 #[map]
-pub static ALLOW_V4: LpmTrie<[u8; 4], u8> =
-    LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
+pub static ALLOW_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
 
 /// IPv6 allowlist. Same semantics, 16-byte address.
 #[map]
-pub static ALLOW_V6: LpmTrie<[u8; 16], u8> =
-    LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
+pub static ALLOW_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
 
 /// v0.2.1 issue #33: IPv4 destination block list. Matched packets
 /// whose dst falls in this LPM trie return `XDP_DROP` (counter
@@ -465,23 +473,31 @@ pub static ALLOW_V6: LpmTrie<[u8; 16], u8> =
 /// as the allowlist; expected entries are a handful of bogon ranges
 /// (RFC 1918, CGNAT, test-net) so 1024 is generous.
 #[map]
-pub static BLOCK_V4: LpmTrie<[u8; 4], u8> =
-    LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
+pub static BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
 
 /// IPv6 destination block list. Same semantics. Currently unused by
 /// any common config; ULA (`fc00::/7`) is the obvious entry point but
 /// most operators will leave this empty.
 #[map]
-pub static BLOCK_V6: LpmTrie<[u8; 16], u8> =
-    LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
+pub static BLOCK_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(ALLOWLIST_MAX_ENTRIES, 0);
 
 /// Runtime flags. One-entry array; userspace writes index 0.
 #[map]
 pub static CFG: Array<FpCfg> = Array::with_max_entries(1, 0);
 
 /// Per-CPU counters (SPEC §4.6). Userspace aggregates across CPUs.
+///
+/// **Shape (v0.2.8+):** a single-entry per-CPU array whose value is
+/// the whole `[u64; STATS_COUNT]` block, not `STATS_COUNT` separate
+/// u64 entries. The old shape cost one `bpf_map_lookup_elem` helper
+/// call per counter bump — 4-6 per forwarded packet; the block shape
+/// costs one lookup per program stage and plain constant-offset
+/// increments after that. Counter *indices and semantics are
+/// unchanged* (`StatIdx` discriminants are the array offsets), so the
+/// CLI/metrics surface is byte-identical. Only raw `bpftool map dump`
+/// consumers see the new one-key layout.
 #[map]
-pub static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(STATS_COUNT, 0);
+pub static STATS: PerCpuArray<[u64; STATS_COUNT_USIZE]> = PerCpuArray::with_max_entries(1, 0);
 
 /// Debug event ringbuf (SPEC §3.7). Kept small in v0.1; structured
 /// event type lands with the reconfigure flow in PR #6.
@@ -557,8 +573,7 @@ pub static MUTATION_CTX: PerCpuArray<MutationCtx> = PerCpuArray::with_max_entrie
 /// fast_path's only writes are to fields the kernel reads (family,
 /// addrs, etc.), with no zero-padded blocks for LLVM to coalesce.
 #[map]
-pub static FIB_LOOKUP_SCRATCH: PerCpuArray<bpf_fib_lookup> =
-    PerCpuArray::with_max_entries(1, 0);
+pub static FIB_LOOKUP_SCRATCH: PerCpuArray<bpf_fib_lookup> = PerCpuArray::with_max_entries(1, 0);
 
 /// Tail-call jump table (v0.2.5+). fast_path tail_calls into slot 0 after
 /// classification + L2/TTL mutations. Slot 0 holds `finalize` today.
@@ -582,13 +597,11 @@ pub static MUTATION_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0);
 /// IPv4 custom FIB. Keyed by `{prefixlen, addr[4]}`; value is a
 /// `FibValue` pointing at `NEXTHOPS` (Single) or `ECMP_GROUPS` (Ecmp).
 #[map]
-pub static FIB_V4: LpmTrie<[u8; 4], FibValue> =
-    LpmTrie::with_max_entries(FIB_V4_MAX_ENTRIES, 0);
+pub static FIB_V4: LpmTrie<[u8; 4], FibValue> = LpmTrie::with_max_entries(FIB_V4_MAX_ENTRIES, 0);
 
 /// IPv6 custom FIB. Same semantics, 128-bit address key.
 #[map]
-pub static FIB_V6: LpmTrie<[u8; 16], FibValue> =
-    LpmTrie::with_max_entries(FIB_V6_MAX_ENTRIES, 0);
+pub static FIB_V6: LpmTrie<[u8; 16], FibValue> = LpmTrie::with_max_entries(FIB_V6_MAX_ENTRIES, 0);
 
 /// Nexthop cache. Seqlock-protected `NexthopEntry` per ID. The FIB
 /// trie values hold indices into this array; 180K routes sharing a
@@ -608,22 +621,34 @@ pub static ECMP_GROUPS: Array<EcmpGroup> = Array::with_max_entries(ECMP_GROUPS_M
 #[map]
 pub static FIB_CONFIG: Array<FpFibCfg> = Array::with_max_entries(1, 0);
 
-// --- Stat increment helper ---------------------------------------------
+// --- Stat increment helpers ----------------------------------------------
 
-/// Bump the per-CPU counter at `idx` by 1. Safe on the hot path, the
-/// verifier tolerates the single get_ptr_mut + deref, and on miss we
-/// simply skip the increment (a map hit is guaranteed iff `idx <
-/// STATS_COUNT`, which we enforce via the [`StatIdx`] enum).
+/// Fetch this CPU's counter block. Called exactly once per program
+/// stage (`fast_path` and `finalize` each need their own, the pointer
+/// cannot cross the tail call); the result is threaded through the
+/// inlined call chain as a scalar register argument.
+///
+/// `None` is unreachable in practice (index 0 of a 1-entry per-CPU
+/// array always exists); callers fail open to `XDP_PASS`.
 #[inline(always)]
-pub fn bump_stat(idx: StatIdx) {
-    let k = idx as u32;
-    if let Some(slot) = STATS.get_ptr_mut(k) {
-        // SAFETY: PerCpuArray with max_entries=STATS_COUNT guarantees
-        // that `get_ptr_mut` returns a pointer to our own CPU's slot
-        // for the entire NAPI cycle. Non-atomic increment is correct
-        // because PerCpuArray serializes per-CPU.
-        unsafe {
-            *slot = (*slot).saturating_add(1);
-        }
+pub fn stats_base() -> Option<StatsPtr> {
+    STATS.get_ptr_mut(0)
+}
+
+/// Bump the counter at `idx` by 1 within a block fetched via
+/// [`stats_base`]. Compiles to a constant-offset load/add/store on the
+/// map-value pointer — no helper call. `wrapping_add` (not saturating,
+/// which costs a compare+select per bump): u64 wrap is unreachable for
+/// packet counters.
+#[inline(always)]
+pub fn bump(stats: StatsPtr, idx: StatIdx) {
+    let i = idx as usize;
+    // SAFETY: `stats` came from `stats_base()` (a bounds-checked map
+    // value pointer valid for the whole program run, per-CPU so no
+    // concurrent writer), and `i < STATS_COUNT_USIZE` by construction
+    // of the `StatIdx` enum. Non-atomic RMW is correct because
+    // PerCpuArray serializes per-CPU.
+    unsafe {
+        (*stats)[i] = (*stats)[i].wrapping_add(1);
     }
 }

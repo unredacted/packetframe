@@ -1824,7 +1824,7 @@ pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
         .ebpf
         .map("STATS")
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "STATS map missing from ELF"))?;
-    let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map).map_err(|e| {
+    let stats: PerCpuArray<_, StatsBlock> = PerCpuArray::try_from(map).map_err(|e| {
         ModuleError::other(MODULE_NAME, format!("STATS PerCpuArray::try_from: {e}"))
     })?;
 
@@ -2023,25 +2023,32 @@ pub fn stats_from_pin(bpffs_root: &Path) -> ModuleResult<Vec<u64>> {
     // aya's `PerCpuArray::try_from` takes a `Map` enum, not a bare
     // `MapData`; wrap before converting.
     let map = Map::PerCpuArray(map_data);
-    let stats: PerCpuArray<_, u64> = PerCpuArray::try_from(map)
+    let stats: PerCpuArray<_, StatsBlock> = PerCpuArray::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("STATS PerCpuArray: {e}")))?;
     read_stats(&stats)
 }
 
+/// Userspace mirror of the BPF side's `[u64; STATS_COUNT]` STATS value
+/// (v0.2.8+ single-entry map shape). Sized from
+/// `metrics::COUNTER_COUNT`, the single userspace mirror of
+/// `STATS_COUNT` in bpf/src/maps.rs — prior versions hardcoded
+/// separate lengths and drifted three times (19 hid `err_head_shift`;
+/// 33 hid `mss_clamp_*`; 37 hid `pass_ndp`).
+pub(crate) type StatsBlock = [u64; crate::metrics::COUNTER_COUNT];
+
 fn read_stats<T: std::borrow::Borrow<aya::maps::MapData>>(
-    stats: &aya::maps::PerCpuArray<T, u64>,
+    stats: &aya::maps::PerCpuArray<T, StatsBlock>,
 ) -> ModuleResult<Vec<u64>> {
-    // Sized from `metrics::COUNTER_NAMES`, the single userspace mirror
-    // of `STATS_COUNT` in bpf/src/maps.rs. Prior versions hardcoded a
-    // separate length here, and it drifted three times (19 hid
-    // `err_head_shift`; 33 hid `mss_clamp_*`; 37 hid `pass_ndp`) —
-    // each time the newest counters silently read as absent.
-    let mut out = vec![0u64; crate::metrics::COUNTER_NAMES.len()];
-    for (idx, slot) in out.iter_mut().enumerate() {
-        let values = stats
-            .get(&(idx as u32), 0)
-            .map_err(|e| ModuleError::other(MODULE_NAME, format!("STATS get[{idx}]: {e}")))?;
-        *slot = values.iter().copied().sum();
+    // One BPF_MAP_LOOKUP_ELEM for the whole counter block (previously
+    // one syscall per counter, O(counters) per metrics tick).
+    let per_cpu = stats
+        .get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("STATS get[0]: {e}")))?;
+    let mut out = vec![0u64; crate::metrics::COUNTER_COUNT];
+    for cpu_block in per_cpu.iter() {
+        for (slot, v) in out.iter_mut().zip(cpu_block.iter()) {
+            *slot += *v;
+        }
     }
     Ok(out)
 }

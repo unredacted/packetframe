@@ -76,6 +76,12 @@ pub const COUNTER_NAMES: [&str; 38] = [
     "pass_ndp",
 ];
 
+/// `COUNTER_NAMES.len()` as a named const. Sizes the `[u64; N]` value
+/// type of the single-entry STATS per-CPU map in `linux_impl` (v0.2.8+
+/// map shape) and the test harness mirror. Must equal the BPF side's
+/// `STATS_COUNT`.
+pub const COUNTER_COUNT: usize = COUNTER_NAMES.len();
+
 /// Render a Prometheus textfile body from stat values + module uptime.
 /// Every counter gets `# TYPE` and `# HELP` headers so Prometheus's
 /// textfile collector categorizes it correctly. Counter names that
