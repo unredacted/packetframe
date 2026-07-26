@@ -140,7 +140,9 @@ jobs:
           cargo test -p packetframe-probe --tests --no-run
 
       - name: Run integration tests in QEMU
-        timeout-minutes: 10
+        # Two full attempts must fit (see retry policy below); a
+        # healthy run is ~7 minutes under TCG.
+        timeout-minutes: 20
         run: |
           set -eux
           # Pass the installed vmlinuz path (not the .deb). virtme-ng
@@ -155,10 +157,26 @@ jobs:
           # rtnetlink + netlink-packet-route + futures) pushes
           # incremental-relink tmpfs usage past the old ~500 MB.
           # 4 GB RAM ⇒ ~2 GB writable tmpfs, comfortable headroom.
-          virtme-ng \
-            --run "${KERNEL_IMG}" \
-            --pwd \
-            --memory 4096 \
-            --disable-kvm \
-            --verbose \
-            -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
+          run_vm() {
+            virtme-ng \
+              --run "${KERNEL_IMG}" \
+              --pwd \
+              --memory 4096 \
+              --disable-kvm \
+              --verbose \
+              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
+          }
+          # Retry policy: virtme-ng propagates the guest command's exit
+          # status, so a genuine test failure arrives as cargo's 101
+          # and fails immediately — no retry. Exit 255 means the VM
+          # died before the guest script ever ran (observed on hosted
+          # runners as a TCG boot hang: dmesg stops mid PCI
+          # enumeration ~20s in, zero test output; PR #69's v6.6 job).
+          # That failure mode is runner noise, not a signal about the
+          # code, so it gets exactly one more attempt.
+          rc=0; run_vm || rc=$?
+          if [ "${rc}" -eq 255 ]; then
+            echo "::warning::virtme-ng exited 255 before the guest script ran (boot flake); retrying once"
+            rc=0; run_vm || rc=$?
+          fi
+          exit "${rc}"
