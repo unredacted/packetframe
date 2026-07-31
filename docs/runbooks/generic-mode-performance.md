@@ -211,6 +211,42 @@ Confirm `net.core.bpf_jit_enable=1` first (`packetframe feasibility` reports it,
 and the driver script warns) — otherwise the bench times the BPF interpreter
 rather than what production runs.
 
+#### Reference figures (cn9670)
+
+Measured 2026-07-31 on an EFG-class box (`5.15.72-ui-cn9670`, aarch64, JIT on,
+`bpf_jit_harden=0`), build `0.2.7~hwtestdd33ae7` — i.e. with the hot-path map-op
+reduction and the tc datapath in place:
+
+| Bench | ns/packet |
+|---|---|
+| `bench_allowlist_miss` | 85 |
+| `bench_custom_fib_forward_syn` | 278 |
+| `bench_custom_fib_forward_established` | 282 |
+
+Two things to read off these:
+
+- **~24 ns per map-helper call.** The forward path does 8 more map operations than
+  the miss path plus TTL/L2 mutation and a tail call; `(282 − 85) / 8 ≈ 24 ns`
+  lands inside the 20–40 ns per `bpf_map_lookup_elem` the optimization work
+  assumed, so the cost model the hot-path reduction was designed against holds on
+  this silicon.
+- **SYN and established cost the same** (278 vs 282 ns, ~1% apart — noise). With no
+  `mss-clamp` configured, the clamp lookups are gated out entirely rather than
+  being paid and discarded.
+
+Note what these figures are *not*: no pre-reduction baseline was ever captured on
+this hardware, so the 23→10 map-op change cannot be quantified from them. Scaling
+the measured per-op cost suggests roughly 13 × 24 ≈ 310 ns saved, which would put
+the old path near 590 ns — but that is arithmetic on one measurement, not a
+before/after. Capturing a real baseline means building `bench` from `83badca` (the
+commit before the reduction landed) with this workflow grafted on, and is worth
+doing before quoting any improvement figure.
+
+At 282 ns of program time, one core sustains ~3.5 Mpps of pure BPF work. On a box
+that is CPU-saturated in generic mode, that is the *small* share of per-packet
+cost — use `perf top` above to size the kernel-side share before concluding the
+program is what needs optimizing.
+
 `run-tests.sh` with no arguments runs the wider correctness suite, which is worth
 doing on the box before a tc canary — it proves this kernel's verifier accepts the
 classifiers and that the fixtures produce the expected verdicts.
