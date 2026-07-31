@@ -127,15 +127,21 @@ cross-built test binaries, the matching `packetframe` CLI, both runbooks, and a
 driver script — all statically linked and carrying the real BPF ELF (the same
 bytecode a release would ship, not a stub).
 
-Download the bundle from the newest run and copy it to the router:
+Download the bundle from the newest `main` run (`gh run download` needs an
+explicit run id or it prompts, hence the subshell):
 
 ```sh
-gh run download --repo unredacted/packetframe --name hwtest-aarch64-unknown-linux-musl --dir /tmp/hw
+gh run download -R unredacted/packetframe -n hwtest-aarch64-unknown-linux-musl -D /tmp/hw "$(gh run list -R unredacted/packetframe -w 'Hardware test artifacts' -b main -s success --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
+
+Unpack and copy to the router (swap `router` for the target host):
 
 ```sh
 tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-musl.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-musl router:/tmp/
 ```
+
+To take a bundle from a PR instead of `main` — the workflow also runs on PRs
+that change it — pass `-b <branch>` in place of `-b main`.
 
 For a target other than the fleet default (aarch64 + musl), dispatch it manually:
 
