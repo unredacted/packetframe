@@ -698,32 +698,64 @@ impl FibProgrammer {
     }
 
     // --- Destination cache control ---
+    //
+    // Invariant: `self.cache_enabled` must mirror what a SUCCESSFUL
+    // write last put in the kernel map, because it gates whether
+    // generation bumps are published. If internal state said
+    // "disabled" while the map still said "enabled" (a failed disable
+    // write), route mutations would stop publishing generations and
+    // stale cached FibValues would stay valid past nexthop reclaim —
+    // the exact hazard the generation exists to prevent. Hence:
+    // toggle transitions only commit internal state after the write
+    // succeeds, and a failed publish during a bump is retried once
+    // then escalated loudly (an 8-byte Array::set on a pinned map has
+    // no expected failure mode; if it fails persistently the map is
+    // unwritable and the operator must restart).
 
-    /// Write the current (enabled, generation) pair to FIB_CACHE_CFG.
-    fn write_cache_cfg(&mut self) {
+    /// Write the (enabled, generation) pair to FIB_CACHE_CFG. Returns
+    /// whether the write succeeded (vacuously true with no handle —
+    /// harness-only construction, where there is no kernel state to
+    /// diverge from).
+    fn write_cache_cfg(&mut self) -> bool {
         let value = FibCacheCfg {
             enabled: u32::from(self.cache_enabled),
             generation: self.cache_generation,
         };
-        if let Some(map) = &mut self.cache_cfg {
-            if let Err(e) = map.set(0, value, 0) {
-                warn!(error = %e, "FIB_CACHE_CFG write failed");
-            }
+        match &mut self.cache_cfg {
+            Some(map) => match map.set(0, value, 0) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "FIB_CACHE_CFG write failed");
+                    false
+                }
+            },
+            None => true,
         }
     }
 
-    /// Advance the generation (skipping the reserved 0) and, when the
-    /// cache is live, publish it — logically flushing every cached
-    /// entry. Called on every successful FIB LPM mutation; skipping
-    /// the syscall while disabled keeps route churn free when the
-    /// experiment is off.
-    fn bump_cache_generation(&mut self) {
+    /// Advance the generation, skipping the reserved 0.
+    fn advance_generation(&mut self) {
         self.cache_generation = self.cache_generation.wrapping_add(1);
         if self.cache_generation == 0 {
             self.cache_generation = 1;
         }
-        if self.cache_enabled {
-            self.write_cache_cfg();
+    }
+
+    /// Advance the generation and, when the cache is live, publish it
+    /// — logically flushing every cached entry. Called on every
+    /// successful FIB LPM mutation; skipping the syscall while
+    /// disabled keeps route churn free when the experiment is off.
+    /// A failed publish is retried once, then escalated: an
+    /// unpublished bump leaves previously cached FibValues validating
+    /// against the old generation until the next successful publish,
+    /// which reopens the reclaim window the generation closes.
+    fn bump_cache_generation(&mut self) {
+        self.advance_generation();
+        if self.cache_enabled && !self.write_cache_cfg() && !self.write_cache_cfg() {
+            tracing::error!(
+                generation = self.cache_generation,
+                "FIB_CACHE_CFG generation publish failed twice; cached FIB entries                  cannot be invalidated — disable fib-cache and restart packetframe"
+            );
         }
     }
 
@@ -732,21 +764,33 @@ impl FibProgrammer {
     /// publishing, so disable→enable can never resurrect entries
     /// filled under an earlier enable epoch; disable publishes
     /// `enabled = 0`, stopping the BPF probe on the next packet.
+    ///
+    /// Internal state commits ONLY on a successful map write: on
+    /// failure the kernel map is unchanged (map array updates are
+    /// atomic), so keeping the previous `cache_enabled` keeps the
+    /// generation-publication policy consistent with what the BPF
+    /// side actually sees, and the next SIGHUP reconcile (which
+    /// resends the directive unconditionally) retries the toggle.
     fn set_cache_enabled(&mut self, on: bool) {
         if on == self.cache_enabled {
             return;
         }
-        self.cache_generation = self.cache_generation.wrapping_add(1);
-        if self.cache_generation == 0 {
-            self.cache_generation = 1;
-        }
+        self.advance_generation();
+        let prev = self.cache_enabled;
         self.cache_enabled = on;
-        self.write_cache_cfg();
-        info!(
-            enabled = on,
-            generation = self.cache_generation,
-            "fib-cache toggled"
-        );
+        if self.write_cache_cfg() {
+            info!(
+                enabled = on,
+                generation = self.cache_generation,
+                "fib-cache toggled"
+            );
+        } else {
+            self.cache_enabled = prev;
+            warn!(
+                requested = on,
+                "fib-cache toggle NOT applied (map write failed); kernel state                  unchanged, will retry on next reconcile"
+            );
+        }
     }
 
     fn register(&mut self, ip: IpAddr) -> Result<NexthopId, ProgrammerError> {
