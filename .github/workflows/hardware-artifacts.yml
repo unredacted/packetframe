@@ -426,7 +426,13 @@ jobs:
             fi
             echo "== ${t}"
             ran=$((ran + 1))
-            ./"${t}" --ignored --nocapture || rc=1
+            # --include-ignored, not --ignored: the *-unittests
+            # harnesses staged here hold mostly ORDINARY tests, and
+            # --ignored would filter every one of them out — zero
+            # tests, exit 0, a silent fake pass. For the integration
+            # binaries the two flags are equivalent (every test there
+            # is #[ignore]-gated), so one flag serves all binaries.
+            ./"${t}" --include-ignored --nocapture || rc=1
           done
           if [ "${ran}" -eq 0 ]; then
             echo "!! no tests ran" >&2
