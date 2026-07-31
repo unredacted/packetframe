@@ -127,11 +127,21 @@ jobs:
       # both rustc-embedded timestamps and the .deb archive's file mtimes
       # are deterministic. Same value across all matrix legs ensures the
       # binary contents (and the .deb wrapping it) match across runners.
-      - name: Set SOURCE_DATE_EPOCH from tag commit
+      - name: Set SOURCE_DATE_EPOCH and artifact label from the ref
         run: |
           set -euo pipefail
           SDE=$(git log -1 --pretty=%ct "${GITHUB_REF_NAME}")
           echo "SOURCE_DATE_EPOCH=${SDE}" >> "${GITHUB_ENV}"
+          # Artifacts are named after the ref. Publishing only ever happens
+          # for tags, but a workflow_dispatch validation run is on a branch,
+          # and a branch name may contain `/` — which would turn the tar and
+          # .deb output paths into directories that don't exist. Flatten
+          # anything that isn't a tag; leave tags exactly as written.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "PF_REF_LABEL=${GITHUB_REF_NAME}" >> "${GITHUB_ENV}"
+          else
+            echo "PF_REF_LABEL=${GITHUB_REF_NAME//[^a-zA-Z0-9._-]/-}" >> "${GITHUB_ENV}"
+          fi
 
       - name: Install Rust (stable + target)
         run: |
@@ -186,8 +196,9 @@ jobs:
       - name: Stage tarball contents
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          STEM="packetframe-${VERSION}-${{ matrix.target }}"
+          # PF_REF_LABEL is the tag verbatim, or a flattened branch name for
+          # a dispatch validation run (a `/` here would break tar's paths).
+          STEM="packetframe-${PF_REF_LABEL}-${{ matrix.target }}"
           STAGE="dist/${STEM}"
           mkdir -p "${STAGE}/conf"
           cp "target/${{ matrix.target }}/release/packetframe" "${STAGE}/"
@@ -211,19 +222,22 @@ jobs:
         if: contains(matrix.target, '-gnu')
         run: |
           set -euo pipefail
-          # Strip the leading `v` so the .deb version is plain semver (e.g.
-          # 0.2.2), matching what `dpkg -s packetframe` will report.
-          DEB_VERSION="${GITHUB_REF_NAME#v}"
-          # A workflow_dispatch pre-release validation run has a branch
-          # name here, not a tag, and dpkg requires an upstream version
-          # starting with a digit — `main` makes cargo-deb fail, which
-          # used to sink both gnu legs of the very dry run that exists to
-          # de-risk a release. Synthesize a valid throwaway version.
-          case "${DEB_VERSION}" in
-            [0-9]*) ;;
-            *) DEB_VERSION="$(cat VERSION)~${DEB_VERSION//[^a-zA-Z0-9]/}$(git rev-parse --short HEAD)" ;;
-          esac
-          STEM="packetframe-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # For a tag, strip the leading `v` so the .deb version is plain
+          # semver (e.g. 0.2.2), matching what `dpkg -s packetframe` reports.
+          #
+          # A workflow_dispatch pre-release validation run has a BRANCH name
+          # here, and dpkg requires an upstream version that starts with a
+          # digit and contains no `/`, so both `main` and `123/feature` make
+          # cargo-deb fail — sinking both gnu legs of the very dry run that
+          # exists to de-risk a release. Decide on the ref TYPE rather than
+          # the string's shape (a digit-led branch name looks like a version
+          # but isn't one) and synthesize a throwaway version for branches.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            DEB_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            DEB_VERSION="$(cat VERSION)~${GITHUB_REF_NAME//[^a-zA-Z0-9]/}$(git rev-parse --short HEAD)"
+          fi
+          STEM="packetframe-${PF_REF_LABEL}-${{ matrix.target }}"
           # SOURCE_DATE_EPOCH is already in GITHUB_ENV from the earlier
           # step; cargo-deb honors it for archive mtimes and the
           # changelog Date field. --no-build because cross already
