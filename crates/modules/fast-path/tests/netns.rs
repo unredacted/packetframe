@@ -251,7 +251,12 @@ fn if_nametoindex(name: &str) -> u32 {
 /// whichever netns held it at mount time, which is usually init. The
 /// ioctl goes through a socket and so is properly netns-scoped.
 fn mac_of(iface: &str) -> [u8; 6] {
-    const SIOCGIFHWADDR: libc::c_ulong = 0x8927;
+    // Plain u32 + `as _` at the call site: libc declares ioctl's
+    // request parameter as `c_ulong` on glibc but `c_int` on musl, and
+    // these tests get cross-built for the routers (aarch64 musl) to run
+    // on hardware. Same pattern as `SIOCETHTOOL` in
+    // `packetframe_common::probe`.
+    const SIOCGIFHWADDR: u32 = 0x8927;
 
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     assert!(
@@ -272,7 +277,8 @@ fn mac_of(iface: &str) -> [u8; 6] {
         ifr.ifr_name[i] = b as libc::c_char;
     }
 
-    let rc = unsafe { libc::ioctl(sock, SIOCGIFHWADDR, &mut ifr as *mut libc::ifreq) };
+    #[allow(clippy::unnecessary_cast)]
+    let rc = unsafe { libc::ioctl(sock, SIOCGIFHWADDR as _, &mut ifr as *mut libc::ifreq) };
     assert_eq!(
         rc,
         0,

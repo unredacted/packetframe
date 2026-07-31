@@ -184,7 +184,9 @@ fn if_nametoindex(name: &str) -> u32 {
 /// it goes through a socket (sysfs is not reliably remounted per-netns
 /// on every distro).
 fn mac_of(iface: &str) -> [u8; 6] {
-    const SIOCGIFHWADDR: libc::c_ulong = 0x8927;
+    // u32 + `as _`: ioctl's request parameter is `c_ulong` on glibc,
+    // `c_int` on musl. See the same constant in `netns.rs`.
+    const SIOCGIFHWADDR: u32 = 0x8927;
 
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     assert!(
@@ -199,7 +201,8 @@ fn mac_of(iface: &str) -> [u8; 6] {
         ifr.ifr_name[i] = b as libc::c_char;
     }
 
-    let rc = unsafe { libc::ioctl(sock, SIOCGIFHWADDR, &mut ifr as *mut libc::ifreq) };
+    #[allow(clippy::unnecessary_cast)]
+    let rc = unsafe { libc::ioctl(sock, SIOCGIFHWADDR as _, &mut ifr as *mut libc::ifreq) };
     assert_eq!(
         rc,
         0,

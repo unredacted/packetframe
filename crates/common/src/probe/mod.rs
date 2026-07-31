@@ -282,6 +282,11 @@ fn uname_release() -> std::io::Result<String> {
         .iter()
         .position(|&c| c == 0)
         .unwrap_or(release.len());
+    // `c_char` is signed on x86_64 but unsigned on aarch64, so this cast
+    // is load-bearing on the dev/CI architecture and a no-op on the
+    // production one. Clippy only ever sees one of the two. Same
+    // targeted-allow pattern as `statfs.f_type` in probe_bpffs.
+    #[allow(clippy::unnecessary_cast)]
     let bytes: Vec<u8> = release[..end].iter().map(|&c| c as u8).collect();
     String::from_utf8(bytes).map_err(|e| {
         std::io::Error::new(

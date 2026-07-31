@@ -115,7 +115,8 @@ jobs:
 
       - name: Install Rust (stable + target)
         run: |
-          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup toolchain install ${{ env.RUST_STABLE }} \
+            --profile minimal --component clippy
           rustup default ${{ env.RUST_STABLE }}
           rustup target add ${{ matrix.target }}
 
@@ -130,6 +131,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      # `cross build` below covers lib + bins only, and the `check` job's
+      # clippy run sees just the host triple, so *test* code that doesn't
+      # compile for a release target slipped through both. It bit us
+      # twice: `libc::ioctl`'s request argument is `c_ulong` on glibc but
+      # `c_int` on musl, and `c_char` is signed on x86_64 but unsigned on
+      # aarch64 — neither is visible from an x86_64-gnu lint of the
+      # workspace. Clippy doesn't link, so `--all-targets` per triple is
+      # cheap insurance, and it's what keeps the test tree cross-buildable
+      # for `hardware-artifacts.yml`.
+      - name: cargo clippy --all-targets
+        run: |
+          cargo clippy --workspace --all-targets --all-features \
+            --target ${{ matrix.target }} -- -D warnings
 
       - name: Install cross
         run: |
