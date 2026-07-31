@@ -173,12 +173,19 @@ Confirm `net.core.bpf_jit_enable=1` first (`packetframe feasibility` reports it,
 and the driver script warns) — otherwise the bench times the BPF interpreter
 rather than what production runs.
 
-`run-tests.sh` with no arguments runs the wider correctness suite. Its default
-selection is deliberately limited to tests that only use `BPF_PROG_TEST_RUN`:
-programs are loaded and fed synthetic packets in-kernel, nothing is attached to a
-live NIC, so it is safe to run on a forwarding router. The tests that create
-veths or network namespaces (`attach`, `tc_attach`, `netns`,
-`local_prefix_netns`, `neigh_resolver_netns`) have to be named explicitly.
+`run-tests.sh` with no arguments runs the wider correctness suite, which is worth
+doing on the box before a tc canary — it proves this kernel's verifier accepts the
+classifiers and that the fixtures produce the expected verdicts.
+
+That default selection is deliberately limited to tests that only use
+`BPF_PROG_TEST_RUN`: programs are loaded and fed synthetic packets in-kernel,
+nothing is attached to a NIC, and no route, neighbour or sysctl state is touched,
+so it is safe on a forwarding router. The one exception to "writes nothing" is
+`fib_comparison`, which pins maps under a unique
+`/sys/fs/bpf/pftestcmp-<pid>-<n>` scratch directory and removes it on exit — never
+the running instance's pins. The tests that create veths or network namespaces
+(`attach`, `tc_attach`, `netns`, `local_prefix_netns`, `neigh_resolver_netns`)
+have to be named explicitly.
 
 ### Counters that matter (`packetframe status`)
 

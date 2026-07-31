@@ -272,9 +272,15 @@ jobs:
           # Every test binary here is #[ignore]d by default (they need
           # CAP_BPF/CAP_NET_ADMIN), so the driver passes --ignored.
           #
-          # SAFE BY DEFAULT: the default suite only uses BPF_PROG_TEST_RUN
-          # — programs are loaded and fed synthetic packets in-kernel;
-          # nothing is attached to a live NIC and no traffic is affected.
+          # SAFE BY DEFAULT, including on a forwarding production router:
+          # the default suite only uses BPF_PROG_TEST_RUN — programs are
+          # loaded and fed synthetic packets in-kernel. Nothing is
+          # attached to a NIC, no route/neighbour/sysctl state is touched,
+          # and no live traffic is affected. `fib_comparison` is the only
+          # one that writes anything outside its own process: it pins maps
+          # under a unique /sys/fs/bpf/pftestcmp-<pid>-<n> scratch dir and
+          # removes it on exit, never the running instance's pins.
+          #
           # `attach`, `tc_attach`, `netns`, `local_prefix_netns` and
           # `neigh_resolver_netns` create interfaces or network
           # namespaces; they clean up after themselves but are excluded
