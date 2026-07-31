@@ -208,6 +208,22 @@ jobs:
           root = os.path.join("dist", f"packetframe-hwtest-{target}")
           tests_dir = os.path.join(root, "tests")
           os.makedirs(tests_dir, exist_ok=True)
+          cwd = os.getcwd()
+
+          def host_path(p):
+              """Translate a cross-container path to its host equivalent.
+
+              cargo ran inside cross's Docker container, which mounts the
+              workspace at /project and the target dir at /target, so every
+              `executable` in build.json is a container path that does not
+              exist out here. Map the two mount points back onto the
+              workspace. A plain (non-cross) build reports host paths
+              already and falls through unchanged.
+              """
+              for prefix, rel in (("/target/", "target/"), ("/project/", "")):
+                  if p.startswith(prefix):
+                      return os.path.join(cwd, rel + p[len(prefix):])
+              return p
 
           staged_tests, staged_bins = [], []
           for line in open("build.json"):
@@ -237,7 +253,13 @@ jobs:
                   staged_bins.append(name)
               if os.path.exists(dest):
                   sys.exit(f"refusing to overwrite staged {dest} (target name collision)")
-              shutil.copy2(exe, dest)
+              src = host_path(exe)
+              if not os.path.exists(src):
+                  sys.exit(
+                      f"cargo reported {exe} but it is not readable at {src} — "
+                      "cross's container mount layout has changed, fix host_path()"
+                  )
+              shutil.copy2(src, dest)
               os.chmod(dest, 0o755)
 
           if not staged_tests:
