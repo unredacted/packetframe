@@ -414,6 +414,24 @@ layer's ebtables hooks for forwarded traffic — consistent with the fast path's
 existing netfilter bypass on ingress, but worth knowing if ebtables rules
 target forwarded traffic on the bridge.
 
+Three scoping caveats, stated precisely:
+
+- **802.1Q only.** `/proc/net/vlan/config` lists 802.1ad (QinQ) subifs
+  indistinguishably from 802.1Q ones, and the datapath's VLAN push always
+  writes TPID 0x8100 — this is a standing assumption of the whole
+  `VLAN_RESOLVE` mechanism (plain subif entries included), not something the
+  bridge feature adds. On an 802.1ad deployment set `bridge-resolve off` and
+  don't rely on subif egress resolution either; protocol-aware resolution is
+  a named follow-up for the subsystem.
+- **`mss-clamp via <bridge>` will not match** while a short-circuit is
+  installed: clamp matching keys on the resolved egress ifindex (identical
+  pre-existing behavior for `via <subif>` under plain VLAN resolution). The
+  loader warns at attach/reconcile with the fix: scope the clamp `via` the
+  underlying device, or set `bridge-resolve off`.
+- **MTU relation is enforced:** a bridge whose MTU is smaller than its
+  underlying device's is skipped (the bridge would have refused packets the
+  short-circuit would forward). Equal MTUs — the normal case — qualify.
+
 **Convergence model — same as every discovery-populated map.** Chains are
 discovered at attach and re-verified on every `packetframe reconfigure`
 (SIGHUP); there is no live topology watcher, exactly as with plain VLAN-subif

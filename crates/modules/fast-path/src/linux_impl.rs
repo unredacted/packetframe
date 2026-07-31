@@ -279,7 +279,42 @@ pub(crate) fn discover_bridge_chains(
         return Ok(Vec::new());
     }
     let bridges = read_bridge_topology()?;
-    Ok(bridge_vlan_chains(&bridges, &vlans))
+    let mut chains = bridge_vlan_chains(&bridges, &vlans);
+    // Wire-equivalence also needs the MTU relation: the uncollapsed
+    // path enforces the BRIDGE's MTU (a packet over it gets dropped /
+    // PTB'd by the bridge layer, and the tc datapath's bpf_check_mtu
+    // would test the bridge device). The short-circuit tests the
+    // underlying device instead, so a bridge with a SMALLER MTU than
+    // its underlying device would silently forward packets the bridge
+    // would have refused. Require mtu(bridge) >= mtu(underlying);
+    // anything else keeps the kernel path. Unreadable → refuse.
+    chains.retain(|(bridge, phys, _)| {
+        let mtu = |dev: &str| -> Option<u32> {
+            std::fs::read_to_string(format!("/sys/class/net/{dev}/mtu"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        match (mtu(bridge), mtu(phys)) {
+            (Some(b), Some(p)) if b >= p => true,
+            (Some(b), Some(p)) => {
+                info!(
+                    bridge = %bridge,
+                    bridge_mtu = b,
+                    underlying = %phys,
+                    underlying_mtu = p,
+                    "bridge egress short-circuit skipped: bridge MTU below underlying device"
+                );
+                false
+            }
+            _ => {
+                warn!(bridge = %bridge, underlying = %phys, "bridge short-circuit skipped: MTU unreadable");
+                false
+            }
+        }
+    });
+    Ok(chains)
 }
 
 /// Read-modify-write one `FpCfg.flags` bit on the live CFG map.
@@ -2188,20 +2223,33 @@ fn populate_vlan_resolve(
         );
     }
 
+    // Bridge entries are an optional optimization: failure to install
+    // one (map at capacity, iface vanished mid-walk) must degrade to
+    // "that bridge keeps the kernel path", never abort attach — unlike
+    // the subif entries above, whose absence would mistag real subif
+    // egress. Warn-and-continue per entry.
     for (bridge_name, phys_name, vid) in chains {
-        let bridge_idx = if_nametoindex(&bridge_name)?;
-        let phys_idx = if_nametoindex(&phys_name)?;
+        let (bridge_idx, phys_idx) =
+            match (if_nametoindex(&bridge_name), if_nametoindex(&phys_name)) {
+                (Ok(b), Ok(p)) => (b, p),
+                _ => {
+                    warn!(bridge = %bridge_name, "bridge short-circuit skipped: iface vanished");
+                    continue;
+                }
+            };
         let value = VlanResolve {
             phys_ifindex: phys_idx,
             vid,
             _pad: 0,
         };
-        hm.insert(bridge_idx, value, 0).map_err(|e| {
-            ModuleError::other(
-                MODULE_NAME,
-                format!("VLAN_RESOLVE insert {bridge_name}: {e}"),
-            )
-        })?;
+        if let Err(e) = hm.insert(bridge_idx, value, 0) {
+            warn!(
+                bridge = %bridge_name,
+                error = %e,
+                "bridge short-circuit skipped: VLAN_RESOLVE insert failed (bridge keeps the kernel path)"
+            );
+            continue;
+        }
         info!(
             bridge = %bridge_name,
             bridge_idx,
@@ -2210,6 +2258,25 @@ fn populate_vlan_resolve(
             vid,
             "bridge egress short-circuit installed"
         );
+        // `mss-clamp via <this bridge>` can no longer match: the clamp
+        // lookup keys on the POST-resolve egress ifindex (identical
+        // pre-existing semantics for plain VLAN subifs). Detectable
+        // here, so say it loudly with the fix.
+        for d in directives {
+            if let ModuleDirective::MssClamp {
+                iface: Some(clamp_iface),
+                ..
+            } = d
+            {
+                if *clamp_iface == bridge_name {
+                    warn!(
+                        bridge = %bridge_name,
+                        underlying = %phys_name,
+                        "mss-clamp `via {bridge_name}` will NOT match while the bridge                          egress short-circuit is installed (clamp matching keys on the                          resolved egress ifindex). Scope the clamp `via {phys_name}` or                          set `bridge-resolve off`."
+                    );
+                }
+            }
+        }
     }
 
     // Entries landed → make sure the VLAN_PRESENT gate bit is on, even
