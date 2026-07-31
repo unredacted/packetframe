@@ -139,16 +139,20 @@ explicit run id or it prompts, hence the subshell):
 gh run download -R unredacted/packetframe -n hwtest-aarch64-unknown-linux-gnu -D /tmp/hw "$(gh run list -R unredacted/packetframe -w 'Hardware test artifacts' -b main -s success --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
-Unpack and copy to the router (swap `router` for the target host):
+Unpack and copy to the router (swap `router` for the target host). **Not `/tmp`** —
+UniFi OS mounts it `noexec`, and since Linux `access(X_OK)` honours mount flags, a
+0755 test binary there tests as non-executable and the whole suite looks absent
+(`sudo …/run-tests.sh` reports "command not found" for a file that plainly exists).
+`run-tests.sh` detects that case and says so, but `/root` avoids it:
 
 ```sh
-tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu router:/tmp/
+tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu router:/root/
 ```
 
 Install it, then run the tests from the same directory:
 
 ```sh
-dpkg -i /tmp/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*_arm64.deb && systemctl daemon-reload
+dpkg -i /root/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*_arm64.deb && systemctl daemon-reload
 ```
 
 The `daemon-reload` is not optional: the package ships
@@ -200,7 +204,7 @@ runner tells you nothing about cn9670 cores — take the reference figures on th
 router itself, from the bundle above:
 
 ```sh
-sudo /tmp/packetframe-hwtest-aarch64-unknown-linux-gnu/run-tests.sh bench
+/root/packetframe-hwtest-aarch64-unknown-linux-gnu/run-tests.sh bench
 ```
 
 Confirm `net.core.bpf_jit_enable=1` first (`packetframe feasibility` reports it,

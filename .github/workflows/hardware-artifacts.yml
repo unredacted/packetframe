@@ -381,6 +381,26 @@ jobs:
             exit 1
           fi
 
+          # Detect a noexec mount before reporting anything as missing.
+          # Every binary here is staged 0755, and Linux access(X_OK) —
+          # which `test -x` uses — honours mount flags, so on a noexec
+          # filesystem a perfectly good binary tests as non-executable.
+          # /tmp is noexec on UniFi OS, so unpacking there makes the whole
+          # suite look absent, which is a maddening thing to debug from a
+          # "not in this bundle" message. Diagnose it once, properly.
+          for probe in ${SAFE}; do
+            if [ -f "./${probe}" ] && [ ! -x "./${probe}" ]; then
+              bundle=$(dirname "$(pwd)")
+              echo "error: ./${probe} exists but is not executable." >&2
+              echo "  cwd:            $(pwd)" >&2
+              echo "  mount options:  $(findmnt -no OPTIONS -T . 2>/dev/null || echo 'unknown (no findmnt)')" >&2
+              echo "  A noexec mount makes every test look missing. /tmp is noexec on" >&2
+              echo "  UniFi OS — copy the bundle somewhere exec-capable and rerun:" >&2
+              echo "    cp -r ${bundle} /root/ && /root/$(basename "${bundle}")/run-tests.sh" >&2
+              exit 1
+            fi
+          done
+
           # The microbenchmark times the JIT-compiled program; with the
           # JIT off it would time the interpreter and the numbers would be
           # meaningless. Warn rather than refuse: correctness tests are
