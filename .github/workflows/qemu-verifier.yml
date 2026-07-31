@@ -152,16 +152,20 @@ jobs:
           # (only the listed overlay paths are writable). Point
           # HOME/CARGO_HOME/RUSTUP_HOME at the /home overlay so rustup
           # can write its state without going read-only.
-          # --memory 4096 (up from 1024): virtme-ng sizes the in-VM
-          # tmpfs against RAM, and the Option F dep graph (tokio +
-          # rtnetlink + netlink-packet-route + futures) pushes
-          # incremental-relink tmpfs usage past the old ~500 MB.
-          # 4 GB RAM ⇒ ~2 GB writable tmpfs, comfortable headroom.
+          # --memory 6144 (1024 → 4096 → here): virtme-ng sizes the
+          # in-VM tmpfs against RAM, and the in-VM incremental relink
+          # of the test binaries is what fills it. 4 GB (~2 GB tmpfs)
+          # was sized for the Option F dep graph; the v0.2.8 fib-cache
+          # branch's grown fast-path test set pushed the subsequent
+          # probe-crate relink over the edge — `ld terminated with
+          # signal 7 [Bus error]` twice in a row on the 6.6 leg, at
+          # the same link. 6 GB ⇒ ~3 GB tmpfs restores the margin;
+          # hosted runners have 16 GB, so TCG + 6 GB guest is fine.
           run_vm() {
             virtme-ng \
               --run "${KERNEL_IMG}" \
               --pwd \
-              --memory 4096 \
+              --memory 6144 \
               --disable-kvm \
               --verbose \
               -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_QUICK=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
