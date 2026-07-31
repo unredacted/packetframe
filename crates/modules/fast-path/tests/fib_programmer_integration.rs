@@ -49,13 +49,43 @@ struct PinDirs {
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static BPFFS_MOUNT: Once = Once::new();
 
+/// bpffs superblock magic (`include/uapi/linux/magic.h`).
+const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+
+fn bpffs_already_mounted() -> bool {
+    let path = match std::ffi::CString::new(BPFFS_ROOT) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    // `f_type` differs in width and signedness across libc/arch.
+    #[allow(clippy::unnecessary_cast)]
+    let f_type = st.f_type as i64;
+    f_type == BPF_FS_MAGIC
+}
+
 /// Ensure `/sys/fs/bpf` exists and has bpffs mounted on it. GitHub's
 /// hosted Ubuntu runner already has this; virtme-ng's VM does not, so
 /// we mount it ourselves. Best-effort: errors are tolerated, the
 /// subsequent `create_dir_all` / `pin` call will surface the real
 /// problem with a clearer message.
+///
+/// Only mounts when bpffs genuinely isn't there. Linux stacks mounts on
+/// the same mountpoint, so mounting unconditionally would shadow a live
+/// packetframe's pinned maps with an empty instance for the rest of the
+/// boot — this test binary ships in the on-router bundle, where that
+/// would be a production incident rather than a test failure. Same guard
+/// in `fib_comparison.rs` and `route_source_bgp_addpath.rs`; each
+/// `tests/*.rs` is its own crate, so the helper can't be shared without
+/// the `tests/common/` refactor noted below.
 fn ensure_bpffs_mounted() {
     BPFFS_MOUNT.call_once(|| {
+        if bpffs_already_mounted() {
+            return;
+        }
         let _ = std::fs::create_dir_all(BPFFS_ROOT);
         let _ = std::process::Command::new("mount")
             .args(["-t", "bpf", "bpf", BPFFS_ROOT])
