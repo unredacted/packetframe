@@ -145,6 +145,11 @@ jobs:
       # out to be older than the cross image's: a static musl build has no
       # runtime libc dependency to satisfy, at the cost of no .deb.
       TARGET: ${{ inputs.target || 'aarch64-unknown-linux-gnu' }}
+      # On a pull_request run, GITHUB_SHA (and the checked-out HEAD) is the
+      # synthetic merge commit, which exists in nobody's clone. Stamp the
+      # package version with the PR head instead, so the sha an operator
+      # reads out of `dpkg -l` is one they can actually `git show`.
+      PF_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v7
 
@@ -305,7 +310,7 @@ jobs:
           cargo deb --no-build --no-strip \
             --target "${TARGET}" \
             -p packetframe-cli \
-            --deb-version "$(cat VERSION)~hwtest$(git rev-parse --short HEAD)" \
+            --deb-version "$(cat VERSION)~hwtest${PF_SHA:0:7}" \
             --output "dist/packetframe-hwtest-${TARGET}/"
           ls -la "dist/packetframe-hwtest-${TARGET}"/*.deb
 

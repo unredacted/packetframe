@@ -148,13 +148,26 @@ tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu.tar.gz -C /tmp/hw &
 Install it, then run the tests from the same directory:
 
 ```sh
-dpkg -i /tmp/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*_arm64.deb
+dpkg -i /tmp/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*_arm64.deb && systemctl daemon-reload
 ```
+
+The `daemon-reload` is not optional: the package ships
+`/lib/systemd/system/packetframe.service` but carries **no maintainer scripts**, so
+nothing reloads systemd for you and `systemctl start packetframe` can otherwise
+fail with "Unit packetframe.service not found". This is true of the release .debs
+as well — `[package.metadata.deb.systemd-units]` is configured in
+`crates/cli/Cargo.toml`, but the built package contains only `control`,
+`conffiles` and `sha256sums`.
+
+The package declares `Depends: libc6 (>= 2.31)`. If the target's libc6 is older,
+`dpkg -i` refuses; check with `dpkg -s libc6 | grep ^Version`. That's the case the
+musl variant below exists for.
 
 The `~hwtest<sha>` version sorts below every real release and is visible in
 `dpkg -l`, so a validation build can't be mistaken for one — and `apt install
-packetframe` later upgrades cleanly over it. To go back, `dpkg -r packetframe` or
-install a release .deb over the top.
+packetframe` later upgrades cleanly over it. The sha is the commit the bundle was
+built from, so `git show <sha>` tells you exactly what is on the box. To go back,
+`dpkg -r packetframe` or install a release .deb over the top.
 
 To take a bundle from a PR instead of `main` — the workflow also runs on PRs that
 change it — pass `-b <branch>` in place of `-b main`. For a different target,
