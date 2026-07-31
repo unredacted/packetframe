@@ -81,21 +81,25 @@ pub fn l4_ports(start: usize, end: usize, offset: usize, proto: u8) -> (u16, u16
 /// Bounds-check shape mirrors [`l4_ports`].
 #[inline(always)]
 pub fn icmpv6_type(start: usize, end: usize, offset: usize) -> Option<u8> {
-    // `p >= end` rather than the file's usual `start + off + k > end`:
-    // mathematically identical for k = 1, but it pins the packet
-    // pointer on the LEFT of the comparison. The 5.15-ui verifier
-    // failed this exact read when LLVM (under register pressure from
-    // the v0.2.8 FIB-cache inlining) emitted the reversed form
-    // `if pkt_end > pkt+off goto read` with `off` reloaded from a
-    // stack spill — range propagation stopped at r=off and the
-    // 1-byte read at `off` was rejected ("R2 offset is outside of
-    // the packet"). The `p >= end → bail` shape compiles to the
-    // canonical JGE-pointer-left compare that every kernel tracks.
-    let p = start + offset;
-    if p >= end {
+    // Bounds-check 4 bytes even though only 1 is read, and the 4 is
+    // load-bearing — do not "fix" it back to 1. Verifier history
+    // (v0.2.8 FIB-cache PR, two failed qemu-5.15 rounds): with k = 1,
+    // LLVM strength-reduces `p + 1 > end` (and the equivalent
+    // `p >= end`) into the reversed strict compare
+    // `if pkt_end > pkt+off goto read`, and the 5.15 verifier's range
+    // propagation for exactly that arm is off by one — the taken
+    // branch keeps r = off where off+1 is provable, and the 1-byte
+    // read at `off` is rejected ("R2 offset is outside of the
+    // packet"). `p + 4 > end` cannot collapse into a >= form, so LLVM
+    // emits the pkt-on-the-left shape (`if pkt+off+4 > pkt_end goto
+    // bail`) whose fall-through range every kernel tracks correctly.
+    // Semantically free: 4 bytes (type, code, checksum) is the ICMPv6
+    // header minimum, and a message truncated below that cannot be a
+    // valid NS/NA — "not NDP" is already the fail-safe answer.
+    if start + offset + 4 > end {
         return None;
     }
-    Some(unsafe { core::ptr::read_unaligned(p as *const u8) })
+    Some(unsafe { core::ptr::read_unaligned((start + offset) as *const u8) })
 }
 
 /// Read TCP header byte 13 (flags) at `tcp_offset` and test SYN.
