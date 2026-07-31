@@ -61,7 +61,15 @@ jobs:
     env:
       PACKETFRAME_BPF_REQUIRED: "1"
     steps:
+      # Check out the PR head rather than the default merge ref. This
+      # workflow's output is an artifact someone installs on a router, so
+      # the revision it was built from has to be a commit that exists:
+      # stamping a package with a sha that isn't what was compiled is
+      # worse than no sha at all. Correctness gating against the merge
+      # result is ci.yml's and qemu-verifier.yml's job, not this one's.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install Rust (stable + nightly for BPF)
         run: |
@@ -145,13 +153,22 @@ jobs:
       # out to be older than the cross image's: a static musl build has no
       # runtime libc dependency to satisfy, at the cost of no .deb.
       TARGET: ${{ inputs.target || 'aarch64-unknown-linux-gnu' }}
-      # On a pull_request run, GITHUB_SHA (and the checked-out HEAD) is the
-      # synthetic merge commit, which exists in nobody's clone. Stamp the
-      # package version with the PR head instead, so the sha an operator
-      # reads out of `dpkg -l` is one they can actually `git show`.
+      # The revision stamped into the package version. Must stay identical
+      # to the checkout `ref` below, so the sha an operator reads out of
+      # `dpkg -l` names the commit that was actually compiled — on a
+      # pull_request run GITHUB_SHA alone would be the synthetic merge
+      # commit, which exists in nobody's clone.
       PF_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
+      # Check out the PR head rather than the default merge ref. This
+      # workflow's output is an artifact someone installs on a router, so
+      # the revision it was built from has to be a commit that exists:
+      # stamping a package with a sha that isn't what was compiled is
+      # worse than no sha at all. Correctness gating against the merge
+      # result is ci.yml's and qemu-verifier.yml's job, not this one's.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install Rust (stable + target)
         run: |
@@ -376,14 +393,26 @@ jobs:
 
           suite="${*:-${SAFE}}"
           rc=0
+          ran=0
           for t in ${suite}; do
+            # A missing binary is a failure, not a skip. Silently passing
+            # here would let a typo, or a staging bug that dropped a
+            # target, report a clean pre-canary validation that in fact
+            # exercised nothing.
             if [ ! -x "./${t}" ]; then
-              echo "== skip ${t} (not in this bundle)"
+              echo "!! ${t}: not in this bundle (run --list to see what is)" >&2
+              rc=1
               continue
             fi
             echo "== ${t}"
+            ran=$((ran + 1))
             ./"${t}" --ignored --nocapture || rc=1
           done
+          if [ "${ran}" -eq 0 ]; then
+            echo "!! no tests ran" >&2
+            rc=1
+          fi
+          echo "== ${ran} test binaries ran, exit ${rc}"
           exit "${rc}"
           SH
           chmod +x "dist/packetframe-hwtest-${TARGET}/run-tests.sh"

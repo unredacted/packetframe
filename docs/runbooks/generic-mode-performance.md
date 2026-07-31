@@ -200,7 +200,7 @@ runner tells you nothing about cn9670 cores — take the reference figures on th
 router itself, from the bundle above:
 
 ```sh
-sudo /tmp/packetframe-hwtest-aarch64-unknown-linux-musl/run-tests.sh bench
+sudo /tmp/packetframe-hwtest-aarch64-unknown-linux-gnu/run-tests.sh bench
 ```
 
 Confirm `net.core.bpf_jit_enable=1` first (`packetframe feasibility` reports it,
