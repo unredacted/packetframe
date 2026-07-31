@@ -301,6 +301,15 @@ Two things to read off these:
   `mss-clamp` configured, the clamp lookups are gated out entirely rather than
   being paid and discarded.
 
+**These are cache-hot, small-table numbers.** The bench populates a handful of
+FIB entries, so every LPM walk hits L1. On the reference box under live load with
+a full BGP-fed FIB, the same perf profile that produced the table above puts the
+map lookups alone (`trie_lookup_elem` + `longest_prefix_match`) at ~1.2 µs/packet
+and the program bodies at ~0.5 µs — roughly 6× the bench total, almost all of it
+LPM-walk cache misses that a small table never pays. Use the bench for
+before/after comparisons of code changes (both sides mis-cache equally); use
+`kernel.bpf_stats_enabled` + `bpftool` (above) for the absolute live cost.
+
 Note what these figures are *not*: no pre-reduction baseline was ever captured on
 this hardware, so the 23→10 map-op change cannot be quantified from them. Scaling
 the measured per-op cost suggests roughly 13 × 24 ≈ 310 ns saved, which would put
