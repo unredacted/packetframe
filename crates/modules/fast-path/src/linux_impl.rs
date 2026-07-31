@@ -25,7 +25,7 @@ use packetframe_common::{
     },
     module::{Attachment, HookType, LoaderCtx, ModuleConfig, ModuleError, ModuleResult},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{aligned_bpf_copy, pin, FAST_PATH_BPF_AVAILABLE, MODULE_NAME};
 
@@ -199,7 +199,16 @@ pub(crate) fn bridge_vlan_chains(
 const BR_STATE_FORWARDING: &str = "3";
 
 /// Enumerate every bridge on the host with its members and their
-/// forwarding state. A device is a bridge iff
+/// forwarding state.
+///
+/// This is a point-in-time sysfs snapshot, converged at attach and on
+/// every SIGHUP — deliberately the same convergence model as every
+/// other discovery-populated map here (`/proc/net/vlan/config` entries,
+/// redirect-target membership). There is no live topology watcher;
+/// membership or STP changes between reconciles keep the previously
+/// proven chain until the next `packetframe reconfigure`. Documented
+/// in the runbook; a netlink link-watcher would introduce a second
+/// writer domain for VLAN_RESOLVE and is out of scope for this slice. A device is a bridge iff
 /// `/sys/class/net/<dev>/bridge` exists; members are the entries of
 /// `<dev>/brif/`. Per-device read failures are skipped (the sysfs tree
 /// is a live snapshot — a device can vanish mid-walk, same tolerance
@@ -214,6 +223,21 @@ fn read_bridge_topology() -> std::io::Result<BridgeTopology> {
         };
         let base = format!("/sys/class/net/{name}");
         if !std::path::Path::new(&format!("{base}/bridge")).is_dir() {
+            continue;
+        }
+        // A VLAN-filtering bridge consults its per-port VLAN table on
+        // every forward — it can drop, retag, or untag before the
+        // member's own 8021q encapsulation. A single forwarding member
+        // is NOT wire-equivalence proof under filtering, so such
+        // bridges never qualify. (The UniFi brXXXX shape this feature
+        // targets is a classic non-filtering bridge; the VLAN work is
+        // the subif's.) Unreadable counts as filtering-on: refuse
+        // rather than assume.
+        let filtering_off = std::fs::read_to_string(format!("{base}/bridge/vlan_filtering"))
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false);
+        if !filtering_off {
+            debug!(bridge = %name, "bridge skipped: vlan_filtering enabled (or unreadable)");
             continue;
         }
         let Ok(ports) = std::fs::read_dir(format!("{base}/brif")) else {
@@ -3063,6 +3087,60 @@ mod tests {
         crate::reconcile::reconcile_vlan_resolve(&mut state, &mcfg)
             .expect("reconcile with bridge-resolve auto");
         assert_eq!(read_entry(&mut state), Some((veth_idx, VID)));
+
+        // Same-key value change must converge in ONE reconcile: swap
+        // the bridge's member for a different-VID subif. The bridge
+        // keeps its ifindex, so the full-tuple diff sees an add and a
+        // remove under one key — the remove pass must not delete the
+        // freshly written value (the Codex-found off-by-one-reconcile).
+        run(&["ip", "link", "del", SUBIF]);
+        run(&[
+            "ip",
+            "link",
+            "add",
+            "link",
+            VETH_A,
+            "name",
+            "pf-brv0.43",
+            "type",
+            "vlan",
+            "id",
+            "43",
+        ]);
+        run(&["ip", "link", "set", "pf-brv0.43", "master", BRIDGE]);
+        run(&["ip", "link", "set", "pf-brv0.43", "up"]);
+        let state43 = "/sys/class/net/pf-brv0.43/brport/state";
+        for _ in 0..50 {
+            if std::fs::read_to_string(state43).is_ok_and(|s| s.trim() == "3") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        crate::reconcile::reconcile_vlan_resolve(&mut state, &mcfg)
+            .expect("reconcile after member swap");
+        assert_eq!(
+            read_entry(&mut state),
+            Some((veth_idx, 43)),
+            "value change under a stable bridge key must survive one reconcile"
+        );
+
+        // A VLAN-filtering bridge must never qualify.
+        run(&[
+            "ip",
+            "link",
+            "set",
+            BRIDGE,
+            "type",
+            "bridge",
+            "vlan_filtering",
+            "1",
+        ]);
+        let chains =
+            discover_bridge_chains(&auto_cfg.modules[0].directives).expect("bridge topology read");
+        assert!(
+            !chains.iter().any(|(b, _, _)| b == BRIDGE),
+            "vlan_filtering bridge must be excluded, got {chains:?}"
+        );
     }
 
     #[test]

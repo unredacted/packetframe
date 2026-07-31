@@ -414,6 +414,16 @@ layer's ebtables hooks for forwarded traffic — consistent with the fast path's
 existing netfilter bypass on ingress, but worth knowing if ebtables rules
 target forwarded traffic on the bridge.
 
+**Convergence model — same as every discovery-populated map.** Chains are
+discovered at attach and re-verified on every `packetframe reconfigure`
+(SIGHUP); there is no live topology watcher, exactly as with plain VLAN-subif
+entries and redirect-target membership. If you change bridge membership (enslave
+a second port, move the subif) or flip `vlan_filtering` on a bridge that has a
+short-circuit installed, run `packetframe reconfigure` afterwards — until then
+the datapath keeps using the previously proven chain. Bridges with
+`vlan_filtering=1` never qualify at all (the per-port VLAN table can drop or
+retag in ways a static entry can't reproduce).
+
 Rollback is SIGHUP-cheap, no restart and no traffic blip:
 
 ```text

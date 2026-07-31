@@ -307,7 +307,18 @@ pub(crate) fn reconcile_vlan_resolve(
             Err(e) => warn!(subif_idx, error = %e, "VLAN_RESOLVE insert failed"),
         }
     }
+    // The diff is over full (key, value) tuples but the map is keyed
+    // on ifindex alone, so a key whose VALUE changed (same bridge,
+    // re-parented member or new VID) appears in both differences: the
+    // add pass above already wrote the new value under the key, and
+    // removing the old tuple here would delete that fresh entry —
+    // one SIGHUP would leave the key absent until the next reconcile.
+    // Skip removals for keys the desired set still contains.
+    let desired_keys: HashSet<u32> = desired.iter().map(|(k, _, _)| *k).collect();
     for (subif_idx, _, _) in current.difference(&desired) {
+        if desired_keys.contains(subif_idx) {
+            continue; // value updated in place by the add pass
+        }
         match hm.remove(subif_idx) {
             Ok(()) => {
                 delta.removed += 1;
