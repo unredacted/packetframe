@@ -30,14 +30,14 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target triple to cross-build the test binaries for'
+        description: 'Target triple to cross-build for (gnu targets also get a .deb)'
         type: choice
-        default: aarch64-unknown-linux-musl
+        default: aarch64-unknown-linux-gnu
         options:
-          - aarch64-unknown-linux-musl
           - aarch64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
           - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
 
 permissions:
   contents: read
@@ -131,15 +131,20 @@ jobs:
           if-no-files-found: error
 
   tests:
-    name: test binaries (${{ inputs.target || 'aarch64-unknown-linux-musl' }})
+    name: test binaries (${{ inputs.target || 'aarch64-unknown-linux-gnu' }})
     needs: bpf
     runs-on: ubuntu-latest
     env:
-      # Default target is the production fleet's: aarch64 + musl.
-      # Static-musl matters here — these binaries run on UniFi OS, whose
-      # glibc version we don't control, and a statically linked test ELF
-      # has no runtime dependency to satisfy.
-      TARGET: ${{ inputs.target || 'aarch64-unknown-linux-musl' }}
+      # Default target matches the production fleet: aarch64 UniFi OS,
+      # which is Debian-family glibc. That's also what makes a .deb
+      # possible — dpkg packages are for glibc distros, so the `-gnu`
+      # targets are the ones that get one, and `dpkg -i` is how this
+      # actually gets onto a test router.
+      #
+      # The musl options remain for the case where a target's glibc turns
+      # out to be older than the cross image's: a static musl build has no
+      # runtime libc dependency to satisfy, at the cost of no .deb.
+      TARGET: ${{ inputs.target || 'aarch64-unknown-linux-gnu' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -157,9 +162,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-musl' }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-gnu' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-musl' }}-
+            ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-gnu' }}-
 
       - name: Install cross
         run: |
@@ -274,6 +279,36 @@ jobs:
              docs/runbooks/generic-mode-performance.md \
              "dist/packetframe-hwtest-${TARGET}/"
 
+      # An installable package, not just loose binaries: `dpkg -i` is how
+      # this reaches a test router, and it brings the systemd unit and
+      # /etc/packetframe along with the binary. Only the `-gnu` targets get
+      # one — a .deb targets glibc Debian-family systems, which is what
+      # UniFi OS is; musl builds are static ELFs with no package.
+      #
+      # release.yml stays the authority for PUBLISHED packages
+      # (reproducible SOURCE_DATE_EPOCH, combined + signed SHA256SUMS).
+      # This one is deliberately versioned `<VERSION>~hwtest<sha>` so it
+      # sorts below any real release, can never be mistaken for one, and is
+      # trivially visible in `dpkg -l`.
+      - name: Build .deb (gnu targets only)
+        if: contains(inputs.target || 'aarch64-unknown-linux-gnu', '-gnu')
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-deb >/dev/null 2>&1 || \
+             [ "$(cargo deb --version 2>/dev/null | awk '{print $2}')" != "2.7.0" ]; then
+            cargo install --locked --force cargo-deb --version 2.7.0
+          fi
+          # --no-build: cross already produced the binary at
+          # target/<triple>/release/packetframe. --no-strip: the release
+          # profile strips, and the host's `strip` can't read a cross-built
+          # arm64 ELF anyway.
+          cargo deb --no-build --no-strip \
+            --target "${TARGET}" \
+            -p packetframe-cli \
+            --deb-version "$(cat VERSION)~hwtest$(git rev-parse --short HEAD)" \
+            --output "dist/packetframe-hwtest-${TARGET}/"
+          ls -la "dist/packetframe-hwtest-${TARGET}"/*.deb
+
       # Default suite is BPF_PROG_TEST_RUN-only: it loads programs and
       # runs packets through them in-kernel without attaching anything to
       # a live interface, so it is safe on a forwarding router. The tests
@@ -359,7 +394,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: hwtest-${{ inputs.target || 'aarch64-unknown-linux-musl' }}
+          name: hwtest-${{ inputs.target || 'aarch64-unknown-linux-gnu' }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

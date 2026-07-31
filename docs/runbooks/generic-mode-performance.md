@@ -116,42 +116,63 @@ Symbols to read:
 If `pskb_expand_head` + linearization dwarf `bpf_prog_run_generic_xdp`, host tuning
 and datapath placement (not BPF micro-optimization) are where the wins are.
 
-### Getting binaries onto the router
+### Getting a build onto a test router
 
 Neither the release tarballs nor the CI test runs give you what an on-hardware
-measurement session needs: releases ship only the `packetframe` binary and only on
-a tag, and the test suites run on x86_64 runners and in qemu. The
-`hardware-artifacts` workflow closes that gap. It runs on every push to `main` and
-publishes a `hwtest-aarch64-unknown-linux-musl` artifact containing the
-cross-built test binaries, the matching `packetframe` CLI, both runbooks, and a
-driver script — all statically linked and carrying the real BPF ELF (the same
-bytecode a release would ship, not a stub).
+session needs: releases only exist for tags, and the test suites run on x86_64
+runners and in qemu. The `hardware-artifacts` workflow closes that gap. It runs on
+every push to `main` and publishes a `hwtest-aarch64-unknown-linux-gnu` artifact
+containing:
+
+- `packetframe_<version>~hwtest<sha>_arm64.deb` — an installable package, same
+  contents as a release .deb (binary, systemd unit, `/etc/packetframe`)
+- `tests/` — the cross-built test binaries, including `bench`
+- `run-tests.sh`, `example.conf`, and both perf runbooks
+
+Everything carries the real BPF ELF — the same bytecode a release would ship, not
+a stub.
 
 Download the bundle from the newest `main` run (`gh run download` needs an
 explicit run id or it prompts, hence the subshell):
 
 ```sh
-gh run download -R unredacted/packetframe -n hwtest-aarch64-unknown-linux-musl -D /tmp/hw "$(gh run list -R unredacted/packetframe -w 'Hardware test artifacts' -b main -s success --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run download -R unredacted/packetframe -n hwtest-aarch64-unknown-linux-gnu -D /tmp/hw "$(gh run list -R unredacted/packetframe -w 'Hardware test artifacts' -b main -s success --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
 Unpack and copy to the router (swap `router` for the target host):
 
 ```sh
-tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-musl.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-musl router:/tmp/
+tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-gnu router:/tmp/
 ```
 
-To take a bundle from a PR instead of `main` — the workflow also runs on PRs
-that change it — pass `-b <branch>` in place of `-b main`.
-
-For a target other than the fleet default (aarch64 + musl), dispatch it manually:
+Install it, then run the tests from the same directory:
 
 ```sh
-gh workflow run hardware-artifacts.yml --repo unredacted/packetframe -f target=aarch64-unknown-linux-gnu
+dpkg -i /tmp/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*_arm64.deb
 ```
 
-A tagged release remains the way to get a *signed, versioned* package. To build
-release tarballs from an untagged `main` without publishing anything, dispatch
-`release.yml` — its `dry_run` input defaults to true and skips the publish job:
+The `~hwtest<sha>` version sorts below every real release and is visible in
+`dpkg -l`, so a validation build can't be mistaken for one — and `apt install
+packetframe` later upgrades cleanly over it. To go back, `dpkg -r packetframe` or
+install a release .deb over the top.
+
+To take a bundle from a PR instead of `main` — the workflow also runs on PRs that
+change it — pass `-b <branch>` in place of `-b main`. For a different target,
+dispatch it:
+
+```sh
+gh workflow run hardware-artifacts.yml --repo unredacted/packetframe -f target=aarch64-unknown-linux-musl
+```
+
+The musl variants are statically linked and produce **no .deb** (dpkg packages
+target glibc distros). They exist as an escape hatch: if a router's glibc turns
+out to be older than the cross image's and the gnu binaries won't start, a static
+musl build has no libc dependency to satisfy.
+
+For a *signed, versioned* package, cut a tag — `release.yml` publishes tarballs
+and .debs for all four targets with reproducible timestamps and a signed
+`SHA256SUMS`. To rehearse that without publishing, dispatch it; `dry_run` defaults
+to true and skips the publish job:
 
 ```sh
 gh workflow run release.yml --repo unredacted/packetframe --ref main

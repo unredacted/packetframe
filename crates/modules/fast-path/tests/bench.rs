@@ -15,12 +15,12 @@
 //! ```
 //!
 //! Run on the reference EFG (or any aarch64 router): download the
-//! `hwtest-aarch64-unknown-linux-musl` artifact from the
+//! `hwtest-aarch64-unknown-linux-gnu` artifact from the
 //! `hardware-artifacts` workflow — it cross-builds this test binary with
-//! the real BPF ELF embedded and stages it with a driver script — then
-//! on the router:
+//! the real BPF ELF embedded and stages it alongside an installable .deb
+//! and a driver script — then on the router:
 //! ```sh
-//! sudo ./packetframe-hwtest-aarch64-unknown-linux-musl/run-tests.sh bench
+//! sudo ./packetframe-hwtest-aarch64-unknown-linux-gnu/run-tests.sh bench
 //! ```
 //! `docs/runbooks/generic-mode-performance.md` has the download
 //! commands. Cross-building by hand needs the BPF toolchain (nightly +
