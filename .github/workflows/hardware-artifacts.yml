@@ -1,0 +1,329 @@
+name: Hardware test artifacts
+
+# Produces a downloadable bundle for running PacketFrame's integration
+# tests and the ns/packet microbenchmark ON A ROUTER, rather than on a
+# CI runner or in qemu.
+#
+# Why this exists: `ci.yml` and `qemu-verifier.yml` prove correctness on
+# x86_64 (host + 5.15/6.6 VMs) but neither produces an artifact you can
+# copy to an aarch64 EFG, and the release tarballs ship only the
+# `packetframe` binary — no test binaries, and only on a tag. Numbers
+# that matter for the generic-XDP-vs-tc work (ns/packet on cn9670 cores)
+# can only be measured on the real hardware, so the test ELFs have to be
+# cross-built somewhere that has both the BPF toolchain and the cross
+# targets. That's here.
+#
+# Runs on every push to main so there is always a current bundle, and on
+# demand for other targets. Never publishes anything.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target triple to cross-build the test binaries for'
+        type: choice
+        default: aarch64-unknown-linux-musl
+        options:
+          - aarch64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_STABLE: "1.95.0"
+  RUST_NIGHTLY: "nightly-2026-04-14"
+  BPF_LINKER_VERSION: "0.10.3"
+
+jobs:
+  # Same shape as release.yml's `bpf` job, and for the same reason:
+  # cross's Docker images have no rustup, so they cannot nest-build the
+  # BPF crate. Build the ELF once here (host has nightly + bpf-linker),
+  # hand it to the cross job via PACKETFRAME_BPF_OBJ_PATH. Test binaries
+  # must embed the REAL bytecode — a stub ELF makes every BPF-loading
+  # test early-return "BPF stub in effect" and report ok.
+  bpf:
+    name: build BPF ELF
+    runs-on: ubuntu-latest
+    env:
+      PACKETFRAME_BPF_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable + nightly for BPF)
+        run: |
+          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup default ${{ env.RUST_STABLE }}
+          rustup toolchain install ${{ env.RUST_NIGHTLY }} \
+            --profile minimal --component rust-src,llvm-tools-preview
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            crates/modules/fast-path/bpf/target/
+            crates/modules/probe/bpf/target/
+          key: ${{ runner.os }}-hwtest-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/probe/bpf/**') }}
+
+      - name: Install bpf-linker
+        run: |
+          if ! command -v bpf-linker >/dev/null 2>&1 || \
+             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${{ env.BPF_LINKER_VERSION }}" ]; then
+            cargo install --locked --force bpf-linker \
+              --version ${{ env.BPF_LINKER_VERSION }}
+          fi
+
+      - name: Build BPF ELFs
+        run: |
+          set -eux
+          build_one() {
+            local bpf_dir="$1"
+            local bin_name="$2"
+            local out_name="$3"
+            ( cd "${bpf_dir}" && cargo build --release --message-format=json ) \
+              | tee "${out_name}.json" >/dev/null
+            local elf
+            elf=$(python3 -c "
+          import json, sys
+          for line in open('${out_name}.json'):
+              try:
+                  msg = json.loads(line)
+              except Exception:
+                  continue
+              if msg.get('reason') == 'compiler-artifact' and msg.get('target', {}).get('name') == '${bin_name}':
+                  print(msg['filenames'][0])
+                  sys.exit(0)
+          sys.exit(1)
+          ")
+            test -n "${elf}" && test -e "${elf}"
+            head -c 4 "${elf}" | od -An -c | grep -q 'E   L   F' || \
+              (echo "BPF output is not an ELF at ${elf}" >&2; exit 1)
+            cp "${elf}" "dist/${out_name}"
+          }
+          mkdir -p dist
+          build_one crates/modules/fast-path/bpf fast-path fast-path.bpf.o
+          build_one crates/modules/probe/bpf     probe     probe.bpf.o
+          ls -la dist/*.bpf.o
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bpf-elf
+          path: |
+            dist/fast-path.bpf.o
+            dist/probe.bpf.o
+          retention-days: 14
+          if-no-files-found: error
+
+  tests:
+    name: test binaries (${{ inputs.target || 'aarch64-unknown-linux-musl' }})
+    needs: bpf
+    runs-on: ubuntu-latest
+    env:
+      # Default target is the production fleet's: aarch64 + musl.
+      # Static-musl matters here — these binaries run on UniFi OS, whose
+      # glibc version we don't control, and a statically linked test ELF
+      # has no runtime dependency to satisfy.
+      TARGET: ${{ inputs.target || 'aarch64-unknown-linux-musl' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable + target)
+        run: |
+          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup default ${{ env.RUST_STABLE }}
+          rustup target add "${TARGET}"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-musl' }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-musl' }}-
+
+      - name: Install cross
+        run: |
+          if ! command -v cross >/dev/null 2>&1; then
+            cargo install --locked cross
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bpf-elf
+          path: prebuilt-bpf
+
+      - name: Point build.rs at the prebuilt BPF ELFs
+        run: |
+          set -eux
+          FAST="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
+          PROBE="$(pwd)/prebuilt-bpf/probe.bpf.o"
+          head -c 4 "${FAST}"  | od -An -c | grep -q 'E   L   F'
+          head -c 4 "${PROBE}" | od -An -c | grep -q 'E   L   F'
+          # Cross.toml's passthrough list doesn't cover these, so forward
+          # them with explicit -e, using the container's mount point for
+          # the workspace (/project). Same approach as release.yml.
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o" >> "${GITHUB_ENV}"
+
+      # `--tests` is the point of this job and is NOT covered by
+      # ci.yml's cross matrix (which builds `--release --workspace`
+      # only). Test code has its own cross-compilation hazards — the
+      # SIOCGIFHWADDR ioctl request type differs between glibc and musl
+      # — so this job is also the gate that keeps the test tree
+      # cross-buildable.
+      - name: Cross-build test binaries + CLI
+        run: |
+          set -euo pipefail
+          cross build --release --target "${TARGET}" \
+            --tests --bins \
+            -p packetframe-fast-path -p packetframe-probe -p packetframe-cli \
+            --message-format=json | tee build.json >/dev/null
+
+      - name: Stage bundle
+        run: |
+          set -euo pipefail
+          python3 - "$TARGET" <<'PY'
+          import json, os, shutil, sys
+
+          target = sys.argv[1]
+          root = os.path.join("dist", f"packetframe-hwtest-{target}")
+          tests_dir = os.path.join(root, "tests")
+          os.makedirs(tests_dir, exist_ok=True)
+
+          staged_tests, staged_bins = [], []
+          for line in open("build.json"):
+              try:
+                  msg = json.loads(line)
+              except Exception:
+                  continue
+              if msg.get("reason") != "compiler-artifact":
+                  continue
+              exe = msg.get("executable")
+              if not exe:
+                  continue
+              tgt = msg["target"]
+              name = tgt["name"]
+              kinds = tgt.get("kind", [])
+              if msg.get("profile", {}).get("test"):
+                  # A lib's or bin's own #[test] harness shares its
+                  # target name with the library/binary itself; suffix so
+                  # the real `packetframe` binary and the test harness
+                  # compiled from src/main.rs don't collide.
+                  if "test" not in kinds:
+                      name = f"{name}-unittests"
+                  dest = os.path.join(tests_dir, name)
+                  staged_tests.append(name)
+              else:
+                  dest = os.path.join(root, name)
+                  staged_bins.append(name)
+              if os.path.exists(dest):
+                  sys.exit(f"refusing to overwrite staged {dest} (target name collision)")
+              shutil.copy2(exe, dest)
+              os.chmod(dest, 0o755)
+
+          if not staged_tests:
+              sys.exit("no test executables found in build.json")
+          if "packetframe" not in staged_bins:
+              sys.exit("packetframe CLI binary missing from build.json")
+          print("tests:", " ".join(sorted(staged_tests)))
+          print("bins: ", " ".join(sorted(staged_bins)))
+          PY
+          cp conf/example.conf "dist/packetframe-hwtest-${TARGET}/"
+          cp docs/runbooks/tc-datapath.md \
+             docs/runbooks/generic-mode-performance.md \
+             "dist/packetframe-hwtest-${TARGET}/"
+
+      # Default suite is BPF_PROG_TEST_RUN-only: it loads programs and
+      # runs packets through them in-kernel without attaching anything to
+      # a live interface, so it is safe on a forwarding router. The tests
+      # that create veths/netns or attach to devices must be named
+      # explicitly — hence the split.
+      - name: Write on-router driver script
+        run: |
+          set -euo pipefail
+          cat > "dist/packetframe-hwtest-${TARGET}/run-tests.sh" <<'SH'
+          #!/bin/sh
+          # On-router driver for PacketFrame's staged test binaries.
+          #
+          #   ./run-tests.sh              # safe suite: no interface is touched
+          #   ./run-tests.sh bench        # just the ns/packet microbenchmark
+          #   ./run-tests.sh tc_attach    # invasive: creates veths (see below)
+          #   ./run-tests.sh --list       # what is in this bundle
+          #
+          # Every test binary here is #[ignore]d by default (they need
+          # CAP_BPF/CAP_NET_ADMIN), so the driver passes --ignored.
+          #
+          # SAFE BY DEFAULT: the default suite only uses BPF_PROG_TEST_RUN
+          # — programs are loaded and fed synthetic packets in-kernel;
+          # nothing is attached to a live NIC and no traffic is affected.
+          # `attach`, `tc_attach`, `netns`, `local_prefix_netns` and
+          # `neigh_resolver_netns` create interfaces or network
+          # namespaces; they clean up after themselves but are excluded
+          # from the default run. Name them explicitly if you want them.
+          set -u
+          cd "$(dirname "$0")/tests" || exit 1
+
+          SAFE="verifier fixtures tc_fixtures feature_gates mss_clamp_gate fib_fixtures fib_hash_vectors fib_comparison bench"
+
+          if [ "${1:-}" = "--list" ]; then
+            ls -1
+            exit 0
+          fi
+
+          if [ "$(id -u)" != 0 ]; then
+            echo "error: run as root — these tests need CAP_BPF + CAP_NET_ADMIN" >&2
+            exit 1
+          fi
+
+          # The microbenchmark times the JIT-compiled program; with the
+          # JIT off it would time the interpreter and the numbers would be
+          # meaningless. Warn rather than refuse: correctness tests are
+          # unaffected.
+          if [ -r /proc/sys/net/core/bpf_jit_enable ]; then
+            jit=$(cat /proc/sys/net/core/bpf_jit_enable)
+            [ "${jit}" = "0" ] && \
+              echo "WARNING: net.core.bpf_jit_enable=0 — bench numbers would measure the BPF interpreter" >&2
+          fi
+
+          suite="${*:-${SAFE}}"
+          rc=0
+          for t in ${suite}; do
+            if [ ! -x "./${t}" ]; then
+              echo "== skip ${t} (not in this bundle)"
+              continue
+            fi
+            echo "== ${t}"
+            ./"${t}" --ignored --nocapture || rc=1
+          done
+          exit "${rc}"
+          SH
+          chmod +x "dist/packetframe-hwtest-${TARGET}/run-tests.sh"
+
+      - name: Bundle
+        run: |
+          set -euo pipefail
+          STEM="packetframe-hwtest-${TARGET}"
+          ( cd dist && tar czf "${STEM}.tar.gz" "${STEM}" )
+          ( cd dist && sha256sum "${STEM}.tar.gz" > "${STEM}.tar.gz.sha256" )
+          ls -la "dist/${STEM}"/ "dist/${STEM}/tests"/
+          du -sh "dist/${STEM}.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hwtest-${{ inputs.target || 'aarch64-unknown-linux-musl' }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 14
+          if-no-files-found: error

@@ -52,6 +52,16 @@ Different, deliberately:
 
 ## Canary rollout
 
+0. Get a build that has the tc datapath onto the box. The
+   `hardware-artifacts` workflow publishes a statically linked aarch64
+   bundle (`packetframe` CLI + test binaries + this runbook) for every
+   push to `main`; `docs/runbooks/generic-mode-performance.md` §"Getting
+   binaries onto the router" has the `gh run download` commands. Before
+   touching the attach set, run the safe test suite on the router —
+   `sudo ./run-tests.sh` — which proves this kernel's verifier accepts
+   the tc classifiers and that the fixtures produce the expected
+   verdicts, without attaching anything to a live interface.
+
 1. Pick the quietest attached interface. Change its attach line:
 
    ```

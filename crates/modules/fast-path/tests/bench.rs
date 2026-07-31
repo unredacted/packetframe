@@ -14,13 +14,20 @@
 //! sudo -E cargo test --test bench -- --ignored --nocapture
 //! ```
 //!
-//! Run on the reference EFG (or any aarch64 router):
+//! Run on the reference EFG (or any aarch64 router): download the
+//! `hwtest-aarch64-unknown-linux-musl` artifact from the
+//! `hardware-artifacts` workflow — it cross-builds this test binary with
+//! the real BPF ELF embedded and stages it with a driver script — then
+//! on the router:
 //! ```sh
-//! cross build --target aarch64-unknown-linux-gnu --tests --release
-//! # find the bench binary under target/aarch64-unknown-linux-gnu/release/deps/bench-<hash>
-//! scp target/aarch64-unknown-linux-gnu/release/deps/bench-* router:/tmp/
-//! ssh router 'sudo /tmp/bench-<hash> --ignored --nocapture'
+//! sudo ./packetframe-hwtest-aarch64-unknown-linux-musl/run-tests.sh bench
 //! ```
+//! `docs/runbooks/generic-mode-performance.md` has the download
+//! commands. Cross-building by hand needs the BPF toolchain (nightly +
+//! bpf-linker) in the same place as the cross target, which is why the
+//! workflow splits the two: a macOS dev box can't build the ELF at all
+//! and would silently embed a stub, making every bench here early-return.
+//!
 //! Confirm `net.core.bpf_jit_enable=1` on the target first (see
 //! `packetframe feasibility`), otherwise the numbers measure the BPF
 //! interpreter, not what production runs.

@@ -116,13 +116,63 @@ Symbols to read:
 If `pskb_expand_head` + linearization dwarf `bpf_prog_run_generic_xdp`, host tuning
 and datapath placement (not BPF micro-optimization) are where the wins are.
 
+### Getting binaries onto the router
+
+Neither the release tarballs nor the CI test runs give you what an on-hardware
+measurement session needs: releases ship only the `packetframe` binary and only on
+a tag, and the test suites run on x86_64 runners and in qemu. The
+`hardware-artifacts` workflow closes that gap. It runs on every push to `main` and
+publishes a `hwtest-aarch64-unknown-linux-musl` artifact containing the
+cross-built test binaries, the matching `packetframe` CLI, both runbooks, and a
+driver script — all statically linked and carrying the real BPF ELF (the same
+bytecode a release would ship, not a stub).
+
+Download the bundle from the newest run and copy it to the router:
+
+```sh
+gh run download --repo unredacted/packetframe --name hwtest-aarch64-unknown-linux-musl --dir /tmp/hw
+```
+
+```sh
+tar xzf /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-musl.tar.gz -C /tmp/hw && scp -r /tmp/hw/packetframe-hwtest-aarch64-unknown-linux-musl router:/tmp/
+```
+
+For a target other than the fleet default (aarch64 + musl), dispatch it manually:
+
+```sh
+gh workflow run hardware-artifacts.yml --repo unredacted/packetframe -f target=aarch64-unknown-linux-gnu
+```
+
+A tagged release remains the way to get a *signed, versioned* package. To build
+release tarballs from an untagged `main` without publishing anything, dispatch
+`release.yml` — its `dry_run` input defaults to true and skips the publish job:
+
+```sh
+gh workflow run release.yml --repo unredacted/packetframe --ref main
+```
+
 ### Program-only microbenchmark
 
 `crates/modules/fast-path/tests/bench.rs` measures ns/packet for the
 `fast_path → finalize` chain via `BPF_PROG_TEST_RUN` (kernel-timed, excludes all
-generic-XDP skb overhead). Run on any Linux host, or cross-build the test binary
-for the router (instructions in the file header). Confirm the JIT is on first —
-otherwise the bench times the interpreter.
+generic-XDP skb overhead). It runs on any Linux host, but a number from a CI
+runner tells you nothing about cn9670 cores — take the reference figures on the
+router itself, from the bundle above:
+
+```sh
+sudo /tmp/packetframe-hwtest-aarch64-unknown-linux-musl/run-tests.sh bench
+```
+
+Confirm `net.core.bpf_jit_enable=1` first (`packetframe feasibility` reports it,
+and the driver script warns) — otherwise the bench times the BPF interpreter
+rather than what production runs.
+
+`run-tests.sh` with no arguments runs the wider correctness suite. Its default
+selection is deliberately limited to tests that only use `BPF_PROG_TEST_RUN`:
+programs are loaded and fed synthetic packets in-kernel, nothing is attached to a
+live NIC, so it is safe to run on a forwarding router. The tests that create
+veths or network namespaces (`attach`, `tc_attach`, `netns`,
+`local_prefix_netns`, `neigh_resolver_netns`) have to be named explicitly.
 
 ### Counters that matter (`packetframe status`)
 

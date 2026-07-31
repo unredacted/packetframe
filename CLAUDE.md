@@ -13,7 +13,7 @@ PacketFrame is a modular eBPF data plane written in pure Rust (aya + aya-ebpf). 
 - `crates/modules/fast-path/`: fast-path module including the custom-FIB control plane under `src/fib/`
 - `conf/example.conf`: reference config per SPEC.md §4.8
 - `docs/runbooks/custom-fib.md`: Option F operations runbook (healthy state, triage by symptom, cutover + rollback, Phase 4 config snippets)
-- `.github/workflows/`: `ci.yml` (fmt/clippy/test + 4× cross-build), `qemu-verifier.yml` (integration tests on 5.15 + 6.6 kernels), `release.yml` (tag-triggered tarballs)
+- `.github/workflows/`: `ci.yml` (fmt/clippy/test + 4× cross-build), `qemu-verifier.yml` (integration tests on 5.15 + 6.6 kernels), `release.yml` (tag-triggered tarballs), `hardware-artifacts.yml` (per-main-push aarch64 test-binary + CLI bundle for on-router runs)
 
 ## Build & test
 
