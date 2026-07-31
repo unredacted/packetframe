@@ -252,6 +252,14 @@ pub enum ModuleDirective {
         line: usize,
     },
     DryRun(bool),
+    /// `fib-cache on|off` — destination cache in front of the custom
+    /// FIB LPM lookups (default off; an experiment with an explicit
+    /// kill criterion, see docs). Caches the FibValue keyed on the
+    /// full destination address; invalidated globally on every route
+    /// change via a generation counter owned by the FibProgrammer.
+    /// Only meaningful under `forwarding-mode custom-fib`; parsed and
+    /// inert otherwise (warned at apply time). SIGHUP-reconcilable.
+    FibCache(bool),
     /// `bridge-resolve auto|on|off` — bridge egress short-circuit
     /// (SPEC §4.7 extension). When the FIB resolves a nexthop whose
     /// egress device is a Linux bridge whose **single forwarding
@@ -1588,6 +1596,25 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::DryRun(on))
         }
         "circuit-breaker" => parse_circuit_breaker(line, rest),
+        "fib-cache" => {
+            let v = rest
+                .next()
+                .ok_or_else(|| ConfigError::parse(line, "fib-cache requires on|off"))?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(line, "fib-cache takes one argument"));
+            }
+            let on = match v {
+                "on" => true,
+                "off" => false,
+                other => {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!("fib-cache expects on|off, got `{other}`"),
+                    ))
+                }
+            };
+            Ok(ModuleDirective::FibCache(on))
+        }
         "bridge-resolve" => parse_single_arg(line, rest, "bridge-resolve", |t| {
             let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
             Ok(ModuleDirective::BridgeResolve(v))
@@ -2403,6 +2430,21 @@ module fast-path
             }
             other => panic!("expected Attach, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fib_cache_parses() {
+        for (tok, want) in [("on", true), ("off", false)] {
+            let s = format!("module fast-path\n  fib-cache {tok}\n");
+            let c = Config::parse(&s).unwrap();
+            match &c.modules[0].directives[0] {
+                ModuleDirective::FibCache(v) => assert_eq!(*v, want),
+                other => panic!("expected FibCache, got {other:?}"),
+            }
+        }
+        assert!(Config::parse("module fast-path\n  fib-cache auto\n").is_err());
+        assert!(Config::parse("module fast-path\n  fib-cache\n").is_err());
+        assert!(Config::parse("module fast-path\n  fib-cache on off\n").is_err());
     }
 
     #[test]

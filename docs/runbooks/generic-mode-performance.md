@@ -472,3 +472,44 @@ What to watch after enabling (canary):
 - Attach/reconcile logs: one `bridge egress short-circuit installed` line per
   collapsed chain says discovery proved the shape; absence means the topology
   didn't qualify and nothing changed.
+
+## FIB destination cache (`fib-cache`, experiment)
+
+Live profiling showed the custom-FIB LPM walks are the dominant *BPF-side* cost
+(~1.2 µs/packet of `trie_lookup_elem` + `longest_prefix_match` on a full table —
+the walks miss cache on a 2M-entry trie). `fib-cache on` puts a direct-mapped
+per-CPU cache in front of `FIB_V4`/`FIB_V6`: repeat destinations become one array
+probe instead of an LPM walk.
+
+What it caches, and why the design is safe:
+
+- **The FIB decision (`FibValue`), never the resolved neighbor.** The per-packet
+  seqlock read and the ECMP 5-tuple hash run identically on hits, so neighbor
+  MAC/state churn needs no invalidation, and per-flow ECMP placement is preserved.
+- **Any route change invalidates the whole cache** via a generation counter the
+  FibProgrammer bumps on every LPM insert/remove. The cache refills at line rate;
+  under sustained BGP churn it is effectively always cold — `fib_cache_stale`
+  measures exactly that.
+- **No negative caching**: unroutable destinations are never cached.
+- Direct-mapped, fixed memory (~27 MB total across 18 CPUs), no eviction
+  machinery: under adversarial destination spray it degrades to baseline cost
+  plus two array probes — not the eviction thrash that killed the Linux route
+  cache in kernel 3.6, which is why this ships as an experiment anyway.
+
+This is an experiment with a kill criterion, not a recommendation. Canary on one
+box (`fib-cache on` + `packetframe reconfigure`, no restart), run ≥24 h across
+normal BGP churn, then compute:
+
+```text
+hit_rate = fib_cache_hit / (fib_cache_hit + fib_cache_miss + fib_cache_stale)
+```
+
+- **≥ 70%** and the LPM share of CPU visibly down → keep it on.
+- **30–70%** → marginal; keep only if the CPU delta justifies 27 MB.
+- **< 30%**, or `fib_cache_stale` > ~20% of probes sustained → your destination
+  diversity or route churn defeats this cache design; turn it off and leave it
+  off. The counters stay (append-only) as a record.
+
+`fib-cache off` + reconfigure disables it immediately (the BPF probe stops on the
+next packet); re-enabling never resurrects pre-disable entries (the generation
+advances on every toggle).

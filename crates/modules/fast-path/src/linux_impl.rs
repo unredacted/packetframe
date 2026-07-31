@@ -134,6 +134,18 @@ pub(crate) fn vlan_subifs_present() -> bool {
     read_vlan_config().map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// The `fib-cache` directive value; absent = off (the experiment is
+/// opt-in).
+pub(crate) fn fib_cache_enabled(directives: &[ModuleDirective]) -> bool {
+    directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::FibCache(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 /// Whether the `bridge-resolve` directive enables the bridge egress
 /// short-circuit. Default (no directive) is `Auto` = enabled; `On` is
 /// a documented synonym for `Auto` (there is nothing to force — an
@@ -1464,12 +1476,24 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
         .map_err(|e| {
             ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))
         })?;
+        // The destination cache rides the programmer's command
+        // channel: the programmer is FIB_CACHE_CFG's sole writer, so
+        // config apply (here) and SIGHUP reconcile both just send the
+        // desired state. Default off; the map's kernel-zeroed content
+        // IS the off state, so nothing is written unless enabling.
+        if fib_cache_enabled(&cfg.section.directives) {
+            ctrl.programmer_handle().set_cache_enabled_nowait(true);
+            info!("fib-cache enabled (destination cache in front of the FIB LPM)");
+        }
         state.route_controller = Some(ctrl);
         info!(
             ?forwarding,
             "RouteController started (NeighborResolver + FibProgrammer active)"
         );
     } else {
+        if fib_cache_enabled(&cfg.section.directives) {
+            warn!("fib-cache on has no effect in kernel-fib mode (no custom FIB to cache)");
+        }
         info!(
             ?forwarding,
             "RouteController not started (kernel-fib mode); Option F control plane idle"

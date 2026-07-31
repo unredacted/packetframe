@@ -169,6 +169,28 @@ impl FpFibCfg {
 #[cfg(target_os = "linux")]
 unsafe impl aya::Pod for FpFibCfg {}
 
+// --- FibCacheCfg --------------------------------------------------------
+
+/// Userspace mirror of `maps::FibCacheCfg`: the destination-cache
+/// enable flag + global generation. 8 bytes. Sole writer is the
+/// FibProgrammer task (reconcile talks to it over the command channel
+/// instead of touching the map — the programmer/reconcile writer
+/// domains stay disjoint). The cache *entry* structs deliberately have
+/// no userspace mirror: userspace never reads or writes cache slots.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FibCacheCfg {
+    /// 0 = off (default; kernel zero-init), 1 = on.
+    pub enabled: u32,
+    /// Current generation. 0 is reserved (never issued): a zeroed
+    /// cache slot can then never compare equal to a live generation.
+    pub generation: u32,
+}
+
+// SAFETY: repr(C), two u32s, every bit pattern valid.
+#[cfg(target_os = "linux")]
+unsafe impl aya::Pod for FibCacheCfg {}
+
 // --- Layout assertions -------------------------------------------------
 //
 // These match the layouts declared in `bpf/src/maps.rs`. Any drift on
@@ -186,6 +208,9 @@ const _: () = assert!(core::mem::align_of::<EcmpGroup>() == 4);
 
 const _: () = assert!(core::mem::size_of::<FpFibCfg>() == 8);
 const _: () = assert!(core::mem::align_of::<FpFibCfg>() == 4);
+
+const _: () = assert!(core::mem::size_of::<FibCacheCfg>() == 8);
+const _: () = assert!(core::mem::align_of::<FibCacheCfg>() == 4);
 
 #[cfg(test)]
 mod tests {

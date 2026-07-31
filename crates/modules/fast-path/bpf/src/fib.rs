@@ -22,9 +22,32 @@ use aya_ebpf::maps::lpm_trie::Key;
 
 use crate::datapath::l4_ports;
 use crate::maps::{
-    bump, EcmpGroup, FibValue, NexthopEntry, StatIdx, StatsPtr, ECMP_GROUPS, FIB_KIND_ECMP,
+    bump, EcmpGroup, FibValue, NexthopEntry, StatIdx, StatsPtr, ECMP_GROUPS, FIB_CACHE_CFG,
+    FIB_CACHE_V4, FIB_CACHE_V4_ENTRIES, FIB_CACHE_V6, FIB_CACHE_V6_ENTRIES, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, FIB_V4, FIB_V6, MAX_ECMP_PATHS, NEXTHOPS, NH_STATE_RESOLVED,
 };
+
+// --- FIB destination cache probe ---------------------------------------
+
+/// Current cache generation, or 0 when the cache is disabled (0 is a
+/// reserved generation the programmer never issues, so "disabled" and
+/// "no valid entry can match" collapse into one sentinel).
+#[inline(always)]
+fn cache_generation() -> u32 {
+    match FIB_CACHE_CFG.get(0) {
+        Some(cc) if cc.enabled != 0 => cc.generation,
+        _ => 0,
+    }
+}
+
+/// Fibonacci multiplicative hash → slot index. Two ALU ops. This hash
+/// is BPF-internal only (cache entries never cross the BPF/userspace
+/// boundary), so unlike the ECMP flow hash it deliberately has no
+/// userspace mirror in `fib_hash_vectors.rs`.
+#[inline(always)]
+fn cache_slot(word: u32, entries: u32) -> u32 {
+    (word.wrapping_mul(0x9E37_79B1) >> 16) & (entries - 1)
+}
 
 // --- Action codes -----------------------------------------------------
 //
@@ -103,14 +126,70 @@ pub fn lookup_v4(
     dst: [u8; 4],
     proto: u8,
 ) -> CustomFibResult {
-    let key = Key::new(32, dst);
-    let fib = match FIB_V4.get(&key) {
-        Some(v) => *v,
-        None => {
-            bump(stats, StatIdx::CustomFibMiss);
-            return CustomFibResult::miss();
-        }
+    // Destination-cache probe (gated; generation 0 = disabled). On a
+    // hit the LPM walk is skipped entirely; the FibValue still resolves
+    // through NEXTHOPS/ECMP_GROUPS below, so the seqlock read and the
+    // per-flow ECMP hash are identical cached or not. Compare-mode
+    // caveat: this lookup also serves the compare arm, so during the
+    // microscopic window between a generation bump and the packet's
+    // gen check, a just-invalidated entry can produce a spurious
+    // CompareDisagree blip under BGP churn — compare is a temporary
+    // validation mode; tolerated and documented.
+    let cache_gen = cache_generation();
+    let dst_w = u32::from_ne_bytes(dst);
+    let mut fib = FibValue {
+        kind: FIB_KIND_SINGLE,
+        _pad: [0; 3],
+        idx: 0,
     };
+    let mut cached = false;
+    if cache_gen != 0 {
+        if let Some(e) = FIB_CACHE_V4.get_ptr_mut(cache_slot(dst_w, FIB_CACHE_V4_ENTRIES)) {
+            // SAFETY: bounds-checked map value pointer; per-CPU, and
+            // XDP/tc programs run to completion on their CPU, so no
+            // concurrent writer exists for this slot.
+            unsafe {
+                if (*e).dst == dst_w {
+                    if (*e).generation == cache_gen {
+                        bump(stats, StatIdx::FibCacheHit);
+                        fib.kind = (*e).kind as u8;
+                        fib.idx = (*e).idx;
+                        cached = true;
+                    } else {
+                        bump(stats, StatIdx::FibCacheStale);
+                    }
+                } else {
+                    bump(stats, StatIdx::FibCacheMiss);
+                }
+            }
+        }
+    }
+    if !cached {
+        let key = Key::new(32, dst);
+        fib = match FIB_V4.get(&key) {
+            Some(v) => *v,
+            None => {
+                // No negative caching: a stale "no route" entry is a
+                // blackhole-shaped bug, and true misses are rare under
+                // a full table.
+                bump(stats, StatIdx::CustomFibMiss);
+                return CustomFibResult::miss();
+            }
+        };
+        if cache_gen != 0 {
+            if let Some(e) = FIB_CACHE_V4.get_ptr_mut(cache_slot(dst_w, FIB_CACHE_V4_ENTRIES)) {
+                // Field-by-field stores (anti-memset discipline).
+                // Ordering within the entry is irrelevant: the sole
+                // reader is this CPU's own later invocations.
+                unsafe {
+                    (*e).dst = dst_w;
+                    (*e).kind = fib.kind as u32;
+                    (*e).idx = fib.idx;
+                    (*e).generation = cache_gen;
+                }
+            }
+        }
+    }
 
     let nh_ptr = match resolve_fib_value_v4(stats, start, end, l4_off, &fib, src, dst, proto) {
         Some(p) => p,
@@ -147,14 +226,63 @@ pub fn lookup_v6(
     dst: [u8; 16],
     proto: u8,
 ) -> CustomFibResult {
-    let key = Key::new(128, dst);
-    let fib = match FIB_V6.get(&key) {
-        Some(v) => *v,
-        None => {
-            bump(stats, StatIdx::CustomFibMiss);
-            return CustomFibResult::miss();
-        }
+    // Destination-cache probe; see the v4 twin for the full contract.
+    let cache_gen = cache_generation();
+    let d0 = u32::from_ne_bytes([dst[0], dst[1], dst[2], dst[3]]);
+    let d1 = u32::from_ne_bytes([dst[4], dst[5], dst[6], dst[7]]);
+    let d2 = u32::from_ne_bytes([dst[8], dst[9], dst[10], dst[11]]);
+    let d3 = u32::from_ne_bytes([dst[12], dst[13], dst[14], dst[15]]);
+    let slot_word = d0 ^ d1 ^ d2 ^ d3;
+    let mut fib = FibValue {
+        kind: FIB_KIND_SINGLE,
+        _pad: [0; 3],
+        idx: 0,
     };
+    let mut cached = false;
+    if cache_gen != 0 {
+        if let Some(e) = FIB_CACHE_V6.get_ptr_mut(cache_slot(slot_word, FIB_CACHE_V6_ENTRIES)) {
+            // SAFETY: as in the v4 twin.
+            unsafe {
+                if (*e).dst[0] == d0 && (*e).dst[1] == d1 && (*e).dst[2] == d2 && (*e).dst[3] == d3
+                {
+                    if (*e).generation == cache_gen {
+                        bump(stats, StatIdx::FibCacheHit);
+                        fib.kind = (*e).kind as u8;
+                        fib.idx = (*e).idx;
+                        cached = true;
+                    } else {
+                        bump(stats, StatIdx::FibCacheStale);
+                    }
+                } else {
+                    bump(stats, StatIdx::FibCacheMiss);
+                }
+            }
+        }
+    }
+    if !cached {
+        let key = Key::new(128, dst);
+        fib = match FIB_V6.get(&key) {
+            Some(v) => *v,
+            None => {
+                bump(stats, StatIdx::CustomFibMiss);
+                return CustomFibResult::miss();
+            }
+        };
+        if cache_gen != 0 {
+            if let Some(e) = FIB_CACHE_V6.get_ptr_mut(cache_slot(slot_word, FIB_CACHE_V6_ENTRIES)) {
+                // Field-by-field stores; see the v4 twin.
+                unsafe {
+                    (*e).dst[0] = d0;
+                    (*e).dst[1] = d1;
+                    (*e).dst[2] = d2;
+                    (*e).dst[3] = d3;
+                    (*e).kind = fib.kind as u32;
+                    (*e).idx = fib.idx;
+                    (*e).generation = cache_gen;
+                }
+            }
+        }
+    }
 
     let nh_ptr = match resolve_fib_value_v6(stats, start, end, l4_off, &fib, src, dst, proto) {
         Some(p) => p,

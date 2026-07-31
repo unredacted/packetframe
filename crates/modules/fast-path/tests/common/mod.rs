@@ -55,7 +55,7 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V2: u32 = 1;
-pub const STATS_COUNT: u32 = 42;
+pub const STATS_COUNT: u32 = 45;
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
 /// uses these to flip forwarding modes on the live BPF program.
@@ -117,6 +117,9 @@ pub enum StatIdx {
     ErrRedirectFailed = 39,
     RxTotalTc = 40,
     FwdOkTc = 41,
+    FibCacheHit = 42,
+    FibCacheMiss = 43,
+    FibCacheStale = 44,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a
@@ -278,6 +281,36 @@ impl Harness {
             mss_clamp_global: 0,
             version: FP_CFG_VERSION_V2,
         });
+    }
+
+    /// Write the destination-cache control entry: `enabled` (0/1) +
+    /// `generation`. In production the FibProgrammer is the sole
+    /// writer; tests poke the map directly to simulate its behavior
+    /// (enable, and later bump the generation to invalidate).
+    pub fn set_fib_cache(&mut self, enabled: u32, generation: u32) {
+        /// Layout mirror of `FibCacheCfg` in `bpf/src/maps.rs`.
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct FibCacheCfg {
+            enabled: u32,
+            generation: u32,
+        }
+        unsafe impl Pod for FibCacheCfg {}
+
+        let map = self
+            .bpf
+            .map_mut("FIB_CACHE_CFG")
+            .expect("FIB_CACHE_CFG map");
+        let mut arr: Array<_, FibCacheCfg> = Array::try_from(map).expect("Array try_from");
+        arr.set(
+            0,
+            FibCacheCfg {
+                enabled,
+                generation,
+            },
+            0,
+        )
+        .expect("FIB_CACHE_CFG set");
     }
 
     /// Insert an IPv4 prefix into the BLOCK_V4 trie. Callers must also

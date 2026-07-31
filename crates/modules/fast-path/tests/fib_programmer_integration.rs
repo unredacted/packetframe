@@ -34,8 +34,8 @@ use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::programmer::FibProgrammer;
 use packetframe_fast_path::fib::types::{
-    EcmpGroup, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_FAMILY_V4, NH_FAMILY_V6,
-    NH_STATE_INCOMPLETE,
+    EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_FAMILY_V4,
+    NH_FAMILY_V6, NH_STATE_INCOMPLETE,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -133,7 +133,13 @@ impl Drop for PinDirs {
 fn load_and_pin(pins: &PinDirs) -> Ebpf {
     let bytes = aligned_bpf_copy();
     let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
-    for name in ["NEXTHOPS", "FIB_V4", "FIB_V6", "ECMP_GROUPS"] {
+    for name in [
+        "NEXTHOPS",
+        "FIB_V4",
+        "FIB_V6",
+        "ECMP_GROUPS",
+        "FIB_CACHE_CFG",
+    ] {
         let path = pins.path(name);
         ebpf.map(name)
             .unwrap_or_else(|| panic!("{name} map missing from ELF"))
@@ -216,6 +222,51 @@ impl ProgrammerHarness {
             handle,
             task: Some(task),
         }
+    }
+
+    /// Variant wiring the FIB_CACHE_CFG handle into the programmer,
+    /// for the destination-cache generation tests. Kept separate so
+    /// the existing tests keep exercising the `new()` shortcut
+    /// (cache-less construction must stay supported for harnesses).
+    fn new_with_cache() -> Self {
+        let pins = PinDirs::setup();
+        let ebpf = load_and_pin(&pins);
+        let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
+        let fib_v4 = open_lpm_v4(&pins.path("FIB_V4"));
+        let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
+        let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
+        let cache_cfg: Array<MapData, FibCacheCfg> = open_array(&pins.path("FIB_CACHE_CFG"));
+        let shutdown = CancellationToken::new();
+        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (programmer, handle) = FibProgrammer::new_with_resolver(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            Some(cache_cfg),
+            events_rx,
+            shutdown.clone(),
+            None,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let task = rt.spawn(programmer.run());
+        Self {
+            pins,
+            _ebpf: ebpf,
+            rt,
+            shutdown,
+            handle,
+            task: Some(task),
+        }
+    }
+
+    /// Read FIB_CACHE_CFG via a fresh handle.
+    fn read_cache_cfg(&self) -> FibCacheCfg {
+        let arr: Array<MapData, FibCacheCfg> = open_array(&self.pins.path("FIB_CACHE_CFG"));
+        arr.get(&0, 0).expect("FIB_CACHE_CFG get")
     }
 
     /// Block on an async call against the programmer from sync test code.
@@ -1300,4 +1351,142 @@ fn add_path_lp_none_treated_as_default_100() {
     );
     let group = h.read_ecmp_group(fib.idx);
     assert_eq!(group.nh_count, 2);
+}
+
+/// Destination-cache generation ownership: every real LPM mutation
+/// bumps FIB_CACHE_CFG.generation, no-op recomputes don't, enable /
+/// disable transitions bump and publish, and torn-down nexthop slots
+/// are grace-deferred (never tombstoned instantly) so a cached
+/// FibValue can't observe a freed-and-reused slot.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn fib_cache_generation_semantics() {
+    let h = ProgrammerHarness::new_with_cache();
+    let prefix = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 21));
+    let peer = PeerId(0x3333);
+    let add = RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![nh],
+        path_id: None,
+        local_pref: None,
+    };
+    // Awaited no-op used as an ordering barrier behind the
+    // fire-and-forget toggle command (the loop is single-threaded, so
+    // a replied command proves everything queued before it ran).
+    let barrier = RouteEvent::Del {
+        peer_id: PeerId(0x9999),
+        prefix: IpPrefix::V4 {
+            addr: [192, 0, 2, 0],
+            prefix_len: 24,
+        },
+        path_id: None,
+    };
+
+    // Before enable: map is kernel-zeroed (off).
+    let cfg0 = h.read_cache_cfg();
+    assert_eq!(cfg0.enabled, 0);
+    assert_eq!(cfg0.generation, 0);
+
+    // Enable: transition bumps (1 → 2) and publishes.
+    h.handle.set_cache_enabled_nowait(true);
+    h.run(async {
+        h.handle.apply_route_event(barrier.clone()).await.unwrap();
+    });
+    let cfg1 = h.read_cache_cfg();
+    assert_eq!(cfg1.enabled, 1);
+    assert_eq!(
+        cfg1.generation, 2,
+        "enable transition bumps past the initial 1"
+    );
+
+    // Real Add → write_fib_entry bumps.
+    h.run(async {
+        h.handle.apply_route_event(add.clone()).await.unwrap();
+    });
+    let cfg2 = h.read_cache_cfg();
+    assert_eq!(cfg2.generation, 3, "LPM insert bumps");
+
+    // Identical re-Add → no-change shortcut, no bump.
+    h.run(async {
+        h.handle.apply_route_event(add.clone()).await.unwrap();
+    });
+    assert_eq!(
+        h.read_cache_cfg().generation,
+        3,
+        "no-op recompute must not flush the cache"
+    );
+
+    // Capture the nexthop slot before withdrawal.
+    let nexthops: Array<MapData, NexthopEntry> = open_array(&h.pins.path("NEXTHOPS"));
+    let entry_before: NexthopEntry = nexthops.get(&0, 0).expect("NEXTHOPS[0]");
+    assert_ne!(
+        entry_before.state,
+        packetframe_fast_path::fib::types::NH_STATE_FAILED
+    );
+
+    // Del → delete_fib_entry bumps, and the slot is grace-deferred:
+    // immediately after the (awaited) Del it must NOT be tombstoned.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix,
+                path_id: None,
+            })
+            .await
+            .unwrap();
+    });
+    assert_eq!(h.read_cache_cfg().generation, 4, "LPM remove bumps");
+    let entry_now: NexthopEntry = nexthops.get(&0, 0).expect("NEXTHOPS[0]");
+    assert_ne!(
+        entry_now.state,
+        packetframe_fast_path::fib::types::NH_STATE_FAILED,
+        "reclaim must be grace-deferred, not immediate"
+    );
+    // After the 100 ms grace + a few 50 ms reclaim ticks, the slot is
+    // tombstoned.
+    h.run(async {
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    });
+    let entry_later: NexthopEntry = nexthops.get(&0, 0).expect("NEXTHOPS[0]");
+    assert_eq!(
+        entry_later.state,
+        packetframe_fast_path::fib::types::NH_STATE_FAILED,
+        "grace elapsed → slot tombstoned"
+    );
+
+    // Disable: transition bumps and publishes enabled = 0.
+    h.handle.set_cache_enabled_nowait(false);
+    h.run(async {
+        h.handle.apply_route_event(barrier).await.unwrap();
+    });
+    let cfg_off = h.read_cache_cfg();
+    assert_eq!(cfg_off.enabled, 0);
+    assert_eq!(cfg_off.generation, 5, "disable transition bumps");
+
+    // Same-value command is a no-op.
+    h.handle.set_cache_enabled_nowait(false);
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: PeerId(0x9998),
+                prefix: IpPrefix::V4 {
+                    addr: [192, 0, 2, 0],
+                    prefix_len: 25,
+                },
+                path_id: None,
+            })
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        h.read_cache_cfg().generation,
+        5,
+        "same-value toggle is a no-op"
+    );
 }

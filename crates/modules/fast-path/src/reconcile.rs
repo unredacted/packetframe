@@ -23,10 +23,10 @@ use packetframe_common::{
 use tracing::{info, warn};
 
 use crate::linux_impl::{
-    discover_bridge_chains, feature_flags_from_config, fib_flags_from_forwarding_mode,
-    if_nametoindex, mss_clamp_global_value, read_vlan_config, set_cfg_flag, ActiveState, FpCfg,
-    MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT,
-    FP_CFG_VERSION_V2,
+    discover_bridge_chains, feature_flags_from_config, fib_cache_enabled,
+    fib_flags_from_forwarding_mode, if_nametoindex, mss_clamp_global_value, read_vlan_config,
+    set_cfg_flag, ActiveState, FpCfg, MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128,
+    FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -46,6 +46,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let mss_clamp = reconcile_mss_clamp(state, cfg)?;
     let vlan = reconcile_vlan_resolve(state, cfg)?;
     let devmap = reconcile_devmap(state)?;
+    reconcile_fib_cache(state, cfg);
 
     info!(
         v4_added = v4.added,
@@ -380,6 +381,27 @@ pub(crate) fn reconcile_vlan_resolve(
         !desired.is_empty(),
     )?;
     Ok(delta)
+}
+
+/// Forward the `fib-cache` directive to the FibProgrammer. The
+/// programmer owns FIB_CACHE_CFG (reconcile never touches the map —
+/// the writer domains stay disjoint) and treats same-value commands
+/// as no-ops, so sending unconditionally on every SIGHUP is cheap and
+/// converges. A toggle transition bumps the generation inside the
+/// programmer, so re-enabling can't resurrect entries cached under an
+/// earlier enable epoch. In kernel-fib mode there is no controller
+/// and the directive is inert (warned at attach).
+fn reconcile_fib_cache(state: &mut ActiveState, cfg: &ModuleConfig<'_>) {
+    let want = fib_cache_enabled(&cfg.section.directives);
+    if let Some(ctrl) = &state.route_controller {
+        ctrl.programmer_handle().set_cache_enabled_nowait(want);
+        info!(
+            enabled = want,
+            "fib-cache directive forwarded to FibProgrammer"
+        );
+    } else if want {
+        warn!("fib-cache on ignored: no RouteController (kernel-fib mode)");
+    }
 }
 
 /// Reconcile REDIRECT_DEVMAP against the current `/sys/class/net`

@@ -515,3 +515,240 @@ fn set_nexthop_seq_permanent_odd(h: &mut Harness, idx: u32) {
     entry.seq = 0xdead_beef; // odd (low bit 1)
     arr.set(idx, entry, 0).expect("NEXTHOPS set");
 }
+
+// ========== FIB destination cache (v0.2.8, default-off) ==================
+//
+// The cache stores the FibValue keyed on the full dst and stamped with
+// the FIB_CACHE_CFG generation. Everything downstream of the FibValue
+// (NEXTHOPS seqlock read, ECMP flow hash) runs identically on hits, so
+// the assertions below lean on output-byte equality between cold and
+// warm runs. In production the FibProgrammer is the map's sole writer;
+// these tests poke FIB_CACHE_CFG directly to simulate enable/bump.
+
+const NEXTHOP_MAC_B: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x0b];
+
+fn cache_pkt(dst_last: u8) -> Vec<u8> {
+    Ipv4TcpBuilder {
+        src_ip: [10, 0, 0, 5],
+        dst_ip: [10, 0, 0, dst_last],
+        ..Default::default()
+    }
+    .build()
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_off_is_byte_identical_and_counts_nothing() {
+    // Default state: FIB_CACHE_CFG untouched (kernel-zeroed = off).
+    let mut h = prep_custom_fib_harness();
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v4_single("10.0.0.0/24", 1);
+
+    let pkt = cache_pkt(42);
+    let (v1, out1) = h.run(&pkt);
+    let (v2, out2) = h.run(&pkt);
+    assert_eq!(v1, xdp_action::XDP_REDIRECT);
+    assert_eq!(v2, xdp_action::XDP_REDIRECT);
+    assert_eq!(out1, out2, "off = repeat runs byte-identical");
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 0);
+    assert_eq!(h.stat(StatIdx::FibCacheMiss), 0);
+    assert_eq!(h.stat(StatIdx::FibCacheStale), 0);
+    assert_eq!(h.stat(StatIdx::CustomFibHit), 2);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_v4_hit_skips_lpm_with_identical_output() {
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 1);
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v4_single("10.0.0.0/24", 1);
+
+    let pkt = cache_pkt(42);
+    let (v1, out1) = h.run(&pkt); // cold: probe misses, LPM walks, slot refills
+    assert_eq!(v1, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheMiss), 1);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 0);
+
+    let (v2, out2) = h.run(&pkt); // warm: probe hits, LPM skipped
+    assert_eq!(v2, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 1);
+    assert_eq!(h.stat(StatIdx::FibCacheMiss), 1, "no second miss");
+    assert_eq!(out1, out2, "cached FibValue must resolve identically");
+    // A cache hit is still a FIB hit — route-decision counters keep
+    // their semantics.
+    assert_eq!(h.stat(StatIdx::CustomFibHit), 2);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_stale_generation_refills_with_new_route() {
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 1);
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_nexthop_v4(2, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC_B);
+    h.add_fib_v4_single("10.0.0.0/24", 1);
+
+    let pkt = cache_pkt(42);
+    let _ = h.run(&pkt); // warm the slot under gen 1 → NH 1
+
+    // Route change: prefix now points at NH 2; the programmer would
+    // bump the generation right after the LPM write.
+    h.add_fib_v4_single("10.0.0.0/24", 2);
+    h.set_fib_cache(1, 2);
+
+    let (v3, out3) = h.run(&pkt);
+    assert_eq!(v3, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheStale), 1, "gen mismatch detected");
+    assert_eq!(
+        &out3[0..6],
+        &NEXTHOP_MAC_B,
+        "stale entry must NOT be used; fresh LPM resolves NH 2"
+    );
+
+    let (v4, out4) = h.run(&pkt);
+    assert_eq!(v4, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 1, "refilled under gen 2");
+    assert_eq!(&out4[0..6], &NEXTHOP_MAC_B);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_ecmp_flow_placement_preserved() {
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 1);
+    h.add_allow_v4("10.0.0.0/8");
+    let dmac_a: [u8; 6] = [0xaa, 0, 0, 0, 0, 0x01];
+    let dmac_b: [u8; 6] = [0xbb, 0, 0, 0, 0, 0x02];
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, dmac_a);
+    h.add_nexthop_v4(2, LO_IFINDEX, EGRESS_MAC, dmac_b);
+    h.add_ecmp_group(0, 5, &[1, 2]);
+    h.add_fib_v4_ecmp("10.0.0.0/24", 0);
+
+    // Each flow (distinct sport) must land on the same leg cold and
+    // warm: the cache stores the FibValue (group ref), so the per-flow
+    // 5-tuple hash still runs on hits.
+    for sport in [1000u16, 1001, 1002, 1003, 1004, 1005, 1006, 1007] {
+        let pkt = Ipv4TcpBuilder {
+            src_ip: [10, 0, 0, 5],
+            dst_ip: [10, 0, 0, 42],
+            src_port: sport,
+            ..Default::default()
+        }
+        .build();
+        let (v_cold, out_cold) = h.run(&pkt);
+        let (v_warm, out_warm) = h.run(&pkt);
+        assert_eq!(v_cold, xdp_action::XDP_REDIRECT);
+        assert_eq!(v_warm, xdp_action::XDP_REDIRECT);
+        assert_eq!(
+            &out_cold[0..6],
+            &out_warm[0..6],
+            "flow sport={sport} must keep its ECMP leg across cache warm-up"
+        );
+    }
+    assert!(
+        h.stat(StatIdx::FibCacheHit) >= 8,
+        "second run of each flow (same dst) must hit"
+    );
+    assert_eq!(
+        h.stat(StatIdx::EcmpHashV4),
+        16,
+        "ECMP hash runs on every packet, cached or not"
+    );
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_nexthop_churn_needs_no_invalidation() {
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 1);
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v4_single("10.0.0.0/24", 1);
+
+    let pkt = cache_pkt(42);
+    let _ = h.run(&pkt); // warm
+
+    // Neighbor churn: same nexthop ID, new MAC. No generation bump —
+    // the cached FibValue is an index, and the per-packet seqlock read
+    // picks up the rewrite.
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC_B);
+    let (v, out) = h.run(&pkt);
+    assert_eq!(v, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 1, "still a cache hit");
+    assert_eq!(
+        &out[0..6],
+        &NEXTHOP_MAC_B,
+        "cache hit must carry the NEW nexthop MAC"
+    );
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_v6_hit_and_stale() {
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 1);
+    h.add_allow_v6("2001:db8::/32");
+    h.add_nexthop_v6(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC_B);
+    h.add_fib_v6_single("2001:db8::/32", 1);
+
+    let pkt = Ipv6TcpBuilder::default().build();
+    let _ = h.run(&pkt);
+    assert_eq!(h.stat(StatIdx::FibCacheMiss), 1);
+    let (v2, out2) = h.run(&pkt);
+    assert_eq!(v2, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 1);
+    assert_eq!(&out2[0..6], &NEXTHOP_MAC);
+
+    h.add_fib_v6_single("2001:db8::/32", 2);
+    h.set_fib_cache(1, 2);
+    let (v3, out3) = h.run(&pkt);
+    assert_eq!(v3, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheStale), 1);
+    assert_eq!(&out3[0..6], &NEXTHOP_MAC_B);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_zeroed_slot_never_false_hits() {
+    // Enable with an arbitrary live generation but never warm the
+    // slot: a kernel-zeroed entry is {dst:0, gen:0} and gen 0 is
+    // reserved, so the first packet must be a MISS, never a hit.
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 7);
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v4_single("10.0.0.0/24", 1);
+
+    let (v, _) = h.run(&cache_pkt(42));
+    assert_eq!(v, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheMiss), 1);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 0);
+    assert_eq!(h.stat(StatIdx::FibCacheStale), 0);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fib_cache_hit_on_tc_datapath() {
+    // fib.rs is shared by both datapaths; prove the cache works under
+    // the tc classifiers too.
+    let mut h = prep_custom_fib_harness();
+    h.set_fib_cache(1, 1);
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v4_single("10.0.0.0/24", 1);
+    h.add_tc_redirect_target(LO_IFINDEX);
+
+    let pkt = cache_pkt(42);
+    let (v1, out1) = h.run_tc(&pkt);
+    assert_eq!(v1, common::tc_action::TC_ACT_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheMiss), 1);
+    let (v2, out2) = h.run_tc(&pkt);
+    assert_eq!(v2, common::tc_action::TC_ACT_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FibCacheHit), 1);
+    assert_eq!(out1, out2);
+}

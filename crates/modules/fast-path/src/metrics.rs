@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 /// operators (19 hid `err_head_shift`; 33 hid the mss-clamp and
 /// tail-call diagnostics from the Prometheus export; a separate
 /// hardcoded 37 hid `pass_ndp` from `packetframe status`).
-pub const COUNTER_NAMES: [&str; 42] = [
+pub const COUNTER_NAMES: [&str; 45] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -80,6 +80,11 @@ pub const COUNTER_NAMES: [&str; 42] = [
     // --- Phase T: tc-ingress datapath A/B attribution ---
     "rx_total_tc",
     "fwd_ok_tc",
+    // --- v0.2.8: FIB destination cache (default-off experiment) ---
+    // Mutually exclusive probe outcomes; hit rate = hit/(hit+miss+stale).
+    "fib_cache_hit",
+    "fib_cache_miss",
+    "fib_cache_stale",
 ];
 
 /// `COUNTER_NAMES.len()` as a named const. Sizes the `[u64; N]` value
@@ -231,12 +236,15 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 42);
+        assert_eq!(COUNTER_NAMES.len(), 45);
         assert_eq!(COUNTER_NAMES.len(), COUNTER_COUNT);
         // The newest counters, as a canary that the tail of the list
         // stayed aligned with the `StatIdx` discriminants.
         assert_eq!(COUNTER_NAMES[40], "rx_total_tc");
         assert_eq!(COUNTER_NAMES[41], "fwd_ok_tc");
+        assert_eq!(COUNTER_NAMES[42], "fib_cache_hit");
+        assert_eq!(COUNTER_NAMES[43], "fib_cache_miss");
+        assert_eq!(COUNTER_NAMES[44], "fib_cache_stale");
     }
 
     #[test]

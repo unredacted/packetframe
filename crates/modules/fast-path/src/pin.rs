@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 20] = [
+pub const MAP_NAMES: [&str; 23] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -54,6 +54,13 @@ pub const MAP_NAMES: [&str; 20] = [
     // --- v0.2.7: per-CPU scratch for bpf_fib_lookup (replaces the
     // stack-allocated struct that was triggering memset libcalls).
     "FIB_LOOKUP_SCRATCH",
+    // --- v0.2.8: FIB destination cache (default-off experiment).
+    // Same rationale as the FIB maps: present in the ELF regardless
+    // of whether `fib-cache` is on, pinned for uniform detach. The
+    // programmer opens FIB_CACHE_CFG from its pin.
+    "FIB_CACHE_V4",
+    "FIB_CACHE_V6",
+    "FIB_CACHE_CFG",
 ];
 
 /// The fast-path XDP program's pinned basename (attached per-iface).
