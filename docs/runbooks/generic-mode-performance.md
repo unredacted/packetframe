@@ -179,13 +179,21 @@ classifiers and that the fixtures produce the expected verdicts.
 
 That default selection is deliberately limited to tests that only use
 `BPF_PROG_TEST_RUN`: programs are loaded and fed synthetic packets in-kernel,
-nothing is attached to a NIC, and no route, neighbour or sysctl state is touched,
-so it is safe on a forwarding router. The one exception to "writes nothing" is
-`fib_comparison`, which pins maps under a unique
-`/sys/fs/bpf/pftestcmp-<pid>-<n>` scratch directory and removes it on exit — never
-the running instance's pins. The tests that create veths or network namespaces
-(`attach`, `tc_attach`, `netns`, `local_prefix_netns`, `neigh_resolver_netns`)
-have to be named explicitly.
+nothing is attached to a NIC, no route/neighbour/sysctl state is touched, and
+nothing is written outside the test process — so it is safe on a forwarding
+router. Two groups are excluded and must be named explicitly:
+
+- `attach`, `tc_attach`, `netns`, `local_prefix_netns`, `neigh_resolver_netns` —
+  create interfaces or network namespaces.
+- `fib_comparison`, `fib_programmer_integration` — pin maps into a scratch
+  `/sys/fs/bpf/pftestcmp-<pid>-<n>` directory (removed on exit) and will mount
+  bpffs if it isn't already mounted.
+
+All of them clean up after themselves; they're excluded so the default run's
+"writes nothing" property holds without caveats. On a box already running
+packetframe, bpffs is of course already mounted and the tests leave it alone —
+they check before mounting, precisely so a second bpffs can never get stacked
+over the live pins.
 
 ### Counters that matter (`packetframe status`)
 

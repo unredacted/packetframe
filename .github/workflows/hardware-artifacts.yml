@@ -295,22 +295,24 @@ jobs:
           # CAP_BPF/CAP_NET_ADMIN), so the driver passes --ignored.
           #
           # SAFE BY DEFAULT, including on a forwarding production router:
-          # the default suite only uses BPF_PROG_TEST_RUN — programs are
-          # loaded and fed synthetic packets in-kernel. Nothing is
-          # attached to a NIC, no route/neighbour/sysctl state is touched,
-          # and no live traffic is affected. `fib_comparison` is the only
-          # one that writes anything outside its own process: it pins maps
-          # under a unique /sys/fs/bpf/pftestcmp-<pid>-<n> scratch dir and
-          # removes it on exit, never the running instance's pins.
+          # every test in the default suite only uses BPF_PROG_TEST_RUN —
+          # programs are loaded and fed synthetic packets in-kernel.
+          # Nothing is attached to a NIC, no route/neighbour/sysctl state
+          # is touched, nothing is written outside the test process, and no
+          # live traffic is affected.
           #
-          # `attach`, `tc_attach`, `netns`, `local_prefix_netns` and
-          # `neigh_resolver_netns` create interfaces or network
-          # namespaces; they clean up after themselves but are excluded
-          # from the default run. Name them explicitly if you want them.
+          # Excluded from the default run, name them explicitly to opt in:
+          #   attach, tc_attach, netns, local_prefix_netns,
+          #   neigh_resolver_netns  — create interfaces or netns
+          #   fib_comparison, fib_programmer_integration — pin maps into a
+          #     scratch /sys/fs/bpf/pftestcmp-<pid>-<n> dir (removed on
+          #     exit) and mount bpffs if it isn't already mounted
+          # All of them clean up after themselves; they're excluded so the
+          # default run's "writes nothing" property holds without caveats.
           set -u
           cd "$(dirname "$0")/tests" || exit 1
 
-          SAFE="verifier fixtures tc_fixtures feature_gates mss_clamp_gate fib_fixtures fib_hash_vectors fib_comparison bench"
+          SAFE="verifier fixtures tc_fixtures feature_gates mss_clamp_gate fib_fixtures fib_hash_vectors bench"
 
           if [ "${1:-}" = "--list" ]; then
             ls -1
