@@ -34,11 +34,15 @@ not being paid on this hardware. See
 Consequence: **expect ~no CPU change from tc on this fleet.** The reasons
 to run it anyway are operational, not performance:
 
-- tc attach never calls `otx2_xdp_setup`, sidestepping the pre-6.8
-  rvu-nicpf `non_qos_queues` leak entirely (XDP attach/detach cycles eat
-  queues until reboot on affected kernels);
 - tcpdump regains ingress visibility (generic XDP consumes packets before
-  the capture point; sched_cls runs after it).
+  the capture point; sched_cls runs after it);
+- tc attach never calls `otx2_xdp_setup`, which matters **only relative
+  to native XDP**: the pre-6.8 rvu-nicpf `non_qos_queues` leak is a
+  native-attach (`DRV_MODE`) bug, and the version gate already forces
+  `auto` to generic on affected kernels precisely because generic
+  attach has no queue leak either. Migrating generic → tc adds no
+  queue-leak protection; the point is that tc (like generic) stays
+  safe if someone later forces native semantics into the mix.
 
 On a driver that *does* pay the headroom copy (check with `perf` for
 `pskb_expand_head` before deciding), the original 1.5–3× estimate stands.
