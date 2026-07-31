@@ -135,8 +135,14 @@ pub fn lookup_v4(
     // gen check, a just-invalidated entry can produce a spurious
     // CompareDisagree blip under BGP churn — compare is a temporary
     // validation mode; tolerated and documented.
+    // Register-pressure note: only `cache_gen` + the 8-byte `fib` +
+    // `cached` stay live across the LPM call. The dst word and slot
+    // index are recomputed at the fill site rather than carried — the
+    // first CI round carried them, LLVM spilled the v6 parse's L4
+    // offset to make room, and the 5.15-ui verifier rejected the
+    // NDP-gate byte read it restructured around the reload (see
+    // datapath::icmpv6_type). Cheap ALU beats live registers here.
     let cache_gen = cache_generation();
-    let dst_w = u32::from_ne_bytes(dst);
     let mut fib = FibValue {
         kind: FIB_KIND_SINGLE,
         _pad: [0; 3],
@@ -144,6 +150,7 @@ pub fn lookup_v4(
     };
     let mut cached = false;
     if cache_gen != 0 {
+        let dst_w = u32::from_ne_bytes(dst);
         if let Some(e) = FIB_CACHE_V4.get_ptr_mut(cache_slot(dst_w, FIB_CACHE_V4_ENTRIES)) {
             // SAFETY: bounds-checked map value pointer; per-CPU, and
             // XDP/tc programs run to completion on their CPU, so no
@@ -177,6 +184,7 @@ pub fn lookup_v4(
             }
         };
         if cache_gen != 0 {
+            let dst_w = u32::from_ne_bytes(dst);
             if let Some(e) = FIB_CACHE_V4.get_ptr_mut(cache_slot(dst_w, FIB_CACHE_V4_ENTRIES)) {
                 // Field-by-field stores (anti-memset discipline).
                 // Ordering within the entry is irrelevant: the sole
@@ -226,13 +234,11 @@ pub fn lookup_v6(
     dst: [u8; 16],
     proto: u8,
 ) -> CustomFibResult {
-    // Destination-cache probe; see the v4 twin for the full contract.
+    // Destination-cache probe; see the v4 twin for the full contract
+    // and the register-pressure note (nothing but `cache_gen`, `fib`,
+    // `cached` may live across the LPM call — the dst words and slot
+    // are recomputed per block from `dst`, which is live regardless).
     let cache_gen = cache_generation();
-    let d0 = u32::from_ne_bytes([dst[0], dst[1], dst[2], dst[3]]);
-    let d1 = u32::from_ne_bytes([dst[4], dst[5], dst[6], dst[7]]);
-    let d2 = u32::from_ne_bytes([dst[8], dst[9], dst[10], dst[11]]);
-    let d3 = u32::from_ne_bytes([dst[12], dst[13], dst[14], dst[15]]);
-    let slot_word = d0 ^ d1 ^ d2 ^ d3;
     let mut fib = FibValue {
         kind: FIB_KIND_SINGLE,
         _pad: [0; 3],
@@ -240,7 +246,13 @@ pub fn lookup_v6(
     };
     let mut cached = false;
     if cache_gen != 0 {
-        if let Some(e) = FIB_CACHE_V6.get_ptr_mut(cache_slot(slot_word, FIB_CACHE_V6_ENTRIES)) {
+        let d0 = u32::from_ne_bytes([dst[0], dst[1], dst[2], dst[3]]);
+        let d1 = u32::from_ne_bytes([dst[4], dst[5], dst[6], dst[7]]);
+        let d2 = u32::from_ne_bytes([dst[8], dst[9], dst[10], dst[11]]);
+        let d3 = u32::from_ne_bytes([dst[12], dst[13], dst[14], dst[15]]);
+        if let Some(e) =
+            FIB_CACHE_V6.get_ptr_mut(cache_slot(d0 ^ d1 ^ d2 ^ d3, FIB_CACHE_V6_ENTRIES))
+        {
             // SAFETY: as in the v4 twin.
             unsafe {
                 if (*e).dst[0] == d0 && (*e).dst[1] == d1 && (*e).dst[2] == d2 && (*e).dst[3] == d3
@@ -269,7 +281,13 @@ pub fn lookup_v6(
             }
         };
         if cache_gen != 0 {
-            if let Some(e) = FIB_CACHE_V6.get_ptr_mut(cache_slot(slot_word, FIB_CACHE_V6_ENTRIES)) {
+            let d0 = u32::from_ne_bytes([dst[0], dst[1], dst[2], dst[3]]);
+            let d1 = u32::from_ne_bytes([dst[4], dst[5], dst[6], dst[7]]);
+            let d2 = u32::from_ne_bytes([dst[8], dst[9], dst[10], dst[11]]);
+            let d3 = u32::from_ne_bytes([dst[12], dst[13], dst[14], dst[15]]);
+            if let Some(e) =
+                FIB_CACHE_V6.get_ptr_mut(cache_slot(d0 ^ d1 ^ d2 ^ d3, FIB_CACHE_V6_ENTRIES))
+            {
                 // Field-by-field stores; see the v4 twin.
                 unsafe {
                     (*e).dst[0] = d0;
