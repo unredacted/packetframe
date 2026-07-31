@@ -252,6 +252,21 @@ pub enum ModuleDirective {
         line: usize,
     },
     DryRun(bool),
+    /// `bridge-resolve auto|on|off` — bridge egress short-circuit
+    /// (SPEC §4.7 extension). When the FIB resolves a nexthop whose
+    /// egress device is a Linux bridge whose **single forwarding
+    /// member** is a VLAN subinterface (`br1337` → `switch0.1337` →
+    /// `switch0`), the loader installs a `VLAN_RESOLVE` entry keyed on
+    /// the *bridge* ifindex so the datapath tags and redirects straight
+    /// to the underlying device, skipping the software bridge traversal
+    /// and the subif device. The wire frame is identical to what the
+    /// bridge stack would emit; multi-member bridges never qualify
+    /// (picking a port needs the FDB, which the datapath can't consult).
+    /// `Auto` (default) installs wherever discovery proves the shape;
+    /// `On` is accepted as a synonym for `Auto` (there is nothing to
+    /// force — an unprovable topology stays on the kernel path);
+    /// `Off` disables installation and is the SIGHUP-able rollback.
+    BridgeResolve(ToggleAutoOnOff),
     CircuitBreaker(CircuitBreakerSpec),
     /// Operator override for a driver-specific workaround. Currently
     /// the only defined knob is `rvu-nicpf-head-shift` (SPEC
@@ -1573,6 +1588,10 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::DryRun(on))
         }
         "circuit-breaker" => parse_circuit_breaker(line, rest),
+        "bridge-resolve" => parse_single_arg(line, rest, "bridge-resolve", |t| {
+            let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
+            Ok(ModuleDirective::BridgeResolve(v))
+        }),
         "driver-workaround" => parse_driver_workaround(line, rest),
         "forwarding-mode" => parse_single_arg(line, rest, "forwarding-mode", |t| {
             let mode: ForwardingMode = t.parse().map_err(|e: String| e)?;
@@ -2384,6 +2403,25 @@ module fast-path
             }
             other => panic!("expected Attach, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bridge_resolve_parses() {
+        for (tok, want) in [
+            ("auto", ToggleAutoOnOff::Auto),
+            ("on", ToggleAutoOnOff::On),
+            ("off", ToggleAutoOnOff::Off),
+        ] {
+            let s = format!("module fast-path\n  bridge-resolve {tok}\n");
+            let c = Config::parse(&s).unwrap();
+            match &c.modules[0].directives[0] {
+                ModuleDirective::BridgeResolve(v) => assert_eq!(*v, want),
+                other => panic!("expected BridgeResolve, got {other:?}"),
+            }
+        }
+        assert!(Config::parse("module fast-path\n  bridge-resolve maybe\n").is_err());
+        assert!(Config::parse("module fast-path\n  bridge-resolve\n").is_err());
+        assert!(Config::parse("module fast-path\n  bridge-resolve on extra\n").is_err());
     }
 
     #[test]

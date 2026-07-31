@@ -23,9 +23,10 @@ use packetframe_common::{
 use tracing::{info, warn};
 
 use crate::linux_impl::{
-    feature_flags_from_config, fib_flags_from_forwarding_mode, if_nametoindex,
-    mss_clamp_global_value, read_vlan_config, set_cfg_flag, ActiveState, FpCfg, MssClampValue,
-    VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
+    discover_bridge_chains, feature_flags_from_config, fib_flags_from_forwarding_mode,
+    if_nametoindex, mss_clamp_global_value, read_vlan_config, set_cfg_flag, ActiveState, FpCfg,
+    MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT,
+    FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -43,7 +44,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let block_v4 = reconcile_block_v4(state, cfg)?;
     let block_v6 = reconcile_block_v6(state, cfg)?;
     let mss_clamp = reconcile_mss_clamp(state, cfg)?;
-    let vlan = reconcile_vlan_resolve(state)?;
+    let vlan = reconcile_vlan_resolve(state, cfg)?;
     let devmap = reconcile_devmap(state)?;
 
     info!(
@@ -231,7 +232,10 @@ where
     Ok(delta)
 }
 
-fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
+pub(crate) fn reconcile_vlan_resolve(
+    state: &mut ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<DeltaCount> {
     // Rebuild the desired set from /proc/net/vlan/config. Missing file
     // means no VLAN subifs, desired is empty, which will remove any
     // stale entries.
@@ -246,6 +250,17 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
         }
     };
 
+    // Bridge egress short-circuits share this map and bit 6: the
+    // desired set is the UNION of both sources, and only the single
+    // set_cfg_flag below writes the gate. `bridge-resolve off` yields
+    // an empty chain set, which purges any previously installed bridge
+    // keys via the normal diff — the SIGHUP rollback path. Read errors
+    // abort before the flag RMW, same policy as the vlan read above
+    // (never clear the gate on a transient failure while the map still
+    // holds entries).
+    let chains = discover_bridge_chains(&cfg.section.directives)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("bridge topology read: {e}")))?;
+
     let desired: HashSet<(u32, u32, u16)> = vlan_entries
         .iter()
         .filter_map(|(subif, vid, parent)| {
@@ -256,6 +271,11 @@ fn reconcile_vlan_resolve(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
             let phys_idx = if_nametoindex(parent).ok()?;
             Some((subif_idx, phys_idx, *vid))
         })
+        .chain(chains.iter().filter_map(|(bridge, phys, vid)| {
+            let bridge_idx = if_nametoindex(bridge).ok()?;
+            let phys_idx = if_nametoindex(phys).ok()?;
+            Some((bridge_idx, phys_idx, *vid))
+        }))
         .collect();
 
     let map = state
