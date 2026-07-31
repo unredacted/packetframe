@@ -116,6 +116,40 @@ Symbols to read:
 If `pskb_expand_head` + linearization dwarf `bpf_prog_run_generic_xdp`, host tuning
 and datapath placement (not BPF micro-optimization) are where the wins are.
 
+#### Measured profile on cn9670 / otx2 (2026-07-31)
+
+`perf record -F 499 -a -e cycles:k` for 10s on a live EFG at ~640 kpps, 30.6%
+idle. Aggregated by area, as a share of *busy* CPU:
+
+| Area | % of busy CPU |
+|---|---|
+| Marvell driver (`otx2_nix_cq_op_status`, `otx2_napi_handler`, `otx2_sq_append_skb`) | 11.2 |
+| **AF_PACKET tap** (`packet_rcv`, `dev_queue_xmit_nit`) | **9.1** |
+| skb alloc/free churn (`__kmalloc_node_track_caller`, `kfree`, `kmem_cache_*`) | 6.9 |
+| BPF map lookups (`trie_lookup_elem`, `longest_prefix_match`) | 5.9 |
+| Transmit (`__dev_queue_xmit`, `skb_push`, `memmove`) | 3.4 |
+| BPF programs (`fast_path`, `finalize`) | 2.6 |
+| ebtables (`ebt_do_table`) | 1.6 |
+
+**`pskb_expand_head` and `skb_linearize` do not appear at all** (below the 0.5%
+cutoff). The generic-XDP headroom-copy cost that the tc-datapath work was designed
+to escape is *not being paid* on this driver — otx2 evidently reserves enough
+headroom that `netif_receive_generic_xdp` never reallocates. Do not assume the
+generic-XDP cost model applies to your hardware without checking this first; on
+this fleet it does not, and the expected tc win is correspondingly much smaller
+than the 1.5–3× estimated from the model.
+
+Two other things worth acting on before any datapath change:
+
+- **An AF_PACKET tap costs more than the entire BPF datapath.** `packet_rcv` plus
+  `dev_queue_xmit_nit` (the transmit-side hook that feeds packet sockets) is 9.1%
+  of busy CPU. `dev_queue_xmit_nit` only runs when a tap exists. Find it with
+  `ss --packet --processes` and stop it if it isn't needed — a leftover `tcpdump`
+  or a monitoring daemon is pure overhead.
+- **Inside BPF, the map lookups cost 2.3× the program bodies.** The LPM tries
+  dominate: a forwarded packet does three (`ALLOW` src, `ALLOW` dst, `FIB`). Any
+  further BPF optimization should target lookup *count*, not instruction count.
+
 **`perf` is not available on UniFi OS.** There is no `perf` package; Debian
 bullseye ships `linux-perf` built for its own 5.10 kernel while these boxes run a
 UniFi 5.15, so `/usr/bin/perf` fails looking for `perf_5.15`. `apt install
