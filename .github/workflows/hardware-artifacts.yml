@@ -19,6 +19,14 @@ name: Hardware test artifacts
 on:
   push:
     branches: [main]
+  # Self-test: a PR that touches this workflow runs it, so a broken
+  # cross-build or staging step is caught by the PR that introduced it
+  # rather than after merge. Path-filtered, so ordinary PRs don't pay for
+  # a second BPF build. It also means the bundle is downloadable from the
+  # PR run — handy when the change being reviewed is the bundle itself.
+  pull_request:
+    paths:
+      - '.github/workflows/hardware-artifacts.yml'
   workflow_dispatch:
     inputs:
       target:
