@@ -214,6 +214,15 @@ jobs:
           # Strip the leading `v` so the .deb version is plain semver (e.g.
           # 0.2.2), matching what `dpkg -s packetframe` will report.
           DEB_VERSION="${GITHUB_REF_NAME#v}"
+          # A workflow_dispatch pre-release validation run has a branch
+          # name here, not a tag, and dpkg requires an upstream version
+          # starting with a digit — `main` makes cargo-deb fail, which
+          # used to sink both gnu legs of the very dry run that exists to
+          # de-risk a release. Synthesize a valid throwaway version.
+          case "${DEB_VERSION}" in
+            [0-9]*) ;;
+            *) DEB_VERSION="$(cat VERSION)~${DEB_VERSION//[^a-zA-Z0-9]/}$(git rev-parse --short HEAD)" ;;
+          esac
           STEM="packetframe-${GITHUB_REF_NAME}-${{ matrix.target }}"
           # SOURCE_DATE_EPOCH is already in GITHUB_ENV from the earlier
           # step; cargo-deb honors it for archive mtimes and the
