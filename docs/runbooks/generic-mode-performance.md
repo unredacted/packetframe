@@ -355,3 +355,25 @@ over the live pins.
   `fallback-default`).
 - `nexthop_seq_retry`, `custom_fib_no_neigh`: sustained growth means nexthop churn
   or unresolved neighbors, each such packet takes the slow path.
+
+## Platform taxes on UniFi OS
+
+Two fixed per-packet costs on this platform are not PacketFrame's and cannot be
+removed — budget for them instead of chasing them:
+
+- **udapi-server neighbor polling.** UniFi's `udapi-server` spawns
+  `arping`/`ndisc6` (via `/data/ix-neighbor-poll-wrapper/`) against **every kernel
+  neighbor** on a poll cycle, each holding AF_PACKET sockets; on the reference box
+  a batch of ~10 concurrent arpings plus lldpd's six per-NIC ETH_P_ALL sockets
+  measured ~9% of busy CPU in `packet_rcv` + `dev_queue_xmit_nit`. This is a known,
+  non-configurable platform behavior
+  (<https://community.ui.com/questions/ubios-udapi-server-runs-arping-ndisc6-against-every-kernel-neighbor-and-is-not-configurable/947bbae1-1625-48f1-b275-61f75d9b313f>).
+  **Do not kill the arping processes** — udapi-server respawns them, and fighting
+  the platform supervisor buys nothing.
+- **The cost scales with kernel neighbor count** — every neighbor is a polling
+  target. That interacts with PacketFrame's own `local-prefix ... arp-scavenge`,
+  which deliberately populates the neighbor table (254 probes per /24 sweep) so
+  quiet hosts get fast-pathed: each host the scavenge discovers is another
+  udapi polling target forever after. That trade is usually right (fast-pathing a
+  host saves far more than its poll costs) but it belongs in capacity planning,
+  not in a surprised `ss --packet` session at 3am.

@@ -19,6 +19,30 @@ hosts that can run native should.
 `auto` never selects tc. It is a per-interface, explicit opt-in so
 canary rollouts stay operator-controlled.
 
+### Measured expectation on rvu-nicpf / otx2
+
+The cost model above is the *documented* generic-XDP behavior — verify it
+against your driver before expecting a win. On the reference EFG
+(5.15.72-ui-cn9670, otx2/rvu-nicpf, ~640 kpps live), a 2026-07-31 `perf`
+profile showed **neither `pskb_expand_head` nor `skb_linearize` anywhere in
+the top of the profile** (below 0.5% of samples): this driver evidently
+already reserves enough headroom that `netif_receive_generic_xdp` never
+reallocates, so the per-packet copy tax that motivates the tc datapath is
+not being paid on this hardware. See
+`generic-mode-performance.md` §"Measured profile on cn9670 / otx2".
+
+Consequence: **expect ~no CPU change from tc on this fleet.** The reasons
+to run it anyway are operational, not performance:
+
+- tc attach never calls `otx2_xdp_setup`, sidestepping the pre-6.8
+  rvu-nicpf `non_qos_queues` leak entirely (XDP attach/detach cycles eat
+  queues until reboot on affected kernels);
+- tcpdump regains ingress visibility (generic XDP consumes packets before
+  the capture point; sched_cls runs after it).
+
+On a driver that *does* pay the headroom copy (check with `perf` for
+`pskb_expand_head` before deciding), the original 1.5–3× estimate stands.
+
 ## Prerequisites
 
 - `forwarding-mode custom-fib` with a live `route-source`. The tc
