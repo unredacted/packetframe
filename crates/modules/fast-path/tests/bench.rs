@@ -55,6 +55,23 @@ use common::{xdp_action, Harness, Ipv4TcpBuilder, StatIdx};
 /// devmap pre-check needs a real entry.
 const LO_IFINDEX: u32 = 1;
 
+/// Quick mode for CI under emulation. The statistics only matter on
+/// real hardware; under qemu TCG the full 1M-execution forward loops
+/// (a) take double-digit minutes and (b) trip the kernel's 22-second
+/// soft-lockup watchdog inside `bpf_test_run`, whose per-fire ~35-line
+/// splat to the emulated serial console compounds the slowdown until
+/// the job times out (observed on the v0.2.8 fib-cache PR: 5.15 qemu
+/// job dead at 20 min with bench still running). CI's question is
+/// "does the bench run and do its sanity asserts hold", which 1/25th
+/// of the iterations answers identically.
+fn bench_calls(full: usize) -> usize {
+    if std::env::var_os("PACKETFRAME_BENCH_QUICK").is_some() {
+        (full / 25).max(8)
+    } else {
+        full
+    }
+}
+
 /// Iterations per syscall on paths that mutate TTL (must stay < 253
 /// with ttl=255; see module docs).
 const FWD_REPEAT: u32 = 200;
@@ -120,16 +137,17 @@ fn bench_custom_fib_forward_established() {
     let fwd_before = h.stat(StatIdx::FwdOk);
     let low_ttl_before = h.stat(StatIdx::PassLowTtl);
 
-    let ns = median_ns(&h, &pkt, FWD_REPEAT, FWD_CALLS, xdp_action::XDP_REDIRECT);
+    let calls = bench_calls(FWD_CALLS);
+    let ns = median_ns(&h, &pkt, FWD_REPEAT, calls, xdp_action::XDP_REDIRECT);
 
     // Every iteration must have forwarded; a TTL-budget bug would
     // divert iterations to PassLowTtl and quietly bench the wrong path.
-    let executed = (FWD_REPEAT as u64) * (FWD_CALLS as u64);
+    let executed = (FWD_REPEAT as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::FwdOk) - fwd_before, executed);
     assert_eq!(h.stat(StatIdx::PassLowTtl), low_ttl_before);
 
     eprintln!(
-        "bench_custom_fib_forward_established: {ns} ns/pkt (median of {FWD_CALLS} x {FWD_REPEAT})"
+        "bench_custom_fib_forward_established: {ns} ns/pkt (median of {calls} x {FWD_REPEAT})"
     );
 
     if let Ok(baseline) = std::env::var("PACKETFRAME_BENCH_BASELINE_NS") {
@@ -150,11 +168,12 @@ fn bench_custom_fib_forward_syn() {
     let pkt = fwd_packet(TCP_FLAG_SYN);
 
     let fwd_before = h.stat(StatIdx::FwdOk);
-    let ns = median_ns(&h, &pkt, FWD_REPEAT, FWD_CALLS, xdp_action::XDP_REDIRECT);
-    let executed = (FWD_REPEAT as u64) * (FWD_CALLS as u64);
+    let calls = bench_calls(FWD_CALLS);
+    let ns = median_ns(&h, &pkt, FWD_REPEAT, calls, xdp_action::XDP_REDIRECT);
+    let executed = (FWD_REPEAT as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::FwdOk) - fwd_before, executed);
 
-    eprintln!("bench_custom_fib_forward_syn: {ns} ns/pkt (median of {FWD_CALLS} x {FWD_REPEAT})");
+    eprintln!("bench_custom_fib_forward_syn: {ns} ns/pkt (median of {calls} x {FWD_REPEAT})");
 }
 
 #[test]
@@ -167,9 +186,10 @@ fn bench_allowlist_miss() {
     let pkt = Ipv4TcpBuilder::default().build();
 
     let rx_before = h.stat(StatIdx::RxTotal);
-    let ns = median_ns(&h, &pkt, MISS_REPEAT, MISS_CALLS, xdp_action::XDP_PASS);
-    let executed = (MISS_REPEAT as u64) * (MISS_CALLS as u64);
+    let calls = bench_calls(MISS_CALLS);
+    let ns = median_ns(&h, &pkt, MISS_REPEAT, calls, xdp_action::XDP_PASS);
+    let executed = (MISS_REPEAT as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::RxTotal) - rx_before, executed);
 
-    eprintln!("bench_allowlist_miss: {ns} ns/pkt (median of {MISS_CALLS} x {MISS_REPEAT})");
+    eprintln!("bench_allowlist_miss: {ns} ns/pkt (median of {calls} x {MISS_REPEAT})");
 }

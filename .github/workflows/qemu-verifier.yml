@@ -164,7 +164,7 @@ jobs:
               --memory 4096 \
               --disable-kvm \
               --verbose \
-              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
+              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_QUICK=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
           }
           # Retry policy: virtme-ng propagates the guest command's exit
           # status, so a genuine test failure arrives as cargo's 101
