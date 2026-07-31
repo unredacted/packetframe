@@ -116,6 +116,39 @@ Symbols to read:
 If `pskb_expand_head` + linearization dwarf `bpf_prog_run_generic_xdp`, host tuning
 and datapath placement (not BPF micro-optimization) are where the wins are.
 
+**`perf` is not available on UniFi OS.** There is no `perf` package; Debian
+bullseye ships `linux-perf` built for its own 5.10 kernel while these boxes run a
+UniFi 5.15, so `/usr/bin/perf` fails looking for `perf_5.15`. `apt install
+linux-perf` then invoking `perf_5.10` directly works (minor skew is fine for cycle
+sampling), but installing it on a forwarding router may not be worth it — the
+split below needs nothing that isn't already present.
+
+### Splitting program cost from kernel cost without perf
+
+The microbenchmark gives program ns/packet directly. Total per-packet CPU comes
+from `/proc/stat` and the module's own counters, so the kernel-side share is the
+difference. Run on a box that is actually forwarding:
+
+```sh
+S1=$(awk '/^cpu /{print $8}' /proc/stat); R1=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); sleep 10; S2=$(awk '/^cpu /{print $8}' /proc/stat); R2=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); echo "rx pps: $(( (R2-R1)/10 ))"; echo "softirq ns per rx packet: $(( (S2-S1)*10000000 / (R2-R1) ))"
+```
+
+Field 8 of `/proc/stat`'s `cpu` line is softirq in USER_HZ, which is always 100 Hz,
+so one tick is 10 ms — hence `10000000` ns. Subtract the measured program time
+(see the reference figures below) to get the kernel-side share. Softirq covers all
+softirq work on the box, not only the XDP receive path, so read it as an upper
+bound.
+
+A direct cross-check of program time under live traffic, if `bpftool` is installed
+(it is not a PacketFrame dependency):
+
+```sh
+sysctl -w kernel.bpf_stats_enabled=1 && sleep 10 && bpftool prog show name fast_path; sysctl -w kernel.bpf_stats_enabled=0
+```
+
+`run_time_ns / run_cnt` is the real per-invocation cost. Enabling the stats adds
+two timestamp reads per invocation (a few percent), so turn it off afterwards.
+
 ### Getting a build onto a test router
 
 Neither the release tarballs nor the CI test runs give you what an on-hardware
