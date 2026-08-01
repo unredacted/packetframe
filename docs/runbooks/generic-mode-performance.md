@@ -150,6 +150,72 @@ Two other things worth acting on before any datapath change:
   dominate: a forwarded packet does three (`ALLOW` src, `ALLOW` dst, `FIB`). Any
   further BPF optimization should target lookup *count*, not instruction count.
 
+### IRQ coalescing: the cheapest measured win on this fleet
+
+The EFG ships with `rx-usecs 1, rx-frames 10, adaptive off` — a 1 µs timer that
+can never aggregate at realistic per-queue packet gaps (~24 µs at 42 kpps/queue
+on 18 queues), so the box takes **~one interrupt per packet** (~800k eth IRQs/s
+measured at ~800 kpps). Each IRQ buys entry/exit, a NAPI schedule, and a softirq
+wakeup; the sum hides across hundreds of small perf symbols, which is why the
+profile table above never shows it as one fat line. `packetframe feasibility`
+flags this state (`iface.<name>.coalesce`).
+
+Measured on the reference EFG (2026-08-01, ~800 kpps live):
+
+| Config | softirq ns/pkt | hardirq ns/pkt | total | eth IRQs/s |
+|---|---|---|---|---|
+| stock (`rx-usecs 1 rx-frames 10`) | 11,306 | not captured | — | ~800k |
+| `rx-usecs 50 rx-frames 32` (rx+tx) | **10,121** | 1,052 | **11,173** | 557k |
+| + NAPI defer (`napi_defer_hard_irqs 2`, `gro_flush_timeout 50000`) | 10,711 | 1,557 | 12,268 | 142k (eth only) |
+
+The winning setting, applied to every attach interface:
+
+```sh
+for i in eth0 eth1 eth2 eth3 eth4 eth5; do ethtool -C $i rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32; done
+```
+
+−10.5% softirq/packet. The 557k residual is exactly timer-bound (20k/s ×
+~28 active queue pairs), so a larger `rx-usecs` buys further reduction
+linearly — at proportionally more worst-case latency; 50 µs is noise at
+internet-edge RTTs, and diminishing returns set in fast beyond it.
+
+**NAPI deferral is a measured LOSS on cn9670 — do not apply the standard
+high-pps recipe here.** `gro_flush_timeout` re-polls NAPI from an hrtimer, and
+hrtimers fire as arch-timer *hardirqs* that `/proc/interrupts`' eth lines never
+show: the eth IRQ count collapsed 4× while both softirq and hardirq time went
+**up** (total +9.8% vs coalescing alone). On this SoC a timer interrupt costs
+more than the NIC interrupt it replaces. Tried, rejected, keep both knobs at 0.
+
+**Persistence:** `ethtool -C` state dies on reboot and may not survive a udapi
+provision cycle (unverified). A oneshot unit keeps the fleet honest:
+
+```ini
+# /etc/systemd/system/packetframe-coalesce.service
+[Unit]
+Description=NIC IRQ coalescing for generic-XDP forwarding (generic-mode-performance runbook)
+After=network-pre.target
+Before=network.target packetframe.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in eth0 eth1 eth2 eth3 eth4 eth5; do ethtool -C $i rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32 || true; done'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+systemctl daemon-reload && systemctl enable --now packetframe-coalesce
+```
+
+After any provision event or firmware update, `packetframe feasibility` (or
+`ethtool -c eth0`) confirms the settings held.
+
+**Judge the win by ns/packet and pps-at-ceiling, never by `%soft`.** On a
+CPU-bound box with BBR senders, freed CPU converts to throughput within a few
+RTTs (measured 766k → 806 kpps across this change) and `%soft` barely moves —
+induced demand working as intended, not a failed optimization.
+
 **`perf` is not available on UniFi OS.** There is no `perf` package; Debian
 bullseye ships `linux-perf` built for its own 5.10 kernel while these boxes run a
 UniFi 5.15, so `/usr/bin/perf` fails looking for `perf_5.15`. `apt install

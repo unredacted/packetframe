@@ -196,10 +196,11 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
 /// (`required = false`); see `docs/runbooks/generic-mode-performance.md`
 /// for what to do with the answers.
 pub fn run_iface_probes(ifaces: &[String]) -> Vec<Capability> {
-    let mut caps = Vec::with_capacity(ifaces.len() * 2);
+    let mut caps = Vec::with_capacity(ifaces.len() * 3);
     for iface in ifaces {
         caps.push(probe_iface_gro(iface));
         caps.push(probe_iface_rps(iface));
+        caps.push(probe_iface_coalesce(iface));
     }
     caps
 }
@@ -802,6 +803,108 @@ fn rps_mask_is_zero(mask: &str) -> bool {
     mask.chars().all(|c| c == '0' || c == ',')
 }
 
+/// IRQ coalescing via `SIOCETHTOOL`/`ETHTOOL_GCOALESCE`. On a
+/// generic-XDP box every packet costs a full IRQ + NAPI wakeup when
+/// the coalescing timer is effectively off; the reference EFG shipped
+/// with `rx-usecs 1 rx-frames 10`, which produced ~1 IRQ per packet
+/// (~800k/s at ~800 kpps) and measured −10.5% softirq/packet when
+/// raised to 50/32. A timer at or below this threshold cannot
+/// aggregate at realistic per-queue packet gaps (tens of µs), so it
+/// is reported as a (non-required) failure with the fix inline.
+/// See `docs/runbooks/generic-mode-performance.md` §"IRQ coalescing".
+const COALESCE_PER_PACKET_USECS: u32 = 2;
+
+fn coalesce_is_per_packet(rx_usecs: u32) -> bool {
+    rx_usecs <= COALESCE_PER_PACKET_USECS
+}
+
+fn probe_iface_coalesce(iface: &str) -> Capability {
+    let name = format!("iface.{iface}.coalesce");
+    match iface_coalesce_state(iface) {
+        Ok((rx_usecs, rx_frames)) => {
+            if coalesce_is_per_packet(rx_usecs) {
+                Capability::fail(
+                    &name,
+                    format!(
+                        "rx-usecs {rx_usecs} / rx-frames {rx_frames}: effectively one IRQ per \
+                         packet at forwarding rates; \
+                         `ethtool -C {iface} rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32` \
+                         measured −10.5% softirq/packet on the reference EFG — settings do not \
+                         survive reboot, see generic-mode-performance runbook §IRQ coalescing \
+                         for persistence"
+                    ),
+                    false,
+                )
+            } else {
+                Capability::pass(
+                    &name,
+                    format!("rx-usecs {rx_usecs} / rx-frames {rx_frames}"),
+                    false,
+                )
+            }
+        }
+        Err(e) => Capability::unknown(&name, e, false),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn iface_coalesce_state(iface: &str) -> Result<(u32, u32), String> {
+    // uapi `struct ethtool_coalesce`: cmd + 22 u32 parameter fields.
+    // Only rx_coalesce_usecs and rx_max_coalesced_frames are read;
+    // the rest exist so the kernel writes into memory we own.
+    const ETHTOOL_GCOALESCE: u32 = 0x0000_000e;
+    // Width-neutral for the ioctl request cast; see iface_gro_state.
+    const SIOCETHTOOL: u32 = 0x8946;
+    #[repr(C)]
+    #[derive(Default)]
+    struct EthtoolCoalesce {
+        cmd: u32,
+        rx_coalesce_usecs: u32,
+        rx_max_coalesced_frames: u32,
+        rest: [u32; 20],
+    }
+
+    let name_bytes = iface.as_bytes();
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name_bytes.len() >= ifr.ifr_name.len() {
+        return Err(format!("interface name `{iface}` exceeds IFNAMSIZ"));
+    }
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes) {
+        *dst = *src as libc::c_char;
+    }
+
+    let mut value = EthtoolCoalesce {
+        cmd: ETHTOOL_GCOALESCE,
+        ..Default::default()
+    };
+    ifr.ifr_ifru.ifru_data = &mut value as *mut EthtoolCoalesce as *mut libc::c_char;
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(format!(
+            "socket(AF_INET, SOCK_DGRAM) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let r = unsafe { libc::ioctl(sock, SIOCETHTOOL as _, &mut ifr) };
+    let ioctl_err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+    if r != 0 {
+        // EOPNOTSUPP is a normal answer (virtual devices, some
+        // drivers); the caller renders it as Unknown, not Fail.
+        return Err(format!(
+            "SIOCETHTOOL/ETHTOOL_GCOALESCE on {iface} failed: {ioctl_err}"
+        ));
+    }
+    Ok((value.rx_coalesce_usecs, value.rx_max_coalesced_frames))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn iface_coalesce_state(_iface: &str) -> Result<(u32, u32), String> {
+    Err("coalescing probe is Linux-only".to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn iface_gro_state(iface: &str) -> Result<bool, String> {
     // ethtool_value { cmd, data } with ETHTOOL_GGRO. A read-only get;
@@ -861,6 +964,18 @@ fn iface_gro_state(_iface: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalesce_per_packet_threshold() {
+        // The EFG shipped at rx-usecs=1 (flagged); the runbook fix is
+        // 50 (passes). 2 µs cannot aggregate at tens-of-µs per-queue
+        // packet gaps, so it is still per-packet in practice.
+        assert!(coalesce_is_per_packet(0));
+        assert!(coalesce_is_per_packet(1));
+        assert!(coalesce_is_per_packet(2));
+        assert!(!coalesce_is_per_packet(3));
+        assert!(!coalesce_is_per_packet(50));
+    }
 
     #[test]
     fn kconfig_flag_matching() {
@@ -987,15 +1102,17 @@ CONFIG_HZ=250
 
     #[test]
     fn iface_probes_shape() {
-        // Two caps per iface, names prefixed with the iface. On
-        // non-Linux both come back Unknown, which is fine — the shape
+        // Three caps per iface, names prefixed with the iface. On
+        // non-Linux all come back Unknown, which is fine — the shape
         // is what this asserts.
         let caps = run_iface_probes(&["eth0".to_string(), "eth1".to_string()]);
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps.len(), 6);
         assert_eq!(caps[0].name, "iface.eth0.gro");
         assert_eq!(caps[1].name, "iface.eth0.rps");
-        assert_eq!(caps[2].name, "iface.eth1.gro");
-        assert_eq!(caps[3].name, "iface.eth1.rps");
+        assert_eq!(caps[2].name, "iface.eth0.coalesce");
+        assert_eq!(caps[3].name, "iface.eth1.gro");
+        assert_eq!(caps[4].name, "iface.eth1.rps");
+        assert_eq!(caps[5].name, "iface.eth1.coalesce");
         assert!(caps.iter().all(|c| !c.required));
     }
 }
