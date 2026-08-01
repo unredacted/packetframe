@@ -755,6 +755,8 @@ version = "0.2.7"
 dependencies = [
  "libc",
  "packetframe-common",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
 ]

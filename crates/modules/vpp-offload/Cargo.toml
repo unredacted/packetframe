@@ -9,6 +9,8 @@ description = "PacketFrame vpp-offload module: VPP-on-VF forwarding vector orche
 packetframe-common = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
