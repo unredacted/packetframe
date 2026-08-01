@@ -161,6 +161,68 @@ pub(crate) fn bridge_resolve_enabled(directives: &[ModuleDirective]) -> bool {
     !matches!(toggle, ToggleAutoOnOff::Off)
 }
 
+/// Whether `fdb-pin` enables FDB-pinned direct-to-port egress
+/// (v0.2.9). Same default/synonym semantics as `bridge-resolve`:
+/// no directive = `Auto` = enabled where provable.
+pub(crate) fn fdb_pin_enabled(directives: &[ModuleDirective]) -> bool {
+    let toggle = directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::FdbPin(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or_default();
+    !matches!(toggle, ToggleAutoOnOff::Off)
+}
+
+/// v0.2.9: derive the FDB-pin chain map for the NeighborResolver:
+/// `bridge ifindex → (underlying bridge ifindex, VID)`, from the same
+/// collapsed chains that feed `VLAN_RESOLVE`, restricted to chains
+/// whose underlying device is itself a bridge (only then does an FDB
+/// exist to decide the member port). Requires both `fdb-pin` and
+/// `bridge-resolve` active — the pin extends the short-circuit's
+/// wire-equivalence proof, it cannot stand without it. Errors and
+/// unresolvable names degrade to "no pin for that chain" with a log
+/// line rather than failing attach: an unpinned nexthop just keeps
+/// today's bridge path.
+pub(crate) fn discover_fdb_pin_chains(
+    directives: &[ModuleDirective],
+) -> std::collections::HashMap<u32, (u32, u16)> {
+    let mut out = std::collections::HashMap::new();
+    if !fdb_pin_enabled(directives) {
+        return out;
+    }
+    let chains = match discover_bridge_chains(directives) {
+        Ok(c) => c, // empty when bridge-resolve is off — the gate above
+        Err(e) => {
+            warn!(error = %e, "fdb-pin: bridge chain discovery failed; no pins");
+            return out;
+        }
+    };
+    for (bridge, under, vid) in chains {
+        // The underlying device must itself be a bridge; a plain
+        // physical underlying device has no FDB and nothing to pin.
+        if !std::path::Path::new(&format!("/sys/class/net/{under}/bridge")).exists() {
+            continue;
+        }
+        let (Ok(bridge_idx), Ok(under_idx)) = (if_nametoindex(&bridge), if_nametoindex(&under))
+        else {
+            warn!(%bridge, %under, "fdb-pin: ifindex resolution failed; chain skipped");
+            continue;
+        };
+        info!(
+            %bridge,
+            bridge_idx,
+            fdb_bridge = %under,
+            under_idx,
+            vid,
+            "fdb-pin chain armed (nexthops on this bridge pin to FDB member ports)"
+        );
+        out.insert(bridge_idx, (under_idx, vid));
+    }
+    out
+}
+
 /// One collapsed bridge egress chain: a bridge whose single forwarding
 /// member is a VLAN subif, resolved down to (bridge, underlying device,
 /// VID). `br1337` over `switch0.1337` over `switch0` yields
@@ -1467,11 +1529,15 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             );
         }
 
+        // v0.2.9: FDB-pin chain derivation. Empty (feature off, no
+        // qualifying topology, or bridge-resolve off) = never pins.
+        let fdb_pin_chains = discover_fdb_pin_chains(&cfg.section.directives);
         let ctrl = crate::fib::controller::RouteController::start(
             &state.bpffs_root,
             route_source,
             local_prefixes,
             fallback_default,
+            fdb_pin_chains,
         )
         .map_err(|e| {
             ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))

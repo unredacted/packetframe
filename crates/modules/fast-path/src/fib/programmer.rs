@@ -336,10 +336,7 @@ enum Command {
     /// applies the pin under the same seqlock as every other entry
     /// write. Idempotent: repeats with an unchanged pin are absorbed
     /// by the stored-state comparison.
-    SetNexthopPin {
-        ip: IpAddr,
-        pin: Option<(u32, u16)>,
-    },
+    SetNexthopPin { ip: IpAddr, pin: Option<(u32, u16)> },
 }
 
 /// Per-nexthop state tracked in userspace. Refcount lets multiple

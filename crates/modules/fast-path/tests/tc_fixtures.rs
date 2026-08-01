@@ -211,3 +211,28 @@ fn tc_parse_error_bumps_both_shared_and_tc_counter() {
     assert_eq!(h.stat(StatIdx::ErrParse), parse_before + 2);
     assert_eq!(h.stat(StatIdx::ErrParseTc), parse_tc_before + 1);
 }
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn tc_fdb_pinned_nexthop_forwards() {
+    // tc twin of feature_gates::fdb_pin_redirects_to_port_with_tag,
+    // proving the pin branch exists in tc_forward_success too. Tag
+    // verification lives in the XDP fixture: tc egress tagging goes
+    // through bpf_skb_vlan_push (skb metadata), which TEST_RUN does
+    // not serialize into data_out — verdict + counters are the
+    // observable surface here.
+    let mut h = Harness::new();
+    h.set_custom_fib(true, false);
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4_pinned(0, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC, 1337);
+    h.add_fib_v4_single("10.0.0.0/8", 0);
+    h.add_tc_redirect_target(LO_IFINDEX);
+
+    let pkt = matched_pkt();
+    let fwd_before = h.stat(StatIdx::FwdOk);
+    let fwd_tc_before = h.stat(StatIdx::FwdOkTc);
+    let (verdict, _) = h.run_tc(&pkt);
+    assert_eq!(verdict, tc_action::TC_ACT_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FwdOk), fwd_before + 1);
+    assert_eq!(h.stat(StatIdx::FwdOkTc), fwd_tc_before + 1);
+}

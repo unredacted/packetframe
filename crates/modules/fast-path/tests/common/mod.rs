@@ -472,6 +472,20 @@ impl Harness {
         arr.set(idx, entry, 0).expect("NEXTHOPS set (even)");
     }
 
+    /// v0.2.9: write an FDB-pinned nexthop — `ifindex` is the physical
+    /// member port and `pin_vid` the egress tag the datapath must
+    /// apply while skipping `VLAN_RESOLVE`.
+    pub fn add_nexthop_v4_pinned(
+        &mut self,
+        idx: u32,
+        port_ifindex: u32,
+        smac: [u8; 6],
+        dmac: [u8; 6],
+        pin_vid: u16,
+    ) {
+        self.add_nexthop_raw_full(idx, port_ifindex, smac, dmac, NH_FAMILY_V4, pin_vid);
+    }
+
     fn add_nexthop_raw(
         &mut self,
         idx: u32,
@@ -480,6 +494,18 @@ impl Harness {
         dmac: [u8; 6],
         family: u8,
     ) {
+        self.add_nexthop_raw_full(idx, ifindex, smac, dmac, family, 0);
+    }
+
+    fn add_nexthop_raw_full(
+        &mut self,
+        idx: u32,
+        ifindex: u32,
+        smac: [u8; 6],
+        dmac: [u8; 6],
+        family: u8,
+        pin_vid: u16,
+    ) {
         let map = self.bpf.map_mut("NEXTHOPS").expect("NEXTHOPS map");
         let mut arr: Array<_, NexthopEntry> = Array::try_from(map).expect("NEXTHOPS try_from");
         // First-time write: go 0 → 1 (odd, in progress) → 2 (even, stable).
@@ -487,7 +513,7 @@ impl Harness {
             seq: 1,
             ifindex,
             dst_mac: dmac,
-            pin_vid: 0,
+            pin_vid,
             src_mac: smac,
             _pad1: [0; 2],
             state: NH_STATE_RESOLVED,

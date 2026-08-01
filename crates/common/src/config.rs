@@ -275,6 +275,25 @@ pub enum ModuleDirective {
     /// force — an unprovable topology stays on the kernel path);
     /// `Off` disables installation and is the SIGHUP-able rollback.
     BridgeResolve(ToggleAutoOnOff),
+    /// `fdb-pin auto|on|off` — FDB-pinned direct-to-port egress
+    /// (v0.2.9). Extends the bridge egress short-circuit one hop
+    /// further: when a short-circuited chain's underlying device is
+    /// itself a multi-member bridge (`br1337` → `switch0.1337` →
+    /// `switch0` over `eth0/4/5`), the NeighborResolver consults
+    /// `switch0`'s FDB for each nexthop MAC and pins the nexthop's
+    /// egress to the specific member port + VID, skipping the bridge
+    /// transmit path (FDB lookup, ebtables, the egress qdisc, and the
+    /// AF_PACKET tap walk) entirely. Pins invalidate live on AF_BRIDGE
+    /// FDB events (MAC move, age-out) and fall back to the bridge
+    /// path whenever the FDB has no answer. Requires `bridge-resolve`
+    /// active (the pin extends that proof); no-op otherwise. `Auto`
+    /// (default) = pin wherever provable; `On` = synonym for `Auto`;
+    /// `Off` = never pin. **Restart-only** (attach-time-bound, like
+    /// `local-prefix`): the chain snapshot and the FDB subscription
+    /// live in the resolver, which is constructed at attach. Editing
+    /// this directive and reloading leaves the running state
+    /// untouched.
+    FdbPin(ToggleAutoOnOff),
     CircuitBreaker(CircuitBreakerSpec),
     /// Operator override for a driver-specific workaround. Currently
     /// the only defined knob is `rvu-nicpf-head-shift` (SPEC
@@ -1619,6 +1638,10 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
             Ok(ModuleDirective::BridgeResolve(v))
         }),
+        "fdb-pin" => parse_single_arg(line, rest, "fdb-pin", |t| {
+            let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
+            Ok(ModuleDirective::FdbPin(v))
+        }),
         "driver-workaround" => parse_driver_workaround(line, rest),
         "forwarding-mode" => parse_single_arg(line, rest, "forwarding-mode", |t| {
             let mode: ForwardingMode = t.parse().map_err(|e: String| e)?;
@@ -2464,6 +2487,25 @@ module fast-path
         assert!(Config::parse("module fast-path\n  bridge-resolve maybe\n").is_err());
         assert!(Config::parse("module fast-path\n  bridge-resolve\n").is_err());
         assert!(Config::parse("module fast-path\n  bridge-resolve on extra\n").is_err());
+    }
+
+    #[test]
+    fn fdb_pin_parses() {
+        for (tok, want) in [
+            ("auto", ToggleAutoOnOff::Auto),
+            ("on", ToggleAutoOnOff::On),
+            ("off", ToggleAutoOnOff::Off),
+        ] {
+            let s = format!("module fast-path\n  fdb-pin {tok}\n");
+            let c = Config::parse(&s).unwrap();
+            match &c.modules[0].directives[0] {
+                ModuleDirective::FdbPin(v) => assert_eq!(*v, want),
+                other => panic!("expected FdbPin, got {other:?}"),
+            }
+        }
+        assert!(Config::parse("module fast-path\n  fdb-pin maybe\n").is_err());
+        assert!(Config::parse("module fast-path\n  fdb-pin\n").is_err());
+        assert!(Config::parse("module fast-path\n  fdb-pin auto extra\n").is_err());
     }
 
     #[test]

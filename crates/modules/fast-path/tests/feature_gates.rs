@@ -124,3 +124,68 @@ fn vlan_gate_clear_bypasses_resolve() {
     assert_eq!(h.stat(StatIdx::PassNotInDevmap), miss_before + 1);
     assert_eq!(out, pkt, "pass-path packet must be pristine (§11.13)");
 }
+
+// --- v0.2.9: FDB-pinned direct-to-port egress -----------------------------
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fdb_pin_redirects_to_port_with_tag() {
+    // Pinned nexthop: ifindex is already the physical port (loopback,
+    // in the devmap) and pin_vid carries the egress tag. No
+    // VLAN_PRESENT bit, no VLAN_RESOLVE entry — the pin must be fully
+    // self-sufficient.
+    let mut h = Harness::new();
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4_pinned(
+        0,
+        LO_IFINDEX,
+        [0x02, 0, 0, 0, 0, 0xee],
+        [0x02, 0, 0, 0, 0, 0xff],
+        1337,
+    );
+    h.add_fib_v4_single("10.0.0.0/8", 0);
+    h.add_devmap_ifindex(LO_IFINDEX);
+    h.set_cfg_flags(BASE_FLAGS);
+
+    let pkt = Ipv4TcpBuilder::default().build();
+    let fwd_before = h.stat(StatIdx::FwdOk);
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::FwdOk), fwd_before + 1);
+    // finalize pushed the pinned tag: frame grew by 4, TPID 0x8100,
+    // TCI carries VID 1337 (0x0539).
+    assert_eq!(out.len(), pkt.len() + 4);
+    assert_eq!(&out[12..14], &[0x81, 0x00]);
+    assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 1337);
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn fdb_pin_skips_vlan_resolve_lookup() {
+    // Poisoned VLAN_RESOLVE: an entry keyed on the pinned nexthop's
+    // ifindex that redirects to an ifindex NOT in the devmap. If the
+    // datapath consulted the map, the devmap pre-check would fire
+    // (PassNotInDevmap + pristine pass). A pinned nexthop must skip
+    // the lookup and forward with its own tag — observable proof the
+    // pin branch bypasses the map, not merely overrides its result.
+    let mut h = Harness::new();
+    h.add_allow_v4("10.0.0.0/8");
+    h.add_nexthop_v4_pinned(
+        0,
+        LO_IFINDEX,
+        [0x02, 0, 0, 0, 0, 0xee],
+        [0x02, 0, 0, 0, 0, 0xff],
+        1337,
+    );
+    h.add_fib_v4_single("10.0.0.0/8", 0);
+    h.add_devmap_ifindex(LO_IFINDEX);
+    h.add_vlan_resolve(LO_IFINDEX, 999, 66); // 999 not in devmap
+    h.set_cfg_flags(BASE_FLAGS | FP_CFG_FLAG_VLAN_PRESENT);
+
+    let pkt = Ipv4TcpBuilder::default().build();
+    let miss_before = h.stat(StatIdx::PassNotInDevmap);
+    let (verdict, out) = h.run(&pkt);
+    assert_eq!(verdict, xdp_action::XDP_REDIRECT);
+    assert_eq!(h.stat(StatIdx::PassNotInDevmap), miss_before);
+    assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 1337);
+}

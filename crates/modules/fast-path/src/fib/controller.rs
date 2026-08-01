@@ -131,6 +131,7 @@ impl RouteController {
         route_source: Option<RouteSourceConfig>,
         local_prefixes: Vec<LocalPrefixSpec>,
         fallback_default: Option<FallbackDefaultSpec>,
+        fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
     ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
@@ -183,6 +184,12 @@ impl RouteController {
         let resolver = match fallback_default {
             Some(spec) => resolver.with_fallback_default(spec, prog_handle.clone()),
             None => resolver,
+        };
+        // v0.2.9: FDB-pinned direct-to-port egress. Empty map = no-op.
+        let resolver = if fdb_pin_chains.is_empty() {
+            resolver
+        } else {
+            resolver.with_fdb_pin(fdb_pin_chains, prog_handle.clone())
         };
 
         let resolver_task = runtime.spawn(async move {
