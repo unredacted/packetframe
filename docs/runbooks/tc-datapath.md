@@ -96,8 +96,21 @@ Different, deliberately:
    attach eth5 tc
    ```
 
-   Attach-set changes are **restart-only** (not SIGHUP-reloadable):
-   `systemctl restart packetframe`.
+   Attach-set changes are **restart-only** (not SIGHUP-reloadable),
+   and a plain `systemctl restart` is **not sufficient**: bpffs pins
+   survive SIGTERM by design (§8.5) and v0.1 never adopts pins from a
+   prior invocation, so the restarted daemon exits immediately and
+   systemd crash-loops — with the old programs still forwarding but
+   the FIB frozen. Verified live twice on the reference EFG. The full
+   dance:
+
+   ```sh
+   systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
+   ```
+
+   Expect a ~30–60 s slow-path window between detach and re-attach;
+   traffic falls back to the kernel routing table, so make sure your
+   routing daemon exports routes to the kernel.
 
 2. Confirm: `packetframe status` shows `eth5 [tc-ingress]`, and
    `tc filter show dev eth5 ingress` lists a `bpf` filter running

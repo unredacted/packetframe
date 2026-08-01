@@ -808,7 +808,10 @@ Reload + restart the units after dropping these files:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl restart packetframe bird
+sudo systemctl restart bird
+# If packetframe was already running attached, a plain restart will
+# crash-loop on its own surviving pins (v0.1 has no pin adoption):
+sudo systemctl stop packetframe && sudo packetframe detach --all && sudo systemctl start packetframe
 ```
 
 ### When to use `route-source bmp` instead

@@ -45,7 +45,19 @@ Adds-before-removes ordering: a renamed prefix (remove + add of the same value) 
 
 ## What requires a restart
 
-These need `systemctl restart packetframe` (or stop + run):
+These need a full daemon restart — and note that a plain `systemctl
+restart packetframe` is **not sufficient**: bpffs pins survive SIGTERM
+(SPEC §8.5) and v0.1 never adopts pins from a prior invocation, so the
+new process refuses startup and systemd crash-loops with the FIB
+frozen. The working sequence is:
+
+```sh
+systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
+```
+
+(~30–60 s slow-path window between detach and re-attach; the kernel
+routing table carries traffic if your routing daemon exports to it.)
+The directives that require it:
 
 - **`attach` directives (interface added or removed).** XDP attach mutates kernel-side state and risks brief link bounce on some drivers (SPEC §11.8). The reconcile path explicitly logs a warning and skips attach-set changes; your delta does not silently apply.
 - **`route-source` config (custom-FIB only).** The RouteController's runtime is started at attach. Editing the BGP/BMP listener address or peer-AS requires bringing the runtime down and back up.
