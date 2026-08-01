@@ -47,6 +47,42 @@ to run it anyway are operational, not performance:
 On a driver that *does* pay the headroom copy (check with `perf` for
 `pskb_expand_head` before deciding), the original 1.5–3× estimate stands.
 
+### Measured verdict on the reference EFG (2026-08-01): do not use tc for CPU
+
+A full-scale test (all six interfaces tc, 100% of ingress on the tc
+datapath, FIB 97% converged in the measurement window, same night and
+traffic profile as the XDP baselines):
+
+| Datapath | total irq+softirq ns/pkt |
+|---|---|
+| generic XDP (IRQ-coalesced) | 11,173 @ 806 kpps |
+| **tc, all interfaces** | **18,951 @ 522 kpps (+70%)** |
+| generic XDP after revert | 12,259 @ 651 kpps |
+
+Two mechanisms, both structural on this platform:
+
+- **tc egress re-enters `dev_queue_xmit`**, paying the fq qdisc
+  (enqueue/dequeue + locks) *and* the AF_PACKET tap walk
+  (`dev_queue_xmit_nit` — ~9% of busy CPU on UniFi OS, see
+  generic-mode-performance.md §"Platform taxes") for every forwarded
+  packet. Generic XDP's `generic_xdp_tx` bypasses both. Any
+  doorbell-batching benefit from qdisc bulk dequeue is buried under
+  these two costs.
+- **fq's `flow_limit` (100 packets/flow on the EFG) drops forwarded
+  traffic** that XDP egress never exposed to a qdisc: `tc -s qdisc`
+  `flows_plimit` advanced at ~100+/s on the busy egress port during the
+  test. Per-flow caps concentrate loss on the heaviest flows, which is
+  exactly what BBR senders back off from — observed as an rx pps drop
+  coincident with the cutover.
+
+A quiet single-interface canary cannot see either effect (0.5% share
+measured 99.4% forward parity and looked clean). On this fleet the tc
+datapath is reserved for **temporary, single-interface tcpdump
+visibility**; it is not a CPU optimization and must not be fleet-wide.
+Also observed and unresolved: `err_parse` runs ~0.18% of tc-path
+traffic (fail-safe — those packets take the kernel slow path) vs
+~zero under XDP; diagnose before any future tc use beyond debugging.
+
 ## Prerequisites
 
 - `forwarding-mode custom-fib` with a live `route-source`. The tc
