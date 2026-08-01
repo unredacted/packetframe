@@ -267,7 +267,32 @@ fn read_bridge_topology() -> std::io::Result<BridgeTopology> {
             let unicast_flood = std::fs::read_to_string(format!("{brport}/unicast_flood"))
                 .map(|s| s.trim() == "1")
                 .unwrap_or(false);
-            members.push((member, forwarding && unicast_flood));
+            // A VLAN member with a non-default egress-qos-map encodes
+            // the mapped PCP into the tag it emits; the datapath's
+            // vlan push writes PCP/DEI 0, so collapsing such a member
+            // would silently flatten wire priority. The map is visible
+            // in /proc/net/vlan/<member> ("EGRESS priority mappings:"
+            // is empty by default) — require it empty. NotFound means
+            // the member isn't a VLAN device at all, which is fine
+            // (such members never match the VLAN join anyway); any
+            // other read failure refuses.
+            let egress_qos_default =
+                match std::fs::read_to_string(format!("/proc/net/vlan/{member}")) {
+                    Ok(content) => content
+                        .lines()
+                        .find(|l| l.contains("EGRESS priority mappings:"))
+                        .map(|l| {
+                            l.split("EGRESS priority mappings:")
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .is_empty()
+                        })
+                        .unwrap_or(false),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+            members.push((member, forwarding && unicast_flood && egress_qos_default));
         }
         out.push((name, members));
     }

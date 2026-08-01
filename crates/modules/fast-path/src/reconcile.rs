@@ -261,6 +261,32 @@ pub(crate) fn reconcile_vlan_resolve(
     let chains = discover_bridge_chains(&cfg.section.directives)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("bridge topology read: {e}")))?;
 
+    // Same clamp-scoping warning the attach-time population emits: an
+    // `mss-clamp via <bridge>` cannot match while that bridge is
+    // collapsed (matching keys on the post-resolve egress ifindex).
+    // A SIGHUP can introduce either half of the collision — the clamp
+    // rule or the alias — so the check has to live here too.
+    for (bridge_name, phys_name, _) in &chains {
+        for d in &cfg.section.directives {
+            if let ModuleDirective::MssClamp {
+                iface: Some(clamp_iface),
+                ..
+            } = d
+            {
+                if clamp_iface == bridge_name {
+                    warn!(
+                        bridge = %bridge_name,
+                        underlying = %phys_name,
+                        "mss-clamp `via {bridge_name}` will NOT match while the bridge \
+                         egress short-circuit is installed (clamp matching keys on the \
+                         resolved egress ifindex). Scope the clamp `via {phys_name}` or \
+                         set `bridge-resolve off`."
+                    );
+                }
+            }
+        }
+    }
+
     let desired_subifs: HashSet<(u32, u32, u16)> = vlan_entries
         .iter()
         .filter_map(|(subif, vid, parent)| {
