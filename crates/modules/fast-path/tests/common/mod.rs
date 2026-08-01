@@ -487,7 +487,7 @@ impl Harness {
             seq: 1,
             ifindex,
             dst_mac: dmac,
-            _pad0: [0; 2],
+            pin_vid: 0,
             src_mac: smac,
             _pad1: [0; 2],
             state: NH_STATE_RESOLVED,

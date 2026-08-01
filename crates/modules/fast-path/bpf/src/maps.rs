@@ -475,11 +475,20 @@ pub struct NexthopEntry {
     pub seq: u32,
     /// Egress interface ifindex. For VLAN-subif nexthops the XDP
     /// redirect-path still consults `VLAN_RESOLVE` to swap this for
-    /// the phys parent + push the recorded VID (SPEC §4.7).
+    /// the phys parent + push the recorded VID (SPEC §4.7) — unless
+    /// `pin_vid != 0`, in which case this is already the physical
+    /// bridge-member port the FDB placed the nexthop MAC behind.
     pub ifindex: u32,
     /// Destination MAC (nexthop's MAC).
     pub dst_mac: [u8; 6],
-    pub _pad0: [u8; 2],
+    /// FDB-pinned egress VID (v0.2.9). 0 = not pinned: normal
+    /// `VLAN_RESOLVE` resolution applies. Non-zero: `ifindex` is the
+    /// physical port, tag with this VID, skip `VLAN_RESOLVE`. Written
+    /// under the same seqlock as every other field, so pin/unpin
+    /// transitions are atomic with the ifindex they describe.
+    /// Occupies former `_pad0`, so entry size and every other field
+    /// offset are unchanged.
+    pub pin_vid: u16,
     /// Source MAC (egress iface MAC).
     pub src_mac: [u8; 6],
     pub _pad1: [u8; 2],

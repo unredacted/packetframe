@@ -370,6 +370,7 @@ fn tc_dispatch_custom_fib(
             result.smac,
             result.dmac,
             ingress_vid,
+            result.pin_vid,
         ),
         fib::FIB_ACTION_NO_NEIGH => {
             bump(stats, StatIdx::PassNoNeigh);
@@ -403,8 +404,13 @@ fn tc_forward_success(
     smac: [u8; 6],
     dmac: [u8; 6],
     ingress_vid: u16,
+    pin_vid: u16,
 ) -> Result<i32, ()> {
-    let (egress_ifindex, egress_vid) = if cfg_flags & FP_CFG_FLAG_VLAN_PRESENT != 0 {
+    // FDB-pinned nexthop (v0.2.9): port + tag decided by the resolver,
+    // skip VLAN_RESOLVE. Mirrors main.rs::forward_success.
+    let (egress_ifindex, egress_vid) = if pin_vid != VLAN_NONE {
+        (ifindex, pin_vid)
+    } else if cfg_flags & FP_CFG_FLAG_VLAN_PRESENT != 0 {
         match unsafe { VLAN_RESOLVE.get(&ifindex) } {
             Some(vi) => (vi.phys_ifindex, vi.vid),
             None => (ifindex, VLAN_NONE),

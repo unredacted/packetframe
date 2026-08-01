@@ -159,6 +159,19 @@ impl FibProgrammerHandle {
         }
     }
 
+    /// v0.2.9 FDB-pin: set (`Some((port_ifindex, vid))`) or clear
+    /// (`None`) the pinned egress for a nexthop IP. Same `try_send`
+    /// posture as [`Self::set_cache_enabled_nowait`]: the sender is
+    /// the resolver's event loop, which must never block on the
+    /// programmer. A dropped pin command is self-healing — the
+    /// resolver re-derives and re-sends pin state on every kernel
+    /// neighbour or FDB event for the affected entry.
+    pub fn set_nexthop_pin_nowait(&self, ip: IpAddr, pin: Option<(u32, u16)>) {
+        if let Err(e) = self.tx.try_send(Command::SetNexthopPin { ip, pin }) {
+            warn!(?ip, ?pin, error = %e, "FDB-pin update dropped (command queue full or shut down)");
+        }
+    }
+
     pub async fn register_nexthop(&self, ip: IpAddr) -> Result<NexthopId, ProgrammerError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -282,7 +295,7 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
                     let _ = reply.send((0, 0));
                 }
                 // Fire-and-forget; nothing to record or reply to.
-                Command::SetCacheEnabled { .. } => {}
+                Command::SetCacheEnabled { .. } | Command::SetNexthopPin { .. } => {}
             }
         }
     });
@@ -316,6 +329,17 @@ enum Command {
     /// writer, which serializes enable flips against generation bumps
     /// by construction.
     SetCacheEnabled { on: bool },
+    /// v0.2.9 FDB-pin: set or clear a nexthop's pinned egress
+    /// `(port_ifindex, vid)`. Fire-and-forget from the
+    /// NeighborResolver (the only sender), which owns the AF_BRIDGE
+    /// FDB view; the programmer stays the sole NEXTHOPS writer and
+    /// applies the pin under the same seqlock as every other entry
+    /// write. Idempotent: repeats with an unchanged pin are absorbed
+    /// by the stored-state comparison.
+    SetNexthopPin {
+        ip: IpAddr,
+        pin: Option<(u32, u16)>,
+    },
 }
 
 /// Per-nexthop state tracked in userspace. Refcount lets multiple
@@ -326,6 +350,13 @@ struct NexthopRecord {
     /// Latest known MAC + ifindex from the kernel. `None` until the
     /// first `NeighEvent::Learned` arrives for `ip`.
     resolved: Option<(u32, [u8; 6])>,
+    /// Full data of the last `Learned` event **iff the entry is
+    /// currently written Resolved** (v0.2.9): `(ifindex, mac,
+    /// src_mac)`. Cleared on `Failed`/`Gone`, unlike `resolved`, which
+    /// deliberately keeps last-known-good for diagnostics. A pin
+    /// arriving via `SetNexthopPin` may only rewrite a live entry —
+    /// rewriting from `resolved` could resurrect a dead nexthop.
+    live: Option<(u32, [u8; 6], [u8; 6])>,
 }
 
 /// Per-route state tracked in userspace. The `fib_value` lets
@@ -445,6 +476,12 @@ pub struct FibProgrammer {
 
     // --- Nexthop state (Phase 2) ---
     by_ip: HashMap<IpAddr, NexthopRecord>,
+    /// v0.2.9 FDB-pin decisions from the resolver, keyed by nexthop
+    /// IP: `(bridge-member port ifindex, egress VID)`. Consulted on
+    /// every `Learned` write; a `SetNexthopPin` on a live entry
+    /// rewrites it immediately. Stored independently of `by_ip` so a
+    /// pin arriving before nexthop registration isn't lost.
+    pins: HashMap<IpAddr, (u32, u16)>,
     /// Reverse index: NexthopId → IpAddr. Held separately so
     /// NeighEvent → NexthopId lookup is O(1) instead of scanning
     /// every record.
@@ -629,6 +666,7 @@ impl FibProgrammer {
                 cmd_rx,
                 shutdown,
                 by_ip: HashMap::new(),
+                pins: HashMap::new(),
                 by_id: HashMap::new(),
                 seq_by_id: HashMap::new(),
                 free_ids: Vec::new(),
@@ -704,6 +742,55 @@ impl FibProgrammer {
                 let _ = reply.send((self.routes_v4.len(), self.routes_v6.len()));
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
+            Command::SetNexthopPin { ip, pin } => self.set_nexthop_pin(ip, pin),
+        }
+    }
+
+    /// v0.2.9 FDB-pin: record the resolver's pin decision for `ip`
+    /// and, when the entry is live-Resolved, rewrite it in place so
+    /// the datapath picks the new egress up on the next packet. For
+    /// entries that aren't currently Resolved the pin is stored only —
+    /// the next `Learned` write applies it (`on_neigh_event` consults
+    /// `self.pins`), and rewriting from stale data here could
+    /// resurrect a dead nexthop.
+    fn set_nexthop_pin(&mut self, ip: IpAddr, pin: Option<(u32, u16)>) {
+        let changed = match pin {
+            Some(p) => self.pins.insert(ip, p) != Some(p),
+            None => self.pins.remove(&ip).is_some(),
+        };
+        if !changed {
+            return; // Resolver re-sends are expected; absorb no-ops.
+        }
+        let Some(rec) = self.by_ip.get(&ip) else {
+            return; // Pin for an IP we haven't registered; keep it stored.
+        };
+        let Some((ifindex, mac, src_mac)) = rec.live else {
+            return; // Not currently Resolved; applied on next Learned.
+        };
+        let id = rec.id;
+        let family = match ip {
+            IpAddr::V4(_) => NH_FAMILY_V4,
+            IpAddr::V6(_) => NH_FAMILY_V6,
+        };
+        let (ifindex, pin_vid) = match pin {
+            Some((port, vid)) => (port, vid),
+            None => (ifindex, 0),
+        };
+        let entry = NexthopEntry {
+            seq: 0,
+            ifindex,
+            dst_mac: mac,
+            pin_vid,
+            src_mac,
+            _pad1: [0; 2],
+            state: NH_STATE_RESOLVED,
+            family,
+            bmp_peer_hint: [0; 2],
+        };
+        if let Err(e) = self.write_seqlock(id, entry) {
+            warn!(?ip, id, error = %e, "FDB-pin NEXTHOPS rewrite failed");
+        } else {
+            debug!(?ip, id, ?pin, "FDB-pin applied to live nexthop");
         }
     }
 
@@ -867,7 +954,7 @@ impl FibProgrammer {
             seq: 0,
             ifindex: 0,
             dst_mac: [0; 6],
-            _pad0: [0; 2],
+            pin_vid: 0,
             src_mac: [0; 6],
             _pad1: [0; 2],
             state: NH_STATE_INCOMPLETE,
@@ -888,6 +975,7 @@ impl FibProgrammer {
                 id,
                 refcount: 1,
                 resolved: None,
+                live: None,
             },
         );
         self.by_id.insert(id, ip);
@@ -933,7 +1021,7 @@ impl FibProgrammer {
             seq: 0,
             ifindex: 0,
             dst_mac: [0; 6],
-            _pad0: [0; 2],
+            pin_vid: 0,
             src_mac: [0; 6],
             _pad1: [0; 2],
             state: NH_STATE_FAILED,
@@ -979,14 +1067,27 @@ impl FibProgrammer {
                 // Remember the MAC so later Failed/Gone → revert-to-Incomplete
                 // preserves the last-known-good for diagnostic use if we
                 // ever expose it. Actual forwarding uses the live state only.
+                // `live` additionally records the full pre-pin Learned data
+                // (v0.2.9) so `SetNexthopPin` can rewrite or un-pin a live
+                // entry without waiting for the next kernel neigh event.
                 if let Some(rec) = self.by_ip.get_mut(&ip) {
                     rec.resolved = Some((ifindex, mac));
+                    rec.live = Some((ifindex, mac, src_mac));
                 }
+                // FDB-pin (v0.2.9): the resolver proved this nexthop's
+                // MAC sits behind a specific bridge-member port; write
+                // the port + VID so the datapath skips the bridge stack
+                // AND the VLAN_RESOLVE lookup. `live` above keeps the
+                // original ifindex for un-pinning.
+                let (ifindex, pin_vid) = match self.pins.get(&ip) {
+                    Some(&(port, vid)) => (port, vid),
+                    None => (ifindex, 0),
+                };
                 NexthopEntry {
                     seq: 0,
                     ifindex,
                     dst_mac: mac,
-                    _pad0: [0; 2],
+                    pin_vid,
                     // src_mac is now provided by the resolver (Phase 3.6).
                     // Falls back to [0; 6] if the resolver hasn't yet
                     // cached the egress iface's MAC (link came up after
@@ -998,28 +1099,38 @@ impl FibProgrammer {
                     bmp_peer_hint: [0; 2],
                 }
             }
-            NeighEvent::Failed { .. } => NexthopEntry {
-                seq: 0,
-                ifindex: 0,
-                dst_mac: [0; 6],
-                _pad0: [0; 2],
-                src_mac: [0; 6],
-                _pad1: [0; 2],
-                state: NH_STATE_FAILED,
-                family,
-                bmp_peer_hint: [0; 2],
-            },
-            NeighEvent::Gone { .. } => NexthopEntry {
-                seq: 0,
-                ifindex: 0,
-                dst_mac: [0; 6],
-                _pad0: [0; 2],
-                src_mac: [0; 6],
-                _pad1: [0; 2],
-                state: NH_STATE_INCOMPLETE,
-                family,
-                bmp_peer_hint: [0; 2],
-            },
+            NeighEvent::Failed { .. } => {
+                if let Some(rec) = self.by_ip.get_mut(&ip) {
+                    rec.live = None;
+                }
+                NexthopEntry {
+                    seq: 0,
+                    ifindex: 0,
+                    dst_mac: [0; 6],
+                    pin_vid: 0,
+                    src_mac: [0; 6],
+                    _pad1: [0; 2],
+                    state: NH_STATE_FAILED,
+                    family,
+                    bmp_peer_hint: [0; 2],
+                }
+            }
+            NeighEvent::Gone { .. } => {
+                if let Some(rec) = self.by_ip.get_mut(&ip) {
+                    rec.live = None;
+                }
+                NexthopEntry {
+                    seq: 0,
+                    ifindex: 0,
+                    dst_mac: [0; 6],
+                    pin_vid: 0,
+                    src_mac: [0; 6],
+                    _pad1: [0; 2],
+                    state: NH_STATE_INCOMPLETE,
+                    family,
+                    bmp_peer_hint: [0; 2],
+                }
+            }
         };
 
         if let Err(e) = self.write_seqlock(id, entry) {

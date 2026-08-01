@@ -62,14 +62,17 @@ pub const FIB_ACTION_DROP: u8 = 3;
 
 /// Result of a custom-FIB lookup. `action` is one of `FIB_ACTION_*`.
 /// When `action == FIB_ACTION_FORWARD`, `egress_ifindex` / `smac` /
-/// `dmac` carry the forwarding decision. Otherwise those fields are
-/// undefined and the caller must not consult them.
+/// `dmac` carry the forwarding decision and `pin_vid` carries the
+/// FDB-pinned egress VID (0 = not pinned; the caller runs its normal
+/// `VLAN_RESOLVE` resolution). Otherwise those fields are undefined
+/// and the caller must not consult them.
 #[derive(Copy, Clone)]
 pub struct CustomFibResult {
     pub action: u8,
     pub egress_ifindex: u32,
     pub smac: [u8; 6],
     pub dmac: [u8; 6],
+    pub pin_vid: u16,
 }
 
 impl CustomFibResult {
@@ -80,6 +83,7 @@ impl CustomFibResult {
             egress_ifindex: 0,
             smac: [0; 6],
             dmac: [0; 6],
+            pin_vid: 0,
         }
     }
 
@@ -90,16 +94,18 @@ impl CustomFibResult {
             egress_ifindex: 0,
             smac: [0; 6],
             dmac: [0; 6],
+            pin_vid: 0,
         }
     }
 
     #[inline(always)]
-    pub fn forward(egress_ifindex: u32, smac: [u8; 6], dmac: [u8; 6]) -> Self {
+    pub fn forward(egress_ifindex: u32, smac: [u8; 6], dmac: [u8; 6], pin_vid: u16) -> Self {
         Self {
             action: FIB_ACTION_FORWARD,
             egress_ifindex,
             smac,
             dmac,
+            pin_vid,
         }
     }
 }
@@ -211,9 +217,9 @@ pub fn lookup_v4(
     };
 
     match read_nexthop_ptr(stats, nh_ptr) {
-        Some((ifindex, smac, dmac)) => {
+        Some((ifindex, smac, dmac, pin_vid)) => {
             bump(stats, StatIdx::CustomFibHit);
-            CustomFibResult::forward(ifindex, smac, dmac)
+            CustomFibResult::forward(ifindex, smac, dmac, pin_vid)
         }
         None => {
             bump(stats, StatIdx::CustomFibNoNeigh);
@@ -312,9 +318,9 @@ pub fn lookup_v6(
     };
 
     match read_nexthop_ptr(stats, nh_ptr) {
-        Some((ifindex, smac, dmac)) => {
+        Some((ifindex, smac, dmac, pin_vid)) => {
             bump(stats, StatIdx::CustomFibHit);
-            CustomFibResult::forward(ifindex, smac, dmac)
+            CustomFibResult::forward(ifindex, smac, dmac, pin_vid)
         }
         None => {
             bump(stats, StatIdx::CustomFibNoNeigh);
@@ -467,8 +473,11 @@ const SEQ_RETRY: u8 = 1;
 const SEQ_NOT_RESOLVED: u8 = 2;
 
 /// Read a `NEXTHOPS` entry under the seqlock discipline. Returns
-/// `Some((ifindex, smac, dmac))` on a stable even-`seq` read with
-/// `state == Resolved`, `None` otherwise.
+/// `Some((ifindex, smac, dmac, pin_vid))` on a stable even-`seq` read
+/// with `state == Resolved`, `None` otherwise. `pin_vid != 0` means
+/// the resolver FDB-pinned this nexthop: `ifindex` is already the
+/// physical bridge-member port and the caller must tag with `pin_vid`
+/// instead of consulting `VLAN_RESOLVE` (v0.2.9).
 ///
 /// **Bounded retry, torn reads only.** Up to 4 attempts, manually
 /// unrolled so the verifier sees fixed instruction count. A stable
@@ -480,31 +489,35 @@ const SEQ_NOT_RESOLVED: u8 = 2;
 /// counter is documented to carry. `NexthopSeqRetry` now counts only
 /// real torn reads; `NeighCacheMiss` still counts every failed read.
 #[inline(always)]
-fn read_nexthop_ptr(stats: StatsPtr, ptr: *const NexthopEntry) -> Option<(u32, [u8; 6], [u8; 6])> {
+fn read_nexthop_ptr(
+    stats: StatsPtr,
+    ptr: *const NexthopEntry,
+) -> Option<(u32, [u8; 6], [u8; 6], u16)> {
     let mut ifindex = 0u32;
     let mut smac = [0u8; 6];
     let mut dmac = [0u8; 6];
+    let mut pin_vid = 0u16;
 
     // Manual 4-attempt unroll; each retry is taken only on SEQ_RETRY.
-    let mut status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+    let mut status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac, &mut pin_vid);
     if status == SEQ_RETRY {
         bump(stats, StatIdx::NexthopSeqRetry);
-        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac, &mut pin_vid);
     }
     if status == SEQ_RETRY {
         bump(stats, StatIdx::NexthopSeqRetry);
-        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac, &mut pin_vid);
     }
     if status == SEQ_RETRY {
         bump(stats, StatIdx::NexthopSeqRetry);
-        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac);
+        status = try_read_seqlock(ptr, &mut ifindex, &mut smac, &mut dmac, &mut pin_vid);
     }
     if status == SEQ_RETRY {
         bump(stats, StatIdx::NexthopSeqRetry);
     }
 
     if status == SEQ_OK {
-        return Some((ifindex, smac, dmac));
+        return Some((ifindex, smac, dmac, pin_vid));
     }
     bump(stats, StatIdx::NeighCacheMiss);
     None
@@ -523,6 +536,7 @@ fn try_read_seqlock(
     out_ifindex: &mut u32,
     out_smac: &mut [u8; 6],
     out_dmac: &mut [u8; 6],
+    out_pin_vid: &mut u16,
 ) -> u8 {
     // SAFETY: `ptr` came from `NEXTHOPS.get_ptr` which bounds-checked
     // the index and returned a pointer into kernel map memory valid
@@ -536,6 +550,7 @@ fn try_read_seqlock(
         let state = core::ptr::read_volatile(&(*ptr).state);
         let ifindex = core::ptr::read_volatile(&(*ptr).ifindex);
         let dmac = core::ptr::read_volatile(&(*ptr).dst_mac);
+        let pin_vid = core::ptr::read_volatile(&(*ptr).pin_vid);
         let smac = core::ptr::read_volatile(&(*ptr).src_mac);
         let seq_after = core::ptr::read_volatile(&(*ptr).seq);
         if seq_after != seq_before {
@@ -549,6 +564,7 @@ fn try_read_seqlock(
         *out_ifindex = ifindex;
         *out_smac = smac;
         *out_dmac = dmac;
+        *out_pin_vid = pin_vid;
         SEQ_OK
     }
 }

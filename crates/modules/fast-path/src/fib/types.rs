@@ -79,7 +79,12 @@ pub struct NexthopEntry {
     pub seq: u32,
     pub ifindex: u32,
     pub dst_mac: [u8; 6],
-    pub _pad0: [u8; 2],
+    /// FDB-pinned egress VID (v0.2.9); 0 = not pinned. When non-zero,
+    /// `ifindex` is the physical bridge-member port the FDB placed
+    /// `dst_mac` behind and the datapath tags with this VID instead of
+    /// consulting `VLAN_RESOLVE`. Occupies the former `_pad0`, so the
+    /// entry stays 28 bytes with unchanged field offsets.
+    pub pin_vid: u16,
     pub src_mac: [u8; 6],
     pub _pad1: [u8; 2],
     pub state: u8,
@@ -93,7 +98,7 @@ impl NexthopEntry {
             seq: 0,
             ifindex: 0,
             dst_mac: [0; 6],
-            _pad0: [0; 2],
+            pin_vid: 0,
             src_mac: [0; 6],
             _pad1: [0; 2],
             state: NH_STATE_INCOMPLETE,

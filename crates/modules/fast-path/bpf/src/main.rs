@@ -617,6 +617,7 @@ fn dispatch_fib(
             fib.smac,
             fib.dmac,
             ingress_vid,
+            VLAN_NONE, // kernel-FIB nexthops are never FDB-pinned
         ),
         BPF_FIB_LKUP_RET_NO_NEIGH => {
             bump(stats, StatIdx::PassNoNeigh);
@@ -662,16 +663,22 @@ fn forward_success(
     smac: [u8; 6],
     dmac: [u8; 6],
     ingress_vid: u16,
+    pin_vid: u16,
 ) -> Result<u32, ()> {
-    // Resolve the egress port's expected tagging. If `ifindex` is
-    // recorded in `vlan_resolve`, it's a VLAN subif, redirect to the
-    // physical parent and push/rewrite to the recorded VID. Otherwise
-    // the target is physical/untagged.
+    // Resolve the egress port's expected tagging. An FDB-pinned
+    // nexthop (v0.2.9, `pin_vid != 0`) already carries the physical
+    // bridge-member port + required tag — the resolver proved the
+    // chain, so `VLAN_RESOLVE` is skipped outright (one map op saved).
+    // Otherwise: if `ifindex` is recorded in `vlan_resolve`, it's a
+    // VLAN subif, redirect to the physical parent and push/rewrite to
+    // the recorded VID. Otherwise the target is physical/untagged.
     //
     // Gated on VLAN_PRESENT: with no VLAN subifs on the host the map
     // is empty and every lookup would miss, so the gate skips one hash
     // helper call per forwarded packet with identical semantics.
-    let (egress_ifindex, egress_vid) = if cfg_flags & FP_CFG_FLAG_VLAN_PRESENT != 0 {
+    let (egress_ifindex, egress_vid) = if pin_vid != VLAN_NONE {
+        (ifindex, pin_vid)
+    } else if cfg_flags & FP_CFG_FLAG_VLAN_PRESENT != 0 {
         match unsafe { VLAN_RESOLVE.get(&ifindex) } {
             Some(vi) => (vi.phys_ifindex, vi.vid),
             None => (ifindex, VLAN_NONE),
@@ -779,6 +786,7 @@ fn dispatch_custom_fib(
             result.smac,
             result.dmac,
             ingress_vid,
+            result.pin_vid,
         ),
         fib::FIB_ACTION_NO_NEIGH => {
             bump(stats, StatIdx::PassNoNeigh);
