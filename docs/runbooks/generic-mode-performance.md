@@ -164,7 +164,7 @@ from `/proc/stat` and the module's own counters, so the kernel-side share is the
 difference. Run on a box that is actually forwarding:
 
 ```sh
-S1=$(awk '/^cpu /{print $8}' /proc/stat); R1=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); sleep 10; S2=$(awk '/^cpu /{print $8}' /proc/stat); R2=$(packetframe status | awk '/^[[:space:]]*rx_total/{print $2}'); echo "rx pps: $(( (R2-R1)/10 ))"; echo "softirq ns per rx packet: $(( (S2-S1)*10000000 / (R2-R1) ))"
+S1=$(awk '/^cpu /{print $8}' /proc/stat); R1=$(packetframe status | awk '$1=="rx_total"{print $2}'); sleep 10; S2=$(awk '/^cpu /{print $8}' /proc/stat); R2=$(packetframe status | awk '$1=="rx_total"{print $2}'); echo "rx pps: $(( (R2-R1)/10 ))"; echo "softirq ns per rx packet: $(( (S2-S1)*10000000 / (R2-R1) ))"
 ```
 
 Field 8 of `/proc/stat`'s `cpu` line is softirq in USER_HZ, which is always 100 Hz,
