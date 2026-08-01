@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 packetframe-common.workspace = true
 packetframe-fast-path = { workspace = true, optional = true }
+packetframe-vpp-offload = { workspace = true, optional = true }
 packetframe-probe = { workspace = true, optional = true }
 
 anyhow.workspace = true
@@ -28,8 +29,9 @@ libc.workspace = true
 signal-hook.workspace = true
 
 [features]
-default = ["fast-path", "probe"]
+default = ["fast-path", "probe", "vpp-offload"]
 fast-path = ["dep:packetframe-fast-path"]
+vpp-offload = ["dep:packetframe-vpp-offload"]
 probe = ["dep:packetframe-probe"]
 
 # cargo-deb metadata. CI builds the .deb in the release workflow via

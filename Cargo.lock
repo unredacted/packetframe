@@ -692,6 +692,7 @@ dependencies = [
  "packetframe-common",
  "packetframe-fast-path",
  "packetframe-probe",
+ "packetframe-vpp-offload",
  "serde_json",
  "signal-hook",
  "thiserror 2.0.19",
@@ -742,6 +743,16 @@ version = "0.2.7"
 dependencies = [
  "anyhow",
  "aya",
+ "libc",
+ "packetframe-common",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "packetframe-vpp-offload"
+version = "0.2.7"
+dependencies = [
  "libc",
  "packetframe-common",
  "thiserror 2.0.19",

@@ -30,7 +30,32 @@ pub fn attach_ifaces_from_config(config: &Config) -> Vec<String> {
     ifaces
 }
 
-pub fn probe_and_render(bpffs_root: &Path, attach_ifaces: &[String], human: bool) -> Rendered {
+/// Interfaces named by `port` lines in a `vpp-offload` section, if
+/// any. Empty when the module isn't configured — the vpp probes then
+/// stay out of the report entirely.
+pub fn vpp_ports_from_config(config: &Config) -> Vec<String> {
+    let mut ports = Vec::new();
+    for m in &config.modules {
+        if m.name != "vpp-offload" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::VppPort { iface, .. } = d {
+                if !ports.contains(iface) {
+                    ports.push(iface.clone());
+                }
+            }
+        }
+    }
+    ports
+}
+
+pub fn probe_and_render(
+    bpffs_root: &Path,
+    attach_ifaces: &[String],
+    vpp_ports: &[String],
+    human: bool,
+) -> Rendered {
     let mut report = run_probes(bpffs_root);
 
     // Graduate §2.3 per-interface trial-attach probe from Deferred
@@ -49,6 +74,17 @@ pub fn probe_and_render(bpffs_root: &Path, attach_ifaces: &[String], human: bool
     for cap in run_iface_probes(attach_ifaces) {
         report.capabilities.push(cap);
     }
+    // vpp-offload probes (phase 4): only when the config declares the
+    // module. Non-required like the perf probes — feasibility informs,
+    // the module's attach enforces.
+    #[cfg(feature = "vpp-offload")]
+    if !vpp_ports.is_empty() {
+        for cap in packetframe_vpp_offload::run_feasibility_probes(vpp_ports) {
+            report.capabilities.push(cap);
+        }
+    }
+    #[cfg(not(feature = "vpp-offload"))]
+    let _ = vpp_ports;
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.

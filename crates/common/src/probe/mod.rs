@@ -47,7 +47,7 @@ pub struct Capability {
 }
 
 impl Capability {
-    fn pass(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
+    pub fn pass(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
         Self {
             name: name.into(),
             status: CapabilityStatus::Pass,
@@ -56,7 +56,7 @@ impl Capability {
         }
     }
 
-    fn fail(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
+    pub fn fail(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
         Self {
             name: name.into(),
             status: CapabilityStatus::Fail,
@@ -65,7 +65,7 @@ impl Capability {
         }
     }
 
-    fn unknown(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
+    pub fn unknown(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
         Self {
             name: name.into(),
             status: CapabilityStatus::Unknown,
@@ -74,7 +74,7 @@ impl Capability {
         }
     }
 
-    fn deferred(name: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn deferred(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             status: CapabilityStatus::Deferred,

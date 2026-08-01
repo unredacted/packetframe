@@ -144,6 +144,28 @@ pub enum ModuleDirective {
         mode: AttachMode,
         line: usize,
     },
+    // --- vpp-offload module (phase 4). Directive namespace is shared
+    // across module sections; these names are vpp-offload's. ---
+    /// `port <iface> cores <n> steer on|off` — VPP forwarding-domain
+    /// membership for one physical port (VF + vfio + VPP interface,
+    /// usable as egress) plus its steering state. Membership is
+    /// all-or-nothing across the domain (a steered packet's best path
+    /// may egress any port); `steer` is the per-port canary lever.
+    VppPort {
+        iface: String,
+        cores: u16,
+        steer: bool,
+        line: usize,
+    },
+    /// `vpp-binary <path>` — override the probed VPP binary path.
+    VppBinary(String),
+    /// `expected-routes <n>` — sizing input: v4+v6 table + headroom.
+    /// The independent variable for VPP heap + hugepage arithmetic.
+    ExpectedRoutes(u64),
+    /// `hugepages <n>` — default-size hugepages to reserve at attach.
+    /// Must be ≥ the minimum derived from `expected-routes`; the
+    /// renderer errors at load otherwise.
+    VppHugepages(u32),
     AllowPrefix4(Ipv4Prefix),
     AllowPrefix6(Ipv6Prefix),
     /// Connected/local prefix the operator wants packetframe to
@@ -911,6 +933,90 @@ impl Config {
         self.validate_interfaces_in(Path::new("/sys/class/net"))
     }
 
+    /// vpp-offload cross-section validation (phase 4). Pure config
+    /// logic — no sysfs — so it runs everywhere `parse` does.
+    ///
+    /// Rules (plan v5 "membership vs steering" + allowlist invariant):
+    /// - a `vpp-offload` section requires a `fast-path` section (the
+    ///   steered-prefix set inherits the fast-path allowlist, and the
+    ///   eBPF path is the failover tier);
+    /// - if ANY port steers, membership must be all-or-nothing:
+    ///   every fast-path `attach` interface needs a `port` line (a
+    ///   steered packet's best path may egress any port; a missing
+    ///   member would blackhole those destinations in VPP);
+    /// - steering requires `forwarding-mode custom-fib` (the full
+    ///   table VPP mirrors comes from the custom-FIB route pipeline);
+    /// - duplicate `port` lines for one interface are rejected.
+    pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
+        let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
+            return Ok(());
+        };
+        let fast_path = self.modules.iter().find(|m| m.name == "fast-path");
+
+        let mut ports: Vec<(&String, bool, usize)> = Vec::new();
+        for d in &vpp.directives {
+            if let ModuleDirective::VppPort {
+                iface, steer, line, ..
+            } = d
+            {
+                if ports.iter().any(|(i, _, _)| *i == iface) {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!("duplicate `port {iface}` in module vpp-offload"),
+                    ));
+                }
+                ports.push((iface, *steer, *line));
+            }
+        }
+
+        let Some(fp) = fast_path else {
+            return Err(ConfigError::parse(
+                0,
+                "module vpp-offload requires a fast-path section (steered prefixes inherit \
+                 its allowlist; the eBPF path is the failover tier)",
+            ));
+        };
+
+        let any_steer = ports.iter().any(|(_, steer, _)| *steer);
+        if !any_steer {
+            return Ok(()); // membership-only staging state is always valid
+        }
+
+        let fwd = fp
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::ForwardingMode(m) => Some(*m),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if fwd != ForwardingMode::CustomFib {
+            return Err(ConfigError::parse(
+                0,
+                "vpp-offload steering requires `forwarding-mode custom-fib` in module \
+                 fast-path (VPP mirrors the custom-FIB route pipeline)",
+            ));
+        }
+
+        for d in &fp.directives {
+            if let ModuleDirective::Attach { iface, line, .. } = d {
+                if !ports.iter().any(|(i, _, _)| *i == iface) {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "vpp-offload steering is enabled but fast-path attach iface \
+                             `{iface}` has no `port` line: membership must cover every \
+                             possible egress port before any ingress is steered \
+                             (missing members blackhole destinations whose best path \
+                             egresses them)"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Same, but with a caller-provided sysfs root (for tests).
     pub fn validate_interfaces_in(&self, sysfs_net: &Path) -> Result<(), ConfigError> {
         for m in &self.modules {
@@ -1641,6 +1747,64 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         "fdb-pin" => parse_single_arg(line, rest, "fdb-pin", |t| {
             let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
             Ok(ModuleDirective::FdbPin(v))
+        }),
+        // --- vpp-offload directives (phase 4) ---
+        "port" => {
+            // port <iface> cores <n> steer on|off
+            let iface = rest
+                .next()
+                .ok_or_else(|| ConfigError::parse(line, "port requires an interface"))?;
+            validate_iface_name(line, "port", iface)?;
+            let usage = "port takes: <iface> cores <n> steer on|off";
+            if rest.next() != Some("cores") {
+                return Err(ConfigError::parse(line, usage));
+            }
+            let cores: u16 = rest
+                .next()
+                .ok_or_else(|| ConfigError::parse(line, usage))?
+                .parse()
+                .map_err(|_| ConfigError::parse(line, "cores must be a positive integer"))?;
+            if cores == 0 {
+                return Err(ConfigError::parse(line, "cores must be >= 1"));
+            }
+            if rest.next() != Some("steer") {
+                return Err(ConfigError::parse(line, usage));
+            }
+            let steer = match rest.next() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => return Err(ConfigError::parse(line, "steer expects on|off")),
+            };
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(line, usage));
+            }
+            Ok(ModuleDirective::VppPort {
+                iface: iface.to_string(),
+                cores,
+                steer,
+                line,
+            })
+        }
+        "vpp-binary" => parse_single_arg(line, rest, "vpp-binary", |t| {
+            Ok(ModuleDirective::VppBinary(t.to_string()))
+        }),
+        "expected-routes" => parse_single_arg(line, rest, "expected-routes", |t| {
+            let n: u64 = t
+                .parse()
+                .map_err(|_| "expected-routes must be a positive integer".to_string())?;
+            if n == 0 {
+                return Err("expected-routes must be >= 1".to_string());
+            }
+            Ok(ModuleDirective::ExpectedRoutes(n))
+        }),
+        "hugepages" => parse_single_arg(line, rest, "hugepages", |t| {
+            let n: u32 = t
+                .parse()
+                .map_err(|_| "hugepages must be a positive integer".to_string())?;
+            if n == 0 {
+                return Err("hugepages must be >= 1".to_string());
+            }
+            Ok(ModuleDirective::VppHugepages(n))
         }),
         "driver-workaround" => parse_driver_workaround(line, rest),
         "forwarding-mode" => parse_single_arg(line, rest, "forwarding-mode", |t| {
@@ -2506,6 +2670,95 @@ module fast-path
         assert!(Config::parse("module fast-path\n  fdb-pin maybe\n").is_err());
         assert!(Config::parse("module fast-path\n  fdb-pin\n").is_err());
         assert!(Config::parse("module fast-path\n  fdb-pin auto extra\n").is_err());
+    }
+
+    #[test]
+    fn vpp_port_parses() {
+        let s = "module vpp-offload\n  port eth4 cores 2 steer off\n  port eth5 cores 1 steer on\n";
+        let c = Config::parse(s).unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppPort {
+                iface,
+                cores,
+                steer,
+                ..
+            } => {
+                assert_eq!(iface, "eth4");
+                assert_eq!(*cores, 2);
+                assert!(!steer);
+            }
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        match &c.modules[0].directives[1] {
+            ModuleDirective::VppPort { steer, .. } => assert!(steer),
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        // Malformed variants: missing keywords, zero cores, trailing junk.
+        for bad in [
+            "module vpp-offload\n  port eth4\n",
+            "module vpp-offload\n  port eth4 cores 0 steer on\n",
+            "module vpp-offload\n  port eth4 cores 1\n",
+            "module vpp-offload\n  port eth4 cores 1 steer maybe\n",
+            "module vpp-offload\n  port eth4 cores 1 steer on extra\n",
+            "module vpp-offload\n  port eth4 steer on cores 1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn vpp_sizing_directives_parse() {
+        let s = "module vpp-offload\n  expected-routes 1200000\n  hugepages 8\n  vpp-binary /usr/bin/vpp\n";
+        let c = Config::parse(s).unwrap();
+        assert!(matches!(
+            c.modules[0].directives[0],
+            ModuleDirective::ExpectedRoutes(1_200_000)
+        ));
+        assert!(matches!(
+            c.modules[0].directives[1],
+            ModuleDirective::VppHugepages(8)
+        ));
+        assert!(Config::parse("module vpp-offload\n  expected-routes 0\n").is_err());
+        assert!(Config::parse("module vpp-offload\n  hugepages 0\n").is_err());
+    }
+
+    #[test]
+    fn vpp_offload_cross_validation() {
+        // Membership-only (no steer) with a fast-path section: valid.
+        let staging = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n";
+        Config::parse(staging)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap();
+
+        // vpp-offload without fast-path: rejected.
+        let orphan = "module vpp-offload\n  port eth4 cores 1 steer off\n";
+        assert!(Config::parse(orphan)
+            .unwrap()
+            .validate_vpp_offload()
+            .is_err());
+
+        // Steering without custom-fib: rejected.
+        let no_cfib = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer on\n";
+        assert!(Config::parse(no_cfib)
+            .unwrap()
+            .validate_vpp_offload()
+            .is_err());
+
+        // Steering with a fast-path attach port missing membership: rejected.
+        let missing_member = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  port eth5 cores 1 steer on\n";
+        assert!(Config::parse(missing_member)
+            .unwrap()
+            .validate_vpp_offload()
+            .is_err());
+
+        // Full membership + steering + custom-fib: valid.
+        let good = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n  port eth5 cores 1 steer on\n";
+        Config::parse(good).unwrap().validate_vpp_offload().unwrap();
+
+        // Duplicate port line: rejected.
+        let dup = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n  port eth4 cores 2 steer off\n";
+        assert!(Config::parse(dup).unwrap().validate_vpp_offload().is_err());
     }
 
     #[test]

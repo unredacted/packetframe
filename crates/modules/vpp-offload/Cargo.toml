@@ -1,0 +1,14 @@
+[package]
+name = "packetframe-vpp-offload"
+version = "0.2.7"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "PacketFrame vpp-offload module: VPP-on-VF forwarding vector orchestrator (phase 4)"
+
+[dependencies]
+packetframe-common = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

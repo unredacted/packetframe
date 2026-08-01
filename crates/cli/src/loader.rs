@@ -95,6 +95,9 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
     config
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
+    config
+        .validate_vpp_offload()
+        .map_err(|e| RunError::Startup(e.to_string()))?;
 
     // Fail fast if metrics-textfile can't be written, the exporter
     // would retry silently every 15s otherwise.
@@ -171,6 +174,11 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             "fast-path" => modules.push((
                 section.name.clone(),
                 Box::new(FastPathModule::new()) as Box<dyn Module>,
+            )),
+            #[cfg(feature = "vpp-offload")]
+            "vpp-offload" => modules.push((
+                section.name.clone(),
+                Box::new(packetframe_vpp_offload::VppOffloadModule::new()) as Box<dyn Module>,
             )),
             other => {
                 return Err(RunError::Startup(format!(

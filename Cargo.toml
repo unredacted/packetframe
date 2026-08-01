@@ -5,6 +5,7 @@ members = [
     "crates/cli",
     "crates/modules/fast-path",
     "crates/modules/probe",
+    "crates/modules/vpp-offload",
 ]
 # BPF crates live at `crates/modules/*/bpf/` and are deliberately
 # excluded from the workspace. They target `bpfel-unknown-none` and
@@ -37,6 +38,7 @@ repository = "https://github.com/unredacted/packetframe"
 packetframe-common = { path = "crates/common" }
 packetframe-fast-path = { path = "crates/modules/fast-path" }
 packetframe-probe = { path = "crates/modules/probe" }
+packetframe-vpp-offload = { path = "crates/modules/vpp-offload" }
 
 anyhow = "1.0"
 thiserror = "2.0"
