@@ -96,6 +96,7 @@ pub fn tc_fast_path(ctx: TcContext) -> i32 {
         Ok(verdict) => verdict,
         Err(()) => {
             bump(stats, StatIdx::ErrParse);
+            bump(stats, StatIdx::ErrParseTc);
             TC_ACT_OK as i32
         }
     }

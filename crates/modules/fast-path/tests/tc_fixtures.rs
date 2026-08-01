@@ -17,7 +17,7 @@
 mod common;
 
 use common::{
-    tc_action, FpCfg, Harness, Ipv4TcpBuilder, StatIdx, FP_CFG_FLAG_BLOCK_PRESENT,
+    tc_action, xdp_action, FpCfg, Harness, Ipv4TcpBuilder, StatIdx, FP_CFG_FLAG_BLOCK_PRESENT,
     FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6, FP_CFG_FLAG_MSS_CLAMP_PRESENT,
     FP_CFG_VERSION_V2,
 };
@@ -171,4 +171,34 @@ fn tc_mss_clamp_parity_with_xdp() {
     // eth(14) + ipv4(20) + tcp fixed(20) + option kind/len(2).
     let mss_off = 14 + 20 + 20 + 2;
     assert_eq!(&out[mss_off..mss_off + 2], &1300u16.to_be_bytes());
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn tc_parse_error_bumps_both_shared_and_tc_counter() {
+    let mut h = Harness::new();
+    h.set_custom_fib(true, false);
+    // 10 bytes: shorter than an Ethernet header, so both datapaths'
+    // very first bounds check fails and the packet passes pristine.
+    let runt = vec![0u8; 10];
+
+    let parse_before = h.stat(StatIdx::ErrParse);
+    let parse_tc_before = h.stat(StatIdx::ErrParseTc);
+
+    let (verdict, out) = h.run_tc(&runt);
+    assert_eq!(verdict, tc_action::TC_ACT_OK);
+    assert_eq!(out, runt, "parse failure must leave the packet pristine");
+    assert_eq!(h.stat(StatIdx::ErrParse), parse_before + 1);
+    assert_eq!(
+        h.stat(StatIdx::ErrParseTc),
+        parse_tc_before + 1,
+        "tc parse failure must be attributable per-hook"
+    );
+
+    // The same runt through the XDP hook bumps only the shared
+    // counter: `err_parse - err_parse_tc` must stay the XDP share.
+    let (verdict, _) = h.run(&runt);
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(h.stat(StatIdx::ErrParse), parse_before + 2);
+    assert_eq!(h.stat(StatIdx::ErrParseTc), parse_tc_before + 1);
 }

@@ -203,12 +203,21 @@ pub enum StatIdx {
     /// the global-generation invalidation; sustained Miss means the
     /// working set outsizes the table (or collisions dominate).
     FibCacheStale = 44,
+    // --- v0.2.9: per-hook parse-error attribution. Append-only. -----
+    /// `tc_fast_path` parse failure (bumped IN ADDITION to `ErrParse`,
+    /// which both datapaths share) — the `RxTotalTc`/`FwdOkTc` pattern
+    /// applied to the error path. Exists because the 2026-08-01
+    /// full-scale tc test showed `err_parse` running ~0.18% of tc-path
+    /// traffic vs ~zero under XDP, and the shared counter made the
+    /// excess unattributable without flipping datapaths. During any
+    /// mixed rollout, `err_parse - err_parse_tc` is the XDP share.
+    ErrParseTc = 45,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 45;
+pub const STATS_COUNT: u32 = 46;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
