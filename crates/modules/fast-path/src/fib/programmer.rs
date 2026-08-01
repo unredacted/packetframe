@@ -805,6 +805,21 @@ impl FibProgrammer {
     /// resends the directive unconditionally) retries the toggle.
     fn set_cache_enabled(&mut self, on: bool) {
         if on == self.cache_enabled {
+            // Same-value commands arrive on every SIGHUP reconcile,
+            // which makes them the natural retry hook for a wedged
+            // publication: if the LAST route mutation was the one
+            // whose publish failed and churn then stopped, nothing
+            // else would ever retry, and the frozen reclaim queue
+            // would hold its slots forever while reconcile claimed
+            // convergence. Publishing the current (enabled,
+            // generation) pair is idempotent; success unfreezes.
+            if self.cache_publish_wedged && self.cache_enabled && self.write_cache_cfg() {
+                info!(
+                    generation = self.cache_generation,
+                    "FIB_CACHE_CFG publish recovered on reconcile retry; resuming reclamation"
+                );
+                self.cache_publish_wedged = false;
+            }
             return;
         }
         self.advance_generation();
