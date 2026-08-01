@@ -287,13 +287,14 @@ impl Harness {
     /// `generation`. In production the FibProgrammer is the sole
     /// writer; tests poke the map directly to simulate its behavior
     /// (enable, and later bump the generation to invalidate).
-    pub fn set_fib_cache(&mut self, enabled: u32, generation: u32) {
-        /// Layout mirror of `FibCacheCfg` in `bpf/src/maps.rs`.
+    pub fn set_fib_cache(&mut self, enabled: u32, generation: u64) {
+        /// Layout mirror of `FibCacheCfg` in `bpf/src/maps.rs` (16 B).
         #[repr(C)]
         #[derive(Copy, Clone)]
         struct FibCacheCfg {
             enabled: u32,
-            generation: u32,
+            _pad: u32,
+            generation: u64,
         }
         unsafe impl Pod for FibCacheCfg {}
 
@@ -306,6 +307,7 @@ impl Harness {
             0,
             FibCacheCfg {
                 enabled,
+                _pad: 0,
                 generation,
             },
             0,

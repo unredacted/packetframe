@@ -33,7 +33,7 @@ use crate::maps::{
 /// reserved generation the programmer never issues, so "disabled" and
 /// "no valid entry can match" collapse into one sentinel).
 #[inline(always)]
-fn cache_generation() -> u32 {
+fn cache_generation() -> u64 {
     match FIB_CACHE_CFG.get(0) {
         Some(cc) if cc.enabled != 0 => cc.generation,
         _ => 0,
@@ -193,6 +193,7 @@ pub fn lookup_v4(
                     (*e).dst = dst_w;
                     (*e).kind = fib.kind as u32;
                     (*e).idx = fib.idx;
+                    (*e)._pad = 0;
                     (*e).generation = cache_gen;
                 }
             }

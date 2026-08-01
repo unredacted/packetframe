@@ -491,7 +491,7 @@ What it caches, and why the design is safe:
   under sustained BGP churn it is effectively always cold — `fib_cache_stale`
   measures exactly that.
 - **No negative caching**: unroutable destinations are never cached.
-- Direct-mapped, fixed memory (~27 MB total across 18 CPUs), no eviction
+- Direct-mapped, fixed memory (~37 MB total across 18 CPUs), no eviction
   machinery: under adversarial destination spray it degrades to baseline cost
   plus two array probes — not the eviction thrash that killed the Linux route
   cache in kernel 3.6, which is why this ships as an experiment anyway.

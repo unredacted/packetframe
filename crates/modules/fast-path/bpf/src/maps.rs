@@ -752,32 +752,40 @@ pub static FIB_CONFIG: Array<FpFibCfg> = Array::with_max_entries(1, 0);
 // All-u32 fields: zero padding by construction (compile-time asserted)
 // and field-by-field stores — the MutationCtx anti-memset discipline.
 
-/// v4 cache entry. 16 bytes.
+/// v4 cache entry. 24 bytes, zero padding (the `_pad` field is
+/// explicit and stored, keeping the anti-memset discipline intact
+/// under the u64 alignment).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct FibCacheEntryV4 {
     /// Destination address, native-endian word of the wire bytes.
     pub dst: u32,
-    /// `FIB_CACHE_CFG.generation` at fill time. 0 = never filled.
-    pub generation: u32,
     /// `FibValue.kind` widened to u32 (avoids u8-plus-padding stores).
     pub kind: u32,
     /// `FibValue.idx`.
     pub idx: u32,
+    /// Explicit padding; always stored as 0.
+    pub _pad: u32,
+    /// `FIB_CACHE_CFG.generation` at fill time. 0 = never filled.
+    /// u64: at one bump per route mutation, wrap is unreachable in any
+    /// deployment lifetime, so a slot never revisited across a full
+    /// generation cycle can never see its stale stamp become live
+    /// again (the u32 flaw review round 3 caught).
+    pub generation: u64,
 }
-const _: () = assert!(core::mem::size_of::<FibCacheEntryV4>() == 16);
+const _: () = assert!(core::mem::size_of::<FibCacheEntryV4>() == 24);
 
-/// v6 cache entry. 28 bytes.
+/// v6 cache entry. 32 bytes, zero padding by construction.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct FibCacheEntryV6 {
     /// Destination address as 4 native-endian words of the wire bytes.
     pub dst: [u32; 4],
-    pub generation: u32,
     pub kind: u32,
     pub idx: u32,
+    pub generation: u64,
 }
-const _: () = assert!(core::mem::size_of::<FibCacheEntryV6>() == 28);
+const _: () = assert!(core::mem::size_of::<FibCacheEntryV6>() == 32);
 
 /// Cache control: enable flag + current generation. One entry, sole
 /// writer is the userspace FibProgrammer task (the enable directive
@@ -789,19 +797,21 @@ const _: () = assert!(core::mem::size_of::<FibCacheEntryV6>() == 28);
 pub struct FibCacheCfg {
     /// 0 = off (default), 1 = on.
     pub enabled: u32,
-    /// Current generation. 0 reserved — the programmer starts at 1
-    /// and skips 0 on wrap, so a zeroed entry can never match.
-    pub generation: u32,
+    /// Explicit padding; always written as 0.
+    pub _pad: u32,
+    /// Current generation. 0 reserved (never issued), so a zeroed
+    /// entry can never match. u64 — see `FibCacheEntryV4::generation`.
+    pub generation: u64,
 }
-const _: () = assert!(core::mem::size_of::<FibCacheCfg>() == 8);
+const _: () = assert!(core::mem::size_of::<FibCacheCfg>() == 16);
 
 /// v4 slot count. Power of two (the probe masks with N-1). Memory:
-/// 65_536 × 16 B × nr_cpus (≈19 MB on an 18-core cn9670) — sized so a
+/// 65_536 × 24 B × nr_cpus (≈28 MB on an 18-core cn9670) — sized so a
 /// per-CPU working set in the tens of thousands of destinations keeps
 /// collision churn low at ~36 kpps/CPU.
 pub const FIB_CACHE_V4_ENTRIES: u32 = 65_536;
 /// v6 slot count. Smaller: v6 traffic share is materially lower on the
-/// target deployments. 16_384 × 28 B × nr_cpus ≈ 8 MB.
+/// target deployments. 16_384 × 32 B × nr_cpus ≈ 9 MB.
 pub const FIB_CACHE_V6_ENTRIES: u32 = 16_384;
 
 #[map]

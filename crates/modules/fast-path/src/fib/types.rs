@@ -182,9 +182,13 @@ unsafe impl aya::Pod for FpFibCfg {}
 pub struct FibCacheCfg {
     /// 0 = off (default; kernel zero-init), 1 = on.
     pub enabled: u32,
+    /// Explicit padding; always written as 0.
+    pub _pad: u32,
     /// Current generation. 0 is reserved (never issued): a zeroed
     /// cache slot can then never compare equal to a live generation.
-    pub generation: u32,
+    /// u64 so wrap-reuse against never-cleared slots is unreachable
+    /// in any deployment lifetime.
+    pub generation: u64,
 }
 
 // SAFETY: repr(C), two u32s, every bit pattern valid.
@@ -209,8 +213,8 @@ const _: () = assert!(core::mem::align_of::<EcmpGroup>() == 4);
 const _: () = assert!(core::mem::size_of::<FpFibCfg>() == 8);
 const _: () = assert!(core::mem::align_of::<FpFibCfg>() == 4);
 
-const _: () = assert!(core::mem::size_of::<FibCacheCfg>() == 8);
-const _: () = assert!(core::mem::align_of::<FibCacheCfg>() == 4);
+const _: () = assert!(core::mem::size_of::<FibCacheCfg>() == 16);
+const _: () = assert!(core::mem::align_of::<FibCacheCfg>() == 8);
 
 #[cfg(test)]
 mod tests {

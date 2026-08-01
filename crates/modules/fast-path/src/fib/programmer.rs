@@ -485,10 +485,19 @@ pub struct FibProgrammer {
     /// Mirrors FIB_CACHE_CFG.enabled. Toggled only via
     /// `Command::SetCacheEnabled`.
     cache_enabled: bool,
-    /// Current generation. Starts at 1 and skips 0 on wrap — 0 is the
-    /// reserved never-valid generation that makes kernel-zeroed cache
-    /// slots unable to false-hit.
-    cache_generation: u32,
+    /// Current generation. Starts at 1; 0 is the reserved never-valid
+    /// generation that makes kernel-zeroed cache slots unable to
+    /// false-hit. u64: wrap (and therefore stamp reuse against
+    /// never-cleared slots) is unreachable in any deployment lifetime.
+    cache_generation: u64,
+    /// True while a generation publish has failed and no later write
+    /// has succeeded. While wedged (and enabled), the reclaim queue is
+    /// frozen: the kernel may still be validating cached entries
+    /// against the last published generation, so freeing the nexthop /
+    /// ECMP slots those entries reference would convert an unpublished
+    /// bump into a use-after-reclaim misroute. Slots leak (bounded by
+    /// churn during the wedge) instead — strictly the safer failure.
+    cache_publish_wedged: bool,
 
     // --- Proactive resolve (Phase 3.9 fix) ---
     /// Handle to the NeighborResolver. Every newly-allocated nexthop
@@ -635,6 +644,7 @@ impl FibProgrammer {
                 cache_cfg,
                 cache_enabled: false,
                 cache_generation: 1,
+                cache_publish_wedged: false,
                 neigh_handle,
             },
             FibProgrammerHandle { tx: cmd_tx },
@@ -719,6 +729,7 @@ impl FibProgrammer {
     fn write_cache_cfg(&mut self) -> bool {
         let value = FibCacheCfg {
             enabled: u32::from(self.cache_enabled),
+            _pad: 0,
             generation: self.cache_generation,
         };
         match &mut self.cache_cfg {
@@ -751,12 +762,33 @@ impl FibProgrammer {
     /// which reopens the reclaim window the generation closes.
     fn bump_cache_generation(&mut self) {
         self.advance_generation();
-        if self.cache_enabled && !self.write_cache_cfg() && !self.write_cache_cfg() {
-            tracing::error!(
-                generation = self.cache_generation,
-                "FIB_CACHE_CFG generation publish failed twice; cached FIB entries                  cannot be invalidated — disable fib-cache and restart packetframe"
-            );
+        if !self.cache_enabled {
+            return;
         }
+        if self.write_cache_cfg() || self.write_cache_cfg() {
+            if self.cache_publish_wedged {
+                info!(
+                    generation = self.cache_generation,
+                    "FIB_CACHE_CFG publish recovered; resuming reclamation"
+                );
+                self.cache_publish_wedged = false;
+            }
+            return;
+        }
+        // Publish failed twice: the kernel keeps validating cached
+        // entries against the LAST PUBLISHED generation, so entries
+        // stamped with it stay live. Freeze reclamation (see
+        // drain_reclaim_queue) until a later publish succeeds —
+        // generations are monotonic, so any successful publish
+        // invalidates everything stamped earlier and the queue becomes
+        // safe to drain again.
+        self.cache_publish_wedged = true;
+        tracing::error!(
+            generation = self.cache_generation,
+            "FIB_CACHE_CFG generation publish failed twice; cached FIB entries cannot \
+             be invalidated — reclamation FROZEN (slots will not be reused) until a \
+             publish succeeds. Disable fib-cache and restart packetframe if this persists"
+        );
     }
 
     /// Handle a `SetCacheEnabled` transition. Same-value commands are
@@ -1655,6 +1687,13 @@ impl FibProgrammer {
     // --- Reclaim queue drain (grace-period release) ---
 
     fn drain_reclaim_queue(&mut self) {
+        // While a generation publish is wedged, cached entries stamped
+        // with the last published generation are still being honored by
+        // the BPF side; releasing the slots they point at would be a
+        // use-after-reclaim. Hold everything until a publish succeeds.
+        if self.cache_publish_wedged && self.cache_enabled {
+            return;
+        }
         let now = Instant::now();
         while let Some(entry) = self.reclaim_queue.front() {
             if entry.release_at > now {
