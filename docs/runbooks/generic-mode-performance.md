@@ -520,10 +520,26 @@ hit_rate = fib_cache_hit / (fib_cache_hit + fib_cache_miss + fib_cache_stale)
   diversity or route churn defeats this cache design; turn it off and leave it
   off. The counters stay (append-only) as a record.
 
-**Measured result (2026-08-01, reference EFG, full BGP table, ~770 kpps):**
-steady-state 60 s delta showed **hit 91.2% / miss 2.3% / stale 6.5%** at 772k
-probes/s — a clear KEEP against the ≥70% bar; the route-cache-thrash fear did
-not materialize on real internet-edge traffic. Two measurement traps hit live,
+**Preliminary result (2026-08-01, reference EFG, full BGP table, ~770 kpps) —
+NOT yet a KEEP verdict.** A steady-state 60 s delta taken ~2 h after enabling
+showed **hit 91.2% / miss 2.3% / stale 6.5%** at 772k probes/s. That clears the
+≥70% hit-rate leg of the criterion on a short window, and it is early evidence
+that the route-cache-thrash fear does not materialize on real internet-edge
+traffic — but **both remaining legs are outstanding**, so the cache is on
+provisionally, not proven:
+
+- *Sustained churn (≥24 h):* one hour-scale window does not cover a full
+  diurnal cycle of BGP churn. Re-run the delta below at several points across a
+  day; `fib_cache_stale` is the number that moves if churn is the problem.
+- *LPM CPU share visibly down:* not demonstrated. The −26.7% softirq/packet
+  above is a whole-campaign figure that also contains the bridge short-circuit,
+  the v0.2.8 hot-path reductions, and traffic-mix drift. Isolating the cache
+  needs a brief `fib-cache off` window (SIGHUP, no restart) with `perf` before
+  and after, comparing the `trie_lookup_elem` + `longest_prefix_match` share.
+
+Until both are recorded here, treat ~37 MB of per-CPU memory as an unproven
+cost. If either leg fails, `fib-cache off` is the answer and this section should
+say so. Two measurement traps hit live,
 recorded so nobody repeats them: snapshots taken during a table (re)load are
 meaningless (initial convergence bumps the generation per route write; 51%
 stale was observed mid-load), and the cumulative counters embed that window
