@@ -261,7 +261,7 @@ pub(crate) fn reconcile_vlan_resolve(
     let chains = discover_bridge_chains(&cfg.section.directives)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("bridge topology read: {e}")))?;
 
-    let desired: HashSet<(u32, u32, u16)> = vlan_entries
+    let desired_subifs: HashSet<(u32, u32, u16)> = vlan_entries
         .iter()
         .filter_map(|(subif, vid, parent)| {
             // Skip entries whose ifindexes don't resolve, the proc
@@ -271,12 +271,22 @@ pub(crate) fn reconcile_vlan_resolve(
             let phys_idx = if_nametoindex(parent).ok()?;
             Some((subif_idx, phys_idx, *vid))
         })
-        .chain(chains.iter().filter_map(|(bridge, phys, vid)| {
+        .collect();
+    let desired_bridges: HashSet<(u32, u32, u16)> = chains
+        .iter()
+        .filter_map(|(bridge, phys, vid)| {
             let bridge_idx = if_nametoindex(bridge).ok()?;
             let phys_idx = if_nametoindex(phys).ok()?;
             Some((bridge_idx, phys_idx, *vid))
-        }))
+        })
         .collect();
+    // Union for the diff/removal/gate logic; the ADD pass below runs
+    // subif entries before bridge aliases so that under map-capacity
+    // pressure the slot that runs out is always the optional
+    // optimization's, never a required subif entry (mirrors the
+    // attach-time population order).
+    let desired: HashSet<(u32, u32, u16)> =
+        desired_subifs.union(&desired_bridges).copied().collect();
 
     let map = state
         .ebpf
@@ -293,7 +303,14 @@ pub(crate) fn reconcile_vlan_resolve(
         .collect();
 
     let mut delta = DeltaCount::default();
-    for (subif_idx, phys_idx, vid) in desired.difference(&current) {
+    let mut to_add: Vec<&(u32, u32, u16)> = desired.difference(&current).collect();
+    to_add.sort_by_key(|t| {
+        (
+            desired_bridges.contains(t) && !desired_subifs.contains(t),
+            t.0,
+        )
+    });
+    for (subif_idx, phys_idx, vid) in to_add.into_iter() {
         let value = VlanResolve {
             phys_ifindex: *phys_idx,
             vid: *vid,

@@ -431,6 +431,17 @@ Three scoping caveats, stated precisely:
 - **MTU relation is enforced:** a bridge whose MTU is smaller than its
   underlying device's is skipped (the bridge would have refused packets the
   short-circuit would forward). Equal MTUs — the normal case — qualify.
+- **Egress qdiscs on the bridge or subif are bypassed** — collapsed traffic
+  traverses only the underlying device's qdisc. This is the standing semantic
+  of `VLAN_RESOLVE` (plain subif entries have always redirected to the parent,
+  skipping the subif's own qdisc); shape or police on the underlying device,
+  or set `bridge-resolve off` for bridges carrying their own qdisc policy.
+  (These virtual devices are `noqueue` by default; a configured qdisc on one
+  is an operator choice this feature cannot see from procfs/sysfs.)
+- **Unicast flooding must be on** (`brport/unicast_flood == 1`, the kernel
+  default): with it off, a destination MAC absent from the FDB is dropped by
+  the bridge rather than emitted through the sole port, so "single member" no
+  longer predicts the bridge's decision. Discovery refuses such ports.
 
 **Convergence model — same as every discovery-populated map.** Chains are
 discovered at attach and re-verified on every `packetframe reconfigure`

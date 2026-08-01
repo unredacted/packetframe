@@ -155,7 +155,10 @@ pub(crate) fn bridge_resolve_enabled(directives: &[ModuleDirective]) -> bool {
 /// `("br1337", "switch0", 1337)`.
 pub(crate) type BridgeChain = (String, String, u16);
 
-/// One bridge port as discovery sees it: (member name, is_forwarding).
+/// One bridge port as discovery sees it: (member name, eligible).
+/// "Eligible" = brport state forwarding AND unicast flooding enabled —
+/// both are preconditions for the wire-equivalence argument (see
+/// `read_bridge_topology`).
 pub(crate) type BridgeMember = (String, bool);
 
 /// Host bridge topology: each bridge with its member ports.
@@ -248,10 +251,23 @@ fn read_bridge_topology() -> std::io::Result<BridgeTopology> {
             let Ok(member) = port.file_name().into_string() else {
                 continue;
             };
-            let state = std::fs::read_to_string(format!("/sys/class/net/{member}/brport/state"))
+            let brport = format!("/sys/class/net/{member}/brport");
+            let forwarding = std::fs::read_to_string(format!("{brport}/state"))
                 .map(|s| s.trim() == BR_STATE_FORWARDING)
                 .unwrap_or(false);
-            members.push((member, state));
+            // With unicast flooding off, a destination MAC absent from
+            // the FDB (e.g. a silent host behind a static neighbor, or
+            // right after an FDB flush) is DROPPED by the bridge rather
+            // than emitted through the sole port — so "single member"
+            // stops implying "the bridge would have sent this frame
+            // there". Forwarded frames always carry a resolved unicast
+            // dst MAC, so unicast_flood is the only flood control that
+            // participates in the equivalence; require it on
+            // (unreadable → refuse).
+            let unicast_flood = std::fs::read_to_string(format!("{brport}/unicast_flood"))
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false);
+            members.push((member, forwarding && unicast_flood));
         }
         out.push((name, members));
     }
