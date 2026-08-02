@@ -430,20 +430,30 @@ jobs:
             echo "PMD names inside $(basename "$plugin"): ${names:-<none, so DPDK PMDs are not linked in>}"
           fi
 
-          # Three shapes count as "this build produced a driver for our
-          # NIC":
-          #   1. VPP's native dev_octeon (its own device framework).
-          #   2. DPDK's cnxk/octeontx2 PMD as a library — static (.a)
-          #      or runtime-loadable (.so under dpdk/pmds-<abi>/),
-          #      under EITHER install prefix.
-          #   3. The same PMD linked into dpdk_plugin.so.
+          # How a DPDK driver actually reaches VPP in this build — read
+          # from the pinned tree, not assumed (dpdk.mk + the plugin's
+          # CMakeLists):
           #
-          # This step deliberately asks only "did the build produce
-          # it". Whether it survives into the .debs is verify-package's
-          # question, and that job searches the installed filesystem —
-          # the right division, because a driver present here but
-          # unpackaged is a packaging bug that a build-tree check
-          # cannot distinguish from success.
+          #   - VPP_USE_SYSTEM_DPDK is OFF, so the plugin links
+          #     `libdpdk.a` wrapped in --whole-archive. That "archive"
+          #     is a LINKER SCRIPT dpdk.mk writes at install:
+          #     `GROUP ( $(ls librte*.a) )`.
+          #   - dpdk.mk then DELETES every shared driver object,
+          #     including the dpdk/pmds-<abi>/ directory the
+          #     symlink-drivers-solibs.sh install hook just populated.
+          #     There is no runtime-loadable PMD shape in this build;
+          #     an earlier revision of this step believed there was.
+          #
+          # Consequence: a surviving librte_net_cnxk.a proves DPDK
+          # BUILT the driver, but the artifact only works if that .a
+          # actually got whole-archived into dpdk_plugin.so. Those can
+          # diverge (a GROUP generated before the .a landed, or
+          # whole-archive failing to propagate through the script), so
+          # when both a static PMD and the plugin exist, the plugin
+          # must contain the driver's name string — a driver that was
+          # built but not linked is a dead artifact and must fail HERE,
+          # with the divergence named, not in verify-package with a
+          # generic "no PMD found".
           native=$(find "$instroot" -name 'dev_octeon*.so*' -print -quit)
           pmd_lib=$(find "$instroot" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           driver=''
@@ -452,11 +462,24 @@ jobs:
             driver=dev_octeon
           fi
           if [ -n "$pmd_lib" ]; then
-            echo "DPDK Octeon PMD: $pmd_lib"
             case "$pmd_lib" in
-              *cnxk*) driver="${driver:+$driver,}net_cnxk" ;;
-              *) driver="${driver:+$driver,}net_octeontx2" ;;
+              *cnxk*) pmdname=net_cnxk ;;
+              *) pmdname=net_octeontx2 ;;
             esac
+            echo "DPDK Octeon PMD built: $pmd_lib ($pmdname)"
+            if [ -n "$plugin" ]; then
+              if strings "$plugin" | grep -q "$pmdname"; then
+                echo "$pmdname is linked into $(basename "$plugin")"
+                driver="${driver:+$driver,}$pmdname"
+              else
+                echo "::error::$pmdname was BUILT ($pmd_lib) but is NOT linked into dpdk_plugin.so — the libdpdk.a GROUP/whole-archive chain dropped it, and nothing loads PMDs at runtime (dpdk.mk deletes the shared objects at install). The shipped artifact cannot drive the NIC."
+                exit 1
+              fi
+            else
+              # No dpdk plugin at all: the .a alone is unreachable.
+              echo "::error::$pmdname built but dpdk_plugin.so is missing entirely"
+              exit 1
+            fi
           elif [ -n "$plugin" ]; then
             linked=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
             if [ -n "$linked" ]; then
