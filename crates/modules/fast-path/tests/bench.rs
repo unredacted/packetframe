@@ -65,20 +65,33 @@ const LO_IFINDEX: u32 = 1;
 /// "does the bench run and do its sanity asserts hold", which a
 /// fraction of the iterations answers identically.
 ///
-/// Quick mode must bound BOTH knobs. The watchdog's unit of concern is
-/// one uninterruptible `bpf_test_run` syscall, so dividing the call
-/// count alone is not enough: a 10_000-repeat syscall runs ~20 s of
-/// kernel time on a slow TCG runner — straddling the 22 s watchdog
-/// line. Runner-speed variance then decides the job (observed on the
-/// PR #81 rerun: 6.6 green in 11 min, 5.15 watchdog-cascaded into the
-/// 20-min timeout on identical code). Capping repeat at 1_000 keeps
-/// each syscall an order of magnitude under the watchdog regardless of
-/// runner.
-const QUICK_MAX_REPEAT: u32 = 1_000;
+/// Quick mode must bound BOTH knobs, and bound them HARD. Two rounds
+/// of evidence shaped these numbers:
+///
+/// 1. The watchdog's unit of concern is one uninterruptible
+///    `bpf_test_run` syscall, so dividing the call count alone is not
+///    enough: a 10_000-repeat syscall runs ~20 s of kernel time on a
+///    slow TCG runner, straddling the 22 s line (PR #81: 6.6 green in
+///    11 min, 5.15 watchdog-cascaded into the 20-min timeout on
+///    identical code).
+/// 2. Capping repeat at 1_000 was still not enough. PR #86's 5.15 job
+///    soft-locked in a FORWARD bench, whose repeat is only 200 — the
+///    cap never applied. What killed it was total volume: 200 calls ×
+///    200 repeats = 40k executions, and TCG is slow enough that the
+///    aggregate stalled a CPU past the watchdog anyway.
+///
+/// So quick mode now targets a few hundred executions per bench, not a
+/// few tens of thousands. CI's question is "does the bench run and do
+/// its sanity asserts hold" — the `FwdOk`/`RxTotal` delta assertions
+/// and the TTL-budget guard are exactly as strong at 400 executions as
+/// at 1M, and the ns/pkt figures were never meaningful under emulation
+/// anyway (hardware runs full mode via the hwtest bundle).
+const QUICK_MAX_REPEAT: u32 = 50;
+const QUICK_MAX_CALLS: usize = 8;
 
 fn bench_params(repeat: u32, calls: usize) -> (u32, usize) {
     if std::env::var_os("PACKETFRAME_BENCH_QUICK").is_some() {
-        (repeat.min(QUICK_MAX_REPEAT), (calls / 25).max(8))
+        (repeat.min(QUICK_MAX_REPEAT), calls.min(QUICK_MAX_CALLS))
     } else {
         (repeat, calls)
     }
