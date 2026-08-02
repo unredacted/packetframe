@@ -193,8 +193,17 @@ provision cycle (unverified). A oneshot unit keeps the fleet honest:
 # /etc/systemd/system/packetframe-coalesce.service
 [Unit]
 Description=NIC IRQ coalescing for generic-XDP forwarding (generic-mode-performance runbook)
-After=network-pre.target
-Before=network.target packetframe.service
+# Order AFTER the network is actually up, not merely after
+# network-pre.target: on a box whose network manager creates, renames,
+# or reconfigures these NICs during boot, both it and this unit can run
+# in the same window with no ordering between them — so `ethtool -C`
+# either hits an interface that does not exist yet or gets overwritten
+# a moment later, and the per-interface `|| true` leaves the oneshot
+# "successful" so nothing retries. packetframe.service already waits
+# for network-online.target; slot in just ahead of it.
+After=network-online.target
+Wants=network-online.target
+Before=packetframe.service
 
 [Service]
 Type=oneshot
@@ -208,8 +217,16 @@ WantedBy=multi-user.target
 systemctl daemon-reload && systemctl enable --now packetframe-coalesce
 ```
 
-After any provision event or firmware update, `packetframe feasibility` (or
-`ethtool -c eth0`) confirms the settings held.
+After any provision event or firmware update, confirm the settings held —
+**with the config**, since a bare `packetframe feasibility` probes no
+interfaces at all (no attach set → no `iface.<name>.coalesce` lines → a
+clean-looking report that checked nothing):
+
+```sh
+packetframe feasibility --config /etc/packetframe/packetframe.conf --human | grep coalesce
+```
+
+or straight from the NIC with `ethtool -c eth0`.
 
 **Judge the win by ns/packet and pps-at-ceiling, never by `%soft`.** On a
 CPU-bound box with BBR senders, freed CPU converts to throughput within a few

@@ -813,16 +813,57 @@ fn rps_mask_is_zero(mask: &str) -> bool {
 /// is reported as a (non-required) failure with the fix inline.
 /// See `docs/runbooks/generic-mode-performance.md` §"IRQ coalescing".
 const COALESCE_PER_PACKET_USECS: u32 = 2;
+/// A frame threshold at or below this coalesces nothing meaningful:
+/// the IRQ fires every packet (1) or every other packet (2).
+const COALESCE_PER_PACKET_FRAMES: u32 = 2;
 
-fn coalesce_is_per_packet(rx_usecs: u32) -> bool {
-    rx_usecs <= COALESCE_PER_PACKET_USECS
+/// Does this configuration effectively interrupt per packet?
+///
+/// The uapi semantics are a DISJUNCTION — the NIC raises an IRQ when
+/// `(usecs > 0 && timer elapsed) || (frames > 0 && count reached)` —
+/// so judging on `rx_usecs` alone gets both edges wrong: `rx-usecs 0
+/// rx-frames 32` coalesces fine but would read as a failure, while
+/// `rx-usecs 50 rx-frames 1` interrupts on every packet and would
+/// read as a pass. A setting is per-packet only when EVERY armed
+/// trigger is tight; a disarmed (0) trigger can't fire at all and so
+/// never rescues the other one.
+fn coalesce_is_per_packet(rx_usecs: u32, rx_frames: u32) -> bool {
+    // Nothing armed at all: the NIC interrupts on every packet.
+    if rx_usecs == 0 && rx_frames == 0 {
+        return true;
+    }
+    // Whichever ARMED trigger fires first decides the interrupt rate,
+    // so any tight one makes the configuration per-packet and a loose
+    // one cannot rescue it. A disarmed (0) trigger never fires and is
+    // simply not considered.
+    //
+    // Calibration: the reference EFG shipped `rx-usecs 1 rx-frames 10`
+    // and measured ~800k IRQs/s at ~800 kpps — one per packet —
+    // because the 1 µs timer always beat the 10-frame count at ~24 µs
+    // per-queue packet gaps. That measurement is what the `||`
+    // encodes; an `&&` would have called that configuration healthy.
+    let timer_per_packet = rx_usecs > 0 && rx_usecs <= COALESCE_PER_PACKET_USECS;
+    let frames_per_packet = rx_frames > 0 && rx_frames <= COALESCE_PER_PACKET_FRAMES;
+    timer_per_packet || frames_per_packet
 }
 
 fn probe_iface_coalesce(iface: &str) -> Capability {
     let name = format!("iface.{iface}.coalesce");
     match iface_coalesce_state(iface) {
-        Ok((rx_usecs, rx_frames)) => {
-            if coalesce_is_per_packet(rx_usecs) {
+        Ok(st) if st.adaptive_rx => Capability::unknown(
+            &name,
+            format!(
+                "adaptive RX coalescing is enabled (resting rx-usecs {} / rx-frames {}): the \
+                 driver varies these by packet rate, so the resting values do not describe \
+                 behavior under forwarding load. Measure IRQs/sec directly \
+                 (/proc/interrupts) before concluding anything",
+                st.rx_usecs, st.rx_frames
+            ),
+            false,
+        ),
+        Ok(st) => {
+            let (rx_usecs, rx_frames) = (st.rx_usecs, st.rx_frames);
+            if coalesce_is_per_packet(rx_usecs, rx_frames) {
                 Capability::fail(
                     &name,
                     format!(
@@ -847,8 +888,16 @@ fn probe_iface_coalesce(iface: &str) -> Capability {
     }
 }
 
+/// The subset of `ethtool_coalesce` the verdict depends on.
+#[derive(Debug, Clone, Copy)]
+struct CoalesceState {
+    rx_usecs: u32,
+    rx_frames: u32,
+    adaptive_rx: bool,
+}
+
 #[cfg(target_os = "linux")]
-fn iface_coalesce_state(iface: &str) -> Result<(u32, u32), String> {
+fn iface_coalesce_state(iface: &str) -> Result<CoalesceState, String> {
     // uapi `struct ethtool_coalesce`: cmd + 22 u32 parameter fields.
     // Only rx_coalesce_usecs and rx_max_coalesced_frames are read;
     // the rest exist so the kernel writes into memory we own.
@@ -861,7 +910,18 @@ fn iface_coalesce_state(iface: &str) -> Result<(u32, u32), String> {
         cmd: u32,
         rx_coalesce_usecs: u32,
         rx_max_coalesced_frames: u32,
-        rest: [u32; 20],
+        rx_coalesce_usecs_irq: u32,
+        rx_max_coalesced_frames_irq: u32,
+        tx_coalesce_usecs: u32,
+        tx_max_coalesced_frames: u32,
+        tx_coalesce_usecs_irq: u32,
+        tx_max_coalesced_frames_irq: u32,
+        stats_block_coalesce_usecs: u32,
+        /// Non-zero means the driver varies the RX settings by packet
+        /// rate, so the resting values above do not describe behavior
+        /// under forwarding load (a resting 50 can become 1 at rate).
+        use_adaptive_rx_coalesce: u32,
+        rest: [u32; 13],
     }
 
     let name_bytes = iface.as_bytes();
@@ -897,11 +957,15 @@ fn iface_coalesce_state(iface: &str) -> Result<(u32, u32), String> {
             "SIOCETHTOOL/ETHTOOL_GCOALESCE on {iface} failed: {ioctl_err}"
         ));
     }
-    Ok((value.rx_coalesce_usecs, value.rx_max_coalesced_frames))
+    Ok(CoalesceState {
+        rx_usecs: value.rx_coalesce_usecs,
+        rx_frames: value.rx_max_coalesced_frames,
+        adaptive_rx: value.use_adaptive_rx_coalesce != 0,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn iface_coalesce_state(_iface: &str) -> Result<(u32, u32), String> {
+fn iface_coalesce_state(_iface: &str) -> Result<CoalesceState, String> {
     Err("coalescing probe is Linux-only".to_string())
 }
 
@@ -967,14 +1031,35 @@ mod tests {
 
     #[test]
     fn coalesce_per_packet_threshold() {
-        // The EFG shipped at rx-usecs=1 (flagged); the runbook fix is
-        // 50 (passes). 2 µs cannot aggregate at tens-of-µs per-queue
-        // packet gaps, so it is still per-packet in practice.
-        assert!(coalesce_is_per_packet(0));
-        assert!(coalesce_is_per_packet(1));
-        assert!(coalesce_is_per_packet(2));
-        assert!(!coalesce_is_per_packet(3));
-        assert!(!coalesce_is_per_packet(50));
+        // The EFG shipped at rx-usecs 1 / rx-frames 10 (flagged); the
+        // runbook fix is 50/32 (passes).
+        assert!(coalesce_is_per_packet(1, 10));
+        assert!(!coalesce_is_per_packet(50, 32));
+
+        // Both triggers armed: whichever fires first wins, so a tight
+        // timer OR tight frame count is enough to be per-packet.
+        assert!(coalesce_is_per_packet(50, 1), "frames=1 fires every packet");
+        assert!(coalesce_is_per_packet(2, 64), "usecs=2 fires every packet");
+        assert!(!coalesce_is_per_packet(3, 3), "both just past the line");
+
+        // A disarmed (0) trigger cannot fire, so it must not rescue
+        // the other one — nor condemn it.
+        assert!(
+            !coalesce_is_per_packet(0, 32),
+            "frame-only threshold of 32 coalesces fine"
+        );
+        assert!(
+            coalesce_is_per_packet(0, 1),
+            "frame-only threshold of 1 is per-packet"
+        );
+        assert!(
+            !coalesce_is_per_packet(50, 0),
+            "timer-only threshold of 50us coalesces fine"
+        );
+        assert!(coalesce_is_per_packet(1, 0), "timer-only 1us is per-packet");
+
+        // Nothing armed at all: the NIC interrupts per packet.
+        assert!(coalesce_is_per_packet(0, 0));
     }
 
     #[test]
