@@ -45,6 +45,44 @@ way — it also sizes the nexthop-device mapping (member ports → VF;
 VLAN nexthops → VPP subif; everything else → excluded + counted as
 unresolvable).
 
+### RESULT (2026-08-02, primary)
+
+| Table | eth3 | eth2 | total | eth3 share |
+|---|---:|---:|---:|---:|
+| master4 | 1,044,497 | 8,552 | 1,053,049 | **99.19%** |
+| master6 | 204,011 | 43,940 | 247,951 | **82.28%** |
+| **both** | **1,248,508** | **52,492** | **1,301,000** | **95.97%** |
+
+Three findings, in descending order of consequence:
+
+**1. The ~99% re-scope trigger fires for v4 and clearly does not for
+v6.** 17.72% of the v6 table prefers eth2 — that is not noise, and it
+alone keeps per-prefix best-path load-bearing. Combined across families
+the top device carries 95.97%, under the trigger. **Verdict: the
+full-table commitment stands.** See the plan's "full table vs
+default+exceptions" note for the alternative that was weighed and why
+it was not taken.
+
+**2. Only two egress devices appear in the entire table.** No VLAN
+nexthops, no management or tunnel devices, nothing excluded. This
+materially simplifies the nexthop-device mapping: membership must cover
+`{eth2, eth3}`, no VPP sub-interface is needed for *BGP* nexthops (the
+br1337/FDB-pin topology is a connected-route concern, not a FIB-nexthop
+one), and **steady-state `unresolvable` should be exactly 0** — which
+makes it a sharp health signal rather than a noisy one, and makes
+"blocks first-attach steering" a safe policy rather than a trip hazard.
+
+**3. `expected-routes 1200000` in the plan's example config is already
+too small** — the live table is 1,301,000 today and the DFZ grows
+~100k/yr. Size at **1,600,000** for roughly three years of headroom.
+
+Caveat carried forward: route *count* is not traffic *volume*. The
+52,492 eth2-preferring prefixes could carry a disproportionate share of
+bytes (an IX/peering port has exactly that shape: few prefixes, much
+traffic), which would make best-path divergence even more load-bearing
+than the counts suggest — never less. The finding is therefore
+directionally safe: it cannot flip toward "default route is fine".
+
 ## 1. Build VPP from source (fd.io debs do not exist for this OS)
 
 Verified 2026-08-01/02, empirically — the reason matters, so don't
