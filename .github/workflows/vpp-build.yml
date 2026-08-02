@@ -399,52 +399,74 @@ jobs:
           # build logs `symlink-drivers-solibs.sh lib dpdk/pmds-26.1`,
           # i.e. the standalone shape). Checking only the first is how
           # a perfectly good build got failed.
+          # Search BOTH install prefixes. `$root` is VPP's own
+          # (install-vpp-native/vpp); DPDK installs alongside it under
+          # install-vpp-native/external, and looking only at the former
+          # is why a build with cnxk enabled still reported no driver.
+          instroot=/vpp/build-root/install-vpp-native
+
           echo "--- driver inventory ---"
-          find "$root" \( -path '*vpp_drivers*' -o -path '*dpdk*' -o -name 'librte_net_*' \) \
-            -type f | sort
+          find "$instroot" \( -path '*vpp_drivers*' -o -path '*vpp_plugins*' \
+            -o -path '*dpdk/pmds*' -o -name 'librte_net_*' \) -type f | sort
+          echo "--- octeon artifacts anywhere under the install trees ---"
+          find "$instroot" \( -name '*cnxk*' -o -name '*octeontx2*' -o -name 'dev_octeon*' \) \
+            | sort | head -40
           echo "--- end inventory ---"
 
-          # Three shapes count as "this build can drive our NIC", and
-          # the third is the one that broke the previous assumption:
-          #
-          #  1. VPP's NATIVE Octeon driver (dev_octeon, under
-          #     vpp_drivers/). VPP >= 24.02 has its own device
-          #     framework, and 26.06's build downloads and compiles
-          #     marvell-octeon-roc specifically to feed it — visible in
-          #     the log as "installing octeon-roc 26.05". This path
-          #     does not involve DPDK at all.
-          #  2. DPDK's cnxk/octeontx2 PMD as a standalone
-          #     librte_net_*.so.
-          #  3. The same PMD linked into dpdk_plugin.so.
-          #
-          # The previous revision accepted only 2 and 3 and failed a
-          # build that had 1 — a `strings dpdk_plugin.so | grep
-          # net_cnxk` that finds nothing is evidence about DPDK's
-          # driver set, not about whether VPP can reach the hardware.
-          # Which shape we get decides the startup.conf that gate 0b
-          # writes, so the manifest records it rather than flattening
-          # it to a boolean.
-          native=$(find "$root" -name 'dev_octeon*.so*' -print -quit)
-          pmd_so=$(find "$root" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           plugin=$(find "$root" -name 'dpdk_plugin.so' -print -quit)
+
+          # Probe sanity, printed every run. `strings dpdk_plugin.so |
+          # grep net_cnxk` was the previous gate, and it reported NONE
+          # on a build whose meson summary listed cnxk under "Drivers
+          # Enabled" — so the probe, not the build, was wrong. Showing
+          # which PMD names (if any) the plugin actually contains makes
+          # that visible instead of inferable: an empty list here means
+          # DPDK's drivers are not linked into the plugin at all, but
+          # loaded at runtime from dpdk/pmds-<abi>/ (which is what
+          # `symlink-drivers-solibs.sh lib dpdk/pmds-26.1` in the build
+          # log is doing).
+          if [ -n "$plugin" ]; then
+            names=$(strings "$plugin" | grep -oE '^net_[a-z0-9_]+$' | sort -u | tr '\n' ' ' || true)
+            echo "PMD names inside $(basename "$plugin"): ${names:-<none, so DPDK PMDs are not linked in>}"
+          fi
+
+          # Three shapes count as "this build produced a driver for our
+          # NIC":
+          #   1. VPP's native dev_octeon (its own device framework).
+          #   2. DPDK's cnxk/octeontx2 PMD as a library — static (.a)
+          #      or runtime-loadable (.so under dpdk/pmds-<abi>/),
+          #      under EITHER install prefix.
+          #   3. The same PMD linked into dpdk_plugin.so.
+          #
+          # This step deliberately asks only "did the build produce
+          # it". Whether it survives into the .debs is verify-package's
+          # question, and that job searches the installed filesystem —
+          # the right division, because a driver present here but
+          # unpackaged is a packaging bug that a build-tree check
+          # cannot distinguish from success.
+          native=$(find "$instroot" -name 'dev_octeon*.so*' -print -quit)
+          pmd_lib=$(find "$instroot" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           driver=''
           if [ -n "$native" ]; then
             echo "native Octeon driver: $native"
             driver=dev_octeon
           fi
-          if [ -n "$pmd_so" ]; then
-            echo "standalone DPDK PMD: $pmd_so"
-            case "$pmd_so" in *cnxk*) driver="${driver:+$driver,}net_cnxk" ;;
-                              *) driver="${driver:+$driver,}net_octeontx2" ;; esac
+          if [ -n "$pmd_lib" ]; then
+            echo "DPDK Octeon PMD: $pmd_lib"
+            case "$pmd_lib" in
+              *cnxk*) driver="${driver:+$driver,}net_cnxk" ;;
+              *) driver="${driver:+$driver,}net_octeontx2" ;;
+            esac
           elif [ -n "$plugin" ]; then
             linked=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
-            [ -n "$linked" ] && echo "PMD linked into $plugin: $linked"
-            driver="${driver:+$driver,}${linked}"
-            driver="${driver%,}"
+            if [ -n "$linked" ]; then
+              echo "PMD linked into $plugin: $linked"
+              driver="${driver:+$driver,}${linked}"
+            fi
           fi
           echo "octeon driver(s): ${driver:-NONE}"
           if [ -z "$driver" ]; then
-            echo "::error::this build has no way to drive the Octeon NIC — neither VPP's native dev_octeon nor a DPDK cnxk/octeontx2 PMD (see inventory above)"
+            echo "::error::this build produced no Octeon driver — neither VPP's native dev_octeon nor a DPDK cnxk/octeontx2 PMD (see inventory above)"
             exit 1
           fi
           echo "PMD_FAMILY=$driver" >> "$GITHUB_ENV"
