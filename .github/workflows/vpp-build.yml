@@ -24,6 +24,13 @@ name: VPP build (bullseye/arm64)
 
 on:
   push:
+    # main ONLY. This workflow has contents:write and derives a
+    # canonical release tag from the pin alone, so an unfiltered push
+    # trigger would let any collaborator's feature branch publish that
+    # tag — and the later main run would then SKIP its build on the
+    # existence check, leaving the fleet's artifact built from unmerged
+    # workflow code.
+    branches: [main]
     paths:
       - 'vpp/pin.toml'
       - '.github/workflows/vpp-build.yml'
@@ -60,9 +67,13 @@ jobs:
           set -euo pipefail
           # Deliberately grep-based: adding a TOML parser to a job whose
           # only input is three scalar fields is not worth the dependency.
-          ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
-          commit=$(grep -E '^\s*commit\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
-          platform=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
+          # `|| true` on each: `commit` and `platform` are documented
+          # as optional, but grep exits 1 on no-match and `set -e`
+          # would abort the step — so omitting an optional field would
+          # have prevented any build at all.
+          ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2 || true)
+          commit=$(grep -E '^\s*commit\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2 || true)
+          platform=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2 || true)
           [ -n "$ref" ] || { echo "::error::vpp/pin.toml has no ref"; exit 1; }
           [ -n "$platform" ] || platform=generic
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
@@ -99,10 +110,18 @@ jobs:
     container:
       image: debian:bullseye
     timeout-minutes: 120
+    # Container jobs get `sh -e` as the default shell, and dash has no
+    # `set -o pipefail` — the first build attempt died on line 1 of the
+    # first step. Everything below is bash; the bootstrap step opts
+    # back down to sh because it is what installs bash's guarantees.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Container prerequisites
+        shell: sh
         run: |
-          set -euo pipefail
+          set -eu
           apt-get update
           # `sudo` because VPP's `make install-dep` invokes it
           # unconditionally; in a root container it must exist and be a
@@ -160,7 +179,13 @@ jobs:
           ls -la /out/debs
           [ -n "$(ls -A /out/debs)" ] || { echo "::error::no .debs produced"; exit 1; }
 
-      - name: Verify the artifact can actually load on bullseye
+      # Fast smoke test on the staging tree so an obviously broken
+      # build fails before we spend time packaging. It is NOT the
+      # gate — the staging tree has every build dependency present and
+      # the binaries at build paths, so it cannot catch a package that
+      # omits a library, installs to the wrong path, or is missing
+      # dependency metadata. The `verify-package` job below does that.
+      - name: Smoke-test the build tree
         run: |
           set -euo pipefail
           vpp_bin=/vpp/build-root/install-vpp-native/vpp/bin/vpp
@@ -223,7 +248,13 @@ jobs:
             '{vpp_ref:$ref, vpp_commit:$commit, platform:$platform, distro:"debian-bullseye",
               arch:"arm64", octeon_pmd:$pmd, patches:"none (upstream verbatim)",
               built_by:$built_by, workflow_run:$run}' > manifest.json
-          sha256sum debs/*.deb vpp-api-json.tar.gz > SHA256SUMS
+          # Flat names: `gh release create` uploads these as flat
+          # assets, so a `debs/` prefix would make `sha256sum -c`
+          # unverifiable after a download-into-one-directory (which is
+          # exactly what the hwtest bundle's instructions tell people
+          # to do).
+          ( cd debs && sha256sum ./*.deb | sed 's#\./##' ) > SHA256SUMS
+          sha256sum vpp-api-json.tar.gz >> SHA256SUMS
           cat manifest.json
 
       - uses: actions/upload-artifact@v4
@@ -237,7 +268,11 @@ jobs:
           retention-days: 14
 
       - name: Publish release
-        if: inputs.publish != false
+        # A push-triggered run leaves `inputs.publish` empty, which
+        # coerces equal to `false` — so the PRIMARY automatic trigger
+        # would spend the whole build and publish nothing, leaving the
+        # hwtest bundle's release pointer dangling. Gate on the event.
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -256,10 +291,76 @@ jobs:
             "" \
             "\`vpp-api-json.tar.gz\` is the API-definition bundle consumed by the vpp-offload binary-API codegen; it is published separately so codegen does not download the .debs." \
             "" \
-            "Install order and operational guidance: \`docs/runbooks/vpp-offload.md\`.")
+            "Install order and operational guidance: \`docs/runbooks/vpp-offload-spike.md\`.")
           gh release create "$tag" \
             --repo '${{ github.repository }}' \
             --title "VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)" \
             --notes "$notes" \
             /out/debs/*.deb /out/vpp-api-json.tar.gz /out/manifest.json /out/SHA256SUMS
           echo "::notice::published $tag"
+
+  verify-package:
+    name: Verify installed package (clean bullseye)
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bullseye
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Deliberately a FRESH container with no build dependencies: the
+      # question this job answers is "does what we publish install and
+      # run on a stock fleet box", which the build tree cannot answer.
+      - name: Bootstrap
+        shell: sh
+        run: |
+          set -eu
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates binutils
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vpp-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.platform }}-bullseye-arm64
+          path: /pkg
+
+      - name: Install the built packages
+        run: |
+          set -euo pipefail
+          ls -la /pkg
+          # `apt-get install ./*.deb` (not `dpkg -i`) so unmet
+          # dependencies fail loudly here rather than on a router.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y /pkg/*.deb
+          command -v vpp || { echo "::error::no vpp on PATH after install"; exit 1; }
+
+      - name: Verify the INSTALLED binary
+        run: |
+          set -euo pipefail
+          vpp_bin=$(command -v vpp)
+          echo "installed at: $vpp_bin"
+
+          # The check that killed the fd.io deb, now applied to what we
+          # actually ship rather than to a staging tree.
+          floor=$(objdump -T "$vpp_bin" | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1)
+          echo "glibc symbol floor: ${floor:-none}"
+          if [ "$(echo "${floor:-GLIBC_2.0}" | cut -d. -f2)" -gt 31 ]; then
+            echo "::error::installed binary requires $floor but UniFi OS ships glibc 2.31"
+            exit 1
+          fi
+
+          # No unresolved libraries with only the package's own
+          # dependencies installed.
+          if ldd "$vpp_bin" | grep -q 'not found'; then
+            echo "::error::unresolved shared libraries after install:"
+            ldd "$vpp_bin" | grep 'not found'
+            exit 1
+          fi
+
+          # The NIC driver must survive packaging, not merely exist in
+          # the build tree.
+          plugin=$(find / -name dpdk_plugin.so -not -path '/proc/*' 2>/dev/null | head -1)
+          [ -n "$plugin" ] || { echo "::error::dpdk_plugin.so not installed"; exit 1; }
+          strings "$plugin" | grep -qE 'net_cnxk|net_octeontx2' \
+            || { echo "::error::no cnxk/octeontx2 PMD in the installed plugin"; exit 1; }
+          echo "installed package verified: loads, resolves, and carries the Octeon PMD"
