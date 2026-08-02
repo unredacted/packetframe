@@ -46,9 +46,15 @@ pub struct VppOffloadConfig {
     pub hugepages: Option<u32>,
 }
 
-/// Default sizing input when `expected-routes` is absent: a full
-/// v4+v6 DFZ table (~1M + ~200k) plus a year of growth headroom.
-pub const DEFAULT_EXPECTED_ROUTES: u64 = 1_400_000;
+/// Default sizing input when `expected-routes` is absent.
+///
+/// Measured 2026-08-02 on the reference fleet: ~1.30M nexthops across
+/// v4+v6 (see `docs/runbooks/vpp-offload-spike.md` §0). The DFZ grows
+/// roughly 100k routes/yr, so this is about three years of headroom.
+/// The previous 1_400_000 sat barely above the live table — under a
+/// year — which is not a useful default for a value that sizes VPP's
+/// main heap at startup.
+pub const DEFAULT_EXPECTED_ROUTES: u64 = 1_600_000;
 
 impl VppOffloadConfig {
     pub fn from_directives(directives: &[ModuleDirective]) -> Self {
