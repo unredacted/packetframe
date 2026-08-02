@@ -235,13 +235,22 @@ is therefore too late — the daemon has already run once by then. Mask
 **first**; the postinst's own unmask only touches masks the packaging
 helper itself created, so an operator mask survives install.
 
-The full sequence:
+The full sequence — stop, then mask, then install, and the install is
+gated on the mask having succeeded (`&&`), because installing past a
+failed mask is exactly the daemon-starts-during-install trap:
 
 ```sh
-systemctl mask vpp.service          # BEFORE install — postinst starts the unit
-cd /tmp/vpp && VPP_INSTALL_SKIP_SYSCTL=1 apt-get install -y ./*.deb \
+# Stop tolerates a unit that does not exist yet (first install);
+# mask does not get that tolerance — if IT fails, do not install.
+# Mask alone is not enough on a rerun: it only blocks future
+# activations, and an already-running daemon keeps holding the
+# hugepages, VF, and API socket right through the install.
+systemctl stop vpp.service 2>/dev/null || true
+systemctl mask vpp.service \
+  && cd /tmp/vpp && VPP_INSTALL_SKIP_SYSCTL=1 apt-get install -y ./*.deb \
   && command -v vpp && vpp --version
 cat /proc/sys/vm/nr_hugepages        # belt-and-braces: must be UNCHANGED
+pgrep -a vpp || echo "no vpp running — correct"
 ```
 
 (`apt-get install`, not `dpkg -i`, so an unmet dependency fails loudly
