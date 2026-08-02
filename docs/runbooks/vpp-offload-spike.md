@@ -47,25 +47,36 @@ unresolvable).
 
 ## 1. Build VPP from source (fd.io debs do not exist for this OS)
 
-Verified 2026-08-01, empirically (don't re-litigate — we extracted the
-jammy 24.10 arm64 deb on the shadow and checked): fd.io's release repo
-carries Ubuntu noble/jammy (arm64) and Debian bookworm (amd64) — **no
-bullseye at all**; Debian proper has never packaged VPP. The jammy deb
-fails on this fleet three independent ways: bullseye's dpkg 1.20 can't
-unpack its zstd members at all, and the binary's symbol floor is
-**GLIBC_2.34** (`objdump -T`) vs UniFi OS's 2.31 — a hard loader
-failure, the newer-distro-on-older-host direction of the "wrong-distro
-debs often work" folklore. The plan's "fd.io deb vs self-build"
-decision is therefore made by packaging reality: **source build,
-on-box** (18 cores; deps largely present from the gate-0a testpmd
-build). This also opens the cn9k-tuned build as a same-pipeline
-variant rather than a separate decision.
+Verified 2026-08-01/02, empirically — the reason matters, so don't
+re-litigate it from a half-memory:
+
+- fd.io publishes per-release repos (`fdio/<YYMM>`, e.g. `fdio/2606`)
+  separately from `fdio/release`. Debian **bullseye packages do exist**
+  there (e.g. `fdio/2306` carries `vpp_23.06.0-...~b20_amd64.deb`).
+- But fd.io's **arm64 builds are Ubuntu-only** (jammy/noble). In
+  `fdio/2306`, arm64 appears solely under `ubuntu/jammy`; bullseye is
+  amd64 exclusively. Bookworm is likewise amd64-only.
+- So the combination we need — **bullseye + arm64 — is published
+  nowhere**, at any VPP version. Debian proper has never packaged VPP.
+- Cross-distro substitution fails in the direction we'd need it: we
+  extracted the jammy 24.10 arm64 deb on the shadow and it fails three
+  ways on UniFi OS — bullseye's dpkg 1.20 cannot unpack its zstd
+  members, and the binary's symbol floor is **GLIBC_2.34** against our
+  2.31 (`objdump -T`). Older-on-newer works; newer-on-older does not.
+
+Hence: **source build, on-box/in-CI** (18 cores; deps largely present
+from the gate-0a testpmd build). This also opens the cn9k-tuned build
+as a same-pipeline variant rather than a separate decision.
 
 Version pins, mirroring the gate-0a two-era doctrine (the AF↔VF
 mailbox does not follow newer-is-better):
 
-1. **VPP `stable/2306`** first — the last LTS line with Debian 11
-   build support, bundling a DPDK with the modern cnxk PMD.
+1. **VPP `stable/2306`** first. NOT because it is newest — 26.06 is the
+   current stable — but because our constraint is *what still builds
+   inside a bullseye container*, and newer VPP lines target
+   bookworm/jammy/noble in `make install-dep`. The 23.06 line is the
+   last with practical Debian 11 build support, and it bundles a DPDK
+   carrying the cnxk PMD.
 2. Fallback **`stable/2202`** — bundles DPDK 21.11, the last
    `octeontx2`-named PMD era, closest to the 20.11 build that passed
    gate 0a.

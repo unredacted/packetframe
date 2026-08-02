@@ -9,13 +9,15 @@
 # rebuilding them per release would burn ~45 min of CI reproducing
 # byte-identical output.
 #
-# Why we build at all (settled empirically 2026-08-01, don't
-# re-litigate): no VPP package exists for Debian 11 arm64 anywhere.
-# fd.io publishes Ubuntu noble/jammy arm64 + Debian bookworm amd64;
-# Debian has never packaged VPP. The jammy arm64 deb fails on UniFi OS
-# three independent ways — bullseye's dpkg can't unpack its zstd
-# members, and the binary's symbol floor is GLIBC_2.34 against our
-# 2.31. See docs/runbooks/vpp-offload-spike.md.
+# Why we build at all (settled empirically 2026-08-01/02). Precisely:
+# fd.io DOES publish Debian bullseye packages in its per-release
+# repos (fdio/<YYMM>) — but amd64 only. Its arm64 builds are
+# Ubuntu-only (jammy/noble). So bullseye+arm64, the one combination
+# UniFi OS can install, is published nowhere at any version, and
+# Debian has never packaged VPP. Substituting the jammy arm64 deb
+# fails three ways: bullseye's dpkg can't unpack its zstd members, and
+# its symbol floor is GLIBC_2.34 against our 2.31. See
+# docs/runbooks/vpp-offload-spike.md.
 #
 # We ship NO patches. This is repackaging, not forking.
 
@@ -24,11 +26,16 @@
 # branches move, and a moving pin defeats the point.
 #
 # PROVISIONAL until gate 0b confirms the DPDK↔AF mailbox handshake on
-# the reference hardware. The 23.06 line is the first candidate (last
-# LTS with Debian 11 build support, bundles a cnxk-era DPDK); if its
-# PMD fails the handshake, the fallback is the 22.02 line (DPDK 21.11,
-# the last `octeontx2`-named era, closest to the DPDK 20.11 build that
-# passed gate 0a). The mailbox does not follow newer-is-better.
+# the reference hardware.
+#
+# Deliberately NOT the newest: 26.06 is the current stable, but our
+# binding constraint is "still builds inside a bullseye container",
+# and newer VPP lines target bookworm/jammy/noble. 23.06 is the last
+# line with practical Debian 11 build support and bundles a cnxk-era
+# DPDK. If its PMD fails the handshake, the fallback is the 22.02 line
+# (DPDK 21.11, the last `octeontx2`-named era, closest to the DPDK
+# 20.11 build that passed gate 0a) — the mailbox does not follow
+# newer-is-better.
 ref = "v23.06"
 
 # Optional strict pin. When non-empty the workflow verifies the ref
