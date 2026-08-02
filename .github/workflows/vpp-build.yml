@@ -86,18 +86,48 @@ jobs:
         id: exists
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           tag='${{ steps.pin.outputs.tag }}'
           force='${{ inputs.force }}'
+
+          # The tag is derived from the PIN alone, but the artifact is
+          # a function of the pin AND this workflow's build config —
+          # which disabled-driver overrides made materially true. So a
+          # workflow change that alters what gets built would otherwise
+          # hit the existence check and skip, leaving the fleet on an
+          # artifact built from superseded config, under a tag implying
+          # otherwise. Detect it and rebuild.
+          #
+          # Cost note against this file's own cost-control rationale:
+          # the workflow path is already a trigger, so this only fires
+          # on a push that edited it — twice a year in practice. It
+          # cannot distinguish a comment edit from a driver-list
+          # change, and rebuilding needlessly is far cheaper than
+          # silently shipping a stale artifact.
+          wf_changed=false
+          if [ '${{ github.event_name }}' = 'push' ] && \
+             [ -n "$BEFORE" ] && \
+             [ "$BEFORE" != '0000000000000000000000000000000000000000' ]; then
+            if gh api "repos/${{ github.repository }}/compare/${BEFORE}...${{ github.sha }}" \
+                 --jq '.files[].filename' 2>/dev/null \
+                 | grep -qx '.github/workflows/vpp-build.yml'; then
+              wf_changed=true
+            fi
+          fi
+
           if [ "$force" = "true" ]; then
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
             echo "force requested; rebuilding"
-          elif gh release view "$tag" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+          elif ! gh release view "$tag" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$wf_changed" = "true" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag exists, but this push changed the build workflow — rebuilding and replacing it."
+          else
             echo "needs_build=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$tag is already published; nothing to build. Re-run with force to rebuild."
-          else
-            echo "needs_build=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -262,9 +292,24 @@ jobs:
           libs=$(printf '%s' "$vars" | sed -n 2p)
 
           filter() {
-            # Drop every cnxk member (common/, net/, mempool/, crypto/
-            # for drivers; the bare `cnxk` lib) and nothing else.
-            printf '%s' "$1" | tr ',' '\n' | grep -v cnxk | grep -v '^$' | paste -sd, -
+            # Drop every member of the Octeon driver families and
+            # nothing else: cnxk (common/, net/, mempool/, crypto/, and
+            # the bare `cnxk` lib) plus octeontx2, the name the same
+            # silicon used before DPDK 22.11 renamed it.
+            #
+            # octeontx2 is a no-op on every version in the fallback
+            # ladder — checked, not assumed: v22.02 disables neither
+            # family (so its octeontx2 PMD is on by default), v23.06
+            # disables only cnxk, and 26.03 has no octeontx2 driver at
+            # all. It is here as insurance for a version that does,
+            # since removing an absent entry costs nothing.
+            #
+            # Deliberately NOT matched: compress/octeontx, event/octeontx
+            # and mempool/octeontx — those are OCTEON TX v1, different
+            # silicon, and upstream means them disabled. `octeontx2`
+            # cannot match `octeontx`.
+            printf '%s' "$1" | tr ',' '\n' \
+              | grep -v -e cnxk -e octeontx2 | grep -v '^$' | paste -sd, -
           }
           for pair in "DRIVERS:$drivers" "LIBS:$libs"; do
             name=${pair%%:*}; val=${pair#*:}
@@ -275,10 +320,10 @@ jobs:
               *,*) : ;;
               *) echo "::error::DPDK_${name}_DISABLED evaluated to '$val' — upstream layout changed?"; exit 1 ;;
             esac
-            echo "$name removing: $(printf '%s' "$val" | tr ',' '\n' | grep cnxk | paste -sd, - || echo none)"
+            echo "$name removing: $(printf '%s' "$val" | tr ',' '\n' | grep -e cnxk -e octeontx2 | paste -sd, - || echo none)"
           done
-          printf '%s' "$drivers" | grep -q cnxk \
-            || echo "::warning::upstream no longer disables cnxk; this override is a no-op"
+          printf '%s' "$drivers" | grep -q -e cnxk -e octeontx2 \
+            || echo "::warning::upstream disables no Octeon driver family at this ref; the override is a no-op (fine — it means the PMD ships enabled)"
 
           {
             echo "DPDK_DRIVERS_KEPT=$(filter "$drivers")"
@@ -607,11 +652,27 @@ jobs:
             "\`vpp-api-json.tar.gz\` is the API-definition bundle consumed by the vpp-offload binary-API codegen; it is published separately so codegen does not download the .debs." \
             "" \
             "Install order and operational guidance: \`docs/runbooks/vpp-offload-spike.md\`.")
+          title="VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)"
           # Flat asset names, matching SHA256SUMS — see the manifest
           # step's note on why that matters after a download.
-          gh release create "$tag" \
-            --repo '${{ github.repository }}' \
-            --title "VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)" \
-            --notes "$notes" \
-            debs/*.deb vpp-api-json.tar.gz manifest.json SHA256SUMS
+          #
+          # The tag can already exist: resolve rebuilds when the build
+          # workflow itself changed, since the artifact depends on this
+          # file's config and not on the pin alone. Update in place
+          # (`--clobber`) rather than delete-and-recreate, so there is
+          # no window where the release the runbook points operators at
+          # does not exist.
+          if gh release view "$tag" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "::notice::$tag exists — replacing its assets"
+            gh release edit "$tag" --repo '${{ github.repository }}' \
+              --title "$title" --notes "$notes"
+            gh release upload "$tag" --repo '${{ github.repository }}' --clobber \
+              debs/*.deb vpp-api-json.tar.gz manifest.json SHA256SUMS
+          else
+            gh release create "$tag" \
+              --repo '${{ github.repository }}' \
+              --title "$title" \
+              --notes "$notes" \
+              debs/*.deb vpp-api-json.tar.gz manifest.json SHA256SUMS
+          fi
           echo "::notice::published $tag"
