@@ -110,6 +110,18 @@ jobs:
     container:
       image: debian:bullseye
     timeout-minutes: 120
+    # VPP's `make install-dep` runs its own apt-get, and UNATTENDED=y
+    # only adds `-y` — it does not set a debconf frontend. Some of the
+    # dependency closure (wireshark-common) has a debconf question, so
+    # apt falls back to the Readline frontend and asks it. Under CI
+    # stdin is /dev/null, so it reads EOF and takes the default rather
+    # than hanging, but that is luck rather than design: the same
+    # command run from an interactive shell — or backgrounded from one,
+    # where the read earns SIGTTIN and suspends the job outright —
+    # blocks. Set the frontend job-wide so no step depends on how it
+    # was invoked.
+    env:
+      DEBIAN_FRONTEND: noninteractive
     # Container jobs get `sh -e` as the default shell, and dash has no
     # `set -o pipefail` — the first build attempt died on line 1 of the
     # first step. Everything below is bash; the bootstrap step opts
@@ -154,7 +166,14 @@ jobs:
         run: |
           set -euo pipefail
           cd /vpp
-          UNATTENDED=y make install-dep
+          # `< /dev/null` belt-and-braces alongside the job-level
+          # DEBIAN_FRONTEND: a container job's stdin is an open pipe
+          # that never delivers EOF, so any package whose maintainer
+          # script reads stdin blocks forever rather than failing. The
+          # first attempt at this build hung here for 26 minutes on
+          # wireshark-common's dumpcap question before being cancelled.
+          # Redirecting guarantees a read returns instead of parking.
+          UNATTENDED=y make install-dep < /dev/null
 
       - name: Build release
         run: |
