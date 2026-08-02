@@ -71,18 +71,21 @@ as a same-pipeline variant rather than a separate decision.
 Version pins, mirroring the gate-0a two-era doctrine (the AF↔VF
 mailbox does not follow newer-is-better):
 
-1. **VPP `stable/2306`** first. NOT because it is newest — 26.06 is the
-   current stable — but because our constraint is *what still builds
-   inside a bullseye container*, and newer VPP lines target
-   bookworm/jammy/noble in `make install-dep`. The 23.06 line is the
-   last with practical Debian 11 build support, and it bundles a DPDK
-   carrying the cnxk PMD.
-2. Fallback **`stable/2202`** — bundles DPDK 21.11, the last
-   `octeontx2`-named PMD era, closest to the 20.11 build that passed
-   gate 0a.
+1. **`v26.06`** — the latest upstream stable — first. Its Makefile has
+   explicit `debian-11` handling, so bullseye is a supported build
+   host; fd.io simply doesn't *publish* bullseye arm64 binaries, which
+   says nothing about buildability. Default to newest for the security
+   fixes and upstream support, and drop back only on a measured
+   failure.
+2. Fallback ladder, only if 26.06's PMD fails the mailbox handshake:
+   `v25.10`/`v24.10` → `v23.06` → `v22.02` (DPDK 21.11, the last
+   `octeontx2`-named era, closest to the DPDK 20.11 build that passed
+   gate 0a). The AF here is SDK-era on a 5.15 vendor kernel and the
+   mailbox does not follow newer-is-better — but that is a reason to
+   TEST the newest, not to pre-emptively ship something old.
 
 ```sh
-cd /root && git clone --depth 1 --branch stable/2306 https://github.com/FDio/vpp && cd vpp && UNATTENDED=y make install-dep && make build-release
+cd /root && git clone --depth 1 --branch v26.06 https://github.com/FDio/vpp && cd vpp && UNATTENDED=y make install-dep && make build-release
 ```
 
 (~30–45 min. Binaries land in
@@ -94,7 +97,7 @@ Check the bundled PMD family with `strings
 build-root/install-vpp-native/vpp/lib/vpp_plugins/dpdk_plugin.so |
 grep -m1 -iE 'net_cnxk|net_octeontx2'` — that names which mailbox era
 this VPP will present to the AF, and if it fails the handshake the
-`stable/2202` fallback is the next build.
+next rung of the fallback ladder is the next build.
 
 ## 2. Stage resources + startup.conf
 

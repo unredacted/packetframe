@@ -25,18 +25,31 @@
 # Git ref in github.com/FDio/vpp. Use a release tag, never a branch:
 # branches move, and a moving pin defeats the point.
 #
-# PROVISIONAL until gate 0b confirms the DPDK↔AF mailbox handshake on
-# the reference hardware.
+# Latest upstream stable release, and PROVISIONAL only in the sense
+# that gate 0b must confirm the DPDK↔AF mailbox handshake on the
+# reference hardware before we depend on it.
 #
-# Deliberately NOT the newest: 26.06 is the current stable, but our
-# binding constraint is "still builds inside a bullseye container",
-# and newer VPP lines target bookworm/jammy/noble. 23.06 is the last
-# line with practical Debian 11 build support and bundles a cnxk-era
-# DPDK. If its PMD fails the handshake, the fallback is the 22.02 line
-# (DPDK 21.11, the last `octeontx2`-named era, closest to the DPDK
-# 20.11 build that passed gate 0a) — the mailbox does not follow
-# newer-is-better.
-ref = "v23.06"
+# Default to newest, not oldest. Newest gets security fixes and
+# upstream support; you drop back only when something forces you to,
+# and "might not build" was not a good enough reason — VPP's Makefile
+# in stable/2606 has explicit `debian-11` handling, so bullseye is a
+# supported build host. (An earlier version of this file pinned 23.06
+# on the assumption that newer lines had dropped Debian 11. That was
+# inferred from fd.io's *package* matrix, which describes their CI,
+# not what the source can build. Checked, wrong, corrected.)
+#
+# The one genuine risk with newness is the AF↔VF mailbox: this fleet
+# runs a 5.15 vendor kernel whose AF is SDK-era, and gate 0a's
+# handshake passed with DPDK 20.11's `octeontx2` PMD. A modern cnxk
+# PMD may or may not agree with it — the mailbox does not follow
+# newer-is-better. That is a question for MEASUREMENT, not for
+# pre-emptive downgrading. Fallback ladder if gate 0b's handshake
+# fails, in order:
+#   v25.10 / v24.10  → newer cnxk, still recent
+#   v23.06           → last line before the cnxk-era churn
+#   v22.02           → DPDK 21.11, last `octeontx2`-named PMD, closest
+#                      to the DPDK 20.11 build that passed gate 0a
+ref = "v26.06"
 
 # Optional strict pin. When non-empty the workflow verifies the ref
 # resolves to exactly this commit and fails otherwise, so a retagged
