@@ -38,6 +38,16 @@
 # inferred from fd.io's *package* matrix, which describes their CI,
 # not what the source can build. Checked, wrong, corrected.)
 #
+# That said, "install-dep succeeds" is NOT the same as "bullseye's
+# toolchain is new enough". 26.06 requires CMake >= 3.19 and bullseye
+# ships 3.18.4, so the workflow installs upstream CMake before
+# building. Expect that supplementing to be the shape of any future
+# obstacle on this line: dependency PACKAGING still targets debian-11,
+# but individual TOOL floors have moved past it. If the list of
+# supplements ever grows past a couple of pinned tools, that is the
+# signal to take the fallback ladder below rather than to keep
+# rebuilding bullseye's toolchain from tarballs.
+#
 # The one genuine risk with newness is the AF↔VF mailbox: this fleet
 # runs a 5.15 vendor kernel whose AF is SDK-era, and gate 0a's
 # handshake passed with DPDK 20.11's `octeontx2` PMD. A modern cnxk

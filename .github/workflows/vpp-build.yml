@@ -175,6 +175,49 @@ jobs:
           # Redirecting guarantees a read returns instead of parking.
           UNATTENDED=y make install-dep < /dev/null
 
+      # VPP 26.06's CMakeLists.txt sets cmake_minimum_required(3.19);
+      # bullseye ships 3.18.4, so `make build-release` aborts at
+      # vpp-configure with "CMake 3.19 or higher is required". Note
+      # what this does and does not mean: VPP's Makefile really does
+      # have debian-11 handling and `install-dep` really does succeed —
+      # what has moved past bullseye is the TOOLCHAIN requirement, not
+      # dependency packaging. The two are easy to conflate.
+      #
+      # Upstream's own aarch64 binary, pinned with a checksum rather
+      # than pulled from bullseye-backports: cmake is a build-time tool
+      # that leaves no trace in the produced .debs (it cannot raise the
+      # glibc floor, which is the only reason we build on bullseye at
+      # all), and a pinned tarball does not depend on the lifecycle of a
+      # backports suite for a release nearing EOL. Deliberately a 3.31
+      # and not a 4.x: CMake 4 dropped compatibility with
+      # cmake_minimum_required < 3.5, which VPP's vendored externals
+      # still rely on.
+      - name: Install CMake (bullseye's 3.18 is below VPP's floor)
+        env:
+          CMAKE_VERSION: '3.31.9'
+          CMAKE_SHA256: '09b7127b09e3d3ed5fa894f4e59f6a01112f267da6acc4249e46dba97b14afcb'
+        run: |
+          set -euo pipefail
+          series="${CMAKE_VERSION%.*}"
+          tarball="cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz"
+          curl -fsSL -o "/tmp/${tarball}" \
+            "https://cmake.org/files/v${series}/${tarball}"
+          echo "${CMAKE_SHA256}  /tmp/${tarball}" | sha256sum -c -
+          # --strip-components=1 into /usr/local keeps cmake's modules
+          # in the share/ path it resolves relative to the binary.
+          tar -xzf "/tmp/${tarball}" -C /usr/local --strip-components=1
+          hash -r
+          cmake --version
+          # /usr/local/bin precedes /usr/bin, but assert rather than
+          # assume: install-dep may have pulled bullseye's cmake, and
+          # silently building with 3.18 is the failure we just fixed.
+          have=$(cmake --version | head -1 | awk '{print $3}')
+          major=${have%%.*}; rest=${have#*.}; minor=${rest%%.*}
+          if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 19 ]; }; then
+            echo "::error::cmake $have is below VPP's 3.19 floor (which cmake: $(command -v cmake))"
+            exit 1
+          fi
+
       - name: Build release
         run: |
           set -euo pipefail
