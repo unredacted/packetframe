@@ -8,13 +8,16 @@
 //! allowlisted traffic onto the VF. Zero dataplane code lives here;
 //! VPP is the upstream program.
 //!
-//! Slice 1 (this crate's initial form) ships the scaffold: config
-//! handling, feasibility probes, and the startup.conf renderer with
-//! its route-count-driven memory arithmetic. `attach` is
-//! NotImplemented until slice 2 (resource lifecycle).
+//! Built so far: slice 1 (config handling, feasibility probes, the
+//! startup.conf renderer and its route-count-driven memory arithmetic)
+//! and slice 2 (VF/vfio/hugepage lifecycle, state file, pidfd adopt,
+//! teardown ordering). [`sink`] carries the wire-format-independent
+//! half of slice 4 — pending map, nexthop mapping policy, three-valued
+//! route ledger — which is testable ahead of the binary-API transport
+//! that slice 3 blocks on.
 //!
-//! Design record: `.claude/plans/` phase-4 plan v5 (frozen after four
-//! review rounds). Key invariants enforced from day one:
+//! Design record: `.claude/plans/` phase-4 plan v6. Key invariants
+//! enforced from day one:
 //! - membership (VF on every possible egress port) is all-or-nothing;
 //!   steering is the per-port canary lever (`Config::validate_vpp_offload`);
 //! - the steered-prefix set inherits the fast-path allowlist, which
@@ -22,6 +25,7 @@
 //! - the eBPF fast-path on the PFs is the permanent failover tier.
 
 pub mod resources;
+pub mod sink;
 pub mod startup_conf;
 
 #[cfg(target_os = "linux")]
