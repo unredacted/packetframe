@@ -279,22 +279,55 @@ jobs:
           # build logs `symlink-drivers-solibs.sh lib dpdk/pmds-26.1`,
           # i.e. the standalone shape). Checking only the first is how
           # a perfectly good build got failed.
+          echo "--- driver inventory ---"
+          find "$root" \( -path '*vpp_drivers*' -o -path '*dpdk*' -o -name 'librte_net_*' \) \
+            -type f | sort
+          echo "--- end inventory ---"
+
+          # Three shapes count as "this build can drive our NIC", and
+          # the third is the one that broke the previous assumption:
+          #
+          #  1. VPP's NATIVE Octeon driver (dev_octeon, under
+          #     vpp_drivers/). VPP >= 24.02 has its own device
+          #     framework, and 26.06's build downloads and compiles
+          #     marvell-octeon-roc specifically to feed it — visible in
+          #     the log as "installing octeon-roc 26.05". This path
+          #     does not involve DPDK at all.
+          #  2. DPDK's cnxk/octeontx2 PMD as a standalone
+          #     librte_net_*.so.
+          #  3. The same PMD linked into dpdk_plugin.so.
+          #
+          # The previous revision accepted only 2 and 3 and failed a
+          # build that had 1 — a `strings dpdk_plugin.so | grep
+          # net_cnxk` that finds nothing is evidence about DPDK's
+          # driver set, not about whether VPP can reach the hardware.
+          # Which shape we get decides the startup.conf that gate 0b
+          # writes, so the manifest records it rather than flattening
+          # it to a boolean.
+          native=$(find "$root" -name 'dev_octeon*.so*' -print -quit)
           pmd_so=$(find "$root" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           plugin=$(find "$root" -name 'dpdk_plugin.so' -print -quit)
-          pmd=''
+          driver=''
+          if [ -n "$native" ]; then
+            echo "native Octeon driver: $native"
+            driver=dev_octeon
+          fi
           if [ -n "$pmd_so" ]; then
-            echo "standalone PMD object: $pmd_so"
-            case "$pmd_so" in *cnxk*) pmd=net_cnxk ;; *) pmd=net_octeontx2 ;; esac
+            echo "standalone DPDK PMD: $pmd_so"
+            case "$pmd_so" in *cnxk*) driver="${driver:+$driver,}net_cnxk" ;;
+                              *) driver="${driver:+$driver,}net_octeontx2" ;; esac
           elif [ -n "$plugin" ]; then
-            echo "dpdk_plugin: $plugin"
-            pmd=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
-          else
-            echo "::error::neither dpdk_plugin.so nor a standalone Octeon PMD found under $root"
+            linked=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
+            [ -n "$linked" ] && echo "PMD linked into $plugin: $linked"
+            driver="${driver:+$driver,}${linked}"
+            driver="${driver%,}"
+          fi
+          echo "octeon driver(s): ${driver:-NONE}"
+          if [ -z "$driver" ]; then
+            echo "::error::this build has no way to drive the Octeon NIC — neither VPP's native dev_octeon nor a DPDK cnxk/octeontx2 PMD (see inventory above)"
             exit 1
           fi
-          echo "octeon PMD: ${pmd:-NONE}"
-          [ -n "$pmd" ] || { echo "::error::no cnxk/octeontx2 PMD in the bundled DPDK"; exit 1; }
-          echo "PMD_FAMILY=$pmd" >> "$GITHUB_ENV"
+          echo "PMD_FAMILY=$driver" >> "$GITHUB_ENV"
 
           # Unresolved-symbol smoke test. `vpp -h` needs its own libs on
           # the path; a clean exit or a usage message both prove linkage.
@@ -432,21 +465,25 @@ jobs:
           fi
 
           # The NIC driver must survive packaging, not merely exist in
-          # the build tree. Same two shapes as the build-tree smoke
-          # test: linked into dpdk_plugin.so, or a standalone
-          # librte_net_*.so under dpdk/pmds-<abi>/.
+          # the build tree. Same three shapes the build-tree smoke test
+          # accepts — VPP's native dev_octeon, a standalone DPDK PMD, or
+          # one linked into dpdk_plugin.so — because which one this VPP
+          # ships is a property of the release, not a constant.
+          native=$(find / -name 'dev_octeon*.so*' -not -path '/proc/*' -print -quit 2>/dev/null || true)
           pmd_so=$(find / \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) \
             -not -path '/proc/*' -print -quit 2>/dev/null || true)
           plugin=$(find / -name dpdk_plugin.so -not -path '/proc/*' -print -quit 2>/dev/null || true)
-          if [ -n "$pmd_so" ]; then
+          if [ -n "$native" ]; then
+            echo "installed native Octeon driver: $native"
+          elif [ -n "$pmd_so" ]; then
             echo "installed standalone PMD: $pmd_so"
           elif [ -n "$plugin" ] && strings "$plugin" | grep -qE 'net_cnxk|net_octeontx2'; then
             echo "installed PMD linked into: $plugin"
           else
-            echo "::error::no cnxk/octeontx2 PMD in the installed packages"
+            echo "::error::the installed packages carry no Octeon driver (native or DPDK)"
             exit 1
           fi
-          echo "installed package verified: loads, resolves, and carries the Octeon PMD"
+          echo "installed package verified: loads, resolves, and carries an Octeon driver"
 
   # Publishing is a SEPARATE job gated on verify-package, not a final
   # step of `build`. It used to be the latter, which meant the .debs
