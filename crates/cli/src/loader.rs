@@ -166,8 +166,6 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
-    use packetframe_common::module::ModuleError;
-
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
