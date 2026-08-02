@@ -143,19 +143,42 @@ re-litigate it from a half-memory:
   members, and the binary's symbol floor is **GLIBC_2.34** against our
   2.31 (`objdump -T`). Older-on-newer works; newer-on-older does not.
 
-Hence: **source build, on-box/in-CI** (18 cores; deps largely present
-from the gate-0a testpmd build). This also opens the cn9k-tuned build
-as a same-pipeline variant rather than a separate decision.
+Hence we build it ourselves — **in CI, not on the box.**
+
+> **Do not build VPP on the router.** The obvious `make install-dep`
+> route is a dead end there and the failure is not obvious in advance:
+> UniFi ships a patched `libnl-3-200 3.4.0-8+ubnt`, while Debian's
+> `libnl-3-dev` depends on its runtime sibling at an *exact* version
+> (`= 3.4.0-1+b1`). apt cannot resolve that and stops. The apparent fix
+> — downgrading `libnl-3-200` — would swap a patched netlink library
+> out from under udapi and the rest of UniFi's stack, on a production
+> router, to satisfy a build dependency. Don't.
+>
+> Verified 2026-08-02 on the primary.
+
+`.github/workflows/vpp-build.yml` builds unmodified upstream VPP in a
+clean `debian:bullseye` container on a native arm64 runner, where none
+of that applies, and publishes `.debs` under their own release tag. It
+runs when `vpp/pin.toml` changes, or on demand. This also makes the
+cn9k-tuned build a same-pipeline variant rather than a separate
+decision.
 
 Version pins, mirroring the gate-0a two-era doctrine (the AF↔VF
 mailbox does not follow newer-is-better):
 
-1. **`v26.06`** — the latest upstream stable — first. Its Makefile has
-   explicit `debian-11` handling, so bullseye is a supported build
-   host; fd.io simply doesn't *publish* bullseye arm64 binaries, which
-   says nothing about buildability. Default to newest for the security
-   fixes and upstream support, and drop back only on a measured
-   failure.
+1. **`v26.06`** — the latest upstream stable — first, and it **builds
+   and packages cleanly** (verified in CI 2026-08-02). fd.io simply
+   doesn't *publish* bullseye arm64 binaries, which says nothing about
+   buildability. Default to newest for the security fixes and upstream
+   support, and drop back only on a measured failure.
+
+   One caveat learned the hard way: `make install-dep` succeeding is
+   *not* evidence that bullseye's toolchain is new enough. Dependency
+   packaging still targets debian-11, but individual tool floors have
+   moved past it — 26.06 needs CMake ≥ 3.19 against bullseye's 3.18.4,
+   which the workflow supplements with a pinned upstream CMake. If that
+   list of supplements ever grows past a couple of tools, take the
+   ladder below rather than keep rebuilding bullseye's toolchain.
 2. Fallback ladder, only if 26.06's PMD fails the mailbox handshake:
    `v25.10`/`v24.10` → `v23.06` → `v22.02` (DPDK 21.11, the last
    `octeontx2`-named era, closest to the DPDK 20.11 build that passed
@@ -163,20 +186,53 @@ mailbox does not follow newer-is-better):
    mailbox does not follow newer-is-better — but that is a reason to
    TEST the newest, not to pre-emptively ship something old.
 
+### Getting the build onto the shadow
+
 ```sh
-cd /root && git clone --depth 1 --branch v26.06 https://github.com/FDio/vpp && cd vpp && UNATTENDED=y make install-dep && make build-release
+# On a workstation with `gh` authenticated, then scp to the shadow —
+# or run on the box if it has network + gh.
+gh release download vpp-v26.06-generic-bullseye-arm64 \
+  --repo unredacted/packetframe --dir /tmp/vpp
 ```
 
-(~30–45 min. Binaries land in
-`build-root/install-vpp-native/vpp/bin/vpp` with plugins alongside —
-run in place for the spike; `make pkg-deb` later for fleet packaging.)
-Record the exact tag/commit — it becomes the pin for slice 3's API
-codegen (`build-root/install-vpp-native/vpp/share/vpp/api/**/*.api.json`).
-Check the bundled PMD family with `strings
-build-root/install-vpp-native/vpp/lib/vpp_plugins/dpdk_plugin.so |
-grep -m1 -iE 'net_cnxk|net_octeontx2'` — that names which mailbox era
-this VPP will present to the AF, and if it fails the handshake the
-next rung of the fallback ladder is the next build.
+**Read the dependency line before installing anything.** The libnl
+divergence above lives at install time too, in a milder form: runtime
+deps are normally `>=` constraints, which UniFi's *newer* `3.4.0-8+ubnt`
+satisfies — but an `=` pin would be the same wall moved later.
+
+```sh
+dpkg -I /tmp/vpp/vpp_*.deb | grep -i depends
+```
+
+Then install with `apt-get install ./*.deb` rather than `dpkg -i`, so
+an unmet dependency fails loudly instead of leaving a half-configured
+package:
+
+```sh
+cd /tmp/vpp && apt-get install -y ./*.deb && command -v vpp && vpp --version
+```
+
+### What CI already proved, so you needn't re-check
+
+The build job verifies these on every run; they are recorded here so a
+failure on the box is read as *new* rather than re-derived:
+
+- **glibc symbol floor `GLIBC_2.17`** against UniFi OS's 2.31. This is
+  the check that killed the fd.io jammy deb, applied to what we ship.
+- The Octeon PMD is present. Note it is a **standalone
+  `librte_net_cnxk*.so` under `dpdk/pmds-<abi>/`**, not linked into
+  `dpdk_plugin.so` — so `strings dpdk_plugin.so | grep net_cnxk` finds
+  nothing and means nothing. Look for the PMD object itself.
+- The `.debs` install into a clean bullseye and the installed binary
+  resolves its libraries (the `verify-package` job).
+
+The `.api.json` definitions publish as a separate small asset on the
+same release — that is slice 3's codegen input, and the exact
+tag/commit in the release manifest is the pin it generates against.
+
+**If the PMD fails the mailbox handshake**, the next rung of the
+fallback ladder is a `vpp/pin.toml` edit, not an on-box rebuild:
+changing `ref` re-runs the workflow and publishes a new tag.
 
 ## 2. Stage resources + startup.conf
 
