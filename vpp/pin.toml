@@ -1,0 +1,45 @@
+# VPP upstream pin for the vpp-offload module (phase 4).
+#
+# THIS FILE IS THE BUILD TRIGGER. Editing it runs
+# `.github/workflows/vpp-build.yml`, which builds *unmodified upstream*
+# VPP inside a `debian:bullseye` container on a native arm64 runner and
+# publishes the .debs + API definitions under their own release tag.
+# Nothing else triggers that build — packetframe releases deliberately
+# do not, because VPP's artifacts are a function of this pin alone and
+# rebuilding them per release would burn ~45 min of CI reproducing
+# byte-identical output.
+#
+# Why we build at all (settled empirically 2026-08-01, don't
+# re-litigate): no VPP package exists for Debian 11 arm64 anywhere.
+# fd.io publishes Ubuntu noble/jammy arm64 + Debian bookworm amd64;
+# Debian has never packaged VPP. The jammy arm64 deb fails on UniFi OS
+# three independent ways — bullseye's dpkg can't unpack its zstd
+# members, and the binary's symbol floor is GLIBC_2.34 against our
+# 2.31. See docs/runbooks/vpp-offload-spike.md.
+#
+# We ship NO patches. This is repackaging, not forking.
+
+[vpp]
+# Git ref in github.com/FDio/vpp. Use a release tag, never a branch:
+# branches move, and a moving pin defeats the point.
+#
+# PROVISIONAL until gate 0b confirms the DPDK↔AF mailbox handshake on
+# the reference hardware. The 23.06 line is the first candidate (last
+# LTS with Debian 11 build support, bundles a cnxk-era DPDK); if its
+# PMD fails the handshake, the fallback is the 22.02 line (DPDK 21.11,
+# the last `octeontx2`-named era, closest to the DPDK 20.11 build that
+# passed gate 0a). The mailbox does not follow newer-is-better.
+ref = "v23.06"
+
+# Optional strict pin. When non-empty the workflow verifies the ref
+# resolves to exactly this commit and fails otherwise, so a retagged
+# upstream can't silently change what we ship. Recorded in the
+# published manifest either way.
+commit = ""
+
+# Build variant. "generic" = baseline armv8-a, portable across any
+# arm64 EFG-class box. "cn9k" = Marvell-tuned (LSE atomics, tuned
+# memcpy) — a few percent on atomics/copy-heavy paths, only worth
+# measuring once we are packet-rate-bound. Changing this produces a
+# separately-tagged artifact; both can coexist.
+platform = "generic"

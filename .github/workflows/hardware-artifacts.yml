@@ -301,6 +301,34 @@ jobs:
              docs/runbooks/generic-mode-performance.md \
              "dist/packetframe-hwtest-${TARGET}/"
 
+          # VPP pointer, not payload. The vpp-offload module needs a VPP
+          # that can't come from any distro repo (see vpp/pin.toml), but
+          # its .debs are ~100 MB and change maybe twice a year while
+          # this bundle is rebuilt on every push to main. Shipping a
+          # fetch line keeps per-push artifacts lean and still makes the
+          # on-router install one command. Empty pin = no file.
+          if [ -f vpp/pin.toml ]; then
+            VPP_REF=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
+            VPP_PLATFORM=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
+            : "${VPP_PLATFORM:=generic}"
+            if [ -n "${VPP_REF}" ]; then
+              cat > "dist/packetframe-hwtest-${TARGET}/vpp-pin.txt" <<EOF
+          VPP pin for the vpp-offload module: ${VPP_REF} (${VPP_PLATFORM}, bullseye/arm64)
+
+          Not bundled here on purpose — the .debs are ~100 MB and change a
+          couple of times a year, while this bundle rebuilds on every push.
+          Fetch them from their own release tag:
+
+            gh release download vpp-${VPP_REF}-${VPP_PLATFORM}-bullseye-arm64 \\
+              -R ${GITHUB_REPOSITORY} -D vpp/
+            sudo dpkg -i vpp/*.deb
+
+          Only needed for \`module vpp-offload\`; the eBPF fast-path needs
+          nothing from this file. See docs/runbooks/vpp-offload-spike.md.
+          EOF
+            fi
+          fi
+
       # An installable package, not just loose binaries: `dpkg -i` is how
       # this reaches a test router, and it brings the systemd unit and
       # /etc/packetframe along with the binary. Only the `-gnu` targets get
