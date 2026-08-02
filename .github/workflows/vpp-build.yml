@@ -250,7 +250,8 @@ jobs:
       - name: Smoke-test the build tree
         run: |
           set -euo pipefail
-          vpp_bin=/vpp/build-root/install-vpp-native/vpp/bin/vpp
+          root=/vpp/build-root/install-vpp-native/vpp
+          vpp_bin="$root/bin/vpp"
           [ -x "$vpp_bin" ] || { echo "::error::no vpp binary at $vpp_bin"; exit 1; }
 
           # THE regression guard: this is the exact check that killed the
@@ -264,21 +265,44 @@ jobs:
             exit 1
           fi
 
+          # Layout, for the record. Printed unconditionally because the
+          # first version of this step hardcoded lib/vpp_plugins and VPP
+          # installs to a multiarch libdir; having the tree in the log
+          # makes the next path surprise self-diagnosing.
+          echo "--- install tree ---"
+          find "$root" -maxdepth 3 -type d | sort
+
           # The NIC driver must be in the bundled DPDK, or VPP cannot
-          # touch the hardware at all.
-          plugin=/vpp/build-root/install-vpp-native/vpp/lib/vpp_plugins/dpdk_plugin.so
-          if [ -f "$plugin" ]; then
+          # touch the hardware at all. Two shapes to accept, because
+          # which one you get is a DPDK build option, not a constant:
+          # the PMD may be linked INTO dpdk_plugin.so, or shipped as a
+          # standalone librte_net_*.so under dpdk/pmds-<abi>/ (this
+          # build logs `symlink-drivers-solibs.sh lib dpdk/pmds-26.1`,
+          # i.e. the standalone shape). Checking only the first is how
+          # a perfectly good build got failed.
+          pmd_so=$(find "$root" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
+          plugin=$(find "$root" -name 'dpdk_plugin.so' -print -quit)
+          pmd=''
+          if [ -n "$pmd_so" ]; then
+            echo "standalone PMD object: $pmd_so"
+            case "$pmd_so" in *cnxk*) pmd=net_cnxk ;; *) pmd=net_octeontx2 ;; esac
+          elif [ -n "$plugin" ]; then
+            echo "dpdk_plugin: $plugin"
             pmd=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
-            echo "octeon PMD in dpdk_plugin: ${pmd:-NONE}"
-            [ -n "$pmd" ] || { echo "::error::no cnxk/octeontx2 PMD in the bundled DPDK"; exit 1; }
-            echo "PMD_FAMILY=$pmd" >> "$GITHUB_ENV"
           else
-            echo "::error::dpdk_plugin.so missing"; exit 1
+            echo "::error::neither dpdk_plugin.so nor a standalone Octeon PMD found under $root"
+            exit 1
           fi
+          echo "octeon PMD: ${pmd:-NONE}"
+          [ -n "$pmd" ] || { echo "::error::no cnxk/octeontx2 PMD in the bundled DPDK"; exit 1; }
+          echo "PMD_FAMILY=$pmd" >> "$GITHUB_ENV"
 
           # Unresolved-symbol smoke test. `vpp -h` needs its own libs on
           # the path; a clean exit or a usage message both prove linkage.
-          export LD_LIBRARY_PATH=/vpp/build-root/install-vpp-native/vpp/lib
+          # Every lib dir, not a guessed one, for the multiarch reason
+          # above.
+          LD_LIBRARY_PATH=$(find "$root" -type d -name 'lib*' -maxdepth 2 | tr '\n' ':')
+          export LD_LIBRARY_PATH
           "$vpp_bin" -h >/dev/null 2>&1 || true
           ldd "$vpp_bin" | grep -q 'not found' && { echo "::error::unresolved shared libs"; ldd "$vpp_bin" | grep 'not found'; exit 1; } || true
 
@@ -288,9 +312,20 @@ jobs:
           mkdir -p /out/api
           # Published as a separate small asset so the codegen job never
           # downloads ~100 MB of .debs just to read message definitions.
-          find /vpp/build-root/install-vpp-native/vpp/share/vpp/api -name '*.api.json' \
-            -exec cp --parents {} /out/api/ \; 2>/dev/null || \
+          # Located rather than hardcoded, for the multiarch reason in
+          # the smoke-test step. Copying the api dir wholesale keeps
+          # upstream's core/ vs plugins/ split, which slice 3's codegen
+          # uses to namespace generated modules; the fallback flattens
+          # because a build tree without share/vpp/api has no split to
+          # preserve anyway.
+          api_dir=$(find /vpp/build-root -type d -path '*/share/vpp/api' -print -quit)
+          if [ -n "$api_dir" ]; then
+            echo "api dir: $api_dir"
+            cp -r "$api_dir/." /out/api/
+          else
+            echo "::warning::no share/vpp/api dir; falling back to a flat scan"
             find /vpp/build-root -name '*.api.json' -exec cp {} /out/api/ \;
+          fi
           count=$(find /out/api -name '*.api.json' | wc -l)
           echo "api.json files: $count"
           [ "$count" -gt 0 ] || { echo "::error::no .api.json produced"; exit 1; }
@@ -420,9 +455,18 @@ jobs:
           fi
 
           # The NIC driver must survive packaging, not merely exist in
-          # the build tree.
-          plugin=$(find / -name dpdk_plugin.so -not -path '/proc/*' 2>/dev/null | head -1)
-          [ -n "$plugin" ] || { echo "::error::dpdk_plugin.so not installed"; exit 1; }
-          strings "$plugin" | grep -qE 'net_cnxk|net_octeontx2' \
-            || { echo "::error::no cnxk/octeontx2 PMD in the installed plugin"; exit 1; }
+          # the build tree. Same two shapes as the build-tree smoke
+          # test: linked into dpdk_plugin.so, or a standalone
+          # librte_net_*.so under dpdk/pmds-<abi>/.
+          pmd_so=$(find / \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) \
+            -not -path '/proc/*' -print -quit 2>/dev/null || true)
+          plugin=$(find / -name dpdk_plugin.so -not -path '/proc/*' -print -quit 2>/dev/null || true)
+          if [ -n "$pmd_so" ]; then
+            echo "installed standalone PMD: $pmd_so"
+          elif [ -n "$plugin" ] && strings "$plugin" | grep -qE 'net_cnxk|net_octeontx2'; then
+            echo "installed PMD linked into: $plugin"
+          else
+            echo "::error::no cnxk/octeontx2 PMD in the installed packages"
+            exit 1
+          fi
           echo "installed package verified: loads, resolves, and carries the Octeon PMD"
