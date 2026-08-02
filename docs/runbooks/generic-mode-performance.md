@@ -599,6 +599,22 @@ Mechanism and safety:
 - Requires `bridge-resolve` active — the pin extends the same
   wire-equivalence proof (identical frame bytes; all chain devices share one
   MAC on the reference platform). Restart-only, like `local-prefix`.
+- **Default OFF; `fdb-pin on` is an explicit opt-in.** The short-circuit
+  reasons from static topology; pinning additionally depends on live bridge
+  learning, so it stays opt-in until it has soaked on hardware. It is also
+  refused under `forwarding-mode compare` (a pinned egress reads as
+  `CompareDisagree` against the kernel FIB's bridge ifindex and would corrupt
+  pre-cutover validation) and warns as inert under `kernel-fib`.
+- **The underlying bridge must not be VLAN-filtering.** A filtering bridge
+  applies per-port VLAN policy on egress that a static pin cannot reproduce,
+  and keys its FDB by `(MAC, VID)` rather than MAC alone. Such chains are
+  skipped, and any VLAN-tagged FDB entry that reaches the resolver anyway is
+  ignored rather than pinned from an ambiguous key.
+- **`mss-clamp via <iface>` does not survive pinning.** Clamp matching keys on
+  the resolved egress ifindex, which for a pinned nexthop is a
+  dynamically-chosen member port with no stable name. Attach warns when a
+  clamp names an affected interface; use a prefix-scoped or global clamp, or
+  leave `fdb-pin` off.
 
 Verification on hardware: `/proc/net/dev` — `switch0` tx pps collapses for
 fast-pathed traffic while the member port's tx holds; `tc -s qdisc show dev

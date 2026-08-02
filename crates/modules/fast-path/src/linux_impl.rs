@@ -162,8 +162,18 @@ pub(crate) fn bridge_resolve_enabled(directives: &[ModuleDirective]) -> bool {
 }
 
 /// Whether `fdb-pin` enables FDB-pinned direct-to-port egress
-/// (v0.2.9). Same default/synonym semantics as `bridge-resolve`:
-/// no directive = `Auto` = enabled where provable.
+/// (v0.2.9).
+///
+/// **Default OFF**, unlike `bridge-resolve`. The short-circuit reasons
+/// entirely from sysfs topology that cannot change under it without a
+/// reconfigure; FDB pinning additionally depends on *live* bridge
+/// learning state, so its correctness surface is wider (MAC moves,
+/// age-out races, dump/watch ordering, per-VLAN keying) and the review
+/// round on this PR found six such issues. A feature that reroutes
+/// production traffic on evidence that expires deserves an explicit
+/// opt-in until it has soaked on hardware: `Auto` therefore means
+/// "off", and only `On` arms it. Revisit the default after the gate-0b
+/// canary, and say so in the runbook when it changes.
 pub(crate) fn fdb_pin_enabled(directives: &[ModuleDirective]) -> bool {
     let toggle = directives
         .iter()
@@ -172,7 +182,7 @@ pub(crate) fn fdb_pin_enabled(directives: &[ModuleDirective]) -> bool {
             _ => None,
         })
         .unwrap_or_default();
-    !matches!(toggle, ToggleAutoOnOff::Off)
+    matches!(toggle, ToggleAutoOnOff::On)
 }
 
 /// v0.2.9: derive the FDB-pin chain map for the NeighborResolver:
@@ -205,6 +215,36 @@ pub(crate) fn discover_fdb_pin_chains(
         if !std::path::Path::new(&format!("/sys/class/net/{under}/bridge")).exists() {
             continue;
         }
+        // ...and it must NOT be VLAN-filtering. Two reasons, both
+        // disqualifying:
+        //
+        // 1. Wire equivalence. On a filtering bridge, egress applies
+        //    the selected port's VLAN policy — it may drop the frame
+        //    or emit it untagged. The pinned datapath bypasses that
+        //    policy entirely and always pushes `vid`, so the frame we
+        //    emit can differ from what the bridge would have emitted,
+        //    or escape a per-port VLAN restriction.
+        // 2. FDB keying. A filtering bridge's FDB is keyed by
+        //    (MAC, VID); our cache is keyed by (master, MAC). With
+        //    the same MAC learned in several VLANs, whichever event
+        //    landed last would decide the port for every chain.
+        //
+        // The outer bridge is already gated on vlan_filtering==0 by
+        // `read_bridge_topology`; this closes the same hole one hop
+        // down, which the runbook always claimed was closed.
+        let filtering =
+            std::fs::read_to_string(format!("/sys/class/net/{under}/bridge/vlan_filtering"))
+                .map(|s| s.trim() != "0")
+                .unwrap_or(true); // unreadable → assume filtering → skip
+        if filtering {
+            info!(
+                %bridge,
+                underlying = %under,
+                "fdb-pin: underlying bridge has vlan_filtering enabled (or unreadable); \
+                 chain skipped — per-port VLAN policy can't be reproduced by a static pin"
+            );
+            continue;
+        }
         let (Ok(bridge_idx), Ok(under_idx)) = (if_nametoindex(&bridge), if_nametoindex(&under))
         else {
             warn!(%bridge, %under, "fdb-pin: ifindex resolution failed; chain skipped");
@@ -218,6 +258,35 @@ pub(crate) fn discover_fdb_pin_chains(
             vid,
             "fdb-pin chain armed (nexthops on this bridge pin to FDB member ports)"
         );
+        // Same hazard the bridge short-circuit already warns about,
+        // one hop further: MSS-clamp matching keys on the POST-resolve
+        // egress ifindex, and a pinned nexthop resolves to a bridge
+        // MEMBER PORT chosen dynamically from the FDB. So an
+        // `mss-clamp via <underlying bridge>` rule — the very scoping
+        // the short-circuit's warning recommends — silently stops
+        // matching once a pin is learned, and there is no stable
+        // interface name to re-scope it to, because the member port
+        // can change with the FDB. Say so at arm time with the
+        // options, rather than letting a clamp quietly go dead.
+        for d in directives {
+            if let ModuleDirective::MssClamp {
+                iface: Some(clamp_iface),
+                ..
+            } = d
+            {
+                if *clamp_iface == under || *clamp_iface == bridge {
+                    warn!(
+                        clamp_iface = %clamp_iface,
+                        %bridge,
+                        underlying = %under,
+                        "mss-clamp `via {clamp_iface}` will NOT match for FDB-pinned nexthops: \
+                         clamp matching keys on the resolved egress ifindex, which for a pinned \
+                         nexthop is a dynamically-chosen bridge member port. Use a \
+                         prefix-scoped or global clamp, or set `fdb-pin off`."
+                    );
+                }
+            }
+        }
         out.insert(bridge_idx, (under_idx, vid));
     }
     out
@@ -1531,7 +1600,30 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
 
         // v0.2.9: FDB-pin chain derivation. Empty (feature off, no
         // qualifying topology, or bridge-resolve off) = never pins.
-        let fdb_pin_chains = discover_fdb_pin_chains(&cfg.section.directives);
+        //
+        // Never in compare mode. Compare bumps CompareDisagree when
+        // the custom-FIB egress ifindex differs from the kernel FIB's
+        // (bpf/src/main.rs `compare_and_bump`), and the kernel always
+        // reports the logical bridge. A pinned nexthop reports the
+        // member port, so every pinned flow would register as a
+        // disagreement even though both paths chose the same route —
+        // corrupting exactly the metric compare mode exists to
+        // produce. Pre-cutover validation wins over an optimization.
+        let fdb_pin_chains = if matches!(
+            forwarding,
+            packetframe_common::config::ForwardingMode::Compare
+        ) {
+            if fdb_pin_enabled(&cfg.section.directives) {
+                warn!(
+                    "fdb-pin is disabled while `forwarding-mode compare` is active: pinned \
+                     egress would read as CompareDisagree against the kernel FIB's bridge \
+                     ifindex and corrupt the validation metrics"
+                );
+            }
+            std::collections::HashMap::new()
+        } else {
+            discover_fdb_pin_chains(&cfg.section.directives)
+        };
         let ctrl = crate::fib::controller::RouteController::start(
             &state.bpffs_root,
             route_source,
@@ -1559,6 +1651,17 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
     } else {
         if fib_cache_enabled(&cfg.section.directives) {
             warn!("fib-cache on has no effect in kernel-fib mode (no custom FIB to cache)");
+        }
+        // Same class of silent no-op: pin discovery and the resolver
+        // that publishes pins both live in the custom-FIB branch, so
+        // `fdb-pin on` under kernel-fib can never dump an FDB or write
+        // a pin. Say so rather than letting an operator believe the
+        // optimization is live.
+        if fdb_pin_enabled(&cfg.section.directives) {
+            warn!(
+                "fdb-pin on has no effect in kernel-fib mode (pins are published by the \
+                 custom-FIB neighbour resolver, which is not running)"
+            );
         }
         info!(
             ?forwarding,

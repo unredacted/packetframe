@@ -293,6 +293,14 @@ pub struct NetlinkNeighborResolver {
     /// v0.2.9 diagnostic: pins sent / cleared, in the periodic stats.
     fdb_pins_sent: u64,
     fdb_pins_cleared: u64,
+    /// v0.2.9: latest desired pin state per nexthop IP that the
+    /// programmer has NOT accepted yet (bounded command queue full).
+    /// Retried on every stats tick. This exists because unpins are
+    /// one-shot: an FDB age-out produces a single `None` transition
+    /// with no later event to regenerate it, so dropping one would
+    /// strand a nexthop pinned to an expired port. Keyed by IP with
+    /// last-write-wins, so churn collapses instead of accumulating.
+    pending_pins: HashMap<IpAddr, Option<(u32, u16)>>,
 }
 
 impl NetlinkNeighborResolver {
@@ -327,6 +335,7 @@ impl NetlinkNeighborResolver {
                 fdb: HashMap::new(),
                 fdb_pins_sent: 0,
                 fdb_pins_cleared: 0,
+                pending_pins: HashMap::new(),
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -480,15 +489,34 @@ impl NetlinkNeighborResolver {
             );
         }
 
+        let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
+        let (connection, handle, mut messages) = new_multicast_connection(&groups)
+            .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
+        tokio::spawn(connection);
+        info!(
+            groups = ?groups,
+            "NeighborResolver netlink multicast subscription live"
+        );
+
         // v0.2.9 FDB-pin: seed the bridge FDB view and push initial
         // pin state for every already-known neighbor on a pin chain.
-        // Runs after the neighbour dump (needs `neigh_cache`) and
-        // before the multicast subscription (same reasoning as the
-        // caches above: an FDB event arriving pre-seed would race an
-        // empty view). Dump failure degrades to "no pins yet" — the
-        // multicast maintenance below rebuilds the view as entries
-        // refresh, and unpinned traffic just keeps taking the bridge
-        // path it takes today.
+        //
+        // ORDERING IS LOAD-BEARING: this runs AFTER the multicast
+        // subscription is live, not before. Dumping first leaves a
+        // window in which an FDB entry can move or age out between the
+        // snapshot and the subscription — we would then publish the
+        // pre-move port and never see the event that corrected it,
+        // leaving traffic pinned to the wrong member port
+        // indefinitely. With the socket already open, events raised
+        // during the dump queue in the socket buffer and the select
+        // loop applies them immediately afterwards, so the window
+        // closes at the cost of replaying a few redundant updates
+        // (handle_fdb_update is idempotent last-write-wins).
+        //
+        // Dump failure degrades to "no pins yet" — the multicast
+        // maintenance rebuilds the view as entries refresh, and
+        // unpinned traffic keeps taking the bridge path it takes
+        // today.
         if !self.pin_chains.is_empty() {
             let parents: std::collections::HashSet<u32> = self
                 .pin_chains
@@ -517,15 +545,6 @@ impl NetlinkNeighborResolver {
                 self.maybe_send_pin(ip, ifindex, mac);
             }
         }
-
-        let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
-        let (connection, handle, mut messages) = new_multicast_connection(&groups)
-            .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
-        tokio::spawn(connection);
-        info!(
-            groups = ?groups,
-            "NeighborResolver netlink multicast subscription live"
-        );
 
         // Phase 3.9 diagnostic: periodic stats so we can see whether
         // synthetic Learned events are firing for most BGP nexthops or
@@ -620,8 +639,14 @@ impl NetlinkNeighborResolver {
                         fdb_entries = self.fdb.len(),
                         fdb_pins_sent = self.fdb_pins_sent,
                         fdb_pins_cleared = self.fdb_pins_cleared,
+                        fdb_pins_pending = self.pending_pins.len(),
                         "neighbour resolver stats"
                     );
+                    // Unpins are one-shot; a dropped one would strand a
+                    // nexthop on an expired port. Retry here rather
+                    // than relying on a future event that may never
+                    // come.
+                    self.retry_pending_pins();
                 }
             }
         }
@@ -754,10 +779,20 @@ impl NetlinkNeighborResolver {
     /// ages out, so a stale pin can never outlive the evidence for it.
     /// Idempotent by construction; the programmer absorbs repeats.
     fn maybe_send_pin(&mut self, ip: IpAddr, ifindex: u32, mac: [u8; 6]) {
-        let Some(&(parent, vid)) = self.pin_chains.get(&ifindex) else {
+        if self.prog_handle.is_none() {
             return;
-        };
-        let Some(prog) = self.prog_handle.as_ref() else {
+        }
+        let Some(&(parent, vid)) = self.pin_chains.get(&ifindex) else {
+            // The nexthop is NOT on a pin chain — but it may have been
+            // a moment ago. The programmer deliberately retains pins
+            // across Gone/unregister/re-register, so returning early
+            // here would let a later Learned event on the new
+            // interface consult the OLD pin and write the new MAC with
+            // the previous bridge member's port and VID. Routing moving
+            // a nexthop off a pinned bridge is exactly the case. Send
+            // an explicit clear instead; the programmer absorbs the
+            // no-op when nothing was pinned.
+            self.queue_pin(ip, None);
             return;
         };
         let pin = self.fdb.get(&(parent, mac)).map(|&port| (port, vid));
@@ -766,7 +801,45 @@ impl NetlinkNeighborResolver {
         } else {
             self.fdb_pins_cleared += 1;
         }
-        prog.set_nexthop_pin_nowait(ip, pin);
+        self.queue_pin(ip, pin);
+    }
+
+    /// Send a pin transition, retaining it for retry if the
+    /// programmer's bounded queue rejected it. See `pending_pins`.
+    fn queue_pin(&mut self, ip: IpAddr, pin: Option<(u32, u16)>) {
+        let accepted = match self.prog_handle.as_ref() {
+            Some(prog) => prog.set_nexthop_pin_nowait(ip, pin),
+            None => return,
+        };
+        if accepted {
+            self.pending_pins.remove(&ip);
+        } else {
+            self.pending_pins.insert(ip, pin);
+        }
+    }
+
+    /// Re-send pin transitions the programmer could not accept.
+    /// Driven from the stats tick so retries are bounded and cheap.
+    fn retry_pending_pins(&mut self) {
+        if self.pending_pins.is_empty() {
+            return;
+        }
+        let retry: Vec<(IpAddr, Option<(u32, u16)>)> =
+            self.pending_pins.iter().map(|(ip, p)| (*ip, *p)).collect();
+        let before = retry.len();
+        for (ip, pin) in retry {
+            self.queue_pin(ip, pin);
+        }
+        let still = self.pending_pins.len();
+        if still > 0 {
+            warn!(
+                retried = before,
+                still_pending = still,
+                "FDB-pin retries still blocked; programmer queue remains saturated"
+            );
+        } else {
+            info!(retried = before, "FDB-pin retries drained");
+        }
     }
 
     /// v0.2.9: apply one AF_BRIDGE FDB event (`added == true` for
@@ -787,6 +860,21 @@ impl NetlinkNeighborResolver {
         let parents: std::collections::HashSet<u32> =
             self.pin_chains.values().map(|&(p, _)| p).collect();
         if !parents.contains(&master) {
+            return;
+        }
+        // Defence in depth on FDB keying. `discover_fdb_pin_chains`
+        // refuses VLAN-filtering underlying bridges precisely because
+        // their FDB is keyed by (MAC, VID) while this cache is keyed
+        // by (master, MAC). If a VLAN-tagged FDB entry reaches us
+        // anyway — filtering flipped on after attach, or a kernel that
+        // reports a VID regardless — ignoring it is the safe answer:
+        // the nexthop stays unpinned on the bridge path rather than
+        // being pinned from a key we cannot disambiguate.
+        if msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, NeighbourAttribute::Vlan(v) if *v != 0))
+        {
             return;
         }
         let Some(mac) = extract_mac(&msg.attributes) else {

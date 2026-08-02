@@ -166,9 +166,21 @@ impl FibProgrammerHandle {
     /// programmer. A dropped pin command is self-healing — the
     /// resolver re-derives and re-sends pin state on every kernel
     /// neighbour or FDB event for the affected entry.
-    pub fn set_nexthop_pin_nowait(&self, ip: IpAddr, pin: Option<(u32, u16)>) {
-        if let Err(e) = self.tx.try_send(Command::SetNexthopPin { ip, pin }) {
-            warn!(?ip, ?pin, error = %e, "FDB-pin update dropped (command queue full or shut down)");
+    /// Returns `false` when the command could not be queued, so the
+    /// caller can retain it for retry. **Unpins must not be lost**: an
+    /// FDB age-out or delete is a one-shot `None` transition with no
+    /// later event to re-derive it, so a dropped clear would leave the
+    /// live NEXTHOPS entry pinned to an expired port instead of
+    /// falling back to the bridge path. The resolver keeps the latest
+    /// desired state per IP and re-sends on its stats tick.
+    #[must_use]
+    pub fn set_nexthop_pin_nowait(&self, ip: IpAddr, pin: Option<(u32, u16)>) -> bool {
+        match self.tx.try_send(Command::SetNexthopPin { ip, pin }) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(?ip, ?pin, error = %e, "FDB-pin update queue full; will retry");
+                false
+            }
         }
     }
 
