@@ -147,14 +147,14 @@ impl Module for VppOffloadModule {
 /// Feasibility probes for `packetframe feasibility`, mirroring how the
 /// fast-path's per-interface probes graft into the report. All
 /// non-required: feasibility output informs, attach enforces.
-pub fn run_feasibility_probes(ports: &[String]) -> Vec<Capability> {
+pub fn run_feasibility_probes(ports: &[String], vpp_binary: Option<&str>) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        probe_linux::run(ports)
+        probe_linux::run(ports, vpp_binary)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = ports;
+        let _ = (ports, vpp_binary);
         Vec::new()
     }
 }

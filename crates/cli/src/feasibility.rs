@@ -50,10 +50,25 @@ pub fn vpp_ports_from_config(config: &Config) -> Vec<String> {
     ports
 }
 
+/// The `vpp-binary` override from a `vpp-offload` section, if set, so
+/// feasibility probes the executable the module will actually run.
+pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| &m.directives)
+        .find_map(|d| match d {
+            ModuleDirective::VppBinary(p) => Some(p.clone()),
+            _ => None,
+        })
+}
+
 pub fn probe_and_render(
     bpffs_root: &Path,
     attach_ifaces: &[String],
     vpp_ports: &[String],
+    vpp_binary: Option<&str>,
     human: bool,
 ) -> Rendered {
     let mut report = run_probes(bpffs_root);
@@ -79,12 +94,12 @@ pub fn probe_and_render(
     // the module's attach enforces.
     #[cfg(feature = "vpp-offload")]
     if !vpp_ports.is_empty() {
-        for cap in packetframe_vpp_offload::run_feasibility_probes(vpp_ports) {
+        for cap in packetframe_vpp_offload::run_feasibility_probes(vpp_ports, vpp_binary) {
             report.capabilities.push(cap);
         }
     }
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = vpp_ports;
+    let _ = (vpp_ports, vpp_binary);
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.

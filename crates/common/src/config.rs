@@ -969,6 +969,20 @@ impl Config {
             }
         }
 
+        // An empty section is a config error, not a staging state.
+        // Previously it parsed clean here while `VppOffloadModule::load`
+        // rejected it, so `packetframe feasibility` could report PASS
+        // with no hint that VPP was configured while `packetframe run`
+        // refused the same file. One verdict, at the earliest point
+        // that can give it.
+        if ports.is_empty() {
+            return Err(ConfigError::parse(
+                0,
+                "module vpp-offload declares no `port` lines; remove the section or give it \
+                 at least one port (membership must cover every possible egress port)",
+            ));
+        }
+
         let Some(fp) = fast_path else {
             return Err(ConfigError::parse(
                 0,
@@ -2759,6 +2773,15 @@ module fast-path
         // Duplicate port line: rejected.
         let dup = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n  port eth4 cores 2 steer off\n";
         assert!(Config::parse(dup).unwrap().validate_vpp_offload().is_err());
+
+        // Empty section: rejected here, so `feasibility` and `run`
+        // reach the same verdict on the same file.
+        let empty = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  expected-routes 100\n";
+        let err = Config::parse(empty)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(format!("{err}").contains("no `port` lines"), "{err}");
     }
 
     #[test]

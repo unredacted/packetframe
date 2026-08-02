@@ -11,12 +11,17 @@ use std::path::Path;
 
 use packetframe_common::probe::Capability;
 
-pub(crate) fn run(ports: &[String]) -> Vec<Capability> {
+pub(crate) fn run(ports: &[String], vpp_binary: Option<&str>) -> Vec<Capability> {
     let mut caps = Vec::with_capacity(4 + ports.len());
     caps.push(probe_iommu());
     caps.push(probe_vfio());
     caps.push(probe_hugepages());
-    caps.push(probe_vpp_binary(None));
+    // Probe the binary the module will ACTUALLY exec. Probing the
+    // defaults while the config names another path would report a pass
+    // for an executable we never run (or a failure for one that
+    // exists) — a capability line describing a different program than
+    // the module uses is worse than no line.
+    caps.push(probe_vpp_binary(vpp_binary));
     for iface in ports {
         caps.push(probe_sriov(iface));
     }
@@ -106,15 +111,22 @@ fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
     };
     for c in &candidates {
         if Path::new(c).exists() {
-            return Capability::pass("vpp.binary", c.clone(), false);
+            let note = if override_path.is_some() {
+                " (from `vpp-binary`)"
+            } else {
+                " (default path)"
+            };
+            return Capability::pass("vpp.binary", format!("{c}{note}"), false);
         }
     }
+    let hint = if override_path.is_some() {
+        "configured via `vpp-binary`"
+    } else {
+        "install the pinned VPP package (see vpp-offload runbook), or set `vpp-binary`"
+    };
     Capability::fail(
         "vpp.binary",
-        format!(
-            "not found at {} — install the pinned VPP package (see vpp-offload runbook)",
-            candidates.join(" or ")
-        ),
+        format!("not found at {} — {hint}", candidates.join(" or ")),
         false,
     )
 }

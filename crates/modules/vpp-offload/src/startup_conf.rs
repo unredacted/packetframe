@@ -130,9 +130,14 @@ pub fn render(
     // 64K-page kernel: state the page sizes explicitly rather than
     // letting VPP's init assume 4K-host defaults (plan v5 gate-0b
     // item; rendering it unconditionally is harmless on 4K hosts).
+    // Ceiling, not truncation: the hugepage budget is checked against
+    // the exact byte figure, so a floor-rounded MiB value would hand
+    // VPP a smaller heap than the reservation advertises (the default
+    // 1.4M-route sizing loses 384 KiB to `>> 20`). Always round up —
+    // over-reserving is free, under-heaping is a runtime failure.
     out.push_str(&format!(
         "memory {{\n  main-heap-size {}M\n  main-heap-page-size default-hugepage\n}}\n",
-        sizing.main_heap_bytes >> 20
+        sizing.main_heap_bytes.div_ceil(1 << 20)
     ));
     let _ = hugepage_bytes; // recorded in the header comment path later; kept as input for stability
     out.push_str("buffers {\n  buffers-per-numa 65536\n  default data-size 2048\n}\n");
@@ -218,7 +223,29 @@ mod tests {
             !conf.contains("linux-cp") && !conf.contains("lcp"),
             "linux-cp must stay out (cannot pair kernel-owned PFs)"
         );
-        // Heap renders in MiB and matches the sizing.
-        assert!(conf.contains(&format!("main-heap-size {}M", sizing.main_heap_bytes >> 20)));
+        // Heap renders in MiB, rounded UP so VPP never gets less than
+        // the reservation promised.
+        let rendered_mib = sizing.main_heap_bytes.div_ceil(1 << 20);
+        assert!(conf.contains(&format!("main-heap-size {rendered_mib}M")));
+        assert!(
+            (rendered_mib << 20) >= sizing.main_heap_bytes,
+            "rendered heap {rendered_mib} MiB must not be below the derived {} bytes",
+            sizing.main_heap_bytes
+        );
+    }
+
+    #[test]
+    fn heap_render_never_rounds_below_derived() {
+        // Sweep route counts that produce non-MiB-aligned heaps; the
+        // rendered value must always cover the derived requirement.
+        for routes in [1u64, 7, 1_399_999, 1_400_000, 1_400_001, 2_000_003] {
+            let s = derive_sizing(routes).unwrap();
+            let mib = s.main_heap_bytes.div_ceil(1 << 20);
+            assert!(
+                (mib << 20) >= s.main_heap_bytes,
+                "routes={routes}: rendered {mib} MiB < derived {} bytes",
+                s.main_heap_bytes
+            );
+        }
     }
 }

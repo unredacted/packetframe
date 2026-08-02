@@ -194,19 +194,63 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         state_dir: &config.global.state_dir,
     };
 
-    for (name, module) in &mut modules {
+    // Index of the last module whose `attach` succeeded, so a failure
+    // partway through a multi-module config can unwind.
+    //
+    // Without this, module N's attach failure exits startup with
+    // modules 0..N still attached — and because bpffs pins deliberately
+    // survive the process (§8.5), the data plane keeps forwarding with
+    // no daemon while the next start refuses the orphaned pins. That is
+    // exactly the crash-loop-with-frozen-FIB failure that hit
+    // production twice on 2026-07-31/08-01, arriving through a
+    // different door. Multi-module configs became reachable with the
+    // vpp-offload module, so the unwind is no longer hypothetical.
+    let mut attached: Vec<usize> = Vec::new();
+    macro_rules! unwind_attached {
+        ($modules:expr, $attached:expr, $failed:expr) => {
+            for idx in $attached.iter().rev() {
+                let (n, m): &mut (String, Box<dyn Module>) = &mut $modules[*idx];
+                match m.detach() {
+                    Ok(()) => tracing::warn!(
+                        module = %n,
+                        failed_module = %$failed,
+                        "rolled back attach after a later module failed"
+                    ),
+                    Err(e) => tracing::error!(
+                        module = %n,
+                        error = %e,
+                        "ROLLBACK FAILED: this module is still attached with no daemon; \
+                         run `packetframe detach --all` before starting again"
+                    ),
+                }
+            }
+        };
+    }
+
+    for i in 0..modules.len() {
+        let name = modules[i].0.clone();
         let section = config
             .modules
             .iter()
-            .find(|m| &m.name == name)
+            .find(|m| m.name == name)
             .expect("module name resolves");
         let mcfg = ModuleConfig::new(section, &config.global);
-        module
-            .load(&mcfg, &ctx)
-            .map_err(|e: ModuleError| RunError::Startup(e.to_string()))?;
-        let attachments = module
-            .attach(&mcfg)
-            .map_err(|e: ModuleError| RunError::Runtime(e.to_string()))?;
+        let module = &mut modules[i].1;
+        if let Err(e) = module.load(&mcfg, &ctx) {
+            unwind_attached!(modules, attached, name);
+            return Err(RunError::Startup(e.to_string()));
+        }
+        let attachments = match module.attach(&mcfg) {
+            Ok(a) => {
+                attached.push(i);
+                a
+            }
+            Err(e) => {
+                unwind_attached!(modules, attached, name);
+                return Err(RunError::Runtime(e.to_string()));
+            }
+        };
+        let module = &mut modules[i].1;
 
         // Persist the pin registry so `packetframe detach` has
         // something to look at post-exit. Pinning itself is PR #6.
