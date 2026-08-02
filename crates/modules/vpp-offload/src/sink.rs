@@ -22,7 +22,17 @@
 //! mark), or `Unresolvable` (its nexthop device maps to nothing VPP
 //! owns). The two degraded counts page differently — `Unresolvable` is a
 //! misconfigured mapping, `Withheld` is the table outgrowing the box —
-//! and conflating them would hide whichever is rarer.
+//! and conflating them would hide whichever is rarer. Both, however,
+//! mean the FIB is incomplete, so both block *first-attach* steering:
+//! MCAM diverts by allowlist, not by what the ledger managed to install,
+//! and a diverted packet can no longer fall back to the eBPF tier.
+//!
+//! **Nothing is recorded as installed until VPP says so.** A fourth,
+//! transient `Installing` state covers the window between handing an op
+//! to the transport and hearing back. It holds a capacity slot — so one
+//! drained batch cannot oversubscribe the table — but is excluded from
+//! readback verification, and a rejection unwinds it to whatever is
+//! genuinely still in VPP.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -113,32 +123,74 @@ pub enum NotInstalled {
     Unresolvable,
 }
 
-/// Three-valued route state. See the module docs.
+/// Route state. See the module docs for the three terminal values;
+/// `Installing` is the transient added so the ledger never claims a
+/// route is in VPP before the transport says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteState {
+    /// VPP has acknowledged this route.
     Installed,
+    /// Handed to the transport, not yet acknowledged. Holds a capacity
+    /// slot (so a batch in flight cannot oversubscribe the table) but is
+    /// **not** eligible for readback verification.
+    ///
+    /// `replacing` records whether a previous version of this route is
+    /// still live in VPP, which is what a failed install has to fall
+    /// back to: a rejected *replacement* leaves the old route
+    /// forwarding, while a rejected *first* install leaves nothing.
+    Installing {
+        replacing: bool,
+    },
     NotInstalled(NotInstalled),
 }
 
 /// Per-state totals, exported as `packetframe_vpp_*` gauges and folded
 /// into the readback-verify pass criteria.
+///
+/// Maintained incrementally by [`RouteLedger`] rather than recomputed:
+/// a full-table load runs ~1.3M classifications, so an O(n) recount per
+/// route would be quadratic — on the order of 10^12 state visits before
+/// steering could be enabled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SinkCounts {
     pub installed: u64,
+    pub installing: u64,
     pub withheld: u64,
     pub unresolvable: u64,
 }
 
 impl SinkCounts {
-    /// `unresolvable > 0` is Degraded health and **blocks first-attach
-    /// steering**: if we cannot install the table, we must not divert
-    /// traffic into it. Withheld routes are a softer signal — the table
-    /// is incomplete but what is installed is correct — so they alarm
-    /// without blocking.
+    /// Whether first-attach steering must be blocked.
+    ///
+    /// **Any** route we know about but have not installed blocks it.
+    /// MCAM steering inherits the fast-path *allowlist*, not this
+    /// ledger's installed subset — so a steered packet whose route is
+    /// missing from VPP's FIB is dropped or follows a less-specific
+    /// covering route, and it can no longer fall back to the eBPF tier
+    /// because the hardware already diverted it. That is true whether
+    /// the route is missing because its nexthop device is unmapped
+    /// (`unresolvable`) or because the table outgrew its heap
+    /// (`withheld`); an earlier revision treated withheld as merely
+    /// alarming, which would have blackholed exactly the prefixes that
+    /// did not fit.
+    ///
+    /// `installing` counts too: a table still in flight is an
+    /// incomplete table. In the normal pipeline (resync → verify →
+    /// steer) it has drained to zero by the time steering is
+    /// considered.
+    ///
+    /// This deliberately governs only **first-attach**. Once traffic is
+    /// steered, a single later withheld route must not tear steering
+    /// down — unsteering a mostly-correct VPP is worse than the gap.
     pub fn blocks_first_steer(&self) -> bool {
-        self.unresolvable > 0
+        self.unresolvable > 0 || self.withheld > 0 || self.installing > 0
     }
 
+    /// Health signal. Coincides with [`Self::blocks_first_steer`] on the
+    /// terminal states by design — both mean "the FIB is incomplete" —
+    /// but the two are reported separately because they answer different
+    /// questions, and because `withheld` and `unresolvable` page
+    /// differently: table-outgrew-the-box versus misconfigured mapping.
     pub fn degraded(&self) -> bool {
         self.unresolvable > 0 || self.withheld > 0
     }
@@ -301,11 +353,24 @@ impl PendingMap {
     }
 }
 
-/// Tracks which prefixes are installed / withheld / unresolvable and
-/// decides what each pending op should become.
+/// Tracks per-prefix state and decides what each pending op becomes.
+///
+/// **Two-phase by construction.** [`Self::classify_upsert`] decides and
+/// *reserves*, but only [`Self::commit_installed`] may record a route as
+/// present in VPP. Nothing else is honest: `PendingMap` exists precisely
+/// because the transport can reject an op, and a ledger that marked
+/// routes installed at classification time would report a FIB it never
+/// confirmed, feed unconfirmed prefixes to readback verification, and
+/// hold capacity slots for routes VPP never accepted — so one
+/// path-specific rejection loop could leave VPP nearly empty while
+/// unrelated valid routes were withheld for lack of headroom.
+///
+/// Counters are maintained incrementally. Recomputing them per
+/// classification made a full-table load quadratic.
 #[derive(Debug)]
 pub struct RouteLedger {
     state: BTreeMap<PrefixKey, RouteState>,
+    counts: SinkCounts,
     capacity: Capacity,
 }
 
@@ -313,6 +378,7 @@ impl RouteLedger {
     pub fn new(capacity: Capacity) -> Self {
         Self {
             state: BTreeMap::new(),
+            counts: SinkCounts::default(),
             capacity,
         }
     }
@@ -321,29 +387,59 @@ impl RouteLedger {
         self.state.get(&prefix.into()).copied()
     }
 
+    /// O(1) — see the type docs.
     pub fn counts(&self) -> SinkCounts {
-        let mut c = SinkCounts::default();
-        for st in self.state.values() {
-            match st {
-                RouteState::Installed => c.installed += 1,
-                RouteState::NotInstalled(NotInstalled::Withheld) => c.withheld += 1,
-                RouteState::NotInstalled(NotInstalled::Unresolvable) => c.unresolvable += 1,
-            }
+        self.counts
+    }
+
+    fn tally(counts: &mut SinkCounts, st: RouteState, add: bool) {
+        let slot = match st {
+            RouteState::Installed => &mut counts.installed,
+            RouteState::Installing { .. } => &mut counts.installing,
+            RouteState::NotInstalled(NotInstalled::Withheld) => &mut counts.withheld,
+            RouteState::NotInstalled(NotInstalled::Unresolvable) => &mut counts.unresolvable,
+        };
+        // Only ever decrements a state just read out of the map, so it
+        // cannot underflow; debug_assert makes a future refactor that
+        // breaks that pairing fail loudly instead of wrapping.
+        if add {
+            *slot += 1;
+        } else {
+            debug_assert!(*slot > 0, "counter underflow for {st:?}");
+            *slot -= 1;
         }
-        c
     }
 
-    fn installed_count(&self) -> u64 {
-        self.state
-            .values()
-            .filter(|s| matches!(s, RouteState::Installed))
-            .count() as u64
+    fn set_state(&mut self, key: PrefixKey, st: RouteState) {
+        if let Some(old) = self.state.insert(key, st) {
+            Self::tally(&mut self.counts, old, false);
+        }
+        Self::tally(&mut self.counts, st, true);
     }
 
-    /// Decide the outcome of an upsert. Resolution is checked *before*
-    /// capacity: a route with no VPP-reachable nexthop is unresolvable
-    /// whether or not there is headroom, and calling it `Withheld` would
-    /// make it retry forever on every capacity change.
+    fn clear_state(&mut self, key: PrefixKey) -> Option<RouteState> {
+        let old = self.state.remove(&key)?;
+        Self::tally(&mut self.counts, old, false);
+        Some(old)
+    }
+
+    /// Capacity slots in use: installed plus in-flight. Counting
+    /// in-flight routes is what stops a single drained batch from
+    /// oversubscribing the table before any of it is acknowledged.
+    fn occupied(&self) -> u64 {
+        self.counts.installed + self.counts.installing
+    }
+
+    /// Decide the outcome of an upsert and reserve a slot for it.
+    ///
+    /// Resolution is checked *before* capacity: a route with no
+    /// VPP-reachable nexthop is unresolvable whether or not there is
+    /// headroom, and calling it `Withheld` would make it retry forever
+    /// on every capacity change.
+    ///
+    /// A resolvable route lands in [`RouteState::Installing`]; the
+    /// caller must follow the transport's answer with
+    /// [`Self::commit_installed`] or [`Self::fail_install`].
     pub fn classify_upsert(
         &mut self,
         prefix: IpPrefix,
@@ -354,27 +450,62 @@ impl RouteLedger {
         let key = PrefixKey::from(prefix);
         if targets.is_empty() {
             let st = RouteState::NotInstalled(NotInstalled::Unresolvable);
-            self.state.insert(key, st);
+            self.set_state(key, st);
             return (st, targets);
         }
-        // An already-installed prefix keeps its slot on replace — a
+        // A prefix that already holds a slot keeps it on replace — a
         // route update must not be withheld just because the table sits
         // at the mark, or steady-state churn would silently erode the
         // installed set.
-        let already = matches!(self.state.get(&key), Some(RouteState::Installed));
-        if already || self.capacity.has_headroom(self.installed_count()) {
-            self.state.insert(key, RouteState::Installed);
-            (RouteState::Installed, targets)
-        } else {
-            let st = RouteState::NotInstalled(NotInstalled::Withheld);
-            self.state.insert(key, st);
-            (st, targets)
+        let prior = self.state.get(&key).copied();
+        let st = match prior {
+            Some(RouteState::Installed) | Some(RouteState::Installing { replacing: true }) => {
+                RouteState::Installing { replacing: true }
+            }
+            Some(RouteState::Installing { replacing: false }) => {
+                RouteState::Installing { replacing: false }
+            }
+            _ if self.capacity.has_headroom(self.occupied()) => {
+                RouteState::Installing { replacing: false }
+            }
+            _ => RouteState::NotInstalled(NotInstalled::Withheld),
+        };
+        self.set_state(key, st);
+        (st, targets)
+    }
+
+    /// VPP acknowledged the route.
+    pub fn commit_installed(&mut self, prefix: IpPrefix) {
+        let key = PrefixKey::from(prefix);
+        if matches!(self.state.get(&key), Some(RouteState::Installing { .. })) {
+            self.set_state(key, RouteState::Installed);
+        }
+    }
+
+    /// The transport rejected the route.
+    ///
+    /// A rejected **replacement** falls back to `Installed`: the prior
+    /// version is still live in VPP, so claiming otherwise would drop a
+    /// forwarding route out of the verify pool. A rejected **first**
+    /// install is forgotten outright, releasing its slot so the headroom
+    /// it reserved becomes available to routes that can use it. The
+    /// retry intent lives in [`PendingMap`], not here.
+    pub fn fail_install(&mut self, prefix: IpPrefix) {
+        let key = PrefixKey::from(prefix);
+        match self.state.get(&key) {
+            Some(RouteState::Installing { replacing: true }) => {
+                self.set_state(key, RouteState::Installed)
+            }
+            Some(RouteState::Installing { replacing: false }) => {
+                self.clear_state(key);
+            }
+            _ => {}
         }
     }
 
     /// Forget a prefix on withdrawal.
     pub fn forget(&mut self, prefix: IpPrefix) {
-        self.state.remove(&prefix.into());
+        self.clear_state(prefix.into());
     }
 
     /// Prefixes eligible for retry once headroom returns. Excludes
@@ -388,15 +519,26 @@ impl RouteLedger {
             .collect()
     }
 
-    /// Sampling pool for readback verification: only prefixes that
-    /// *should* be in VPP's FIB. Verifying against withheld or
-    /// unresolvable prefixes would fail by design.
+    /// Sampling pool for readback verification: only prefixes VPP has
+    /// **confirmed**. Withheld and unresolvable prefixes would fail by
+    /// design; in-flight ones would race the transport.
     pub fn verifiable_prefixes(&self) -> Vec<IpPrefix> {
         self.state
             .iter()
             .filter(|(_, st)| **st == RouteState::Installed)
             .map(|(k, _)| (*k).into())
             .collect()
+    }
+
+    /// Recompute counts by scanning. Test-only cross-check against the
+    /// incrementally maintained figures.
+    #[cfg(test)]
+    fn counts_by_scan(&self) -> SinkCounts {
+        let mut c = SinkCounts::default();
+        for st in self.state.values() {
+            Self::tally(&mut c, *st, true);
+        }
+        c
     }
 }
 
@@ -573,17 +715,90 @@ mod tests {
         assert!(led.withheld_prefixes().is_empty());
     }
 
+    /// classify + acknowledge, the ordinary success path.
+    fn install(led: &mut RouteLedger, p: IpPrefix, nexthops: &[IpAddr], map: &NexthopMap) {
+        led.classify_upsert(p, nexthops, map);
+        led.commit_installed(p);
+    }
+
     #[test]
     fn installs_are_withheld_above_the_high_water_mark() {
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(2));
+        for i in 0..4u8 {
+            install(&mut led, v4(10, i, 0, 0, 16), &[nh(192, 0, 2, 1)], &map);
+        }
+        let c = led.counts();
+        assert_eq!(c.installed, 2);
+        assert_eq!(c.withheld, 2);
+        assert_eq!(led.withheld_prefixes().len(), 2);
+    }
+
+    #[test]
+    fn in_flight_routes_hold_capacity_slots() {
+        // A drained batch must not oversubscribe the table before any of
+        // it is acknowledged: classification alone consumes headroom.
         let map = member_map();
         let mut led = RouteLedger::new(Capacity::new(2));
         for i in 0..4u8 {
             led.classify_upsert(v4(10, i, 0, 0, 16), &[nh(192, 0, 2, 1)], &map);
         }
         let c = led.counts();
-        assert_eq!(c.installed, 2);
+        assert_eq!(c.installing, 2, "only two slots exist");
+        assert_eq!(c.installed, 0, "nothing acknowledged yet");
         assert_eq!(c.withheld, 2);
-        assert_eq!(led.withheld_prefixes().len(), 2);
+    }
+
+    #[test]
+    fn classification_alone_never_reports_installed() {
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(10));
+        let p = v4(10, 0, 0, 0, 8);
+        let (st, _) = led.classify_upsert(p, &[nh(192, 0, 2, 1)], &map);
+        assert_eq!(st, RouteState::Installing { replacing: false });
+        assert_eq!(led.counts().installed, 0);
+        assert!(
+            led.verifiable_prefixes().is_empty(),
+            "in-flight routes must not be verified — that races the transport"
+        );
+
+        led.commit_installed(p);
+        assert_eq!(led.state_of(p), Some(RouteState::Installed));
+        assert_eq!(led.verifiable_prefixes(), vec![p]);
+    }
+
+    #[test]
+    fn rejected_first_install_releases_its_slot() {
+        // Otherwise a persistent path-specific failure would hold
+        // capacity hostage and withhold unrelated valid routes.
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(1));
+        let bad = v4(10, 0, 0, 0, 8);
+        let good = v4(10, 1, 0, 0, 16);
+        led.classify_upsert(bad, &[nh(192, 0, 2, 1)], &map);
+        led.fail_install(bad);
+        assert_eq!(led.state_of(bad), None);
+        assert_eq!(led.counts(), SinkCounts::default());
+
+        install(&mut led, good, &[nh(192, 0, 2, 1)], &map);
+        assert_eq!(led.counts().installed, 1);
+    }
+
+    #[test]
+    fn rejected_replacement_falls_back_to_the_live_route() {
+        // VPP still holds the previous version, so dropping the prefix
+        // would take a forwarding route out of the verify pool.
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(10));
+        let p = v4(10, 0, 0, 0, 8);
+        install(&mut led, p, &[nh(192, 0, 2, 1)], &map);
+
+        let (st, _) = led.classify_upsert(p, &[nh(192, 0, 2, 2)], &map);
+        assert_eq!(st, RouteState::Installing { replacing: true });
+        led.fail_install(p);
+        assert_eq!(led.state_of(p), Some(RouteState::Installed));
+        assert_eq!(led.counts().installed, 1);
+        assert_eq!(led.verifiable_prefixes(), vec![p]);
     }
 
     #[test]
@@ -593,9 +808,8 @@ mod tests {
         let map = member_map();
         let mut led = RouteLedger::new(Capacity::new(1));
         let p = v4(10, 0, 0, 0, 8);
-        led.classify_upsert(p, &[nh(192, 0, 2, 1)], &map);
-        assert_eq!(led.state_of(p), Some(RouteState::Installed));
-        led.classify_upsert(p, &[nh(192, 0, 2, 2)], &map);
+        install(&mut led, p, &[nh(192, 0, 2, 1)], &map);
+        install(&mut led, p, &[nh(192, 0, 2, 2)], &map);
         assert_eq!(led.state_of(p), Some(RouteState::Installed));
         assert_eq!(led.counts().installed, 1);
     }
@@ -606,38 +820,101 @@ mod tests {
         let mut led = RouteLedger::new(Capacity::new(1));
         let a = v4(10, 0, 0, 0, 8);
         let b = v4(10, 1, 0, 0, 16);
-        led.classify_upsert(a, &[nh(192, 0, 2, 1)], &map);
-        led.classify_upsert(b, &[nh(192, 0, 2, 1)], &map);
+        install(&mut led, a, &[nh(192, 0, 2, 1)], &map);
+        install(&mut led, b, &[nh(192, 0, 2, 1)], &map);
         assert_eq!(led.counts().withheld, 1);
 
         led.forget(a);
-        led.classify_upsert(b, &[nh(192, 0, 2, 1)], &map);
+        install(&mut led, b, &[nh(192, 0, 2, 1)], &map);
         assert_eq!(led.counts().installed, 1);
         assert_eq!(led.counts().withheld, 0);
     }
 
     #[test]
-    fn unresolvable_blocks_first_steer_but_withheld_only_alarms() {
+    fn any_uninstalled_route_blocks_first_steer() {
+        // Steering inherits the fast-path ALLOWLIST, not the installed
+        // subset, so a steered packet whose route is missing from VPP is
+        // dropped or takes a covering route — and cannot fall back to
+        // the eBPF tier, because the hardware already diverted it. That
+        // holds for withheld exactly as for unresolvable.
         let map = member_map();
         let mut led = RouteLedger::new(Capacity::new(1));
-        led.classify_upsert(v4(10, 0, 0, 0, 8), &[nh(192, 0, 2, 1)], &map);
-        led.classify_upsert(v4(10, 1, 0, 0, 16), &[nh(192, 0, 2, 1)], &map);
-        let c = led.counts();
-        assert!(!c.blocks_first_steer(), "withheld alone must not block");
-        assert!(c.degraded(), "but it is still degraded");
+        install(&mut led, v4(10, 0, 0, 0, 8), &[nh(192, 0, 2, 1)], &map);
+        assert!(!led.counts().blocks_first_steer(), "complete table is fine");
 
-        led.classify_upsert(v4(10, 2, 0, 0, 16), &[nh(192, 0, 2, 9)], &map);
+        install(&mut led, v4(10, 1, 0, 0, 16), &[nh(192, 0, 2, 1)], &map);
+        let c = led.counts();
+        assert_eq!(c.withheld, 1);
+        assert!(c.blocks_first_steer(), "withheld blackholes those prefixes");
+        assert!(c.degraded());
+
+        install(&mut led, v4(10, 2, 0, 0, 16), &[nh(192, 0, 2, 9)], &map);
         assert!(led.counts().blocks_first_steer());
     }
 
     #[test]
-    fn verify_pool_contains_only_installed_prefixes() {
+    fn in_flight_table_blocks_first_steer() {
         let map = member_map();
-        let mut led = RouteLedger::new(Capacity::new(1));
+        let mut led = RouteLedger::new(Capacity::new(10));
+        let p = v4(10, 0, 0, 0, 8);
+        led.classify_upsert(p, &[nh(192, 0, 2, 1)], &map);
+        assert!(
+            led.counts().blocks_first_steer(),
+            "a table still in flight is an incomplete table"
+        );
+        led.commit_installed(p);
+        assert!(!led.counts().blocks_first_steer());
+    }
+
+    #[test]
+    fn verify_pool_contains_only_confirmed_prefixes() {
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(2));
         let good = v4(10, 0, 0, 0, 8);
-        led.classify_upsert(good, &[nh(192, 0, 2, 1)], &map);
-        led.classify_upsert(v4(10, 1, 0, 0, 16), &[nh(192, 0, 2, 1)], &map); // withheld
-        led.classify_upsert(v4(10, 2, 0, 0, 16), &[nh(192, 0, 2, 9)], &map); // unresolvable
+        install(&mut led, good, &[nh(192, 0, 2, 1)], &map);
+        led.classify_upsert(v4(10, 3, 0, 0, 16), &[nh(192, 0, 2, 1)], &map); // in flight
+        install(&mut led, v4(10, 1, 0, 0, 16), &[nh(192, 0, 2, 1)], &map); // withheld
+        install(&mut led, v4(10, 2, 0, 0, 16), &[nh(192, 0, 2, 9)], &map); // unresolvable
         assert_eq!(led.verifiable_prefixes(), vec![good]);
+    }
+
+    #[test]
+    fn counters_track_a_long_mixed_transition_sequence() {
+        // The incremental counters replaced an O(n) rescan per
+        // classification. This checks they stay identical to a full
+        // scan across every transition the ledger supports — and the
+        // 20k loop would crawl if the quadratic recount came back.
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(8_000));
+        for i in 0..20_000u32 {
+            let p = v4(10, (i >> 8) as u8, (i & 0xff) as u8, 0, 24);
+            // Rotate through reachable, unreachable, commit, reject and
+            // withdraw so no state is left untouched.
+            match i % 5 {
+                0 => install(&mut led, p, &[nh(192, 0, 2, 1)], &map),
+                1 => install(&mut led, p, &[nh(192, 0, 2, 9)], &map),
+                2 => {
+                    led.classify_upsert(p, &[nh(192, 0, 2, 1)], &map);
+                    led.fail_install(p);
+                }
+                3 => {
+                    install(&mut led, p, &[nh(192, 0, 2, 1)], &map);
+                    led.forget(p);
+                }
+                _ => {
+                    led.classify_upsert(p, &[nh(192, 0, 2, 2)], &map);
+                }
+            }
+        }
+        assert_eq!(
+            led.counts(),
+            led.counts_by_scan(),
+            "incremental counters drifted from the ledger contents"
+        );
+        let c = led.counts();
+        assert_eq!(
+            c.installed + c.installing + c.withheld + c.unresolvable,
+            led.state.len() as u64
+        );
     }
 }
