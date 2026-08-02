@@ -611,7 +611,21 @@ jobs:
           printf 'installing: %s\n' "${debs[@]}"
           # `apt-get install ./*.deb` (not `dpkg -i`) so unmet
           # dependencies fail loudly here rather than on a router.
-          DEBIAN_FRONTEND=noninteractive apt-get install -y "${debs[@]}"
+          #
+          # VPP_INSTALL_SKIP_SYSCTL is upstream's own knob (read the
+          # postinst: "Allow for a nerd knob to skip this, e.g. during
+          # the container installs"). Without it, vpp.postinst runs
+          # `sysctl --system`: in this container that dies on a missing
+          # sysctl binary — and installing procps would only trade that
+          # for an EPERM on the container's read-only /proc/sys/vm. The
+          # knob is ALSO mandatory on the fleet, for a harsher reason:
+          # the deb ships vm.nr_hugepages=1024 written for 2MB pages,
+          # and on the routers' 64K-page kernel (512MB default
+          # hugepages) applying it requests 512 GiB of hugepages on a
+          # 64 GB box, at install time. See the spike runbook's install
+          # section.
+          DEBIAN_FRONTEND=noninteractive VPP_INSTALL_SKIP_SYSCTL=1 \
+            apt-get install -y "${debs[@]}"
           command -v vpp || { echo "::error::no vpp on PATH after install"; exit 1; }
 
       - name: Verify the INSTALLED binary

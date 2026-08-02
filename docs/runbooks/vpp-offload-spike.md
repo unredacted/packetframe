@@ -201,43 +201,66 @@ gh release download "vpp-${ref}-${plat:-generic}-bullseye-arm64" \
   --repo unredacted/packetframe --dir /tmp/vpp
 ```
 
-**Read the dependency lines before installing anything.** The libnl
-divergence above lives at install time too, in a milder form: runtime
-deps are normally `>=` constraints, which UniFi's *newer* `3.4.0-8+ubnt`
-satisfies — but an `=` pin would be the same wall moved later. Check
-**every** package, not just the main one: `vpp-plugin-dpdk` and the
-`-dev` packages carry their own dependency sets, and the plugin package
-is the one that pulls DPDK's libraries.
+**The install-time libnl question is ANSWERED (2026-08-02, read from
+the built deb's control):** `vpp` depends on `libnl-3-200 (>= 3.2.7)`
+and `libnl-route-3-200 (>= 3.2.26)` — `>=` constraints, which UniFi's
+*newer* `3.4.0-8+ubnt` satisfies. The wall that kills the on-box
+*build* (libnl-3-dev's exact-version pin) does not exist at install
+time. The check below stays for future pins — an `=` could appear in
+any new version. Check **every** package, not just the main one:
 
 ```sh
 for d in /tmp/vpp/*.deb; do echo "== $d"; dpkg -I "$d" | grep -i '^ *depends'; done
 ```
 
-Then install with `apt-get install` rather than `dpkg -i`, so an unmet
-dependency fails loudly instead of leaving a half-configured package:
+### Two traps in vpp.postinst — handle BOTH before installing
+
+Read from the shipped postinst, not guessed:
+
+**1. It applies `sysctl --system`, and the deb ships
+`vm.nr_hugepages=1024` written for 2 MB pages.** On this fleet's
+64K-page kernel the default hugepage size is **512 MB**, so letting it
+run asks the kernel for **512 GiB of hugepages on a 64 GB router, at
+install time** — the kernel grabs what it can, which is a
+memory-eating event on a production box. Upstream ships its own
+escape hatch (`VPP_INSTALL_SKIP_SYSCTL`, quoted in the postinst as a
+"nerd knob... e.g. during the container installs"); on this fleet it
+is **mandatory, always**. Hugepages are managed deliberately — by the
+vpp-offload module in production, by hand in this spike — never by a
+package hook.
+
+**2. It STARTS `vpp.service` during install** (`deb-systemd-invoke
+start`) on the stock `/etc/vpp/startup.conf`. Masking *after* install
+is therefore too late — the daemon has already run once by then. Mask
+**first**; the postinst's own unmask only touches masks the packaging
+helper itself created, so an operator mask survives install.
+
+The full sequence — stop, then mask, then install, and the install is
+gated on the mask having succeeded (`&&`), because installing past a
+failed mask is exactly the daemon-starts-during-install trap:
 
 ```sh
-cd /tmp/vpp && apt-get install -y ./*.deb && command -v vpp && vpp --version
-```
-
-### Stop the packaged service before the manual bring-up
-
-Installing VPP's `.deb` brings its systemd unit with it, and the
-packaged daemon may start on the stock `/etc/vpp/startup.conf`. That
-matters here because §3 starts VPP **by hand** on a spike config: two
-instances contend for the same hugepages, VF, and API socket, and the
-second one's failure looks like a config or mailbox problem rather than
-what it is. `pkill vpp` will not settle it either — systemd restarts
-the unit underneath you.
-
-```sh
+# Stop tolerates a unit that does not exist yet (first install);
+# mask does not get that tolerance — if IT fails, do not install.
+# Mask alone is not enough on a rerun: it only blocks future
+# activations, and an already-running daemon keeps holding the
+# hugepages, VF, and API socket right through the install.
 systemctl stop vpp.service 2>/dev/null || true
-systemctl mask vpp.service          # survives a package reconfigure
+systemctl mask vpp.service \
+  && cd /tmp/vpp && VPP_INSTALL_SKIP_SYSCTL=1 apt-get install -y ./*.deb \
+  && command -v vpp && vpp --version
+cat /proc/sys/vm/nr_hugepages        # belt-and-braces: must be UNCHANGED
+pgrep -a vpp || echo "no vpp running — correct"
 ```
 
-Unmask at cleanup (`systemctl unmask vpp.service`) if you intend to
-leave the box able to run the packaged daemon. For the spike, staying
-masked is the safer state — nothing should start VPP except you.
+(`apt-get install`, not `dpkg -i`, so an unmet dependency fails loudly
+instead of leaving a half-configured package.)
+
+Unmask at cleanup (`systemctl unmask vpp.service`) only if you intend
+to leave the box able to run the packaged daemon. For the spike,
+staying masked is the safer state — nothing should start VPP except
+you, and §3 starting a second instance against a stock-config daemon
+reads as a config or mailbox failure rather than what it is.
 
 ### What CI already proved, so you needn't re-check
 
