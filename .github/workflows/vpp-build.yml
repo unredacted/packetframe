@@ -217,18 +217,93 @@ jobs:
             exit 1
           fi
 
+      # VPP's DPDK recipe disables the ENTIRE cnxk family by default —
+      # `common/cnxk`, `net/cnxk`, `mempool/cnxk`, `crypto/cnxk` all
+      # appear in DPDK_DRIVERS_DISABLED, and `cnxk` in
+      # DPDK_LIBS_DISABLED. That is upstream's choice for a portable
+      # build, and it is why the first artifact carried no Octeon
+      # driver at all: not a packaging accident, and not something a
+      # different VPP version fixes, because the disable list is
+      # long-standing. VPP 26.06 also has no native `dev_octeon` — its
+      # vpp_drivers/ ships atlantic, iavf and ige only — so DPDK's cnxk
+      # PMD is the only way this VPP can reach an Octeon NIC.
+      #
+      # Re-enabling it is a BUILD-CONFIG override, not a patch: the
+      # source tree stays verbatim (the clone step still asserts a
+      # clean working tree), we only pass different make variables.
+      #
+      # Derived from the pinned tree rather than hardcoded, so the rest
+      # of upstream's disable list keeps whatever upstream decides it
+      # should be across version bumps; we subtract cnxk and nothing
+      # else. Enabled unconditionally rather than under the cn9k
+      # platform, because `platform` means CPU TUNING here — a generic
+      # armv8-a build still has to drive this fleet's NIC.
+      - name: Re-enable the cnxk driver family in DPDK
+        run: |
+          set -euo pipefail
+          cd /vpp/build/external
+          # Ask make for the EFFECTIVE lists rather than parsing the
+          # .mk. Parsing is wrong here in a way that is easy to miss:
+          # the base lists are `:=` continued over ~40 backslashed
+          # lines, and dpdk.mk then APPENDS to them conditionally
+          # (net/tap, net/failsafe, and the mlx family, depending on
+          # DPDK_*_PMD). A file-scraped base list would silently drop
+          # those and enable drivers upstream meant to stay off.
+          # Including the real Makefile evaluates all of it, including
+          # the package versions dpdk.mk requires to parse at all.
+          # printf, not a heredoc: make demands a literal TAB to start a
+          # recipe line, and a heredoc indented to match this YAML block
+          # would prepend spaces (while `<<-` strips tabs, including the
+          # one that matters). Single quotes keep `$(...)` for make.
+          printf 'include Makefile\n__pf_print:\n\t@echo "$(DPDK_DRIVERS_DISABLED)"\n\t@echo "$(DPDK_LIBS_DISABLED)"\n' \
+            > /tmp/pf-dpdk-vars.mk
+          vars=$(make -s -f /tmp/pf-dpdk-vars.mk __pf_print | tail -2)
+          drivers=$(printf '%s' "$vars" | sed -n 1p)
+          libs=$(printf '%s' "$vars" | sed -n 2p)
+
+          filter() {
+            # Drop every cnxk member (common/, net/, mempool/, crypto/
+            # for drivers; the bare `cnxk` lib) and nothing else.
+            printf '%s' "$1" | tr ',' '\n' | grep -v cnxk | grep -v '^$' | paste -sd, -
+          }
+          for pair in "DRIVERS:$drivers" "LIBS:$libs"; do
+            name=${pair%%:*}; val=${pair#*:}
+            # An empty or single-token result means the evaluation went
+            # wrong; overriding with it would enable every driver DPDK
+            # has. Stopping here is much cheaper than that build.
+            case "$val" in
+              *,*) : ;;
+              *) echo "::error::DPDK_${name}_DISABLED evaluated to '$val' — upstream layout changed?"; exit 1 ;;
+            esac
+            echo "$name removing: $(printf '%s' "$val" | tr ',' '\n' | grep cnxk | paste -sd, - || echo none)"
+          done
+          printf '%s' "$drivers" | grep -q cnxk \
+            || echo "::warning::upstream no longer disables cnxk; this override is a no-op"
+
+          {
+            echo "DPDK_DRIVERS_KEPT=$(filter "$drivers")"
+            echo "DPDK_LIBS_KEPT=$(filter "$libs")"
+          } >> "$GITHUB_ENV"
+
       - name: Build release
         run: |
           set -euo pipefail
           cd /vpp
+          # Command-line make variables override the makefile's own
+          # assignments (these are `=`/`:=`, not `?=`, so environment
+          # alone would lose) and propagate to the external sub-make.
+          args=(
+            "DPDK_DRIVERS_DISABLED=$DPDK_DRIVERS_KEPT"
+            "DPDK_LIBS_DISABLED=$DPDK_LIBS_KEPT"
+          )
           if [ '${{ needs.resolve.outputs.platform }}' = 'cn9k' ]; then
-            # Marvell-tuned variant: LSE atomics + tuned memcpy. Only
-            # meaningful once packet-rate-bound; produces a separately
-            # tagged artifact.
-            make build-release VPP_EXTRA_CMAKE_ARGS='-DVPP_LIBRARY_FLAGS=-mcpu=octeontx2'
-          else
-            make build-release
+            # Marvell-tuned variant: LSE atomics + tuned memcpy, plus
+            # DPDK's own cn9k platform tuning. Only meaningful once
+            # packet-rate-bound; produces a separately tagged artifact.
+            args+=(DPDK_MACHINE=cn9k VPP_EXTRA_CMAKE_ARGS='-DVPP_LIBRARY_FLAGS=-mcpu=octeontx2')
           fi
+          printf 'make arg: %s\n' "${args[@]}"
+          make build-release "${args[@]}"
 
       - name: Package .debs
         run: |
