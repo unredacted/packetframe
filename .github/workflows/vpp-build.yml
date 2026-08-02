@@ -111,15 +111,14 @@ jobs:
       image: debian:bullseye
     timeout-minutes: 120
     # VPP's `make install-dep` runs its own apt-get, and UNATTENDED=y
-    # only adds `-y` — it does not set a debconf frontend. Some of the
-    # dependency closure (wireshark-common) has a debconf question, so
-    # apt falls back to the Readline frontend and asks it. Under CI
-    # stdin is /dev/null, so it reads EOF and takes the default rather
-    # than hanging, but that is luck rather than design: the same
-    # command run from an interactive shell — or backgrounded from one,
-    # where the read earns SIGTTIN and suspends the job outright —
-    # blocks. Set the frontend job-wide so no step depends on how it
-    # was invoked.
+    # only adds `-y` — it does not set a debconf frontend. Part of the
+    # dependency closure (wireshark-common) asks a debconf question, so
+    # apt falls back to the Readline frontend and prompts, and the job
+    # HANGS: a container job's stdin is an open pipe that never
+    # delivers EOF, so the read parks forever with no error and no
+    # output. Observed for 26 minutes before cancellation. (Set
+    # job-wide rather than per-step: the per-command form in
+    # `Container prerequisites` never reached VPP's nested apt-get.)
     env:
       DEBIAN_FRONTEND: noninteractive
     # Container jobs get `sh -e` as the default shell, and dash has no
@@ -280,22 +279,55 @@ jobs:
           # build logs `symlink-drivers-solibs.sh lib dpdk/pmds-26.1`,
           # i.e. the standalone shape). Checking only the first is how
           # a perfectly good build got failed.
+          echo "--- driver inventory ---"
+          find "$root" \( -path '*vpp_drivers*' -o -path '*dpdk*' -o -name 'librte_net_*' \) \
+            -type f | sort
+          echo "--- end inventory ---"
+
+          # Three shapes count as "this build can drive our NIC", and
+          # the third is the one that broke the previous assumption:
+          #
+          #  1. VPP's NATIVE Octeon driver (dev_octeon, under
+          #     vpp_drivers/). VPP >= 24.02 has its own device
+          #     framework, and 26.06's build downloads and compiles
+          #     marvell-octeon-roc specifically to feed it — visible in
+          #     the log as "installing octeon-roc 26.05". This path
+          #     does not involve DPDK at all.
+          #  2. DPDK's cnxk/octeontx2 PMD as a standalone
+          #     librte_net_*.so.
+          #  3. The same PMD linked into dpdk_plugin.so.
+          #
+          # The previous revision accepted only 2 and 3 and failed a
+          # build that had 1 — a `strings dpdk_plugin.so | grep
+          # net_cnxk` that finds nothing is evidence about DPDK's
+          # driver set, not about whether VPP can reach the hardware.
+          # Which shape we get decides the startup.conf that gate 0b
+          # writes, so the manifest records it rather than flattening
+          # it to a boolean.
+          native=$(find "$root" -name 'dev_octeon*.so*' -print -quit)
           pmd_so=$(find "$root" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           plugin=$(find "$root" -name 'dpdk_plugin.so' -print -quit)
-          pmd=''
+          driver=''
+          if [ -n "$native" ]; then
+            echo "native Octeon driver: $native"
+            driver=dev_octeon
+          fi
           if [ -n "$pmd_so" ]; then
-            echo "standalone PMD object: $pmd_so"
-            case "$pmd_so" in *cnxk*) pmd=net_cnxk ;; *) pmd=net_octeontx2 ;; esac
+            echo "standalone DPDK PMD: $pmd_so"
+            case "$pmd_so" in *cnxk*) driver="${driver:+$driver,}net_cnxk" ;;
+                              *) driver="${driver:+$driver,}net_octeontx2" ;; esac
           elif [ -n "$plugin" ]; then
-            echo "dpdk_plugin: $plugin"
-            pmd=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
-          else
-            echo "::error::neither dpdk_plugin.so nor a standalone Octeon PMD found under $root"
+            linked=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
+            [ -n "$linked" ] && echo "PMD linked into $plugin: $linked"
+            driver="${driver:+$driver,}${linked}"
+            driver="${driver%,}"
+          fi
+          echo "octeon driver(s): ${driver:-NONE}"
+          if [ -z "$driver" ]; then
+            echo "::error::this build has no way to drive the Octeon NIC — neither VPP's native dev_octeon nor a DPDK cnxk/octeontx2 PMD (see inventory above)"
             exit 1
           fi
-          echo "octeon PMD: ${pmd:-NONE}"
-          [ -n "$pmd" ] || { echo "::error::no cnxk/octeontx2 PMD in the bundled DPDK"; exit 1; }
-          echo "PMD_FAMILY=$pmd" >> "$GITHUB_ENV"
+          echo "PMD_FAMILY=$driver" >> "$GITHUB_ENV"
 
           # Unresolved-symbol smoke test. `vpp -h` needs its own libs on
           # the path; a clean exit or a usage message both prove linkage.
@@ -364,38 +396,6 @@ jobs:
             /out/SHA256SUMS
           retention-days: 14
 
-      - name: Publish release
-        # A push-triggered run leaves `inputs.publish` empty, which
-        # coerces equal to `false` — so the PRIMARY automatic trigger
-        # would spend the whole build and publish nothing, leaving the
-        # hwtest bundle's release pointer dangling. Gate on the event.
-        if: github.event_name == 'push' || inputs.publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          apt-get install -y --no-install-recommends gh || {
-            curl -fsSL https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_arm64.tar.gz \
-              | tar xz -C /tmp && install /tmp/gh_2.62.0_linux_arm64/bin/gh /usr/local/bin/gh
-          }
-          tag='${{ needs.resolve.outputs.tag }}'
-          notes=$(printf '%s\n' \
-            "Unmodified upstream VPP \`${{ needs.resolve.outputs.ref }}\` (\`$VPP_COMMIT\`), built for Debian 11 (bullseye) arm64 — the only combination UniFi OS can install." \
-            "" \
-            "Variant: \`${{ needs.resolve.outputs.platform }}\` · Octeon PMD: \`${PMD_FAMILY:-unknown}\` · No patches applied." \
-            "" \
-            "Verified in CI: glibc symbol floor ≤ 2.31, cnxk/octeontx2 PMD present in the bundled DPDK, no unresolved shared libraries." \
-            "" \
-            "\`vpp-api-json.tar.gz\` is the API-definition bundle consumed by the vpp-offload binary-API codegen; it is published separately so codegen does not download the .debs." \
-            "" \
-            "Install order and operational guidance: \`docs/runbooks/vpp-offload-spike.md\`.")
-          gh release create "$tag" \
-            --repo '${{ github.repository }}' \
-            --title "VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)" \
-            --notes "$notes" \
-            /out/debs/*.deb /out/vpp-api-json.tar.gz /out/manifest.json /out/SHA256SUMS
-          echo "::notice::published $tag"
-
   verify-package:
     name: Verify installed package (clean bullseye)
     needs: [resolve, build]
@@ -425,10 +425,20 @@ jobs:
       - name: Install the built packages
         run: |
           set -euo pipefail
-          ls -la /pkg
+          find /pkg -type f | sort
+          # The .debs sit under /pkg/debs/: upload-artifact roots the
+          # artifact at the least common ancestor of its path patterns
+          # (/out), so the debs/ component survives the round trip. A
+          # bare /pkg/*.deb glob matches nothing and, unexpanded, gets
+          # handed to apt as a literal filename. Locate them instead —
+          # this job had never actually run before, so the shape of the
+          # download was assumption, not observation.
+          mapfile -t debs < <(find /pkg -name '*.deb' | sort)
+          [ "${#debs[@]}" -gt 0 ] || { echo "::error::no .deb in the artifact"; exit 1; }
+          printf 'installing: %s\n' "${debs[@]}"
           # `apt-get install ./*.deb` (not `dpkg -i`) so unmet
           # dependencies fail loudly here rather than on a router.
-          DEBIAN_FRONTEND=noninteractive apt-get install -y /pkg/*.deb
+          DEBIAN_FRONTEND=noninteractive apt-get install -y "${debs[@]}"
           command -v vpp || { echo "::error::no vpp on PATH after install"; exit 1; }
 
       - name: Verify the INSTALLED binary
@@ -455,18 +465,78 @@ jobs:
           fi
 
           # The NIC driver must survive packaging, not merely exist in
-          # the build tree. Same two shapes as the build-tree smoke
-          # test: linked into dpdk_plugin.so, or a standalone
-          # librte_net_*.so under dpdk/pmds-<abi>/.
+          # the build tree. Same three shapes the build-tree smoke test
+          # accepts — VPP's native dev_octeon, a standalone DPDK PMD, or
+          # one linked into dpdk_plugin.so — because which one this VPP
+          # ships is a property of the release, not a constant.
+          native=$(find / -name 'dev_octeon*.so*' -not -path '/proc/*' -print -quit 2>/dev/null || true)
           pmd_so=$(find / \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) \
             -not -path '/proc/*' -print -quit 2>/dev/null || true)
           plugin=$(find / -name dpdk_plugin.so -not -path '/proc/*' -print -quit 2>/dev/null || true)
-          if [ -n "$pmd_so" ]; then
+          if [ -n "$native" ]; then
+            echo "installed native Octeon driver: $native"
+          elif [ -n "$pmd_so" ]; then
             echo "installed standalone PMD: $pmd_so"
           elif [ -n "$plugin" ] && strings "$plugin" | grep -qE 'net_cnxk|net_octeontx2'; then
             echo "installed PMD linked into: $plugin"
           else
-            echo "::error::no cnxk/octeontx2 PMD in the installed packages"
+            echo "::error::the installed packages carry no Octeon driver (native or DPDK)"
             exit 1
           fi
-          echo "installed package verified: loads, resolves, and carries the Octeon PMD"
+          echo "installed package verified: loads, resolves, and carries an Octeon driver"
+
+  # Publishing is a SEPARATE job gated on verify-package, not a final
+  # step of `build`. It used to be the latter, which meant the .debs
+  # were downloadable before anything had tried installing them: a
+  # package that failed verification was already on the release page,
+  # and the runbook told operators that a published artifact had been
+  # verified. Ordering, not wording, is what makes that true.
+  publish:
+    name: Publish release
+    needs: [resolve, build, verify-package]
+    # A push-triggered run leaves `inputs.publish` empty, which coerces
+    # equal to `false` — so the PRIMARY automatic trigger would spend
+    # the whole build and publish nothing, leaving the runbook's
+    # release pointer dangling. Gate on the event.
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vpp-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.platform }}-bullseye-arm64
+          path: /tmp/pkg
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd /tmp/pkg
+          find . -type f | sort
+          # Facts come from the manifest the build wrote, not from job
+          # env: this job runs on a different runner, and re-deriving
+          # them here would let the release notes disagree with the
+          # artifact they describe.
+          commit=$(jq -r '.vpp_commit' manifest.json)
+          pmd=$(jq -r '.octeon_pmd' manifest.json)
+          tag='${{ needs.resolve.outputs.tag }}'
+          notes=$(printf '%s\n' \
+            "Unmodified upstream VPP \`${{ needs.resolve.outputs.ref }}\` (\`$commit\`), built for Debian 11 (bullseye) arm64 — the only combination UniFi OS can install." \
+            "" \
+            "Variant: \`${{ needs.resolve.outputs.platform }}\` · Octeon PMD: \`$pmd\` · No patches applied." \
+            "" \
+            "Verified in CI before publication: glibc symbol floor ≤ 2.31, no unresolved shared libraries, Octeon PMD present, and the .debs install cleanly into a stock bullseye." \
+            "" \
+            "\`vpp-api-json.tar.gz\` is the API-definition bundle consumed by the vpp-offload binary-API codegen; it is published separately so codegen does not download the .debs." \
+            "" \
+            "Install order and operational guidance: \`docs/runbooks/vpp-offload-spike.md\`.")
+          # Flat asset names, matching SHA256SUMS — see the manifest
+          # step's note on why that matters after a download.
+          gh release create "$tag" \
+            --repo '${{ github.repository }}' \
+            --title "VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)" \
+            --notes "$notes" \
+            debs/*.deb vpp-api-json.tar.gz manifest.json SHA256SUMS
+          echo "::notice::published $tag"
