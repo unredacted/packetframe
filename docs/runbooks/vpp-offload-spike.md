@@ -261,14 +261,17 @@ than re-derived:
   cnxk PMD registers one driver per SoC generation, so
 
   ```sh
-  strings /usr/lib/*/vpp_plugins/dpdk_plugin.so | grep -E 'net_cn9k|net_cn10k|net_cn20k'
+  strings /usr/lib/*/vpp_plugins/dpdk_plugin.so | grep -E 'net_cn9k|net_cn10k|net_cn20k|net_octeontx2'
   ```
 
   is the probe that means something, while `grep net_cnxk` finds
   nothing in any working build (that miss cost a CI round). The fleet
-  is cn9670 = CN9K: **`net_cn9k` is the one that matters**, and it is
-  also the name to expect in `show hardware-interfaces` driver output
-  during this spike.
+  is cn9670 = CN9K: **`net_cn9k` is the one that matters** on the
+  current pin, and it is also the name to expect in
+  `show hardware-interfaces` driver output during this spike.
+  `net_octeontx2` is the same silicon's name in the ≤ DPDK 21.11 era —
+  it is what a `v22.02` fallback artifact registers instead, so on a
+  fallback pin its presence (not net_cn9k's) is the pass condition.
 - The `.debs` install into a clean bullseye and the installed binary
   resolves its libraries (the `verify-package` job).
 

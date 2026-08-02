@@ -112,7 +112,7 @@ jobs:
              [ "$BEFORE" != '0000000000000000000000000000000000000000' ]; then
             if gh api "repos/${{ github.repository }}/compare/${BEFORE}...${{ github.sha }}" \
                  --jq '.files[].filename' 2>/dev/null \
-                 | grep -qx '.github/workflows/vpp-build.yml'; then
+                 | grep -x '.github/workflows/vpp-build.yml' >/dev/null; then
               wf_changed=true
             fi
           fi
@@ -473,9 +473,18 @@ jobs:
             if [ -n "$matched" ]; then
               echo "Octeon drivers linked into $(basename "$plugin"): $matched"
               driver="${driver:+$driver,}$matched"
+              # Hard requirement, not a warning: the fleet is cn9670 =
+              # CN9K, so a plugin carrying only net_cn10k/net_cn20k
+              # cannot drive a single one of our NICs. "Has Octeon
+              # drivers" is not the gate; "has OUR Octeon driver" is —
+              # publishing the former as verified would be the exact
+              # lie this step exists to stop.
               case ",$matched," in
                 *,net_cn9k,*|*,net_octeontx2,*) : ;;
-                *) echo "::warning::plugin has Octeon drivers ($matched) but none for CN9K silicon — the fleet is cn9670" ;;
+                *)
+                  echo "::error::plugin has Octeon drivers ($matched) but none that drives CN9K silicon (need net_cn9k or net_octeontx2) — unusable on this fleet"
+                  exit 1
+                  ;;
               esac
             elif [ -n "$pmd_lib" ]; then
               echo "::error::an Octeon PMD was built ($pmd_lib) but none of its registered driver names ($OCTEON_PMD_NAMES) appear in dpdk_plugin.so — built but not linked, and nothing loads PMDs at runtime (dpdk.mk deletes the shared objects at install)."
@@ -641,11 +650,19 @@ jobs:
             echo "installed native Octeon driver: $native"
           elif [ -n "$pmd_so" ]; then
             echo "installed standalone PMD: $pmd_so"
-          elif [ -n "$plugin" ] && strings "$plugin" | grep -qE 'net_cn9k|net_cn10k|net_cn20k|net_octeontx2'; then
-            # REGISTERED driver names, not the library name: the cnxk
-            # PMD registers net_cn9k/net_cn10k/net_cn20k — the string
-            # `net_cnxk` exists in no working build (see the smoke
-            # test's needle note; this cost a CI round).
+          elif [ -n "$plugin" ] && strings "$plugin" | grep -E 'net_cn9k|net_octeontx2' >/dev/null; then
+            # REGISTERED driver names, not the library name (`net_cnxk`
+            # exists in no working build — see the smoke test's needle
+            # note), and only the names that can drive CN9K silicon:
+            # a plugin with just net_cn10k/net_cn20k is unusable on
+            # this fleet and must not verify.
+            #
+            # `grep -E ... >/dev/null`, NOT `grep -q`: under this
+            # step's pipefail, -q exits at the first match, the
+            # still-writing strings gets SIGPIPE (141), and the
+            # pipeline — and so this condition — goes false on a GOOD
+            # plugin. Without -q grep reads the stream to EOF, so the
+            # pipeline status is grep's own.
             echo "installed PMD linked into: $plugin"
           else
             echo "::error::the installed packages carry no Octeon driver (native or DPDK)"
