@@ -446,14 +446,21 @@ jobs:
           #
           # Consequence: a surviving librte_net_cnxk.a proves DPDK
           # BUILT the driver, but the artifact only works if that .a
-          # actually got whole-archived into dpdk_plugin.so. Those can
-          # diverge (a GROUP generated before the .a landed, or
-          # whole-archive failing to propagate through the script), so
-          # when both a static PMD and the plugin exist, the plugin
-          # must contain the driver's name string — a driver that was
-          # built but not linked is a dead artifact and must fail HERE,
-          # with the divergence named, not in verify-package with a
-          # generic "no PMD found".
+          # actually got whole-archived into dpdk_plugin.so — so when
+          # both exist, the plugin must contain the driver's REGISTERED
+          # names.
+          #
+          # And those names are NOT the library's name. This cost a
+          # full CI round: the cnxk PMD registers one driver per SoC
+          # generation — net_cn9k, net_cn10k, net_cn20k — and no
+          # string `net_cnxk` exists in any working build. A probe
+          # grepping for the library name reported a perfectly good
+          # plugin as driverless. The needle below is the set of
+          # REGISTERED names across the eras we can pin: cn9k/cn10k/
+          # cn20k (cnxk era) and net_octeontx2 (<= DPDK 21.11 era).
+          # The fleet is cn9670 = CN9K, so net_cn9k specifically is
+          # the load-bearing one.
+          OCTEON_PMD_NAMES='net_cn9k|net_cn10k|net_cn20k|net_octeontx2'
           native=$(find "$instroot" -name 'dev_octeon*.so*' -print -quit)
           pmd_lib=$(find "$instroot" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           driver=''
@@ -461,31 +468,23 @@ jobs:
             echo "native Octeon driver: $native"
             driver=dev_octeon
           fi
-          if [ -n "$pmd_lib" ]; then
-            case "$pmd_lib" in
-              *cnxk*) pmdname=net_cnxk ;;
-              *) pmdname=net_octeontx2 ;;
-            esac
-            echo "DPDK Octeon PMD built: $pmd_lib ($pmdname)"
-            if [ -n "$plugin" ]; then
-              if strings "$plugin" | grep -q "$pmdname"; then
-                echo "$pmdname is linked into $(basename "$plugin")"
-                driver="${driver:+$driver,}$pmdname"
-              else
-                echo "::error::$pmdname was BUILT ($pmd_lib) but is NOT linked into dpdk_plugin.so — the libdpdk.a GROUP/whole-archive chain dropped it, and nothing loads PMDs at runtime (dpdk.mk deletes the shared objects at install). The shipped artifact cannot drive the NIC."
-                exit 1
-              fi
-            else
-              # No dpdk plugin at all: the .a alone is unreachable.
-              echo "::error::$pmdname built but dpdk_plugin.so is missing entirely"
+          if [ -n "$plugin" ]; then
+            matched=$(strings "$plugin" | grep -oE "$OCTEON_PMD_NAMES" | sort -u | paste -sd, - || true)
+            if [ -n "$matched" ]; then
+              echo "Octeon drivers linked into $(basename "$plugin"): $matched"
+              driver="${driver:+$driver,}$matched"
+              case ",$matched," in
+                *,net_cn9k,*|*,net_octeontx2,*) : ;;
+                *) echo "::warning::plugin has Octeon drivers ($matched) but none for CN9K silicon — the fleet is cn9670" ;;
+              esac
+            elif [ -n "$pmd_lib" ]; then
+              echo "::error::an Octeon PMD was built ($pmd_lib) but none of its registered driver names ($OCTEON_PMD_NAMES) appear in dpdk_plugin.so — built but not linked, and nothing loads PMDs at runtime (dpdk.mk deletes the shared objects at install)."
               exit 1
             fi
-          elif [ -n "$plugin" ]; then
-            linked=$(strings "$plugin" | grep -m1 -oE 'net_cnxk|net_octeontx2' || true)
-            if [ -n "$linked" ]; then
-              echo "PMD linked into $plugin: $linked"
-              driver="${driver:+$driver,}${linked}"
-            fi
+          elif [ -n "$pmd_lib" ]; then
+            # No dpdk plugin at all: the .a alone is unreachable.
+            echo "::error::$(basename "$pmd_lib") built but dpdk_plugin.so is missing entirely"
+            exit 1
           fi
           echo "octeon driver(s): ${driver:-NONE}"
           if [ -z "$driver" ]; then
@@ -642,7 +641,11 @@ jobs:
             echo "installed native Octeon driver: $native"
           elif [ -n "$pmd_so" ]; then
             echo "installed standalone PMD: $pmd_so"
-          elif [ -n "$plugin" ] && strings "$plugin" | grep -qE 'net_cnxk|net_octeontx2'; then
+          elif [ -n "$plugin" ] && strings "$plugin" | grep -qE 'net_cn9k|net_cn10k|net_cn20k|net_octeontx2'; then
+            # REGISTERED driver names, not the library name: the cnxk
+            # PMD registers net_cn9k/net_cn10k/net_cn20k — the string
+            # `net_cnxk` exists in no working build (see the smoke
+            # test's needle note; this cost a CI round).
             echo "installed PMD linked into: $plugin"
           else
             echo "::error::the installed packages carry no Octeon driver (native or DPDK)"

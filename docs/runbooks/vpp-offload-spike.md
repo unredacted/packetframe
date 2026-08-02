@@ -253,10 +253,22 @@ than re-derived:
 
 - **glibc symbol floor `GLIBC_2.17`** against UniFi OS's 2.31. This is
   the check that killed the fd.io jammy deb, applied to what we ship.
-- The Octeon PMD is present. Note it is a **standalone
-  `librte_net_cnxk*.so` under `dpdk/pmds-<abi>/`**, not linked into
-  `dpdk_plugin.so` — so `strings dpdk_plugin.so | grep net_cnxk` finds
-  nothing and means nothing. Look for the PMD object itself.
+- The Octeon PMD is present, **statically linked into
+  `dpdk_plugin.so`** (VPP whole-archives its DPDK and deletes the
+  shared driver objects at install — there is no standalone PMD `.so`
+  in this build; an earlier revision of this bullet claimed one). And
+  check for the **registered driver names, not the library name**: the
+  cnxk PMD registers one driver per SoC generation, so
+
+  ```sh
+  strings /usr/lib/*/vpp_plugins/dpdk_plugin.so | grep -E 'net_cn9k|net_cn10k|net_cn20k'
+  ```
+
+  is the probe that means something, while `grep net_cnxk` finds
+  nothing in any working build (that miss cost a CI round). The fleet
+  is cn9670 = CN9K: **`net_cn9k` is the one that matters**, and it is
+  also the name to expect in `show hardware-interfaces` driver output
+  during this spike.
 - The `.debs` install into a clean bullseye and the installed binary
   resolves its libraries (the `verify-package` job).
 
