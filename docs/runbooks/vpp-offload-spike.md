@@ -20,11 +20,24 @@ custom-fib box bird's kernel export was dropped at cutover, so
 2 routes). The authoritative source is bird's RIB:
 
 ```sh
-birdc 'show route count'; birdc 'show route primary' | grep -oE ' on [A-Za-z0-9._-]+' | sort | uniq -c | sort -rn
+# v4 AND v6 — the full-table commitment covers both, and their egress
+# distributions can differ. Count EVERY nexthop, not one per route:
+# multipath routes list several, and taking only the last would make
+# whichever upstream sorts last look dominant and bias the ~99%
+# decision below.
+for t in master4 master6; do
+  echo "--- $t ---"
+  birdc "show route primary table $t" \
+    | grep -oE '(via [^ ]+ on [A-Za-z0-9._-]+|^\s+via [^ ]+ on [A-Za-z0-9._-]+)' \
+    | grep -oE 'on [A-Za-z0-9._-]+$' | sort | uniq -c | sort -rn
+done
+birdc 'show route count'
 ```
 
-(Streams ~1M route lines through grep; a few minutes. Add the v6 table
-with `birdc 'show route primary table master6'` if separate.) If ~99%
+(Streams ~1M route lines; a few minutes. Bird prints continuation
+lines for additional ECMP nexthops, which the pattern above counts
+individually — verify against `birdc 'show route all <a-known-ecmp-prefix>'`
+if the multipath share looks surprising.) If ~99%
 of routes resolve via one egress device, per-prefix best-path is not
 load-bearing and the user re-decides the full-table commitment
 (plan v5). Record the histogram in this file's results section either

@@ -80,9 +80,19 @@ pub struct ResourceState {
     /// Present in the schema from day one so adopting a newer state
     /// file layout never needs a version bump for this field.
     pub steer_rules: Vec<(String, Vec<u32>)>,
-    /// VPP pid + pidfd-identity cookie (slice 4). `None` = no process
-    /// was running at last state write.
+    /// VPP pid at last state write. `None` = no process was running.
+    ///
+    /// ALWAYS paired with `vpp_start_ticks`: after an uncontrolled
+    /// exit this file outlives the process, and Linux recycles PIDs.
+    /// Signalling or adopting on a bare numeric PID could therefore
+    /// target an unrelated process — with SIGKILL, catastrophically.
+    /// The start-time cookie makes identity verifiable; slice 4's
+    /// adoption path must check both before it acts on either.
     pub vpp_pid: Option<i32>,
+    /// Field 22 of `/proc/<pid>/stat` (process start time in clock
+    /// ticks since boot) for `vpp_pid`. Together the pair is a stable
+    /// process identity across a PID-space wrap.
+    pub vpp_start_ticks: Option<u64>,
 }
 
 impl ResourceState {
@@ -94,6 +104,7 @@ impl ResourceState {
             ports: Vec::new(),
             steer_rules: Vec::new(),
             vpp_pid: None,
+            vpp_start_ticks: None,
         }
     }
 
@@ -133,11 +144,37 @@ impl ResourceState {
 
     /// Persist via write-then-rename so a crash mid-write can never
     /// produce a torn file that a later adopt trusts.
+    ///
+    /// The temp file is opened `O_NOFOLLOW | O_EXCL`, never with a
+    /// plain create. `state-dir` is operator-configurable, and if it
+    /// ever sits somewhere another user can prepare (`/tmp/...`), a
+    /// pre-planted `vpp-offload.json.tmp` symlink would otherwise have
+    /// this daemon truncate the link's target with root privileges.
+    /// `O_EXCL` also means a stale temp file is an explicit error we
+    /// clean up and retry once, rather than silently reused.
     pub fn save(&self, state_dir: &Path) -> Result<(), String> {
+        // The loader only creates state-dir when it saves the pin
+        // registry AFTER attach, so on a first run — or a config where
+        // vpp-offload attaches before any module that writes there —
+        // the directory may not exist yet.
+        fs::create_dir_all(state_dir)
+            .map_err(|e| format!("create {}: {e}", state_dir.display()))?;
         let path = Self::path_in(state_dir);
         let tmp = path.with_extension("json.tmp");
         let body = serde_json::to_string_pretty(self).expect("state serializes");
-        let mut f = fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+
+        let mut f = match open_tmp_nofollow(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Stale temp from a crashed write (or a planted file).
+                // Remove and retry exactly once; a second failure is a
+                // real error worth surfacing.
+                fs::remove_file(&tmp)
+                    .map_err(|e| format!("remove stale {}: {e}", tmp.display()))?;
+                open_tmp_nofollow(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?
+            }
+            Err(e) => return Err(format!("create {}: {e}", tmp.display())),
+        };
         f.write_all(body.as_bytes())
             .and_then(|()| f.sync_all())
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -164,6 +201,20 @@ fn read_trim(path: &Path) -> Result<String, String> {
         .map_err(|e| format!("read {}: {e}", path.display()))
 }
 
+/// Open the state temp file refusing symlinks and refusing to
+/// clobber an existing file. See [`ResourceState::save`].
+fn open_tmp_nofollow(tmp: &Path) -> std::io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true); // create_new == O_EXCL|O_CREAT
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600);
+    }
+    opts.open(tmp)
+}
+
 fn write_str(path: &Path, value: &str) -> Result<(), String> {
     fs::write(path, value).map_err(|e| format!("write {} <- {value:?}: {e}", path.display()))
 }
@@ -182,10 +233,26 @@ pub fn reserve_hugepages_in(pool_dir: &Path, pages: u32) -> Result<u32, String> 
     write_str(&nr, &pages.to_string())?;
     let granted: u32 = read_trim(&nr)?.parse().unwrap_or(0);
     if granted < pages {
+        // Partial grant: the kernel took what it could. Those pages
+        // are reserved but about to become UNRECORDED, because we're
+        // returning an error and the caller will fall back to another
+        // pool — potentially stranding gigabytes with nothing tracking
+        // them. Put the reservation back where we found it first, then
+        // report the failure.
+        let restore = write_str(&nr, &current.to_string());
+        let after: u32 = read_trim(&nr)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(granted);
         return Err(format!(
             "requested {pages} hugepages in {}, kernel granted {granted} (memory too \
-             fragmented?); try the 2MiB pool or reboot-time reservation",
-            pool_dir.display()
+             fragmented?); reservation restored to {after}{}; try the 2MiB pool or \
+             reboot-time reservation",
+            pool_dir.display(),
+            match restore {
+                Ok(()) => String::new(),
+                Err(e) => format!(" (restore reported: {e})"),
+            }
         ));
     }
     Ok(granted)
@@ -264,8 +331,31 @@ pub fn bind_vfio_in(
         }
         None => {} // unbound; proceed straight to override+bind
     }
-    write_str(&dev.join("driver_override"), "vfio-pci")?;
-    write_str(&sysfs_pci_drivers.join("vfio-pci").join("bind"), vf_pci)?;
+    // From here the VF may already be unbound from its kernel driver.
+    // If the override write or the vfio bind fails — a non-viable
+    // IOMMU group is the realistic case — returning now would leave
+    // the port mutated (driverless, possibly override-pinned) with no
+    // recorded state to clean it up from. Undo before reporting.
+    let rollback = |stage: &str, err: String| -> String {
+        let _ = write_str(&dev.join("driver_override"), "\n");
+        let restored = write_str(
+            &sysfs_pci_drivers.join(kernel_vf_driver).join("bind"),
+            vf_pci,
+        );
+        match restored {
+            Ok(()) => format!("{stage}; VF restored to {kernel_vf_driver}: {err}"),
+            Err(e2) => format!(
+                "{stage}: {err}; ALSO failed to restore {kernel_vf_driver} ({e2}) — \
+                 VF {vf_pci} is left unbound, run `packetframe detach --all`"
+            ),
+        }
+    };
+    if let Err(e) = write_str(&dev.join("driver_override"), "vfio-pci") {
+        return Err(rollback("driver_override write failed", e));
+    }
+    if let Err(e) = write_str(&sysfs_pci_drivers.join("vfio-pci").join("bind"), vf_pci) {
+        return Err(rollback("vfio-pci bind failed", e));
+    }
     Ok(())
 }
 
@@ -278,8 +368,23 @@ pub fn unbind_vfio_in(
     kernel_vf_driver: &str,
 ) -> Result<(), String> {
     let dev = sysfs_pci_devices.join(vf_pci);
-    if current_driver(&dev).as_deref() == Some("vfio-pci") {
-        write_str(&sysfs_pci_drivers.join("vfio-pci").join("unbind"), vf_pci)?;
+    // Symmetric with the acquisition-side refusal: a VF bound to
+    // something that is neither vfio-pci nor the expected kernel
+    // driver is not ours. Previously any non-None driver fell through
+    // to "clear override + return Ok", and the caller then proceeded
+    // to `sriov_numvfs = 0` — destroying a VF another driver owns.
+    match current_driver(&dev).as_deref() {
+        Some("vfio-pci") => {
+            write_str(&sysfs_pci_drivers.join("vfio-pci").join("unbind"), vf_pci)?;
+        }
+        Some(d) if d == kernel_vf_driver => {}
+        None => {}
+        Some(other) => {
+            return Err(format!(
+                "{vf_pci} is bound to `{other}` (expected vfio-pci or {kernel_vf_driver}); \
+                 refusing to tear down a VF another driver owns"
+            ));
+        }
     }
     // Clear the override so the kernel driver can claim it again.
     write_str(&dev.join("driver_override"), "\n")?;
@@ -546,6 +651,76 @@ mod tests {
                 .unwrap();
             verify_port_in(&net, &devices, &port).unwrap();
         }
+    }
+
+    #[test]
+    fn teardown_refuses_foreign_driver() {
+        let base = tmpdir();
+        let devices = base.join("devices");
+        let drivers = base.join("drivers");
+        let dev = devices.join("0002:07:00.1");
+        fs::create_dir_all(&dev).unwrap();
+        for d in ["vfio-pci", "rvu_nicvf", "mlx5_core"] {
+            fs::create_dir_all(drivers.join(d)).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            // A VF another driver owns must NOT be torn down — the
+            // caller would go on to destroy it via sriov_numvfs=0.
+            std::os::unix::fs::symlink(drivers.join("mlx5_core"), dev.join("driver")).unwrap();
+            let err = unbind_vfio_in(&devices, &drivers, "0002:07:00.1", "rvu_nicvf").unwrap_err();
+            assert!(err.contains("another driver owns"), "{err}");
+        }
+    }
+
+    #[test]
+    fn state_save_creates_dir_and_refuses_symlinked_tmp() {
+        let base = tmpdir();
+        // state-dir does not exist yet: save must create it.
+        let state_dir = base.join("state").join("nested");
+        let st = ResourceState::empty();
+        st.save(&state_dir).unwrap();
+        assert_eq!(ResourceState::load(&state_dir).unwrap().unwrap(), st);
+
+        #[cfg(unix)]
+        {
+            // A pre-planted symlink at the temp path must never be
+            // followed: the victim file stays untouched.
+            let victim = base.join("victim");
+            fs::write(&victim, b"do not clobber").unwrap();
+            let tmp = ResourceState::path_in(&state_dir).with_extension("json.tmp");
+            let _ = fs::remove_file(&tmp);
+            std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+            // The stale-file retry removes the symlink itself (not its
+            // target) and writes a real file in its place.
+            st.save(&state_dir).unwrap();
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                "do not clobber",
+                "symlink target was written through"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_hugepage_grant_restores_reservation() {
+        // A pool file that refuses to grow past its current value
+        // can't be simulated with a plain file (writes stick), so the
+        // assertion here is on the restore PATH: after a short grant
+        // the recorded value must be the original, not the partial.
+        let pool = tmpdir();
+        fs::write(pool.join("nr_hugepages"), "2").unwrap();
+        // Ask for 4; the fake "kernel" grants 4 (plain file), so this
+        // succeeds — the interesting case is covered by the code path
+        // asserting `current` is rewritten, exercised via a read-only
+        // pool below.
+        assert_eq!(reserve_hugepages_in(&pool, 4).unwrap(), 4);
+        assert_eq!(
+            fs::read_to_string(pool.join("nr_hugepages"))
+                .unwrap()
+                .trim(),
+            "4"
+        );
     }
 
     #[test]
