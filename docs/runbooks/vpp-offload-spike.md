@@ -188,34 +188,68 @@ mailbox does not follow newer-is-better):
 
 ### Getting the build onto the shadow
 
+Derive the tag from the pin rather than typing a version — otherwise
+working the fallback ladder below re-downloads the build that just
+failed, which looks exactly like the fallback not working:
+
 ```sh
-# On a workstation with `gh` authenticated, then scp to the shadow —
-# or run on the box if it has network + gh.
-gh release download vpp-v26.06-generic-bullseye-arm64 \
+# From a checkout of this repo (workstation with `gh` authenticated;
+# scp to the shadow afterwards, or run on the box if it has both).
+ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
+plat=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
+gh release download "vpp-${ref}-${plat:-generic}-bullseye-arm64" \
   --repo unredacted/packetframe --dir /tmp/vpp
 ```
 
-**Read the dependency line before installing anything.** The libnl
+**Read the dependency lines before installing anything.** The libnl
 divergence above lives at install time too, in a milder form: runtime
 deps are normally `>=` constraints, which UniFi's *newer* `3.4.0-8+ubnt`
-satisfies — but an `=` pin would be the same wall moved later.
+satisfies — but an `=` pin would be the same wall moved later. Check
+**every** package, not just the main one: `vpp-plugin-dpdk` and the
+`-dev` packages carry their own dependency sets, and the plugin package
+is the one that pulls DPDK's libraries.
 
 ```sh
-dpkg -I /tmp/vpp/vpp_*.deb | grep -i depends
+for d in /tmp/vpp/*.deb; do echo "== $d"; dpkg -I "$d" | grep -i '^ *depends'; done
 ```
 
-Then install with `apt-get install ./*.deb` rather than `dpkg -i`, so
-an unmet dependency fails loudly instead of leaving a half-configured
-package:
+Then install with `apt-get install` rather than `dpkg -i`, so an unmet
+dependency fails loudly instead of leaving a half-configured package:
 
 ```sh
 cd /tmp/vpp && apt-get install -y ./*.deb && command -v vpp && vpp --version
 ```
 
+### Stop the packaged service before the manual bring-up
+
+Installing VPP's `.deb` brings its systemd unit with it, and the
+packaged daemon may start on the stock `/etc/vpp/startup.conf`. That
+matters here because §3 starts VPP **by hand** on a spike config: two
+instances contend for the same hugepages, VF, and API socket, and the
+second one's failure looks like a config or mailbox problem rather than
+what it is. `pkill vpp` will not settle it either — systemd restarts
+the unit underneath you.
+
+```sh
+systemctl stop vpp.service 2>/dev/null || true
+systemctl mask vpp.service          # survives a package reconfigure
+```
+
+Unmask at cleanup (`systemctl unmask vpp.service`) if you intend to
+leave the box able to run the packaged daemon. For the spike, staying
+masked is the safer state — nothing should start VPP except you.
+
 ### What CI already proved, so you needn't re-check
 
-The build job verifies these on every run; they are recorded here so a
-failure on the box is read as *new* rather than re-derived:
+**Publication is gated on verification** — the `publish` job runs only
+after `verify-package` passes, so a release tag existing is itself the
+evidence that the checks below passed. (This was not always true:
+publishing used to be the last step of the build job, which put
+unverified `.debs` on the release page. If you are looking at an
+artifact published before 2026-08-02, check the run.)
+
+They are recorded here so a failure on the box is read as *new* rather
+than re-derived:
 
 - **glibc symbol floor `GLIBC_2.17`** against UniFi OS's 2.31. This is
   the check that killed the fd.io jammy deb, applied to what we ship.
@@ -291,3 +325,10 @@ section:
 `pkill vpp`; sweep `/dev/hugepages/rtemap_*`; VF and hugepage teardown
 per the gate-0a notes (or leave staged for the next session — the
 shadow is the integration environment).
+
+`vpp.service` stays **masked** from §1 unless you deliberately want the
+packaged daemon running. Leave it masked between sessions: an
+unattended VPP holding hugepages and the VF is exactly the state that
+makes the next bring-up fail confusingly. Only `systemctl unmask
+vpp.service` when handing the box back to normal use — and note that
+`pkill vpp` alone does not survive an unmasked unit's restart policy.

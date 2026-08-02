@@ -111,15 +111,14 @@ jobs:
       image: debian:bullseye
     timeout-minutes: 120
     # VPP's `make install-dep` runs its own apt-get, and UNATTENDED=y
-    # only adds `-y` — it does not set a debconf frontend. Some of the
-    # dependency closure (wireshark-common) has a debconf question, so
-    # apt falls back to the Readline frontend and asks it. Under CI
-    # stdin is /dev/null, so it reads EOF and takes the default rather
-    # than hanging, but that is luck rather than design: the same
-    # command run from an interactive shell — or backgrounded from one,
-    # where the read earns SIGTTIN and suspends the job outright —
-    # blocks. Set the frontend job-wide so no step depends on how it
-    # was invoked.
+    # only adds `-y` — it does not set a debconf frontend. Part of the
+    # dependency closure (wireshark-common) asks a debconf question, so
+    # apt falls back to the Readline frontend and prompts, and the job
+    # HANGS: a container job's stdin is an open pipe that never
+    # delivers EOF, so the read parks forever with no error and no
+    # output. Observed for 26 minutes before cancellation. (Set
+    # job-wide rather than per-step: the per-command form in
+    # `Container prerequisites` never reached VPP's nested apt-get.)
     env:
       DEBIAN_FRONTEND: noninteractive
     # Container jobs get `sh -e` as the default shell, and dash has no
@@ -364,38 +363,6 @@ jobs:
             /out/SHA256SUMS
           retention-days: 14
 
-      - name: Publish release
-        # A push-triggered run leaves `inputs.publish` empty, which
-        # coerces equal to `false` — so the PRIMARY automatic trigger
-        # would spend the whole build and publish nothing, leaving the
-        # hwtest bundle's release pointer dangling. Gate on the event.
-        if: github.event_name == 'push' || inputs.publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          apt-get install -y --no-install-recommends gh || {
-            curl -fsSL https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_arm64.tar.gz \
-              | tar xz -C /tmp && install /tmp/gh_2.62.0_linux_arm64/bin/gh /usr/local/bin/gh
-          }
-          tag='${{ needs.resolve.outputs.tag }}'
-          notes=$(printf '%s\n' \
-            "Unmodified upstream VPP \`${{ needs.resolve.outputs.ref }}\` (\`$VPP_COMMIT\`), built for Debian 11 (bullseye) arm64 — the only combination UniFi OS can install." \
-            "" \
-            "Variant: \`${{ needs.resolve.outputs.platform }}\` · Octeon PMD: \`${PMD_FAMILY:-unknown}\` · No patches applied." \
-            "" \
-            "Verified in CI: glibc symbol floor ≤ 2.31, cnxk/octeontx2 PMD present in the bundled DPDK, no unresolved shared libraries." \
-            "" \
-            "\`vpp-api-json.tar.gz\` is the API-definition bundle consumed by the vpp-offload binary-API codegen; it is published separately so codegen does not download the .debs." \
-            "" \
-            "Install order and operational guidance: \`docs/runbooks/vpp-offload-spike.md\`.")
-          gh release create "$tag" \
-            --repo '${{ github.repository }}' \
-            --title "VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)" \
-            --notes "$notes" \
-            /out/debs/*.deb /out/vpp-api-json.tar.gz /out/manifest.json /out/SHA256SUMS
-          echo "::notice::published $tag"
-
   verify-package:
     name: Verify installed package (clean bullseye)
     needs: [resolve, build]
@@ -425,10 +392,20 @@ jobs:
       - name: Install the built packages
         run: |
           set -euo pipefail
-          ls -la /pkg
+          find /pkg -type f | sort
+          # The .debs sit under /pkg/debs/: upload-artifact roots the
+          # artifact at the least common ancestor of its path patterns
+          # (/out), so the debs/ component survives the round trip. A
+          # bare /pkg/*.deb glob matches nothing and, unexpanded, gets
+          # handed to apt as a literal filename. Locate them instead —
+          # this job had never actually run before, so the shape of the
+          # download was assumption, not observation.
+          mapfile -t debs < <(find /pkg -name '*.deb' | sort)
+          [ "${#debs[@]}" -gt 0 ] || { echo "::error::no .deb in the artifact"; exit 1; }
+          printf 'installing: %s\n' "${debs[@]}"
           # `apt-get install ./*.deb` (not `dpkg -i`) so unmet
           # dependencies fail loudly here rather than on a router.
-          DEBIAN_FRONTEND=noninteractive apt-get install -y /pkg/*.deb
+          DEBIAN_FRONTEND=noninteractive apt-get install -y "${debs[@]}"
           command -v vpp || { echo "::error::no vpp on PATH after install"; exit 1; }
 
       - name: Verify the INSTALLED binary
@@ -470,3 +447,59 @@ jobs:
             exit 1
           fi
           echo "installed package verified: loads, resolves, and carries the Octeon PMD"
+
+  # Publishing is a SEPARATE job gated on verify-package, not a final
+  # step of `build`. It used to be the latter, which meant the .debs
+  # were downloadable before anything had tried installing them: a
+  # package that failed verification was already on the release page,
+  # and the runbook told operators that a published artifact had been
+  # verified. Ordering, not wording, is what makes that true.
+  publish:
+    name: Publish release
+    needs: [resolve, build, verify-package]
+    # A push-triggered run leaves `inputs.publish` empty, which coerces
+    # equal to `false` — so the PRIMARY automatic trigger would spend
+    # the whole build and publish nothing, leaving the runbook's
+    # release pointer dangling. Gate on the event.
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vpp-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.platform }}-bullseye-arm64
+          path: /tmp/pkg
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd /tmp/pkg
+          find . -type f | sort
+          # Facts come from the manifest the build wrote, not from job
+          # env: this job runs on a different runner, and re-deriving
+          # them here would let the release notes disagree with the
+          # artifact they describe.
+          commit=$(jq -r '.vpp_commit' manifest.json)
+          pmd=$(jq -r '.octeon_pmd' manifest.json)
+          tag='${{ needs.resolve.outputs.tag }}'
+          notes=$(printf '%s\n' \
+            "Unmodified upstream VPP \`${{ needs.resolve.outputs.ref }}\` (\`$commit\`), built for Debian 11 (bullseye) arm64 — the only combination UniFi OS can install." \
+            "" \
+            "Variant: \`${{ needs.resolve.outputs.platform }}\` · Octeon PMD: \`$pmd\` · No patches applied." \
+            "" \
+            "Verified in CI before publication: glibc symbol floor ≤ 2.31, no unresolved shared libraries, Octeon PMD present, and the .debs install cleanly into a stock bullseye." \
+            "" \
+            "\`vpp-api-json.tar.gz\` is the API-definition bundle consumed by the vpp-offload binary-API codegen; it is published separately so codegen does not download the .debs." \
+            "" \
+            "Install order and operational guidance: \`docs/runbooks/vpp-offload-spike.md\`.")
+          # Flat asset names, matching SHA256SUMS — see the manifest
+          # step's note on why that matters after a download.
+          gh release create "$tag" \
+            --repo '${{ github.repository }}' \
+            --title "VPP ${{ needs.resolve.outputs.ref }} (${{ needs.resolve.outputs.platform }}, bullseye/arm64)" \
+            --notes "$notes" \
+            debs/*.deb vpp-api-json.tar.gz manifest.json SHA256SUMS
+          echo "::notice::published $tag"
