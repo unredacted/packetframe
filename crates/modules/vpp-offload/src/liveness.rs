@@ -32,19 +32,49 @@ pub const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// published 2 s. See [`worst_case_detection`].
 pub const PING_BUDGET: Duration = Duration::from_millis(1_500);
 
-/// The relaxed budget to use while a full FIB resync is in flight.
+/// The relaxed budget for a resync on a dataplane that is **not**
+/// carrying traffic.
 ///
 /// VPP answers the binary API on its **main** thread, which is the
-/// same thread executing our route batches. Under a full-table load
-/// (~1.05M routes) it is legitimately busy, and a ping can queue
-/// behind a batch without anything being wrong. Applying the steady
-/// budget there would make every large resync look like a wedge and
-/// restart-loop the box precisely when it is doing the most work.
+/// same thread executing our route batches, so under load a ping can
+/// queue behind a batch without anything being wrong. Applying the
+/// steady budget to a first-attach resync would make every large load
+/// look like a wedge and restart-loop the box while it does the most
+/// work — and nothing is lost by waiting, because no traffic is
+/// steered yet.
 ///
-/// This is deliberately far above the steady budget: during resync we
-/// are not yet forwarding through VPP, so a slow answer costs latency
-/// in coming back, not dropped traffic.
+/// **This budget must never be used while steering is up.** Pick it
+/// with [`budget_for`], not by asking "am I resyncing". See that
+/// function for why the distinction is load-bearing.
 pub const SYNC_PING_BUDGET: Duration = Duration::from_secs(10);
+
+/// Choose the silence budget from what is actually at stake.
+///
+/// The decision is **"is traffic currently steered into VPP"**, not
+/// "am I resyncing". Those look interchangeable and are not: the
+/// adopted path (`AdoptedResyncing`) resyncs a VPP that never stopped
+/// forwarding, which is the entire point of adoption. Selecting the
+/// relaxed budget there would let a wedged, *steered* VPP blackhole
+/// traffic for up to `SYNC_PING_BUDGET + PING_INTERVAL` — 10.5 s
+/// against a published promise of 2 s.
+///
+/// So: whenever packets are on VPP, the published number governs, and
+/// the risk moves to the other side of the trade — a busy adopted
+/// resync is now more likely to trip a restart. That is the correct
+/// direction to be wrong in. A restart unsteers first and recovers
+/// within the 90 s budget; a silent 10 s blackhole just drops traffic.
+/// It is also less likely than it looks: the drainer holds at most
+/// [`crate::fib_sync::DEFAULT_WINDOW`] requests in flight, so a ping
+/// queues behind ~256 route ops, not behind the whole table.
+pub const fn budget_for(steered: bool, converging: bool) -> Duration {
+    if steered {
+        PING_BUDGET
+    } else if converging {
+        SYNC_PING_BUDGET
+    } else {
+        PING_BUDGET
+    }
+}
 
 /// Worst-case time from "VPP wedges" to "we notice", for a given
 /// silence budget.
@@ -106,8 +136,10 @@ impl WedgeDetector {
         now.duration_since(self.last_ok)
     }
 
-    /// Has it been silent past `budget`? Pass [`PING_BUDGET`] in
-    /// steady state and [`SYNC_PING_BUDGET`] while resyncing.
+    /// Has it been silent past `budget`? Get `budget` from
+    /// [`budget_for`] rather than picking a constant directly — the
+    /// choice depends on whether traffic is steered, and getting it
+    /// from "am I resyncing" is the bug [`budget_for`] documents.
     pub fn is_wedged(&self, now: Instant, budget: Duration) -> bool {
         self.silent_for(now) > budget
     }
@@ -164,6 +196,31 @@ mod tests {
         // Pings at 500 and 1000 both go unanswered.
         assert!(!d.is_wedged(at(t0, 500), PING_BUDGET));
         assert!(!d.is_wedged(at(t0, 1_000), PING_BUDGET));
+    }
+
+    /// The published ≤2 s must hold whenever packets are on VPP —
+    /// including the adopted path, which resyncs a VPP that never
+    /// stopped forwarding. Choosing the budget by "am I resyncing"
+    /// would let a wedged, steered VPP blackhole for 10.5 s.
+    #[test]
+    fn a_steered_resync_keeps_the_published_budget() {
+        assert_eq!(
+            budget_for(true, true),
+            PING_BUDGET,
+            "steered + converging (adoption) must not get the relaxed budget"
+        );
+        assert!(
+            worst_case_detection(budget_for(true, true)) <= Duration::from_secs(2),
+            "a steered dataplane must stay inside the published 2 s"
+        );
+    }
+
+    /// The relaxed budget is only for a dataplane carrying no traffic.
+    #[test]
+    fn only_an_unsteered_resync_gets_the_relaxed_budget() {
+        assert_eq!(budget_for(false, true), SYNC_PING_BUDGET);
+        assert_eq!(budget_for(false, false), PING_BUDGET);
+        assert_eq!(budget_for(true, false), PING_BUDGET);
     }
 
     /// A slow resync must not read as a wedge — this is the one that

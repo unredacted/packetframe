@@ -93,6 +93,22 @@ pub struct ResourceState {
     /// ticks since boot) for `vpp_pid`. Together the pair is a stable
     /// process identity across a PID-space wrap.
     pub vpp_start_ticks: Option<u64>,
+    /// `/proc/sys/kernel/random/boot_id` when `vpp_pid` was recorded.
+    ///
+    /// The third leg of the identity, and it is not optional in spirit.
+    /// `vpp_start_ticks` counts from BOOT, and this file lives under
+    /// `/var/lib`, so it survives a reboot that the tick counter does
+    /// not: after a restart an unrelated process can land on the
+    /// recorded pid at the recorded tick and satisfy a `(pid, ticks)`
+    /// check, at which point we would hold a pidfd for a stranger and
+    /// eventually SIGKILL it as root.
+    ///
+    /// `serde(default)` so a state file written before this field
+    /// existed still parses — [`crate::process::VppProcess::adopt`]
+    /// treats the resulting `None` as "identity unverifiable, refuse
+    /// adoption", which costs one restart and cannot mis-target.
+    #[serde(default)]
+    pub vpp_boot_id: Option<String>,
 }
 
 impl ResourceState {
@@ -105,6 +121,7 @@ impl ResourceState {
             steer_rules: Vec::new(),
             vpp_pid: None,
             vpp_start_ticks: None,
+            vpp_boot_id: None,
         }
     }
 

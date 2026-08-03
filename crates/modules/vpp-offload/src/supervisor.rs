@@ -41,6 +41,33 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// one and the FIB is still warm in bird's mirror.
 pub const BASE_BACKOFF: Duration = Duration::from_millis(250);
 
+/// How long VPP may take to answer its binary API after spawn before
+/// we give up on it.
+///
+/// Without this, `Starting` is a **trap with no exit**. A VPP that
+/// lives but deadlocks before opening its API socket generates no
+/// event at all: `ApiUp` never arrives, the pidfd stays quiet because
+/// the process is alive, and the wedge detector cannot help because it
+/// only starts once the API has answered at least once. Forwarding
+/// would stay down until an operator noticed.
+///
+/// Generous, because startup genuinely takes time on this platform:
+/// VPP allocates and faults in a multi-GB main heap on 512 MiB
+/// hugepages, then probes and attaches the device. Being wrong in the
+/// slow direction costs a longer first attach; being wrong in the fast
+/// direction restart-loops a VPP that was about to come up.
+pub const API_STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long a resync + verify cycle may take before we treat it as
+/// hung.
+///
+/// Same failure shape as [`API_STARTUP_BUDGET`]: a resync that never
+/// finishes emits neither `SyncComplete` nor a failure, so `Syncing`
+/// would also be a trap. Sized above the ≤60 s convergence budget the
+/// full v4 table is measured against, with room for the verify pass —
+/// exceeding it means something is wrong, not merely slow.
+pub const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
+
 /// Where the supervised VPP is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -74,16 +101,13 @@ impl State {
     pub fn has_process(self) -> bool {
         !matches!(self, State::Stopped | State::Backoff)
     }
-
-    /// Whether a resync or verify is in flight — the window in which a
-    /// restart must not be started (rule 4).
-    pub fn is_converging(self) -> bool {
-        matches!(
-            self,
-            State::Syncing | State::Verifying | State::AdoptedResyncing
-        )
-    }
 }
+// NOTE: there is deliberately no `State::is_converging()`. Deriving
+// "a resync is in flight" from the lifecycle state is what broke rule
+// 4: `fail()` moves the state to `Backoff`, which is not a converging
+// state, so the guard vanished exactly when VPP died mid-convergence.
+// Ask `Supervisor::is_converging()`, which tracks the real thing.
+// `State::is_steered()` is absent for the same reason.
 
 /// Something that happened to the supervised process or its FIB.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +145,27 @@ pub enum Event {
     /// alive but not scheduling; treated as death because a wedged
     /// forwarder drops exactly as thoroughly as a dead one.
     Wedged,
+    /// The current phase outran its budget — [`API_STARTUP_BUDGET`] in
+    /// `Starting`, [`CONVERGENCE_BUDGET`] while converging.
+    ///
+    /// Exists because those phases are otherwise **exitless**: a VPP
+    /// that is alive but not answering, or a resync that never
+    /// finishes, produces no event whatsoever. The caller arms a
+    /// deadline from [`Supervisor::phase_budget`] and sends this when
+    /// it fires.
+    PhaseTimedOut,
+    /// Installing the MCAM rules failed. The dataplane is verified but
+    /// traffic is NOT diverted — the safe staging state, reported
+    /// rather than papered over.
+    SteerFailed,
+    /// An aborted resync or verify has actually finished unwinding.
+    ///
+    /// The supervisor cannot observe this itself: the work runs in the
+    /// caller's task, so only the caller knows when it has stopped
+    /// touching the transport. Until it arrives,
+    /// [`Supervisor::may_restart`] stays false so a restart cannot
+    /// stack a second load onto one VPP.
+    ConvergenceStopped,
     /// Backoff elapsed.
     BackoffElapsed,
     /// Operator asked for a clean stop.
@@ -146,6 +191,10 @@ pub enum Action {
     StartVerify,
     /// Install MCAM steering rules.
     Steer,
+    /// Stop an in-flight resync/verify. Paired with
+    /// `Event::ConvergenceStopped`, which reports when it has actually
+    /// wound down — the restart waits for that, not for this.
+    AbortConvergence,
     /// Arm the backoff timer.
     ArmBackoff(Duration),
     /// Release VF/hugepage resources; terminal.
@@ -174,6 +223,19 @@ pub struct Supervisor {
     /// remembered across the restart so `Ready` knows whether to
     /// re-steer automatically or wait for the operator's canary.
     was_steered: bool,
+    /// Whether a resync or verify task is still running.
+    ///
+    /// A field for the same reason `steered` is one: derived from the
+    /// lifecycle state it was wrong in exactly the case that matters.
+    /// `fail()` moves the state straight to `Backoff`, and `Backoff` is
+    /// not a converging state — so `may_restart()` said yes while the
+    /// resync task was still unwinding, and rule 4 ("no restart while a
+    /// resync is in flight") failed precisely when VPP died *during*
+    /// convergence, which is when it is most likely to.
+    ///
+    /// Only the caller knows when its task has truly stopped, so this
+    /// is cleared by `Event::ConvergenceStopped`, not by a state change.
+    converging: bool,
 }
 
 impl Default for Supervisor {
@@ -189,6 +251,7 @@ impl Supervisor {
             failures: 0,
             steered: false,
             was_steered: false,
+            converging: false,
         }
     }
 
@@ -244,8 +307,12 @@ impl Supervisor {
             // ignores both StartRequested and BackoffElapsed, so the
             // retry policy it has would never run.
             (Starting, SpawnFailed) => self.fail(),
+            // VPP is alive but never answered. Without this the state
+            // is exitless — see API_STARTUP_BUDGET.
+            (Starting, PhaseTimedOut) => self.fail(),
             (Starting, ApiUp) => {
                 self.state = Syncing;
+                self.converging = true;
                 // Devices first: the FIB paths we are about to install
                 // reference interface indices that do not exist until
                 // the device is attached and its port interface
@@ -257,6 +324,7 @@ impl Supervisor {
             (Stopped | Backoff | Starting, Adopted { steered }) => {
                 self.steered = steered;
                 self.was_steered = steered;
+                self.converging = true;
                 // An adopted VPP is presumed good until proven stale:
                 // mark dirty, resync, verify — but do NOT unsteer a
                 // correctly-forwarding dataplane to do it.
@@ -269,8 +337,12 @@ impl Supervisor {
                 self.state = Verifying;
                 vec![Action::StartVerify]
             }
+            // A resync or verify that never finishes is the same trap
+            // as a VPP that never answers.
+            (Syncing | AdoptedResyncing | Verifying, PhaseTimedOut) => self.fail(),
             (Verifying, VerifyPassed) => {
                 self.failures = 0;
+                self.converging = false;
                 // Steer if traffic was flowing before the disruption —
                 // or is still flowing, in the adopted case. A first
                 // attach waits for the operator's explicit canary;
@@ -283,12 +355,18 @@ impl Supervisor {
                 // provisioning and deploys, so rules we installed
                 // before a restart may simply be gone. Re-asserting
                 // them is the reconcile step, and it is cheap.
+                //
+                // The state does NOT become `Steered` here. Installing
+                // MCAM rules can fail, and claiming success before the
+                // action has run would report a steered dataplane whose
+                // rules were never installed — failures cleared, no
+                // retry, traffic quietly still on the fallback tier.
+                // `Event::Steered` is the acknowledgement, exactly as
+                // on the first-attach path.
+                self.state = Ready;
                 if self.steered || self.was_steered {
-                    self.state = State::Steered;
-                    self.steered = true;
                     vec![Action::Steer]
                 } else {
-                    self.state = Ready;
                     vec![]
                 }
             }
@@ -296,6 +374,7 @@ impl Supervisor {
                 // A FIB we cannot verify is not one to divert traffic
                 // into. Treat as a failure and cycle, rather than
                 // steering optimistically.
+                self.converging = false;
                 self.fail()
             }
             (Ready, Event::Steered) => {
@@ -313,12 +392,31 @@ impl Supervisor {
                 self.fail()
             }
 
+            // Steering could not be installed. We stay verified but
+            // UNSTEERED — the safe staging state, and one an operator
+            // can see. Deliberately not a `fail()`: the dataplane is
+            // fine, so killing and restarting VPP would trade a
+            // working-but-idle forwarder for an outage. `steered` is
+            // left untouched, because on the adopted path the previous
+            // rules may still be live and claiming otherwise would
+            // suppress the Unsteer we owe on teardown.
+            (Ready, SteerFailed) => vec![],
+
+            // --- convergence bookkeeping ---
+            (_, ConvergenceStopped) => {
+                self.converging = false;
+                vec![]
+            }
+
             // --- clean stop ---
             (_, StopRequested) => {
                 let mut actions = Vec::new();
                 if self.steered {
                     actions.push(Action::Unsteer);
                     self.steered = false;
+                }
+                if self.converging {
+                    actions.push(Action::AbortConvergence);
                 }
                 actions.push(Action::Kill);
                 actions.push(Action::ReleaseResources);
@@ -349,6 +447,13 @@ impl Supervisor {
             actions.push(Action::Unsteer);
             self.steered = false;
         }
+        // Tell the caller to wind down any resync/verify still running.
+        // `converging` stays true until it confirms with
+        // `ConvergenceStopped`, which is what holds the restart back —
+        // this action only asks.
+        if self.converging {
+            actions.push(Action::AbortConvergence);
+        }
         actions.push(Action::Kill);
         self.failures = self.failures.saturating_add(1);
         let delay = self.backoff();
@@ -357,14 +462,36 @@ impl Supervisor {
         actions
     }
 
+    /// Whether a resync or verify is still running.
+    pub fn is_converging(&self) -> bool {
+        self.converging
+    }
+
+    /// How long the current phase may take before the caller should
+    /// send `Event::PhaseTimedOut`. `None` = no deadline applies.
+    ///
+    /// The caller arms this rather than the supervisor, which owns no
+    /// clock — but the *budget* belongs here, next to the states it
+    /// bounds.
+    pub fn phase_budget(&self) -> Option<Duration> {
+        match self.state {
+            State::Starting => Some(API_STARTUP_BUDGET),
+            State::Syncing | State::AdoptedResyncing | State::Verifying => Some(CONVERGENCE_BUDGET),
+            _ => None,
+        }
+    }
+
     /// Whether a restart may be started right now (rule 4).
     ///
-    /// The caller checks this before acting on a `BackoffElapsed`: a
-    /// resync still draining means the previous attempt has not
-    /// finished failing, and starting another would stack two loads
+    /// Gated on the `converging` FIELD, not on the lifecycle state.
+    /// `fail()` sets the state to `Backoff`, which is not a converging
+    /// state, so a state-derived check returned true while the resync
+    /// task was still unwinding — the guard evaporated exactly when VPP
+    /// died mid-convergence. The caller checks this before acting on
+    /// `BackoffElapsed`; starting another attempt would stack two loads
     /// onto one VPP.
     pub fn may_restart(&self) -> bool {
-        !self.state.is_converging()
+        !self.converging
     }
 }
 
@@ -569,11 +696,111 @@ mod tests {
         s.on(Event::SyncComplete);
         assert_eq!(s.state(), State::Verifying);
         let actions = s.on(Event::VerifyPassed);
-        assert_eq!(s.state(), State::Steered);
         assert!(
             actions.contains(&Action::Steer),
             "re-assert rules after adoption so ours own them"
         );
+        // Pending, not done: the rules are not confirmed installed
+        // until the action reports back.
+        assert_eq!(s.state(), State::Ready);
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::Steered);
+        assert!(s.is_steered());
+    }
+
+    /// `Starting` used to be a trap with no exit: a VPP that lives but
+    /// never opens its API emits nothing at all — no `ApiUp`, no pidfd
+    /// exit (it is alive), and no wedge event (the detector only starts
+    /// after the first answer). Forwarding stayed down until a human
+    /// noticed.
+    #[test]
+    fn a_vpp_that_never_answers_its_api_is_not_waited_on_forever() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        assert_eq!(s.state(), State::Starting);
+        assert_eq!(
+            s.phase_budget(),
+            Some(API_STARTUP_BUDGET),
+            "the caller needs a deadline to arm"
+        );
+
+        let actions = s.on(Event::PhaseTimedOut);
+        assert_eq!(s.state(), State::Backoff);
+        assert!(actions.contains(&Action::Kill));
+        assert!(actions.iter().any(|a| matches!(a, Action::ArmBackoff(_))));
+        assert!(s.may_restart(), "nothing was converging");
+        assert_eq!(s.on(Event::BackoffElapsed), vec![Action::Spawn]);
+    }
+
+    /// Same trap, one phase later: a resync that never finishes.
+    #[test]
+    fn a_hung_resync_times_out_instead_of_hanging_forever() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        assert_eq!(s.state(), State::Syncing);
+        assert_eq!(s.phase_budget(), Some(CONVERGENCE_BUDGET));
+
+        let actions = s.on(Event::PhaseTimedOut);
+        assert_eq!(s.state(), State::Backoff);
+        assert!(
+            actions.contains(&Action::AbortConvergence),
+            "the hung task must be told to stop: {actions:?}"
+        );
+    }
+
+    /// Rule 4 through the path that actually breaks it. `fail()` sets
+    /// the state to `Backoff`, which is not a converging *state* — so a
+    /// state-derived `may_restart()` said yes while the resync task was
+    /// still unwinding, and the guard evaporated exactly when VPP died
+    /// mid-convergence.
+    #[test]
+    fn a_death_during_convergence_blocks_restart_until_the_task_stops() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        assert!(s.is_converging());
+
+        let actions = s.on(Event::ProcessExited { status: None });
+        assert_eq!(s.state(), State::Backoff);
+        assert!(
+            actions.contains(&Action::AbortConvergence),
+            "must ask the resync to wind down: {actions:?}"
+        );
+        assert!(
+            !s.may_restart(),
+            "a restart here would stack two loads onto one VPP"
+        );
+
+        // The action only ASKS. Only the caller knows when its task has
+        // actually stopped touching the transport.
+        s.on(Event::ConvergenceStopped);
+        assert!(s.may_restart());
+    }
+
+    /// A steer that fails must not be reported as success. The
+    /// first-attach path always waited for an acknowledgement; the
+    /// automatic-restore path assumed it.
+    #[test]
+    fn a_failed_steer_leaves_us_verified_but_unsteered() {
+        let mut s = running_and_steered();
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        let actions = s.on(Event::VerifyPassed);
+        assert!(actions.contains(&Action::Steer));
+        assert_eq!(s.state(), State::Ready);
+
+        // Rules could not be installed.
+        assert_eq!(s.on(Event::SteerFailed), vec![]);
+        assert_eq!(
+            s.state(),
+            State::Ready,
+            "verified but not steered — the safe staging state"
+        );
+        // And it must NOT be reported as a running steered dataplane.
+        assert_ne!(s.state(), State::Steered);
     }
 
     #[test]
@@ -596,11 +823,13 @@ mod tests {
         s.on(Event::ApiUp);
         s.on(Event::SyncComplete);
         let actions = s.on(Event::VerifyPassed);
-        assert_eq!(s.state(), State::Steered);
         assert!(
             actions.contains(&Action::Steer),
             "traffic was flowing before the crash, so restore it"
         );
+        assert_eq!(s.state(), State::Ready, "awaiting the steer ack");
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::Steered);
     }
 
     #[test]

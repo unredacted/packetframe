@@ -46,6 +46,31 @@ pub fn parse_start_ticks(stat: &str) -> Option<u64> {
     stat[close + 1..].split_whitespace().nth(19)?.parse().ok()
 }
 
+/// Identity of the running kernel, from
+/// `/proc/sys/kernel/random/boot_id`.
+///
+/// **Load-bearing for adoption, not diagnostics.** `start_ticks` is
+/// measured in clock ticks *since boot*, and the state file outlives a
+/// reboot (the default state dir is under `/var/lib`). After a reboot
+/// the tick counter restarts, so an unrelated process can legitimately
+/// land on the recorded pid at the recorded tick and satisfy a
+/// `(pid, start_ticks)` equality check. We would then hold a pidfd for
+/// a stranger and later send it SIGTERM and SIGKILL as root.
+///
+/// The boot id makes the pair meaningful again: it changes on every
+/// boot, so a state file from a previous boot can never match.
+pub fn boot_id() -> std::io::Result<String> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let id = raw.trim().to_string();
+    if id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "/proc/sys/kernel/random/boot_id is empty",
+        ));
+    }
+    Ok(id)
+}
+
 /// How a process handle was obtained. Adopted processes cannot be
 /// reaped (they are init's children, not ours), so their exit status
 /// is unavailable — the supervisor's `ProcessExited { status }` is an
@@ -103,6 +128,27 @@ mod imp {
         Ok(())
     }
 
+    /// Kill and reap a child we spawned but could not take ownership
+    /// of, then return the original error with that noted.
+    ///
+    /// Signalling by pid rather than pidfd is safe *here specifically*:
+    /// we hold the unreaped `Child`, so the pid cannot have been
+    /// recycled yet — it is at worst our own zombie.
+    fn orphan_cleanup(mut child: Child, pid: i32, cause: io::Error) -> io::Error {
+        // SAFETY: kill(2) on a pid we own and have not reaped.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // Reap so it does not linger as a zombie holding the pid.
+        let reaped = child.wait().is_ok();
+        io::Error::new(
+            cause.kind(),
+            format!(
+                "spawned VPP (pid {pid}) but could not take ownership of it: {cause}; \
+                 the child was killed{} to avoid an untracked VPP holding the VF",
+                if reaped { " and reaped" } else { "" }
+            ),
+        )
+    }
+
     fn read_start_ticks(pid: i32) -> io::Result<u64> {
         let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
         parse_start_ticks(&raw).ok_or_else(|| {
@@ -134,7 +180,7 @@ mod imp {
         /// would signal "exited" immediately and the supervisor would
         /// restart-loop a perfectly healthy VPP.
         pub fn spawn(binary: &Path, conf: &Path) -> io::Result<Self> {
-            let child = Command::new(binary)
+            let mut child = Command::new(binary)
                 .arg("-c")
                 .arg(conf)
                 // VPP's own `log` stanza owns its output. Inheriting
@@ -149,8 +195,22 @@ mod imp {
             // Open the pidfd before anything else can reap the child.
             // `child` is still owned here, so even if VPP died during
             // exec it is a zombie, not gone, and pidfd_open succeeds.
-            let pidfd = pidfd_open(pid)?;
-            let start_ticks = read_start_ticks(pid)?;
+            //
+            // Both of these can fail on a healthy, RUNNING child — an
+            // fd-limit hit on `pidfd_open`, a procfs read error on the
+            // stat. Propagating with `?` would drop `child` and leave
+            // that VPP alive and untracked: still holding the VF and
+            // the API socket, invisible to the pidfd we never got, and
+            // the `SpawnFailed` retry would then start a SECOND VPP on
+            // the same resources. Kill what we started before giving up.
+            let pidfd = match pidfd_open(pid) {
+                Ok(fd) => fd,
+                Err(e) => return Err(orphan_cleanup(child, pid, e)),
+            };
+            let start_ticks = match read_start_ticks(pid) {
+                Ok(t) => t,
+                Err(e) => return Err(orphan_cleanup(child, pid, e)),
+            };
             Ok(Self {
                 pid,
                 start_ticks,
@@ -161,11 +221,20 @@ mod imp {
         }
 
         /// Re-acquire a VPP that outlived us, from the state file's
-        /// `(pid, start_ticks)` pair.
+        /// `(pid, start_ticks, boot_id)` triple.
         ///
-        /// `Ok(None)` means "nothing of ours is running" — either the
-        /// pid is gone, or it now belongs to an unrelated process.
-        /// Both are ordinary fresh-attach outcomes, not errors.
+        /// `Ok(None)` means "nothing of ours is running" — the pid is
+        /// gone, it now belongs to an unrelated process, or the state
+        /// file is from a previous boot. All three are ordinary
+        /// fresh-attach outcomes, not errors.
+        ///
+        /// **`recorded_boot_id` is not optional in spirit.** Passing
+        /// `None` (an old state file that predates the field) refuses
+        /// adoption, because `start_ticks` counts from boot and the
+        /// state file outlives a reboot: without a boot id, a fresh
+        /// unrelated process can match the recorded pid at the recorded
+        /// tick, and we would SIGKILL it as root. One needless restart
+        /// is the correct price.
         ///
         /// Order matters: **open the pidfd first, verify identity
         /// second.** The pidfd pins one process for its lifetime, so
@@ -173,7 +242,24 @@ mod imp {
         /// start-time check then rules out a reuse that happened
         /// *before* the open. Verifying first and opening second would
         /// leave exactly the window this is meant to close.
-        pub fn adopt(pid: i32, start_ticks: u64) -> io::Result<Option<Self>> {
+        pub fn adopt(
+            pid: i32,
+            start_ticks: u64,
+            recorded_boot_id: Option<&str>,
+        ) -> io::Result<Option<Self>> {
+            // Cheapest and most decisive check, before we touch a pid
+            // that may not be ours at all.
+            match (recorded_boot_id, super::boot_id()) {
+                (Some(recorded), Ok(current)) if recorded == current => {}
+                // Different boot: the state file's pid/tick pair refers
+                // to a process that cannot still exist.
+                (Some(_), Ok(_)) => return Ok(None),
+                // No recorded boot id: cannot establish identity.
+                (None, _) => return Ok(None),
+                // Cannot read our own boot id — refuse rather than
+                // adopt on an unverifiable identity.
+                (_, Err(e)) => return Err(e),
+            }
             let pidfd = match pidfd_open(pid) {
                 Ok(fd) => fd,
                 // No such process: the normal "VPP died while we were
@@ -346,7 +432,11 @@ mod imp {
         pub fn spawn(_binary: &Path, _conf: &Path) -> io::Result<Self> {
             unsupported()
         }
-        pub fn adopt(_pid: i32, _start_ticks: u64) -> io::Result<Option<Self>> {
+        pub fn adopt(
+            _pid: i32,
+            _start_ticks: u64,
+            _recorded_boot_id: Option<&str>,
+        ) -> io::Result<Option<Self>> {
             unsupported()
         }
         pub fn pid(&self) -> i32 {
@@ -383,23 +473,57 @@ pub use imp::VppProcess;
 /// that distinction is the difference between a seamless packetframe
 /// restart and a self-inflicted blackhole.
 pub fn adopt_or_spawn(
-    prior: Option<(i32, u64)>,
+    prior: Option<(i32, u64, Option<String>)>,
     binary: &Path,
     conf: &Path,
 ) -> io::Result<(VppProcess, bool)> {
-    if let Some((pid, ticks)) = prior {
-        if let Some(p) = VppProcess::adopt(pid, ticks)? {
+    if let Some((pid, ticks, boot)) = prior {
+        if let Some(p) = VppProcess::adopt(pid, ticks, boot.as_deref())? {
             return Ok((p, true));
         }
     }
     Ok((VppProcess::spawn(binary, conf)?, false))
 }
 
-/// Best-effort teardown used on paths that must not fail, such as
-/// detach unwinding: log-and-continue rather than propagate.
-pub fn terminate_quietly(p: &mut VppProcess, grace: Duration) {
-    if let Err(e) = p.terminate(grace) {
-        tracing::warn!(pid = p.pid(), error = %e, "VPP termination did not complete cleanly");
+/// Whether the caller may release the resources VPP was using.
+///
+/// The distinction is the whole point of [`VppProcess::terminate`]'s
+/// bounded SIGKILL wait, so it must survive into the teardown path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Disposition {
+    /// The process is gone. VF unbind, numvfs=0, and hugepage release
+    /// are safe.
+    SafeToRelease,
+    /// The process may still be alive and DMA-capable. Resources MUST
+    /// be leaked rather than released.
+    MustLeak,
+}
+
+/// Teardown for paths that cannot propagate an error, such as detach
+/// unwinding — but which still must not release resources under a live
+/// process.
+///
+/// Returns a [`Disposition`] instead of swallowing the outcome. An
+/// earlier version logged the failure and returned `()`, which handed
+/// the caller no way to distinguish "VPP is gone" from "VPP survived
+/// SIGKILL and may still be writing into the buffers you are about to
+/// hand back to the kernel". Unbinding a VF or dropping hugepages under
+/// a process that can still DMA into them is memory corruption with a
+/// warning line in the log as its only trace — leaking a VF is
+/// dramatically cheaper, and it is visible in `packetframe status`.
+pub fn terminate_or_leak(p: &mut VppProcess, grace: Duration) -> Disposition {
+    match p.terminate(grace) {
+        Ok(_) => Disposition::SafeToRelease,
+        Err(e) => {
+            tracing::error!(
+                pid = p.pid(),
+                error = %e,
+                "VPP did not die; LEAKING its VF and hugepages rather than \
+                 releasing resources a live process may still DMA into"
+            );
+            Disposition::MustLeak
+        }
     }
 }
 
@@ -445,6 +569,45 @@ mod tests {
         // Field 22 present but not a number.
         let bad = "4242 (vpp) S 1 4242 4242 0 -1 4194560 1234 0 0 0 10 20 0 0 20 0 8 0 xxx 1 2";
         assert_eq!(parse_start_ticks(bad), None);
+    }
+
+    /// Adoption across a reboot is the case that could aim SIGKILL at
+    /// a stranger: `start_ticks` counts from boot and resets, while the
+    /// state file under `/var/lib` does not. A state file with no
+    /// recorded boot id therefore cannot establish identity at all, and
+    /// must be refused rather than trusted.
+    #[test]
+    fn adoption_without_a_recorded_boot_id_is_refused() {
+        // Our own pid is certainly alive, so this isolates the boot-id
+        // check from every other reason adoption can decline.
+        let me = std::process::id() as i32;
+        let ticks = 12345;
+        match VppProcess::adopt(me, ticks, None) {
+            Ok(None) => {} // refused, as required
+            Ok(Some(_)) => panic!("adopted a process on an unverifiable identity"),
+            // Non-Linux stubs return Unsupported; that is also "did not
+            // adopt", which is the property under test.
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}"),
+        }
+    }
+
+    /// A boot id from a different boot must not match.
+    #[test]
+    fn adoption_from_a_previous_boot_is_refused() {
+        let me = std::process::id() as i32;
+        match VppProcess::adopt(me, 12345, Some("not-the-current-boot-id")) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("adopted across a reboot"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}"),
+        }
+    }
+
+    /// `Disposition` is the signal that stops teardown from releasing
+    /// a VF under a process that may still DMA into it. It must be
+    /// impossible to ignore by accident.
+    #[test]
+    fn disposition_distinguishes_safe_from_must_leak() {
+        assert_ne!(Disposition::SafeToRelease, Disposition::MustLeak);
     }
 
     /// Real kernels emit a trailing newline.
