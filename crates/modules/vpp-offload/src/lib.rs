@@ -25,9 +25,12 @@
 //! - the eBPF fast-path on the PFs is the permanent failover tier.
 
 pub mod fib_sync;
+pub mod liveness;
+pub mod process;
 pub mod resources;
 pub mod sink;
 pub mod startup_conf;
+pub mod supervisor;
 pub mod vpp_api;
 
 #[cfg(target_os = "linux")]
