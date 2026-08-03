@@ -91,6 +91,19 @@ impl VppOffloadConfig {
         }
         out
     }
+
+    /// Total VPP worker threads the config promises, across all ports.
+    ///
+    /// VPP's thread count is global, not per-interface, and its counter
+    /// vectors replicate per thread — so this, not any single port's
+    /// `cores`, is what sizes the stats segment
+    /// (`startup_conf::derive_sizing`).
+    pub fn total_workers(&self) -> u32 {
+        self.ports
+            .iter()
+            .map(|(_, cores, _)| u32::from(*cores))
+            .sum()
+    }
 }
 
 pub struct VppOffloadModule {
@@ -130,8 +143,9 @@ impl Module for VppOffloadModule {
         // the fast-path section is visible; by load time it has passed.
         // Here: validate the sizing arithmetic so a too-small
         // `hugepages` is a clean startup error, not a VPP init abort.
-        let sizing = startup_conf::derive_sizing(self.cfg.expected_routes)
-            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        let sizing =
+            startup_conf::derive_sizing(self.cfg.expected_routes, self.cfg.total_workers())
+                .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         if let Some(pages) = self.cfg.hugepages {
             startup_conf::check_hugepage_budget(&sizing, pages, default_hugepage_bytes())
                 .map_err(|e| ModuleError::other(MODULE_NAME, e))?;

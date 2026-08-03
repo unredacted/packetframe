@@ -17,15 +17,25 @@
 //! that omits the stats segment does not run VPP short; it kills it
 //! partway through its first full-table resync.
 //!
+//! **The stats segment also scales with VPP's thread count**, which the
+//! main heap's route term does not. VPP's counter vectors are per-thread
+//! (`vec_validate (cm->counters, tm->n_vlib_mains - 1)`), so every
+//! worker adds another copy of every per-FIB-entry counter. Gate 0b ran
+//! one worker; a five-port config runs five. Sizing from the measured
+//! aggregate as if it were thread-independent would under-provision a
+//! five-worker box by ~3× and reproduce the very abort this module now
+//! exists to prevent.
+//!
 //! ## Measured, gate 0b item 10 (2026-08-03, shadow)
 //!
 //! 1,053,360 v4 prefixes from the live bird `master4`, loaded into
-//! v26.06/octeon9 on a 4 GiB main heap:
+//! v26.06/octeon9 on a 4 GiB main heap, `corelist-workers 17` —
+//! **one worker, so two VPP threads** (main + worker):
 //!
 //! | | baseline | full table | per route |
 //! |---|---|---|---|
 //! | main heap (used) | 337.86 MiB | 803.49 MiB | **463 B** |
-//! | stat segment (populated) | 1.19 MiB | 101.94 MiB | **97 B** |
+//! | stat segment (populated) | 1.19 MiB | 101.94 MiB | **97 B** (at 2 threads) |
 //! | hugepages in use | 9 × 512 MiB | 10 × 512 MiB | — |
 //!
 //! Per-chunk increments ranged 82 B–2,058 B/route because mtrie
@@ -66,22 +76,48 @@ pub const HEAP_FLOOR_BYTES: u64 = 512 << 20;
 /// short at full table.
 pub const BUFFER_BYTES: u64 = 1 << 30;
 
-/// Stats-segment bytes per installed route.
+/// Stats-segment bytes per installed route, **per VPP thread**.
 ///
-/// Measured **97 B/route** from populated pages. 192 is ~2×.
+/// Measured **97 B/route** from populated pages with two threads (the
+/// main thread plus one worker) ⇒ 48.5 B/route/thread. 96 is ~2×, and
+/// reproduces the measured configuration's 192 B/route exactly.
+///
+/// The per-thread form is not cosmetic. VPP allocates counter vectors
+/// per thread, so a five-worker config needs three times what gate 0b
+/// measured. The decomposition is deliberately **conservative**:
+/// gate 0b has a single data point, so it cannot separate the fixed
+/// per-route cost (statseg directory entries, name strings) from the
+/// per-thread cost, and this attributes all of it to per-thread. That
+/// over-provisions multi-worker boxes — the safe direction, since the
+/// resource is cheap and the failure mode is an abort mid-resync.
+/// Re-measuring at two different worker counts would refine it; until
+/// then, err high.
 ///
 /// This term did not exist before gate 0b, and its absence is what
 /// aborted VPP at ~380k routes on the default segment.
-pub const STATSEG_BYTES_PER_ROUTE: u64 = 192;
+pub const STATSEG_BYTES_PER_ROUTE_PER_THREAD: u64 = 96;
 
 /// Stats-segment floor. VPP's own counters exist before any route does,
 /// and its own default is 32 MiB — no reason to go below that.
 pub const STATSEG_FLOOR_BYTES: u64 = 32 << 20;
 
+/// VPP threads for `workers` configured workers: `n_vlib_mains` in
+/// VPP's own terms — the main thread plus one per worker. The main
+/// thread gets a counter slot whether or not workers exist, so a
+/// worker-less VPP is one thread, not zero.
+pub fn thread_count(workers: u32) -> u64 {
+    u64::from(workers) + 1
+}
+
 /// Derived sizing: what the config's `expected-routes` implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
     pub expected_routes: u64,
+    /// Configured VPP workers (sum of every port's `cores`). Recorded
+    /// because the stats segment scales with it and because [`render`]
+    /// cross-checks it against the core list it is handed — two
+    /// independent worker counts is how a segment gets undersized.
+    pub workers: u32,
     pub main_heap_bytes: u64,
     /// The **hugepage** budget: main heap + buffers.
     ///
@@ -96,10 +132,15 @@ pub struct Sizing {
     pub statseg_bytes: u64,
 }
 
-/// Compute the sizing from the route count. Errors on inputs that
-/// would overflow or that are plainly nonsensical (0 is rejected at
-/// parse; this guards the arithmetic itself).
-pub fn derive_sizing(expected_routes: u64) -> Result<Sizing, String> {
+/// Compute the sizing from the route count and the configured worker
+/// count. Errors on inputs that would overflow or that are plainly
+/// nonsensical (0 routes is rejected at parse; this guards the
+/// arithmetic itself).
+///
+/// `workers` is the **total** across every port — the sum of the
+/// `cores` promises — because VPP's thread count, and therefore its
+/// counter-vector replication, is global rather than per-interface.
+pub fn derive_sizing(expected_routes: u64, workers: u32) -> Result<Sizing, String> {
     let table = expected_routes
         .checked_mul(HEAP_BYTES_PER_ROUTE)
         .ok_or_else(|| format!("expected-routes {expected_routes} overflows sizing math"))?;
@@ -110,11 +151,17 @@ pub fn derive_sizing(expected_routes: u64) -> Result<Sizing, String> {
         .checked_add(BUFFER_BYTES)
         .ok_or_else(|| "total sizing overflow".to_string())?;
     let statseg_bytes = expected_routes
-        .checked_mul(STATSEG_BYTES_PER_ROUTE)
-        .ok_or_else(|| "stats-segment sizing overflow".to_string())?
+        .checked_mul(STATSEG_BYTES_PER_ROUTE_PER_THREAD)
+        .and_then(|b| b.checked_mul(thread_count(workers)))
+        .ok_or_else(|| {
+            format!(
+                "stats-segment sizing overflows at {expected_routes} routes × {workers} workers"
+            )
+        })?
         .max(STATSEG_FLOOR_BYTES);
     Ok(Sizing {
         expected_routes,
+        workers,
         main_heap_bytes,
         total_bytes,
         statseg_bytes,
@@ -201,6 +248,22 @@ pub fn render(
     api_socket: &str,
     hugepage_bytes: u64,
 ) -> String {
+    // The core list and the sizing must describe the same VPP. They
+    // come from the same config, so a mismatch is a programming error —
+    // but an *invisible* one: too few workers in the sizing means an
+    // undersized stats segment, which surfaces hours later as an OOM
+    // abort partway through a resync, with no hint that startup.conf
+    // was the cause. Fail here, loudly, where the message names the
+    // problem.
+    assert_eq!(
+        worker_cores.len(),
+        sizing.workers as usize,
+        "sizing was derived for {} workers but {} worker cores were given; \
+         the stats segment scales with thread count and would be undersized",
+        sizing.workers,
+        worker_cores.len(),
+    );
+
     let mut out = String::with_capacity(2048);
     let workers = worker_cores
         .iter()
@@ -270,11 +333,18 @@ mod tests {
     const MEASURED_ROUTES: u64 = 1_053_360;
     const MEASURED_HEAP_USED: u64 = 803 * (1 << 20); // 803.49 MiB
     const MEASURED_STATSEG_POPULATED: u64 = 102 * (1 << 20); // 101.94 MiB
+    /// The spike ran `corelist-workers 17`: one worker, two VPP threads.
+    /// Every statseg figure above is a two-thread figure.
+    const MEASURED_WORKERS: u32 = 1;
+    /// 101.94 MiB / 1,053,360 routes / 2 threads, rounded up. Used to
+    /// extrapolate the measurement to worker counts the spike did not
+    /// run, which is the only honest way to check those configurations.
+    const MEASURED_STATSEG_PER_ROUTE_PER_THREAD: u64 = 51;
 
     #[test]
     fn sizing_scales_with_routes() {
-        let small = derive_sizing(1_000).unwrap();
-        let full = derive_sizing(1_400_000).unwrap();
+        let small = derive_sizing(1_000, 1).unwrap();
+        let full = derive_sizing(1_400_000, 1).unwrap();
         assert!(full.main_heap_bytes > small.main_heap_bytes);
         assert!(full.statseg_bytes > small.statseg_bytes);
         // Post-measurement band: 1.4M × 1 KiB + 512 MiB floor + 1 GiB
@@ -289,7 +359,7 @@ mod tests {
     /// "tidy up the constants" that quietly drops below reality.
     #[test]
     fn the_constants_cover_the_measured_full_table() {
-        let s = derive_sizing(MEASURED_ROUTES).unwrap();
+        let s = derive_sizing(MEASURED_ROUTES, MEASURED_WORKERS).unwrap();
         assert!(
             s.main_heap_bytes > MEASURED_HEAP_USED,
             "derived heap {} must exceed the measured {MEASURED_HEAP_USED}",
@@ -313,9 +383,87 @@ mod tests {
         // time — a default that stopped covering the measured table
         // should fail the build, not a test run.
         const { assert!(crate::DEFAULT_EXPECTED_ROUTES > MEASURED_ROUTES) };
-        let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES).unwrap();
+        let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, MEASURED_WORKERS).unwrap();
         assert!(s.statseg_bytes > MEASURED_STATSEG_POPULATED);
         assert!(s.main_heap_bytes > MEASURED_HEAP_USED);
+    }
+
+    /// The stats segment must cover the extrapolated measurement at
+    /// **every** worker count a config can ask for, not just the one the
+    /// spike happened to run.
+    ///
+    /// This is the invariant, so it is asserted against the extrapolated
+    /// measurement rather than against `STATSEG_BYTES_PER_ROUTE_PER_THREAD`
+    /// — checking the constant against itself would pass for any value.
+    /// A fixed per-route slope fails this at 2 workers and is 3× short at
+    /// 5, which is the `example.conf` shape.
+    #[test]
+    fn the_stats_segment_covers_every_supported_worker_count() {
+        for workers in 0..=16u32 {
+            let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, workers).unwrap();
+            let need = crate::DEFAULT_EXPECTED_ROUTES
+                * MEASURED_STATSEG_PER_ROUTE_PER_THREAD
+                * thread_count(workers);
+            assert!(
+                s.statseg_bytes >= need * 3 / 2,
+                "workers={workers}: derived {} is not 1.5× the extrapolated {need}",
+                s.statseg_bytes
+            );
+        }
+    }
+
+    /// Every added worker adds a full copy of every per-FIB-entry
+    /// counter, so the segment must grow strictly with worker count. A
+    /// route-count-only slope makes this constant, which is the bug.
+    #[test]
+    fn the_stats_segment_scales_with_workers() {
+        let one = derive_sizing(1_600_000, 1).unwrap();
+        let five = derive_sizing(1_600_000, 5).unwrap();
+        assert!(
+            five.statseg_bytes > one.statseg_bytes,
+            "5 workers ({}) must need more than 1 ({})",
+            five.statseg_bytes,
+            one.statseg_bytes
+        );
+        // Linear in thread count, not worker count: 6 threads vs 2.
+        assert_eq!(five.statseg_bytes, one.statseg_bytes * 3);
+        // And the main heap does NOT scale with workers — its route term
+        // is shared FIB state, and treating it as per-thread would
+        // inflate the hugepage reservation for no reason.
+        assert_eq!(five.main_heap_bytes, one.main_heap_bytes);
+        assert_eq!(five.total_bytes, one.total_bytes);
+    }
+
+    /// A worker-less VPP still runs its main thread, and that thread
+    /// still holds counters. Zero threads would size the segment to the
+    /// floor and abort on a real table.
+    #[test]
+    fn the_main_thread_counts_even_with_no_workers() {
+        assert_eq!(thread_count(0), 1);
+        assert_eq!(thread_count(1), 2);
+        assert_eq!(thread_count(5), 6);
+        let s = derive_sizing(1_600_000, 0).unwrap();
+        assert_eq!(
+            s.statseg_bytes,
+            1_600_000 * STATSEG_BYTES_PER_ROUTE_PER_THREAD
+        );
+    }
+
+    /// Two independent worker counts — one in the sizing, one in the
+    /// rendered core list — is how a stats segment gets silently
+    /// undersized. The renderer refuses.
+    #[test]
+    #[should_panic(expected = "stats segment scales with thread count")]
+    fn render_refuses_a_worker_count_that_disagrees_with_the_sizing() {
+        let sizing = derive_sizing(1_600_000, 1).unwrap();
+        // Sizing says one worker; the core map says four.
+        render(
+            &sizing,
+            &[14, 15, 16, 17],
+            13,
+            "/run/packetframe/vpp/api.sock",
+            0,
+        );
     }
 
     /// The stats segment is 64 K-backed locked RAM, not hugepages
@@ -324,7 +472,7 @@ mod tests {
     /// satisfy.
     #[test]
     fn the_stats_segment_is_not_in_the_hugepage_budget() {
-        let s = derive_sizing(1_600_000).unwrap();
+        let s = derive_sizing(1_600_000, 5).unwrap();
         assert_eq!(s.total_bytes, s.main_heap_bytes + BUFFER_BYTES);
         assert!(s.statseg_bytes > 0);
         assert!(
@@ -336,17 +484,20 @@ mod tests {
     #[test]
     fn the_stats_segment_respects_its_floor() {
         // A tiny table still needs VPP's own counters.
-        let s = derive_sizing(1_000).unwrap();
+        let s = derive_sizing(1_000, 1).unwrap();
         assert_eq!(s.statseg_bytes, STATSEG_FLOOR_BYTES);
         // A large one scales past it.
-        let big = derive_sizing(1_600_000).unwrap();
-        assert_eq!(big.statseg_bytes, 1_600_000 * STATSEG_BYTES_PER_ROUTE);
+        let big = derive_sizing(1_600_000, 1).unwrap();
+        assert_eq!(
+            big.statseg_bytes,
+            1_600_000 * STATSEG_BYTES_PER_ROUTE_PER_THREAD * 2
+        );
         assert!(big.statseg_bytes > STATSEG_FLOOR_BYTES);
     }
 
     #[test]
     fn hugepage_budget_enforced() {
-        let sizing = derive_sizing(1_400_000).unwrap();
+        let sizing = derive_sizing(1_400_000, 1).unwrap();
         let page = 512u64 << 20; // the EFG's 512 MiB default pages
                                  // 5 pages = 2.5 GiB: below the ~2.8 GiB need → rejected with
                                  // the corrective count in the message.
@@ -360,7 +511,7 @@ mod tests {
 
     #[test]
     fn render_is_deterministic_and_complete() {
-        let sizing = derive_sizing(1_400_000).unwrap();
+        let sizing = derive_sizing(1_400_000, 2).unwrap();
         let conf = render(
             &sizing,
             &[14, 15],
@@ -399,7 +550,7 @@ mod tests {
     #[test]
     fn a_stats_segment_stanza_is_always_emitted() {
         for routes in [1_000u64, 1_053_360, 1_600_000] {
-            let s = derive_sizing(routes).unwrap();
+            let s = derive_sizing(routes, 1).unwrap();
             let conf = render(&s, &[14], 13, "/run/packetframe/vpp/api.sock", 0);
             assert!(conf.contains("statseg {"), "routes={routes}:\n{conf}");
             let want = s.statseg_bytes.div_ceil(1 << 20);
@@ -418,8 +569,8 @@ mod tests {
     /// shortfall shows up as an OOM mid-resync.
     #[test]
     fn the_stats_segment_rounds_up_never_down() {
-        // 1,000,001 × 192 = 192,000,192 B = 183.10… MiB
-        let s = derive_sizing(1_000_001).unwrap();
+        // 1,000,001 × 96 × 2 threads = 192,000,192 B = 183.10… MiB
+        let s = derive_sizing(1_000_001, 1).unwrap();
         let mib = s.statseg_bytes.div_ceil(1 << 20);
         assert!(
             (mib << 20) >= s.statseg_bytes,
@@ -435,7 +586,7 @@ mod tests {
     /// dataplane that will not come up.
     #[test]
     fn no_dpdk_and_no_device_stanzas() {
-        let sizing = derive_sizing(1_000).unwrap();
+        let sizing = derive_sizing(1_000, 1).unwrap();
         let conf = render(&sizing, &[14], 13, "/run/packetframe/vpp/api.sock", 0);
 
         assert!(
@@ -466,7 +617,7 @@ mod tests {
         // Sweep route counts that produce non-MiB-aligned heaps; the
         // rendered value must always cover the derived requirement.
         for routes in [1u64, 7, 1_399_999, 1_400_000, 1_400_001, 2_000_003] {
-            let s = derive_sizing(routes).unwrap();
+            let s = derive_sizing(routes, 1).unwrap();
             let mib = s.main_heap_bytes.div_ceil(1 << 20);
             assert!(
                 (mib << 20) >= s.main_heap_bytes,
