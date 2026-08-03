@@ -7,7 +7,8 @@
 //! - [`generated`] — message and type shapes, produced from the
 //!   pinned release's `.api.json` by `packetframe-vpp-api-codegen`.
 //!   Never edited by hand; CI regenerates and diffs.
-//! - the transport (next commit) — socket, handshake, message table.
+//! - [`transport`] — blocking unix socket, handshake, message
+//!   table, CRC verification, request/reply correlation.
 //!
 //! The split exists because the shapes churn with the VPP pin while
 //! the framing does not; mixing them would make every pin bump a
@@ -59,5 +60,7 @@
 pub mod codec;
 #[rustfmt::skip]
 pub mod generated;
+pub mod transport;
 
 pub use codec::{Decode, Decoder, Encode, Message, MessageMeta, WireError};
+pub use transport::{Transport, TransportError};
