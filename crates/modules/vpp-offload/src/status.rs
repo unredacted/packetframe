@@ -322,28 +322,52 @@ impl StatusSnapshot {
         if self.steered_but_broken() {
             return HealthState::Unhealthy;
         }
-        // Steered and forwarding, but with a known-incomplete table:
-        // real degradation, and specifically NOT a reason to tear
-        // steering down — unsteering a mostly-correct VPP is worse than
-        // the holes.
-        if self.steered && self.counts.degraded() {
-            return HealthState::Degraded;
+        // Everything else is Degraded unless it is *positively* nominal.
+        if self.nominal() {
+            HealthState::Healthy
+        } else {
+            HealthState::Degraded
         }
-        // Not steered: the fast path has the traffic and forwarding is
-        // correct. Anything wrong with VPP is a degradation of this
-        // module, not of the box.
-        if !self.steered
-            && (self.steer_intended
-                || self.failures > 0
-                || !self.state.has_process()
-                || !self.dead_ports().is_empty())
-        {
-            return HealthState::Degraded;
-        }
-        if self.counts.degraded() {
-            return HealthState::Degraded;
-        }
-        HealthState::Healthy
+    }
+
+    /// The narrow set of conditions under which this module is doing its
+    /// job. Stated as a whitelist on purpose.
+    ///
+    /// The first cut of `overall` enumerated the ways things go wrong and
+    /// fell through to `Healthy`, which meant every condition nobody had
+    /// thought of read as fine. Concretely: a first start sitting in
+    /// `Starting`, `Syncing` or `Verifying` has a live process, no
+    /// failures, an empty port list and clean route counts — so it
+    /// reported `Healthy` while the API was still opening and the FIB had
+    /// never been verified, and it *disagreed with its own subsystems*,
+    /// which were reporting `Degraded` for exactly those reasons.
+    ///
+    /// Inverting it makes the default safe: a lifecycle state, port
+    /// condition or ledger state that nothing here anticipates lands in
+    /// `Degraded`, which is an honest "this module is impaired" rather
+    /// than a false all-clear. Same discipline as [`StatusSnapshot`]
+    /// having no `Default`.
+    ///
+    /// Note `Ready` counts as arrived: it is the deliberate
+    /// all-members-verified-nothing-steered staging state, which is a
+    /// designed resting place rather than an impairment. Every state
+    /// short of it — including the whole of a first convergence — is a
+    /// module that is not yet forwarding anything, and says so.
+    fn nominal(&self) -> bool {
+        // Arrived: verified and either steered or deliberately staged.
+        matches!(self.state, State::Ready | State::Steered)
+            && self.fib.verified()
+            && matches!(self.api, ApiHealth::Answering { .. })
+            && self.failures == 0
+            // A complete table. Withheld and unresolvable are real
+            // degradation even when everything else is clean.
+            && !self.counts.degraded()
+            // Membership is all-or-nothing, so "no ports" is not a
+            // vacuous pass — it means nothing was ever attached.
+            && !self.ports.is_empty()
+            && self.dead_ports().is_empty()
+            // Steering wanted but absent: a broken rollout, not staging.
+            && (self.steered || !self.steer_intended)
     }
 
     fn process_health(&self) -> SubsystemHealth {
@@ -526,6 +550,36 @@ fn gauge(out: &mut String, name: &str, help: &str) {
     let _ = writeln!(out, "# TYPE {name} gauge");
 }
 
+/// Escape a dynamic Prometheus label value (text exposition format:
+/// backslash, double quote, newline).
+///
+/// Needed because interface names reach the label set from config, and
+/// `validate_iface_name` mirrors the kernel's `dev_valid_name()` — it
+/// rejects `/`, `\`, NUL and whitespace but permits `"`. A port named
+/// `eth"0` therefore parses, and would emit `port="eth"0"`.
+///
+/// The blast radius is what makes this worth handling rather than
+/// asserting away: a single malformed line makes the textfile collector
+/// reject the **whole file**, so one odd interface name would take out
+/// every metric on the host, fast-path's included. Escaping at the point
+/// of emission is also the right layer — the renderer owes valid
+/// exposition for whatever name it is handed, whatever the source.
+fn label(value: &str) -> String {
+    if !value.contains(['\\', '"', '\n']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render `packetframe_vpp_*` gauges for the Prometheus textfile
 /// collector.
 ///
@@ -702,7 +756,7 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             let _ = writeln!(
                 out,
                 "packetframe_vpp_port_up{{module=\"{module}\",port=\"{}\",sw_if_index=\"{}\"}} {}",
-                p.port,
+                label(&p.port),
                 p.sw_if_index,
                 u8::from(p.forwards())
             );
@@ -1246,6 +1300,153 @@ mod tests {
                 "sample line missing a value: {line}"
             );
         }
+    }
+
+    /// A first convergence is not healthy. Every state short of `Ready`
+    /// means this module is not forwarding anything yet — and reporting
+    /// otherwise made `overall` contradict its own subsystems, which were
+    /// already saying "API still opening" and "never verified".
+    #[test]
+    fn a_first_convergence_is_degraded_at_every_step() {
+        let mut sup = Supervisor::new();
+        sup.on(Event::StartRequested);
+        sup.on(Event::Spawned);
+
+        // Starting: process alive, API not yet open, nothing verified.
+        let starting = snap_of(
+            &sup,
+            &ledger_with(0, 0, 0),
+            ApiHealth::Starting,
+            FibSync::NeverVerified,
+            ports_up(),
+        );
+        assert_eq!(starting.report().overall, HealthState::Degraded);
+
+        // Syncing: API up, resync in flight.
+        sup.on(Event::ApiUp);
+        assert_eq!(sup.state(), State::Syncing);
+        let syncing = snap_of(
+            &sup,
+            &ledger_with(5, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            FibSync::NeverVerified,
+            ports_up(),
+        );
+        assert_eq!(syncing.report().overall, HealthState::Degraded);
+
+        // Verifying: drained, verification in flight.
+        sup.on(Event::SyncComplete);
+        assert_eq!(sup.state(), State::Verifying);
+        let verifying = snap_of(
+            &sup,
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            FibSync::NeverVerified,
+            ports_up(),
+        );
+        assert_eq!(verifying.report().overall, HealthState::Degraded);
+
+        // Only a verified Ready is healthy.
+        sup.on(Event::VerifyPassed);
+        let ready = snap_of(
+            &sup,
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(0),
+            ports_up(),
+        );
+        assert_eq!(ready.report().overall, HealthState::Healthy);
+    }
+
+    /// `overall` must never be a cheerier verdict than its own
+    /// subsystems. A whitelist makes that structural; the enumerate-the-
+    /// failures version violated it during every first convergence.
+    #[test]
+    fn overall_is_never_better_than_its_worst_subsystem() {
+        let rank = |h: HealthState| match h {
+            HealthState::Healthy => 0,
+            HealthState::Degraded => 1,
+            HealthState::Unhealthy => 2,
+        };
+        // Sweep the lifecycle against both port conditions and a
+        // never-verified FIB, which is the shape that regressed.
+        for state in STATE_LABELS.map(|(s, _)| s) {
+            for ports in [ports_up(), port_down(), Vec::new()] {
+                for fib in [FibSync::NeverVerified, verified(1)] {
+                    for api in [
+                        ApiHealth::NoProcess,
+                        ApiHealth::Starting,
+                        ApiHealth::Answering {
+                            silent_for: Duration::ZERO,
+                        },
+                    ] {
+                        let mut s = snap_of(
+                            &Supervisor::new(),
+                            &ledger_with(4, 0, 0),
+                            api,
+                            fib.clone(),
+                            ports.clone(),
+                        );
+                        s.state = state;
+                        let r = s.report();
+                        let worst = r.subsystems.iter().map(|x| rank(x.state)).max().unwrap();
+                        assert!(
+                            rank(r.overall) >= worst,
+                            "overall {:?} is cheerier than the worst subsystem in \
+                             state={state:?} fib={fib:?} api={api:?}:\n{:#?}",
+                            r.overall,
+                            r.subsystems
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A port name can reach the label set with a `"` in it:
+    /// `validate_iface_name` mirrors the kernel's `dev_valid_name()`,
+    /// which rejects `/`, `\`, NUL and whitespace but not quotes. One
+    /// malformed line makes the textfile collector reject the entire
+    /// file, so this would take out every metric on the host.
+    #[test]
+    fn dynamic_label_values_are_escaped() {
+        assert_eq!(label("eth4"), "eth4");
+        assert_eq!(label("eth\"0"), "eth\\\"0");
+        assert_eq!(label("a\\b"), "a\\\\b");
+
+        let mut s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            vec![PortLink {
+                port: "eth\"0".into(),
+                sw_if_index: 3,
+                admin_up: true,
+                link_up: true,
+            }],
+        );
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(m.contains(r#"port="eth\"0""#), "{m}");
+        // Every label set must still be balanced: an unescaped quote
+        // closes the value early and leaves a stray `"` before the `}`.
+        for line in m.lines().filter(|l| !l.starts_with('#')) {
+            let unescaped = line
+                .char_indices()
+                .filter(|(i, c)| *c == '"' && (*i == 0 || line.as_bytes()[i - 1] != b'\\'))
+                .count();
+            assert_eq!(unescaped % 2, 0, "unbalanced quotes in: {line}");
+        }
+        s.ports.clear();
+        assert!(!render_metrics(&s, "vpp-offload").contains("packetframe_vpp_port_up"));
     }
 
     #[test]
