@@ -519,11 +519,17 @@ changing `ref` re-runs the workflow and publishes a new tag.
 Reuse the gate-0a staging (VF on a quiet port, vfio-bound, hugepages
 reserved — see the perf-campaign memory / gate-0a notes for the exact
 commands and the rtemap/dpdk.service gotchas). Sizing per the slice-1
-renderer's arithmetic, updated for the round-4 decision (v4-only,
-~1.05M nexthops): placeholder math says ~2.2 GiB heap + buffers ⇒
-`vm.nr_hugepages=8` at 512 MiB pages gives comfortable margin. (The
-pre-decision v4+v6 figure was ~4.4 GiB ⇒ 10 pages; item 10's measured
-number supersedes both.)
+renderer's arithmetic, now driven by item 10's **measured** numbers
+rather than the pre-measurement guesses: at v4-only ~1.05M routes,
+~1.5 GiB heap + 1 GiB buffers ≈ 2.5 GiB ⇒ **5 × 512 MiB pages**, so
+`vm.nr_hugepages=8` leaves comfortable margin. (The earlier figures —
+~2.2 GiB off a placeholder, ~4.4 GiB from the pre-decision v4+v6
+shape — are both superseded.)
+
+**The stats segment is a separate budget line and is not hugepages.**
+It is 64 K-page locked RAM, ~193 MiB at this table with one worker, and
+it scales with VPP's *thread* count. Reserving hugepages for it would
+be wasted; forgetting it entirely aborts VPP mid-load.
 
 startup.conf: **the renderer now emits the post-pivot shape** — it
 dropped the `dpdk { dev ... }` stanza, disables `dpdk_plugin.so`, and
@@ -543,20 +549,37 @@ unix {
 }
 socksvr { socket-name /run/vpp/api.sock }
 memory {
-  main-heap-size 512M              # bump per sizing math for item 10
+  main-heap-size 1536M
   main-heap-page-size default-hugepage
+}
+statseg {
+  size 256M
 }
 buffers { buffers-per-numa 16384 default data-size 2048 }
 cpu { main-core 16 corelist-workers 17 }
 plugins { plugin dpdk_plugin.so { disable } }
 ```
 
-Load-bearing: `main-heap-page-size default-hugepage` (64K-page
-kernel), `socksvr` for the API socket, explicit `corelist-workers`,
-**dpdk_plugin disabled**, **no `dpdk {}` stanza, no `devices {}`
-stanza** (an empty-block `devices{}` is a parse error; the device
-attaches via the runtime CLI in §3), and **no linux-cp** (routes come
-from vppctl in this spike; the binary-API sink in production).
+The two sizing numbers, both from item 10's measurement below:
+
+- `main-heap-size 1536M` — 1.05M v4 routes × 1 KiB/route + a 512 MiB
+  floor. (Round 3 ran 4 GiB, which is also fine; this is the derived
+  minimum with margin, not the value that was on the box.)
+- `statseg 256M` — **not optional.** The 32 MiB default aborts partway
+  through a full table, and `show memory main-heap` will not show you
+  why. Budget **96 B per route per VPP *thread***: 1.05M routes × 2
+  threads (main + the one worker above) ≈ 193 MiB. **Add ~96 MiB per
+  additional worker** — VPP replicates every counter per thread, so
+  this is the one number here that does not scale the way it looks like
+  it does. It is also 64 K-page locked RAM, so it does **not** come out
+  of the hugepage reservation.
+
+Load-bearing beyond sizing: `main-heap-page-size default-hugepage`
+(64K-page kernel), `socksvr` for the API socket, explicit
+`corelist-workers`, **dpdk_plugin disabled**, **no `dpdk {}` stanza, no
+`devices {}` stanza** (an empty-block `devices{}` is a parse error; the
+device attaches via the runtime CLI in §3), and **no linux-cp** (routes
+come from vppctl in this spike; the binary-API sink in production).
 
 ## 3. Bring-up + the checklist
 
@@ -589,9 +612,99 @@ section:
 | 7 | **PMTUD positive test** | >MTU DF packet through a steered path → correctly-sourced frag-needed back at the sender. **Do not skip.** |
 | 8 | VLAN subif egress | `create sub-interface` + tag 1337 toward the br1337-shaped topology |
 | 9 | rx-mode adaptive | `set interface rx-mode <if> adaptive`; watch idle CPU (the heat verdict) |
-| 10 | Full-table load — **v4-ONLY per the round-4 decision** | dump bird's `master4` ONLY (`birdc 'show route primary table master4'` → script `ip route add` via vppctl); record wall time, `show memory main-heap` (replaces HEAP_BYTES_PER_ROUTE=2048 in startup_conf.rs), and packetframe daemon RSS. Loading v4+v6 would measure a table shape the decision rejected |
+| 10 | Full-table load — **v4-ONLY per the round-4 decision** — **DONE, see RESULT below** | dump bird's `master4` ONLY (`birdc 'show route primary table master4'` → script `ip route add` via vppctl); record wall time, `show memory` (**all heaps, not `main-heap`** — see RESULT), and packetframe daemon RSS. Loading v4+v6 would measure a table shape the decision rejected |
 | 11 | pps/core + latency | steered constant-rate flow: pps at 1 worker, p50/p99 vs the kernel path |
 | 12 | Watts/thermals | idle + loaded, poll-mode vs adaptive (if 9 works) |
+
+### RESULT (2026-08-03, shadow, item 10): **v4 FULL TABLE FITS** — and the stats segment is the constraint nobody was sizing
+
+**1,053,360 v4 prefixes** from the live bird `master4`, loaded into
+v26.06/octeon9 via `vppctl exec` in ~35 s. Item 10 **PASSES**.
+
+| | baseline (empty FIB) | full table | Δ | per route |
+|---|---|---:|---:|---:|
+| main heap (used) | 337.86 MiB | 803.49 MiB | 465.63 MiB | **463 B** |
+| stat segment (populated) | 1.19 MiB | 101.94 MiB | 100.75 MiB | **97 B** ‡ |
+| hugepages (512 MiB) | 9 | 10 | +1 | — |
+
+‡ **at two VPP threads.** This run was `corelist-workers 17` — one
+worker — and VPP replicates counter vectors per thread
+(`vec_validate (cm->counters, tm->n_vlib_mains - 1)`), so the statseg
+row is a two-thread figure and nothing else here is. Per thread it is
+~48.5 B/route. A five-port config runs five workers and needs ~3× this.
+
+**The finding that matters is a first-attempt crash, not the numbers.**
+With the default `statseg` (31.94 MiB) VPP **aborted** partway through
+the fourth 100k chunk:
+
+```
+Out-of-memory, calling os_panic().
+os_panic() called, aborting.
+```
+
+Per-chunk statseg usage explains it exactly — 22.85 MiB at 300k, 33.84
+MiB at 400k, i.e. it crosses the 31.94 MiB default at roughly **380k
+routes**. Adding `statseg { size 1G }` loaded the whole table with no
+other change.
+
+Consequences, all now in `startup_conf.rs`:
+
+- **`show memory main-heap` is a misleading diagnostic.** During the
+  abort it read `used: 470M / 4.00G` — 87% free — while a different
+  segment was exhausted. **Always use `show memory` (all heaps).** An
+  hour went into suspecting the main heap because of this.
+- **Size the stats segment from `populated`, not `used`.** The
+  allocator said 75.04 MiB while the OS had backed 101.94 MiB; sizing
+  from `used` under-provisions by a third.
+- **The stats segment is 64 K-page backed, not hugepages** (`page-size
+  64K` in `show memory`). It is locked RAM on a *separate* budget line
+  and must NOT inflate the hugepage reservation.
+- **`HEAP_BYTES_PER_ROUTE` 2048 → 1024** (measured 463, ~2.2× margin);
+  **`HEAP_FLOOR_BYTES` 1 GiB → 512 MiB** (measured 337.86 MiB);
+  **`BUFFER_BYTES` 512 MiB → 1 GiB** (10 hugepages in use against a
+  4 GiB heap = 1 GiB beyond it, so 512 MiB would have left the
+  reservation a page short at full table).
+- **New `STATSEG_BYTES_PER_ROUTE_PER_THREAD` = 96** (measured ~48.5
+  per thread, ~2×) with a 32 MiB floor, and `render()` now emits the
+  stanza. It emitted none before, so the module as merged would have
+  killed VPP partway through its first full-table resync.
+- **The stats segment scales with VPP's thread count, the main heap's
+  route term does not.** `derive_sizing` therefore takes the summed
+  `cores` across all ports, and the renderer refuses a core list that
+  disagrees with the sizing it was handed — two independent worker
+  counts is how a segment gets silently undersized. Sizing off the
+  measured aggregate as though it were thread-independent would have
+  under-provisioned the five-port `example.conf` shape by ~3× and
+  reproduced this same abort at ~1.05M routes.
+- **The decomposition is one data point deep.** This run cannot
+  separate the fixed per-route cost (statseg directory entries, name
+  strings) from the per-thread cost, so all of it is attributed to
+  per-thread. That over-provisions multi-worker boxes, which is the
+  safe direction. Re-measuring at two different worker counts would
+  refine it; nobody should tighten the constant without that.
+
+**Per-chunk increments are not usable as a per-route figure** — they
+ranged 82 B to 2,058 B/route because mtrie interior nodes allocate in
+blocks. Only the full-table average means anything.
+
+**Still NOT measured — the ≤60 s convergence budget.** The ~35 s load
+was VPP's CLI parser with one shared path-list, not 1.05M binary-API
+round trips with the real 129 nexthops. Treat 35 s as an encouraging
+lower bound on what VPP itself can absorb and nothing more; the real
+number needs the module's sink.
+
+Method note: routes were pointed at a single synthetic nexthop
+(`10.255.255.2` on `octeon0/0`, static neighbor) rather than the real
+129. Path-lists are shared, so 129 versus 1 is ~128 extra objects
+against 1.05M prefixes — negligible for the per-prefix slope this
+measures.
+
+Also captured, closing a caveat that had been open since §0: the
+primary's `birdc 'show route count'` reports **2,105,065 routes for
+1,053,380 networks** in `master4`, against the histogram's 1,053,049
+best-path nexthops. Those agree to within ~331, confirming **0 ECMP
+among selected routes** — so "nexthops as prefixes" is now measured
+rather than inferred, and the `expected-routes` sizing stands.
 
 ## 4. Pass / kill / record
 
