@@ -28,6 +28,7 @@ pub mod fib_sync;
 pub mod resources;
 pub mod sink;
 pub mod startup_conf;
+pub mod supervisor;
 pub mod vpp_api;
 
 #[cfg(target_os = "linux")]
