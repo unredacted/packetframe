@@ -447,11 +447,24 @@ impl RouteLedger {
         map: &NexthopMap,
     ) -> (RouteState, Vec<NexthopTarget>) {
         let targets = map.resolve_all(nexthops);
+        let st = self.classify_resolved(prefix, targets.len());
+        (st, targets)
+    }
+
+    /// Same decision, for a caller that has already resolved the
+    /// nexthops.
+    ///
+    /// The drainer resolves once and needs the addresses alongside the
+    /// targets to encode FIB paths; making it re-resolve through
+    /// [`Self::classify_upsert`] would run the mapping policy twice per
+    /// route — a million times over on a full-table load — and risk
+    /// the two answers diverging if the map changed in between.
+    pub fn classify_resolved(&mut self, prefix: IpPrefix, n_resolved: usize) -> RouteState {
         let key = PrefixKey::from(prefix);
-        if targets.is_empty() {
+        if n_resolved == 0 {
             let st = RouteState::NotInstalled(NotInstalled::Unresolvable);
             self.set_state(key, st);
-            return (st, targets);
+            return st;
         }
         // A prefix that already holds a slot keeps it on replace — a
         // route update must not be withheld just because the table sits
@@ -471,7 +484,7 @@ impl RouteLedger {
             _ => RouteState::NotInstalled(NotInstalled::Withheld),
         };
         self.set_state(key, st);
-        (st, targets)
+        st
     }
 
     /// VPP acknowledged the route.

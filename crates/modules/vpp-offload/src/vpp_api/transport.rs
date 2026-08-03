@@ -245,33 +245,65 @@ impl Transport {
             .ok_or(TransportError::MessageUnknown(M::NAME))
     }
 
-    /// Send a request and read its reply, matched by context.
-    pub fn request<Req, Rep>(&mut self, mut req: Req) -> Result<Rep, TransportError>
-    where
-        Req: Message,
-        Rep: Message + Decode,
-    {
+    /// Send a request WITHOUT waiting for its reply; returns the
+    /// context to match it by.
+    ///
+    /// This is what makes a full-table load feasible. Strict
+    /// request/reply costs a round trip per route — at ~1.05M routes
+    /// and even 30 µs each that is half a minute of pure latency,
+    /// against a 60 s convergence budget that also has to cover VPP
+    /// actually installing them. Pipelining a window of requests and
+    /// collecting the replies afterwards spends that latency once per
+    /// window instead of once per route.
+    ///
+    /// The caller is responsible for eventually reading exactly one
+    /// reply per send: VPP answers every request, so an unread reply
+    /// desynchronises the next read.
+    pub fn send<Req: Message>(&mut self, mut req: Req) -> Result<u32, TransportError> {
         let id = self.id_of::<Req>()?;
         let context = self.take_context();
         self.tx.clear();
         encode_request(&mut self.tx, &mut req, id, self.client_index, context);
         self.write_frame()?;
+        Ok(context)
+    }
 
+    /// Read one reply, returning its context alongside the decoded
+    /// message.
+    ///
+    /// The context is returned rather than checked because a
+    /// pipelining caller has several outstanding and must decide which
+    /// one this answers.
+    pub fn recv<Rep: Message + Decode>(&mut self) -> Result<(u32, Rep), TransportError> {
         let payload = self.read_frame()?;
         let msg_id = peek_msg_id(&payload)?;
         let offset = *self
             .context_offsets
             .get(&msg_id)
             .ok_or(TransportError::UnknownReplyId(msg_id))?;
-        let got = peek_context(&payload, offset)?;
+        let context = peek_context(&payload, offset)?;
+        let mut d = Decoder::new(&payload);
+        Ok((context, Rep::decode(&mut d)?))
+    }
+
+    /// Send a request and read its reply, matched by context.
+    ///
+    /// For one-shot operations (attach, ping, a spot verify). Bulk
+    /// paths should use [`Self::send`] + [`Self::recv`].
+    pub fn request<Req, Rep>(&mut self, req: Req) -> Result<Rep, TransportError>
+    where
+        Req: Message,
+        Rep: Message + Decode,
+    {
+        let context = self.send(req)?;
+        let (got, reply) = self.recv::<Rep>()?;
         if got != context {
             return Err(TransportError::ContextMismatch {
                 expected: context,
                 got,
             });
         }
-        let mut d = Decoder::new(&payload);
-        Ok(Rep::decode(&mut d)?)
+        Ok(reply)
     }
 
     /// Liveness probe. The plan's wedge detector: a VPP that answers

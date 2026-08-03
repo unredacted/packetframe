@@ -1,0 +1,628 @@
+//! Bridges the sink's route state ([`crate::sink`]) to VPP's binary
+//! API ([`crate::vpp_api`]).
+//!
+//! Everything here is the *translation and pacing* layer: turning a
+//! prefix plus resolved nexthops into `ip_route_add_del`, pipelining
+//! those onto the socket, and feeding VPP's answers back into the
+//! ledger. It owns no policy — what should be installed is the sink's
+//! question, and how bytes reach VPP is the transport's.
+//!
+//! **Pipelining is the point.** VPP answers every request, so a naive
+//! loop pays a round trip per route: at ~1.05M v4 routes that is tens
+//! of seconds of pure latency against a 60 s convergence budget which
+//! also has to cover VPP installing them. [`Drainer`] keeps a window
+//! of requests in flight and reconciles replies afterwards, so the
+//! latency is paid once per window.
+//!
+//! **A failed drain leaves nothing lost.** Any op that was not
+//! positively acknowledged goes back into the pending map, and the
+//! ledger unwinds to what VPP is actually known to hold. That is what
+//! makes a mid-load transport failure a retry rather than a silently
+//! partial FIB.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+
+use packetframe_common::fib::IpPrefix;
+
+use crate::sink::{NexthopTarget, PendingMap, PendingOp, RouteLedger, RouteState};
+use crate::vpp_api::generated::{
+    Address, AddressUnion, FibPath, IpRoute, IpRouteAddDel, IpRouteAddDelReply, Prefix,
+    ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE, FIB_API_PATH_NH_PROTO_IP4,
+    FIB_API_PATH_NH_PROTO_IP6, FIB_API_PATH_TYPE_NORMAL,
+};
+use crate::vpp_api::{Transport, TransportError};
+
+/// How many requests may be in flight before we stop and read.
+///
+/// Bounded for backpressure: without a cap, a full-table load would
+/// queue a million requests into the socket buffer and VPP's input
+/// queue, turning a bounded memory cost into an unbounded one on both
+/// sides. 256 keeps the syscall amortisation while capping the
+/// unacknowledged work — and, more importantly, caps how much has to
+/// be requeued when a drain fails mid-window.
+pub const DEFAULT_WINDOW: usize = 256;
+
+/// VPP interface indices for the ports the module owns.
+///
+/// Populated at attach from `dev_create_port_if_reply`, which is where
+/// VPP assigns them — they are not derivable from the PCI address or
+/// the port name, so this map is the only link between the sink's
+/// device-name view and the FIB paths it has to encode.
+#[derive(Debug, Default, Clone)]
+pub struct PortIndex {
+    /// `(port, vlan)` → sw_if_index. A VLAN nexthop resolves to a VPP
+    /// sub-interface, which carries its OWN index — using the parent
+    /// port's would install every VLAN route onto the untagged
+    /// interface.
+    idx: HashMap<(String, Option<u16>), u32>,
+}
+
+impl PortIndex {
+    pub fn insert(&mut self, port: impl Into<String>, vlan: Option<u16>, sw_if_index: u32) {
+        self.idx.insert((port.into(), vlan), sw_if_index);
+    }
+
+    pub fn get(&self, target: &NexthopTarget) -> Option<u32> {
+        let key = match target {
+            NexthopTarget::Vf { port } => (port.clone(), None),
+            NexthopTarget::Subif { port, vlan } => (port.clone(), Some(*vlan)),
+        };
+        self.idx.get(&key).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.idx.is_empty()
+    }
+}
+
+/// Wire form of an address, family tag and all.
+pub fn to_address(ip: IpAddr) -> Address {
+    let mut un = [0u8; 16];
+    match ip {
+        IpAddr::V4(v4) => {
+            un[..4].copy_from_slice(&v4.octets());
+            Address {
+                af: ADDRESS_IP4,
+                un: AddressUnion(un),
+            }
+        }
+        IpAddr::V6(v6) => {
+            un.copy_from_slice(&v6.octets());
+            Address {
+                af: ADDRESS_IP6,
+                un: AddressUnion(un),
+            }
+        }
+    }
+}
+
+/// Wire form of a prefix.
+pub fn to_prefix(p: IpPrefix) -> Prefix {
+    match p {
+        IpPrefix::V4 { addr, prefix_len } => {
+            let mut un = [0u8; 16];
+            un[..4].copy_from_slice(&addr);
+            Prefix {
+                address: Address {
+                    af: ADDRESS_IP4,
+                    un: AddressUnion(un),
+                },
+                len: prefix_len,
+            }
+        }
+        IpPrefix::V6 { addr, prefix_len } => Prefix {
+            address: Address {
+                af: ADDRESS_IP6,
+                un: AddressUnion(addr),
+            },
+            len: prefix_len,
+        },
+    }
+}
+
+/// One resolved path: where it exits and via which neighbor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPath {
+    pub nexthop: IpAddr,
+    pub target: NexthopTarget,
+}
+
+/// Build the FIB paths for a route.
+///
+/// Returns `None` when a target has no interface index yet — that is
+/// an attach-ordering fault (routes arriving before the device's
+/// interface exists), and installing the route with index 0 would
+/// silently point it at `local0`.
+pub fn build_paths(paths: &[ResolvedPath], ports: &PortIndex) -> Option<Vec<FibPath>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let sw_if_index = ports.get(&p.target)?;
+        let proto = match p.nexthop {
+            IpAddr::V4(_) => FIB_API_PATH_NH_PROTO_IP4,
+            IpAddr::V6(_) => FIB_API_PATH_NH_PROTO_IP6,
+        };
+        let mut fp = FibPath {
+            sw_if_index,
+            table_id: 0,
+            rpf_id: 0,
+            // Equal weight: ECMP share is VPP's to compute, and this
+            // fleet runs no unequal-cost groups. Preference 0 keeps
+            // every path in the same tier — the sink has already
+            // filtered to the winning local-pref tier upstream.
+            weight: 1,
+            preference: 0,
+            r#type: FIB_API_PATH_TYPE_NORMAL,
+            flags: FIB_API_PATH_FLAG_NONE,
+            proto,
+            nh: Default::default(),
+            n_labels: 0,
+            label_stack: Default::default(),
+        };
+        // The nexthop address goes in the path's own union, which is
+        // the bare address — no family tag, since `proto` above
+        // already carries it.
+        match p.nexthop {
+            IpAddr::V4(v4) => fp.nh.address.0[..4].copy_from_slice(&v4.octets()),
+            IpAddr::V6(v6) => fp.nh.address.0.copy_from_slice(&v6.octets()),
+        }
+        out.push(fp);
+    }
+    Some(out)
+}
+
+/// What one drain accomplished.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DrainStats {
+    /// Routes VPP acknowledged as installed.
+    pub installed: u64,
+    /// Routes VPP acknowledged as withdrawn.
+    pub withdrawn: u64,
+    /// Held back by capacity — retried when headroom returns.
+    pub withheld: u64,
+    /// No nexthop resolved to a VPP-owned device.
+    pub unresolvable: u64,
+    /// VPP returned a non-zero retval. Requeued, not dropped.
+    pub rejected: u64,
+    /// Not attempted because a target had no interface index yet.
+    pub deferred: u64,
+}
+
+impl DrainStats {
+    pub fn attempted(&self) -> u64 {
+        self.installed + self.withdrawn + self.rejected
+    }
+}
+
+/// Pipelines pending route operations onto a [`Transport`].
+pub struct Drainer {
+    window: usize,
+}
+
+/// One request awaiting its reply.
+struct InFlight {
+    context: u32,
+    prefix: IpPrefix,
+    op: PendingOp,
+}
+
+impl Default for Drainer {
+    fn default() -> Self {
+        Self::new(DEFAULT_WINDOW)
+    }
+}
+
+impl Drainer {
+    pub fn new(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+        }
+    }
+
+    /// Drain up to `max_ops` pending operations.
+    ///
+    /// On transport failure, everything not positively acknowledged is
+    /// put back: in-flight ops are requeued and their ledger
+    /// reservations unwound, and the untouched tail of the batch goes
+    /// back too. The caller may retry against a fresh connection
+    /// without having lost or double-counted anything.
+    pub fn drain(
+        &self,
+        pending: &mut PendingMap,
+        ledger: &mut RouteLedger,
+        resolve: &dyn Fn(&[IpAddr]) -> Vec<ResolvedPath>,
+        ports: &PortIndex,
+        transport: &mut Transport,
+        max_ops: usize,
+    ) -> Result<DrainStats, (DrainStats, TransportError)> {
+        let mut stats = DrainStats::default();
+        let batch = pending.drain_batch(max_ops);
+        let mut inflight: Vec<InFlight> = Vec::with_capacity(self.window);
+        let mut iter = batch.into_iter();
+
+        loop {
+            // Fill the window.
+            while inflight.len() < self.window {
+                let Some((prefix, op)) = iter.next() else {
+                    break;
+                };
+                match self.begin(prefix, &op, ledger, resolve, ports, transport, &mut stats) {
+                    Ok(Some(context)) => inflight.push(InFlight {
+                        context,
+                        prefix,
+                        op,
+                    }),
+                    // Nothing to send (withheld, unresolvable,
+                    // deferred): already counted, ledger already
+                    // updated.
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.unwind(pending, ledger, inflight, Some((prefix, op)), iter);
+                        return Err((stats, e));
+                    }
+                }
+            }
+            if inflight.is_empty() {
+                break;
+            }
+
+            // Read exactly one reply per request sent, recording
+            // answers before applying any of them. Applying as we go
+            // and bailing on the first error would strand the REST of
+            // the window: their reservations would survive and they
+            // would never be requeued — a silently partial FIB, which
+            // is the failure this whole unwind path exists to prevent.
+            let mut answered: Vec<i32> = Vec::with_capacity(inflight.len());
+            let mut failure: Option<TransportError> = None;
+            for f in inflight.iter() {
+                match transport.recv::<IpRouteAddDelReply>() {
+                    Ok((context, reply)) => {
+                        // Contexts are issued in send order and VPP
+                        // replies in order, so a mismatch means the
+                        // stream desynchronised — not something to
+                        // paper over by scanning ahead.
+                        if context != f.context {
+                            failure = Some(TransportError::ContextMismatch {
+                                expected: f.context,
+                                got: context,
+                            });
+                            break;
+                        }
+                        answered.push(reply.retval);
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            for (f, retval) in inflight.iter().zip(answered.iter()) {
+                self.finish(f, *retval, pending, ledger, &mut stats);
+            }
+
+            if let Some(e) = failure {
+                let unacked = inflight.split_off(answered.len());
+                self.unwind(pending, ledger, unacked, None, iter);
+                return Err((stats, e));
+            }
+            inflight.clear();
+        }
+        Ok(stats)
+    }
+
+    /// Classify and send one op. `Ok(None)` means there was nothing to
+    /// send and the outcome is already recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn begin(
+        &self,
+        prefix: IpPrefix,
+        op: &PendingOp,
+        ledger: &mut RouteLedger,
+        resolve: &dyn Fn(&[IpAddr]) -> Vec<ResolvedPath>,
+        ports: &PortIndex,
+        transport: &mut Transport,
+        stats: &mut DrainStats,
+    ) -> Result<Option<u32>, TransportError> {
+        match op {
+            PendingOp::Upsert { nexthops } => {
+                let resolved = resolve(nexthops);
+                // Ledger decides installable / withheld / unresolvable
+                // and reserves the capacity slot. It takes the count
+                // because we already resolved — running the mapping
+                // policy twice per route is a million redundant passes
+                // on a full-table load.
+                let state = ledger.classify_resolved(prefix, resolved.len());
+                match state {
+                    RouteState::Installing { .. } => {}
+                    RouteState::NotInstalled(nf) => {
+                        match nf {
+                            crate::sink::NotInstalled::Withheld => stats.withheld += 1,
+                            crate::sink::NotInstalled::Unresolvable => stats.unresolvable += 1,
+                        }
+                        return Ok(None);
+                    }
+                    RouteState::Installed => return Ok(None),
+                }
+                let Some(paths) = build_paths(&resolved, ports) else {
+                    // Interface index not known yet: unwind the
+                    // reservation and leave it pending rather than
+                    // installing a route pointed at local0.
+                    ledger.fail_install(prefix);
+                    stats.deferred += 1;
+                    return Ok(None);
+                };
+                let msg = IpRouteAddDel {
+                    context: 0,
+                    is_add: true,
+                    is_multipath: false,
+                    route: IpRoute {
+                        table_id: 0,
+                        stats_index: 0,
+                        prefix: to_prefix(prefix),
+                        n_paths: paths.len() as u8,
+                        paths,
+                    },
+                };
+                Ok(Some(transport.send(msg)?))
+            }
+            PendingOp::Withdraw => {
+                let msg = IpRouteAddDel {
+                    context: 0,
+                    is_add: false,
+                    is_multipath: false,
+                    route: IpRoute {
+                        table_id: 0,
+                        stats_index: 0,
+                        prefix: to_prefix(prefix),
+                        n_paths: 0,
+                        paths: Vec::new(),
+                    },
+                };
+                Ok(Some(transport.send(msg)?))
+            }
+        }
+    }
+
+    /// Apply VPP's answer to one op.
+    fn finish(
+        &self,
+        f: &InFlight,
+        retval: i32,
+        pending: &mut PendingMap,
+        ledger: &mut RouteLedger,
+        stats: &mut DrainStats,
+    ) {
+        match (&f.op, retval) {
+            (PendingOp::Upsert { .. }, 0) => {
+                ledger.commit_installed(f.prefix);
+                stats.installed += 1;
+            }
+            (PendingOp::Withdraw, 0) => {
+                ledger.forget(f.prefix);
+                stats.withdrawn += 1;
+            }
+            // A per-route rejection is NOT a connection fault: the
+            // stream is fine and other routes will succeed. Unwind
+            // this one and requeue it so a transient cause (a nexthop
+            // whose interface is still coming up) resolves on retry
+            // instead of leaving a hole nobody notices.
+            (op, _) => {
+                ledger.fail_install(f.prefix);
+                pending.requeue(f.prefix, op.clone());
+                stats.rejected += 1;
+            }
+        }
+    }
+
+    /// Put back everything not positively acknowledged.
+    fn unwind(
+        &self,
+        pending: &mut PendingMap,
+        ledger: &mut RouteLedger,
+        inflight: Vec<InFlight>,
+        current: Option<(IpPrefix, PendingOp)>,
+        rest: impl Iterator<Item = (IpPrefix, PendingOp)>,
+    ) {
+        for f in inflight {
+            ledger.fail_install(f.prefix);
+            pending.requeue(f.prefix, f.op);
+        }
+        if let Some((prefix, op)) = current {
+            ledger.fail_install(prefix);
+            pending.requeue(prefix, op);
+        }
+        for (prefix, op) in rest {
+            pending.requeue(prefix, op);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::{Capacity, NexthopMap};
+    use std::net::Ipv4Addr;
+
+    fn v4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpPrefix {
+        IpPrefix::V4 {
+            addr: [a, b, c, d],
+            prefix_len: len,
+        }
+    }
+
+    fn nh(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn ports() -> PortIndex {
+        let mut p = PortIndex::default();
+        p.insert("eth3", None, 7);
+        p.insert("eth2", None, 9);
+        p.insert("eth3", Some(1337), 11);
+        p
+    }
+
+    #[test]
+    fn prefix_encodes_family_and_length() {
+        let p = to_prefix(v4(198, 51, 100, 0, 24));
+        assert_eq!(p.len, 24);
+        assert_eq!(p.address.af, ADDRESS_IP4);
+        assert_eq!(&p.address.un.0[..4], &[198, 51, 100, 0]);
+        assert!(
+            p.address.un.0[4..].iter().all(|&b| b == 0),
+            "v4 must zero-fill the union tail"
+        );
+    }
+
+    #[test]
+    fn v6_prefix_uses_the_whole_union() {
+        let addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let p = to_prefix(IpPrefix::V6 {
+            addr,
+            prefix_len: 48,
+        });
+        assert_eq!(p.address.af, ADDRESS_IP6);
+        assert_eq!(p.address.un.0, addr);
+    }
+
+    #[test]
+    fn paths_carry_the_interface_index_and_nexthop() {
+        let paths = build_paths(
+            &[ResolvedPath {
+                nexthop: nh(192, 0, 2, 1),
+                target: NexthopTarget::Vf {
+                    port: "eth3".into(),
+                },
+            }],
+            &ports(),
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].sw_if_index, 7);
+        assert_eq!(paths[0].proto, FIB_API_PATH_NH_PROTO_IP4);
+        assert_eq!(paths[0].r#type, FIB_API_PATH_TYPE_NORMAL);
+        assert_eq!(paths[0].weight, 1);
+        assert_eq!(&paths[0].nh.address.0[..4], &[192, 0, 2, 1]);
+    }
+
+    #[test]
+    fn a_vlan_target_uses_the_subinterface_index_not_the_ports() {
+        // Installing a VLAN route on the parent port's index would
+        // send tagged traffic out untagged, which forwards to the
+        // wrong place rather than failing.
+        let paths = build_paths(
+            &[ResolvedPath {
+                nexthop: nh(192, 0, 2, 20),
+                target: NexthopTarget::Subif {
+                    port: "eth3".into(),
+                    vlan: 1337,
+                },
+            }],
+            &ports(),
+        )
+        .unwrap();
+        assert_eq!(paths[0].sw_if_index, 11);
+    }
+
+    #[test]
+    fn an_unknown_target_defers_rather_than_pointing_at_local0() {
+        // sw_if_index 0 is local0. Encoding a route with a missing
+        // index would install a black hole that looks installed.
+        let out = build_paths(
+            &[ResolvedPath {
+                nexthop: nh(192, 0, 2, 1),
+                target: NexthopTarget::Vf {
+                    port: "eth9".into(),
+                },
+            }],
+            &ports(),
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn multipath_encodes_one_path_per_resolved_nexthop() {
+        let paths = build_paths(
+            &[
+                ResolvedPath {
+                    nexthop: nh(192, 0, 2, 1),
+                    target: NexthopTarget::Vf {
+                        port: "eth3".into(),
+                    },
+                },
+                ResolvedPath {
+                    nexthop: nh(192, 0, 2, 2),
+                    target: NexthopTarget::Vf {
+                        port: "eth2".into(),
+                    },
+                },
+            ],
+            &ports(),
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].sw_if_index, 7);
+        assert_eq!(paths[1].sw_if_index, 9);
+        assert!(
+            paths.iter().all(|p| p.weight == 1 && p.preference == 0),
+            "ECMP members share weight and tier"
+        );
+    }
+
+    #[test]
+    fn port_index_distinguishes_tagged_from_untagged() {
+        let p = ports();
+        assert_eq!(
+            p.get(&NexthopTarget::Vf {
+                port: "eth3".into()
+            }),
+            Some(7)
+        );
+        assert_eq!(
+            p.get(&NexthopTarget::Subif {
+                port: "eth3".into(),
+                vlan: 1337
+            }),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn drain_stats_count_only_what_reached_vpp() {
+        let s = DrainStats {
+            installed: 3,
+            withdrawn: 2,
+            withheld: 5,
+            unresolvable: 1,
+            rejected: 1,
+            deferred: 4,
+        };
+        // Withheld/unresolvable/deferred never left the process.
+        assert_eq!(s.attempted(), 6);
+    }
+
+    #[test]
+    fn a_nexthop_map_feeds_resolved_paths() {
+        // The resolve closure the drainer takes is exactly the sink's
+        // mapping policy, re-paired with the addresses the FIB needs.
+        let mut m = NexthopMap::new(vec!["eth3".into()]);
+        m.set_device(nh(192, 0, 2, 1), "eth3");
+        m.set_device(nh(192, 0, 2, 9), "eth0"); // excluded
+        let resolve = |nhs: &[IpAddr]| -> Vec<ResolvedPath> {
+            nhs.iter()
+                .filter_map(|ip| {
+                    m.resolve(ip).map(|t| ResolvedPath {
+                        nexthop: *ip,
+                        target: t,
+                    })
+                })
+                .collect()
+        };
+        let out = resolve(&[nh(192, 0, 2, 1), nh(192, 0, 2, 9)]);
+        assert_eq!(out.len(), 1, "excluded devices drop out of the path set");
+        assert_eq!(out[0].nexthop, nh(192, 0, 2, 1));
+
+        let _ = RouteLedger::new(Capacity::new(10));
+    }
+}
