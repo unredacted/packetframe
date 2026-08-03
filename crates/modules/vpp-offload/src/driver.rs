@@ -20,7 +20,14 @@
 //!
 //! | Field | Set by | Cleared by |
 //! |---|---|---|
-//! | `detector` | the first pong (`ApiUp`) | process exit |
+//! | `detector` | the API first answering, for **any** process — spawned or adopted | the state no longer having a process |
+//!
+//! Both halves were wrong on the first attempt, in opposite directions.
+//! Setting it only on the `Starting → Syncing` transition meant an
+//! *adopted* VPP never got a detector at all, which is the one case
+//! still carrying steered traffic while we resync it. Clearing it only
+//! on an observed exit meant it outlived a `Backoff` reached by a wedge,
+//! where it went on reporting the silence of something already gone.
 //!
 //! That is the whole table, and it is short on purpose. The process
 //! handle and the transport live in the caller's [`Observe`]
@@ -120,11 +127,9 @@ impl Driver {
     /// Feed an externally-sourced event (an operator's start/stop, an
     /// adoption) and run its actions.
     pub fn inject(&mut self, now: Instant, event: Event, fx: &mut dyn Effects) -> Tick {
+        let before = self.sup.state();
         let mut tick = self.apply(now, vec![event], fx);
-        if !self.sup.state().has_process() {
-            self.detector = None;
-        }
-        tick.sleep = self.sleep(now);
+        self.settle_after(now, before, false, &mut tick);
         tick
     }
 
@@ -137,21 +142,39 @@ impl Driver {
     /// [`Tick::sleep`].
     pub fn tick(&mut self, now: Instant, obs: &mut dyn Observe, fx: &mut dyn Effects) -> Tick {
         let before = self.sup.state();
-        let mut events = self.sched.fired(now, self.sup.may_restart());
+        let mut events = Vec::new();
         let mut more_to_drain = false;
 
-        // Death first, and unconditionally. If the process is gone, the
-        // ping and the drain below would both fail with their own
-        // confusing errors; handling the exit first turns three reports
-        // into one accurate event.
-        if let Some(status) = obs.poll_exit() {
+        // Death first, and **before the deadline events**. A pidfd is
+        // level-triggered, so an exit can still be readable on the very
+        // tick a backoff expires. Queued the other way round, the
+        // backoff spawns a replacement, the state becomes `Starting`,
+        // and the OLD process's exit is then attributed to the new one —
+        // killing a VPP that just started, on every retry.
+        let exited = obs.poll_exit();
+        if let Some(status) = exited {
             events.push(Event::ProcessExited { status });
-        } else {
-            if before == State::Starting && obs.api_ready() {
-                events.push(Event::ApiUp);
-                // Start the liveness clock on the first answer, not on
-                // the spawn.
+        }
+        // `may_restart` is read before the exit is applied, which is the
+        // conservative direction: a withheld backoff stays armed and
+        // fires next tick rather than being lost.
+        events.extend(self.sched.fired(now, self.sup.may_restart()));
+
+        if exited.is_none() {
+            // Start the liveness clock at the first answer from ANY
+            // process, not only a freshly spawned one. Gating this on
+            // `Starting` meant an adopted VPP never got a detector at
+            // all: adoption goes straight to `Syncing`/
+            // `AdoptedResyncing`, so a wedged adoptee — the one case
+            // that is still carrying steered traffic — could blackhole
+            // forever without ever emitting `Wedged`.
+            if before.has_process() && self.detector.is_none() && obs.api_ready() {
                 self.detector = Some(WedgeDetector::started(now));
+                // Only a startup transition needs announcing; an
+                // adopted process is already past `ApiUp`.
+                if before == State::Starting {
+                    events.push(Event::ApiUp);
+                }
             }
 
             // Only while the RESYNC is in flight — not merely while
@@ -175,7 +198,23 @@ impl Driver {
         }
 
         let mut tick = self.apply(now, events, fx);
+        self.settle_after(now, before, more_to_drain, &mut tick);
+        tick
+    }
 
+    /// Post-pass bookkeeping shared by [`Self::tick`] and
+    /// [`Self::inject`]: drop a detector with no process, then decide
+    /// whether the caller may sleep.
+    ///
+    /// `inject` needs this as much as `tick` does. Returning the phase
+    /// deadline as the permitted sleep after an injected
+    /// `StartRequested` would let a caller that honours `sleep` wait the
+    /// whole 60 s startup budget without ever calling `api_ready` — and
+    /// then `PhaseTimedOut` is queued ahead of the `ApiUp` observed on
+    /// the same tick, so a perfectly healthy VPP is killed and
+    /// restarted. Injected adoption had the same shape against the
+    /// convergence budget.
+    fn settle_after(&mut self, now: Instant, before: State, more_to_drain: bool, tick: &mut Tick) {
         // Nothing to ping once no process exists. Covers `Backoff` and
         // `Stopped` alike, and it is load-bearing rather than tidy: a
         // detector outliving its process keeps reporting the silence of
@@ -189,11 +228,17 @@ impl Driver {
         // A partly-drained table must not wait for the ping interval.
         // At ~256 routes a batch, one batch per 500 ms would take the
         // full v4 table over half an hour against a 60 s budget.
-        // Likewise a transition opens observations we have not made yet.
-        if more_to_drain || self.sup.state() != before {
+        let settled = self.sup.state();
+        // A transition also warrants an immediate pass, but only into a
+        // state there is something to observe IN. `Backoff` and
+        // `Stopped` have no process to poll: the first is governed by
+        // its timer and the second by nothing at all, so asking for a
+        // re-tick there buys a wasted pass — and in `Backoff` it would
+        // be one per pass until the timer elapsed.
+        let opened_observations = settled != before && settled.has_process();
+        if more_to_drain || opened_observations {
             tick.sleep = Some(Duration::ZERO);
         }
-        tick
     }
 
     fn sleep(&self, now: Instant) -> Option<Duration> {
@@ -810,6 +855,128 @@ mod tests {
         w2.exited = None;
         let t = d2.tick(at(t0, 90_000), &mut w2, &mut fx2);
         assert!(t.events.contains(&Event::BackoffElapsed), "{:?}", t.events);
+    }
+
+    /// Adoption goes straight to `Syncing`/`AdoptedResyncing`, so gating
+    /// detector creation on `Starting` meant an adopted VPP never got
+    /// one — and adoption is the single case still carrying steered
+    /// traffic. A wedged adoptee could have blackholed forever without
+    /// ever emitting `Wedged`.
+    #[test]
+    fn an_adopted_process_gets_a_wedge_detector() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ping_fails: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        assert_eq!(d.state(), State::AdoptedResyncing);
+
+        // First tick must create the detector even though we never
+        // passed through `Starting`.
+        d.tick(t0, &mut w, &mut fx);
+        assert!(w.pings > 0 || d.detector.is_some(), "detector must exist");
+
+        // Silence past the steady budget (steered ⇒ published bound)
+        // must be reported.
+        let mut wedged = false;
+        for ms in (500..4_000).step_by(250) {
+            if d.tick(at(t0, ms), &mut w, &mut fx)
+                .events
+                .contains(&Event::Wedged)
+            {
+                wedged = true;
+                break;
+            }
+        }
+        assert!(wedged, "a wedged adoptee must be detected");
+    }
+
+    /// An injected transition must not hand back a deadline as the
+    /// permitted sleep. A caller honouring it would wait the whole 60 s
+    /// startup budget without ever calling `api_ready`, and
+    /// `PhaseTimedOut` is then queued ahead of the `ApiUp` observed on
+    /// the same tick — killing a healthy VPP on every start.
+    #[test]
+    fn an_injected_start_asks_to_be_ticked_immediately() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let t = d.inject(t0, Event::StartRequested, &mut fx);
+        assert_eq!(d.state(), State::Starting);
+        assert_eq!(
+            t.sleep,
+            Some(Duration::ZERO),
+            "must not sleep out the startup budget before observing"
+        );
+    }
+
+    #[test]
+    fn an_injected_adoption_asks_to_be_ticked_immediately() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let t = d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        assert_eq!(
+            t.sleep,
+            Some(Duration::ZERO),
+            "the first batch must not wait out the convergence budget"
+        );
+    }
+
+    /// A pidfd is level-triggered, so an exit can still be readable on
+    /// the tick a backoff expires. Queued after `BackoffElapsed`, the
+    /// replacement is spawned first and the OLD process's exit is then
+    /// attributed to it — killing a VPP that just started, every retry.
+    #[test]
+    fn an_exit_is_attributed_before_an_elapsed_backoff_spawns() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+
+        // Die, entering backoff.
+        w.exited = Some(None);
+        d.tick(at(t0, 30), &mut w, &mut fx);
+        assert_eq!(d.state(), State::Backoff);
+
+        // The pidfd is STILL readable when the backoff expires.
+        fx.calls.clear();
+        let t = d.tick(at(t0, 5_000), &mut w, &mut fx);
+        let exit_at = t
+            .events
+            .iter()
+            .position(|e| matches!(e, Event::ProcessExited { .. }));
+        let backoff_at = t.events.iter().position(|e| *e == Event::BackoffElapsed);
+        assert!(exit_at.is_some() && backoff_at.is_some(), "{:?}", t.events);
+        assert!(
+            exit_at < backoff_at,
+            "the exit belongs to the process observed at entry: {:?}",
+            t.events
+        );
+        // And the freshly spawned process is NOT killed.
+        assert_eq!(d.state(), State::Starting, "{:?}", fx.calls);
+        let spawn_at = fx.calls.iter().position(|c| *c == "spawn");
+        assert!(spawn_at.is_some(), "{:?}", fx.calls);
+        assert!(
+            fx.calls
+                .iter()
+                .skip(spawn_at.unwrap())
+                .all(|c| *c != "kill"),
+            "nothing may kill the replacement: {:?}",
+            fx.calls
+        );
     }
 
     /// Actions are executed, not merely decided — the seam the whole
