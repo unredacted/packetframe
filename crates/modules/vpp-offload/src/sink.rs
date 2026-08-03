@@ -262,6 +262,22 @@ impl NexthopMap {
         self.device_of.insert(nexthop, dev.into());
     }
 
+    /// Forget every learned nexthop→device pair, keeping the members and
+    /// VLAN policy.
+    ///
+    /// Called before repopulating from an authoritative snapshot. Without
+    /// it the map is insert-only, so a nexthop the source has stopped
+    /// reporting keeps its last known device forever — and a route still
+    /// naming that nexthop resolves as *reachable* through a stale
+    /// interface instead of being classified unresolvable. Traffic then
+    /// keeps pointing at a neighbour that is gone, and readback
+    /// verification cannot catch it: verification checks that a route
+    /// exists on an interface we own, deliberately not that its nexthop
+    /// is still the one we intended.
+    pub fn forget_devices(&mut self) {
+        self.device_of.clear();
+    }
+
     /// Resolve one nexthop, or `None` if its device is excluded.
     pub fn resolve(&self, nexthop: &IpAddr) -> Option<NexthopTarget> {
         let dev = self.device_of.get(nexthop)?;

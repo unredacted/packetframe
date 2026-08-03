@@ -47,13 +47,36 @@ use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
 use crate::vpp_api::{Transport, TransportError};
 
-/// How long to wait for the API socket on a connect attempt.
+/// How long to wait for the handshake on a connect attempt.
 ///
 /// Short on purpose: `api_ready` is polled from the supervision loop and
 /// a long blocking connect would stall the tick that also services the
-/// pidfd and the wedge ping. The *overall* patience for a slow start is
+/// pidfd and the wedge ping. A timeout here just means the next tick
+/// tries again; the *overall* patience for a slow start is
 /// `API_STARTUP_BUDGET`, which is the loop's business, not this call's.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Socket timeout for every request after the handshake.
+///
+/// **Must exceed the largest liveness budget**, and that is the whole
+/// reason it is a separate constant. `Transport::connect` installs its
+/// timeout with `set_read_timeout`, so it governs not just the handshake
+/// but every subsequent reply — and using the short handshake value would
+/// make the transport error at 500 ms during a full-table load, when VPP
+/// legitimately takes seconds to answer because it services the API on
+/// the same main thread that is executing our route batch.
+///
+/// That would hand the transport a veto over a decision that belongs to
+/// the wedge detector: `SYNC_PING_BUDGET` exists precisely so a resync
+/// can be slow without being declared dead, and a shorter socket timeout
+/// silently defeats it — disconnect, requeue, restart, forever, on a VPP
+/// that was working. Derived from the budget rather than picked so the
+/// two cannot drift.
+pub const OP_TIMEOUT: Duration = crate::liveness::SYNC_PING_BUDGET.saturating_add(TIMEOUT_MARGIN);
+
+/// Headroom between the largest liveness budget and the socket timeout,
+/// so a reply arriving right at the budget is not raced by the socket.
+pub const TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 
 /// Route ops handed to VPP per drain call.
 ///
@@ -193,10 +216,27 @@ impl ConvergenceEngine {
         self
     }
 
-    /// Register a VLAN device as a sub-interface of a member port.
-    pub fn add_vlan(&mut self, dev: impl Into<String>, port: impl Into<String>, vid: u16) {
-        self.nexthops.add_vlan(dev, port, vid);
-    }
+    // NOTE: there is deliberately no `add_vlan` here, even though
+    // [`NexthopMap`] supports VLAN nexthops.
+    //
+    // Teaching the mapping to return `NexthopTarget::Subif` is only half
+    // of it: FIB paths need the sub-interface's OWN `sw_if_index`, and
+    // nothing creates or discovers one. The generated API whitelist has
+    // no sub-interface message at all, so `PortIndex` could never gain a
+    // `(port, Some(vid))` entry — `build_paths` would return `None` for
+    // every route through that VLAN, the drainer would defer all of them
+    // forever, and the resync would burn the whole convergence budget
+    // installing nothing.
+    //
+    // An affordance that silently produces a permanently-deferred table
+    // is worse than a missing one, so it is missing. Re-enabling it means
+    // adding a sub-interface create message to the whitelist, calling it
+    // during attach, and recording the index VPP assigns.
+    //
+    // Not currently needed: the gate-0b nexthop histogram found exactly
+    // two egress devices across the whole table and no VLAN nexthops —
+    // the br1337/FDB-pin topology is a connected-route concern, not a BGP
+    // nexthop one.
 
     pub fn counts(&self) -> SinkCounts {
         self.ledger.counts()
@@ -218,23 +258,50 @@ impl ConvergenceEngine {
         self.transport.is_some()
     }
 
-    /// Interface state for the health surface, from the last attach
-    /// pass. Reports what VPP said, not what we asked for.
+    /// Interface state for the health surface.
+    ///
+    /// Flags come from the most recent **observation**, which is the
+    /// verify pass's interface dump — `VerifyOutcome::dead_interfaces`
+    /// names every owned interface that is not both admin- and link-up,
+    /// including ones absent from VPP entirely.
+    ///
+    /// An earlier version hard-coded both flags true and rationalised it
+    /// as "the attach-time observation". It was not one: `attach_ports`
+    /// asserts the admin flag but never checks carrier, so link state was
+    /// pure fabrication — and it persisted, so a port that verify had
+    /// just found dead still reported as forwarding. That is exactly the
+    /// defect this module's docs claim to defend against, in the health
+    /// surface, written by the same hand that wrote the claim.
+    ///
+    /// Before the first verify there is genuinely no link observation.
+    /// Reporting up there cannot cause a false all-clear, because
+    /// `status::StatusSnapshot::nominal` requires a *passing verify*
+    /// independently — so the window is bounded by something that does
+    /// not trust this value.
     pub fn port_links(&self) -> Vec<PortLink> {
+        let dead = self
+            .last_verify
+            .as_ref()
+            .map(|v| v.dead_interfaces.as_slice())
+            .unwrap_or_default();
         self.attached
             .iter()
-            .map(|p| PortLink {
-                port: p.port.clone(),
-                sw_if_index: p.sw_if_index,
-                // Attach refuses a port that is not both admin- and
-                // link-up, so anything in `attached` was up when we
-                // last looked. The freshness of that claim is the
-                // verify pass's job — it re-reads link state every
-                // time — so this reports the attach-time observation
-                // rather than inventing a live one.
-                admin_up: true,
-                link_up: true,
-            })
+            .map(
+                |p| match dead.iter().find(|d| d.sw_if_index == p.sw_if_index) {
+                    Some(d) => PortLink {
+                        port: p.port.clone(),
+                        sw_if_index: p.sw_if_index,
+                        admin_up: d.admin_up,
+                        link_up: d.link_up,
+                    },
+                    None => PortLink {
+                        port: p.port.clone(),
+                        sw_if_index: p.sw_if_index,
+                        admin_up: true,
+                        link_up: true,
+                    },
+                },
+            )
             .collect()
     }
 
@@ -247,8 +314,17 @@ impl ConvergenceEngine {
         if self.transport.is_some() {
             return true;
         }
-        match Transport::connect(&self.api_socket, CONNECT_TIMEOUT) {
-            Ok(t) => {
+        match Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT) {
+            Ok(mut t) => {
+                // Re-arm to the operation timeout. The handshake value is
+                // deliberately short so a failed connect costs the loop
+                // one tick, but `connect` installs it as the socket's
+                // persistent read/write timeout — leaving it in force
+                // would make every drain reply time out at 500 ms during
+                // a full-table load and defeat SYNC_PING_BUDGET.
+                if t.set_timeout(OP_TIMEOUT).is_err() {
+                    return false;
+                }
                 self.transport = Some(t);
                 true
             }
@@ -302,7 +378,25 @@ impl ConvergenceEngine {
         let result = attach_ports(t, &ports, &known, mode);
         self.ports = ports;
         self.recorded_indices = known;
-        let attached = result?;
+        let attached = match result {
+            Ok(a) => a,
+            Err(e) => {
+                // A transport failure may have left an unread or partial
+                // reply on the stream, so the socket has to go — reusing
+                // it would match a later reply against the wrong context.
+                // Ping, drain and verify all do this; attach must not be
+                // the one path that leaves a poisoned socket looking
+                // healthy to `api_ready`.
+                //
+                // A plain refusal (`Refused`, `LocalZero`, `StaleIndex`,
+                // `UnknownIndexOnAdopt`) is VPP answering us correctly, so
+                // the connection stays.
+                if matches!(e, AttachError::Transport(_)) {
+                    self.disconnect();
+                }
+                return Err(e.into());
+            }
+        };
 
         // Only now, with VPP's own indices in hand.
         for p in &attached {
@@ -330,6 +424,22 @@ impl ConvergenceEngine {
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
         self.phase = Some(Phase::Resync);
 
+        // Rebuild, not merge. An insert-only refresh leaves a nexthop the
+        // source has stopped reporting mapped to its last known device,
+        // so a route still naming it resolves as reachable through a
+        // stale interface rather than being classified unresolvable —
+        // traffic aimed at a neighbour that is gone, invisible to
+        // readback verification because verification checks that the
+        // route exists on an interface we own, not that its nexthop is
+        // the one we meant.
+        //
+        // The source is authoritative, so an empty snapshot means every
+        // route is unresolvable. That is loud by construction — verify
+        // fails on `unresolvable > 0` and first-attach steering is
+        // blocked — which is the right direction to fail if the
+        // neighbour source is broken. Silently keeping stale mappings
+        // would forward into the hole instead.
+        self.nexthops.forget_devices();
         src.for_each_nexthop_device(&mut |nh, dev| self.nexthops.set_device(nh, dev));
 
         let mut plan = ResyncPlan::default();
@@ -453,6 +563,13 @@ impl ConvergenceEngine {
         self.disconnect();
         self.attached.clear();
         self.port_index = PortIndex::default();
+        // The state file's recorded indices belong to the dead instance
+        // too. Keeping them meant the replacement process was handed
+        // indices its interface dump cannot contain, so `attach_ports`
+        // answered `StaleIndex` — correctly, it cannot tell whether a
+        // live FIB still references them — and every recovery after an
+        // adopted-process failure was driven straight back into teardown.
+        self.recorded_indices.clear();
         self.pending = PendingMap::new();
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;
@@ -704,6 +821,115 @@ mod tests {
         // Deterministic: the same predecessor always gives the same
         // successor, which is what makes a failing pass replayable.
         assert_eq!(next_seed(0), a);
+    }
+
+    /// A nexthop the source stops reporting must become unresolvable, not
+    /// keep its last known device. Otherwise a route naming a vanished
+    /// neighbour resolves as reachable through a stale interface, and
+    /// readback verification cannot see it — verification checks the
+    /// route exists on an interface we own, deliberately not that its
+    /// nexthop is the one we meant.
+    #[test]
+    fn a_nexthop_the_source_dropped_becomes_unresolvable() {
+        let mut e = engine();
+        let p = v4(10, 0, 0, 0, 8);
+
+        let with_nh = Mirror {
+            routes: vec![(p, vec![nh(1)])],
+            devices: vec![(nh(1), "eth4".into())],
+        };
+        e.begin_resync(&with_nh);
+        assert!(e.nexthops.resolve(&nh(1)).is_some());
+
+        // The neighbour goes away; the route still names it.
+        let without_nh = Mirror {
+            routes: vec![(p, vec![nh(1)])],
+            devices: Vec::new(),
+        };
+        e.begin_resync(&without_nh);
+        assert!(
+            e.nexthops.resolve(&nh(1)).is_none(),
+            "a dropped nexthop must not keep its stale device"
+        );
+        // And classification now says so, rather than pointing a path at
+        // an interface the neighbour no longer lives on.
+        let st = e
+            .ledger
+            .classify_resolved(p, e.nexthops.resolve_all(&[nh(1)]).len());
+        assert_eq!(
+            st,
+            crate::sink::RouteState::NotInstalled(crate::sink::NotInstalled::Unresolvable)
+        );
+    }
+
+    /// The state file's indices belong to the instance that is gone.
+    /// Keeping them handed the replacement process indices its dump
+    /// cannot contain, so attach answered `StaleIndex` and every recovery
+    /// after an adopted-process failure went straight back to teardown.
+    #[test]
+    fn a_dead_process_invalidates_the_recorded_indices_too() {
+        let mut e = engine().with_recorded_indices(vec![("eth4".into(), 9)]);
+        assert!(!e.recorded_indices.is_empty());
+        e.on_process_gone();
+        assert!(
+            e.recorded_indices.is_empty(),
+            "recorded indices belong to the dead instance"
+        );
+    }
+
+    /// The socket timeout must never be shorter than the largest liveness
+    /// budget, or the transport errors before the wedge detector's budget
+    /// expires and takes a decision that belongs to the detector — a busy
+    /// but healthy VPP gets disconnected, requeued and restarted.
+    #[test]
+    fn the_operation_timeout_outlasts_every_liveness_budget() {
+        for steered in [false, true] {
+            for converging in [false, true] {
+                let budget = crate::liveness::budget_for(steered, converging);
+                assert!(
+                    OP_TIMEOUT > budget,
+                    "OP_TIMEOUT {OP_TIMEOUT:?} must exceed the {budget:?} budget \
+                     (steered={steered}, converging={converging})"
+                );
+            }
+        }
+        // And it must be clearly distinct from the handshake value, which
+        // is the bug: one constant serving both roles.
+        assert!(OP_TIMEOUT > HANDSHAKE_TIMEOUT * 10);
+    }
+
+    /// Link state must come from an observation. An earlier version
+    /// hard-coded both flags true, so a port verify had just found dead
+    /// still reported as forwarding.
+    #[test]
+    fn port_links_report_what_verify_observed() {
+        let mut e = engine();
+        e.attached.push(AttachedPort {
+            port: "eth4".into(),
+            dev_index: Some(0),
+            sw_if_index: 3,
+        });
+        // No verify yet: nothing contradicts, so it reads up — bounded by
+        // `nominal()` independently requiring a passing verify.
+        assert!(e.port_links()[0].link_up);
+
+        e.last_verify = Some(VerifyOutcome {
+            sampled: 64,
+            dead_interfaces: vec![crate::verify::DeadInterface {
+                sw_if_index: 3,
+                name: "octeon0/0".into(),
+                admin_up: true,
+                link_up: false,
+            }],
+            ..Default::default()
+        });
+        let links = e.port_links();
+        assert_eq!(links.len(), 1);
+        assert!(links[0].admin_up);
+        assert!(
+            !links[0].link_up,
+            "a port verify found dead must not report as forwarding"
+        );
     }
 
     #[test]
