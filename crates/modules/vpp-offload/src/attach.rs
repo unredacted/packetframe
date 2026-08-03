@@ -39,6 +39,21 @@ pub const IF_STATUS_ADMIN_UP: u32 = 1;
 /// `IF_STATUS_API_FLAG_LINK_UP` — carrier, not configuration.
 pub const IF_STATUS_LINK_UP: u32 = 2;
 
+/// Whether the VPP on the other end of the socket is one we just
+/// started or one that was already running.
+///
+/// Explicit rather than inferred from `known` being empty, because the
+/// two genuinely differ: a fresh VPP has no interfaces, so attaching is
+/// always right; an adopted one may already have them, so attaching
+/// without knowing the index is a duplicate waiting to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachMode {
+    /// We spawned this process; it has no interfaces yet.
+    Fresh,
+    /// This process outlived us and may already own its interfaces.
+    Adopted,
+}
+
 /// What to attach: one member port's VF.
 #[derive(Debug, Clone)]
 pub struct PortAttach {
@@ -95,6 +110,17 @@ pub enum AttachError {
         port: String,
         sw_if_index: u32,
     },
+    /// We adopted a live VPP but have no recorded index for this port.
+    ///
+    /// Reachable without any schema mishap: process identity is
+    /// persisted at spawn and the interface index only after attach, so
+    /// a crash between those writes leaves a valid adoptable process
+    /// and no index. Attaching would duplicate an interface the running
+    /// VPP may already have, and the dump cannot disambiguate ports, so
+    /// a clean restart is the only safe answer.
+    UnknownIndexOnAdopt {
+        port: String,
+    },
 }
 
 impl std::fmt::Display for AttachError {
@@ -118,6 +144,11 @@ impl std::fmt::Display for AttachError {
                 "state file records sw_if_index {sw_if_index} for {port} but VPP no longer has \
                  it; refusing to attach a duplicate while a live FIB may still reference the old \
                  index"
+            ),
+            AttachError::UnknownIndexOnAdopt { port } => write!(
+                f,
+                "adopted a running VPP but no sw_if_index is recorded for {port}; refusing to \
+                 attach a possibly-duplicate interface — restart cleanly instead"
             ),
             AttachError::LocalZero { port } => write!(
                 f,
@@ -163,10 +194,21 @@ impl From<TransportError> for AttachError {
 /// address, so on a box with several member ports `octeon0/0` and
 /// `octeon1/0` are indistinguishable by port id alone. Guessing there
 /// would map a port to the wrong VF, which is worse than not adopting.
+///
+/// `mode` says whether the process on the other end of this socket was
+/// adopted or freshly spawned, and it is **not** derivable from `known`
+/// being empty. There is a real window in which we adopted a live VPP
+/// and yet have no recorded index: the state file records process
+/// identity at spawn and the interface index only after attach, so a
+/// crash between those two writes — after `dev_create_port_if` already
+/// succeeded — leaves exactly that combination. Blind-attaching there is
+/// the duplicate-interface case this function exists to avoid, so
+/// [`AttachMode::Adopted`] with a missing index refuses instead.
 pub fn attach_ports(
     t: &mut Transport,
     ports: &[PortAttach],
     known: &[(String, u32)],
+    mode: AttachMode,
 ) -> Result<Vec<AttachedPort>, AttachError> {
     // One dump for the whole pass: it both confirms recorded indices
     // still exist and is the only way to see link state.
@@ -177,6 +219,17 @@ pub fn attach_ports(
             .iter()
             .find(|(name, _)| *name == p.port)
             .map(|(_, idx)| *idx);
+
+        if recorded.is_none() && mode == AttachMode::Adopted {
+            // We are talking to a VPP that was already running, and we
+            // do not know what index it gave this port. It may already
+            // have the interface; attaching would duplicate it, and
+            // guessing from the dump is ruled out above. Refuse and let
+            // the supervisor restart cleanly instead.
+            return Err(AttachError::UnknownIndexOnAdopt {
+                port: p.port.clone(),
+            });
+        }
 
         if let Some(idx) = recorded {
             if existing.iter().any(|i| i.sw_if_index == idx) {

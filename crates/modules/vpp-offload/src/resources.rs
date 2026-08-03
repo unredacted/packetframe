@@ -45,7 +45,18 @@ use serde::{Deserialize, Serialize};
 /// State-file schema version. Bump on layout change; adopt refuses a
 /// version it doesn't know (upgrade = detach → install → attach, per
 /// plan — no cross-version adoption).
-pub const STATE_VERSION: u32 = 1;
+///
+/// **2** since `PortState::sw_if_index` was added. The field carries
+/// `serde(default)`, so a version-1 file would have parsed and yielded
+/// `None` — and adoption now *depends* on that index, which is exactly
+/// the situation this counter exists to refuse. A `serde(default)` is
+/// the right tool for a field nothing depends on; it is the wrong tool
+/// for one the adopted path cannot work without.
+///
+/// The cost of the bump is bounded and already the documented policy:
+/// an upgrade across it requires `packetframe detach --all` with the
+/// previous binary before attaching with the new one.
+pub const STATE_VERSION: u32 = 2;
 
 pub const STATE_FILE_NAME: &str = "vpp-offload.json";
 
