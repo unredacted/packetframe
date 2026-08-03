@@ -70,15 +70,45 @@
 # PMD families; if its cnxk half hits the same model gate, EAL tries
 # the next matching driver, which is exactly the gate-free octeontx2.
 #
-# The AF↔VF mailbox question itself is therefore STILL OPEN — v26.06
-# never got far enough to ask it. The proper road back to current
-# VPP is upstreaming the one-line MIDR entry to DPDK/octeon-roc, not
-# carrying a local patch; until that lands and reaches a release,
-# this pin stays in the octeontx2 era.
-#   v25.10 / v24.10 / v23.06 → cnxk-era: same roc_model gate, skip
-#   v22.02           → DPDK 21.11, last `octeontx2`-named PMD, closest
-#                      to the DPDK 20.11 build that passed gate 0a
-ref = "v22.02"
+# v22.02 was then tried on the shadow (2026-08-02) and settled the
+# big question: **the AF↔VF mailbox WORKS.** DPDK 21.11's otx2 PMD
+# probed the VF through the SDK-era AF — interface created, MAC
+# assigned, full capability tables read. It then failed one layer up:
+#
+#   PMD: otx2_nix_rx_queue_setup(): mempool ops should be of
+#        octeontx2_npa type   (rte_eth_rx_queue_setup -> -22)
+#
+# Both otx2 and cnxk hard-require NPA mempool ops for packet buffers
+# (checked in 21.11 and 26.03 source — no bypass, no devarg), and
+# mainline VPP's buffer manager only provides its own "vpp" mempool
+# ops. So DPDK-PMD-inside-VPP is a dead end on this NIC at EVERY
+# version — the wall is VPP<->PMD buffer integration, not the
+# hardware, the kernel, or the era.
+#
+# The mainline path that remains is VPP's NATIVE octeon driver
+# (src/drivers/octeon), and every piece checks out in source:
+#   - it is gated on VPP_PLATFORM octeon9|octeon10 — which is why the
+#     generic build never contained it;
+#   - it links marvell-octeon-roc, and octeon-roc v26.05's model
+#     table (unlike DPDK's stale copy) HAS the cn9670's stepping:
+#     MIDR (0x43, 0xB2, major=3, minor=0) = **CN96xx D0**;
+#   - CN9K support is first-class (roc_model_is_cn9k() paths,
+#     PLATFORM_OCTEON9 defines).
+# Hence: ref back to latest stable, platform=octeon9. The native
+# driver is configured through VPP's vnet/dev `devices {}` startup
+# stanza, NOT `dpdk {}` — the spike runbook carries the shape.
+#
+# Kept for the record (all measured on the shadow, 2026-08-02):
+#   - v26.06 generic: cnxk PMD fails PRE-mailbox — DPDK's
+#     drivers/common/cnxk/roc_model.c stops at CN96xx variant 2 and
+#     hard-fails unknown MIDR with no override. Task #22 upstreams
+#     the D0 entry to DPDK (sync from octeon-roc); a courtesy fix
+#     now, not our critical path.
+#   - v25.10 / v24.10 / v23.06: same stale table, same failure, skip.
+#   - v22.02 generic: mailbox PASSES, rx queue setup fails on NPA
+#     mempool ops (above). Published tag stays as the mailbox-proof
+#     artifact.
+ref = "v26.06"
 
 # Optional strict pin. When non-empty the workflow verifies the ref
 # resolves to exactly this commit and fails otherwise, so a retagged
@@ -86,9 +116,14 @@ ref = "v22.02"
 # published manifest either way.
 commit = ""
 
-# Build variant. "generic" = baseline armv8-a, portable across any
-# arm64 EFG-class box. "cn9k" = Marvell-tuned (LSE atomics, tuned
-# memcpy) — a few percent on atomics/copy-heavy paths, only worth
-# measuring once we are packet-rate-bound. Changing this produces a
-# separately-tagged artifact; both can coexist.
-platform = "generic"
+# Build variant. Changing this produces a separately-tagged artifact;
+# variants coexist on the release page.
+#   "octeon9" = VPP_PLATFORM=octeon9: the ONLY shape that builds the
+#               native octeon driver (armv8.2-a+crc+crypto, 128B cache
+#               lines — correct for CN96xx). Required for this fleet;
+#               see above for why the DPDK PMD path cannot work.
+#   "generic" = baseline armv8-a, no octeon driver. Useful only for
+#               non-datapath testing of VPP itself.
+#   "cn9k"    = legacy DPDK-era tuning (octeontx2-era pins like
+#               v22.02): DPDK_MACHINE=cn9k + -mcpu=octeontx2.
+platform = "octeon9"

@@ -374,12 +374,30 @@ jobs:
             "DPDK_DRIVERS_DISABLED=$DPDK_DRIVERS_KEPT"
             "DPDK_LIBS_DISABLED=$DPDK_LIBS_KEPT"
           )
-          if [ '${{ needs.resolve.outputs.platform }}' = 'cn9k' ]; then
-            # Marvell-tuned variant: LSE atomics + tuned memcpy, plus
-            # DPDK's own cn9k platform tuning. Only meaningful once
-            # packet-rate-bound; produces a separately tagged artifact.
-            args+=(DPDK_MACHINE=cn9k VPP_EXTRA_CMAKE_ARGS='-DVPP_LIBRARY_FLAGS=-mcpu=octeontx2')
-          fi
+          case '${{ needs.resolve.outputs.platform }}' in
+            octeon9)
+              # VPP's first-class Marvell platform (src/cmake/platform/
+              # octeon9.cmake: armv8.2-a+crc+crypto, 128B cache lines —
+              # correct for CN96xx, still runs on Neoverse CI runners).
+              # This is the ONLY build shape that produces the NATIVE
+              # octeon driver (src/drivers/octeon is gated on
+              # VPP_PLATFORM_NAME octeon9|octeon10), which is in turn
+              # the only mainline path onto this NIC: the DPDK PMDs
+              # inside VPP hard-require NPA mempool ops that VPP's
+              # buffer manager does not provide (measured on the
+              # shadow, 2026-08-02; no bypass exists in otx2 or cnxk).
+              # The native driver links octeon-roc, whose model table —
+              # unlike DPDK's stale copy — knows the cn9670's CN96xx D0
+              # stepping.
+              args+=(VPP_EXTRA_CMAKE_ARGS='-DVPP_PLATFORM=octeon9')
+              ;;
+            cn9k)
+              # Legacy DPDK-era tuning, for octeontx2-era pins
+              # (e.g. v22.02): LSE atomics + tuned memcpy + DPDK's own
+              # cn9k platform tuning.
+              args+=(DPDK_MACHINE=cn9k VPP_EXTRA_CMAKE_ARGS='-DVPP_LIBRARY_FLAGS=-mcpu=octeontx2')
+              ;;
+          esac
           printf 'make arg: %s\n' "${args[@]}"
           make build-release "${args[@]}"
 
@@ -442,7 +460,7 @@ jobs:
           find "$instroot" \( -path '*vpp_drivers*' -o -path '*vpp_plugins*' \
             -o -path '*dpdk/pmds*' -o -name 'librte_net_*' \) -type f | sort
           echo "--- octeon artifacts anywhere under the install trees ---"
-          find "$instroot" \( -name '*cnxk*' -o -name '*octeontx2*' -o -name 'dev_octeon*' \) \
+          find "$instroot" \( -name '*cnxk*' -o -name '*octeontx2*' -o -name 'dev_octeon*' -o -name 'octeon_driver*' \) \
             | sort | head -40
           echo "--- end inventory ---"
 
@@ -494,7 +512,12 @@ jobs:
           # The fleet is cn9670 = CN9K, so net_cn9k specifically is
           # the load-bearing one.
           OCTEON_PMD_NAMES='net_cn9k|net_cn10k|net_cn20k|net_octeontx2'
-          native=$(find "$instroot" -name 'dev_octeon*.so*' -print -quit)
+          # The native driver installs as vpp_drivers/octeon_driver.so —
+          # verified from src/drivers CMake (`add_vpp_driver(octeon)`,
+          # same pattern as atlantic_driver.so), NOT as dev_octeon*.
+          # The old needle predated reading the tree; keep both names
+          # in case upstream renames back.
+          native=$(find "$instroot" \( -name 'octeon_driver.so*' -o -name 'dev_octeon*.so*' \) -print -quit)
           pmd_lib=$(find "$instroot" \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) -print -quit)
           driver=''
           if [ -n "$native" ]; then
@@ -689,7 +712,7 @@ jobs:
           # accepts — VPP's native dev_octeon, a standalone DPDK PMD, or
           # one linked into dpdk_plugin.so — because which one this VPP
           # ships is a property of the release, not a constant.
-          native=$(find / -name 'dev_octeon*.so*' -not -path '/proc/*' -print -quit 2>/dev/null || true)
+          native=$(find / \( -name 'octeon_driver.so*' -o -name 'dev_octeon*.so*' \) -not -path '/proc/*' -print -quit 2>/dev/null || true)
           pmd_so=$(find / \( -name 'librte_net_cnxk*' -o -name 'librte_net_octeontx2*' \) \
             -not -path '/proc/*' -print -quit 2>/dev/null || true)
           plugin=$(find / -name dpdk_plugin.so -not -path '/proc/*' -print -quit 2>/dev/null || true)
