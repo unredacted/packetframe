@@ -59,7 +59,7 @@ jobs:
       tag: ${{ steps.pin.outputs.tag }}
       needs_build: ${{ steps.exists.outputs.needs_build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Parse vpp/pin.toml
         id: pin
@@ -626,7 +626,7 @@ jobs:
           sha256sum vpp-api-json.tar.gz >> SHA256SUMS
           cat manifest.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vpp-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.platform }}-bullseye-arm64
           path: |
@@ -657,7 +657,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates binutils
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: vpp-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.platform }}-bullseye-arm64
           path: /pkg
@@ -769,7 +769,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: vpp-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.platform }}-bullseye-arm64
           path: /tmp/pkg
