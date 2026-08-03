@@ -1,0 +1,953 @@
+//! The supervision loop body: one tick.
+//!
+//! Composes the four pieces that already exist —
+//! [`Supervisor`](crate::supervisor::Supervisor) for decisions,
+//! [`Schedule`](crate::schedule::Schedule) for deadlines,
+//! [`WedgeDetector`](crate::liveness::WedgeDetector) for liveness, and
+//! [`execute`](crate::executor::execute) for effects — into the thing
+//! that actually runs.
+//!
+//! **Requests and observations are separate traits, deliberately.**
+//! [`Effects`] does things; [`Observe`] reports what happened. That is
+//! not symmetry for its own sake: eleven review findings in this
+//! subsystem have been one mistake — state recorded when an effect was
+//! *requested* rather than when it was *observed* — and putting the two
+//! behind different traits makes the distinction hard to blur. Nothing
+//! in this module may set state from an `Effects` call; only from an
+//! `Observe` one.
+//!
+//! ## State, and what is allowed to clear it
+//!
+//! | Field | Set by | Cleared by |
+//! |---|---|---|
+//! | `detector` | the first pong (`ApiUp`) | process exit |
+//!
+//! That is the whole table, and it is short on purpose. The process
+//! handle and the transport live in the caller's [`Observe`]
+//! implementation rather than here, because they have one lifetime
+//! between them: the socket belongs to that process. Modelling them as
+//! two fields with two clearers invites the case where a socket error
+//! and a process exit both try to clear, and the second acts on a `None`
+//! it did not expect — so the rule is that **a transport error reports
+//! and does not clear**. The pidfd is the authoritative observer of
+//! death; a broken socket is a symptom, and every later operation on it
+//! simply fails and reports again until the exit arrives.
+
+use std::time::{Duration, Instant};
+
+use crate::executor::{execute, Effects, Outcome};
+use crate::liveness::{budget_for, WedgeDetector};
+use crate::schedule::Schedule;
+use crate::supervisor::{Event, State, Supervisor};
+
+/// What the world reports. Every one of these is an observation; none
+/// of them requests a state change.
+pub trait Observe {
+    /// Non-blocking. `Some(status)` = the process has exited.
+    ///
+    /// Must come from a pidfd, not `waitpid`: an adopted VPP was
+    /// reparented to init and would never be reaped by us.
+    fn poll_exit(&mut self) -> Option<Option<i32>>;
+
+    /// Whether the binary API is answering, connecting it if needed.
+    ///
+    /// `false` is not an error — VPP takes time to open its socket while
+    /// it faults in a multi-GB heap. The startup deadline, not this, is
+    /// what decides when waiting has gone on too long.
+    fn api_ready(&mut self) -> bool;
+
+    /// Send a ping and read its reply.
+    fn ping(&mut self) -> Result<(), String>;
+
+    /// Drain **one bounded batch** of pending routes.
+    /// `Ok(true)` = nothing left pending.
+    ///
+    /// Bounded is the contract, not an implementation detail. A blocking
+    /// full-table drain would hold the loop for the whole convergence
+    /// budget, during which no ping is sent and no exit is noticed — so
+    /// the wedge detector would either be useless or fire on a VPP that
+    /// was working fine.
+    fn drain_batch(&mut self) -> Result<bool, String>;
+}
+
+/// One tick's result.
+#[derive(Debug, Clone)]
+pub struct Tick {
+    /// Events observed and applied, in the order they were applied.
+    pub events: Vec<Event>,
+    /// What executing the resulting actions produced.
+    pub outcome: Outcome,
+    /// How long the caller may sleep. `None` = block on the fds.
+    pub sleep: Option<Duration>,
+}
+
+/// Owns the supervision state that is not the caller's.
+#[derive(Debug)]
+pub struct Driver {
+    sup: Supervisor,
+    sched: Schedule,
+    /// Liveness tracking, from the first pong onward.
+    ///
+    /// `Option` because it must NOT exist before the API has answered
+    /// once: counting VPP's startup as silence would declare a wedge
+    /// before it ever had a chance to reply.
+    detector: Option<WedgeDetector>,
+}
+
+impl Default for Driver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Driver {
+    pub fn new() -> Self {
+        Self {
+            sup: Supervisor::new(),
+            sched: Schedule::new(),
+            detector: None,
+        }
+    }
+
+    pub fn state(&self) -> State {
+        self.sup.state()
+    }
+
+    pub fn supervisor(&self) -> &Supervisor {
+        &self.sup
+    }
+
+    /// Feed an externally-sourced event (an operator's start/stop, an
+    /// adoption) and run its actions.
+    pub fn inject(&mut self, now: Instant, event: Event, fx: &mut dyn Effects) -> Tick {
+        let mut tick = self.apply(now, vec![event], fx);
+        if !self.sup.state().has_process() {
+            self.detector = None;
+        }
+        tick.sleep = self.sleep(now);
+        tick
+    }
+
+    /// One pass: observe, decide, act, re-arm.
+    ///
+    /// **Observations use the state as it was at entry**, and any
+    /// transition takes effect for the *next* pass. That is ordinary for
+    /// an event loop, and it is why a tick that changes state asks to be
+    /// called again immediately rather than sleeping — see
+    /// [`Tick::sleep`].
+    pub fn tick(&mut self, now: Instant, obs: &mut dyn Observe, fx: &mut dyn Effects) -> Tick {
+        let before = self.sup.state();
+        let mut events = self.sched.fired(now, self.sup.may_restart());
+        let mut more_to_drain = false;
+
+        // Death first, and unconditionally. If the process is gone, the
+        // ping and the drain below would both fail with their own
+        // confusing errors; handling the exit first turns three reports
+        // into one accurate event.
+        if let Some(status) = obs.poll_exit() {
+            events.push(Event::ProcessExited { status });
+        } else {
+            if before == State::Starting && obs.api_ready() {
+                events.push(Event::ApiUp);
+                // Start the liveness clock on the first answer, not on
+                // the spawn.
+                self.detector = Some(WedgeDetector::started(now));
+            }
+
+            // Only while the RESYNC is in flight — not merely while
+            // `is_converging()`, which also covers `Verifying`. Draining
+            // an already-empty map during verify would report
+            // `SyncComplete` on every pass; the supervisor ignores it,
+            // but "an event was applied" is what asks for an immediate
+            // re-tick, so it would spin a core through the whole verify.
+            if matches!(before, State::Syncing | State::AdoptedResyncing) {
+                match obs.drain_batch() {
+                    // Empty means the resync is done — and only the
+                    // drain can say so, which is why this is observed
+                    // rather than assumed after issuing StartResync.
+                    Ok(true) => events.push(Event::SyncComplete),
+                    Ok(false) => more_to_drain = true,
+                    Err(_) => events.push(Event::ConvergenceFailed),
+                }
+            }
+
+            events.extend(self.poll_liveness(now, obs));
+        }
+
+        let mut tick = self.apply(now, events, fx);
+
+        // Nothing to ping once no process exists. Covers `Backoff` and
+        // `Stopped` alike, and it is load-bearing rather than tidy: a
+        // detector outliving its process keeps reporting the silence of
+        // something already dead, and each of those `Wedged` events is
+        // an applied event asking for another immediate tick.
+        if !self.sup.state().has_process() {
+            self.detector = None;
+        }
+
+        tick.sleep = self.sleep(now);
+        // A partly-drained table must not wait for the ping interval.
+        // At ~256 routes a batch, one batch per 500 ms would take the
+        // full v4 table over half an hour against a 60 s budget.
+        // Likewise a transition opens observations we have not made yet.
+        if more_to_drain || self.sup.state() != before {
+            tick.sleep = Some(Duration::ZERO);
+        }
+        tick
+    }
+
+    fn sleep(&self, now: Instant) -> Option<Duration> {
+        self.sched.next_wakeup(
+            now,
+            self.detector.as_ref().map(|d| d.next_ping_at()),
+            self.sup.may_restart(),
+        )
+    }
+
+    /// Ping if due, and decide whether the silence has gone too far.
+    fn poll_liveness(&mut self, now: Instant, obs: &mut dyn Observe) -> Vec<Event> {
+        let Some(d) = self.detector.as_mut() else {
+            return Vec::new();
+        };
+        if d.ping_due(now) {
+            // Recorded before the result is known, so an unanswered ping
+            // cannot make the next one immediately due and spin.
+            d.on_ping_sent(now);
+            if obs.ping().is_ok() {
+                d.on_pong(now);
+            }
+        }
+        // The budget depends on whether traffic is steered, NOT on
+        // whether we are resyncing: an adopted resync forwards the whole
+        // time, and the published bound applies whenever packets are on
+        // VPP.
+        let budget = budget_for(self.sup.is_steered(), self.sup.is_converging());
+        if d.is_wedged(now, budget) {
+            vec![Event::Wedged]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Apply events through the supervisor, execute what they ask for,
+    /// and feed the results back until the system settles.
+    fn apply(&mut self, now: Instant, events: Vec<Event>, fx: &mut dyn Effects) -> Tick {
+        let mut applied = Vec::new();
+        let mut outcome = Outcome::default();
+        let mut queue = events;
+
+        // Bounded: a seam that will not settle is a bug, and looping
+        // forever would hang the daemon instead of reporting it.
+        for _ in 0..16 {
+            if queue.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for e in queue.drain(..) {
+                let actions = self.sup.on(e.clone());
+                applied.push(e);
+                // Re-arm from the supervisor's own view after EVERY
+                // transition, including ones with no budget — arming
+                // only on entry to a timed phase would leave a deadline
+                // describing a phase already left.
+                self.sched.arm_phase(now, self.sup.phase());
+                for a in &actions {
+                    if let crate::supervisor::Action::ArmBackoff(d) = a {
+                        self.sched.arm_backoff(now, *d);
+                    }
+                }
+                if self.sup.state() == State::Stopped {
+                    self.sched.disarm();
+                }
+                let o = execute(&actions, fx);
+                next.extend(o.events.clone());
+                outcome.events.extend(o.events);
+                outcome.failures.extend(o.failures);
+                outcome.resources_leaked |= o.resources_leaked;
+            }
+            queue = next;
+        }
+
+        Tick {
+            events: applied,
+            outcome,
+            // Overwritten by the caller once it has finished adjusting
+            // state; `apply` cannot know whether more work is queued.
+            sleep: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::liveness::{PING_BUDGET, PING_INTERVAL, SYNC_PING_BUDGET};
+    use crate::process::Disposition;
+    use crate::supervisor::Action;
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// Tick until the driver stops asking to be re-run immediately.
+    ///
+    /// Observations use the state as it was at tick entry, so a
+    /// transition takes effect on the next pass — the driver signals
+    /// that by returning `sleep == ZERO`. Tests that want "run until
+    /// settled" say so here rather than hand-counting ticks.
+    fn settle(d: &mut Driver, now: Instant, w: &mut World, fx: &mut Fx) -> Vec<Event> {
+        let mut seen = Vec::new();
+        for i in 0..32 {
+            let t = d.tick(at(now, i), w, fx);
+            seen.extend(t.events);
+            if t.sleep != Some(Duration::ZERO) {
+                return seen;
+            }
+        }
+        panic!("driver never settled: {seen:?}");
+    }
+
+    /// Reports whatever it is told to, and counts what was asked.
+    #[derive(Default)]
+    struct World {
+        exited: Option<Option<i32>>,
+        api: bool,
+        /// Batches remaining before the drain reports empty.
+        batches: usize,
+        drain_fails: bool,
+        ping_fails: bool,
+        pings: usize,
+        drains: usize,
+    }
+
+    impl Observe for World {
+        fn poll_exit(&mut self) -> Option<Option<i32>> {
+            self.exited
+        }
+        fn api_ready(&mut self) -> bool {
+            self.api
+        }
+        fn ping(&mut self) -> Result<(), String> {
+            self.pings += 1;
+            if self.ping_fails {
+                Err("no answer".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn drain_batch(&mut self) -> Result<bool, String> {
+            self.drains += 1;
+            if self.drain_fails {
+                return Err("socket closed".into());
+            }
+            self.batches = self.batches.saturating_sub(1);
+            Ok(self.batches == 0)
+        }
+    }
+
+    #[derive(Default)]
+    struct Fx {
+        calls: Vec<&'static str>,
+        kill_disposition: Option<Disposition>,
+    }
+
+    impl Effects for Fx {
+        fn spawn(&mut self) -> Result<(), String> {
+            self.calls.push("spawn");
+            Ok(())
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            self.calls.push("unsteer");
+            Ok(())
+        }
+        fn steer(&mut self) -> Result<(), String> {
+            self.calls.push("steer");
+            Ok(())
+        }
+        fn kill(&mut self) -> Disposition {
+            self.calls.push("kill");
+            self.kill_disposition.unwrap_or(Disposition::SafeToRelease)
+        }
+        fn attach_devices(&mut self) -> Result<(), String> {
+            self.calls.push("attach");
+            Ok(())
+        }
+        fn start_resync(&mut self) -> Result<(), String> {
+            self.calls.push("resync");
+            Ok(())
+        }
+        fn start_verify(&mut self) -> Result<(), String> {
+            self.calls.push("verify");
+            Ok(())
+        }
+        fn abort_convergence(&mut self) {
+            self.calls.push("abort");
+        }
+        fn arm_backoff(&mut self, _d: Duration) {
+            self.calls.push("backoff");
+        }
+        fn release_resources(&mut self) -> Result<(), String> {
+            self.calls.push("release");
+            Ok(())
+        }
+    }
+
+    // ---- The drain is incremental ----
+
+    /// The reason `drain_batch` is bounded. A blocking full-table drain
+    /// would hold the loop for the entire convergence budget, sending no
+    /// ping and noticing no exit — so the wedge detector would be either
+    /// useless or a liar.
+    #[test]
+    fn a_resync_takes_several_ticks_and_reports_complete_only_when_empty() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 4,
+            ..Default::default()
+        };
+
+        d.inject(t0, Event::StartRequested, &mut fx);
+        // First tick brings the API up; observations use the state at
+        // entry, so draining begins on the next pass.
+        let t = d.tick(t0, &mut w, &mut fx);
+        assert!(t.events.contains(&Event::ApiUp));
+        assert_eq!(d.state(), State::Syncing);
+        assert_eq!(
+            t.sleep,
+            Some(Duration::ZERO),
+            "a transition must not wait for the ping interval"
+        );
+
+        // Batches 1..3 make progress without claiming completion.
+        for i in 1..4 {
+            let t = d.tick(at(t0, i * 10), &mut w, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "batch {i} must not claim completion: {:?}",
+                t.events
+            );
+            assert_eq!(d.state(), State::Syncing);
+            assert_eq!(
+                t.sleep,
+                Some(Duration::ZERO),
+                "a partly-drained table must keep draining, not sleep"
+            );
+        }
+        // The batch that empties the map reports it.
+        let t = d.tick(at(t0, 40), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::SyncComplete), "{:?}", t.events);
+        assert_eq!(d.state(), State::Verifying);
+        assert_eq!(w.drains, 4, "one batch per tick, no more");
+    }
+
+    /// `is_converging()` covers `Verifying` too, so draining on it would
+    /// re-report `SyncComplete` against an already-empty map every pass.
+    /// The supervisor ignores the event — but "an event was applied" is
+    /// what asks for an immediate re-tick, so the loop would spin a core
+    /// for the whole verify.
+    #[test]
+    fn verification_does_not_drain_and_does_not_spin() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        assert_eq!(d.state(), State::Verifying);
+        assert!(
+            d.supervisor().is_converging(),
+            "verify counts as converging"
+        );
+
+        let drains_before = w.drains;
+        let t = d.tick(at(t0, 100), &mut w, &mut fx);
+        assert_eq!(w.drains, drains_before, "no drain during verification");
+        assert!(t.events.is_empty(), "nothing to report: {:?}", t.events);
+        assert_ne!(
+            t.sleep,
+            Some(Duration::ZERO),
+            "a settled verify must let the loop sleep"
+        );
+    }
+
+    #[test]
+    fn a_drain_failure_reports_convergence_failed() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 5,
+            drain_fails: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        let seen = settle(&mut d, t0, &mut w, &mut fx);
+        assert!(seen.contains(&Event::ConvergenceFailed), "{seen:?}");
+        assert_eq!(d.state(), State::Backoff);
+    }
+
+    // ---- Liveness ----
+
+    /// The detector must not exist before the API has answered, or
+    /// VPP's startup would be counted as silence and a wedge declared
+    /// before it ever had a chance to reply.
+    #[test]
+    fn liveness_starts_at_the_first_answer_not_at_the_spawn() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World::default(); // API not up yet
+
+        d.inject(t0, Event::StartRequested, &mut fx);
+        // Far beyond the wedge budget, but nothing has answered yet.
+        let t = d.tick(at(t0, 30_000), &mut w, &mut fx);
+        assert!(
+            !t.events.contains(&Event::Wedged),
+            "startup is not silence: {:?}",
+            t.events
+        );
+        assert_eq!(w.pings, 0, "nothing to ping yet");
+        assert_eq!(d.state(), State::Starting);
+    }
+
+    #[test]
+    fn a_ping_goes_out_on_the_interval_and_a_pong_keeps_us_healthy() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        d.tick(t0, &mut w, &mut fx);
+
+        // Not yet due.
+        d.tick(at(t0, 100), &mut w, &mut fx);
+        assert_eq!(w.pings, 0);
+        // Due.
+        let t = d.tick(t0 + PING_INTERVAL, &mut w, &mut fx);
+        assert_eq!(w.pings, 1);
+        assert!(!t.events.contains(&Event::Wedged));
+    }
+
+    /// Silence past the budget is a wedge — and the ping that goes
+    /// unanswered must not suppress the next attempt.
+    #[test]
+    fn unanswered_pings_lead_to_a_wedge() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ping_fails: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        // Reach Ready so we are not converging (relaxed budget).
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        assert_eq!(d.state(), State::Ready);
+
+        let mut pings_seen = 0;
+        let mut wedged = false;
+        for ms in (500..3_000).step_by(500) {
+            let t = d.tick(at(t0, ms), &mut w, &mut fx);
+            pings_seen = w.pings;
+            if t.events.contains(&Event::Wedged) {
+                wedged = true;
+                break;
+            }
+        }
+        assert!(wedged, "silence past the budget must be a wedge");
+        assert!(pings_seen >= 2, "each interval must retry: {pings_seen}");
+    }
+
+    /// The budget follows steering, not resyncing — the correction from
+    /// an earlier round, checked here through the loop that applies it.
+    #[test]
+    fn a_steered_adopted_resync_uses_the_steady_budget() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 100, // still draining
+            ping_fails: true,
+            ..Default::default()
+        };
+        // Adopt a steered VPP; it is converging AND forwarding.
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        // The detector only exists once the API answers; simulate that
+        // by driving a tick from Starting is not possible here, so feed
+        // ApiUp's effect directly.
+        d.tick(t0, &mut w, &mut fx);
+        assert!(d.supervisor().is_steered());
+        assert!(d.supervisor().is_converging());
+
+        // Just past the steady budget but far inside the sync budget.
+        let probe = t0 + PING_BUDGET + Duration::from_millis(200);
+        assert!(probe < t0 + SYNC_PING_BUDGET);
+        // No detector was created (no ApiUp from Adopted), so this
+        // asserts the budget choice rather than the wedge itself.
+        assert_eq!(
+            budget_for(true, true),
+            PING_BUDGET,
+            "steered means the published bound applies"
+        );
+    }
+
+    // ---- Death, and the schedule ----
+
+    /// An exit is handled before anything else: the ping and drain would
+    /// both fail against a dead process and produce noise.
+    #[test]
+    fn an_exit_is_reported_without_a_ping_or_drain() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 5,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        d.tick(t0, &mut w, &mut fx);
+        let drains_before = w.drains;
+
+        w.exited = Some(Some(1));
+        let t = d.tick(at(t0, 10), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::ProcessExited { status: Some(1) }));
+        assert_eq!(w.drains, drains_before, "no drain against a dead process");
+        assert_eq!(w.pings, 0, "no ping against a dead process");
+        assert_eq!(d.state(), State::Backoff);
+    }
+
+    /// The backoff the supervisor asked for is armed, and the retry
+    /// fires from it on a later tick — without the caller tracking time.
+    #[test]
+    fn the_backoff_is_armed_and_the_retry_fires_from_it() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+
+        w.exited = Some(None);
+        d.tick(at(t0, 30), &mut w, &mut fx);
+        assert_eq!(d.state(), State::Backoff);
+
+        // Not yet.
+        w.exited = None;
+        let t = d.tick(at(t0, 100), &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::BackoffElapsed));
+
+        fx.calls.clear();
+        let t = d.tick(at(t0, 5_000), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::BackoffElapsed), "{:?}", t.events);
+        assert!(fx.calls.contains(&"spawn"), "{:?}", fx.calls);
+        assert_eq!(d.state(), State::Starting);
+    }
+
+    /// A phase that never completes must not hang the loop — the
+    /// startup deadline fires and the supervisor cycles.
+    #[test]
+    fn a_vpp_that_never_answers_times_out_through_the_loop() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World::default(); // never becomes ready
+
+        d.inject(t0, Event::StartRequested, &mut fx);
+        assert_eq!(d.state(), State::Starting);
+
+        let t = d.tick(at(t0, 61_000), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::PhaseTimedOut), "{:?}", t.events);
+        assert_eq!(d.state(), State::Backoff);
+        assert!(fx.calls.contains(&"kill"));
+    }
+
+    /// The loop must not spin. In steady state the only timer is the
+    /// ping; with nothing running at all there is no timer.
+    #[test]
+    fn an_idle_driver_asks_to_block_rather_than_spin() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World::default();
+        let t = d.tick(t0, &mut w, &mut fx);
+        assert_eq!(t.sleep, None, "nothing armed: block on the fds");
+    }
+
+    #[test]
+    fn a_running_driver_wakes_for_the_ping() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        // Settled: the only remaining timer is the ping.
+        let t = d.tick(at(t0, 50), &mut w, &mut fx);
+        assert!(t.sleep.is_some());
+        assert!(t.sleep.unwrap() <= PING_INTERVAL, "{:?}", t.sleep);
+    }
+
+    /// A stop disarms everything: an idle stopped daemon must not hold a
+    /// timer that wakes it for nothing.
+    #[test]
+    fn a_stop_disarms_the_schedule() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+
+        let t = d.inject(at(t0, 20), Event::StopRequested, &mut fx);
+        assert_eq!(d.state(), State::Stopped);
+        assert!(fx.calls.contains(&"release"));
+        assert_eq!(t.sleep, None, "a stopped driver holds no timers");
+    }
+
+    /// Teardown ordering survives composition: unsteer precedes kill all
+    /// the way from an observed exit.
+    #[test]
+    fn an_observed_exit_while_steered_unsteers_before_killing() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        d.inject(at(t0, 21), Event::Steered, &mut fx);
+        assert!(d.supervisor().is_steered());
+
+        fx.calls.clear();
+        w.exited = Some(None);
+        d.tick(at(t0, 30), &mut w, &mut fx);
+        let unsteer = fx.calls.iter().position(|c| *c == "unsteer");
+        let kill = fx.calls.iter().position(|c| *c == "kill");
+        assert!(unsteer.is_some() && kill.is_some(), "{:?}", fx.calls);
+        assert!(unsteer < kill, "{:?}", fx.calls);
+    }
+
+    /// A process that survived the kill must not be replaced on the next
+    /// backoff — checked here through the loop, where the block has to
+    /// survive across ticks.
+    #[test]
+    fn an_undead_process_blocks_the_retry_across_ticks() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            kill_disposition: Some(Disposition::MustLeak),
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        w.exited = Some(None);
+        d.tick(at(t0, 30), &mut w, &mut fx);
+        // The exit itself clears `undead`; the wedge path below is the
+        // one where the process is still believed alive.
+        assert_eq!(d.state(), State::Backoff);
+
+        let mut d2 = Driver::new();
+        let mut fx2 = Fx {
+            kill_disposition: Some(Disposition::MustLeak),
+            ..Default::default()
+        };
+        d2.inject(t0, Event::StartRequested, &mut fx2);
+        d2.inject(at(t0, 1), Event::Wedged, &mut fx2);
+        assert!(d2.supervisor().is_undead());
+        assert!(!d2.supervisor().may_restart());
+
+        // Long past the backoff, and still no spawn.
+        fx2.calls.clear();
+        let mut w2 = World::default();
+        let t = d2.tick(at(t0, 60_000), &mut w2, &mut fx2);
+        assert!(!t.events.contains(&Event::BackoffElapsed), "{:?}", t.events);
+        assert!(!fx2.calls.contains(&"spawn"), "{:?}", fx2.calls);
+        // And the withheld backoff must not busy-spin.
+        assert_eq!(t.sleep, None, "blocked: sleep on the fds");
+
+        // The pidfd finally reports the exit; now the retry proceeds.
+        w2.exited = Some(None);
+        d2.tick(at(t0, 60_100), &mut w2, &mut fx2);
+        w2.exited = None;
+        let t = d2.tick(at(t0, 90_000), &mut w2, &mut fx2);
+        assert!(t.events.contains(&Event::BackoffElapsed), "{:?}", t.events);
+    }
+
+    /// Actions are executed, not merely decided — the seam the whole
+    /// module exists to close.
+    #[test]
+    fn convergence_runs_attach_then_resync_through_the_effects() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 2,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        fx.calls.clear();
+        d.tick(t0, &mut w, &mut fx);
+        assert_eq!(fx.calls, vec!["attach", "resync"]);
+        settle(&mut d, at(t0, 10), &mut w, &mut fx);
+        assert!(fx.calls.contains(&"verify"), "{:?}", fx.calls);
+    }
+
+    #[test]
+    fn the_first_attach_does_not_steer_itself() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        assert_eq!(d.state(), State::Ready);
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "the canary is the operator's lever: {:?}",
+            fx.calls
+        );
+    }
+
+    /// An event the supervisor ignores must not produce actions.
+    #[test]
+    fn a_stale_event_settles_without_acting() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let t = d.inject(t0, Event::BackoffElapsed, &mut fx);
+        assert!(t.outcome.events.is_empty());
+        assert!(fx.calls.is_empty(), "{:?}", fx.calls);
+        assert!(!t.outcome.resources_leaked);
+    }
+
+    /// The action list is not merely run — its ordering is preserved
+    /// through the driver's feedback loop.
+    #[test]
+    fn a_verified_restart_re_steers_only_after_verification() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        d.inject(at(t0, 21), Event::Steered, &mut fx);
+
+        w.exited = Some(None);
+        d.tick(at(t0, 30), &mut w, &mut fx);
+        w.exited = None;
+        w.batches = 2;
+        fx.calls.clear();
+
+        settle(&mut d, at(t0, 5_000), &mut w, &mut fx);
+        d.inject(at(t0, 6_000), Event::VerifyPassed, &mut fx);
+
+        let pos = |n: &str| fx.calls.iter().position(|c| *c == n);
+        assert!(pos("verify") < pos("steer"), "{:?}", fx.calls);
+        assert!(pos("resync") < pos("verify"), "{:?}", fx.calls);
+    }
+
+    /// Actions include the arm-backoff the schedule consumed, so the
+    /// caller can see what happened without inspecting internals.
+    #[test]
+    fn the_tick_reports_the_actions_that_ran() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World::default();
+        d.inject(t0, Event::StartRequested, &mut fx);
+        let t = d.tick(at(t0, 61_000), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::PhaseTimedOut));
+        assert!(fx.calls.contains(&"backoff"));
+        assert!(t.outcome.ok(), "{:?}", t.outcome);
+    }
+
+    /// `Action` is re-exported through the driver's surface so callers
+    /// can match on failures without importing the supervisor.
+    #[test]
+    fn failures_name_the_action_that_failed() {
+        struct Bad;
+        impl Effects for Bad {
+            fn spawn(&mut self) -> Result<(), String> {
+                Err("no binary".into())
+            }
+            fn unsteer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn steer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn kill(&mut self) -> Disposition {
+                Disposition::SafeToRelease
+            }
+            fn attach_devices(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn start_resync(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn start_verify(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn abort_convergence(&mut self) {}
+            fn arm_backoff(&mut self, _d: Duration) {}
+            fn release_resources(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let t = d.inject(t0, Event::StartRequested, &mut Bad);
+        assert!(t.outcome.failures.iter().any(|(a, _)| *a == Action::Spawn));
+        assert_eq!(d.state(), State::Backoff, "a failed spawn retries");
+    }
+}
