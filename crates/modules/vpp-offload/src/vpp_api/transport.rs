@@ -314,6 +314,43 @@ impl Transport {
         Ok(reply.vpe_pid)
     }
 
+    /// Run a DUMP request and collect every streamed item.
+    ///
+    /// VPP dumps have **no end-of-stream marker**. The idiom every
+    /// client uses is to trail the dump with a `control_ping`: replies
+    /// come back in order, so the ping's reply arriving means the dump
+    /// finished. That is why this cannot be expressed as
+    /// [`Self::request`] — one request, N replies, and the terminator is
+    /// a different message type.
+    ///
+    /// A message that is neither an item nor the terminator is a
+    /// desynchronised stream, not something to skip: silently ignoring
+    /// it would leave the next caller reading someone else's reply.
+    pub fn dump<Req, Item>(&mut self, req: Req) -> Result<Vec<Item>, TransportError>
+    where
+        Req: Message,
+        Item: Message + Decode,
+    {
+        let item_id = self.id_of::<Item>()?;
+        let end_id = self.id_of::<ControlPingReply>()?;
+        self.send(req)?;
+        self.send(ControlPing { context: 0 })?;
+
+        let mut out = Vec::new();
+        loop {
+            let payload = self.read_frame()?;
+            let id = peek_msg_id(&payload)?;
+            if id == end_id {
+                return Ok(out);
+            }
+            if id != item_id {
+                return Err(TransportError::UnknownReplyId(id));
+            }
+            let mut d = Decoder::new(&payload);
+            out.push(Item::decode(&mut d)?);
+        }
+    }
+
     pub fn client_index(&self) -> u32 {
         self.client_index
     }

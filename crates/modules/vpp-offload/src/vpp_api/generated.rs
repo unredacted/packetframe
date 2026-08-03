@@ -33,6 +33,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "ip_neighbor_add_del_reply", crc: "0x1992deab", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_flags", crc: "0xf5aec1b8", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_flags_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_dump", crc: "0xaa610c27", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_details", crc: "0x6c221fc7", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "dev_attach", crc: "0x44b725fc", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "dev_attach_reply", crc: "0x6082b181", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "dev_detach", crc: "0xafae52d6", context_offset: 6, client_index_prefix: true },
@@ -84,10 +86,33 @@ pub const FIB_API_PATH_TYPE_CLASSIFY: u32 = 10;
 pub const IF_STATUS_API_FLAG_ADMIN_UP: u32 = 1;
 pub const IF_STATUS_API_FLAG_LINK_UP: u32 = 2;
 
+// enum if_type : u32
+pub const IF_API_TYPE_HARDWARE: u32 = 0;
+pub const IF_API_TYPE_SUB: u32 = 1;
+pub const IF_API_TYPE_P2P: u32 = 2;
+pub const IF_API_TYPE_PIPE: u32 = 3;
+
 // enum ip_neighbor_flags : u8
 pub const IP_API_NEIGHBOR_FLAG_NONE: u8 = 0;
 pub const IP_API_NEIGHBOR_FLAG_STATIC: u8 = 1;
 pub const IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY: u8 = 2;
+
+// enum link_duplex : u32
+pub const LINK_DUPLEX_API_UNKNOWN: u32 = 0;
+pub const LINK_DUPLEX_API_HALF: u32 = 1;
+pub const LINK_DUPLEX_API_FULL: u32 = 2;
+
+// enum sub_if_flags : u32
+pub const SUB_IF_API_FLAG_NO_TAGS: u32 = 1;
+pub const SUB_IF_API_FLAG_ONE_TAG: u32 = 2;
+pub const SUB_IF_API_FLAG_TWO_TAGS: u32 = 4;
+pub const SUB_IF_API_FLAG_DOT1AD: u32 = 8;
+pub const SUB_IF_API_FLAG_EXACT_MATCH: u32 = 16;
+pub const SUB_IF_API_FLAG_DEFAULT: u32 = 32;
+pub const SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY: u32 = 64;
+pub const SUB_IF_API_FLAG_INNER_VLAN_ID_ANY: u32 = 128;
+pub const SUB_IF_API_FLAG_MASK_VNET: u32 = 254;
+pub const SUB_IF_API_FLAG_DOT1AH: u32 = 256;
 
 /// `address_union` — fixed 16-byte union overlay.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -942,6 +967,210 @@ impl Decode for SwInterfaceSetFlagsReply {
 impl Message for SwInterfaceSetFlagsReply {
     const NAME: &'static str = "sw_interface_set_flags_reply";
     const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceDump {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub name_filter_valid: bool,
+    pub name_filter: String,
+}
+
+impl Encode for SwInterfaceDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.push(if self.name_filter_valid { 1u8 } else { 0u8 });
+        buf.extend_from_slice(&(self.name_filter.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.name_filter.as_bytes());
+    }
+}
+
+impl Decode for SwInterfaceDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let name_filter_valid = d.bool()?;
+        let name_filter = d.string_var()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            name_filter_valid,
+            name_filter,
+        })
+    }
+}
+
+impl Message for SwInterfaceDump {
+    const NAME: &'static str = "sw_interface_dump";
+    const CRC: &'static str = "0xaa610c27";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceDetails {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub sup_sw_if_index: u32,
+    pub l2_address: [u8; 6],
+    pub flags: u32,
+    pub r#type: u32,
+    pub link_duplex: u32,
+    pub link_speed: u32,
+    pub link_mtu: u16,
+    pub mtu: [u32; 4],
+    pub sub_id: u32,
+    pub sub_number_of_tags: u8,
+    pub sub_outer_vlan_id: u16,
+    pub sub_inner_vlan_id: u16,
+    pub sub_if_flags: u32,
+    pub vtr_op: u32,
+    pub vtr_push_dot1q: u32,
+    pub vtr_tag1: u32,
+    pub vtr_tag2: u32,
+    pub outer_tag: u16,
+    pub b_dmac: [u8; 6],
+    pub b_smac: [u8; 6],
+    pub b_vlanid: u16,
+    pub i_sid: u32,
+    pub interface_name: String,
+    pub interface_dev_type: String,
+    pub tag: String,
+}
+
+impl Encode for SwInterfaceDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.sup_sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&self.l2_address[..]);
+        buf.extend_from_slice(&(self.flags as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.r#type as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.link_duplex as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.link_speed).to_be_bytes());
+        buf.extend_from_slice(&(self.link_mtu).to_be_bytes());
+        for it in self.mtu.iter() {
+        buf.extend_from_slice(&(*it).to_be_bytes());
+        }
+        buf.extend_from_slice(&(self.sub_id).to_be_bytes());
+        buf.extend_from_slice(&(self.sub_number_of_tags).to_be_bytes());
+        buf.extend_from_slice(&(self.sub_outer_vlan_id).to_be_bytes());
+        buf.extend_from_slice(&(self.sub_inner_vlan_id).to_be_bytes());
+        buf.extend_from_slice(&(self.sub_if_flags as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.vtr_op).to_be_bytes());
+        buf.extend_from_slice(&(self.vtr_push_dot1q).to_be_bytes());
+        buf.extend_from_slice(&(self.vtr_tag1).to_be_bytes());
+        buf.extend_from_slice(&(self.vtr_tag2).to_be_bytes());
+        buf.extend_from_slice(&(self.outer_tag).to_be_bytes());
+        buf.extend_from_slice(&self.b_dmac[..]);
+        buf.extend_from_slice(&self.b_smac[..]);
+        buf.extend_from_slice(&(self.b_vlanid).to_be_bytes());
+        buf.extend_from_slice(&(self.i_sid).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.interface_name.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.interface_dev_type.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.tag.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+    }
+}
+
+impl Decode for SwInterfaceDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let sup_sw_if_index = d.u32()?;
+        let l2_address = d.bytes::<6>()?;
+        let flags = d.u32()?;
+        let r#type = d.u32()?;
+        let link_duplex = d.u32()?;
+        let link_speed = d.u32()?;
+        let link_mtu = d.u16()?;
+        let mtu = {
+            let mut a = <[_; 4]>::default();
+            for slot in a.iter_mut() {
+                *slot = d.u32()?;
+            }
+            a
+        };
+        let sub_id = d.u32()?;
+        let sub_number_of_tags = d.u8()?;
+        let sub_outer_vlan_id = d.u16()?;
+        let sub_inner_vlan_id = d.u16()?;
+        let sub_if_flags = d.u32()?;
+        let vtr_op = d.u32()?;
+        let vtr_push_dot1q = d.u32()?;
+        let vtr_tag1 = d.u32()?;
+        let vtr_tag2 = d.u32()?;
+        let outer_tag = d.u16()?;
+        let b_dmac = d.bytes::<6>()?;
+        let b_smac = d.bytes::<6>()?;
+        let b_vlanid = d.u16()?;
+        let i_sid = d.u32()?;
+        let interface_name = d.string_fixed(64)?;
+        let interface_dev_type = d.string_fixed(64)?;
+        let tag = d.string_fixed(64)?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            sup_sw_if_index,
+            l2_address,
+            flags,
+            r#type,
+            link_duplex,
+            link_speed,
+            link_mtu,
+            mtu,
+            sub_id,
+            sub_number_of_tags,
+            sub_outer_vlan_id,
+            sub_inner_vlan_id,
+            sub_if_flags,
+            vtr_op,
+            vtr_push_dot1q,
+            vtr_tag1,
+            vtr_tag2,
+            outer_tag,
+            b_dmac,
+            b_smac,
+            b_vlanid,
+            i_sid,
+            interface_name,
+            interface_dev_type,
+            tag,
+        })
+    }
+}
+
+impl Message for SwInterfaceDetails {
+    const NAME: &'static str = "sw_interface_details";
+    const CRC: &'static str = "0x6c221fc7";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

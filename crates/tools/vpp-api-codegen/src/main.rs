@@ -43,6 +43,15 @@ const MESSAGES: &[&str] = &[
     // Interface state.
     "sw_interface_set_flags",
     "sw_interface_set_flags_reply",
+    // Interface discovery + link state. `sw_interface_dump` is a DUMP:
+    // it streams `sw_interface_details` and is terminated by trailing a
+    // `control_ping`. Two jobs neither of which is optional — adoption
+    // must find the interfaces a surviving VPP already has rather than
+    // re-attaching them, and verification must confirm the link is UP,
+    // since a VF that is admin-up with no carrier keeps every route on
+    // the right index while forwarding nothing.
+    "sw_interface_dump",
+    "sw_interface_details",
     // Native-driver device attach (v7 pivot).
     "dev_attach",
     "dev_attach_reply",

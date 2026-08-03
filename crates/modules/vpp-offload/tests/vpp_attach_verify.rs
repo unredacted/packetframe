@@ -27,8 +27,9 @@ use packetframe_vpp_offload::vpp_api::codec::{
     SOCKCLNT_CREATE_MSG_ID,
 };
 use packetframe_vpp_offload::vpp_api::generated::{
-    DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply, MessageTableEntry,
-    SockclntCreateReply, SwInterfaceSetFlagsReply, MESSAGE_META,
+    ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply,
+    MessageTableEntry, SockclntCreateReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
+    MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
 
@@ -143,8 +144,21 @@ struct Fake {
     seen: Receiver<String>,
 }
 
+/// `(sw_if_index, name, flags)` the fake reports from
+/// `sw_interface_dump`. `flags` uses IF_STATUS_ADMIN_UP|LINK_UP.
+type Ifaces = Vec<(u32, String, u32)>;
+
 impl Fake {
     fn start(tag: &str, attach: AttachBehaviour, lookup: LookupBehaviour) -> Self {
+        Self::start_with(tag, attach, lookup, vec![(7, "octeon0/0".into(), 3)])
+    }
+
+    fn start_with(
+        tag: &str,
+        attach: AttachBehaviour,
+        lookup: LookupBehaviour,
+        ifaces: Ifaces,
+    ) -> Self {
         let dir = tempdir::TempDir::new(tag).unwrap();
         let path = dir.path().join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -242,6 +256,26 @@ impl Fake {
                         }
                         .encode(&mut out);
                     }
+                    // A DUMP: stream one details frame per interface and
+                    // send NO terminator — the trailing control_ping's
+                    // reply is what ends the stream, exactly as VPP does.
+                    "sw_interface_dump" => {
+                        for (idx, name, flags) in &ifaces {
+                            let mut d = reply_head("sw_interface_details");
+                            details(*idx, name, *flags, ctx).encode(&mut d);
+                            write_frame(&mut sock, &d);
+                        }
+                        continue;
+                    }
+                    "control_ping" => {
+                        out = reply_head("control_ping_reply");
+                        ControlPingReply {
+                            context: ctx,
+                            retval: 0,
+                            vpe_pid: 4242,
+                        }
+                        .encode(&mut out);
+                    }
                     other => panic!("fake got unexpected message {other}"),
                 }
                 write_frame(&mut sock, &out);
@@ -269,6 +303,38 @@ impl Fake {
     }
 }
 
+fn details(sw_if_index: u32, name: &str, flags: u32, context: u32) -> SwInterfaceDetails {
+    SwInterfaceDetails {
+        context,
+        sw_if_index,
+        sup_sw_if_index: sw_if_index,
+        l2_address: [0u8; 6],
+        flags,
+        r#type: 0,
+        link_duplex: 0,
+        link_speed: 2_500_000,
+        link_mtu: 9000,
+        mtu: [9000, 0, 0, 0],
+        sub_id: 0,
+        sub_number_of_tags: 0,
+        sub_outer_vlan_id: 0,
+        sub_inner_vlan_id: 0,
+        sub_if_flags: 0,
+        vtr_op: 0,
+        vtr_push_dot1q: 0,
+        vtr_tag1: 0,
+        vtr_tag2: 0,
+        outer_tag: 0,
+        b_dmac: [0u8; 6],
+        b_smac: [0u8; 6],
+        b_vlanid: 0,
+        i_sid: 0,
+        interface_name: name.to_string(),
+        interface_dev_type: "octeon".into(),
+        tag: String::new(),
+    }
+}
+
 fn path_on(sw_if_index: u32) -> FibPath {
     FibPath {
         sw_if_index,
@@ -283,6 +349,15 @@ fn path_on(sw_if_index: u32) -> FibPath {
         n_labels: 0,
         label_stack: Default::default(),
     }
+}
+
+/// Route lookups the fake saw. Verify also issues an interface dump
+/// (dump + trailing ping), so a raw message count is not a probe count.
+fn lookups(f: &Fake) -> usize {
+    f.observed()
+        .iter()
+        .filter(|n| *n == "ip_route_lookup")
+        .count()
 }
 
 fn v4(a: u8, b: u8) -> IpPrefix {
@@ -313,18 +388,22 @@ fn attach_sends_the_three_messages_in_order() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let got = attach_ports(&mut t, &ports()).expect("attach");
+    let got = attach_ports(&mut t, &ports(), &[]).expect("attach");
 
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].port, "eth3");
-    assert_eq!(got[0].dev_index, 3);
+    assert_eq!(got[0].dev_index, Some(3));
     assert_eq!(got[0].sw_if_index, 7);
 
-    // Order is not cosmetic: create_port_if consumes dev_attach's
-    // index, and set_flags consumes create_port_if's.
+    // A discovery dump comes first (so an adopted VPP is not
+    // re-attached), then the attach proper. Order within the attach is
+    // not cosmetic: create_port_if consumes dev_attach's index, and
+    // set_flags consumes create_port_if's.
     assert_eq!(
         fake.observed(),
         vec![
+            "sw_interface_dump".to_string(),
+            "control_ping".to_string(),
             "dev_attach".to_string(),
             "dev_create_port_if".to_string(),
             "sw_interface_set_flags".to_string(),
@@ -347,7 +426,7 @@ fn an_sw_if_index_of_zero_is_refused_as_local0() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports()).expect_err("must refuse index 0");
+    let err = attach_ports(&mut t, &ports(), &[]).expect_err("must refuse index 0");
     assert!(matches!(err, AttachError::LocalZero { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("local0"), "{msg}");
@@ -355,7 +434,12 @@ fn an_sw_if_index_of_zero_is_refused_as_local0() {
     // And it stops there: no interface is brought up on a bad index.
     assert_eq!(
         fake.observed(),
-        vec!["dev_attach".to_string(), "dev_create_port_if".to_string()]
+        vec![
+            "sw_interface_dump".to_string(),
+            "control_ping".to_string(),
+            "dev_attach".to_string(),
+            "dev_create_port_if".to_string()
+        ]
     );
 }
 
@@ -370,13 +454,20 @@ fn a_refused_dev_attach_reports_vpps_own_text() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports()).expect_err("must fail");
+    let err = attach_ports(&mut t, &ports(), &[]).expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("dev_attach"), "{msg}");
     assert!(msg.contains("eth3"), "names the port: {msg}");
     assert!(msg.contains("no such driver"), "keeps VPP's detail: {msg}");
     // Nothing further is attempted.
-    assert_eq!(fake.observed(), vec!["dev_attach".to_string()]);
+    assert_eq!(
+        fake.observed(),
+        vec![
+            "sw_interface_dump".to_string(),
+            "control_ping".to_string(),
+            "dev_attach".to_string()
+        ]
+    );
 }
 
 /// A `dev_attach` that succeeds followed by a `dev_create_port_if` that
@@ -394,15 +485,80 @@ fn a_refused_create_port_if_names_the_step_that_failed() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports()).expect_err("must fail");
+    let err = attach_ports(&mut t, &ports(), &[]).expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("dev_create_port_if"), "{msg}");
     assert!(msg.contains("-11"), "reports the retval: {msg}");
     // The device attached; only the port interface failed. No admin-up.
     assert_eq!(
         fake.observed(),
-        vec!["dev_attach".to_string(), "dev_create_port_if".to_string()]
+        vec![
+            "sw_interface_dump".to_string(),
+            "control_ping".to_string(),
+            "dev_attach".to_string(),
+            "dev_create_port_if".to_string()
+        ]
     );
+}
+
+/// Adoption: VPP already has the interface, and the live FIB is already
+/// pointing at its index. Re-issuing `dev_attach` there would either be
+/// refused — fatal in this module, so it would cycle a healthy and
+/// possibly steered VPP — or create a duplicate interface nothing
+/// references.
+#[test]
+fn a_recorded_interface_is_reused_not_re_attached() {
+    let fake = Fake::start_with(
+        "adopt",
+        AttachBehaviour::default(),
+        LookupBehaviour::Missing,
+        vec![(7, "octeon0/0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let known = vec![("eth3".to_string(), 7u32)];
+    let got = attach_ports(&mut t, &ports(), &known).expect("adopt");
+
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].sw_if_index, 7);
+    assert_eq!(got[0].dev_index, None, "not attached this pass");
+
+    let seen = fake.observed();
+    assert!(
+        !seen.contains(&"dev_attach".to_string()),
+        "must not re-attach a device VPP already has: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&"dev_create_port_if".to_string()),
+        "must not create a duplicate interface: {seen:?}"
+    );
+    // Admin-up IS re-asserted: controller deploys can flap state, and
+    // this is the reconcile point.
+    assert!(
+        seen.contains(&"sw_interface_set_flags".to_string()),
+        "{seen:?}"
+    );
+}
+
+/// A recorded index VPP no longer has must be refused, not silently
+/// re-attached: we cannot tell whether a live FIB still references the
+/// old index, and a duplicate would leave routes pointing at nothing.
+#[test]
+fn a_stale_recorded_index_is_refused() {
+    let fake = Fake::start_with(
+        "stale",
+        AttachBehaviour::default(),
+        LookupBehaviour::Missing,
+        // VPP has local0 only — index 7 is gone.
+        vec![(0, "local0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let known = vec![("eth3".to_string(), 7u32)];
+    let err = attach_ports(&mut t, &ports(), &known).expect_err("must refuse");
+    assert!(matches!(err, AttachError::StaleIndex { .. }), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("no longer has it"), "{msg}");
+    let seen = fake.observed();
+    assert!(!seen.contains(&"dev_attach".to_string()), "{seen:?}");
 }
 
 /// A ledger holding `n` installed prefixes, all resolvable.
@@ -432,7 +588,7 @@ fn verify_passes_when_every_probe_finds_a_route_on_an_owned_interface() {
     assert_eq!(out.sampled, 16);
     assert!(out.mismatches.is_empty(), "{:?}", out.mismatches);
     assert!(out.passed(), "{}", out.summary());
-    assert_eq!(fake.observed().len(), 16, "one lookup per probe");
+    assert_eq!(lookups(&fake), 16, "one lookup per probe");
 }
 
 /// The silent-blackhole check, from the readback side: VPP happily
@@ -522,12 +678,13 @@ fn verify_fails_on_unresolvable_even_with_clean_probes() {
     assert!(!out.passed(), "{}", out.summary());
 }
 
-/// An empty ledger cannot be verified into a pass by sampling nothing —
-/// but it also must not report a mismatch it never observed. Zero
-/// probes with zero unresolvable is a vacuous pass, and the caller
-/// (first attach, before any resync) is the one that knows that.
+/// An empty ledger must NOT pass. Sampling nothing proves nothing, and
+/// a resync completing against an unexpectedly empty mirror would
+/// otherwise verify clean — letting the supervisor steer traffic into a
+/// VPP with an empty FIB, which is the blackhole rule 1 exists to
+/// prevent, reached through the gate meant to prevent it.
 #[test]
-fn an_empty_table_probes_nothing() {
+fn an_empty_table_fails_rather_than_passing_vacuously() {
     let fake = Fake::start(
         "vempty",
         AttachBehaviour::default(),
@@ -539,10 +696,72 @@ fn an_empty_table_probes_nothing() {
     let out = verify(&mut t, &ledger, &ports, 16, 5).expect("verify");
     assert_eq!(out.sampled, 0);
     assert!(
-        fake.observed().is_empty(),
-        "no socket traffic for no routes"
+        out.mismatches.is_empty(),
+        "nothing was observed to mismatch"
     );
-    assert!(out.passed());
+    assert!(!out.passed(), "zero probes is not evidence of health");
+    assert!(
+        out.summary().contains("no installed routes"),
+        "{}",
+        out.summary()
+    );
+    // No routes were probed; only the interface dump touched the socket.
+    assert_eq!(lookups(&fake), 0);
+}
+
+/// The check the route probes structurally cannot make. A VF that is
+/// admin-up with no carrier keeps every route on a valid, owned
+/// `sw_if_index` — so every probe passes and we would steer into an
+/// interface that forwards nothing. `set_admin_up` only ever asserted
+/// the administrative flag; the runbook treats link-up as the bring-up
+/// pass for exactly this reason.
+#[test]
+fn verify_fails_when_an_owned_interface_has_no_carrier() {
+    let fake = Fake::start_with(
+        "nolink",
+        AttachBehaviour::default(),
+        LookupBehaviour::Found { sw_if_index: 7 },
+        // admin up (1), link DOWN — no 2 bit.
+        vec![(7, "octeon0/0".into(), 1)],
+    );
+    let mut t = fake.connect();
+    let (ledger, ports) = ledger_with(50);
+
+    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    assert!(
+        out.mismatches.is_empty(),
+        "every route probe looks perfect: {:?}",
+        out.mismatches
+    );
+    assert_eq!(out.dead_interfaces.len(), 1);
+    assert_eq!(out.dead_interfaces[0].sw_if_index, 7);
+    assert!(out.dead_interfaces[0].admin_up);
+    assert!(!out.dead_interfaces[0].link_up);
+    assert!(!out.passed(), "{}", out.summary());
+    assert!(out.summary().contains("link_up=false"), "{}", out.summary());
+}
+
+/// An interface we do NOT own being down is not our problem and must
+/// not fail our verify — otherwise any unrelated down interface on the
+/// box blocks steering forever.
+#[test]
+fn verify_ignores_link_state_on_interfaces_we_do_not_own() {
+    let fake = Fake::start_with(
+        "otherdown",
+        AttachBehaviour::default(),
+        LookupBehaviour::Found { sw_if_index: 7 },
+        vec![
+            (7, "octeon0/0".into(), 3), // ours, up
+            (9, "octeon1/0".into(), 1), // not ours, link down
+            (0, "local0".into(), 0),    // local0, entirely down
+        ],
+    );
+    let mut t = fake.connect();
+    let (ledger, ports) = ledger_with(50);
+
+    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    assert!(out.dead_interfaces.is_empty(), "{:?}", out.dead_interfaces);
+    assert!(out.passed(), "{}", out.summary());
 }
 
 /// Sampling must actually vary between passes against a live socket,
@@ -563,5 +782,5 @@ fn consecutive_passes_probe_different_routes() {
     assert_eq!(a.sampled, 32);
     assert_eq!(b.sampled, 32);
     // 64 lookups total reached the socket across the two passes.
-    assert_eq!(fake.observed().len(), 64);
+    assert_eq!(lookups(&fake), 64);
 }

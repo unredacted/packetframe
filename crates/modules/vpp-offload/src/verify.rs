@@ -62,6 +62,15 @@ pub enum Mismatch {
     ForeignPath { prefix: IpPrefix, sw_if_index: u32 },
 }
 
+/// An interface that cannot forward, whatever the FIB says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadInterface {
+    pub sw_if_index: u32,
+    pub name: String,
+    pub admin_up: bool,
+    pub link_up: bool,
+}
+
 /// Result of one verify pass.
 #[derive(Debug, Clone, Default)]
 pub struct VerifyOutcome {
@@ -77,32 +86,57 @@ pub struct VerifyOutcome {
     /// on it would convert a graceful degradation into a restart loop.
     /// Reported so it can alarm separately.
     pub withheld: u64,
+    /// Owned interfaces that are not both admin-up and link-up.
+    pub dead_interfaces: Vec<DeadInterface>,
 }
 
 impl VerifyOutcome {
-    /// Pass criteria: nothing sampled disagreed with the ledger, and
-    /// nothing is unresolvable.
+    /// Pass criteria: at least one route was actually probed, nothing
+    /// sampled disagreed with the ledger, nothing is unresolvable, and
+    /// every owned interface can forward.
+    ///
+    /// **`sampled == 0` fails.** An earlier version treated it as a
+    /// vacuous pass, and a test asserted that as intended — which was
+    /// wrong in the case that matters: a resync completing against an
+    /// unexpectedly empty mirror would verify clean, and the supervisor
+    /// would (re-)steer traffic into a VPP with an empty FIB. That is
+    /// the blackhole rule 1 exists to prevent, arrived at through the
+    /// gate meant to prevent it. A box with genuinely no routes should
+    /// not be steered either, so failing is right in both readings.
     ///
     /// `unresolvable > 0` fails because it means the nexthop-device
     /// mapping is wrong — a misconfiguration, not a capacity condition
     /// — and steering traffic into a FIB with known holes is how a
     /// deploy becomes an outage.
     pub fn passed(&self) -> bool {
-        self.mismatches.is_empty() && self.unresolvable == 0
+        self.sampled > 0
+            && self.mismatches.is_empty()
+            && self.unresolvable == 0
+            && self.dead_interfaces.is_empty()
     }
 
     /// One-line operator summary. Separates the two degraded counts,
     /// because "mapping is misconfigured" and "table outgrew the box"
     /// are different pages at 03:00.
     pub fn summary(&self) -> String {
-        format!(
+        let mut s = format!(
             "verify {}: {}/{} probes matched, unresolvable={}, withheld={}",
             if self.passed() { "PASS" } else { "FAIL" },
-            self.sampled - self.mismatches.len(),
+            self.sampled.saturating_sub(self.mismatches.len()),
             self.sampled,
             self.unresolvable,
             self.withheld
-        )
+        );
+        if self.sampled == 0 {
+            s.push_str(" (no installed routes to verify)");
+        }
+        for d in &self.dead_interfaces {
+            s.push_str(&format!(
+                ", {} (idx {}) admin_up={} link_up={}",
+                d.name, d.sw_if_index, d.admin_up, d.link_up
+            ));
+        }
+        s
     }
 }
 
@@ -170,6 +204,27 @@ pub fn verify(
         withheld: counts.withheld,
         ..Default::default()
     };
+
+    // Link state, before the probes. A VF that is admin-up with no
+    // carrier keeps every route on a valid, owned `sw_if_index`, so the
+    // per-route checks below cannot see it at all — every probe passes
+    // and we steer into an interface that forwards nothing. The runbook
+    // treats link-up as the bring-up pass for exactly this reason;
+    // `set_admin_up` only ever asserted the administrative flag.
+    for iface in crate::attach::interfaces(t)? {
+        if !owned.contains(&iface.sw_if_index) {
+            continue;
+        }
+        let (admin_up, link_up) = (iface.admin_up(), iface.link_up());
+        if !admin_up || !link_up {
+            out.dead_interfaces.push(DeadInterface {
+                sw_if_index: iface.sw_if_index,
+                name: iface.name,
+                admin_up,
+                link_up,
+            });
+        }
+    }
 
     for prefix in probes {
         let reply = t.request::<IpRouteLookup, IpRouteLookupReply>(IpRouteLookup {

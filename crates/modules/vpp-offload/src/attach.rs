@@ -21,8 +21,8 @@
 //! `AttachDevices` ahead of `StartResync` for exactly this reason.
 
 use crate::vpp_api::generated::{
-    DevAttach, DevAttachReply, DevCreatePortIf, DevCreatePortIfReply, SwInterfaceSetFlags,
-    SwInterfaceSetFlagsReply,
+    DevAttach, DevAttachReply, DevCreatePortIf, DevCreatePortIfReply, SwInterfaceDetails,
+    SwInterfaceDump, SwInterfaceSetFlags, SwInterfaceSetFlagsReply,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -35,7 +35,9 @@ use crate::vpp_api::{Transport, TransportError};
 pub const OCTEON_DRIVER: &str = "octeon";
 
 /// `IF_STATUS_API_FLAG_ADMIN_UP` from interface_types.api.
-const ADMIN_UP: u32 = 1;
+pub const IF_STATUS_ADMIN_UP: u32 = 1;
+/// `IF_STATUS_API_FLAG_LINK_UP` — carrier, not configuration.
+pub const IF_STATUS_LINK_UP: u32 = 2;
 
 /// What to attach: one member port's VF.
 #[derive(Debug, Clone)]
@@ -55,7 +57,10 @@ pub struct PortAttach {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedPort {
     pub port: String,
-    pub dev_index: u32,
+    /// `Some` when we attached the device this pass; `None` when the
+    /// interface was reused from a previous one (the dump does not
+    /// report a device index, and nothing downstream needs it).
+    pub dev_index: Option<u32>,
     pub sw_if_index: u32,
 }
 
@@ -80,6 +85,16 @@ pub enum AttachError {
     LocalZero {
         port: String,
     },
+    /// The state file records an index VPP no longer has.
+    ///
+    /// Refused rather than silently re-attached: we cannot tell from
+    /// here whether a live FIB still references the old index, and
+    /// creating a second interface would leave routes pointing at
+    /// something nothing services. A clean restart is the safe answer.
+    StaleIndex {
+        port: String,
+        sw_if_index: u32,
+    },
 }
 
 impl std::fmt::Display for AttachError {
@@ -98,6 +113,12 @@ impl std::fmt::Display for AttachError {
                 }
                 Ok(())
             }
+            AttachError::StaleIndex { port, sw_if_index } => write!(
+                f,
+                "state file records sw_if_index {sw_if_index} for {port} but VPP no longer has \
+                 it; refusing to attach a duplicate while a live FIB may still reference the old \
+                 index"
+            ),
             AttachError::LocalZero { port } => write!(
                 f,
                 "VPP returned sw_if_index 0 (local0) for {port}; refusing to build FIB paths \
@@ -115,34 +136,132 @@ impl From<TransportError> for AttachError {
     }
 }
 
-/// Attach every port and bring it admin-up.
+/// Attach every port and bring it admin-up — **idempotently**.
 ///
 /// Sequential rather than pipelined, deliberately: each step consumes
 /// the index the previous one returned, and there are a handful of
 /// ports rather than a million routes — the latency this would save is
 /// irrelevant next to being able to name exactly which port failed.
 ///
-/// Stops at the first failure. Ports already attached are returned in
-/// the error-free prefix only on success; on failure the caller tears
-/// the process down anyway (the supervisor routes an attach failure
-/// through `fail()`), so partial cleanup here would duplicate work
-/// that `Kill` does more reliably.
+/// **A port VPP already has is reused, not re-attached.** The
+/// supervisor emits `AttachDevices` on the adopted path too, where the
+/// device and its interface already exist and the live FIB is already
+/// pointing at their indices. Blindly re-issuing `dev_attach` there
+/// would either be refused — and this module treats a refusal as fatal,
+/// so it would cycle a healthy, possibly *steered* VPP, creating
+/// exactly the outage adoption exists to avoid — or create a duplicate
+/// interface whose index nothing in the FIB references. So the first
+/// thing we do is ask VPP what it already has.
+///
+/// Stops at the first genuine failure. On failure the caller tears the
+/// process down anyway (the supervisor routes it through `fail()`), so
+/// partial cleanup here would duplicate what `Kill` does more reliably.
+/// `known` maps a port name to the `sw_if_index` a previous attach
+/// recorded — empty on a fresh attach, populated from the state file on
+/// the adopted path. It is the identity source **because the interface
+/// dump cannot be one**: the dump exposes `octeonN/P` and no PCI
+/// address, so on a box with several member ports `octeon0/0` and
+/// `octeon1/0` are indistinguishable by port id alone. Guessing there
+/// would map a port to the wrong VF, which is worse than not adopting.
 pub fn attach_ports(
     t: &mut Transport,
     ports: &[PortAttach],
+    known: &[(String, u32)],
 ) -> Result<Vec<AttachedPort>, AttachError> {
+    // One dump for the whole pass: it both confirms recorded indices
+    // still exist and is the only way to see link state.
+    let existing = interfaces(t)?;
     let mut out = Vec::with_capacity(ports.len());
     for p in ports {
+        let recorded = known
+            .iter()
+            .find(|(name, _)| *name == p.port)
+            .map(|(_, idx)| *idx);
+
+        if let Some(idx) = recorded {
+            if existing.iter().any(|i| i.sw_if_index == idx) {
+                // Reuse. `dev_index` is not recoverable from the dump,
+                // and nothing downstream needs it — FIB paths and link
+                // checks both key on `sw_if_index` — so it stays `None`
+                // rather than being invented.
+                //
+                // Admin-up is still asserted: controller deploys and
+                // udapi provisioning can flap interface state under us,
+                // and this is the reconcile point.
+                set_admin_up(t, p, idx)?;
+                out.push(AttachedPort {
+                    port: p.port.clone(),
+                    dev_index: None,
+                    sw_if_index: idx,
+                });
+                continue;
+            }
+            // Recorded but gone: the state file outlived the interface.
+            // Refuse rather than attach a second one, because we cannot
+            // tell whether the live FIB still references the old index.
+            return Err(AttachError::StaleIndex {
+                port: p.port.clone(),
+                sw_if_index: idx,
+            });
+        }
+
         let dev_index = attach_device(t, p)?;
         let sw_if_index = create_port_if(t, p, dev_index)?;
         set_admin_up(t, p, sw_if_index)?;
         out.push(AttachedPort {
             port: p.port.clone(),
-            dev_index,
+            dev_index: Some(dev_index),
             sw_if_index,
         });
     }
     Ok(out)
+}
+
+/// Every interface VPP currently has.
+///
+/// Returns [`TransportError`] rather than [`AttachError`] because a
+/// dump has no attach-specific failure modes — and because
+/// [`crate::verify`] needs it too, for link state.
+pub fn interfaces(t: &mut Transport) -> Result<Vec<Interface>, TransportError> {
+    let details: Vec<SwInterfaceDetails> = t.dump(SwInterfaceDump {
+        context: 0,
+        // ~0 = all interfaces; an empty name filter must be paired with
+        // `name_filter_valid = false` or VPP matches nothing.
+        sw_if_index: u32::MAX,
+        name_filter_valid: false,
+        name_filter: String::new(),
+    })?;
+    Ok(details
+        .into_iter()
+        .map(|d| Interface {
+            sw_if_index: d.sw_if_index,
+            name: d.interface_name,
+            flags: d.flags,
+        })
+        .collect())
+}
+
+/// One interface as VPP reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interface {
+    pub sw_if_index: u32,
+    pub name: String,
+    pub flags: u32,
+}
+
+impl Interface {
+    pub fn admin_up(&self) -> bool {
+        self.flags & IF_STATUS_ADMIN_UP != 0
+    }
+
+    /// Whether the interface has carrier.
+    ///
+    /// Distinct from [`Self::admin_up`] and that distinction is the
+    /// whole point: an admin-up interface with no link keeps every FIB
+    /// path pointing at a valid index while forwarding nothing.
+    pub fn link_up(&self) -> bool {
+        self.flags & IF_STATUS_LINK_UP != 0
+    }
 }
 
 fn attach_device(t: &mut Transport, p: &PortAttach) -> Result<u32, AttachError> {
@@ -207,7 +326,7 @@ fn set_admin_up(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(
         t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
             context: 0,
             sw_if_index,
-            flags: ADMIN_UP,
+            flags: IF_STATUS_ADMIN_UP,
         })?;
     if reply.retval != 0 {
         return Err(AttachError::Refused {
