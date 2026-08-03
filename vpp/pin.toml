@@ -48,18 +48,37 @@
 # signal to take the fallback ladder below rather than to keep
 # rebuilding bullseye's toolchain from tarballs.
 #
-# The one genuine risk with newness is the AF↔VF mailbox: this fleet
-# runs a 5.15 vendor kernel whose AF is SDK-era, and gate 0a's
-# handshake passed with DPDK 20.11's `octeontx2` PMD. A modern cnxk
-# PMD may or may not agree with it — the mailbox does not follow
-# newer-is-better. That is a question for MEASUREMENT, not for
-# pre-emptive downgrading. Fallback ladder if gate 0b's handshake
-# fails, in order:
-#   v25.10 / v24.10  → newer cnxk, still recent
-#   v23.06           → last line before the cnxk-era churn
+# v26.06 was tried on the shadow (2026-08-02) and its cnxk PMD fails
+# BEFORE the mailbox — this is measured, not assumed:
+#
+#   CNXK: populate_model(): Invalid RoC model (impl=0x43, part=0xb2,
+#                                              major=0x3, minor=0x0)
+#   CNXK: cn9k_nix_probe(): Failed to initialize platform model, rc=-22
+#
+# The cn9670 reports MIDR variant 3 — a die stepping absent from
+# drivers/common/cnxk/roc_model.c in EVERY public DPDK (the CN96xx
+# table stops at variant 2), and unknown MIDR is a hard -EINVAL with
+# no override (checked in v26.03 source: no env, no devargs, no
+# default-to-nearest). That gates the ENTIRE cnxk era, so the middle
+# fallback rungs (v25.10 / v24.10 / v23.06) would fail identically
+# and are SKIPPED on purpose.
+#
+# The octeontx2 era has no such gate: DPDK 21.11's otx2 code reads no
+# MIDR at probe (verified in source), and gate 0a's DPDK 20.11
+# testpmd moved real packets on this exact silicon. Hence v22.02 —
+# DPDK 21.11, the last `octeontx2`-named era. Note 21.11 ships BOTH
+# PMD families; if its cnxk half hits the same model gate, EAL tries
+# the next matching driver, which is exactly the gate-free octeontx2.
+#
+# The AF↔VF mailbox question itself is therefore STILL OPEN — v26.06
+# never got far enough to ask it. The proper road back to current
+# VPP is upstreaming the one-line MIDR entry to DPDK/octeon-roc, not
+# carrying a local patch; until that lands and reaches a release,
+# this pin stays in the octeontx2 era.
+#   v25.10 / v24.10 / v23.06 → cnxk-era: same roc_model gate, skip
 #   v22.02           → DPDK 21.11, last `octeontx2`-named PMD, closest
 #                      to the DPDK 20.11 build that passed gate 0a
-ref = "v26.06"
+ref = "v22.02"
 
 # Optional strict pin. When non-empty the workflow verifies the ref
 # resolves to exactly this commit and fails otherwise, so a retagged
