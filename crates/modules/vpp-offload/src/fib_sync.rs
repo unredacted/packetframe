@@ -74,6 +74,15 @@ impl PortIndex {
     pub fn is_empty(&self) -> bool {
         self.idx.is_empty()
     }
+
+    /// Every interface index we own.
+    ///
+    /// Readback verification uses this to reject a FIB path pointing
+    /// anywhere else — most importantly index 0, `local0`, which
+    /// forwards nothing while looking installed.
+    pub fn indices(&self) -> std::collections::HashSet<u32> {
+        self.idx.values().copied().collect()
+    }
 }
 
 /// Wire form of an address, family tag and all.
