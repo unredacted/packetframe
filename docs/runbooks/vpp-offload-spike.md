@@ -186,6 +186,40 @@ mailbox does not follow newer-is-better):
    mailbox does not follow newer-is-better — but that is a reason to
    TEST the newest, not to pre-emptively ship something old.
 
+### RESULT (2026-08-02, shadow): the v26.06 rung fails BEFORE the mailbox
+
+Tested on the shadow with the published artifact. Install, mask,
+sysctl-skip and bring-up all held; VPP ran; `-a 0002:07:00.1` reached
+EAL (the init.c "Unsupported PCI device" warning is **cosmetic** — it
+skips only the uio-bind step and does not blacklist; confirmed in
+source and by `show dpdk version` showing the `-a`). The probe then
+died at the ROC model check, before any AF contact:
+
+```
+CNXK: populate_model():224 Invalid RoC model (impl=0x43, part=0xb2, major=0x3, minor=0x0)
+CNXK: cn9k_nix_probe():810 Failed to initialize platform model, rc=-22
+```
+
+**The cn9670 reports MIDR variant 3 — a die stepping absent from
+`drivers/common/cnxk/roc_model.c` in every public DPDK** (the CN96xx
+table stops at variant 2), and unknown MIDR is a hard `-EINVAL` with
+no override (no env, no devargs, no default-to-nearest; verified in
+v26.03 source). Consequences:
+
+- **The mailbox question is STILL OPEN** — this failure is upstream
+  of it.
+- **The whole cnxk era is gated identically**: v25.10/v24.10/v23.06
+  would fail the same way. The ladder's middle rungs are skipped by
+  measurement, not caution.
+- **v22.02 (DPDK 21.11) is the active rung**: the octeontx2 driver
+  reads no MIDR at probe (verified in v21.11 source), and gate 0a's
+  DPDK 20.11 testpmd moved real packets on this exact silicon. 21.11
+  ships both PMD families; if its cnxk half hits the same gate, EAL
+  falls through to the next matching driver — the gate-free octeontx2.
+- **Road back to current VPP**: upstream the one-line MIDR entry to
+  DPDK / marvell-octeon-roc. No local patch — the pin stays in the
+  octeontx2 era until an upstream release carries the fix.
+
 ### Getting the build onto the shadow
 
 Derive the tag from the pin rather than typing a version — otherwise
