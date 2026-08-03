@@ -355,6 +355,19 @@ Consequences:
   failure-mode logic. A v4-only full table is also ~20% smaller
   (~1.05M routes) with proportionally faster resync.
 
+  **DECIDED (2026-08-02, user): FULL v4 TABLE.** The failure-behavior
+  and verifiability arguments won again on v4-only numbers. v6 stays
+  on the XDP custom-FIB path — fully correct forwarding, and the v4
+  offload effectively dedicates the entire 18-core kernel path to
+  v6's remainder, so v6 can grow ~10x before the split even itches.
+  v6 roadmap, recorded not built: (1) retest ip6 ntuple at every
+  UniFi kernel bump — the MKEX profile ships with the AF driver;
+  (2) kernel >=6.8 unlocks native XDP = 2-3x for v6 on the fallback
+  tier with no VPP involvement; (3) the XDP->AF_XDP->VPP side door
+  stays documented and deliberately unbuilt until native XDP makes
+  AF_XDP zero-copy — while rx is generic-XDP copy mode it buys
+  nothing over the custom-FIB path v6 already has.
+
 **Item 9 — rx-mode: FAILS; the heat goal is dead on this driver.**
 `set interface rx-mode` (adaptive and interrupt) both answer
 `not supported (rx queue interupt mode enable/disable not supported)`
