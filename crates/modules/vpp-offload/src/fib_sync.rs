@@ -209,6 +209,9 @@ pub struct DrainStats {
     /// Skipped because the prefix's address family is not carried by
     /// VPP on this platform. See [`FamilyPolicy`].
     pub out_of_family: u64,
+    /// Previously-withheld ops moved back into the active map because
+    /// headroom returned. They install on the next drain.
+    pub released: u64,
 }
 
 impl DrainStats {
@@ -267,6 +270,9 @@ enum Begun {
     Done,
     /// Cannot be attempted yet. Must go back into the pending map.
     Defer,
+    /// Refused by capacity. Parked until headroom returns — NOT put
+    /// back in the active map, which the caller drains to empty.
+    Withhold,
 }
 
 /// One request awaiting its reply.
@@ -349,6 +355,11 @@ impl Drainer {
                     // and absent from verification — a silent hole
                     // that nothing ever reports.
                     Ok(Begun::Defer) => pending.requeue(prefix, op),
+                    // Parked, not dropped: the ledger keeps only the
+                    // prefix and its Withheld state, so these nexthops
+                    // are the only record of what the route should
+                    // become when headroom returns.
+                    Ok(Begun::Withhold) => pending.withhold(prefix, op),
                     Err(e) => {
                         self.unwind(pending, ledger, inflight, Some((prefix, op)), iter);
                         return Err((stats, e));
@@ -401,6 +412,16 @@ impl Drainer {
             }
             inflight.clear();
         }
+
+        // Withdrawals during this drain may have freed slots. Release
+        // parked ops so the NEXT drain retries them — releasing them
+        // mid-drain would re-classify work we just parked in the same
+        // pass. Gated on headroom so this cannot become a spin: with
+        // no headroom nothing is released, and anything released that
+        // still does not fit is simply parked again.
+        if ledger.has_headroom() && pending.withheld_len() > 0 {
+            stats.released = pending.release_withheld() as u64;
+        }
         Ok(stats)
     }
 
@@ -445,7 +466,10 @@ impl Drainer {
                     RouteState::Installing { .. } => {}
                     RouteState::NotInstalled(nf) => {
                         match nf {
-                            crate::sink::NotInstalled::Withheld => stats.withheld += 1,
+                            crate::sink::NotInstalled::Withheld => {
+                                stats.withheld += 1;
+                                return Ok(Begun::Withhold);
+                            }
                             crate::sink::NotInstalled::Unresolvable => {
                                 stats.unresolvable += 1;
                                 // An update whose nexthops all moved off
@@ -724,6 +748,7 @@ mod tests {
             rejected: 1,
             deferred: 4,
             out_of_family: 7,
+            released: 9,
         };
         // Withheld/unresolvable/deferred/out-of-family never left the
         // process.

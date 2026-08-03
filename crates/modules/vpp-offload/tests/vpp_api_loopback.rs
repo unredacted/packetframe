@@ -589,6 +589,52 @@ fn capacity_withholds_without_sending() {
         "withheld routes are never sent"
     );
     assert_eq!(ledger.withheld_prefixes().len(), 3);
+    // The nexthops must survive somewhere. The ledger keeps only the
+    // prefix and its Withheld state, so if the drainer discarded the
+    // op there is nothing left to rebuild the request from and
+    // "retried when headroom returns" is unimplementable.
+    assert_eq!(pending.withheld_len(), 3, "withheld ops are parked");
+    assert!(
+        pending.is_empty(),
+        "but not in the active map, or the drain loop would spin"
+    );
+}
+
+#[test]
+fn withheld_routes_install_once_headroom_returns() {
+    let fake = Fake::start("headroom", vec![Answer::Ok], None);
+    let mut t = fake.connect();
+    let (mut pending, _l, ports, map) = fixture();
+    let mut ledger = RouteLedger::new(Capacity::new(2));
+    let resolve = resolver(&map);
+    for i in 0..5u8 {
+        pending.upsert(v4(10, i, 0, 0, 16), vec![nh(192, 0, 2, 1)]);
+    }
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 100)
+        .expect("drain");
+    assert_eq!(stats.installed, 2);
+    assert_eq!(stats.withheld, 3);
+    assert_eq!(stats.released, 0, "no headroom yet");
+
+    // Withdraw one installed route: a slot frees up.
+    pending.withdraw(v4(10, 0, 0, 0, 16));
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 100)
+        .expect("drain");
+    assert_eq!(stats.withdrawn, 1);
+    assert_eq!(stats.released, 3, "parked ops return to the active map");
+
+    // The next drain installs what now fits.
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 100)
+        .expect("drain");
+    assert_eq!(stats.installed, 1, "one slot, one route");
+    assert_eq!(stats.withheld, 2, "the rest park again");
+    assert_eq!(ledger.counts().installed, 2);
+    // Converged: still full, so nothing is released and the caller is
+    // not spun.
+    assert_eq!(stats.released, 0);
 }
 
 #[test]
