@@ -87,10 +87,20 @@ pub fn check_hugepage_budget(
 }
 
 /// One VPP dataplane port: the VF's PCI address plus the worker count
-/// the operator promised for it. Slice 1 renders the promise as
-/// explicit config; the scheduler's round-robin default is not
-/// trusted (plan v5 "cores promises are honored by rendering explicit
-/// rx-placement").
+/// the operator promised for it.
+///
+/// Input to the **runtime attach step**, not to [`render`]. Before the
+/// v7 driver pivot this was config: a `dpdk { dev <pci> }` stanza. The
+/// native octeon driver takes device identity at runtime instead
+/// (`dev_attach` with the PCI address, then `dev_create_port_if` with
+/// the port number and `num_rx_queues`), which is the better shape
+/// anyway — detach and reattach need no config rewrite, and the
+/// supervisor can sequence attach inside its resync pipeline.
+///
+/// `cores` still means what it meant: the operator's promise, rendered
+/// explicitly rather than left to the scheduler's round-robin default
+/// (plan v5, "cores promises are honored by rendering explicit
+/// rx-placement"). It now lands as `num_rx_queues` at attach.
 #[derive(Debug, Clone)]
 pub struct PortSpec {
     pub pci_addr: String,
@@ -102,9 +112,25 @@ pub struct PortSpec {
 /// the explicit CPU list for VPP workers (the plan's core-map set B);
 /// `api_socket`/`stats_socket` live under packetframe's runtime dir so
 /// supervision and metrics know where to look without guessing.
+///
+/// **Devices are deliberately absent.** After the v7 driver pivot the
+/// dataplane is VPP's native octeon driver, and devices attach at
+/// RUNTIME (`dev_attach` → `dev_create_port_if` over the binary API)
+/// rather than from a config stanza. There is no `dpdk {}` block
+/// because the DPDK PMD path cannot allocate NPA buffers on this NIC
+/// at any version, and no `devices {}` block either — an empty one is
+/// a parse error, and a populated one would duplicate what the
+/// supervisor attaches. That makes [`PortSpec`] input to the attach
+/// step, not to this function.
+///
+/// Shape matches what actually came up on the shadow (runbook §2,
+/// round 3). It is deliberately not "improved" beyond that: the one
+/// tempting change — keeping `plugin default { disable }` and enabling
+/// plugins explicitly — is untested against the native driver's
+/// loading path, and deviating from a hardware-proven config on an
+/// untested theory is how bring-up rounds get spent.
 pub fn render(
     sizing: &Sizing,
-    ports: &[PortSpec],
     worker_cores: &[u16],
     main_core: u16,
     api_socket: &str,
@@ -141,18 +167,17 @@ pub fn render(
     ));
     let _ = hugepage_bytes; // recorded in the header comment path later; kept as input for stability
     out.push_str("buffers {\n  buffers-per-numa 65536\n  default data-size 2048\n}\n");
-    out.push_str("dpdk {\n");
-    for p in ports {
-        out.push_str(&format!(
-            "  dev {} {{\n    num-rx-queues {}\n  }}\n",
-            p.pci_addr, p.cores
-        ));
-    }
-    out.push_str("}\n");
-    // linux-cp deliberately ABSENT: it cannot pair kernel-owned PFs
-    // (plan v3 correction). Routes and neighbors arrive over the
-    // binary API from the RouteController's VppSink (slice 3).
-    out.push_str("plugins {\n  plugin default { disable }\n  plugin dpdk_plugin.so { enable }\n  plugin ping_plugin.so { enable }\n}\n");
+    // dpdk_plugin OFF. Round 2 on the shadow established that both the
+    // otx2 and cnxk PMDs hard-require NPA mempool ops that VPP's buffer
+    // manager does not provide, so the DPDK path cannot allocate
+    // buffers on this NIC at ANY version — leaving the plugin enabled
+    // would only load a driver that cannot work and can bind the VF
+    // out from under the native one.
+    //
+    // linux-cp also deliberately ABSENT: it cannot pair kernel-owned
+    // PFs (plan v3 correction). Routes and neighbors arrive over the
+    // binary API from the RouteController's VppSink.
+    out.push_str("plugins {\n  plugin dpdk_plugin.so { disable }\n}\n");
     out
 }
 
@@ -188,19 +213,8 @@ mod tests {
     #[test]
     fn render_is_deterministic_and_complete() {
         let sizing = derive_sizing(1_400_000).unwrap();
-        let ports = [
-            PortSpec {
-                pci_addr: "0002:07:00.1".into(),
-                cores: 1,
-            },
-            PortSpec {
-                pci_addr: "0002:08:00.1".into(),
-                cores: 2,
-            },
-        ];
         let conf = render(
             &sizing,
-            &ports,
             &[14, 15],
             13,
             "/run/packetframe/vpp/api.sock",
@@ -208,15 +222,12 @@ mod tests {
         );
         let again = render(
             &sizing,
-            &ports,
             &[14, 15],
             13,
             "/run/packetframe/vpp/api.sock",
             512 << 20,
         );
         assert_eq!(conf, again, "renderer must be pure");
-        assert!(conf.contains("dev 0002:07:00.1"));
-        assert!(conf.contains("num-rx-queues 2"));
         assert!(conf.contains("corelist-workers 14,15"));
         assert!(conf.contains("main-heap-page-size default-hugepage"));
         assert!(
@@ -231,6 +242,39 @@ mod tests {
             (rendered_mib << 20) >= sizing.main_heap_bytes,
             "rendered heap {rendered_mib} MiB must not be below the derived {} bytes",
             sizing.main_heap_bytes
+        );
+    }
+
+    /// The v7 driver pivot, asserted rather than described. Round 2 on
+    /// the shadow proved the DPDK PMD path cannot allocate NPA buffers
+    /// on this NIC at any version, so a rendered `dpdk {}` stanza — or
+    /// an enabled dpdk_plugin — is not a style question, it is a
+    /// dataplane that will not come up.
+    #[test]
+    fn no_dpdk_and_no_device_stanzas() {
+        let sizing = derive_sizing(1_000).unwrap();
+        let conf = render(&sizing, &[14], 13, "/run/packetframe/vpp/api.sock", 0);
+
+        assert!(
+            conf.contains("plugin dpdk_plugin.so { disable }"),
+            "dpdk_plugin must be disabled:\n{conf}"
+        );
+        assert!(
+            !conf.contains("dpdk {"),
+            "no dpdk stanza — the PMD cannot drive this NIC:\n{conf}"
+        );
+        // An empty `devices {}` is a VPP parse error, and a populated
+        // one would duplicate what the supervisor attaches at runtime
+        // over dev_attach/dev_create_port_if.
+        assert!(
+            !conf.contains("devices {"),
+            "devices attach at runtime, not from config:\n{conf}"
+        );
+        // No PCI address may appear anywhere: device identity now
+        // lives in the attach step, not the config file.
+        assert!(
+            !conf.contains("0002:"),
+            "no device identity in startup.conf:\n{conf}"
         );
     }
 

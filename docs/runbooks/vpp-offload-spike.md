@@ -525,13 +525,14 @@ renderer's arithmetic, updated for the round-4 decision (v4-only,
 pre-decision v4+v6 figure was ~4.4 GiB ⇒ 10 pages; item 10's measured
 number supersedes both.)
 
-startup.conf: **hand-write it; do NOT use the slice-1 renderer for
-now.** The renderer (`packetframe-vpp-offload::startup_conf::render`)
-still emits a `dpdk { dev ... }` stanza with dpdk_plugin enabled —
-the PMD path that round 2 proved CANNOT allocate NPA buffers on this
-NIC. Its sizing *arithmetic* (heap/hugepage math) remains valid; its
-*output shape* is pre-pivot and its native-driver rework is tracked
-for slice 3/4. The canonical working shape, from round 3:
+startup.conf: **the renderer now emits the post-pivot shape** — it
+dropped the `dpdk { dev ... }` stanza, disables `dpdk_plugin.so`, and
+carries no device identity at all (devices attach at runtime; see §3).
+Its sizing arithmetic was always valid and is unchanged. The hand-
+written config below stays here as the reference the renderer is
+tested against, and as what to fall back to if you are bringing up a
+box without a packetframe build. The canonical working shape, from
+round 3:
 
 ```
 unix {
