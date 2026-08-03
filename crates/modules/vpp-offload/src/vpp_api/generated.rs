@@ -9,32 +9,38 @@
 // format fails the build rather than corrupting a FIB.
 #![allow(clippy::all, dead_code, non_camel_case_types)]
 
-use super::codec::{Decode, Decoder, Encode, WireError};
+use super::codec::{Decode, Decoder, Encode, Message, MessageMeta, WireError};
 
-/// `(name, crc)` for every message this client speaks.
-pub const MESSAGE_CRCS: &[(&str, &str)] = &[
-    ("sockclnt_create", "0x455fb9c4"),
-    ("sockclnt_create_reply", "0x35166268"),
-    ("sockclnt_delete", "0x8ac76db6"),
-    ("sockclnt_delete_reply", "0x8f38b1ee"),
-    ("control_ping", "0x51077d14"),
-    ("control_ping_reply", "0xf6b0b8ca"),
-    ("ip_route_add_del", "0xb8ecfe0d"),
-    ("ip_route_add_del_reply", "0x1992deab"),
-    ("ip_route_lookup", "0x710d6471"),
-    ("ip_route_lookup_reply", "0x5d8febcb"),
-    ("ip_neighbor_add_del", "0x0607c257"),
-    ("ip_neighbor_add_del_reply", "0x1992deab"),
-    ("sw_interface_set_flags", "0xf5aec1b8"),
-    ("sw_interface_set_flags_reply", "0xe8d4e804"),
-    ("dev_attach", "0x44b725fc"),
-    ("dev_attach_reply", "0x6082b181"),
-    ("dev_detach", "0xafae52d6"),
-    ("dev_detach_reply", "0xc8d74455"),
-    ("dev_create_port_if", "0xdbdf06f3"),
-    ("dev_create_port_if_reply", "0x243c2374"),
-    ("dev_remove_port_if", "0x529cb13f"),
-    ("dev_remove_port_if_reply", "0xc8d74455"),
+/// `(name, crc, context_offset, client_index_precedes_context)`
+/// for every message this client speaks.
+///
+/// `context_offset` is where `context` sits in the full wire
+/// payload; the transport needs it to correlate a reply before
+/// it knows the message type. It is NOT constant: replies with
+/// a leading client_index put context at 6, most at 2.
+pub const MESSAGE_META: &[MessageMeta] = &[
+    MessageMeta { name: "sockclnt_create", crc: "0x455fb9c4", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sockclnt_create_reply", crc: "0x35166268", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sockclnt_delete", crc: "0x8ac76db6", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sockclnt_delete_reply", crc: "0x8f38b1ee", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "control_ping", crc: "0x51077d14", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "control_ping_reply", crc: "0xf6b0b8ca", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "ip_route_add_del", crc: "0xb8ecfe0d", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "ip_route_add_del_reply", crc: "0x1992deab", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "ip_route_lookup", crc: "0x710d6471", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "ip_route_lookup_reply", crc: "0x5d8febcb", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "ip_neighbor_add_del", crc: "0x0607c257", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "ip_neighbor_add_del_reply", crc: "0x1992deab", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_set_flags", crc: "0xf5aec1b8", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_set_flags_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "dev_attach", crc: "0x44b725fc", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "dev_attach_reply", crc: "0x6082b181", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "dev_detach", crc: "0xafae52d6", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "dev_detach_reply", crc: "0xc8d74455", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "dev_create_port_if", crc: "0xdbdf06f3", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "dev_create_port_if_reply", crc: "0x243c2374", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "dev_remove_port_if", crc: "0x529cb13f", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "dev_remove_port_if_reply", crc: "0xc8d74455", context_offset: 2, client_index_prefix: false },
 ];
 
 // enum address_family : u8
@@ -307,7 +313,7 @@ impl Encode for IpRoute {
         buf.extend_from_slice(&(self.table_id).to_be_bytes());
         buf.extend_from_slice(&(self.stats_index).to_be_bytes());
         self.prefix.encode(buf);
-        buf.extend_from_slice(&(self.n_paths).to_be_bytes());
+        buf.extend_from_slice(&(self.paths.len() as u8).to_be_bytes());
         for it in &self.paths {
         it.encode(buf);
         }
@@ -426,6 +432,14 @@ impl Decode for SockclntCreate {
     }
 }
 
+impl Message for SockclntCreate {
+    const NAME: &'static str = "sockclnt_create";
+    const CRC: &'static str = "0x455fb9c4";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `sockclnt_create_reply` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SockclntCreateReply {
@@ -441,7 +455,7 @@ impl Encode for SockclntCreateReply {
         buf.extend_from_slice(&(self.context).to_be_bytes());
         buf.extend_from_slice(&(self.response).to_be_bytes());
         buf.extend_from_slice(&(self.index).to_be_bytes());
-        buf.extend_from_slice(&(self.count).to_be_bytes());
+        buf.extend_from_slice(&(self.message_table.len() as u16).to_be_bytes());
         for it in &self.message_table {
         it.encode(buf);
         }
@@ -451,8 +465,7 @@ impl Encode for SockclntCreateReply {
 impl Decode for SockclntCreateReply {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let response = d.i32()?;
         let index = d.u32()?;
@@ -475,6 +488,14 @@ impl Decode for SockclntCreateReply {
     }
 }
 
+impl Message for SockclntCreateReply {
+    const NAME: &'static str = "sockclnt_create_reply";
+    const CRC: &'static str = "0x35166268";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `sockclnt_delete` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SockclntDelete {
@@ -492,8 +513,7 @@ impl Encode for SockclntDelete {
 impl Decode for SockclntDelete {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let index = d.u32()?;
         Ok(Self {
@@ -501,6 +521,14 @@ impl Decode for SockclntDelete {
             index,
         })
     }
+}
+
+impl Message for SockclntDelete {
+    const NAME: &'static str = "sockclnt_delete";
+    const CRC: &'static str = "0x8ac76db6";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `sockclnt_delete_reply` — generated from the pinned .api.json.
@@ -529,6 +557,14 @@ impl Decode for SockclntDeleteReply {
     }
 }
 
+impl Message for SockclntDeleteReply {
+    const NAME: &'static str = "sockclnt_delete_reply";
+    const CRC: &'static str = "0x8f38b1ee";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `control_ping` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ControlPing {
@@ -544,13 +580,20 @@ impl Encode for ControlPing {
 impl Decode for ControlPing {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         Ok(Self {
             context,
         })
     }
+}
+
+impl Message for ControlPing {
+    const NAME: &'static str = "control_ping";
+    const CRC: &'static str = "0x51077d14";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `control_ping_reply` — generated from the pinned .api.json.
@@ -574,8 +617,7 @@ impl Decode for ControlPingReply {
         let _ = d.u16()?;
         let context = d.u32()?;
         let retval = d.i32()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let vpe_pid = d.u32()?;
         Ok(Self {
             context,
@@ -583,6 +625,14 @@ impl Decode for ControlPingReply {
             vpe_pid,
         })
     }
+}
+
+impl Message for ControlPingReply {
+    const NAME: &'static str = "control_ping_reply";
+    const CRC: &'static str = "0xf6b0b8ca";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `ip_route_add_del` — generated from the pinned .api.json.
@@ -606,8 +656,7 @@ impl Encode for IpRouteAddDel {
 impl Decode for IpRouteAddDel {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let is_add = d.bool()?;
         let is_multipath = d.bool()?;
@@ -619,6 +668,14 @@ impl Decode for IpRouteAddDel {
             route,
         })
     }
+}
+
+impl Message for IpRouteAddDel {
+    const NAME: &'static str = "ip_route_add_del";
+    const CRC: &'static str = "0xb8ecfe0d";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `ip_route_add_del_reply` — generated from the pinned .api.json.
@@ -651,6 +708,14 @@ impl Decode for IpRouteAddDelReply {
     }
 }
 
+impl Message for IpRouteAddDelReply {
+    const NAME: &'static str = "ip_route_add_del_reply";
+    const CRC: &'static str = "0x1992deab";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `ip_route_lookup` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IpRouteLookup {
@@ -672,8 +737,7 @@ impl Encode for IpRouteLookup {
 impl Decode for IpRouteLookup {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let table_id = d.u32()?;
         let exact = d.u8()?;
@@ -685,6 +749,14 @@ impl Decode for IpRouteLookup {
             prefix,
         })
     }
+}
+
+impl Message for IpRouteLookup {
+    const NAME: &'static str = "ip_route_lookup";
+    const CRC: &'static str = "0x710d6471";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `ip_route_lookup_reply` — generated from the pinned .api.json.
@@ -717,6 +789,14 @@ impl Decode for IpRouteLookupReply {
     }
 }
 
+impl Message for IpRouteLookupReply {
+    const NAME: &'static str = "ip_route_lookup_reply";
+    const CRC: &'static str = "0x5d8febcb";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `ip_neighbor_add_del` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IpNeighborAddDel {
@@ -736,8 +816,7 @@ impl Encode for IpNeighborAddDel {
 impl Decode for IpNeighborAddDel {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let is_add = d.bool()?;
         let neighbor = IpNeighbor::decode(d)?;
@@ -747,6 +826,14 @@ impl Decode for IpNeighborAddDel {
             neighbor,
         })
     }
+}
+
+impl Message for IpNeighborAddDel {
+    const NAME: &'static str = "ip_neighbor_add_del";
+    const CRC: &'static str = "0x0607c257";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `ip_neighbor_add_del_reply` — generated from the pinned .api.json.
@@ -779,6 +866,14 @@ impl Decode for IpNeighborAddDelReply {
     }
 }
 
+impl Message for IpNeighborAddDelReply {
+    const NAME: &'static str = "ip_neighbor_add_del_reply";
+    const CRC: &'static str = "0x1992deab";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `sw_interface_set_flags` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SwInterfaceSetFlags {
@@ -798,8 +893,7 @@ impl Encode for SwInterfaceSetFlags {
 impl Decode for SwInterfaceSetFlags {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let sw_if_index = d.u32()?;
         let flags = d.u32()?;
@@ -809,6 +903,14 @@ impl Decode for SwInterfaceSetFlags {
             flags,
         })
     }
+}
+
+impl Message for SwInterfaceSetFlags {
+    const NAME: &'static str = "sw_interface_set_flags";
+    const CRC: &'static str = "0xf5aec1b8";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `sw_interface_set_flags_reply` — generated from the pinned .api.json.
@@ -835,6 +937,14 @@ impl Decode for SwInterfaceSetFlagsReply {
             retval,
         })
     }
+}
+
+impl Message for SwInterfaceSetFlagsReply {
+    const NAME: &'static str = "sw_interface_set_flags_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `dev_attach` — generated from the pinned .api.json.
@@ -873,8 +983,7 @@ impl Encode for DevAttach {
 impl Decode for DevAttach {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let device_id = d.string_fixed(48)?;
         let driver_name = d.string_fixed(16)?;
@@ -888,6 +997,14 @@ impl Decode for DevAttach {
             args,
         })
     }
+}
+
+impl Message for DevAttach {
+    const NAME: &'static str = "dev_attach";
+    const CRC: &'static str = "0x44b725fc";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `dev_attach_reply` — generated from the pinned .api.json.
@@ -925,6 +1042,14 @@ impl Decode for DevAttachReply {
     }
 }
 
+impl Message for DevAttachReply {
+    const NAME: &'static str = "dev_attach_reply";
+    const CRC: &'static str = "0x6082b181";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `dev_detach` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DevDetach {
@@ -942,8 +1067,7 @@ impl Encode for DevDetach {
 impl Decode for DevDetach {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let dev_index = d.u32()?;
         Ok(Self {
@@ -951,6 +1075,14 @@ impl Decode for DevDetach {
             dev_index,
         })
     }
+}
+
+impl Message for DevDetach {
+    const NAME: &'static str = "dev_detach";
+    const CRC: &'static str = "0xafae52d6";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `dev_detach_reply` — generated from the pinned .api.json.
@@ -982,6 +1114,14 @@ impl Decode for DevDetachReply {
             error_string,
         })
     }
+}
+
+impl Message for DevDetachReply {
+    const NAME: &'static str = "dev_detach_reply";
+    const CRC: &'static str = "0xc8d74455";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `dev_create_port_if` — generated from the pinned .api.json.
@@ -1024,8 +1164,7 @@ impl Encode for DevCreatePortIf {
 impl Decode for DevCreatePortIf {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let dev_index = d.u32()?;
         let intf_name = d.string_fixed(32)?;
@@ -1051,6 +1190,14 @@ impl Decode for DevCreatePortIf {
     }
 }
 
+impl Message for DevCreatePortIf {
+    const NAME: &'static str = "dev_create_port_if";
+    const CRC: &'static str = "0xdbdf06f3";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
 /// `dev_create_port_if_reply` — generated from the pinned .api.json.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DevCreatePortIfReply {
@@ -1073,8 +1220,7 @@ impl Encode for DevCreatePortIfReply {
 impl Decode for DevCreatePortIfReply {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let sw_if_index = d.u32()?;
         let retval = d.i32()?;
@@ -1086,6 +1232,14 @@ impl Decode for DevCreatePortIfReply {
             error_string,
         })
     }
+}
+
+impl Message for DevCreatePortIfReply {
+    const NAME: &'static str = "dev_create_port_if_reply";
+    const CRC: &'static str = "0x243c2374";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `dev_remove_port_if` — generated from the pinned .api.json.
@@ -1105,8 +1259,7 @@ impl Encode for DevRemovePortIf {
 impl Decode for DevRemovePortIf {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         let _ = d.u16()?;
-        let _ = d.u16()?;
-        let _ = d.u16()?;
+        let _ = d.u32()?;
         let context = d.u32()?;
         let sw_if_index = d.u32()?;
         Ok(Self {
@@ -1114,6 +1267,14 @@ impl Decode for DevRemovePortIf {
             sw_if_index,
         })
     }
+}
+
+impl Message for DevRemovePortIf {
+    const NAME: &'static str = "dev_remove_port_if";
+    const CRC: &'static str = "0x529cb13f";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 
 /// `dev_remove_port_if_reply` — generated from the pinned .api.json.
@@ -1145,5 +1306,13 @@ impl Decode for DevRemovePortIfReply {
             error_string,
         })
     }
+}
+
+impl Message for DevRemovePortIfReply {
+    const NAME: &'static str = "dev_remove_port_if_reply";
+    const CRC: &'static str = "0xc8d74455";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
 }
 

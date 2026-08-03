@@ -14,8 +14,8 @@
 //! beats catching it as a FIB that installs garbage.
 
 use packetframe_vpp_offload::vpp_api::codec::{
-    parse_frame_header, peek_reply_header, write_frame_header, write_request_header, Decode,
-    Decoder, Encode, MSG_HEADER_LEN, SOCKCLNT_CREATE_MSG_ID,
+    encode_request, parse_frame_header, peek_context, peek_msg_id, write_frame_header, Decode,
+    Decoder, Encode, Message, MSG_HEADER_LEN, SOCKCLNT_CREATE_MSG_ID,
 };
 use packetframe_vpp_offload::vpp_api::generated::*;
 
@@ -162,11 +162,13 @@ fn ip_route_roundtrips_with_two_paths() {
 }
 
 #[test]
-fn ip_route_add_del_omits_transport_owned_fields() {
-    // _vl_msg_id and client_index are stamped by the transport, so the
-    // generated body must NOT re-encode them — otherwise every request
-    // carries them twice and VPP reads garbage.
-    let msg = IpRouteAddDel {
+fn full_request_frame_writes_context_exactly_once() {
+    // THE regression this file previously missed. An earlier revision
+    // stamped context in the prefix AND encoded it in the body, so VPP
+    // read the duplicate's bytes as is_add/is_multipath and would have
+    // applied the wrong FIB operation. Asserting the composed frame —
+    // not the body in isolation — is what makes that visible.
+    let mut msg = IpRouteAddDel {
         context: 0,
         is_add: true,
         is_multipath: false,
@@ -177,26 +179,109 @@ fn ip_route_add_del_omits_transport_owned_fields() {
         },
     };
     let mut buf = Vec::new();
-    msg.encode(&mut buf);
-    // context(4) + is_add(1) + is_multipath(1) + route(4+4+18+1).
-    assert_eq!(buf.len(), 4 + 1 + 1 + 4 + 4 + PREFIX_LEN + 1);
-    assert_eq!(buf[4], 1, "is_add encodes as a single byte");
-    assert_eq!(buf[5], 0, "is_multipath");
+    encode_request(&mut buf, &mut msg, 0x0102, 0xaabb_ccdd, 0xdead_beef);
+
+    // id(2) + client_index(4) + context(4) + is_add(1) + is_multipath(1)
+    //   + route(table_id 4 + stats_index 4 + prefix 18 + n_paths 1).
+    assert_eq!(buf.len(), 2 + 4 + 4 + 1 + 1 + 4 + 4 + PREFIX_LEN + 1);
+    assert_eq!(&buf[0..2], &0x0102u16.to_be_bytes(), "message id");
+    assert_eq!(&buf[2..6], &0xaabb_ccddu32.to_be_bytes(), "client_index");
+    assert_eq!(&buf[6..10], &0xdead_beefu32.to_be_bytes(), "context, once");
+    assert_eq!(buf[10], 1, "is_add lands immediately after context");
+    assert_eq!(buf[11], 0, "is_multipath");
 }
 
 #[test]
-fn variable_length_array_encodes_from_vec_len_not_count_field() {
-    // A route whose n_paths disagrees with paths.len() must still emit
-    // the vec it actually holds — the encoder writes what is there, so
-    // a stale count cannot produce a short read on VPP's side.
+fn sockclnt_create_has_no_client_index_in_its_prefix() {
+    // The bootstrap request's schema is [id][context][name] — stamping
+    // a client_index would push the name four bytes late and the
+    // handshake could never complete.
+    const { assert!(!SockclntCreate::CLIENT_INDEX_PREFIX) };
+    const { assert!(SockclntCreate::CONTEXT_OFFSET == 2) };
+
+    let mut msg = SockclntCreate {
+        context: 0,
+        name: "packetframe".into(),
+    };
+    let mut buf = Vec::new();
+    encode_request(&mut buf, &mut msg, SOCKCLNT_CREATE_MSG_ID, 0, 1);
+    // id(2) + context(4) + name[64].
+    assert_eq!(buf.len(), 2 + 4 + 64);
+    assert_eq!(&buf[0..2], &SOCKCLNT_CREATE_MSG_ID.to_be_bytes());
+    assert_eq!(&buf[2..6], &1u32.to_be_bytes(), "context at byte 2");
+    assert_eq!(&buf[6..17], b"packetframe");
+}
+
+#[test]
+fn array_counts_are_derived_from_the_vector() {
+    // VPP parses exactly `n_paths` elements. A caller-supplied count
+    // that disagrees with the vector either truncates the route or
+    // walks VPP past the end of the payload, so the encoder derives it
+    // and the struct's value is ignored on the wire.
     let route = IpRoute {
-        n_paths: 7, // lie
+        n_paths: 7, // deliberately wrong
         paths: vec![FibPath::default()],
         ..Default::default()
     };
     let mut buf = Vec::new();
     route.encode(&mut buf);
     assert_eq!(buf.len(), 4 + 4 + PREFIX_LEN + 1 + FIB_PATH_LEN);
+    assert_eq!(
+        buf[4 + 4 + PREFIX_LEN],
+        1,
+        "n_paths on the wire must equal paths.len(), not the struct field"
+    );
+
+    // And it round-trips to a self-consistent value.
+    let mut d = Decoder::new(&buf);
+    let back = IpRoute::decode(&mut d).unwrap();
+    assert_eq!(back.n_paths, 1);
+    assert_eq!(back.paths.len(), 1);
+}
+
+#[test]
+fn context_offset_is_per_message_not_a_constant() {
+    // The three shapes that make a uniform-header assumption wrong.
+    assert_eq!(IpRouteAddDelReply::CONTEXT_OFFSET, 2, "plain reply");
+    assert_eq!(
+        SockclntCreateReply::CONTEXT_OFFSET,
+        6,
+        "reply WITH a leading client_index"
+    );
+    assert_eq!(
+        DevCreatePortIfReply::CONTEXT_OFFSET,
+        6,
+        "the other client_index-carrying reply"
+    );
+    assert_eq!(
+        ControlPingReply::CONTEXT_OFFSET,
+        2,
+        "client_index exists but sits after context"
+    );
+}
+
+#[test]
+fn peek_context_uses_the_messages_own_offset() {
+    // A sockclnt_create_reply whose client_index and context differ:
+    // reading byte 2 unconditionally would return the client index and
+    // the reply would never match its waiting request.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&SOCKCLNT_CREATE_MSG_ID.to_be_bytes());
+    payload.extend_from_slice(&0x1111_1111u32.to_be_bytes()); // client_index
+    payload.extend_from_slice(&0x2222_2222u32.to_be_bytes()); // context
+    payload.extend_from_slice(&[0u8; 10]);
+
+    assert_eq!(peek_msg_id(&payload).unwrap(), SOCKCLNT_CREATE_MSG_ID);
+    assert_eq!(
+        peek_context(&payload, SockclntCreateReply::CONTEXT_OFFSET).unwrap(),
+        0x2222_2222,
+        "context must come from the schema-derived offset"
+    );
+    assert_eq!(
+        peek_context(&payload, 2).unwrap(),
+        0x1111_1111,
+        "and byte 2 really is the client index here — the trap"
+    );
 }
 
 #[test]
@@ -233,8 +318,11 @@ fn dev_attach_reply_decodes_error_string() {
     payload.extend_from_slice(&5u32.to_be_bytes());
     payload.extend_from_slice(b"oh no");
 
-    let (id, ctx) = peek_reply_header(&payload).unwrap();
-    assert_eq!((id, ctx), (7, 0xabcd));
+    assert_eq!(peek_msg_id(&payload).unwrap(), 7);
+    assert_eq!(
+        peek_context(&payload, DevAttachReply::CONTEXT_OFFSET).unwrap(),
+        0xabcd
+    );
 
     let mut d = Decoder::new(&payload);
     let r = DevAttachReply::decode(&mut d).unwrap();
@@ -277,10 +365,9 @@ fn sockclnt_create_reply_parses_the_message_table() {
 
 #[test]
 fn framing_and_request_header_compose() {
-    let msg = ControlPing { context: 42 };
+    let mut msg = ControlPing { context: 0 };
     let mut payload = Vec::new();
-    write_request_header(&mut payload, 77, 5, 42);
-    msg.encode(&mut payload);
+    encode_request(&mut payload, &mut msg, 77, 5, 42);
 
     let mut frame = Vec::new();
     write_frame_header(&mut frame, payload.len());
@@ -295,15 +382,23 @@ fn framing_and_request_header_compose() {
 }
 
 #[test]
-fn every_whitelisted_message_has_a_crc() {
+fn every_whitelisted_message_has_metadata() {
     // The message table is keyed by name_crc; an empty CRC means the
     // generator failed to read one and version-mismatch detection
     // would silently degrade to name-only matching.
-    assert!(!MESSAGE_CRCS.is_empty());
-    for (name, crc) in MESSAGE_CRCS {
+    assert!(!MESSAGE_META.is_empty());
+    for m in MESSAGE_META {
         assert!(
-            crc.starts_with("0x") && crc.len() > 2,
-            "message {name} has no usable CRC: {crc:?}"
+            m.crc.starts_with("0x") && m.crc.len() > 2,
+            "message {} has no usable CRC: {:?}",
+            m.name,
+            m.crc
+        );
+        assert!(
+            m.context_offset == 2 || m.context_offset == 6,
+            "unexpected context offset {} for {} — schema shape changed",
+            m.context_offset,
+            m.name
         );
     }
 }

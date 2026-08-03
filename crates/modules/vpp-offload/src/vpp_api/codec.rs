@@ -22,11 +22,25 @@
 //!                  ...message fields...
 //! ```
 //!
-//! The reply header is shorter than the request header: replies carry
-//! `[u16 msg_id][u32 context]` with no client_index. That asymmetry is
-//! in the `.api.json` field lists themselves, so the generated
-//! encode/decode already reflects it — this module only needs to know
-//! it when stamping request headers.
+//! **There is no uniform header.** An earlier revision of this file
+//! assumed requests are `[id][client_index][context]` and replies are
+//! `[id][context]`. The vendored schemas say otherwise, and all three
+//! shapes are in our whitelist:
+//!
+//! | message | prefix |
+//! |---|---|
+//! | `sockclnt_create` (a REQUEST) | `[id][context]` — no client_index |
+//! | `ip_route_add_del`, `dev_attach` | `[id][client_index][context]` |
+//! | `ip_route_add_del_reply` | `[id][context]` |
+//! | `sockclnt_create_reply`, `dev_create_port_if_reply` | `[id][client_index][context]` |
+//! | `control_ping_reply` | `[id][context][retval][client_index]` |
+//!
+//! So the geometry is per message and comes from the schema: the
+//! generator emits [`Message::CONTEXT_OFFSET`] and
+//! [`Message::CLIENT_INDEX_PREFIX`], and [`MESSAGE_META`] carries the
+//! same for runtime lookup by message id. Guessing here misparses a
+//! context (replies routed to the wrong waiter) or shifts a request
+//! body (VPP reading `is_add` out of a client index).
 
 /// Bytes of framing that precede every message payload.
 pub const MSG_HEADER_LEN: usize = 16;
@@ -80,6 +94,39 @@ pub trait Encode {
 /// Something that can be read from the wire.
 pub trait Decode: Sized {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError>;
+}
+
+/// Schema-derived facts about one API message.
+///
+/// Generated, never hand-written: every field here is read out of the
+/// pinned `.api.json`, so a pin bump that moves `context` moves this
+/// with it instead of silently breaking correlation.
+pub trait Message: Encode {
+    /// Wire name, as it appears in the handshake's message table
+    /// (which is keyed `name_crc`).
+    const NAME: &'static str;
+    /// CRC of the message definition. A mismatch against the table
+    /// means our types describe a different VPP than the one we are
+    /// talking to.
+    const CRC: &'static str;
+    /// Byte offset of `context` in the full wire payload.
+    const CONTEXT_OFFSET: usize;
+    /// Whether a `client_index` sits between the id and `context`, and
+    /// so must be stamped by the transport.
+    const CLIENT_INDEX_PREFIX: bool;
+    /// Set the correlation context. Owned by the transport: a caller
+    /// choosing its own would break reply matching.
+    fn set_context(&mut self, context: u32);
+}
+
+/// Runtime form of [`Message`], for looking geometry up by message id
+/// once the handshake table is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageMeta {
+    pub name: &'static str,
+    pub crc: &'static str,
+    pub context_offset: usize,
+    pub client_index_prefix: bool,
 }
 
 /// Cursor over one message payload.
@@ -207,34 +254,69 @@ pub fn parse_frame_header(hdr: &[u8; MSG_HEADER_LEN]) -> u32 {
     ])
 }
 
-/// Stamp a request's `_vl_msg_id`, `client_index` and `context` ahead
-/// of the generated body.
+/// Write the bytes that precede a message's own encoded body: the id,
+/// and a `client_index` only when this message's schema has one there.
 ///
-/// Kept here rather than in generated code because these three fields
-/// are transport state, not message content: the caller does not own
-/// them, and letting a caller set them would make context-matching
-/// (which pairs replies to requests) silently unreliable.
-pub fn write_request_header(buf: &mut Vec<u8>, msg_id: u16, client_index: u32, context: u32) {
+/// The body itself starts at `context`, which the generated `encode`
+/// writes — so `context` appears exactly once. Stamping it here too
+/// (as an earlier revision did) shifted every subsequent field by four
+/// bytes: for `ip_route_add_del`, VPP would read the duplicated
+/// context's high bytes as `is_add`/`is_multipath` and apply the wrong
+/// FIB operation.
+pub fn write_msg_prefix<M: Message>(buf: &mut Vec<u8>, msg_id: u16, client_index: u32) {
     buf.extend_from_slice(&msg_id.to_be_bytes());
-    buf.extend_from_slice(&client_index.to_be_bytes());
-    buf.extend_from_slice(&context.to_be_bytes());
+    if M::CLIENT_INDEX_PREFIX {
+        buf.extend_from_slice(&client_index.to_be_bytes());
+    }
 }
 
-/// `(msg_id, context)` from a reply payload, without consuming it.
-///
-/// Replies carry no `client_index`, so context sits at byte 2 — one of
-/// the easiest things to get wrong when reading VPP's structs, and the
-/// reason this is a named function rather than an inline slice.
-pub fn peek_reply_header(payload: &[u8]) -> Result<(u16, u32), WireError> {
-    if payload.len() < 6 {
+/// Encode a complete request: prefix, then the body with `context`
+/// stamped by the transport rather than the caller.
+pub fn encode_request<M: Message>(
+    buf: &mut Vec<u8>,
+    msg: &mut M,
+    msg_id: u16,
+    client_index: u32,
+    context: u32,
+) {
+    msg.set_context(context);
+    write_msg_prefix::<M>(buf, msg_id, client_index);
+    msg.encode(buf);
+}
+
+/// Message id of a payload. Always the first two bytes, for every
+/// message shape.
+pub fn peek_msg_id(payload: &[u8]) -> Result<u16, WireError> {
+    if payload.len() < 2 {
         return Err(WireError::Truncated {
-            need: 6,
+            need: 2,
             have: payload.len(),
         });
     }
-    let msg_id = u16::from_be_bytes([payload[0], payload[1]]);
-    let context = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
-    Ok((msg_id, context))
+    Ok(u16::from_be_bytes([payload[0], payload[1]]))
+}
+
+/// Correlation context at a schema-derived offset.
+///
+/// `context_offset` must come from the message's own metadata — see
+/// the table in this module's docs. Reading byte 2 unconditionally
+/// returns a client index for `sockclnt_create_reply` and
+/// `dev_create_port_if_reply`, so those replies would never match the
+/// request that is waiting for them.
+pub fn peek_context(payload: &[u8], context_offset: usize) -> Result<u32, WireError> {
+    let end = context_offset + 4;
+    if payload.len() < end {
+        return Err(WireError::Truncated {
+            need: end,
+            have: payload.len(),
+        });
+    }
+    Ok(u32::from_be_bytes([
+        payload[context_offset],
+        payload[context_offset + 1],
+        payload[context_offset + 2],
+        payload[context_offset + 3],
+    ]))
 }
 
 #[cfg(test)]
@@ -255,16 +337,28 @@ mod tests {
     }
 
     #[test]
-    fn reply_header_reads_context_without_client_index() {
-        // msg_id=0x0203, context=0xdeadbeef, then body.
+    fn msg_id_is_always_the_first_two_bytes() {
         let payload = [0x02, 0x03, 0xde, 0xad, 0xbe, 0xef, 0xff, 0xff];
-        assert_eq!(peek_reply_header(&payload).unwrap(), (0x0203, 0xdead_beef));
+        assert_eq!(peek_msg_id(&payload).unwrap(), 0x0203);
+        assert!(matches!(
+            peek_msg_id(&[0]),
+            Err(WireError::Truncated { need: 2, have: 1 })
+        ));
     }
 
     #[test]
-    fn reply_header_rejects_a_runt() {
+    fn context_is_read_at_the_offset_it_is_given() {
+        // Same bytes, two shapes: offset 2 for a plain reply, offset 6
+        // when a client_index precedes context.
+        let payload = [0x02, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(peek_context(&payload, 2).unwrap(), 0xdead_beef);
+        assert_eq!(peek_context(&payload, 6).unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn context_peek_rejects_a_runt() {
         assert!(matches!(
-            peek_reply_header(&[0, 1, 2]),
+            peek_context(&[0, 1, 2], 2),
             Err(WireError::Truncated { need: 6, have: 3 })
         ));
     }
@@ -301,13 +395,68 @@ mod tests {
         assert_eq!(d.remaining(), 1);
     }
 
+    /// Two stand-ins for the two prefix shapes; the real impls are
+    /// generated, but the codec must be testable without them.
+    struct WithCi(u32);
+    struct WithoutCi(u32);
+
+    impl Encode for WithCi {
+        fn encode(&self, buf: &mut Vec<u8>) {
+            buf.extend_from_slice(&self.0.to_be_bytes());
+        }
+    }
+    impl Message for WithCi {
+        const NAME: &'static str = "with_ci";
+        const CRC: &'static str = "0x0";
+        const CONTEXT_OFFSET: usize = 6;
+        const CLIENT_INDEX_PREFIX: bool = true;
+        fn set_context(&mut self, context: u32) {
+            self.0 = context;
+        }
+    }
+    impl Encode for WithoutCi {
+        fn encode(&self, buf: &mut Vec<u8>) {
+            buf.extend_from_slice(&self.0.to_be_bytes());
+        }
+    }
+    impl Message for WithoutCi {
+        const NAME: &'static str = "without_ci";
+        const CRC: &'static str = "0x0";
+        const CONTEXT_OFFSET: usize = 2;
+        const CLIENT_INDEX_PREFIX: bool = false;
+        fn set_context(&mut self, context: u32) {
+            self.0 = context;
+        }
+    }
+
     #[test]
-    fn request_header_is_id_client_context_in_order() {
+    fn prefix_includes_client_index_only_when_the_schema_does() {
+        let mut a = WithCi(0);
         let mut buf = Vec::new();
-        write_request_header(&mut buf, 0x1234, 0xaabb_ccdd, 0x0000_0007);
-        assert_eq!(
-            buf,
-            vec![0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00, 0x00, 0x07]
-        );
+        encode_request(&mut buf, &mut a, 0x1234, 0xaabb_ccdd, 7);
+        // id + client_index + context(=body), written once each.
+        assert_eq!(buf, vec![0x12, 0x34, 0xaa, 0xbb, 0xcc, 0xdd, 0, 0, 0, 7]);
+
+        let mut b = WithoutCi(0);
+        let mut buf = Vec::new();
+        encode_request(&mut buf, &mut b, 0x1234, 0xaabb_ccdd, 7);
+        assert_eq!(buf, vec![0x12, 0x34, 0, 0, 0, 7]);
+    }
+
+    #[test]
+    fn context_lands_where_the_metadata_says_it_will() {
+        // The invariant that ties encoding to correlation: whatever we
+        // write, peek_context at the message's own offset finds it.
+        for (ci, off) in [(true, 6usize), (false, 2usize)] {
+            let mut buf = Vec::new();
+            if ci {
+                let mut m = WithCi(0);
+                encode_request(&mut buf, &mut m, 9, 0xffff_ffff, 0x5555_5555);
+            } else {
+                let mut m = WithoutCi(0);
+                encode_request(&mut buf, &mut m, 9, 0xffff_ffff, 0x5555_5555);
+            }
+            assert_eq!(peek_context(&buf, off).unwrap(), 0x5555_5555);
+        }
     }
 }

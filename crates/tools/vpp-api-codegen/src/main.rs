@@ -136,6 +136,46 @@ fn parse_fields(entries: &[Value]) -> (Vec<Field>, Option<String>) {
     (out, crc)
 }
 
+/// Wire size of the fixed-width fields that can precede `context`.
+/// Only `_vl_msg_id` (u16) and `client_index` (u32) ever do; anything
+/// else appearing before it means the schema changed shape and the
+/// generator must be revisited rather than guessed at.
+fn presize(f: &Field) -> usize {
+    match f.ty.as_str() {
+        "u16" => 2,
+        "u32" => 4,
+        other => panic!(
+            "unexpected field `{}` of type {other} before `context`",
+            f.name
+        ),
+    }
+}
+
+/// `(byte offset of context, client_index precedes context)`.
+///
+/// There is no request/reply rule here — it is per message, verified
+/// against the vendored schemas: `sockclnt_create` is a REQUEST with
+/// no client_index, `sockclnt_create_reply` is a REPLY that has one,
+/// and `control_ping_reply` carries it AFTER context. Anything that
+/// assumes a pattern gets one of these three wrong, and the failure
+/// mode is a silently misparsed context (mismatched reply routing) or
+/// a shifted request body (VPP reading `is_add` out of a client
+/// index).
+fn header_geometry(fields: &[Field]) -> (usize, bool) {
+    let mut offset = 0usize;
+    let mut client_index_first = false;
+    for f in fields {
+        if f.name == "context" {
+            return (offset, client_index_first);
+        }
+        if f.name == "client_index" {
+            client_index_first = true;
+        }
+        offset += presize(f);
+    }
+    panic!("message has no `context` field");
+}
+
 fn load(dir: &Path) -> Api {
     let mut api = Api::default();
     for f in FILES {
@@ -363,6 +403,15 @@ fn emit_struct(out: &mut String, api: &Api, name: &str, fields: &[Field], is_msg
 
 fn emit_encode(out: &mut String, api: &Api, name: &str, fields: &[Field], is_msg: bool) {
     let rname = pascal(name);
+    // count field name -> the array whose length defines it.
+    let counts: BTreeMap<String, String> = fields
+        .iter()
+        .filter_map(|f| {
+            f.count_from
+                .as_ref()
+                .map(|c| (c.clone(), field_ident(&f.name)))
+        })
+        .collect();
     writeln!(out, "impl Encode for {rname} {{").unwrap();
     writeln!(out, "    fn encode(&self, buf: &mut Vec<u8>) {{").unwrap();
     if fields.is_empty() {
@@ -370,6 +419,21 @@ fn emit_encode(out: &mut String, api: &Api, name: &str, fields: &[Field], is_msg
     }
     for f in fields {
         if is_msg && (f.name == "_vl_msg_id" || f.name == "client_index") {
+            continue;
+        }
+        // A count field is DERIVED, never taken from the struct. VPP
+        // parses exactly `count` elements, so a caller-supplied value
+        // that disagrees with the vector either truncates the route
+        // silently or walks VPP off the end of the payload — an
+        // earlier revision wrote the caller's value and a golden test
+        // enshrined that as intended.
+        if let Some(arr) = counts.get(&f.name) {
+            writeln!(
+                out,
+                "        buf.extend_from_slice(&(self.{arr}.len() as {}).to_be_bytes());",
+                f.ty
+            )
+            .unwrap();
             continue;
         }
         emit_field_encode(out, api, f);
@@ -468,12 +532,12 @@ fn emit_decode(out: &mut String, api: &Api, name: &str, fields: &[Field], is_msg
     let mut assigned: Vec<String> = Vec::new();
     for f in fields {
         if is_msg && (f.name == "_vl_msg_id" || f.name == "client_index") {
-            // Still present on the wire — consume, don't expose.
-            writeln!(out, "        let _ = d.u16()?;").unwrap();
-            if f.name == "client_index" {
-                // client_index is u32; the u16 above was _vl_msg_id.
-                writeln!(out, "        let _ = d.u16()?;").unwrap();
-            }
+            // Present on the wire, not in the struct: consume at the
+            // field's own width, in schema order. control_ping_reply
+            // puts client_index AFTER context, so position must come
+            // from the schema rather than an assumed header shape.
+            let w = if f.name == "_vl_msg_id" { "u16" } else { "u32" };
+            writeln!(out, "        let _ = d.{w}()?;").unwrap();
             continue;
         }
         emit_field_decode(out, api, f);
@@ -581,16 +645,32 @@ fn main() {
          // CI re-runs this and diffs, so a pin bump that changes the wire\n\
          // format fails the build rather than corrupting a FIB.\n\
          #![allow(clippy::all, dead_code, non_camel_case_types)]\n\n\
-         use super::codec::{Decode, Decoder, Encode, WireError};\n\n",
+         use super::codec::{Decode, Decoder, Encode, Message, MessageMeta, WireError};\n\n",
     );
 
-    // CRCs: the handshake's message table is keyed by name_crc, and a
-    // mismatch must be a loud refusal rather than a silent misparse.
-    out.push_str("/// `(name, crc)` for every message this client speaks.\n");
-    out.push_str("pub const MESSAGE_CRCS: &[(&str, &str)] = &[\n");
+    // Per-message metadata. The handshake's table is keyed by
+    // name_crc (so a CRC mismatch is a loud refusal), and the header
+    // geometry is what lets the transport stamp requests and locate
+    // `context` in replies WITHOUT assuming a uniform header — which
+    // the schemas do not have.
+    out.push_str(
+        "/// `(name, crc, context_offset, client_index_precedes_context)`\n\
+         /// for every message this client speaks.\n\
+         ///\n\
+         /// `context_offset` is where `context` sits in the full wire\n\
+         /// payload; the transport needs it to correlate a reply before\n\
+         /// it knows the message type. It is NOT constant: replies with\n\
+         /// a leading client_index put context at 6, most at 2.\n",
+    );
+    out.push_str("pub const MESSAGE_META: &[MessageMeta] = &[\n");
     for m in &roots {
-        let (_, crc) = &api.messages[m];
-        writeln!(out, "    (\"{m}\", \"{crc}\"),").unwrap();
+        let (fields, crc) = &api.messages[m];
+        let (off, ci) = header_geometry(fields);
+        writeln!(
+            out,
+            "    MessageMeta {{ name: \"{m}\", crc: \"{crc}\", context_offset: {off}, client_index_prefix: {ci} }},"
+        )
+        .unwrap();
     }
     out.push_str("];\n\n");
 
@@ -653,10 +733,23 @@ fn main() {
     }
 
     for m in &roots {
-        let (fields, _) = &api.messages[m];
+        let (fields, crc) = &api.messages[m];
         emit_struct(&mut out, &api, m, fields, true);
         emit_encode(&mut out, &api, m, fields, true);
         emit_decode(&mut out, &api, m, fields, true);
+        let (off, ci) = header_geometry(fields);
+        let rname = pascal(m);
+        writeln!(out, "impl Message for {rname} {{").unwrap();
+        writeln!(out, "    const NAME: &'static str = \"{m}\";").unwrap();
+        writeln!(out, "    const CRC: &'static str = \"{crc}\";").unwrap();
+        writeln!(out, "    const CONTEXT_OFFSET: usize = {off};").unwrap();
+        writeln!(out, "    const CLIENT_INDEX_PREFIX: bool = {ci};").unwrap();
+        writeln!(
+            out,
+            "    fn set_context(&mut self, context: u32) {{ self.context = context; }}"
+        )
+        .unwrap();
+        writeln!(out, "}}\n").unwrap();
     }
 
     std::fs::write(&args[2], out).expect("write output");
