@@ -25,6 +25,7 @@
 //! - the eBPF fast-path on the PFs is the permanent failover tier.
 
 pub mod attach;
+pub mod executor;
 pub mod fib_sync;
 pub mod liveness;
 pub mod process;

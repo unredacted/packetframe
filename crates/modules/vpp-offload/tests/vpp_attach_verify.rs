@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use packetframe_common::fib::IpPrefix;
-use packetframe_vpp_offload::attach::{attach_ports, AttachError, PortAttach};
+use packetframe_vpp_offload::attach::{attach_ports, AttachError, AttachMode, PortAttach};
 use packetframe_vpp_offload::fib_sync::{to_prefix, PortIndex};
 use packetframe_vpp_offload::sink::{Capacity, RouteLedger};
 use packetframe_vpp_offload::verify::{verify, Mismatch};
@@ -388,7 +388,7 @@ fn attach_sends_the_three_messages_in_order() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let got = attach_ports(&mut t, &ports(), &[]).expect("attach");
+    let got = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect("attach");
 
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].port, "eth3");
@@ -426,7 +426,8 @@ fn an_sw_if_index_of_zero_is_refused_as_local0() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports(), &[]).expect_err("must refuse index 0");
+    let err =
+        attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect_err("must refuse index 0");
     assert!(matches!(err, AttachError::LocalZero { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("local0"), "{msg}");
@@ -454,7 +455,7 @@ fn a_refused_dev_attach_reports_vpps_own_text() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports(), &[]).expect_err("must fail");
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("dev_attach"), "{msg}");
     assert!(msg.contains("eth3"), "names the port: {msg}");
@@ -485,7 +486,7 @@ fn a_refused_create_port_if_names_the_step_that_failed() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports(), &[]).expect_err("must fail");
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("dev_create_port_if"), "{msg}");
     assert!(msg.contains("-11"), "reports the retval: {msg}");
@@ -516,7 +517,7 @@ fn a_recorded_interface_is_reused_not_re_attached() {
     );
     let mut t = fake.connect();
     let known = vec![("eth3".to_string(), 7u32)];
-    let got = attach_ports(&mut t, &ports(), &known).expect("adopt");
+    let got = attach_ports(&mut t, &ports(), &known, AttachMode::Adopted).expect("adopt");
 
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].sw_if_index, 7);
@@ -553,12 +554,59 @@ fn a_stale_recorded_index_is_refused() {
     );
     let mut t = fake.connect();
     let known = vec![("eth3".to_string(), 7u32)];
-    let err = attach_ports(&mut t, &ports(), &known).expect_err("must refuse");
+    let err = attach_ports(&mut t, &ports(), &known, AttachMode::Adopted).expect_err("must refuse");
     assert!(matches!(err, AttachError::StaleIndex { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("no longer has it"), "{msg}");
     let seen = fake.observed();
     assert!(!seen.contains(&"dev_attach".to_string()), "{seen:?}");
+}
+
+/// The window a schema version cannot close. Process identity is
+/// persisted at spawn; the interface index only after attach. A crash
+/// between those two writes — after `dev_create_port_if` already
+/// succeeded — leaves an adoptable process and no recorded index. The
+/// running VPP may already have the interface, so attaching would
+/// duplicate it, and the dump cannot tell ports apart.
+#[test]
+fn adopting_without_a_recorded_index_refuses_rather_than_duplicating() {
+    let fake = Fake::start_with(
+        "adoptnoidx",
+        AttachBehaviour::default(),
+        LookupBehaviour::Missing,
+        vec![(7, "octeon0/0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Adopted).expect_err("must refuse");
+    assert!(
+        matches!(err, AttachError::UnknownIndexOnAdopt { .. }),
+        "{err:?}"
+    );
+    let seen = fake.observed();
+    assert!(
+        !seen.contains(&"dev_attach".to_string()),
+        "nothing may be attached against a live VPP we cannot identify: {seen:?}"
+    );
+}
+
+/// The same missing index on a FRESH process is fine — a VPP we just
+/// started has no interfaces, so attaching is the only correct move.
+#[test]
+fn a_fresh_process_with_no_recorded_index_attaches_normally() {
+    let fake = Fake::start_with(
+        "freshnoidx",
+        AttachBehaviour {
+            dev_index: 1,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![],
+    );
+    let mut t = fake.connect();
+    let got = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect("attach");
+    assert_eq!(got[0].sw_if_index, 7);
+    assert_eq!(got[0].dev_index, Some(1));
 }
 
 /// A ledger holding `n` installed prefixes, all resolvable.
@@ -739,6 +787,38 @@ fn verify_fails_when_an_owned_interface_has_no_carrier() {
     assert!(!out.dead_interfaces[0].link_up);
     assert!(!out.passed(), "{}", out.summary());
     assert!(out.summary().contains("link_up=false"), "{}", out.summary());
+}
+
+/// An owned index that VPP does not report at all is not healthy by
+/// omission. Only iterating the dump meant a port that vanished after
+/// attach was never examined — and if the random sample happened not to
+/// select a route through it, every probe matched and verify passed on a
+/// port that could not forward.
+#[test]
+fn verify_fails_when_an_owned_interface_is_absent_from_vpp() {
+    let fake = Fake::start_with(
+        "absent",
+        AttachBehaviour::default(),
+        LookupBehaviour::Found { sw_if_index: 7 },
+        // We own 7 and 9; VPP only has 7.
+        vec![(7, "octeon0/0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let (ledger, mut ports) = ledger_with(50);
+    ports.insert("eth2", None, 9);
+
+    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    assert!(
+        out.mismatches.is_empty(),
+        "every route probe still looks perfect: {:?}",
+        out.mismatches
+    );
+    assert_eq!(out.dead_interfaces.len(), 1, "{:?}", out.dead_interfaces);
+    assert_eq!(out.dead_interfaces[0].sw_if_index, 9);
+    assert!(!out.dead_interfaces[0].admin_up);
+    assert!(!out.dead_interfaces[0].link_up);
+    assert!(!out.passed(), "{}", out.summary());
+    assert!(out.summary().contains("absent"), "{}", out.summary());
 }
 
 /// An interface we do NOT own being down is not our problem and must

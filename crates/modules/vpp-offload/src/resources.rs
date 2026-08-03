@@ -45,7 +45,18 @@ use serde::{Deserialize, Serialize};
 /// State-file schema version. Bump on layout change; adopt refuses a
 /// version it doesn't know (upgrade = detach → install → attach, per
 /// plan — no cross-version adoption).
-pub const STATE_VERSION: u32 = 1;
+///
+/// **2** since `PortState::sw_if_index` was added. The field carries
+/// `serde(default)`, so a version-1 file would have parsed and yielded
+/// `None` — and adoption now *depends* on that index, which is exactly
+/// the situation this counter exists to refuse. A `serde(default)` is
+/// the right tool for a field nothing depends on; it is the wrong tool
+/// for one the adopted path cannot work without.
+///
+/// The cost of the bump is bounded and already the documented policy:
+/// an upgrade across it requires `packetframe detach --all` with the
+/// previous binary before attaching with the new one.
+pub const STATE_VERSION: u32 = 2;
 
 pub const STATE_FILE_NAME: &str = "vpp-offload.json";
 
@@ -60,6 +71,22 @@ pub struct PortState {
     /// Worker cores promised for this port (config echo, used by the
     /// startup.conf renderer on adopt without re-parsing config).
     pub cores: u16,
+    /// The `sw_if_index` VPP assigned this port's interface.
+    ///
+    /// **Adoption depends on this being persisted.**
+    /// [`crate::attach::attach_ports`] reuses a recorded index rather
+    /// than re-issuing `dev_attach` against a surviving VPP — which
+    /// would either be refused (fatal, cycling a healthy and possibly
+    /// steered dataplane) or create a duplicate interface the live FIB
+    /// does not reference. Without this field that mapping cannot be
+    /// reconstructed after a packetframe restart, so the adoption path
+    /// would always take the blind-attach branch it exists to avoid.
+    ///
+    /// `None` = not yet attached, or state written before this field
+    /// existed. Both make adoption fall back to a fresh attach, which
+    /// is correct: the index is unknown, so nothing may be reused.
+    #[serde(default)]
+    pub sw_if_index: Option<u32>,
 }
 
 /// Everything attach acquired, in acquisition order. Release walks it
@@ -513,6 +540,7 @@ mod tests {
             iface: "eth4".into(),
             vf_pci: "0002:07:00.1".into(),
             cores: 1,
+            sw_if_index: Some(7),
         });
         st.steer_rules.push(("eth4".into(), vec![1, 2, 3]));
         st.save(&dir).unwrap();
@@ -646,6 +674,7 @@ mod tests {
             iface: "eth4".into(),
             vf_pci: "0002:07:00.1".into(),
             cores: 1,
+            sw_if_index: None,
         };
 
         // No VF at all → provision-cleared message.
