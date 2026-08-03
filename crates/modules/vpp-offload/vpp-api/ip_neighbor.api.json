@@ -1,0 +1,1265 @@
+{
+    "module": "ip_neighbor",
+    "types": [
+        [
+            "address",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_address_union_t",
+                "un",
+                {
+                    "discriminator": "af"
+                }
+            ]
+        ],
+        [
+            "prefix",
+            [
+                "vl_api_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_address_and_mask",
+            [
+                "vl_api_ip4_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip4_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "ip6_address_and_mask",
+            [
+                "vl_api_ip6_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "mprefix",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u16",
+                "grp_address_length"
+            ],
+            [
+                "vl_api_address_union_t",
+                "grp_address"
+            ],
+            [
+                "vl_api_address_union_t",
+                "src_address"
+            ]
+        ],
+        [
+            "ip6_prefix",
+            [
+                "vl_api_ip6_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_prefix",
+            [
+                "vl_api_ip4_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "prefix_matcher",
+            [
+                "u8",
+                "le"
+            ],
+            [
+                "u8",
+                "ge"
+            ],
+            {
+                "comment": "/** \\brief A context for matching prefixes against.  (Think ip prefix list.)\n    The meaning (exact match / want subnets) of an unset matcher is left to the implementer.\n    @param le - le mut be <= to prefix.len. Default: 255 (not set).\n    @param ge - ge must be greater than le and <= max_size of prefix. Default: 255 (not set).\n\n*/"
+            }
+        ],
+        [
+            "ip_neighbor",
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_ip_neighbor_flags_t",
+                "flags"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac_address"
+            ],
+            [
+                "vl_api_address_t",
+                "ip_address"
+            ],
+            {
+                "comment": "/** \\brief IP neighbor\n    @param sw_if_index - interface used to reach neighbor\n    @param flags - flags for the neighbor\n    @param mac_address - l2 address of the neighbor\n    @param ip_address - ip4 or ip6 address of the neighbor\n*/"
+            }
+        ]
+    ],
+    "messages": [
+        [
+            "ip_neighbor_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add"
+            ],
+            [
+                "vl_api_ip_neighbor_t",
+                "neighbor"
+            ],
+            {
+                "crc": "0x0607c257",
+                "options": {},
+                "comment": "/** \\brief IP neighbor add / del request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param is_add - 1 to add neighbor, 0 to delete\n    @param neighbor - the neighbor to add/remove\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "stats_index"
+            ],
+            {
+                "crc": "0x1992deab",
+                "options": {},
+                "comment": "/** \\brief IP neighbor add / del reply\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param retval - return value\n    @param stats_index - the index to use for this neighbor in the stats segment\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            {
+                "crc": "0xd817a484",
+                "options": {},
+                "comment": "/** \\brief Dump IP neighbors\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - the interface to dump neighbors, ~0 == all\n    @param af - address family is ipv[6|4]\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "f64",
+                "age"
+            ],
+            [
+                "vl_api_ip_neighbor_t",
+                "neighbor"
+            ],
+            {
+                "crc": "0xe29d79f0",
+                "options": {},
+                "comment": "/** \\brief IP neighbors dump response\n    @param context - sender context which was passed in the request\n    @param age - time between last update and sending this message, in seconds\n    @param neighbour - the neighbor\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_config",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u32",
+                "max_number"
+            ],
+            [
+                "u32",
+                "max_age"
+            ],
+            [
+                "bool",
+                "recycle"
+            ],
+            {
+                "crc": "0xf4a5cf44",
+                "options": {},
+                "comment": "/** \\brief Enable/disable periodic IP neighbor scan\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param af - Address family v4/v6\n    @param max_number - The maximum number of neighbours that will be created.\n                         default 50k\n    @param max_age - The maximum age (in seconds) before an inactive neighbour\n                     is flushed\n                         default 0 => never\n    @param recycle - If max_number of neighbours is reached and new ones need\n                      to be created should the oldest neighbour be 'recycled'.\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_config_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_neighbor_config_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            {
+                "crc": "0xa5db7bf7",
+                "options": {
+                    "in_progress": null
+                },
+                "comment": "/** \\brief Get neighbor database configuration per AF\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param af - Address family (v4/v6)\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_config_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u32",
+                "max_number"
+            ],
+            [
+                "u32",
+                "max_age"
+            ],
+            [
+                "bool",
+                "recycle"
+            ],
+            {
+                "crc": "0x798e6fdd",
+                "options": {
+                    "in_progress": null
+                },
+                "comment": "/** \\brief Neighbor database configuration reply\n    @param context - sender context, to match reply w/ request\n    @param retval - error (0 is \"no error\")\n    @param af - Address family (v4/v6)\n    @param max_number - The maximum number of neighbours that will be created\n    @param max_age - The maximum age (in seconds) before an inactive neighbour\n                     is flushed\n    @param recycle - If max_number of neighbours is reached and new ones need\n                      to be created, should the oldest neighbour be 'recycled'\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_replace_begin",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief IP neighbour replace begin\n\n    The use-case is that, for some unspecified reason, the control plane\n    has a different set of neighbours it than VPP\n    currently has. The CP would thus like to 'replace' VPP's set\n    only by specifying what the new set shall be, i.e. it is not\n    going to delete anything that already exists, rather, it wants any\n    unspecified neighbors deleted implicitly.\n    The CP declares the start of this procedure with this replace_begin\n    API Call, and when it has populated all neighbours it wants, it calls\n    the below replace_end API. From this point on it is of course free\n    to add and delete neighbours as usual.\n    The underlying mechanism by which VPP implements this replace is\n    intentionally left unspecified.\n\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_replace_begin_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_neighbor_replace_end",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief IP neighbour replace end\n\n    see ip_neighbor_replace_begin description.\n\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_replace_end_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_neighbor_flush",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0x16aa35d2",
+                "options": {},
+                "comment": "/** \\brief IP neighbor flush request - removes *all* neighbours.\n     dynamic and static from API/CLI and dynamic from data-plane.\n\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param af - Flush neighbours of this address family\n    @param sw_if_index - Flush on this interface (~0 => all interfaces)\n*/"
+            }
+        ],
+        [
+            "ip_neighbor_flush_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "want_ip_neighbor_events",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "vl_api_address_t",
+                "ip"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0x73e70a86",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Register for IP neighbour events creation\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param enable - 1 => register for events, 0 => cancel registration\n    @param pid - sender's pid\n    @param ip - exact IP address of interested neighbor resolution event\n    @param sw_if_index - interface on which the IP address is present.\n*/"
+            }
+        ],
+        [
+            "want_ip_neighbor_events_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "ip_neighbor_event",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "vl_api_ip_neighbor_t",
+                "neighbor"
+            ],
+            {
+                "crc": "0xbdb092b2",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Tell client about an IP4 ARP resolution event or\n           MAC/IP info from ARP requests in L2 BDs\n    @param client_index - opaque cookie to identify the sender\n    @param pid - client pid registered to receive notification\n    @param neighbor - new neighbor created\n*/"
+            }
+        ],
+        [
+            "want_ip_neighbor_events_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "vl_api_address_t",
+                "ip"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0x73e70a86",
+                "options": {},
+                "comment": "/** \\brief Register for IP neighbour events (creation or deletion)\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param enable - 1 => register for events, 0 => cancel registration\n    @param pid - sender's pid\n    @param ip - exact IP address of interested neighbor resolution event\n    @param sw_if_index - interface on which the IP address is present.\n*/"
+            }
+        ],
+        [
+            "want_ip_neighbor_events_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_neighbor_event_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "vl_api_ip_neighbor_event_flags_t",
+                "flags"
+            ],
+            [
+                "vl_api_ip_neighbor_t",
+                "neighbor"
+            ],
+            {
+                "crc": "0xc1d53dc0",
+                "options": {},
+                "comment": "/** \\brief Tell client about an IP4 ARP resolution event or\n           MAC/IP info from ARP requests in L2 BDs\n    @param client_index - opaque cookie to identify the sender\n    @param pid - client pid registered to receive notification\n    @param flags - Flags\n    @param neighbor -  neighbor\n*/"
+            }
+        ]
+    ],
+    "unions": [
+        [
+            "address_union",
+            [
+                "vl_api_ip4_address_t",
+                "ip4",
+                {
+                    "case": "ADDRESS_IP4"
+                }
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip6",
+                {
+                    "case": "ADDRESS_IP6"
+                }
+            ]
+        ]
+    ],
+    "enums": [
+        [
+            "address_family",
+            [
+                "ADDRESS_IP4",
+                0
+            ],
+            [
+                "ADDRESS_IP6",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_feature_location",
+            [
+                "IP_API_FEATURE_INPUT",
+                0
+            ],
+            [
+                "IP_API_FEATURE_OUTPUT",
+                1
+            ],
+            [
+                "IP_API_FEATURE_LOCAL",
+                2
+            ],
+            [
+                "IP_API_FEATURE_PUNT",
+                3
+            ],
+            [
+                "IP_API_FEATURE_DROP",
+                4
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_ecn",
+            [
+                "IP_API_ECN_NONE",
+                0
+            ],
+            [
+                "IP_API_ECN_ECT0",
+                1
+            ],
+            [
+                "IP_API_ECN_ECT1",
+                2
+            ],
+            [
+                "IP_API_ECN_CE",
+                3
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_dscp",
+            [
+                "IP_API_DSCP_CS0",
+                0
+            ],
+            [
+                "IP_API_DSCP_CS1",
+                8
+            ],
+            [
+                "IP_API_DSCP_AF11",
+                10
+            ],
+            [
+                "IP_API_DSCP_AF12",
+                12
+            ],
+            [
+                "IP_API_DSCP_AF13",
+                14
+            ],
+            [
+                "IP_API_DSCP_CS2",
+                16
+            ],
+            [
+                "IP_API_DSCP_AF21",
+                18
+            ],
+            [
+                "IP_API_DSCP_AF22",
+                20
+            ],
+            [
+                "IP_API_DSCP_AF23",
+                22
+            ],
+            [
+                "IP_API_DSCP_CS3",
+                24
+            ],
+            [
+                "IP_API_DSCP_AF31",
+                26
+            ],
+            [
+                "IP_API_DSCP_AF32",
+                28
+            ],
+            [
+                "IP_API_DSCP_AF33",
+                30
+            ],
+            [
+                "IP_API_DSCP_CS4",
+                32
+            ],
+            [
+                "IP_API_DSCP_AF41",
+                34
+            ],
+            [
+                "IP_API_DSCP_AF42",
+                36
+            ],
+            [
+                "IP_API_DSCP_AF43",
+                38
+            ],
+            [
+                "IP_API_DSCP_CS5",
+                40
+            ],
+            [
+                "IP_API_DSCP_EF",
+                46
+            ],
+            [
+                "IP_API_DSCP_CS6",
+                48
+            ],
+            [
+                "IP_API_DSCP_CS7",
+                50
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_proto",
+            [
+                "IP_API_PROTO_HOPOPT",
+                0
+            ],
+            [
+                "IP_API_PROTO_ICMP",
+                1
+            ],
+            [
+                "IP_API_PROTO_IGMP",
+                2
+            ],
+            [
+                "IP_API_PROTO_TCP",
+                6
+            ],
+            [
+                "IP_API_PROTO_UDP",
+                17
+            ],
+            [
+                "IP_API_PROTO_GRE",
+                47
+            ],
+            [
+                "IP_API_PROTO_ESP",
+                50
+            ],
+            [
+                "IP_API_PROTO_AH",
+                51
+            ],
+            [
+                "IP_API_PROTO_ICMP6",
+                58
+            ],
+            [
+                "IP_API_PROTO_EIGRP",
+                88
+            ],
+            [
+                "IP_API_PROTO_OSPF",
+                89
+            ],
+            [
+                "IP_API_PROTO_SCTP",
+                132
+            ],
+            [
+                "IP_API_PROTO_RESERVED",
+                255
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "if_status_flags",
+            [
+                "IF_STATUS_API_FLAG_ADMIN_UP",
+                1
+            ],
+            [
+                "IF_STATUS_API_FLAG_LINK_UP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mtu_proto",
+            [
+                "MTU_PROTO_API_L3",
+                0
+            ],
+            [
+                "MTU_PROTO_API_IP4",
+                1
+            ],
+            [
+                "MTU_PROTO_API_IP6",
+                2
+            ],
+            [
+                "MTU_PROTO_API_MPLS",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "link_duplex",
+            [
+                "LINK_DUPLEX_API_UNKNOWN",
+                0
+            ],
+            [
+                "LINK_DUPLEX_API_HALF",
+                1
+            ],
+            [
+                "LINK_DUPLEX_API_FULL",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "sub_if_flags",
+            [
+                "SUB_IF_API_FLAG_NO_TAGS",
+                1
+            ],
+            [
+                "SUB_IF_API_FLAG_ONE_TAG",
+                2
+            ],
+            [
+                "SUB_IF_API_FLAG_TWO_TAGS",
+                4
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AD",
+                8
+            ],
+            [
+                "SUB_IF_API_FLAG_EXACT_MATCH",
+                16
+            ],
+            [
+                "SUB_IF_API_FLAG_DEFAULT",
+                32
+            ],
+            [
+                "SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY",
+                64
+            ],
+            [
+                "SUB_IF_API_FLAG_INNER_VLAN_ID_ANY",
+                128
+            ],
+            [
+                "SUB_IF_API_FLAG_MASK_VNET",
+                254
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AH",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "rx_mode",
+            [
+                "RX_MODE_API_UNKNOWN",
+                0
+            ],
+            [
+                "RX_MODE_API_POLLING",
+                1
+            ],
+            [
+                "RX_MODE_API_INTERRUPT",
+                2
+            ],
+            [
+                "RX_MODE_API_ADAPTIVE",
+                3
+            ],
+            [
+                "RX_MODE_API_DEFAULT",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_type",
+            [
+                "IF_API_TYPE_HARDWARE",
+                0
+            ],
+            [
+                "IF_API_TYPE_SUB",
+                1
+            ],
+            [
+                "IF_API_TYPE_P2P",
+                2
+            ],
+            [
+                "IF_API_TYPE_PIPE",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "direction",
+            [
+                "RX",
+                0
+            ],
+            [
+                "TX",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_neighbor_flags",
+            [
+                "IP_API_NEIGHBOR_FLAG_NONE",
+                0
+            ],
+            [
+                "IP_API_NEIGHBOR_FLAG_STATIC",
+                1
+            ],
+            [
+                "IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY",
+                2
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_neighbor_event_flags",
+            [
+                "IP_NEIGHBOR_API_EVENT_FLAG_ADDED",
+                1
+            ],
+            [
+                "IP_NEIGHBOR_API_EVENT_FLAG_REMOVED",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ]
+    ],
+    "enumflags": [],
+    "services": {
+        "want_ip_neighbor_events": {
+            "reply": "want_ip_neighbor_events_reply",
+            "events": [
+                "ip_neighbor_event"
+            ]
+        },
+        "want_ip_neighbor_events_v2": {
+            "reply": "want_ip_neighbor_events_v2_reply",
+            "events": [
+                "ip_neighbor_event_v2"
+            ]
+        },
+        "ip_neighbor_add_del": {
+            "reply": "ip_neighbor_add_del_reply"
+        },
+        "ip_neighbor_dump": {
+            "reply": "ip_neighbor_details",
+            "stream": true
+        },
+        "ip_neighbor_config": {
+            "reply": "ip_neighbor_config_reply"
+        },
+        "ip_neighbor_config_get": {
+            "reply": "ip_neighbor_config_get_reply"
+        },
+        "ip_neighbor_replace_begin": {
+            "reply": "ip_neighbor_replace_begin_reply"
+        },
+        "ip_neighbor_replace_end": {
+            "reply": "ip_neighbor_replace_end_reply"
+        },
+        "ip_neighbor_flush": {
+            "reply": "ip_neighbor_flush_reply"
+        }
+    },
+    "options": {
+        "version": "1.0.1"
+    },
+    "aliases": {
+        "ip4_address": {
+            "type": "u8",
+            "length": 4
+        },
+        "ip6_address": {
+            "type": "u8",
+            "length": 16
+        },
+        "address_with_prefix": {
+            "type": "vl_api_prefix_t"
+        },
+        "ip4_address_with_prefix": {
+            "type": "vl_api_ip4_prefix_t"
+        },
+        "ip6_address_with_prefix": {
+            "type": "vl_api_ip6_prefix_t"
+        },
+        "mac_address": {
+            "type": "u8",
+            "length": 6
+        },
+        "interface_index": {
+            "type": "u32"
+        }
+    },
+    "vl_api_version": "0x36db39bd",
+    "imports": [
+        "vnet/ip/ip_types.api",
+        "vnet/ethernet/ethernet_types.api",
+        "vnet/interface_types.api"
+    ],
+    "counters": [
+        {
+            "name": "ip4_neighbor",
+            "elements": [
+                {
+                    "name": "throttled",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ARP requests throttled"
+                },
+                {
+                    "name": "resolved",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ARP requests resolved"
+                },
+                {
+                    "name": "no_buffers",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ARP requests out of buffer"
+                },
+                {
+                    "name": "request_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ARP requests sent"
+                },
+                {
+                    "name": "non_arp_adj",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ARPs to non-ARP adjacencies"
+                },
+                {
+                    "name": "no_source_address",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "no source address for ARP request"
+                }
+            ]
+        },
+        {
+            "name": "ip6_neighbor",
+            "elements": [
+                {
+                    "name": "throttled",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "throttled"
+                },
+                {
+                    "name": "drop",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "address overflow drops"
+                },
+                {
+                    "name": "request_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor solicitations sent"
+                },
+                {
+                    "name": "no_source_address",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "no source address for ND solicitation"
+                },
+                {
+                    "name": "no_buffers",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "no buffers"
+                }
+            ]
+        }
+    ],
+    "paths": [
+        [
+            {
+                "path": "/err/ip4-arp",
+                "counter": "ip4_neighbor"
+            },
+            {
+                "path": "/err/ip4-glean",
+                "counter": "ip4_neighbor"
+            },
+            {
+                "path": "/err/ip6-arp",
+                "counter": "ip6_neighbor"
+            },
+            {
+                "path": "/err/ip6-glean",
+                "counter": "ip6_neighbor"
+            }
+        ]
+    ]
+}

@@ -1,0 +1,5664 @@
+{
+    "module": "ip",
+    "types": [
+        [
+            "address",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_address_union_t",
+                "un",
+                {
+                    "discriminator": "af"
+                }
+            ]
+        ],
+        [
+            "prefix",
+            [
+                "vl_api_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_address_and_mask",
+            [
+                "vl_api_ip4_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip4_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "ip6_address_and_mask",
+            [
+                "vl_api_ip6_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "mprefix",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u16",
+                "grp_address_length"
+            ],
+            [
+                "vl_api_address_union_t",
+                "grp_address"
+            ],
+            [
+                "vl_api_address_union_t",
+                "src_address"
+            ]
+        ],
+        [
+            "ip6_prefix",
+            [
+                "vl_api_ip6_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_prefix",
+            [
+                "vl_api_ip4_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "prefix_matcher",
+            [
+                "u8",
+                "le"
+            ],
+            [
+                "u8",
+                "ge"
+            ],
+            {
+                "comment": "/** \\brief A context for matching prefixes against.  (Think ip prefix list.)\n    The meaning (exact match / want subnets) of an unset matcher is left to the implementer.\n    @param le - le mut be <= to prefix.len. Default: 255 (not set).\n    @param ge - ge must be greater than le and <= max_size of prefix. Default: 255 (not set).\n\n*/"
+            }
+        ],
+        [
+            "fib_mpls_label",
+            [
+                "u8",
+                "is_uniform"
+            ],
+            [
+                "u32",
+                "label"
+            ],
+            [
+                "u8",
+                "ttl"
+            ],
+            [
+                "u8",
+                "exp"
+            ],
+            {
+                "comment": "/** \\brief MPLS label\n*/"
+            }
+        ],
+        [
+            "fib_path_nh",
+            [
+                "vl_api_address_union_t",
+                "address"
+            ],
+            [
+                "u32",
+                "via_label"
+            ],
+            [
+                "u32",
+                "obj_id"
+            ],
+            [
+                "u32",
+                "classify_table_index"
+            ],
+            {
+                "comment": "/* \\brief A description of the 'next-hop' for a path\n *  this can be something that needs resolving like an IP address\n *  (into an adjacency or another FIB entry) or the index of another\n *  VPP object that was previously created (i.e. a UDP encap object)\n */"
+            }
+        ],
+        [
+            "fib_path",
+            [
+                "u32",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "u32",
+                "rpf_id"
+            ],
+            [
+                "u8",
+                "weight"
+            ],
+            [
+                "u8",
+                "preference"
+            ],
+            [
+                "vl_api_fib_path_type_t",
+                "type"
+            ],
+            [
+                "vl_api_fib_path_flags_t",
+                "flags"
+            ],
+            [
+                "vl_api_fib_path_nh_proto_t",
+                "proto"
+            ],
+            [
+                "vl_api_fib_path_nh_t",
+                "nh"
+            ],
+            [
+                "u8",
+                "n_labels"
+            ],
+            [
+                "vl_api_fib_mpls_label_t",
+                "label_stack",
+                16
+            ],
+            {
+                "comment": "/** \\brief FIB path\n    @param sw_if_index - index of the interface\n    @param table_id - The table ID in which to find the next-hop address\n                      (for recursive routes, i.e. when the interface is\n\t\t       not given)\n    @param weight - The weight, for UCMP\n    @param preference - The preference of the path. lowest preference\n                        is preferred\n    @param rpf-id - For paths that pop to multicast, this the the\n                    RPF ID the packet will be given (0 and ~0 => unset)\n    @param type - the path type\n    @param flags - path flags\n    @param proto - protocol that describes the next-hop address\n    @param nh - the next-hop/net resolving object\n    @param n_labels - the number of labels present in the stack\n    @param label_stack - a stack of MPLS labels\n*/"
+            }
+        ],
+        [
+            "address",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_address_union_t",
+                "un",
+                {
+                    "discriminator": "af"
+                }
+            ]
+        ],
+        [
+            "prefix",
+            [
+                "vl_api_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_address_and_mask",
+            [
+                "vl_api_ip4_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip4_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "ip6_address_and_mask",
+            [
+                "vl_api_ip6_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "mprefix",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u16",
+                "grp_address_length"
+            ],
+            [
+                "vl_api_address_union_t",
+                "grp_address"
+            ],
+            [
+                "vl_api_address_union_t",
+                "src_address"
+            ]
+        ],
+        [
+            "ip6_prefix",
+            [
+                "vl_api_ip6_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_prefix",
+            [
+                "vl_api_ip4_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "prefix_matcher",
+            [
+                "u8",
+                "le"
+            ],
+            [
+                "u8",
+                "ge"
+            ],
+            {
+                "comment": "/** \\brief A context for matching prefixes against.  (Think ip prefix list.)\n    The meaning (exact match / want subnets) of an unset matcher is left to the implementer.\n    @param le - le mut be <= to prefix.len. Default: 255 (not set).\n    @param ge - ge must be greater than le and <= max_size of prefix. Default: 255 (not set).\n\n*/"
+            }
+        ],
+        [
+            "fib_mpls_label",
+            [
+                "u8",
+                "is_uniform"
+            ],
+            [
+                "u32",
+                "label"
+            ],
+            [
+                "u8",
+                "ttl"
+            ],
+            [
+                "u8",
+                "exp"
+            ],
+            {
+                "comment": "/** \\brief MPLS label\n*/"
+            }
+        ],
+        [
+            "fib_path_nh",
+            [
+                "vl_api_address_union_t",
+                "address"
+            ],
+            [
+                "u32",
+                "via_label"
+            ],
+            [
+                "u32",
+                "obj_id"
+            ],
+            [
+                "u32",
+                "classify_table_index"
+            ],
+            {
+                "comment": "/* \\brief A description of the 'next-hop' for a path\n *  this can be something that needs resolving like an IP address\n *  (into an adjacency or another FIB entry) or the index of another\n *  VPP object that was previously created (i.e. a UDP encap object)\n */"
+            }
+        ],
+        [
+            "fib_path",
+            [
+                "u32",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "u32",
+                "rpf_id"
+            ],
+            [
+                "u8",
+                "weight"
+            ],
+            [
+                "u8",
+                "preference"
+            ],
+            [
+                "vl_api_fib_path_type_t",
+                "type"
+            ],
+            [
+                "vl_api_fib_path_flags_t",
+                "flags"
+            ],
+            [
+                "vl_api_fib_path_nh_proto_t",
+                "proto"
+            ],
+            [
+                "vl_api_fib_path_nh_t",
+                "nh"
+            ],
+            [
+                "u8",
+                "n_labels"
+            ],
+            [
+                "vl_api_fib_mpls_label_t",
+                "label_stack",
+                16
+            ],
+            {
+                "comment": "/** \\brief FIB path\n    @param sw_if_index - index of the interface\n    @param table_id - The table ID in which to find the next-hop address\n                      (for recursive routes, i.e. when the interface is\n\t\t       not given)\n    @param weight - The weight, for UCMP\n    @param preference - The preference of the path. lowest preference\n                        is preferred\n    @param rpf-id - For paths that pop to multicast, this the the\n                    RPF ID the packet will be given (0 and ~0 => unset)\n    @param type - the path type\n    @param flags - path flags\n    @param proto - protocol that describes the next-hop address\n    @param nh - the next-hop/net resolving object\n    @param n_labels - the number of labels present in the stack\n    @param label_stack - a stack of MPLS labels\n*/"
+            }
+        ],
+        [
+            "address",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_address_union_t",
+                "un",
+                {
+                    "discriminator": "af"
+                }
+            ]
+        ],
+        [
+            "prefix",
+            [
+                "vl_api_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_address_and_mask",
+            [
+                "vl_api_ip4_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip4_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "ip6_address_and_mask",
+            [
+                "vl_api_ip6_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "mprefix",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u16",
+                "grp_address_length"
+            ],
+            [
+                "vl_api_address_union_t",
+                "grp_address"
+            ],
+            [
+                "vl_api_address_union_t",
+                "src_address"
+            ]
+        ],
+        [
+            "ip6_prefix",
+            [
+                "vl_api_ip6_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_prefix",
+            [
+                "vl_api_ip4_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "prefix_matcher",
+            [
+                "u8",
+                "le"
+            ],
+            [
+                "u8",
+                "ge"
+            ],
+            {
+                "comment": "/** \\brief A context for matching prefixes against.  (Think ip prefix list.)\n    The meaning (exact match / want subnets) of an unset matcher is left to the implementer.\n    @param le - le mut be <= to prefix.len. Default: 255 (not set).\n    @param ge - ge must be greater than le and <= max_size of prefix. Default: 255 (not set).\n\n*/"
+            }
+        ],
+        [
+            "mfib_path",
+            [
+                "vl_api_mfib_itf_flags_t",
+                "itf_flags"
+            ],
+            [
+                "vl_api_fib_path_t",
+                "path"
+            ],
+            {
+                "comment": "/** \\brief mFIB path\n*/"
+            }
+        ],
+        [
+            "ip_table",
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "bool",
+                "is_ip6"
+            ],
+            [
+                "string",
+                "name",
+                64
+            ],
+            {
+                "comment": "/** \\brief An IP table\n    @param is_ipv6 - V4 or V6 table\n    @param table_id - table ID associated with the route\n                     This table ID will apply to both the unicast\n\t\t      and multicast FIBs\n    @param name - A client provided name/tag for the table. If this is\n                  not set by the client, then VPP will generate something\n\t\t  meaningful.\n*/"
+            }
+        ],
+        [
+            "ip_route",
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "u32",
+                "stats_index"
+            ],
+            [
+                "vl_api_prefix_t",
+                "prefix"
+            ],
+            [
+                "u8",
+                "n_paths"
+            ],
+            [
+                "vl_api_fib_path_t",
+                "paths",
+                0,
+                "n_paths"
+            ],
+            {
+                "comment": "/** \\brief An IP route\n  @param table_id The IP table the route is in\n  @param stats_index The index of the route in the stats segment\n  @param prefix the prefix for the route\n  @param n_paths The number of paths the route has\n  @param src The entity adding the route. either 0 for default\n             or a value returned from fib_source_sdd.\n  @param paths The paths of the route\n*/"
+            }
+        ],
+        [
+            "ip_route_v2",
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "u32",
+                "stats_index"
+            ],
+            [
+                "vl_api_prefix_t",
+                "prefix"
+            ],
+            [
+                "u8",
+                "n_paths"
+            ],
+            [
+                "u8",
+                "src"
+            ],
+            [
+                "vl_api_fib_path_t",
+                "paths",
+                0,
+                "n_paths"
+            ]
+        ],
+        [
+            "ip_mroute",
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "vl_api_mfib_entry_flags_t",
+                "entry_flags"
+            ],
+            [
+                "u32",
+                "rpf_id"
+            ],
+            [
+                "vl_api_mprefix_t",
+                "prefix"
+            ],
+            [
+                "u8",
+                "n_paths"
+            ],
+            [
+                "vl_api_mfib_path_t",
+                "paths",
+                0,
+                "n_paths"
+            ],
+            {
+                "comment": "/** \\brief Add / del route request\n\n    Adds a route, consisting both of the MFIB entry to match packets\n    (which may already exist) and a path to send those packets down.\n    Routes can be entered repeatedly to add multiple paths.  Deletions are\n    per-path.\n\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param table_id - fib table /vrf associated with the route\n    @param is_add - true if adding a route; false if deleting one\n    @param is_ipv6 - true iff all the addresses are v6\n    @param entry_flags - see fib_entry_flag_t\n    @param itf_flags - see mfib_entry_flags_t\n    @param next_hop_afi - see dpo_proto_t; the type of destination description\n    @param src_address - the source of the packet\n    @param grp_address - the group the packet is destined to\n    @param nh_address - the nexthop to forward the packet to\n    @param next_hop_sw_if_index - interface to emit packet on\n\n    BIER AFIs use the BIER imposition ID.  v4 and v6 AFIs use either the\n    interface or the nexthop address.\n\n    Note that if the route is source-specific (S is supplied, not all 0s),\n    the prefix match is treated as exact (prefixlen /32 or /128).\n\n    FIXME not complete yet\n*/"
+            }
+        ],
+        [
+            "punt_redirect",
+            [
+                "vl_api_interface_index_t",
+                "rx_sw_if_index"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "tx_sw_if_index"
+            ],
+            [
+                "vl_api_address_t",
+                "nh"
+            ],
+            {
+                "comment": "/** \\brief Punt redirect type\n    @param rx_sw_if_index - specify the original RX interface of traffic\n                            that should be redirected. ~0 means any interface.\n    @param tx_sw_if_index - the TX interface to which traffic should be\n                            redirected.\n    @param nh - the next-hop to redirect the traffic to.\n    @param is_ipv6 - 1 for IPv6 neighbor, 0 for IPv4\n*/"
+            }
+        ],
+        [
+            "punt_redirect_v2",
+            [
+                "vl_api_interface_index_t",
+                "rx_sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u32",
+                "n_paths"
+            ],
+            [
+                "vl_api_fib_path_t",
+                "paths",
+                0,
+                "n_paths"
+            ],
+            {
+                "comment": "/** \\brief Punt redirect type\n    @param rx_sw_if_index - specify the original RX interface of traffic\n                            that should be redirected. ~0 means any interface.\n    @param af - Address family (ip4 or ip6)\n    @param paths - the TX paths to which traffic should be redirected.\n*/"
+            }
+        ],
+        [
+            "ip_path_mtu",
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "vl_api_address_t",
+                "nh"
+            ],
+            [
+                "u16",
+                "path_mtu"
+            ],
+            {
+                "comment": "/**\n    @brief Set a Path MTU value. i.e. a MTU value for a given neighbour.\n           The neighbour can be described as attached (w/ interface and next-hop)\n           or remote (w/ table_id and next-hop);\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param table_id - table-ID for next-hop\n    @param nh - Next hop\n    @param path_mtu - value to set, 0 is disable.\n*/"
+            }
+        ]
+    ],
+    "messages": [
+        [
+            "ip_table_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0x0ffdaec0",
+                "options": {},
+                "comment": "/** \\brief Add / del table request\n           A table can be added multiple times, but need be deleted only once.\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "ip_table_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_table_add_del_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            [
+                "bool",
+                "create_mfib",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x14e5081f",
+                "options": {},
+                "comment": "/** \\brief Add / del table request - version 2\n           A table can be added multiple times, but need be deleted only once.\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param table - the FIB table to add or del\n    @param create_mfib - whether to create mfib or not\n    @param is_add - add or del\n*/"
+            }
+        ],
+        [
+            "ip_table_add_del_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_table_allocate",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {},
+                "comment": "/** \\brief Allocate an unused table\n           A table can be added multiple times.\n           If a large number of tables are in use (millions), this API might\n           fail to find a free ID with very low probability, and will return\n           EAGAIN. A subsequent attempt may be successful.\n  @param client_index - opaque cookie to identify the sender\n  @param context - sender context, to match reply w/ request\n  @param table - if table.table_id == ~0, vpp allocates an unused table_id and\n                    proceeds as in ip_table_add_del with is_add = true\n                 if table.table_id != ~0, vpp uses the table.table_id and\n                    proceeds as in ip_table_add_del with is_add = true\n                 table.table_id should never be 0\n*/"
+            }
+        ],
+        [
+            "ip_table_allocate_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0x1728303a",
+                "options": {}
+            }
+        ],
+        [
+            "ip_table_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief Dump IP all fib tables\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "ip_table_replace_begin",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {},
+                "comment": "/** \\brief IP table replace being\n\n    The use-case is that, for some unspecified reason, the control plane\n    has a very different set of entries it wants in the table than VPP\n    currently has. The CP would thus like to 'replace' VPP's current table\n    only by specifying what the new set of entries shall be, i.e. it is not\n    going to delete anything that already exists.\n    the CP declares the start of this procedure with this begin_replace\n    API Call, and when it has populated all the entries it wants, it calls\n    the below end_replace API. From this point on it is of course free\n    to add and delete entries as usual.\n    The underlying mechanism by which VPP implements this replace is\n    purposefully left unspecified.\n\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param table - The table to resync\n*/"
+            }
+        ],
+        [
+            "ip_table_replace_begin_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_table_replace_end",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {},
+                "comment": "/** \\brief IP table replace end\n\n    see replace start/\n\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param table - The table that has converged\n*/"
+            }
+        ],
+        [
+            "ip_table_replace_end_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_table_flush",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {},
+                "comment": "/** \\brief IP table flush\n    Flush a table of all routes\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param table - The table to flush\n*/"
+            }
+        ],
+        [
+            "ip_table_flush_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_table_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xc79fca0f",
+                "options": {},
+                "comment": "/** \\brief IP FIB table response\n    @param context - sender context\n    @param table - description of the table\n*/"
+            }
+        ],
+        [
+            "ip_route_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "bool",
+                "is_multipath"
+            ],
+            [
+                "vl_api_ip_route_t",
+                "route"
+            ],
+            {
+                "crc": "0xb8ecfe0d",
+                "options": {},
+                "comment": "/** \\brief Add / del route request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param is_multipath - Set to 1 if these paths will be added/removed\n                          to/from the existing set, or 0 to replace\n\t\t\t  the existing set.\n                          is_add=0 & is_multipath=0 implies delete all paths\n    @param is_add - Are the paths being added or removed\n*/"
+            }
+        ],
+        [
+            "ip_route_add_del_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "bool",
+                "is_multipath"
+            ],
+            [
+                "vl_api_ip_route_v2_t",
+                "route"
+            ],
+            {
+                "crc": "0x521ef330",
+                "options": {
+                    "in_progress": null
+                }
+            }
+        ],
+        [
+            "ip_route_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "stats_index"
+            ],
+            {
+                "crc": "0x1992deab",
+                "options": {}
+            }
+        ],
+        [
+            "ip_route_add_del_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "stats_index"
+            ],
+            {
+                "crc": "0x1992deab",
+                "options": {
+                    "in_progress": null
+                }
+            }
+        ],
+        [
+            "ip_route_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {},
+                "comment": "/** \\brief Dump IP routes from a table\n    @param client_index - opaque cookie to identify the sender\n    @param src The entity adding the route. either 0 for default\n               or a value returned from fib_source_sdd.\n    @param table - The table from which to dump routes (ony ID an AF are needed)\n*/"
+            }
+        ],
+        [
+            "ip_route_v2_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u8",
+                "src"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xd16f72e6",
+                "options": {
+                    "in_progress": null
+                }
+            }
+        ],
+        [
+            "ip_route_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_route_t",
+                "route"
+            ],
+            {
+                "crc": "0xbda8f315",
+                "options": {},
+                "comment": "/** \\brief IP FIB table entry response\n    @param route The route entry in the table\n*/"
+            }
+        ],
+        [
+            "ip_route_v2_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_route_v2_t",
+                "route"
+            ],
+            {
+                "crc": "0xb09aa6c0",
+                "options": {
+                    "in_progress": null
+                }
+            }
+        ],
+        [
+            "ip_route_lookup",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "u8",
+                "exact"
+            ],
+            [
+                "vl_api_prefix_t",
+                "prefix"
+            ],
+            {
+                "crc": "0x710d6471",
+                "options": {},
+                "comment": "/** \\brief Lookup IP route from a table\n    @param client_index - opaque cookie to identify the sender\n    @param table_id - The IP table to look the route up in\n    @param exact - 0 for normal route lookup, 1 for exact match only\n    @param prefix - The prefix (or host) for route lookup.\n*/"
+            }
+        ],
+        [
+            "ip_route_lookup_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "u8",
+                "exact"
+            ],
+            [
+                "vl_api_prefix_t",
+                "prefix"
+            ],
+            {
+                "crc": "0x710d6471",
+                "options": {
+                    "in_progress": null
+                }
+            }
+        ],
+        [
+            "ip_route_lookup_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_ip_route_t",
+                "route"
+            ],
+            {
+                "crc": "0x5d8febcb",
+                "options": {},
+                "comment": "/** \\brief IP FIB table lookup response\n    @param retval - return code of the lookup\n    @param route - The route entry in the table if found\n*/"
+            }
+        ],
+        [
+            "ip_route_lookup_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_ip_route_v2_t",
+                "route"
+            ],
+            {
+                "crc": "0x84cc9e03",
+                "options": {
+                    "in_progress": null
+                }
+            }
+        ],
+        [
+            "set_ip_flow_hash",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "vrf_id"
+            ],
+            [
+                "bool",
+                "is_ipv6"
+            ],
+            [
+                "bool",
+                "src"
+            ],
+            [
+                "bool",
+                "dst"
+            ],
+            [
+                "bool",
+                "sport"
+            ],
+            [
+                "bool",
+                "dport"
+            ],
+            [
+                "bool",
+                "proto"
+            ],
+            [
+                "bool",
+                "reverse"
+            ],
+            [
+                "bool",
+                "symmetric"
+            ],
+            {
+                "crc": "0x084ee09e",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Set the ip flow hash config for a fib request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param vrf_id - vrf/fib id\n    @param is_ipv6 - if non-zero the fib is ip6, else ip4\n    @param src - if non-zero include src in flow hash\n    @param dst - if non-zero include dst in flow hash\n    @param sport - if non-zero include sport in flow hash\n    @param dport - if non-zero include dport in flow hash\n    @param proto -if non-zero include proto in flow hash\n    @param reverse - if non-zero include reverse in flow hash\n    @param symmetric - if non-zero include symmetry in flow hash\n*/"
+            }
+        ],
+        [
+            "set_ip_flow_hash_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "set_ip_flow_hash_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_ip_flow_hash_config_t",
+                "flow_hash_config"
+            ],
+            {
+                "crc": "0x6d132100",
+                "options": {}
+            }
+        ],
+        [
+            "set_ip_flow_hash_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "set_ip_flow_hash_v3",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_ip_flow_hash_config_v2_t",
+                "flow_hash_config"
+            ],
+            {
+                "crc": "0xb7876e07",
+                "options": {
+                    "status": "in_progress"
+                }
+            }
+        ],
+        [
+            "set_ip_flow_hash_v3_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "status": "in_progress"
+                }
+            }
+        ],
+        [
+            "set_ip_flow_hash_router_id",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "router_id"
+            ],
+            {
+                "crc": "0x03e4f48e",
+                "options": {},
+                "comment": "/** \\brief Set the ip flow hash router ID\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param router_id - The ID of the router. Mixed into the hash.\n                       Used to prevent polarisation across a network,\n                       since each router is assumed to have a different ID\n*/"
+            }
+        ],
+        [
+            "set_ip_flow_hash_router_id_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_ip6_enable_disable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            {
+                "crc": "0xae6cfcfb",
+                "options": {},
+                "comment": "/** \\brief IPv6 interface enable / disable request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface used to reach neighbor\n    @param enable - if non-zero enable ip6 on interface, else disable\n*/"
+            }
+        ],
+        [
+            "sw_interface_ip6_enable_disable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_ip4_enable_disable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            {
+                "crc": "0xae6cfcfb",
+                "options": {},
+                "comment": "/** \\brief IPv4 interface enable / disable request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface used to reach neighbor\n    @param enable - if non-zero enable ip4 on interface, else disable\n*/"
+            }
+        ],
+        [
+            "sw_interface_ip4_enable_disable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_mtable_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief Dump IP multicast fib table\n    @param client_index - opaque cookie to identify the sender\n*/"
+            }
+        ],
+        [
+            "ip_mtable_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {}
+            }
+        ],
+        [
+            "ip_mroute_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "bool",
+                "is_multipath"
+            ],
+            [
+                "vl_api_ip_mroute_t",
+                "route"
+            ],
+            {
+                "crc": "0x0dd7e790",
+                "options": {}
+            }
+        ],
+        [
+            "ip_mroute_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "stats_index"
+            ],
+            {
+                "crc": "0x1992deab",
+                "options": {}
+            }
+        ],
+        [
+            "ip_mroute_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_table_t",
+                "table"
+            ],
+            {
+                "crc": "0xb9d2e09e",
+                "options": {},
+                "comment": "/** \\brief Dump IP multicast fib table\n    @param table - The table from which to dump routes (ony ID an AF are needed)\n*/"
+            }
+        ],
+        [
+            "ip_mroute_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_mroute_t",
+                "route"
+            ],
+            {
+                "crc": "0xc5cb23fc",
+                "options": {},
+                "comment": "/** \\brief IP Multicast Route Details\n    @param route - Details of the route\n*/"
+            }
+        ],
+        [
+            "ip_address_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_address_with_prefix_t",
+                "prefix"
+            ],
+            {
+                "crc": "0xee29b797",
+                "options": {}
+            }
+        ],
+        [
+            "ip_address_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_ipv6"
+            ],
+            {
+                "crc": "0x2d033de4",
+                "options": {}
+            }
+        ],
+        [
+            "ip_unnumbered_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "ip_sw_if_index"
+            ],
+            {
+                "crc": "0xcc59bd42",
+                "options": {},
+                "comment": "/** \\brief IP unnumbered configurations\n    @param sw_if_index The interface that has unnumbered configuration\n    @param ip_sw_if_index The IP interface that it is unnumbered to\n*/"
+            }
+        ],
+        [
+            "ip_unnumbered_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief Dump IP unnumbered configurations\n    @param sw_if_index ~0 for all interfaces, else the interface desired\n*/"
+            }
+        ],
+        [
+            "ip_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_ipv6"
+            ],
+            {
+                "crc": "0xeb152d07",
+                "options": {}
+            }
+        ],
+        [
+            "ip_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_ipv6"
+            ],
+            {
+                "crc": "0x98d231ca",
+                "options": {}
+            }
+        ],
+        [
+            "mfib_signal_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "mfib_signal_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "table_id"
+            ],
+            [
+                "vl_api_mprefix_t",
+                "prefix"
+            ],
+            [
+                "u16",
+                "ip_packet_len"
+            ],
+            [
+                "u8",
+                "ip_packet_data",
+                256
+            ],
+            {
+                "crc": "0x6f4a4cfb",
+                "options": {}
+            }
+        ],
+        [
+            "ip_punt_redirect",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_punt_redirect_t",
+                "punt"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x6580f635",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief IP punt redirect\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param punt - punt definition\n    @param is_add - 1 to add neighbor, 0 to delete\n*/"
+            }
+        ],
+        [
+            "ip_punt_redirect_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "ip_punt_redirect_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_ipv6"
+            ],
+            {
+                "crc": "0x2d033de4",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "ip_punt_redirect_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_punt_redirect_t",
+                "punt"
+            ],
+            {
+                "crc": "0x2cef63e7",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "add_del_ip_punt_redirect_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "vl_api_punt_redirect_v2_t",
+                "punt"
+            ],
+            {
+                "crc": "0x9e804227",
+                "options": {},
+                "comment": "/** \\brief Add IP punt redirect rule\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param punt - punt definition\n    @param is_add - 1 to add punt_redirect rule, 0 to delete\n*/"
+            }
+        ],
+        [
+            "add_del_ip_punt_redirect_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_punt_redirect_v2_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            {
+                "crc": "0xd817a484",
+                "options": {}
+            }
+        ],
+        [
+            "ip_punt_redirect_v2_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_punt_redirect_v2_t",
+                "punt"
+            ],
+            {
+                "crc": "0x7ba42e1d",
+                "options": {}
+            }
+        ],
+        [
+            "ip_container_proxy_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_prefix_t",
+                "pfx"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x7df1dff1",
+                "options": {}
+            }
+        ],
+        [
+            "ip_container_proxy_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_container_proxy_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "ip_container_proxy_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_prefix_t",
+                "prefix"
+            ],
+            {
+                "crc": "0xa8085523",
+                "options": {}
+            }
+        ],
+        [
+            "ip_source_and_port_range_check_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "vl_api_prefix_t",
+                "prefix"
+            ],
+            [
+                "u8",
+                "number_of_ranges"
+            ],
+            [
+                "u16",
+                "low_ports",
+                32
+            ],
+            [
+                "u16",
+                "high_ports",
+                32
+            ],
+            [
+                "u32",
+                "vrf_id"
+            ],
+            {
+                "crc": "0x92a067e3",
+                "options": {},
+                "comment": "/** \\brief Configure IP source and L4 port-range check\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param is_ip6 - 1 if source address type is IPv6\n    @param is_add - 1 if add, 0 if delete\n    @param ip - prefix to match\n    @param number_of_ranges - length of low_port and high_port arrays (must match)\n    @param low_ports[32] - up to 32 low end of port range entries (must have corresponding high_ports entry)\n    @param high_ports[32] - up to 32 high end of port range entries (must have corresponding low_ports entry)\n    @param vrf_id - fib table/vrf id to associate the source and port-range check with\n    @note To specify a single port set low_port and high_port entry the same\n*/"
+            }
+        ],
+        [
+            "ip_source_and_port_range_check_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_source_and_port_range_check_interface_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "tcp_in_vrf_id"
+            ],
+            [
+                "u32",
+                "tcp_out_vrf_id"
+            ],
+            [
+                "u32",
+                "udp_in_vrf_id"
+            ],
+            [
+                "u32",
+                "udp_out_vrf_id"
+            ],
+            {
+                "crc": "0xe1ba8987",
+                "options": {},
+                "comment": "/** \\brief Set interface source and L4 port-range request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param interface_id - interface index\n    @param tcp_vrf_id - VRF associated with source and TCP port-range check\n    @param udp_vrf_id - VRF associated with source and TCP port-range check\n*/"
+            }
+        ],
+        [
+            "ip_source_and_port_range_check_interface_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_ip6_set_link_local_address",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip"
+            ],
+            {
+                "crc": "0x1c10f15f",
+                "options": {},
+                "comment": "/** \\brief IPv6 set link local address on interface request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to set link local on\n    @param ip - the new link local address\n*/"
+            }
+        ],
+        [
+            "sw_interface_ip6_set_link_local_address_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_ip6_get_link_local_address",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief IPv6 get link local address on interface request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to set link local on\n*/"
+            }
+        ],
+        [
+            "sw_interface_ip6_get_link_local_address_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip"
+            ],
+            {
+                "crc": "0xd16b7130",
+                "options": {},
+                "comment": "/** \\brief IPv6 link local address detail\n    @param context - sender context, to match reply w/ request\n    @param ip - the link local address\n*/"
+            }
+        ],
+        [
+            "ioam_enable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u16",
+                "id"
+            ],
+            [
+                "bool",
+                "seqno"
+            ],
+            [
+                "bool",
+                "analyse"
+            ],
+            [
+                "bool",
+                "pot_enable"
+            ],
+            [
+                "bool",
+                "trace_enable"
+            ],
+            [
+                "u32",
+                "node_id"
+            ],
+            {
+                "crc": "0x51ccd868",
+                "options": {},
+                "comment": "/** \\brief IOAM enable : Enable in-band OAM\n    @param id - profile id\n    @param seqno - To enable Seqno Processing\n    @param analyse - Enabling analysis of iOAM at decap node\n    @param pow_enable - Proof of Work enabled or not flag\n    @param trace_enable - iOAM Trace enabled or not flag\n*/"
+            }
+        ],
+        [
+            "ioam_enable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ioam_disable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u16",
+                "id"
+            ],
+            {
+                "crc": "0x6b16a45e",
+                "options": {},
+                "comment": "/** \\brief iOAM disable\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param index - MAP Domain index\n*/"
+            }
+        ],
+        [
+            "ioam_disable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_reassembly_set",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "timeout_ms"
+            ],
+            [
+                "u32",
+                "max_reassemblies"
+            ],
+            [
+                "u32",
+                "max_reassembly_length"
+            ],
+            [
+                "u32",
+                "expire_walk_interval_ms"
+            ],
+            [
+                "bool",
+                "is_ip6"
+            ],
+            [
+                "vl_api_ip_reass_type_t",
+                "type"
+            ],
+            {
+                "crc": "0x16467d25",
+                "options": {}
+            }
+        ],
+        [
+            "ip_reassembly_set_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_reassembly_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_ip6"
+            ],
+            [
+                "vl_api_ip_reass_type_t",
+                "type"
+            ],
+            {
+                "crc": "0xea13ff63",
+                "options": {}
+            }
+        ],
+        [
+            "ip_reassembly_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "timeout_ms"
+            ],
+            [
+                "u32",
+                "max_reassemblies"
+            ],
+            [
+                "u32",
+                "max_reassembly_length"
+            ],
+            [
+                "u32",
+                "expire_walk_interval_ms"
+            ],
+            [
+                "bool",
+                "is_ip6"
+            ],
+            {
+                "crc": "0xd5eb8d34",
+                "options": {}
+            }
+        ],
+        [
+            "ip_reassembly_enable_disable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "enable_ip4"
+            ],
+            [
+                "bool",
+                "enable_ip6"
+            ],
+            [
+                "vl_api_ip_reass_type_t",
+                "type"
+            ],
+            {
+                "crc": "0xeb77968d",
+                "options": {},
+                "comment": "/** \\brief Enable/disable reassembly feature\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to enable/disable feature on\n    @param enable_ip4 - enable ip4 reassembly if non-zero, disable if 0\n    @param enable_ip6 - enable ip6 reassembly if non-zero, disable if 0\n*/"
+            }
+        ],
+        [
+            "ip_reassembly_enable_disable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_local_reass_enable_disable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable_ip4"
+            ],
+            [
+                "bool",
+                "enable_ip6"
+            ],
+            {
+                "crc": "0x34e2ccc4",
+                "options": {},
+                "comment": "/** enable/disable full reassembly of packets aimed at our addresses */"
+            }
+        ],
+        [
+            "ip_local_reass_enable_disable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_local_reass_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** get status of local reassembly */"
+            }
+        ],
+        [
+            "ip_local_reass_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "bool",
+                "ip4_is_enabled"
+            ],
+            [
+                "bool",
+                "ip6_is_enabled"
+            ],
+            {
+                "crc": "0x3e93a702",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_update",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_path_mtu_t",
+                "pmtu"
+            ],
+            {
+                "crc": "0x10bbe5cb",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_update_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "cursor"
+            ],
+            {
+                "crc": "0xf75ba505",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "cursor"
+            ],
+            {
+                "crc": "0x53b48f5d",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_ip_path_mtu_t",
+                "pmtu"
+            ],
+            {
+                "crc": "0xac9539a7",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_replace_begin",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_replace_begin_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_replace_end",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "ip_path_mtu_replace_end_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ]
+    ],
+    "unions": [
+        [
+            "address_union",
+            [
+                "vl_api_ip4_address_t",
+                "ip4",
+                {
+                    "case": "ADDRESS_IP4"
+                }
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip6",
+                {
+                    "case": "ADDRESS_IP6"
+                }
+            ]
+        ],
+        [
+            "address_union",
+            [
+                "vl_api_ip4_address_t",
+                "ip4",
+                {
+                    "case": "ADDRESS_IP4"
+                }
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip6",
+                {
+                    "case": "ADDRESS_IP6"
+                }
+            ]
+        ],
+        [
+            "address_union",
+            [
+                "vl_api_ip4_address_t",
+                "ip4",
+                {
+                    "case": "ADDRESS_IP4"
+                }
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip6",
+                {
+                    "case": "ADDRESS_IP6"
+                }
+            ]
+        ]
+    ],
+    "enums": [
+        [
+            "if_status_flags",
+            [
+                "IF_STATUS_API_FLAG_ADMIN_UP",
+                1
+            ],
+            [
+                "IF_STATUS_API_FLAG_LINK_UP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mtu_proto",
+            [
+                "MTU_PROTO_API_L3",
+                0
+            ],
+            [
+                "MTU_PROTO_API_IP4",
+                1
+            ],
+            [
+                "MTU_PROTO_API_IP6",
+                2
+            ],
+            [
+                "MTU_PROTO_API_MPLS",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "link_duplex",
+            [
+                "LINK_DUPLEX_API_UNKNOWN",
+                0
+            ],
+            [
+                "LINK_DUPLEX_API_HALF",
+                1
+            ],
+            [
+                "LINK_DUPLEX_API_FULL",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "sub_if_flags",
+            [
+                "SUB_IF_API_FLAG_NO_TAGS",
+                1
+            ],
+            [
+                "SUB_IF_API_FLAG_ONE_TAG",
+                2
+            ],
+            [
+                "SUB_IF_API_FLAG_TWO_TAGS",
+                4
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AD",
+                8
+            ],
+            [
+                "SUB_IF_API_FLAG_EXACT_MATCH",
+                16
+            ],
+            [
+                "SUB_IF_API_FLAG_DEFAULT",
+                32
+            ],
+            [
+                "SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY",
+                64
+            ],
+            [
+                "SUB_IF_API_FLAG_INNER_VLAN_ID_ANY",
+                128
+            ],
+            [
+                "SUB_IF_API_FLAG_MASK_VNET",
+                254
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AH",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "rx_mode",
+            [
+                "RX_MODE_API_UNKNOWN",
+                0
+            ],
+            [
+                "RX_MODE_API_POLLING",
+                1
+            ],
+            [
+                "RX_MODE_API_INTERRUPT",
+                2
+            ],
+            [
+                "RX_MODE_API_ADAPTIVE",
+                3
+            ],
+            [
+                "RX_MODE_API_DEFAULT",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_type",
+            [
+                "IF_API_TYPE_HARDWARE",
+                0
+            ],
+            [
+                "IF_API_TYPE_SUB",
+                1
+            ],
+            [
+                "IF_API_TYPE_P2P",
+                2
+            ],
+            [
+                "IF_API_TYPE_PIPE",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "direction",
+            [
+                "RX",
+                0
+            ],
+            [
+                "TX",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "address_family",
+            [
+                "ADDRESS_IP4",
+                0
+            ],
+            [
+                "ADDRESS_IP6",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_feature_location",
+            [
+                "IP_API_FEATURE_INPUT",
+                0
+            ],
+            [
+                "IP_API_FEATURE_OUTPUT",
+                1
+            ],
+            [
+                "IP_API_FEATURE_LOCAL",
+                2
+            ],
+            [
+                "IP_API_FEATURE_PUNT",
+                3
+            ],
+            [
+                "IP_API_FEATURE_DROP",
+                4
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_ecn",
+            [
+                "IP_API_ECN_NONE",
+                0
+            ],
+            [
+                "IP_API_ECN_ECT0",
+                1
+            ],
+            [
+                "IP_API_ECN_ECT1",
+                2
+            ],
+            [
+                "IP_API_ECN_CE",
+                3
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_dscp",
+            [
+                "IP_API_DSCP_CS0",
+                0
+            ],
+            [
+                "IP_API_DSCP_CS1",
+                8
+            ],
+            [
+                "IP_API_DSCP_AF11",
+                10
+            ],
+            [
+                "IP_API_DSCP_AF12",
+                12
+            ],
+            [
+                "IP_API_DSCP_AF13",
+                14
+            ],
+            [
+                "IP_API_DSCP_CS2",
+                16
+            ],
+            [
+                "IP_API_DSCP_AF21",
+                18
+            ],
+            [
+                "IP_API_DSCP_AF22",
+                20
+            ],
+            [
+                "IP_API_DSCP_AF23",
+                22
+            ],
+            [
+                "IP_API_DSCP_CS3",
+                24
+            ],
+            [
+                "IP_API_DSCP_AF31",
+                26
+            ],
+            [
+                "IP_API_DSCP_AF32",
+                28
+            ],
+            [
+                "IP_API_DSCP_AF33",
+                30
+            ],
+            [
+                "IP_API_DSCP_CS4",
+                32
+            ],
+            [
+                "IP_API_DSCP_AF41",
+                34
+            ],
+            [
+                "IP_API_DSCP_AF42",
+                36
+            ],
+            [
+                "IP_API_DSCP_AF43",
+                38
+            ],
+            [
+                "IP_API_DSCP_CS5",
+                40
+            ],
+            [
+                "IP_API_DSCP_EF",
+                46
+            ],
+            [
+                "IP_API_DSCP_CS6",
+                48
+            ],
+            [
+                "IP_API_DSCP_CS7",
+                50
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_proto",
+            [
+                "IP_API_PROTO_HOPOPT",
+                0
+            ],
+            [
+                "IP_API_PROTO_ICMP",
+                1
+            ],
+            [
+                "IP_API_PROTO_IGMP",
+                2
+            ],
+            [
+                "IP_API_PROTO_TCP",
+                6
+            ],
+            [
+                "IP_API_PROTO_UDP",
+                17
+            ],
+            [
+                "IP_API_PROTO_GRE",
+                47
+            ],
+            [
+                "IP_API_PROTO_ESP",
+                50
+            ],
+            [
+                "IP_API_PROTO_AH",
+                51
+            ],
+            [
+                "IP_API_PROTO_ICMP6",
+                58
+            ],
+            [
+                "IP_API_PROTO_EIGRP",
+                88
+            ],
+            [
+                "IP_API_PROTO_OSPF",
+                89
+            ],
+            [
+                "IP_API_PROTO_SCTP",
+                132
+            ],
+            [
+                "IP_API_PROTO_RESERVED",
+                255
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "fib_path_nh_proto",
+            [
+                "FIB_API_PATH_NH_PROTO_IP4",
+                0
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_IP6",
+                1
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_MPLS",
+                2
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_ETHERNET",
+                3
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_BIER",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "fib_path_flags",
+            [
+                "FIB_API_PATH_FLAG_NONE",
+                0
+            ],
+            [
+                "FIB_API_PATH_FLAG_RESOLVE_VIA_ATTACHED",
+                1
+            ],
+            [
+                "FIB_API_PATH_FLAG_RESOLVE_VIA_HOST",
+                2
+            ],
+            [
+                "FIB_API_PATH_FLAG_POP_PW_CW",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "fib_path_type",
+            [
+                "FIB_API_PATH_TYPE_NORMAL",
+                0
+            ],
+            [
+                "FIB_API_PATH_TYPE_LOCAL",
+                1
+            ],
+            [
+                "FIB_API_PATH_TYPE_DROP",
+                2
+            ],
+            [
+                "FIB_API_PATH_TYPE_UDP_ENCAP",
+                3
+            ],
+            [
+                "FIB_API_PATH_TYPE_BIER_IMP",
+                4
+            ],
+            [
+                "FIB_API_PATH_TYPE_ICMP_UNREACH",
+                5
+            ],
+            [
+                "FIB_API_PATH_TYPE_ICMP_PROHIBIT",
+                6
+            ],
+            [
+                "FIB_API_PATH_TYPE_SOURCE_LOOKUP",
+                7
+            ],
+            [
+                "FIB_API_PATH_TYPE_DVR",
+                8
+            ],
+            [
+                "FIB_API_PATH_TYPE_INTERFACE_RX",
+                9
+            ],
+            [
+                "FIB_API_PATH_TYPE_CLASSIFY",
+                10
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "address_family",
+            [
+                "ADDRESS_IP4",
+                0
+            ],
+            [
+                "ADDRESS_IP6",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_feature_location",
+            [
+                "IP_API_FEATURE_INPUT",
+                0
+            ],
+            [
+                "IP_API_FEATURE_OUTPUT",
+                1
+            ],
+            [
+                "IP_API_FEATURE_LOCAL",
+                2
+            ],
+            [
+                "IP_API_FEATURE_PUNT",
+                3
+            ],
+            [
+                "IP_API_FEATURE_DROP",
+                4
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_ecn",
+            [
+                "IP_API_ECN_NONE",
+                0
+            ],
+            [
+                "IP_API_ECN_ECT0",
+                1
+            ],
+            [
+                "IP_API_ECN_ECT1",
+                2
+            ],
+            [
+                "IP_API_ECN_CE",
+                3
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_dscp",
+            [
+                "IP_API_DSCP_CS0",
+                0
+            ],
+            [
+                "IP_API_DSCP_CS1",
+                8
+            ],
+            [
+                "IP_API_DSCP_AF11",
+                10
+            ],
+            [
+                "IP_API_DSCP_AF12",
+                12
+            ],
+            [
+                "IP_API_DSCP_AF13",
+                14
+            ],
+            [
+                "IP_API_DSCP_CS2",
+                16
+            ],
+            [
+                "IP_API_DSCP_AF21",
+                18
+            ],
+            [
+                "IP_API_DSCP_AF22",
+                20
+            ],
+            [
+                "IP_API_DSCP_AF23",
+                22
+            ],
+            [
+                "IP_API_DSCP_CS3",
+                24
+            ],
+            [
+                "IP_API_DSCP_AF31",
+                26
+            ],
+            [
+                "IP_API_DSCP_AF32",
+                28
+            ],
+            [
+                "IP_API_DSCP_AF33",
+                30
+            ],
+            [
+                "IP_API_DSCP_CS4",
+                32
+            ],
+            [
+                "IP_API_DSCP_AF41",
+                34
+            ],
+            [
+                "IP_API_DSCP_AF42",
+                36
+            ],
+            [
+                "IP_API_DSCP_AF43",
+                38
+            ],
+            [
+                "IP_API_DSCP_CS5",
+                40
+            ],
+            [
+                "IP_API_DSCP_EF",
+                46
+            ],
+            [
+                "IP_API_DSCP_CS6",
+                48
+            ],
+            [
+                "IP_API_DSCP_CS7",
+                50
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_proto",
+            [
+                "IP_API_PROTO_HOPOPT",
+                0
+            ],
+            [
+                "IP_API_PROTO_ICMP",
+                1
+            ],
+            [
+                "IP_API_PROTO_IGMP",
+                2
+            ],
+            [
+                "IP_API_PROTO_TCP",
+                6
+            ],
+            [
+                "IP_API_PROTO_UDP",
+                17
+            ],
+            [
+                "IP_API_PROTO_GRE",
+                47
+            ],
+            [
+                "IP_API_PROTO_ESP",
+                50
+            ],
+            [
+                "IP_API_PROTO_AH",
+                51
+            ],
+            [
+                "IP_API_PROTO_ICMP6",
+                58
+            ],
+            [
+                "IP_API_PROTO_EIGRP",
+                88
+            ],
+            [
+                "IP_API_PROTO_OSPF",
+                89
+            ],
+            [
+                "IP_API_PROTO_SCTP",
+                132
+            ],
+            [
+                "IP_API_PROTO_RESERVED",
+                255
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "fib_path_nh_proto",
+            [
+                "FIB_API_PATH_NH_PROTO_IP4",
+                0
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_IP6",
+                1
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_MPLS",
+                2
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_ETHERNET",
+                3
+            ],
+            [
+                "FIB_API_PATH_NH_PROTO_BIER",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "fib_path_flags",
+            [
+                "FIB_API_PATH_FLAG_NONE",
+                0
+            ],
+            [
+                "FIB_API_PATH_FLAG_RESOLVE_VIA_ATTACHED",
+                1
+            ],
+            [
+                "FIB_API_PATH_FLAG_RESOLVE_VIA_HOST",
+                2
+            ],
+            [
+                "FIB_API_PATH_FLAG_POP_PW_CW",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "fib_path_type",
+            [
+                "FIB_API_PATH_TYPE_NORMAL",
+                0
+            ],
+            [
+                "FIB_API_PATH_TYPE_LOCAL",
+                1
+            ],
+            [
+                "FIB_API_PATH_TYPE_DROP",
+                2
+            ],
+            [
+                "FIB_API_PATH_TYPE_UDP_ENCAP",
+                3
+            ],
+            [
+                "FIB_API_PATH_TYPE_BIER_IMP",
+                4
+            ],
+            [
+                "FIB_API_PATH_TYPE_ICMP_UNREACH",
+                5
+            ],
+            [
+                "FIB_API_PATH_TYPE_ICMP_PROHIBIT",
+                6
+            ],
+            [
+                "FIB_API_PATH_TYPE_SOURCE_LOOKUP",
+                7
+            ],
+            [
+                "FIB_API_PATH_TYPE_DVR",
+                8
+            ],
+            [
+                "FIB_API_PATH_TYPE_INTERFACE_RX",
+                9
+            ],
+            [
+                "FIB_API_PATH_TYPE_CLASSIFY",
+                10
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "address_family",
+            [
+                "ADDRESS_IP4",
+                0
+            ],
+            [
+                "ADDRESS_IP6",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_feature_location",
+            [
+                "IP_API_FEATURE_INPUT",
+                0
+            ],
+            [
+                "IP_API_FEATURE_OUTPUT",
+                1
+            ],
+            [
+                "IP_API_FEATURE_LOCAL",
+                2
+            ],
+            [
+                "IP_API_FEATURE_PUNT",
+                3
+            ],
+            [
+                "IP_API_FEATURE_DROP",
+                4
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_ecn",
+            [
+                "IP_API_ECN_NONE",
+                0
+            ],
+            [
+                "IP_API_ECN_ECT0",
+                1
+            ],
+            [
+                "IP_API_ECN_ECT1",
+                2
+            ],
+            [
+                "IP_API_ECN_CE",
+                3
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_dscp",
+            [
+                "IP_API_DSCP_CS0",
+                0
+            ],
+            [
+                "IP_API_DSCP_CS1",
+                8
+            ],
+            [
+                "IP_API_DSCP_AF11",
+                10
+            ],
+            [
+                "IP_API_DSCP_AF12",
+                12
+            ],
+            [
+                "IP_API_DSCP_AF13",
+                14
+            ],
+            [
+                "IP_API_DSCP_CS2",
+                16
+            ],
+            [
+                "IP_API_DSCP_AF21",
+                18
+            ],
+            [
+                "IP_API_DSCP_AF22",
+                20
+            ],
+            [
+                "IP_API_DSCP_AF23",
+                22
+            ],
+            [
+                "IP_API_DSCP_CS3",
+                24
+            ],
+            [
+                "IP_API_DSCP_AF31",
+                26
+            ],
+            [
+                "IP_API_DSCP_AF32",
+                28
+            ],
+            [
+                "IP_API_DSCP_AF33",
+                30
+            ],
+            [
+                "IP_API_DSCP_CS4",
+                32
+            ],
+            [
+                "IP_API_DSCP_AF41",
+                34
+            ],
+            [
+                "IP_API_DSCP_AF42",
+                36
+            ],
+            [
+                "IP_API_DSCP_AF43",
+                38
+            ],
+            [
+                "IP_API_DSCP_CS5",
+                40
+            ],
+            [
+                "IP_API_DSCP_EF",
+                46
+            ],
+            [
+                "IP_API_DSCP_CS6",
+                48
+            ],
+            [
+                "IP_API_DSCP_CS7",
+                50
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_proto",
+            [
+                "IP_API_PROTO_HOPOPT",
+                0
+            ],
+            [
+                "IP_API_PROTO_ICMP",
+                1
+            ],
+            [
+                "IP_API_PROTO_IGMP",
+                2
+            ],
+            [
+                "IP_API_PROTO_TCP",
+                6
+            ],
+            [
+                "IP_API_PROTO_UDP",
+                17
+            ],
+            [
+                "IP_API_PROTO_GRE",
+                47
+            ],
+            [
+                "IP_API_PROTO_ESP",
+                50
+            ],
+            [
+                "IP_API_PROTO_AH",
+                51
+            ],
+            [
+                "IP_API_PROTO_ICMP6",
+                58
+            ],
+            [
+                "IP_API_PROTO_EIGRP",
+                88
+            ],
+            [
+                "IP_API_PROTO_OSPF",
+                89
+            ],
+            [
+                "IP_API_PROTO_SCTP",
+                132
+            ],
+            [
+                "IP_API_PROTO_RESERVED",
+                255
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "mfib_entry_flags",
+            [
+                "MFIB_API_ENTRY_FLAG_NONE",
+                0
+            ],
+            [
+                "MFIB_API_ENTRY_FLAG_SIGNAL",
+                1
+            ],
+            [
+                "MFIB_API_ENTRY_FLAG_DROP",
+                2
+            ],
+            [
+                "MFIB_API_ENTRY_FLAG_CONNECTED",
+                4
+            ],
+            [
+                "MFIB_API_ENTRY_FLAG_ACCEPT_ALL_ITF",
+                8
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mfib_itf_flags",
+            [
+                "MFIB_API_ITF_FLAG_NONE",
+                0
+            ],
+            [
+                "MFIB_API_ITF_FLAG_NEGATE_SIGNAL",
+                1
+            ],
+            [
+                "MFIB_API_ITF_FLAG_ACCEPT",
+                2
+            ],
+            [
+                "MFIB_API_ITF_FLAG_FORWARD",
+                4
+            ],
+            [
+                "MFIB_API_ITF_FLAG_SIGNAL_PRESENT",
+                8
+            ],
+            [
+                "MFIB_API_ITF_FLAG_DONT_PRESERVE",
+                16
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_status_flags",
+            [
+                "IF_STATUS_API_FLAG_ADMIN_UP",
+                1
+            ],
+            [
+                "IF_STATUS_API_FLAG_LINK_UP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mtu_proto",
+            [
+                "MTU_PROTO_API_L3",
+                0
+            ],
+            [
+                "MTU_PROTO_API_IP4",
+                1
+            ],
+            [
+                "MTU_PROTO_API_IP6",
+                2
+            ],
+            [
+                "MTU_PROTO_API_MPLS",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "link_duplex",
+            [
+                "LINK_DUPLEX_API_UNKNOWN",
+                0
+            ],
+            [
+                "LINK_DUPLEX_API_HALF",
+                1
+            ],
+            [
+                "LINK_DUPLEX_API_FULL",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "sub_if_flags",
+            [
+                "SUB_IF_API_FLAG_NO_TAGS",
+                1
+            ],
+            [
+                "SUB_IF_API_FLAG_ONE_TAG",
+                2
+            ],
+            [
+                "SUB_IF_API_FLAG_TWO_TAGS",
+                4
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AD",
+                8
+            ],
+            [
+                "SUB_IF_API_FLAG_EXACT_MATCH",
+                16
+            ],
+            [
+                "SUB_IF_API_FLAG_DEFAULT",
+                32
+            ],
+            [
+                "SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY",
+                64
+            ],
+            [
+                "SUB_IF_API_FLAG_INNER_VLAN_ID_ANY",
+                128
+            ],
+            [
+                "SUB_IF_API_FLAG_MASK_VNET",
+                254
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AH",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "rx_mode",
+            [
+                "RX_MODE_API_UNKNOWN",
+                0
+            ],
+            [
+                "RX_MODE_API_POLLING",
+                1
+            ],
+            [
+                "RX_MODE_API_INTERRUPT",
+                2
+            ],
+            [
+                "RX_MODE_API_ADAPTIVE",
+                3
+            ],
+            [
+                "RX_MODE_API_DEFAULT",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_type",
+            [
+                "IF_API_TYPE_HARDWARE",
+                0
+            ],
+            [
+                "IF_API_TYPE_SUB",
+                1
+            ],
+            [
+                "IF_API_TYPE_P2P",
+                2
+            ],
+            [
+                "IF_API_TYPE_PIPE",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "direction",
+            [
+                "RX",
+                0
+            ],
+            [
+                "TX",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_reass_type",
+            [
+                "IP_REASS_TYPE_FULL",
+                0
+            ],
+            [
+                "IP_REASS_TYPE_SHALLOW_VIRTUAL",
+                1
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ]
+    ],
+    "enumflags": [
+        [
+            "ip_flow_hash_config",
+            [
+                "IP_API_FLOW_HASH_SRC_IP",
+                1
+            ],
+            [
+                "IP_API_FLOW_HASH_DST_IP",
+                2
+            ],
+            [
+                "IP_API_FLOW_HASH_SRC_PORT",
+                4
+            ],
+            [
+                "IP_API_FLOW_HASH_DST_PORT",
+                8
+            ],
+            [
+                "IP_API_FLOW_HASH_PROTO",
+                16
+            ],
+            [
+                "IP_API_FLOW_HASH_REVERSE",
+                32
+            ],
+            [
+                "IP_API_FLOW_HASH_SYMETRIC",
+                64
+            ],
+            [
+                "IP_API_FLOW_HASH_FLOW_LABEL",
+                128
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "ip_flow_hash_config_v2",
+            [
+                "IP_API_V2_FLOW_HASH_SRC_IP",
+                1
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_DST_IP",
+                2
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_SRC_PORT",
+                4
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_DST_PORT",
+                8
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_PROTO",
+                16
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_REVERSE",
+                32
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_SYMETRIC",
+                64
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_FLOW_LABEL",
+                128
+            ],
+            [
+                "IP_API_V2_FLOW_HASH_GTPV1_TEID",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ]
+    ],
+    "services": {
+        "ip_path_mtu_get": {
+            "reply": "ip_path_mtu_get_reply",
+            "stream": true,
+            "stream_msg": "ip_path_mtu_details"
+        },
+        "ip_table_add_del": {
+            "reply": "ip_table_add_del_reply"
+        },
+        "ip_table_add_del_v2": {
+            "reply": "ip_table_add_del_v2_reply"
+        },
+        "ip_table_allocate": {
+            "reply": "ip_table_allocate_reply"
+        },
+        "ip_table_dump": {
+            "reply": "ip_table_details",
+            "stream": true
+        },
+        "ip_table_replace_begin": {
+            "reply": "ip_table_replace_begin_reply"
+        },
+        "ip_table_replace_end": {
+            "reply": "ip_table_replace_end_reply"
+        },
+        "ip_table_flush": {
+            "reply": "ip_table_flush_reply"
+        },
+        "ip_route_add_del": {
+            "reply": "ip_route_add_del_reply"
+        },
+        "ip_route_add_del_v2": {
+            "reply": "ip_route_add_del_v2_reply"
+        },
+        "ip_route_dump": {
+            "reply": "ip_route_details",
+            "stream": true
+        },
+        "ip_route_v2_dump": {
+            "reply": "ip_route_v2_details",
+            "stream": true
+        },
+        "ip_route_lookup": {
+            "reply": "ip_route_lookup_reply"
+        },
+        "ip_route_lookup_v2": {
+            "reply": "ip_route_lookup_v2_reply"
+        },
+        "set_ip_flow_hash": {
+            "reply": "set_ip_flow_hash_reply"
+        },
+        "set_ip_flow_hash_v2": {
+            "reply": "set_ip_flow_hash_v2_reply"
+        },
+        "set_ip_flow_hash_v3": {
+            "reply": "set_ip_flow_hash_v3_reply"
+        },
+        "set_ip_flow_hash_router_id": {
+            "reply": "set_ip_flow_hash_router_id_reply"
+        },
+        "sw_interface_ip6_enable_disable": {
+            "reply": "sw_interface_ip6_enable_disable_reply"
+        },
+        "sw_interface_ip4_enable_disable": {
+            "reply": "sw_interface_ip4_enable_disable_reply"
+        },
+        "ip_mtable_dump": {
+            "reply": "ip_mtable_details",
+            "stream": true
+        },
+        "ip_mroute_add_del": {
+            "reply": "ip_mroute_add_del_reply"
+        },
+        "ip_mroute_dump": {
+            "reply": "ip_mroute_details",
+            "stream": true
+        },
+        "ip_address_dump": {
+            "reply": "ip_address_details",
+            "stream": true
+        },
+        "ip_unnumbered_dump": {
+            "reply": "ip_unnumbered_details",
+            "stream": true
+        },
+        "ip_dump": {
+            "reply": "ip_details",
+            "stream": true
+        },
+        "mfib_signal_dump": {
+            "reply": "mfib_signal_details",
+            "stream": true
+        },
+        "ip_punt_redirect": {
+            "reply": "ip_punt_redirect_reply"
+        },
+        "ip_punt_redirect_dump": {
+            "reply": "ip_punt_redirect_details",
+            "stream": true
+        },
+        "add_del_ip_punt_redirect_v2": {
+            "reply": "add_del_ip_punt_redirect_v2_reply"
+        },
+        "ip_punt_redirect_v2_dump": {
+            "reply": "ip_punt_redirect_v2_details",
+            "stream": true
+        },
+        "ip_container_proxy_add_del": {
+            "reply": "ip_container_proxy_add_del_reply"
+        },
+        "ip_container_proxy_dump": {
+            "reply": "ip_container_proxy_details",
+            "stream": true
+        },
+        "ip_source_and_port_range_check_add_del": {
+            "reply": "ip_source_and_port_range_check_add_del_reply"
+        },
+        "ip_source_and_port_range_check_interface_add_del": {
+            "reply": "ip_source_and_port_range_check_interface_add_del_reply"
+        },
+        "sw_interface_ip6_set_link_local_address": {
+            "reply": "sw_interface_ip6_set_link_local_address_reply"
+        },
+        "sw_interface_ip6_get_link_local_address": {
+            "reply": "sw_interface_ip6_get_link_local_address_reply"
+        },
+        "ioam_enable": {
+            "reply": "ioam_enable_reply"
+        },
+        "ioam_disable": {
+            "reply": "ioam_disable_reply"
+        },
+        "ip_reassembly_set": {
+            "reply": "ip_reassembly_set_reply"
+        },
+        "ip_reassembly_get": {
+            "reply": "ip_reassembly_get_reply"
+        },
+        "ip_reassembly_enable_disable": {
+            "reply": "ip_reassembly_enable_disable_reply"
+        },
+        "ip_local_reass_enable_disable": {
+            "reply": "ip_local_reass_enable_disable_reply"
+        },
+        "ip_local_reass_get": {
+            "reply": "ip_local_reass_get_reply"
+        },
+        "ip_path_mtu_update": {
+            "reply": "ip_path_mtu_update_reply"
+        },
+        "ip_path_mtu_replace_begin": {
+            "reply": "ip_path_mtu_replace_begin_reply"
+        },
+        "ip_path_mtu_replace_end": {
+            "reply": "ip_path_mtu_replace_end_reply"
+        }
+    },
+    "options": {
+        "version": "3.2.0"
+    },
+    "aliases": {
+        "interface_index": {
+            "type": "u32"
+        },
+        "ip4_address": {
+            "type": "u8",
+            "length": 4
+        },
+        "ip6_address": {
+            "type": "u8",
+            "length": 16
+        },
+        "address_with_prefix": {
+            "type": "vl_api_prefix_t"
+        },
+        "ip4_address_with_prefix": {
+            "type": "vl_api_ip4_prefix_t"
+        },
+        "ip6_address_with_prefix": {
+            "type": "vl_api_ip6_prefix_t"
+        },
+        "mac_address": {
+            "type": "u8",
+            "length": 6
+        }
+    },
+    "vl_api_version": "0xc55aec44",
+    "imports": [
+        "vnet/interface_types.api",
+        "vnet/fib/fib_types.api",
+        "vnet/ip/ip_types.api",
+        "vnet/ethernet/ethernet_types.api",
+        "vnet/mfib/mfib_types.api",
+        "vnet/fib/fib_types.api",
+        "vnet/ip/ip_types.api",
+        "vnet/ip/ip_types.api",
+        "vnet/interface_types.api"
+    ],
+    "counters": [
+        {
+            "name": "ip_frag",
+            "elements": [
+                {
+                    "name": "none",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "packet fragmented"
+                },
+                {
+                    "name": "small_packet",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "packet smaller than MTU"
+                },
+                {
+                    "name": "fragment_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "number of sent fragments"
+                },
+                {
+                    "name": "cant_fragment_header",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "can't fragment header"
+                },
+                {
+                    "name": "dont_fragment_set",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "can't fragment this packet"
+                },
+                {
+                    "name": "malformed",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "malformed packet"
+                },
+                {
+                    "name": "memory",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "could not allocate buffer"
+                },
+                {
+                    "name": "unknown",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unknown error"
+                }
+            ]
+        },
+        {
+            "name": "ip4",
+            "elements": [
+                {
+                    "name": "none",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "valid ip4 packets"
+                },
+                {
+                    "name": "too_short",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 length < 20 bytes"
+                },
+                {
+                    "name": "bad_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 length > l2 length"
+                },
+                {
+                    "name": "bad_checksum",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "bad ip4 checksum"
+                },
+                {
+                    "name": "version",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 version != 4"
+                },
+                {
+                    "name": "options",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 options present"
+                },
+                {
+                    "name": "fragment_offset_one",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 fragment offset == 1"
+                },
+                {
+                    "name": "time_expired",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 ttl <= 1"
+                },
+                {
+                    "name": "hdr_too_short",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 IHL < 5"
+                },
+                {
+                    "name": "mtu_exceeded",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 MTU exceeded and DF set"
+                },
+                {
+                    "name": "dst_lookup_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 destination lookup miss"
+                },
+                {
+                    "name": "src_lookup_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 source lookup miss"
+                },
+                {
+                    "name": "drop",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 drop"
+                },
+                {
+                    "name": "punt",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 punt"
+                },
+                {
+                    "name": "same_interface",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 egress interface same as ingress"
+                },
+                {
+                    "name": "unknown_protocol",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unknown ip protocol"
+                },
+                {
+                    "name": "tcp_checksum",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "bad tcp checksum"
+                },
+                {
+                    "name": "udp_checksum",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "bad udp checksum"
+                },
+                {
+                    "name": "udp_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "inconsistent udp/ip lengths"
+                },
+                {
+                    "name": "spoofed_local_packets",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip4 spoofed local-address packet drops"
+                },
+                {
+                    "name": "inacl_table_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "input ACL table-miss drops"
+                },
+                {
+                    "name": "inacl_session_deny",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "input ACL session deny drops"
+                },
+                {
+                    "name": "outacl_table_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "output ACL table-miss drops"
+                },
+                {
+                    "name": "outacl_session_deny",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "output ACL session deny drops"
+                },
+                {
+                    "name": "rpf_failure",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "Multicast RPF check failed"
+                },
+                {
+                    "name": "reass_duplicate_fragment",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "duplicate/overlapping fragments"
+                },
+                {
+                    "name": "reass_limit_reached",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "drops due to concurrent reassemblies limit"
+                },
+                {
+                    "name": "reass_fragment_chain_too_long",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragment chain too long (drop)"
+                },
+                {
+                    "name": "reass_no_buf",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "out of buffers (drop)"
+                },
+                {
+                    "name": "reass_malformed_packet",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "malformed packets"
+                },
+                {
+                    "name": "reass_internal_error",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "drops due to internal reassembly error"
+                },
+                {
+                    "name": "reass_timeout",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragments dropped due to reassembly timeout"
+                },
+                {
+                    "name": "reass_to_custom_app",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "send to custom drop app"
+                },
+                {
+                    "name": "reass_success",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "successful reassemblies"
+                },
+                {
+                    "name": "reass_fragments_reassembled",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragments reassembled"
+                },
+                {
+                    "name": "reass_fragments_rcvd",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragments received"
+                },
+                {
+                    "name": "reass_unsupp_ip_prot",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unsupported ip protocol"
+                }
+            ]
+        },
+        {
+            "name": "ip6",
+            "elements": [
+                {
+                    "name": "none",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "valid ip6 packets"
+                },
+                {
+                    "name": "too_short",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 length < 40 bytes"
+                },
+                {
+                    "name": "bad_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 length > l2 length"
+                },
+                {
+                    "name": "version",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 version != 6"
+                },
+                {
+                    "name": "time_expired",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 ttl <= 1"
+                },
+                {
+                    "name": "mtu_exceeded",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 MTU exceeded"
+                },
+                {
+                    "name": "dst_lookup_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 destination lookup miss"
+                },
+                {
+                    "name": "src_lookup_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 source lookup miss"
+                },
+                {
+                    "name": "drop",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 drop"
+                },
+                {
+                    "name": "punt",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 punt"
+                },
+                {
+                    "name": "unknown_protocol",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unknown ip protocol"
+                },
+                {
+                    "name": "udp_checksum",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "bad udp checksum"
+                },
+                {
+                    "name": "icmp_checksum",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "bad icmp checksum"
+                },
+                {
+                    "name": "udp_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "inconsistent udp/ip lengths"
+                },
+                {
+                    "name": "unknown_udp_port",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "no listener for udp port"
+                },
+                {
+                    "name": "spoofed_local_packets",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "ip6 spoofed local-address packet drops"
+                },
+                {
+                    "name": "inacl_table_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "input ACL table-miss drops"
+                },
+                {
+                    "name": "inacl_session_deny",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "input ACL session deny drops"
+                },
+                {
+                    "name": "outacl_table_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "output ACL table-miss drops"
+                },
+                {
+                    "name": "outacl_session_deny",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "output ACL session deny drops"
+                },
+                {
+                    "name": "rpf_failure",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "Multicast RPF check failed"
+                },
+                {
+                    "name": "reass_missing_upper",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "missing-upper layer drops"
+                },
+                {
+                    "name": "reass_duplicate_fragment",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "duplicate fragments"
+                },
+                {
+                    "name": "reass_overlapping_fragment",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "overlapping fragments"
+                },
+                {
+                    "name": "reass_limit_reached",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "drops due to concurrent reassemblies limit"
+                },
+                {
+                    "name": "reass_fragment_chain_too_long",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragment chain too long (drop)"
+                },
+                {
+                    "name": "reass_no_buf",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "out of buffers (drop)"
+                },
+                {
+                    "name": "reass_timeout",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragments dropped due to reassembly timeout"
+                },
+                {
+                    "name": "reass_internal_error",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "drops due to internal reassembly error"
+                },
+                {
+                    "name": "reass_invalid_frag_len",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "invalid fragment length"
+                },
+                {
+                    "name": "reass_to_custom_app",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "send to custom drop app"
+                },
+                {
+                    "name": "reass_no_frag_hdr",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "no fragmentation header"
+                },
+                {
+                    "name": "reass_invalid_frag_size",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "drop due to invalid fragment size"
+                },
+                {
+                    "name": "reass_success",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "successful reassemblies"
+                },
+                {
+                    "name": "reass_fragments_reassembled",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragments reassembled"
+                },
+                {
+                    "name": "reass_fragments_rcvd",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "fragments received"
+                },
+                {
+                    "name": "reass_unsupp_ip_proto",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unsupported ip protocol"
+                }
+            ]
+        },
+        {
+            "name": "icmp4",
+            "elements": [
+                {
+                    "name": "none",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "valid packets"
+                },
+                {
+                    "name": "unknown_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unknown type"
+                },
+                {
+                    "name": "invalid_code_for_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "invalid code for type"
+                },
+                {
+                    "name": "invalid_hop_limit_for_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "hop_limit != 255"
+                },
+                {
+                    "name": "length_too_small_for_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "payload length too small for type"
+                },
+                {
+                    "name": "options_with_odd_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "total option length not multiple of 8 bytes"
+                },
+                {
+                    "name": "option_with_zero_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "option has zero length"
+                },
+                {
+                    "name": "echo_replies_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "echo replies sent"
+                },
+                {
+                    "name": "dst_lookup_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "icmp6 dst address lookup misses"
+                },
+                {
+                    "name": "dest_unreach_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "destination unreachable response sent"
+                },
+                {
+                    "name": "ttl_expire_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "hop limit exceeded response sent"
+                },
+                {
+                    "name": "param_problem_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "parameter problem response sent"
+                },
+                {
+                    "name": "drop",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "error message dropped"
+                }
+            ]
+        },
+        {
+            "name": "icmp6",
+            "elements": [
+                {
+                    "name": "none",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "valid packets"
+                },
+                {
+                    "name": "unknown_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "unknown type"
+                },
+                {
+                    "name": "invalid_code_for_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "invalid code for type"
+                },
+                {
+                    "name": "invalid_hop_limit_for_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "hop_limit != 255"
+                },
+                {
+                    "name": "length_too_small_for_type",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "payload length too small for type"
+                },
+                {
+                    "name": "options_with_odd_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "total option length not multiple of 8 bytes"
+                },
+                {
+                    "name": "option_with_zero_length",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "option has zero length"
+                },
+                {
+                    "name": "echo_replies_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "echo replies sent"
+                },
+                {
+                    "name": "neighbor_solicitation_source_not_on_link",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor solicitations from source not on link"
+                },
+                {
+                    "name": "neighbor_solicitation_source_unknown",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor solicitations for unknown targets"
+                },
+                {
+                    "name": "neighbor_advertisements_tx",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor advertisements sent"
+                },
+                {
+                    "name": "neighbor_advertisements_rx",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor advertisements received"
+                },
+                {
+                    "name": "router_solicitation_source_not_on_link",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "router solicitations from source not on link"
+                },
+                {
+                    "name": "router_solicitation_unsupported_intf",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor discovery unsupported interface"
+                },
+                {
+                    "name": "router_solicitation_radv_not_config",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor discovery not configured"
+                },
+                {
+                    "name": "router_advertisement_source_not_link_local",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "router advertisement source not link local"
+                },
+                {
+                    "name": "router_advertisements_tx",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "router advertisements sent"
+                },
+                {
+                    "name": "router_advertisements_rx",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "router advertisements received"
+                },
+                {
+                    "name": "dst_lookup_miss",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "icmp6 dst address lookup misses"
+                },
+                {
+                    "name": "dest_unreach_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "destination unreachable response sent"
+                },
+                {
+                    "name": "packet_too_big_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "packet too big response sent"
+                },
+                {
+                    "name": "ttl_expire_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "hop limit exceeded response sent"
+                },
+                {
+                    "name": "param_problem_sent",
+                    "severity": "info",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "parameter problem response sent"
+                },
+                {
+                    "name": "drop",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "error message dropped"
+                },
+                {
+                    "name": "alloc_failure",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "buffer allocation failure"
+                }
+            ]
+        }
+    ],
+    "paths": [
+        [
+            {
+                "path": "/err/ip-frag",
+                "counter": "ip_frag"
+            },
+            {
+                "path": "/err/mpls-frag",
+                "counter": "ip_frag"
+            },
+            {
+                "path": "/err/ip4-mpls-label-disposition-pipe",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-mpls-label-disposition-uniform",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-local",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-input",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-full-reassembly",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-local-full-reassembly",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-full-reassembly-feature",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-full-reassembly-custom",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-full-reassembly-expire-walk",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-sv-reassembly",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-sv-reassembly-feature",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-sv-reassembly-output-feature",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-sv-reassembly-custom-next",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip4-sv-reassembly-expire-walk",
+                "counter": "ip4"
+            },
+            {
+                "path": "/err/ip6-mpls-label-disposition-pipe",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-mpls-label-disposition-uniform",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-local",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-input",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-full-reassembly",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-local-full-reassembly",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-full-reassembly-feature",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-full-reassembly-custom",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-full-reassembly-expire-walk",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-sv-reassembly",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-sv-reassembly-feature",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-sv-reassembly-output-feature",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-sv-reassembly-custom-next",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip6-sv-reassembly-expire-walk",
+                "counter": "ip6"
+            },
+            {
+                "path": "/err/ip4-icmp-input",
+                "counter": "icmp4"
+            },
+            {
+                "path": "/err/ip4-icmp-error",
+                "counter": "icmp4"
+            },
+            {
+                "path": "/err/ip6-icmp-input",
+                "counter": "icmp6"
+            },
+            {
+                "path": "/err/ip6-icmp-error",
+                "counter": "icmp6"
+            }
+        ]
+    ]
+}
