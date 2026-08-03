@@ -579,17 +579,28 @@ jobs:
           # uses to namespace generated modules; the fallback flattens
           # because a build tree without share/vpp/api has no split to
           # preserve anyway.
-          api_dir=$(find /vpp/build-root -type d -path '*/share/vpp/api' -print -quit)
-          if [ -n "$api_dir" ]; then
-            echo "api dir: $api_dir"
-            cp -r "$api_dir/." /out/api/
-          else
-            echo "::warning::no share/vpp/api dir; falling back to a flat scan"
-            find /vpp/build-root -name '*.api.json' -exec cp {} /out/api/ \;
-          fi
+          # The INSTALL tree explicitly, not a find. The first published
+          # bundle was collected with `find ... -print -quit`, which
+          # stopped at a partially-populated build-stage directory and
+          # shipped 89 plugin files with ZERO core ones — no memclnt
+          # (the handshake), no ip (routes), no ip_neighbor, no dev
+          # (device attach). Codegen is dead without those, and a
+          # count-only check cannot notice their absence.
+          api_dir=/vpp/build-root/install-vpp-native/vpp/share/vpp/api
+          [ -d "$api_dir" ] || api_dir=$(find /vpp/build-root/install-vpp-native \
+            -type d -path '*/share/vpp/api' -print -quit)
+          [ -n "$api_dir" ] && [ -d "$api_dir" ] || { echo "::error::no share/vpp/api under the install tree"; exit 1; }
+          echo "api dir: $api_dir"
+          cp -r "$api_dir/." /out/api/
           count=$(find /out/api -name '*.api.json' | wc -l)
           echo "api.json files: $count"
-          [ "$count" -gt 0 ] || { echo "::error::no .api.json produced"; exit 1; }
+          # The files slice 3's codegen actually consumes. Named, not
+          # counted: 89 files that lack the handshake are worthless.
+          for f in core/memclnt.api.json core/ip.api.json \
+                   core/ip_neighbor.api.json core/interface.api.json \
+                   core/dev.api.json; do
+            [ -f "/out/api/$f" ] || { echo "::error::API bundle missing $f — codegen input incomplete"; exit 1; }
+          done
           tar czf /out/vpp-api-json.tar.gz -C /out/api .
 
       - name: Write manifest
