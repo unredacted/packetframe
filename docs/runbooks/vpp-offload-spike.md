@@ -326,6 +326,44 @@ Checklist status after round 3: bring-up done; **item 1 half-proven**
 (wire → VPP delivery works unsteered; the MCAM-steered variant still
 to run) — items 1–12 now execute on this stack.
 
+### RESULT (2026-08-02, shadow, round 4): items 3 and 9 — both answered, one re-opens a decision
+
+**Item 3 — ip6 ntuple: FAILS, and it is the AF, not the driver.**
+Both v6 shapes (drop, VF-steer via ring_cookie) rejected with AF
+mailbox error 710 (NPC flow family); `ethtool -n` confirms zero rules
+landed. The control on the same PF, same slots, same day: **v4 drop
+AND v4 VF-steer both insert cleanly** — ethtool decodes the cookie as
+`Direct to VF 0 queue 0`. Verdict: the vendor firmware's NPC
+key-extraction profile does not carry v6 fields. Not a regression,
+not fixable from our side. (Beware ethtool's exit code: it printed
+the rmgr error and still exited 0 — judge by `ethtool -n`, not `$?`.)
+
+Consequences:
+- **v6 cannot be MCAM-steered into VPP.** The per-family split from
+  the plan activates: v6 stays on the XDP custom-FIB path (already
+  correct, ~2% of matched traffic), unless the XDP→AF_XDP side door
+  is ever deemed worth its complexity for that 2%.
+- **The full-table verdict's condition fired** (§0's conditional
+  note said re-read it after item 3). VPP now carries a v4-only
+  table, and v4 alone is 99.19% one egress device — which MEETS the
+  ~99% re-scope trigger. The full-table-vs-default+exceptions
+  decision is re-taken by the user on v4's numbers. Note what does
+  NOT change: the failure-behavior argument (default+exceptions
+  inverts the exception set when the majority device dies) and the
+  FIB-mirrors-bird verifiability argument are family-independent —
+  the trigger firing shrinks the steady-state *benefit*, not the
+  failure-mode logic. A v4-only full table is also ~20% smaller
+  (~1.05M routes) with proportionally faster resync.
+
+**Item 9 — rx-mode: FAILS; the heat goal is dead on this driver.**
+`set interface rx-mode` (adaptive and interrupt) both answer
+`not supported (rx queue interupt mode enable/disable not supported)`
+from the native octeon driver, and the worker core measures ~100%
+busy in every mode. **VPP worker cores burn 24/7 in poll mode**;
+core count is a deliberate, permanent spend, one hot core per worker.
+Record in the fleet runbook and thermals watch accordingly. (vppctl
+also exits 0 on CLI errors — same exit-code trap as ethtool.)
+
 ### Getting the build onto the shadow
 
 Derive the tag from the pin rather than typing a version — otherwise
