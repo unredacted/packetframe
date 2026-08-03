@@ -355,6 +355,28 @@ impl Transport {
         self.client_index
     }
 
+    /// Re-arm the socket's read/write timeouts after the handshake.
+    ///
+    /// [`Self::connect`]'s `timeout` governs the handshake *and*, because
+    /// it is installed with `set_read_timeout`, every request that
+    /// follows. Those two want very different values: a connect attempt
+    /// should fail fast so the supervision loop stays responsive, while a
+    /// request issued during a full-table load legitimately waits far
+    /// longer — VPP answers the binary API on its main thread, the same
+    /// thread executing the route batch.
+    ///
+    /// Leaving one short value in force means the transport errors before
+    /// the wedge detector's budget expires, which hands the transport a
+    /// veto over a decision that belongs to the detector: a busy but
+    /// healthy VPP would be disconnected, requeued and eventually
+    /// restarted. The socket timeout is a backstop against parking
+    /// forever, not a liveness policy.
+    pub fn set_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.sock.set_read_timeout(Some(timeout))?;
+        self.sock.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
     /// Message id table, for callers that need to recognise async
     /// events. Read-only by design; nothing outside may mutate it.
     pub fn message_id(&self, name: &str) -> Option<u16> {

@@ -262,6 +262,22 @@ impl NexthopMap {
         self.device_of.insert(nexthop, dev.into());
     }
 
+    /// Forget every learned nexthop→device pair, keeping the members and
+    /// VLAN policy.
+    ///
+    /// Called before repopulating from an authoritative snapshot. Without
+    /// it the map is insert-only, so a nexthop the source has stopped
+    /// reporting keeps its last known device forever — and a route still
+    /// naming that nexthop resolves as *reachable* through a stale
+    /// interface instead of being classified unresolvable. Traffic then
+    /// keeps pointing at a neighbour that is gone, and readback
+    /// verification cannot catch it: verification checks that a route
+    /// exists on an interface we own, deliberately not that its nexthop
+    /// is still the one we intended.
+    pub fn forget_devices(&mut self) {
+        self.device_of.clear();
+    }
+
     /// Resolve one nexthop, or `None` if its device is excluded.
     pub fn resolve(&self, nexthop: &IpAddr) -> Option<NexthopTarget> {
         let dev = self.device_of.get(nexthop)?;
@@ -380,6 +396,22 @@ impl PendingMap {
             .collect()
     }
 
+    /// Drop every active op whose prefix fails `keep`.
+    ///
+    /// Used by the full-table resync to discard ops left over from an
+    /// aborted one. Those prefixes live only here — they were never
+    /// classified, so `RouteLedger::known_prefixes` cannot see them, and
+    /// the resync's withdrawal loop walks the ledger. Without this, a
+    /// prefix the source dropped between an aborted resync and the next
+    /// one keeps its stale pending upsert and is installed later, even
+    /// though the current snapshot does not advertise it.
+    ///
+    /// Only the active map: parked (withheld) ops keep their own
+    /// lifecycle, and the resync releases them separately.
+    pub fn retain(&mut self, keep: impl Fn(&IpPrefix) -> bool) {
+        self.ops.retain(|k, _| keep(&IpPrefix::from(*k)));
+    }
+
     /// Re-queue an op the transport could not apply — but only if the
     /// prefix has not been superseded in the meantime. A newer event
     /// that arrived while the batch was in flight is the current intent
@@ -426,6 +458,18 @@ impl RouteLedger {
     /// O(1) — see the type docs.
     pub fn counts(&self) -> SinkCounts {
         self.counts
+    }
+
+    /// The capacity policy this ledger enforces.
+    ///
+    /// Exposed so a caller rebuilding the ledger — on restart, when the
+    /// old VPP's FIB is gone and every recorded install is void — can
+    /// carry the policy across. Capacity is derived from the measured
+    /// heap gauge, not from the process that happened to be running, so
+    /// losing it on restart would rebuild an unbounded ledger and
+    /// install straight past the high-water mark.
+    pub fn capacity(&self) -> Capacity {
+        self.capacity
     }
 
     fn tally(counts: &mut SinkCounts, st: RouteState, add: bool) {
@@ -572,6 +616,19 @@ impl RouteLedger {
             .filter(|(_, st)| **st == RouteState::NotInstalled(NotInstalled::Withheld))
             .map(|(k, _)| (*k).into())
             .collect()
+    }
+
+    /// Every prefix the ledger holds an opinion about, in any state.
+    ///
+    /// The full-table resync needs this to compute **withdrawals**. A
+    /// prefix that left the route source while VPP was down, or while
+    /// packetframe was, is still installed in VPP's FIB — an add-only
+    /// resync would leave it forwarding to a nexthop the source no
+    /// longer advertises, which is a black hole that readback
+    /// verification cannot see (it samples what the ledger claims, and
+    /// the ledger claims that route is fine).
+    pub fn known_prefixes(&self) -> Vec<IpPrefix> {
+        self.state.keys().map(|k| (*k).into()).collect()
     }
 
     /// Sampling pool for readback verification: only prefixes VPP has

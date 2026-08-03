@@ -43,6 +43,17 @@ use crate::vpp_api::{Transport, TransportError};
 /// be requeued when a drain fails mid-window.
 pub const DEFAULT_WINDOW: usize = 256;
 
+/// Wire limit on paths per route: `n_paths` is a `u8`.
+///
+/// Load-bearing rather than theoretical. The encoder writes
+/// `paths.len() as u8` while still serialising every element, so a set
+/// larger than this puts a **wrapped count** on the wire followed by more
+/// path records than it declares — VPP either rejects the route or
+/// installs a truncated set, and a surviving owned path would still pass
+/// readback verification. Silent wire corruption is not a shape to leave
+/// reachable, however unlikely the input.
+pub const MAX_FIB_PATHS: usize = u8::MAX as usize;
+
 /// VPP interface indices for the ports the module owns.
 ///
 /// Populated at attach from `dev_create_port_if_reply`, which is where
@@ -221,6 +232,15 @@ pub struct DrainStats {
     /// Previously-withheld ops moved back into the active map because
     /// headroom returned. They install on the next drain.
     pub released: u64,
+    /// Routes whose resolved path set exceeded [`MAX_FIB_PATHS`] and was
+    /// truncated to fit the wire's `u8` count.
+    ///
+    /// Capped rather than refused: 255 of 300 paths still forwards
+    /// correctly, just with less spread, while refusing the route
+    /// blackholes the prefix outright. Counted because a non-zero value
+    /// means the route source is producing ECMP sets nobody designed
+    /// for — the reference fleet measured **zero** ECMP groups.
+    pub paths_capped: u64,
 }
 
 impl DrainStats {
@@ -263,6 +283,27 @@ impl FamilyPolicy {
     }
 }
 
+/// Truncate a path set to what the wire can describe, reporting whether
+/// it had to.
+///
+/// See [`MAX_FIB_PATHS`]: past 255 the declared count wraps while every
+/// element is still serialised, so VPP reads a wrapped count followed by
+/// more path records than it was told about — the route is rejected or
+/// installed with a truncated set, and a surviving owned path would still
+/// pass readback verification.
+///
+/// Capped rather than refused because 255 of 300 paths still forwards
+/// correctly, just with less spread, whereas refusing blackholes the
+/// prefix outright. Deterministic (a plain prefix of the resolved order)
+/// so the same input always produces the same FIB.
+pub fn cap_paths(paths: &mut Vec<FibPath>) -> bool {
+    if paths.len() <= MAX_FIB_PATHS {
+        return false;
+    }
+    paths.truncate(MAX_FIB_PATHS);
+    true
+}
+
 /// Pipelines pending route operations onto a [`Transport`].
 pub struct Drainer {
     window: usize,
@@ -274,7 +315,18 @@ enum Begun {
     /// A request went out; await its reply. `op` is the *effective*
     /// operation, which is not always the pending one — an installed
     /// prefix that becomes unresolvable is sent as a withdrawal.
-    Sent { context: u32, op: PendingOp },
+    ///
+    /// `derived` marks exactly that case: a withdrawal we invented
+    /// because resolution failed, as opposed to one the route source
+    /// asked for. The two must complete differently (see
+    /// [`Drainer::finish`]) — an authoritative withdrawal means the
+    /// prefix is gone, a derived one means the prefix is still
+    /// advertised but unresolvable, and conflating them loses the hole.
+    Sent {
+        context: u32,
+        op: PendingOp,
+        derived: bool,
+    },
     /// Resolved without touching the socket; already counted.
     Done,
     /// Cannot be attempted yet. Must go back into the pending map.
@@ -296,6 +348,9 @@ struct InFlight {
     /// from the original intent, not re-apply a withdrawal we derived
     /// from state that may have changed.
     original: PendingOp,
+    /// Whether `sent` is a withdrawal this drainer derived rather than
+    /// one the route source asked for.
+    derived: bool,
 }
 
 impl Default for Drainer {
@@ -325,6 +380,17 @@ impl Drainer {
     /// reservations unwound, and the untouched tail of the batch goes
     /// back too. The caller may retry against a fresh connection
     /// without having lost or double-counted anything.
+    // The Err variant carries partial `DrainStats` alongside the
+    // transport error, which is the point: the caller needs to know what
+    // did land before the socket broke. That tuple crosses clippy's
+    // 128-byte threshold now that `DrainStats` has ten counters.
+    //
+    // Not boxed. This returns **once per drain batch** (4096 routes), not
+    // per route, so the copy is noise — and boxing would put a heap
+    // allocation on the failure path, at the exact moment the transport
+    // is already failing and we are unwinding a window of in-flight
+    // requests.
+    #[allow(clippy::result_large_err)]
     pub fn drain(
         &self,
         pending: &mut PendingMap,
@@ -346,11 +412,16 @@ impl Drainer {
                     break;
                 };
                 match self.begin(prefix, &op, ledger, resolve, ports, transport, &mut stats) {
-                    Ok(Begun::Sent { context, op: sent }) => inflight.push(InFlight {
+                    Ok(Begun::Sent {
+                        context,
+                        op: sent,
+                        derived,
+                    }) => inflight.push(InFlight {
                         context,
                         prefix,
                         sent,
                         original: op,
+                        derived,
                     }),
                     // Nothing to send (withheld, unresolvable,
                     // out-of-family): already counted, ledger already
@@ -465,6 +536,35 @@ impl Drainer {
                     ledger.state_of(prefix),
                     Some(RouteState::Installed) | Some(RouteState::Installing { replacing: true })
                 );
+
+                // A live route whose nexthops all left VPP's ports.
+                //
+                // Withdrawn, not left alone: VPP is still forwarding the
+                // PREVIOUS version, so leaving it keeps traffic on a path
+                // the route source has abandoned.
+                //
+                // Sent BEFORE reclassifying, which is the subtle part.
+                // Reclassifying first recorded `Unresolvable` immediately,
+                // and that lost the prefix twice over: a *successful*
+                // delete then hit `forget`, erasing the Unresolvable
+                // state, so `verify` saw `unresolvable == 0`, never
+                // sampled the prefix, and the supervisor could steer into
+                // a table with a known hole; and a *rejected* delete left
+                // the state Unresolvable, so the requeued upsert saw
+                // `was_installed == false` and silently stopped retrying,
+                // making a transient refusal permanent with the stale
+                // route still live. Leaving the prefix `Installed` until
+                // VPP confirms the delete fixes both: rejection retries,
+                // success records the hole.
+                if resolved.is_empty() && was_installed {
+                    let ctx = transport.send(withdraw_msg(prefix))?;
+                    return Ok(Begun::Sent {
+                        context: ctx,
+                        op: PendingOp::Withdraw,
+                        derived: true,
+                    });
+                }
+
                 // Ledger decides installable / withheld / unresolvable
                 // and reserves the capacity slot. It takes the count
                 // because we already resolved — running the mapping
@@ -480,29 +580,17 @@ impl Drainer {
                                 return Ok(Begun::Withhold);
                             }
                             crate::sink::NotInstalled::Unresolvable => {
+                                // Nothing live to withdraw — the
+                                // was-installed case was handled above,
+                                // before classification.
                                 stats.unresolvable += 1;
-                                // An update whose nexthops all moved off
-                                // VPP-owned ports is not a no-op: VPP is
-                                // still forwarding the PREVIOUS version
-                                // of this route. Leaving it would keep
-                                // traffic on a path bird has already
-                                // abandoned, and the ledger now excludes
-                                // the prefix from verification, so
-                                // nothing would ever notice. Withdraw it.
-                                if was_installed {
-                                    let ctx = transport.send(withdraw_msg(prefix))?;
-                                    return Ok(Begun::Sent {
-                                        context: ctx,
-                                        op: PendingOp::Withdraw,
-                                    });
-                                }
                             }
                         }
                         return Ok(Begun::Done);
                     }
                     RouteState::Installed => return Ok(Begun::Done),
                 }
-                let Some(paths) = build_paths(&resolved, ports) else {
+                let Some(mut paths) = build_paths(&resolved, ports) else {
                     // Interface index not known yet: unwind the
                     // reservation and put it back rather than
                     // installing a route pointed at local0.
@@ -510,6 +598,9 @@ impl Drainer {
                     stats.deferred += 1;
                     return Ok(Begun::Defer);
                 };
+                if cap_paths(&mut paths) {
+                    stats.paths_capped += 1;
+                }
                 let msg = IpRouteAddDel {
                     context: 0,
                     is_add: true,
@@ -518,6 +609,7 @@ impl Drainer {
                         table_id: 0,
                         stats_index: 0,
                         prefix: to_prefix(prefix),
+                        // Cannot wrap: truncated above.
                         n_paths: paths.len() as u8,
                         paths,
                     },
@@ -527,11 +619,15 @@ impl Drainer {
                     op: PendingOp::Upsert {
                         nexthops: nexthops.clone(),
                     },
+                    derived: false,
                 })
             }
+            // An authoritative withdrawal: the route source no longer
+            // advertises this prefix at all.
             PendingOp::Withdraw => Ok(Begun::Sent {
                 context: transport.send(withdraw_msg(prefix))?,
                 op: PendingOp::Withdraw,
+                derived: false,
             }),
         }
     }
@@ -554,9 +650,22 @@ impl Drainer {
                 ledger.commit_installed(f.prefix);
                 stats.installed += 1;
             }
-            (PendingOp::Withdraw, 0) => {
+            // Authoritative: the source dropped the prefix, so the
+            // ledger should hold no opinion about it any more.
+            (PendingOp::Withdraw, 0) if !f.derived => {
                 ledger.forget(f.prefix);
                 stats.withdrawn += 1;
+            }
+            // Derived: the prefix is still advertised, we simply cannot
+            // reach any of its nexthops. The stale route is gone from
+            // VPP — record the hole NOW, not before, so it survives into
+            // verification. `forget` here would erase it and let the
+            // supervisor steer traffic into a table it knows is
+            // incomplete.
+            (PendingOp::Withdraw, 0) => {
+                ledger.classify_resolved(f.prefix, 0);
+                stats.withdrawn += 1;
+                stats.unresolvable += 1;
             }
             // A per-route rejection is NOT a connection fault: the
             // stream is fine and other routes will succeed. Unwind
@@ -747,6 +856,46 @@ mod tests {
         );
     }
 
+    /// `n_paths` is a `u8` and the encoder writes `paths.len() as u8`
+    /// independently of it, so an oversized set puts a wrapped count on
+    /// the wire followed by more records than it declares.
+    #[test]
+    fn a_path_set_never_exceeds_what_the_wire_can_count() {
+        let one = FibPath {
+            sw_if_index: 3,
+            table_id: 0,
+            rpf_id: 0,
+            weight: 1,
+            preference: 0,
+            r#type: 0,
+            flags: 0,
+            proto: 0,
+            nh: Default::default(),
+            n_labels: 0,
+            label_stack: Default::default(),
+        };
+
+        // The realistic case is untouched: the reference fleet measured
+        // ZERO ECMP groups, so this must not disturb ordinary routes.
+        let mut small = vec![one.clone(); 4];
+        assert!(!cap_paths(&mut small));
+        assert_eq!(small.len(), 4);
+
+        // Exactly at the limit still fits.
+        let mut exact = vec![one.clone(); MAX_FIB_PATHS];
+        assert!(!cap_paths(&mut exact));
+        assert_eq!(exact.len(), MAX_FIB_PATHS);
+        assert_eq!(exact.len() as u8 as usize, exact.len(), "no wrap");
+
+        // One past it wraps to 0 without the cap — which is the whole
+        // point: a declared count of 0 followed by 256 records.
+        let mut over = vec![one; MAX_FIB_PATHS + 1];
+        assert_eq!((MAX_FIB_PATHS + 1) as u8, 0, "this is the corruption");
+        assert!(cap_paths(&mut over));
+        assert_eq!(over.len(), MAX_FIB_PATHS);
+        assert_eq!(over.len() as u8 as usize, over.len());
+    }
+
     #[test]
     fn drain_stats_count_only_what_reached_vpp() {
         let s = DrainStats {
@@ -758,6 +907,7 @@ mod tests {
             deferred: 4,
             out_of_family: 7,
             released: 9,
+            paths_capped: 0,
         };
         // Withheld/unresolvable/deferred/out-of-family never left the
         // process.
