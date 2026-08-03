@@ -285,6 +285,47 @@ this runbook:
 
 The v22.02 tag stays published as the mailbox-proof artifact.
 
+### RESULT (2026-08-02, shadow, round 3): **BRING-UP COMPLETE** — link up, first packet received
+
+The octeon9 artifact, end to end on mainline unpatched VPP:
+
+```
+octeon0/0  up  Link speed: 2.500000 Gbps
+rx packets 1 / rx bytes 60 / ip4 1 / drops 1
+octeon/queue 0002:07:00.1: NPA pool created, aura_handle = 0xffff93f70000/...
+```
+
+Every layer now proven: install (guarded) → CN96xx **D0 model gate
+passed** (octeon-roc's table) → AF mailbox → interface `octeon0/0` →
+**NPA hardware buffer pools** (the exact allocation the DPDK PMD path
+structurally could not do) → link up at 2.5 Gbps → an unsolicited
+60-byte IPv4 frame off eth1's wire delivered into VPP's rx node and
+correctly dropped by an unconfigured dataplane.
+
+**The working bring-up sequence** (the `devices {}` startup stanza
+with an EMPTY options block is rejected — `vnet_dev_config_one_device:
+unknown input ''`; use the runtime CLI, which is also the shape the
+vpp-offload module wants, since supervision gets runtime attach/detach
+for free):
+
+```sh
+# VF must be on vfio-pci first (NOTE: vpp package REMOVAL unbinds it —
+# postrm "cleans up" the binding; re-bind after any purge):
+#   echo vfio-pci > /sys/bus/pci/devices/0002:07:00.1/driver_override
+#   echo 0002:07:00.1 > /sys/bus/pci/drivers_probe
+# startup.conf: unix/socksvr/memory/buffers/cpu sections as in §2,
+# plus: plugins { plugin dpdk_plugin.so { disable } }  — no dpdk{} and
+# no devices{} stanza. Then:
+vppctl device attach pci/0002:07:00.1 driver octeon
+vppctl device create-interface pci/0002:07:00.1 port 0 num-rx-queues 1
+vppctl set interface state octeon0/0 up
+vppctl show interface octeon0/0     # link, counters
+```
+
+Checklist status after round 3: bring-up done; **item 1 half-proven**
+(wire → VPP delivery works unsteered; the MCAM-steered variant still
+to run) — items 1–12 now execute on this stack.
+
 ### Getting the build onto the shadow
 
 Derive the tag from the pin rather than typing a version — otherwise
@@ -413,19 +454,54 @@ commands and the rtemap/dpdk.service gotchas). Sizing per the slice-1
 renderer's arithmetic: full table wants ~4.4 GiB ⇒ `vm.nr_hugepages=10`
 at 512 MiB pages.
 
-startup.conf: generate with the slice-1 renderer
-(`packetframe-vpp-offload::startup_conf::render`) or hand-write its
-output shape — the load-bearing lines are `main-heap-size` from the
-sizing math, `main-heap-page-size default-hugepage` (64K-page kernel),
-`socksvr` for the API socket, explicit `corelist-workers`, the VF
-`dev` stanzas, and **no linux-cp** (routes come from vppctl in this
-spike; the binary-API sink in production).
+startup.conf: **hand-write it; do NOT use the slice-1 renderer for
+now.** The renderer (`packetframe-vpp-offload::startup_conf::render`)
+still emits a `dpdk { dev ... }` stanza with dpdk_plugin enabled —
+the PMD path that round 2 proved CANNOT allocate NPA buffers on this
+NIC. Its sizing *arithmetic* (heap/hugepage math) remains valid; its
+*output shape* is pre-pivot and its native-driver rework is tracked
+for slice 3/4. The canonical working shape, from round 3:
+
+```
+unix {
+  nodaemon
+  log /var/log/vpp-spike.log
+  cli-listen /run/vpp/cli.sock
+  full-coredump
+}
+socksvr { socket-name /run/vpp/api.sock }
+memory {
+  main-heap-size 512M              # bump per sizing math for item 10
+  main-heap-page-size default-hugepage
+}
+buffers { buffers-per-numa 16384 default data-size 2048 }
+cpu { main-core 16 corelist-workers 17 }
+plugins { plugin dpdk_plugin.so { disable } }
+```
+
+Load-bearing: `main-heap-page-size default-hugepage` (64K-page
+kernel), `socksvr` for the API socket, explicit `corelist-workers`,
+**dpdk_plugin disabled**, **no `dpdk {}` stanza, no `devices {}`
+stanza** (an empty-block `devices{}` is a parse error; the device
+attaches via the runtime CLI in §3), and **no linux-cp** (routes come
+from vppctl in this spike; the binary-API sink in production).
 
 ## 3. Bring-up + the checklist
 
-Start VPP manually (`/usr/bin/vpp -c /path/startup.conf`), then
-`vppctl show hardware-interfaces` — link up on the VF with counters
-present is the VPP-side mailbox pass.
+Start VPP manually (`/usr/bin/vpp -c /path/startup.conf`), then attach
+the VF through the native driver at runtime (the sequence proven in
+round 3 — see that RESULT for context):
+
+```sh
+vppctl device attach pci/0002:07:00.1 driver octeon
+vppctl device create-interface pci/0002:07:00.1 port 0 num-rx-queues 1
+vppctl set interface state octeon0/0 up
+vppctl show interface octeon0/0
+```
+
+Link up on `octeon0/0` with counters present is the bring-up pass
+(mailbox, D0 model gate, and NPA pool allocation all sit inside those
+four commands and fail loudly in `show log` if anything regresses).
 
 Work the checklist; each item gets a WORKS / FAILS / N/A in the results
 section:
