@@ -7,33 +7,93 @@
 //! minimum is a clean load-time error instead of a cryptic VPP init
 //! abort.
 //!
-//! The per-route constant below is a deliberately generous
-//! **pre-measurement placeholder**: gate 0b loads a real table into a
-//! real VPP and replaces it with the measured number (plan: "measure
-//! actual heap consumption at gate 0b rather than trusting anyone's
-//! rule of thumb"). Memory is the cheapest resource on the reference
-//! platform (64 GB); headroom errs large.
+//! **The main heap is not the only thing that scales with route
+//! count.** VPP keeps per-FIB-entry counters in a separate `statseg`
+//! with its own fixed size, invisible to `show memory main-heap`. Gate
+//! 0b established that the default 31.94 MiB segment is exhausted at
+//! roughly 380k routes and VPP then aborts with a bare
+//! `Out-of-memory, calling os_panic()` — while the main heap sits 87%
+//! free, which points every diagnostic at the wrong allocator. Sizing
+//! that omits the stats segment does not run VPP short; it kills it
+//! partway through its first full-table resync.
+//!
+//! ## Measured, gate 0b item 10 (2026-08-03, shadow)
+//!
+//! 1,053,360 v4 prefixes from the live bird `master4`, loaded into
+//! v26.06/octeon9 on a 4 GiB main heap:
+//!
+//! | | baseline | full table | per route |
+//! |---|---|---|---|
+//! | main heap (used) | 337.86 MiB | 803.49 MiB | **463 B** |
+//! | stat segment (populated) | 1.19 MiB | 101.94 MiB | **97 B** |
+//! | hugepages in use | 9 × 512 MiB | 10 × 512 MiB | — |
+//!
+//! Per-chunk increments ranged 82 B–2,058 B/route because mtrie
+//! interior nodes allocate in blocks, so the full-table **average** is
+//! the figure to size from — no single marginal is meaningful.
+//!
+//! The stats segment is sized from *populated* pages, not `used`: the
+//! allocator reported 75.04 MiB used while the OS had backed 101.94
+//! MiB. Sizing from `used` would under-provision by a third.
+//!
+//! Constants carry roughly 2× margin over measurement. Memory is the
+//! cheapest resource here (64 GB), and the failure mode of being wrong
+//! low is a mid-resync abort.
 
-/// Estimated main-heap bytes per installed route (v4/v6 blended),
-/// covering mtrie nodes, fib_entry, path-list sharing, adjacencies.
-/// Generous by design; replaced by the gate-0b measurement.
-pub const HEAP_BYTES_PER_ROUTE: u64 = 2_048;
+/// Main-heap bytes per installed route: mtrie nodes, `fib_entry`,
+/// path-list, adjacency.
+///
+/// Measured **463 B** on the v4 table (see module docs). 1024 is ~2.2×
+/// that. The previous value was 2,048 — a pre-measurement guess that
+/// turned out ~4.4× high, which mattered only because it also implied
+/// the stats segment was covered. It was not.
+pub const HEAP_BYTES_PER_ROUTE: u64 = 1_024;
 
 /// Fixed main-heap floor independent of table size: VPP's own
-/// allocations, stats segment, API rings, plugin overhead.
-pub const HEAP_FLOOR_BYTES: u64 = 1 << 30; // 1 GiB
+/// allocations, API rings, plugin overhead.
+///
+/// Measured **337.86 MiB** with an empty FIB. 512 MiB is ~1.5×. The
+/// previous 1 GiB predates the measurement and did NOT cover the stats
+/// segment despite claiming to.
+pub const HEAP_FLOOR_BYTES: u64 = 512 << 20;
 
-/// Buffer memory independent of the main heap (buffers-per-numa ×
-/// ~2.5 KB each, plus descriptor overhead). One conservative number
-/// until gate 0b measures per-port needs.
-pub const BUFFER_BYTES: u64 = 512 << 20; // 512 MiB
+/// Hugepage-backed memory beyond the main heap: buffers, and whatever
+/// else VPP maps on hugepages.
+///
+/// Measured as **1 GiB**: at full table, 10 × 512 MiB pages were in
+/// use with a 4 GiB main heap declared — two pages beyond the heap's
+/// eight. The previous 512 MiB would have left the reservation one page
+/// short at full table.
+pub const BUFFER_BYTES: u64 = 1 << 30;
+
+/// Stats-segment bytes per installed route.
+///
+/// Measured **97 B/route** from populated pages. 192 is ~2×.
+///
+/// This term did not exist before gate 0b, and its absence is what
+/// aborted VPP at ~380k routes on the default segment.
+pub const STATSEG_BYTES_PER_ROUTE: u64 = 192;
+
+/// Stats-segment floor. VPP's own counters exist before any route does,
+/// and its own default is 32 MiB — no reason to go below that.
+pub const STATSEG_FLOOR_BYTES: u64 = 32 << 20;
 
 /// Derived sizing: what the config's `expected-routes` implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
     pub expected_routes: u64,
     pub main_heap_bytes: u64,
+    /// The **hugepage** budget: main heap + buffers.
+    ///
+    /// Deliberately excludes the stats segment, which VPP backs with
+    /// ordinary 64 K pages (verified at gate 0b) — counting it here
+    /// would inflate the hugepage reservation by hundreds of MiB that
+    /// hugepages never satisfy.
     pub total_bytes: u64,
+    /// Stats-segment size. **Locked RAM, outside the hugepage
+    /// reservation** — a separate budget line, not part of
+    /// `total_bytes`.
+    pub statseg_bytes: u64,
 }
 
 /// Compute the sizing from the route count. Errors on inputs that
@@ -49,10 +109,15 @@ pub fn derive_sizing(expected_routes: u64) -> Result<Sizing, String> {
     let total_bytes = main_heap_bytes
         .checked_add(BUFFER_BYTES)
         .ok_or_else(|| "total sizing overflow".to_string())?;
+    let statseg_bytes = expected_routes
+        .checked_mul(STATSEG_BYTES_PER_ROUTE)
+        .ok_or_else(|| "stats-segment sizing overflow".to_string())?
+        .max(STATSEG_FLOOR_BYTES);
     Ok(Sizing {
         expected_routes,
         main_heap_bytes,
         total_bytes,
+        statseg_bytes,
     })
 }
 
@@ -166,6 +231,20 @@ pub fn render(
         sizing.main_heap_bytes.div_ceil(1 << 20)
     ));
     let _ = hugepage_bytes; // recorded in the header comment path later; kept as input for stability
+                            // The stats segment. NOT optional and NOT covered by
+                            // main-heap-size: VPP keeps per-FIB-entry counters here, the
+                            // default is 32 MiB, and gate 0b watched it exhaust at ~380k
+                            // routes and abort the process with an OOM that named no
+                            // segment. Emitting nothing here — which is what this
+                            // renderer did before — means the first full-table resync
+                            // kills VPP partway through.
+                            //
+                            // Ceiling for the same reason as the heap: a floor-rounded
+                            // MiB value hands VPP less than the arithmetic promised.
+    out.push_str(&format!(
+        "statseg {{\n  size {}M\n}}\n",
+        sizing.statseg_bytes.div_ceil(1 << 20)
+    ));
     out.push_str("buffers {\n  buffers-per-numa 65536\n  default data-size 2048\n}\n");
     // dpdk_plugin OFF. Round 2 on the shadow established that both the
     // otx2 and cnxk PMDs hard-require NPA mempool ops that VPP's buffer
@@ -185,27 +264,96 @@ pub fn render(
 mod tests {
     use super::*;
 
+    /// Routes measured at gate 0b, and what each heap actually used, so
+    /// the constants can be checked against reality rather than against
+    /// each other.
+    const MEASURED_ROUTES: u64 = 1_053_360;
+    const MEASURED_HEAP_USED: u64 = 803 * (1 << 20); // 803.49 MiB
+    const MEASURED_STATSEG_POPULATED: u64 = 102 * (1 << 20); // 101.94 MiB
+
     #[test]
     fn sizing_scales_with_routes() {
         let small = derive_sizing(1_000).unwrap();
         let full = derive_sizing(1_400_000).unwrap();
         assert!(full.main_heap_bytes > small.main_heap_bytes);
-        // The default full-table sizing lands in the plan's "couple of
-        // GB" band: floor + ~2.9G table + buffers ≈ 4.4 GiB total.
-        assert!(full.total_bytes > 3 << 30, "{}", full.total_bytes);
-        assert!(full.total_bytes < 8 << 30, "{}", full.total_bytes);
+        assert!(full.statseg_bytes > small.statseg_bytes);
+        // Post-measurement band: 1.4M × 1 KiB + 512 MiB floor + 1 GiB
+        // buffers ≈ 2.8 GiB. The pre-measurement arithmetic put this at
+        // ~4.4 GiB off a 2 KiB/route guess.
+        assert!(full.total_bytes > 2 << 30, "{}", full.total_bytes);
+        assert!(full.total_bytes < 4 << 30, "{}", full.total_bytes);
+    }
+
+    /// The constants must cover what the hardware actually consumed,
+    /// with margin — the point of measuring. Guards against a future
+    /// "tidy up the constants" that quietly drops below reality.
+    #[test]
+    fn the_constants_cover_the_measured_full_table() {
+        let s = derive_sizing(MEASURED_ROUTES).unwrap();
+        assert!(
+            s.main_heap_bytes > MEASURED_HEAP_USED,
+            "derived heap {} must exceed the measured {MEASURED_HEAP_USED}",
+            s.main_heap_bytes
+        );
+        assert!(
+            s.statseg_bytes > MEASURED_STATSEG_POPULATED,
+            "derived statseg {} must exceed the measured {MEASURED_STATSEG_POPULATED}",
+            s.statseg_bytes
+        );
+        // And with real margin, not by a hair.
+        assert!(s.main_heap_bytes >= MEASURED_HEAP_USED * 3 / 2);
+        assert!(s.statseg_bytes >= MEASURED_STATSEG_POPULATED * 3 / 2);
+    }
+
+    /// The default `expected-routes` must cover the measured table plus
+    /// DFZ growth — that is what the default is for.
+    #[test]
+    fn the_default_route_count_covers_the_measured_table() {
+        // Both sides are constants, so this is checkable at compile
+        // time — a default that stopped covering the measured table
+        // should fail the build, not a test run.
+        const { assert!(crate::DEFAULT_EXPECTED_ROUTES > MEASURED_ROUTES) };
+        let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES).unwrap();
+        assert!(s.statseg_bytes > MEASURED_STATSEG_POPULATED);
+        assert!(s.main_heap_bytes > MEASURED_HEAP_USED);
+    }
+
+    /// The stats segment is 64 K-backed locked RAM, not hugepages
+    /// (verified at gate 0b). Folding it into the hugepage budget would
+    /// demand hundreds of MiB of reservation that hugepages never
+    /// satisfy.
+    #[test]
+    fn the_stats_segment_is_not_in_the_hugepage_budget() {
+        let s = derive_sizing(1_600_000).unwrap();
+        assert_eq!(s.total_bytes, s.main_heap_bytes + BUFFER_BYTES);
+        assert!(s.statseg_bytes > 0);
+        assert!(
+            s.total_bytes < s.main_heap_bytes + BUFFER_BYTES + s.statseg_bytes,
+            "statseg must not be counted in the hugepage total"
+        );
+    }
+
+    #[test]
+    fn the_stats_segment_respects_its_floor() {
+        // A tiny table still needs VPP's own counters.
+        let s = derive_sizing(1_000).unwrap();
+        assert_eq!(s.statseg_bytes, STATSEG_FLOOR_BYTES);
+        // A large one scales past it.
+        let big = derive_sizing(1_600_000).unwrap();
+        assert_eq!(big.statseg_bytes, 1_600_000 * STATSEG_BYTES_PER_ROUTE);
+        assert!(big.statseg_bytes > STATSEG_FLOOR_BYTES);
     }
 
     #[test]
     fn hugepage_budget_enforced() {
         let sizing = derive_sizing(1_400_000).unwrap();
         let page = 512u64 << 20; // the EFG's 512 MiB default pages
-                                 // 8 pages = 4 GiB: below the ~4.4 GiB need → rejected with the
-                                 // corrective count in the message.
-        let err = check_hugepage_budget(&sizing, 8, page).unwrap_err();
+                                 // 5 pages = 2.5 GiB: below the ~2.8 GiB need → rejected with
+                                 // the corrective count in the message.
+        let err = check_hugepage_budget(&sizing, 5, page).unwrap_err();
         assert!(err.contains("hugepages"), "{err}");
-        // 10 pages = 5 GiB: enough.
-        check_hugepage_budget(&sizing, 10, page).unwrap();
+        // 6 pages = 3 GiB: enough.
+        check_hugepage_budget(&sizing, 6, page).unwrap();
         // Unknown page size: byte check skipped.
         check_hugepage_budget(&sizing, 1, 0).unwrap();
     }
@@ -242,6 +390,41 @@ mod tests {
             (rendered_mib << 20) >= sizing.main_heap_bytes,
             "rendered heap {rendered_mib} MiB must not be below the derived {} bytes",
             sizing.main_heap_bytes
+        );
+    }
+
+    /// The stanza whose absence aborted VPP at ~380k routes. Asserted,
+    /// not described — a renderer that silently stops emitting it looks
+    /// fine until the first full-table resync dies.
+    #[test]
+    fn a_stats_segment_stanza_is_always_emitted() {
+        for routes in [1_000u64, 1_053_360, 1_600_000] {
+            let s = derive_sizing(routes).unwrap();
+            let conf = render(&s, &[14], 13, "/run/packetframe/vpp/api.sock", 0);
+            assert!(conf.contains("statseg {"), "routes={routes}:\n{conf}");
+            let want = s.statseg_bytes.div_ceil(1 << 20);
+            assert!(
+                conf.contains(&format!("size {want}M")),
+                "routes={routes} want size {want}M:\n{conf}"
+            );
+            // Never below VPP's own default, which is what the old
+            // implicit behaviour gave us.
+            assert!(want >= (STATSEG_FLOOR_BYTES >> 20));
+        }
+    }
+
+    /// Rounding UP, for the same reason as the heap: a floor-rounded
+    /// MiB value hands VPP less than the arithmetic promised, and the
+    /// shortfall shows up as an OOM mid-resync.
+    #[test]
+    fn the_stats_segment_rounds_up_never_down() {
+        // 1,000,001 × 192 = 192,000,192 B = 183.10… MiB
+        let s = derive_sizing(1_000_001).unwrap();
+        let mib = s.statseg_bytes.div_ceil(1 << 20);
+        assert!(
+            (mib << 20) >= s.statseg_bytes,
+            "rendered {mib} MiB is below the derived {} bytes",
+            s.statseg_bytes
         );
     }
 

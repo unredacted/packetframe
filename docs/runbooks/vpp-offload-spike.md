@@ -589,9 +589,79 @@ section:
 | 7 | **PMTUD positive test** | >MTU DF packet through a steered path → correctly-sourced frag-needed back at the sender. **Do not skip.** |
 | 8 | VLAN subif egress | `create sub-interface` + tag 1337 toward the br1337-shaped topology |
 | 9 | rx-mode adaptive | `set interface rx-mode <if> adaptive`; watch idle CPU (the heat verdict) |
-| 10 | Full-table load — **v4-ONLY per the round-4 decision** | dump bird's `master4` ONLY (`birdc 'show route primary table master4'` → script `ip route add` via vppctl); record wall time, `show memory main-heap` (replaces HEAP_BYTES_PER_ROUTE=2048 in startup_conf.rs), and packetframe daemon RSS. Loading v4+v6 would measure a table shape the decision rejected |
+| 10 | Full-table load — **v4-ONLY per the round-4 decision** — **DONE, see RESULT below** | dump bird's `master4` ONLY (`birdc 'show route primary table master4'` → script `ip route add` via vppctl); record wall time, `show memory` (**all heaps, not `main-heap`** — see RESULT), and packetframe daemon RSS. Loading v4+v6 would measure a table shape the decision rejected |
 | 11 | pps/core + latency | steered constant-rate flow: pps at 1 worker, p50/p99 vs the kernel path |
 | 12 | Watts/thermals | idle + loaded, poll-mode vs adaptive (if 9 works) |
+
+### RESULT (2026-08-03, shadow, item 10): **v4 FULL TABLE FITS** — and the stats segment is the constraint nobody was sizing
+
+**1,053,360 v4 prefixes** from the live bird `master4`, loaded into
+v26.06/octeon9 via `vppctl exec` in ~35 s. Item 10 **PASSES**.
+
+| | baseline (empty FIB) | full table | Δ | per route |
+|---|---|---:|---:|---:|
+| main heap (used) | 337.86 MiB | 803.49 MiB | 465.63 MiB | **463 B** |
+| stat segment (populated) | 1.19 MiB | 101.94 MiB | 100.75 MiB | **97 B** |
+| hugepages (512 MiB) | 9 | 10 | +1 | — |
+
+**The finding that matters is a first-attempt crash, not the numbers.**
+With the default `statseg` (31.94 MiB) VPP **aborted** partway through
+the fourth 100k chunk:
+
+```
+Out-of-memory, calling os_panic().
+os_panic() called, aborting.
+```
+
+Per-chunk statseg usage explains it exactly — 22.85 MiB at 300k, 33.84
+MiB at 400k, i.e. it crosses the 31.94 MiB default at roughly **380k
+routes**. Adding `statseg { size 1G }` loaded the whole table with no
+other change.
+
+Consequences, all now in `startup_conf.rs`:
+
+- **`show memory main-heap` is a misleading diagnostic.** During the
+  abort it read `used: 470M / 4.00G` — 87% free — while a different
+  segment was exhausted. **Always use `show memory` (all heaps).** An
+  hour went into suspecting the main heap because of this.
+- **Size the stats segment from `populated`, not `used`.** The
+  allocator said 75.04 MiB while the OS had backed 101.94 MiB; sizing
+  from `used` under-provisions by a third.
+- **The stats segment is 64 K-page backed, not hugepages** (`page-size
+  64K` in `show memory`). It is locked RAM on a *separate* budget line
+  and must NOT inflate the hugepage reservation.
+- **`HEAP_BYTES_PER_ROUTE` 2048 → 1024** (measured 463, ~2.2× margin);
+  **`HEAP_FLOOR_BYTES` 1 GiB → 512 MiB** (measured 337.86 MiB);
+  **`BUFFER_BYTES` 512 MiB → 1 GiB** (10 hugepages in use against a
+  4 GiB heap = 1 GiB beyond it, so 512 MiB would have left the
+  reservation a page short at full table).
+- **New `STATSEG_BYTES_PER_ROUTE` = 192** (measured 97, ~2×) with a
+  32 MiB floor, and `render()` now emits the stanza. It emitted none
+  before, so the module as merged would have killed VPP partway
+  through its first full-table resync.
+
+**Per-chunk increments are not usable as a per-route figure** — they
+ranged 82 B to 2,058 B/route because mtrie interior nodes allocate in
+blocks. Only the full-table average means anything.
+
+**Still NOT measured — the ≤60 s convergence budget.** The ~35 s load
+was VPP's CLI parser with one shared path-list, not 1.05M binary-API
+round trips with the real 129 nexthops. Treat 35 s as an encouraging
+lower bound on what VPP itself can absorb and nothing more; the real
+number needs the module's sink.
+
+Method note: routes were pointed at a single synthetic nexthop
+(`10.255.255.2` on `octeon0/0`, static neighbor) rather than the real
+129. Path-lists are shared, so 129 versus 1 is ~128 extra objects
+against 1.05M prefixes — negligible for the per-prefix slope this
+measures.
+
+Also captured, closing a caveat that had been open since §0: the
+primary's `birdc 'show route count'` reports **2,105,065 routes for
+1,053,380 networks** in `master4`, against the histogram's 1,053,049
+best-path nexthops. Those agree to within ~331, confirming **0 ECMP
+among selected routes** — so "nexthops as prefixes" is now measured
+rather than inferred, and the `expected-routes` sizing stands.
 
 ## 4. Pass / kill / record
 
