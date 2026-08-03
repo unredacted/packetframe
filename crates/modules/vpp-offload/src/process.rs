@@ -180,7 +180,7 @@ mod imp {
         /// would signal "exited" immediately and the supervisor would
         /// restart-loop a perfectly healthy VPP.
         pub fn spawn(binary: &Path, conf: &Path) -> io::Result<Self> {
-            let mut child = Command::new(binary)
+            let child = Command::new(binary)
                 .arg("-c")
                 .arg(conf)
                 // VPP's own `log` stanza owns its output. Inheriting
