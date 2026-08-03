@@ -326,6 +326,74 @@ Checklist status after round 3: bring-up done; **item 1 half-proven**
 (wire → VPP delivery works unsteered; the MCAM-steered variant still
 to run) — items 1–12 now execute on this stack.
 
+### RESULT (2026-08-02, shadow, round 4): items 3 and 9 — both answered, one re-opens a decision
+
+**Item 3 — ip6 ntuple: FAILS, and it is the AF, not the driver.**
+Both v6 shapes (drop, VF-steer via ring_cookie) rejected with AF
+mailbox error 710 (NPC flow family); `ethtool -n` confirms zero rules
+landed. The control on the same PF, same slots, same day: **v4 drop
+AND v4 VF-steer both insert cleanly** — ethtool decodes the cookie as
+`Direct to VF 0 queue 0`. Decoded against the fleet kernel's own enum
+(v5.15 `octeontx2/af/mbox.h`): **-710 = `NPC_FLOW_NOT_SUPPORTED`**,
+raised by `npc_check_unsupported_flows()` exactly when requested match
+fields are absent from the loaded MKEX profile's feature set. Verdict,
+now sourced rather than inferred: the vendor firmware's NPC
+key-extraction profile does not carry v6 fields. Not a regression,
+not fixable from our side. (Beware ethtool's exit code: it printed
+the rmgr error and still exited 0 — judge by `ethtool -n`, not `$?`.)
+
+The full shape matrix, so nobody re-probes it: `ip6 src-ip`,
+`tcp6 dst-ip`, `udp6 dst-ip`, `tcp6 dst-ip+dst-port` — ALL rejected
+with 710. **`ether proto 0x86DD` INSERTS** — L2 ethertype extraction
+works, so the wall is precisely "no v6 L3 fields", not "no v6
+awareness". The ethertype rule is deliberately NOT used: it is
+all-or-nothing v6 — it would steer BGP v6 sessions, NDP and
+management into VPP, and a punt-to-kernel path for control traffic is
+the linux-cp-shaped complexity this design refuses (a VPP crash would
+take the v6 control plane down with it, breaking the failover tier's
+premise). Recorded as a door that exists and was not walked through.
+
+Consequences:
+- **v6 cannot be MCAM-steered into VPP.** The per-family split from
+  the plan activates: v6 stays on the XDP custom-FIB path (already
+  correct, ~2% of matched traffic), unless the XDP→AF_XDP side door
+  is ever deemed worth its complexity for that 2%.
+- **The full-table verdict's condition fired** (§0's conditional
+  note said re-read it after item 3). VPP now carries a v4-only
+  table, and v4 alone is 99.19% one egress device — which MEETS the
+  ~99% re-scope trigger. The full-table-vs-default+exceptions
+  decision is re-taken by the user on v4's numbers. Note what does
+  NOT change: the failure-behavior argument (default+exceptions
+  inverts the exception set when the majority device dies) and the
+  FIB-mirrors-bird verifiability argument are family-independent —
+  the trigger firing shrinks the steady-state *benefit*, not the
+  failure-mode logic. A v4-only full table is also ~20% smaller —
+  **~1.05M NEXTHOPS** (=routes only under the 0-ECMP observation; the
+  §0 caveat about the uncaptured `show route count` applies to this
+  figure and to the resync-speed corollary equally).
+
+  **DECIDED (2026-08-02, user): FULL v4 TABLE.** The failure-behavior
+  and verifiability arguments won again on v4-only numbers. v6 stays
+  on the XDP custom-FIB path — fully correct forwarding, and the v4
+  offload effectively dedicates the entire 18-core kernel path to
+  v6's remainder, so v6 can grow ~10x before the split even itches.
+  v6 roadmap, recorded not built: (1) retest ip6 ntuple at every
+  UniFi kernel bump — the MKEX profile ships with the AF driver;
+  (2) kernel >=6.8 unlocks native XDP = 2-3x for v6 on the fallback
+  tier with no VPP involvement; (3) the XDP->AF_XDP->VPP side door
+  stays documented and deliberately unbuilt until native XDP makes
+  AF_XDP zero-copy — while rx is generic-XDP copy mode it buys
+  nothing over the custom-FIB path v6 already has.
+
+**Item 9 — rx-mode: FAILS; the heat goal is dead on this driver.**
+`set interface rx-mode` (adaptive and interrupt) both answer
+`not supported (rx queue interupt mode enable/disable not supported)`
+from the native octeon driver, and the worker core measures ~100%
+busy in every mode. **VPP worker cores burn 24/7 in poll mode**;
+core count is a deliberate, permanent spend, one hot core per worker.
+Record in the fleet runbook and thermals watch accordingly. (vppctl
+also exits 0 on CLI errors — same exit-code trap as ethtool.)
+
 ### Getting the build onto the shadow
 
 Derive the tag from the pin rather than typing a version — otherwise
@@ -451,8 +519,11 @@ changing `ref` re-runs the workflow and publishes a new tag.
 Reuse the gate-0a staging (VF on a quiet port, vfio-bound, hugepages
 reserved — see the perf-campaign memory / gate-0a notes for the exact
 commands and the rtemap/dpdk.service gotchas). Sizing per the slice-1
-renderer's arithmetic: full table wants ~4.4 GiB ⇒ `vm.nr_hugepages=10`
-at 512 MiB pages.
+renderer's arithmetic, updated for the round-4 decision (v4-only,
+~1.05M nexthops): placeholder math says ~2.2 GiB heap + buffers ⇒
+`vm.nr_hugepages=8` at 512 MiB pages gives comfortable margin. (The
+pre-decision v4+v6 figure was ~4.4 GiB ⇒ 10 pages; item 10's measured
+number supersedes both.)
 
 startup.conf: **hand-write it; do NOT use the slice-1 renderer for
 now.** The renderer (`packetframe-vpp-offload::startup_conf::render`)
@@ -517,18 +588,21 @@ section:
 | 7 | **PMTUD positive test** | >MTU DF packet through a steered path → correctly-sourced frag-needed back at the sender. **Do not skip.** |
 | 8 | VLAN subif egress | `create sub-interface` + tag 1337 toward the br1337-shaped topology |
 | 9 | rx-mode adaptive | `set interface rx-mode <if> adaptive`; watch idle CPU (the heat verdict) |
-| 10 | Full-table load | script `ip route add` via vppctl from a table dump; record wall time, `show memory main-heap` (replaces HEAP_BYTES_PER_ROUTE=2048 in startup_conf.rs), and packetframe daemon RSS for the sizing table |
+| 10 | Full-table load — **v4-ONLY per the round-4 decision** | dump bird's `master4` ONLY (`birdc 'show route primary table master4'` → script `ip route add` via vppctl); record wall time, `show memory main-heap` (replaces HEAP_BYTES_PER_ROUTE=2048 in startup_conf.rs), and packetframe daemon RSS. Loading v4+v6 would measure a table shape the decision rejected |
 | 11 | pps/core + latency | steered constant-rate flow: pps at 1 worker, p50/p99 vs the kernel path |
 | 12 | Watts/thermals | idle + loaded, poll-mode vs adaptive (if 9 works) |
 
 ## 4. Pass / kill / record
 
 - **Pass:** items 1, 2, 7, 10 all WORK (delivery, egress, PMTUD,
-  full-table capacity). Everything else shapes design rather than
-  gating it.
-- **Kill:** VPP's PMD can't handshake the AF at any pinnable version →
-  phase parks with the verdict recorded (the honest outcome the plan
-  endorses).
+  **v4** full-table capacity — the round-4 decision's shape; a v4+v6
+  load would validate a table nobody is shipping). Everything else
+  shapes design rather than gating it. Items 3 and 9 are already
+  FAILED-and-absorbed: v6 stays on XDP by design, poll-mode heat is a
+  recorded cost — neither kills the phase.
+- **Kill:** ~~VPP's PMD can't handshake the AF~~ — RETIRED: the
+  mailbox is proven (rounds 2–3). No kill criterion remains; what is
+  left is measurement.
 - Record every number in this file under a Results heading, then update
   `HEAP_BYTES_PER_ROUTE` and the plan's sizing notes from item 10, and
   pin the VPP version for slice 3.
