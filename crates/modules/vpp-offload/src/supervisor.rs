@@ -134,6 +134,15 @@ pub enum Event {
     /// Readback verification finished.
     VerifyPassed,
     VerifyFailed,
+    /// A step in the attach → resync pipeline failed outright: the
+    /// device would not attach, or the transport broke mid-drain.
+    ///
+    /// Distinct from `VerifyFailed`, which means "VPP is answering and
+    /// its FIB is wrong". This means the pipeline itself did not run.
+    /// Without it a deterministic attach failure would sit in `Syncing`
+    /// until `CONVERGENCE_BUDGET` expired — two minutes of waiting for
+    /// something already known to have failed.
+    ConvergenceFailed,
     /// Steering rules installed.
     Steered,
     /// The process exited — from pidfd, not SIGCHLD, because adoption
@@ -340,6 +349,17 @@ impl Supervisor {
             // A resync or verify that never finishes is the same trap
             // as a VPP that never answers.
             (Syncing | AdoptedResyncing | Verifying, PhaseTimedOut) => self.fail(),
+            // The pipeline broke rather than merely being slow.
+            //
+            // `converging` is deliberately NOT cleared here, unlike on
+            // `VerifyFailed`. A failed verify has *finished* — the task
+            // reported its own result, so nothing is in flight. A failed
+            // pipeline step says nothing about the other steps: an
+            // attach failure still leaves the resync that was started
+            // after it running against the transport. So `fail()` emits
+            // `AbortConvergence` and the restart waits for the caller's
+            // `ConvergenceStopped`, which is the only thing that knows.
+            (Syncing | AdoptedResyncing | Verifying, ConvergenceFailed) => self.fail(),
             (Verifying, VerifyPassed) => {
                 self.failures = 0;
                 self.converging = false;
