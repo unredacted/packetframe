@@ -26,6 +26,23 @@
 //! gate 0b's job with a peer. A clean run means the table went in and
 //! read back — not that the dataplane works.
 //!
+//! **Nor that the route file is the table.** This measures whatever it is
+//! handed; it cannot tell a complete dump from one that ended cleanly
+//! halfway. `PACKETFRAME_VPP_EXPECT_ROUTES` is the operator asserting the
+//! size, and it is only worth anything if it came from a source
+//! *independent* of the file — bird's own `show route count`, per the
+//! runbook. An expectation derived from the same pipeline it validates
+//! agrees with a truncated dump perfectly, which is worse than no check
+//! at all because it manufactures confidence. An earlier revision of the
+//! runbook did exactly that.
+//!
+//! The measured set is **best-path routes carrying a `via` nexthop**.
+//! Connected, blackhole and unreachable primaries have no nexthop that
+//! could map to a VPP-owned port, so the sink would classify them
+//! unresolvable — excluding them measures what production installs, but
+//! it does mean this is not literally every row in `master4`, and the
+//! runbook has the operator record the excluded count.
+//!
 //! ## Inputs
 //!
 //! | env | meaning |
@@ -36,7 +53,7 @@
 //! | `PACKETFRAME_VPP_PORT` | member port names, comma-separated: `eth2,eth3` |
 //! | `PACKETFRAME_VPP_PCI` | VF PCI addresses, comma-separated, **paired by position** with PORT |
 //! | `PACKETFRAME_VPP_SWIFINDEX` | recorded `sw_if_index` per port, required only for adopt |
-//! | `PACKETFRAME_VPP_EXPECT_ROUTES` | **required** — distinct prefixes the dump must contain |
+//! | `PACKETFRAME_VPP_EXPECT_ROUTES` | **required** — distinct prefixes the dump must contain, reconciled against bird's own count (see the runbook) |
 //! | `PACKETFRAME_VPP_BUDGET_S` | override the 60 s budget |
 //! | `PACKETFRAME_VPP_ADOPT` | adopt interfaces VPP already has (needs SWIFINDEX) |
 //!
@@ -206,7 +223,7 @@ fn secs(d: Duration) -> String {
 }
 
 #[test]
-fn full_table_convergence_against_a_real_vpp() {
+fn measured_convergence_against_a_real_vpp() {
     let Some(sock) = env("PACKETFRAME_VPP_API_SOCK") else {
         // Not a silent pass: say why, so a run that was meant to measure
         // something and measured nothing is obvious in the log.
@@ -298,7 +315,8 @@ fn full_table_convergence_against_a_real_vpp() {
         src.routes.len(),
         expect,
         "loaded {} distinct prefixes, expected {expect} — the dump is not \
-         the table you think it is",
+         the table you think it is (and if {expect} came from this same \
+         file, it never could have been)",
         src.routes.len()
     );
 

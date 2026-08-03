@@ -726,54 +726,61 @@ kernel export was dropped at custom-fib cutover, so `ip route show` is
 deliberately near-empty.
 
 ```sh
-birdc -r 'show route primary table master4' \
-  | awk '/^[0-9]/ { pfx=$1 } /via/ { for (i=1;i<=NF;i++) if ($i=="via") print pfx, $(i+1) }' \
-  | sort -u > /tmp/pf-routes.txt
-wc -l /tmp/pf-routes.txt
+birdc 'show route table master4 count' | tee /tmp/pf-count.txt
 ```
+
+Note the `networks` figure. That is **bird's own count, independent of the
+extraction below**, and it is what makes the check meaningful — an
+expectation derived from the same pipeline it is meant to validate proves
+nothing, because a `birdc` that ends cleanly halfway produces a shortened
+file and a shortened count that agree with each other perfectly.
+
+Now extract, and reconcile against that independent figure:
+
+```sh
+birdc 'show route primary table master4' > /tmp/pf-raw.txt
+awk '/^[0-9]/ { pfx=$1; nets++ } /via/ { for (i=1;i<=NF;i++) if ($i=="via") print pfx, $(i+1) } END { print "networks_seen", nets > "/tmp/pf-nets.txt" }' /tmp/pf-raw.txt | sort -u > /tmp/pf-routes.txt
+BIRD_NETS=$(awk '{ for (i=1;i<=NF;i++) if ($i=="networks") print $(i-1) }' /tmp/pf-count.txt)
+SEEN_NETS=$(awk '{print $2}' /tmp/pf-nets.txt)
+VIA_NETS=$(awk '{print $1}' /tmp/pf-routes.txt | sort -u | wc -l)
+echo "bird reports   : ${BIRD_NETS} networks"
+echo "dump contained : ${SEEN_NETS} networks"
+echo "with a via     : ${VIA_NETS}  <-- PACKETFRAME_VPP_EXPECT_ROUTES"
+echo "excluded       : $((SEEN_NETS - VIA_NETS)) (connected/blackhole/unreachable)"
+[ "${BIRD_NETS}" = "${SEEN_NETS}" ] && echo "OK: dump is complete" || echo "TRUNCATED — do not measure this"
+```
+
+**Stop if that last line says TRUNCATED.** The whole point of the
+expectation is that a partial dump cannot produce a clean result.
+
+**This is a via-nexthop measurement, not literally every route class.**
+The `excluded` figure is real — `master4` carries connected, blackhole and
+unreachable primaries that have no `via`, and the §0 numbers show the gap
+(1,053,380 networks against 1,053,049 best-path via-nexthops, so ~331).
+Those are exactly the routes the sink would classify unresolvable, since
+they present no nexthop that can map to a VPP-owned port, so excluding
+them measures what production installs rather than hiding a shortfall.
+Record `excluded` alongside the timings so the scope of the number is on
+the record rather than implied.
 
 ```sh
 ip -4 neigh show \
   | awk '$1 !~ /:/ && $5 ~ /:/ && $NF != "FAILED" && $NF != "INCOMPLETE" { print $1, $3, $5 }' \
-  > /tmp/pf-neigh.txt
-wc -l /tmp/pf-neigh.txt
+  > /tmp/pf-neigh-all.txt
+awk 'NR==FNR { for (n=split($2,a,","); n>0; n--) want[a[n]]=1; next } want[$1]' \
+  /tmp/pf-routes.txt /tmp/pf-neigh-all.txt > /tmp/pf-neigh.txt
+wc -l /tmp/pf-neigh-all.txt /tmp/pf-neigh.txt
 ```
 
-Count the distinct prefixes — the bench requires this as an input, so a
-dump truncated at a line boundary fails loudly instead of producing a
-clean, fast, meaningless result for a fraction of the table:
-
-```sh
-awk '{print $1}' /tmp/pf-routes.txt | sort -u | wc -l
-```
+The second step keeps only neighbours the routes actually use. Management
+and tunnel entries are harmless to the *bench* — it checks ownership only
+for route nexthops — but they matter for the one-VF rewrite below, where
+rewriting them onto the member port would make `program_neighbours` treat
+them as owned and program them into VPP. Extra work at best, and a
+refusal aborts the run.
 
 **Every device carrying a route nexthop must be a member port with its own
-VF.** Unrelated management and tunnel neighbours in the dump are fine —
-`program_neighbours` skips anything not on a member port. The
-`master4` table egresses via two devices, so a single-port run leaves the
-other device's routes unresolvable and verification fails — correctly: a
-packet whose best path exits a port VPP does not own would blackhole. The
-bench refuses up front rather than discovering it 1.05M routes later.
-
-With only one VF bound, rewrite the device column onto that port and
-record the run as a **reduced** measurement — the drain, wire encoding and
-VPP-side insert are fully exercised, but every adjacency lands on one
-interface:
-
-```sh
-awk '{ print $1, "eth3", $3 }' /tmp/pf-neigh.txt > /tmp/pf-neigh-one.txt
-```
-
-Copy both to the shadow, then check the nexthops the routes name are
-actually covered by the neighbour file — an uncovered nexthop is an
-`unresolvable` route, which fails verification by design:
-
-```sh
-comm -23 <(awk '{print $2}' /tmp/pf-routes.txt | tr ',' '\n' | sort -u) \
-         <(awk '{print $1}' /tmp/pf-neigh.txt | sort -u) | head
-```
-
-### Run
+VF.** The### Run
 
 VPP must already be up with its sized `startup.conf` (§2 — **including
 the `statseg` stanza**, or it aborts partway through). The test attaches
