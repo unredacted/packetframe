@@ -338,6 +338,17 @@ key-extraction profile does not carry v6 fields. Not a regression,
 not fixable from our side. (Beware ethtool's exit code: it printed
 the rmgr error and still exited 0 — judge by `ethtool -n`, not `$?`.)
 
+The full shape matrix, so nobody re-probes it: `ip6 src-ip`,
+`tcp6 dst-ip`, `udp6 dst-ip`, `tcp6 dst-ip+dst-port` — ALL rejected
+with 710. **`ether proto 0x86DD` INSERTS** — L2 ethertype extraction
+works, so the wall is precisely "no v6 L3 fields", not "no v6
+awareness". The ethertype rule is deliberately NOT used: it is
+all-or-nothing v6 — it would steer BGP v6 sessions, NDP and
+management into VPP, and a punt-to-kernel path for control traffic is
+the linux-cp-shaped complexity this design refuses (a VPP crash would
+take the v6 control plane down with it, breaking the failover tier's
+premise). Recorded as a door that exists and was not walked through.
+
 Consequences:
 - **v6 cannot be MCAM-steered into VPP.** The per-family split from
   the plan activates: v6 stays on the XDP custom-FIB path (already
