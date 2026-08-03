@@ -35,6 +35,7 @@
 
 pub mod attach;
 pub mod driver;
+pub mod engine;
 pub mod executor;
 pub mod fib_sync;
 pub mod liveness;

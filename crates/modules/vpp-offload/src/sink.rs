@@ -428,6 +428,18 @@ impl RouteLedger {
         self.counts
     }
 
+    /// The capacity policy this ledger enforces.
+    ///
+    /// Exposed so a caller rebuilding the ledger — on restart, when the
+    /// old VPP's FIB is gone and every recorded install is void — can
+    /// carry the policy across. Capacity is derived from the measured
+    /// heap gauge, not from the process that happened to be running, so
+    /// losing it on restart would rebuild an unbounded ledger and
+    /// install straight past the high-water mark.
+    pub fn capacity(&self) -> Capacity {
+        self.capacity
+    }
+
     fn tally(counts: &mut SinkCounts, st: RouteState, add: bool) {
         let slot = match st {
             RouteState::Installed => &mut counts.installed,
@@ -572,6 +584,19 @@ impl RouteLedger {
             .filter(|(_, st)| **st == RouteState::NotInstalled(NotInstalled::Withheld))
             .map(|(k, _)| (*k).into())
             .collect()
+    }
+
+    /// Every prefix the ledger holds an opinion about, in any state.
+    ///
+    /// The full-table resync needs this to compute **withdrawals**. A
+    /// prefix that left the route source while VPP was down, or while
+    /// packetframe was, is still installed in VPP's FIB — an add-only
+    /// resync would leave it forwarding to a nexthop the source no
+    /// longer advertises, which is a black hole that readback
+    /// verification cannot see (it samples what the ledger claims, and
+    /// the ledger claims that route is fine).
+    pub fn known_prefixes(&self) -> Vec<IpPrefix> {
+        self.state.keys().map(|k| (*k).into()).collect()
     }
 
     /// Sampling pool for readback verification: only prefixes VPP has
