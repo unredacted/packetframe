@@ -706,6 +706,87 @@ best-path nexthops. Those agree to within ~331, confirming **0 ECMP
 among selected routes** — so "nexthops as prefixes" is now measured
 rather than inferred, and the `expected-routes` sizing stands.
 
+## 3b. Convergence over the binary API (the ≤60 s budget)
+
+**This is the number item 10 explicitly did NOT measure.** Item 10 timed
+VPP's *CLI parser* absorbing the table — ~35 s for 1,053,360 routes via
+`vppctl exec`, with one shared path-list — and recorded it as a lower
+bound only. Production is 1.05M **binary-API round trips** driven by the
+module's `ConvergenceEngine`, against the real nexthop set. The plan
+publishes ≤60 s; nothing has ever checked it.
+
+Needs **no traffic peer**: nothing is steered, so this can run on the
+shadow any time VPP is up.
+
+### Inputs
+
+Two plain files, produced on the **primary** (bird has the table) and
+copied to the shadow. Note the source is bird, not the kernel — bird's
+kernel export was dropped at custom-fib cutover, so `ip route show` is
+deliberately near-empty.
+
+```sh
+birdc -r 'show route primary table master4' \
+  | awk '/^[0-9]/ { pfx=$1 } /via/ { for (i=1;i<=NF;i++) if ($i=="via") print pfx, $(i+1) }' \
+  | sort -u > /tmp/pf-routes.txt
+wc -l /tmp/pf-routes.txt
+```
+
+```sh
+ip -4 neigh show nud reachable nud stale nud permanent \
+  | awk '$1 !~ /:/ && $5 ~ /:/ { print $1, $3, $5 }' > /tmp/pf-neigh.txt
+wc -l /tmp/pf-neigh.txt
+```
+
+Copy both to the shadow, then check the nexthops the routes name are
+actually covered by the neighbour file — an uncovered nexthop is an
+`unresolvable` route, which fails verification by design:
+
+```sh
+comm -23 <(awk '{print $2}' /tmp/pf-routes.txt | tr ',' '\n' | sort -u) \
+         <(awk '{print $1}' /tmp/pf-neigh.txt | sort -u) | head
+```
+
+### Run
+
+VPP must already be up with its sized `startup.conf` (§2 — **including
+the `statseg` stanza**, or it aborts partway through). The test attaches
+the device itself, so do **not** pre-run the §3 `vppctl device attach`
+sequence; set `PACKETFRAME_VPP_ADOPT=1` if the interface is already
+attached from an earlier run.
+
+```sh
+PACKETFRAME_VPP_API_SOCK=/run/vpp/api.sock \
+PACKETFRAME_VPP_PORT=eth3 \
+PACKETFRAME_VPP_PCI=0002:07:00.1 \
+PACKETFRAME_VPP_ROUTES=/tmp/pf-routes.txt \
+PACKETFRAME_VPP_NEIGH=/tmp/pf-neigh.txt \
+  ./run-tests.sh vpp_convergence_bench -- --nocapture
+```
+
+### Reading the result
+
+The phase breakdown prints **before** any budget assertion, deliberately:
+a run that blows the budget is exactly the one whose breakdown matters,
+and a panic that hid it would waste the trip. Record `connect / attach /
+resync plan / neighbours / drain / verify / TOTAL`, the routes/s rate,
+and the ledger line.
+
+Failure modes worth recognising rather than debugging from scratch:
+
+- **`unresolvable > 0`** — the neighbour file does not cover every
+  nexthop the routes name. Verification fails by design; fix the input,
+  do not lower the bar.
+- **`deferred` large** — interface indices were not known when the drain
+  started, i.e. attach did not land. The attach step failing is louder;
+  check `show interface` first.
+- **drain not converging** — the run aborts after 10× budget rather than
+  hanging.
+- **abort with `Out-of-memory, calling os_panic()`** — the `statseg` is
+  undersized. Use `show memory` (**all** heaps), never
+  `show memory main-heap`, which reads mostly free during exactly this
+  failure. See the item-10 RESULT.
+
 ## 4. Pass / kill / record
 
 - **Pass:** items 1, 2, 7, 10 all WORK (delivery, egress, PMTUD,
