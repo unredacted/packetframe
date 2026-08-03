@@ -33,14 +33,18 @@ use packetframe_vpp_offload::vpp_api::codec::{
     SOCKCLNT_CREATE_MSG_ID,
 };
 use packetframe_vpp_offload::vpp_api::generated::{
-    ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute, IpRouteAddDel,
-    IpRouteAddDelReply, IpRouteLookupReply, MessageTableEntry, SockclntCreateReply,
-    SwInterfaceDetails, SwInterfaceSetFlagsReply, MESSAGE_META,
+    ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpNeighborAddDel,
+    IpNeighborAddDelReply, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteLookupReply,
+    MessageTableEntry, SockclntCreateReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
+    MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
 /// install onto *this*, learned from VPP, never onto a guess.
 const ASSIGNED_INDEX: u32 = 3;
+
+/// Link-layer address the fake mirror hands out for its one neighbour.
+const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
 fn id_for(name: &str) -> u16 {
     100 + MESSAGE_META.iter().position(|m| m.name == name).unwrap() as u16
@@ -90,13 +94,18 @@ mod tempdir {
     impl TempDir {
         pub fn new(tag: &str) -> std::io::Result<Self> {
             let mut p = std::env::temp_dir();
+            // Short by construction: a unix socket path is capped at
+            // SUN_LEN (~104 bytes) and macOS $TMPDIR is already ~50 of
+            // them, so a full nanosecond stamp overflows it and the
+            // failure surfaces as an unrelated-looking bind error.
             p.push(format!(
-                "pf-eng-{tag}-{}-{:?}",
+                "pf-e{tag}-{}-{:x}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
+                    % 0x100_000
             ));
             std::fs::create_dir_all(&p)?;
             Ok(Self(p))
@@ -128,6 +137,11 @@ struct WireRoute {
 enum Event {
     Msg(String),
     Route(WireRoute),
+    Neighbour {
+        sw_if_index: u32,
+        mac: [u8; 6],
+        flags: u8,
+    },
 }
 
 struct Fake {
@@ -136,9 +150,19 @@ struct Fake {
     events: Receiver<Event>,
 }
 
+/// How the fake misbehaves.
+#[derive(Clone, Copy, Default)]
+struct Behaviour {
+    /// Drop the connection after this many route ops.
+    hangup_after: Option<usize>,
+    /// Reject this many *deletes* with a non-zero retval before
+    /// accepting them.
+    reject_deletes: usize,
+}
+
 impl Fake {
     fn start(tag: &str) -> Self {
-        Self::start_with(tag, usize::MAX)
+        Self::start_behaving(tag, Behaviour::default())
     }
 
     /// Drop the connection after `hangup_after` route ops — the
@@ -148,18 +172,30 @@ impl Fake {
     /// connection can finish the job, so a fake that hung up on every
     /// connection would make recovery untestable rather than testing it.
     fn start_with(tag: &str, hangup_after: usize) -> Self {
+        Self::start_behaving(
+            tag,
+            Behaviour {
+                hangup_after: Some(hangup_after),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn start_behaving(tag: &str, behaviour: Behaviour) -> Self {
         let dir = tempdir::TempDir::new(tag).unwrap();
         let path = dir.path().join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx): (Sender<Event>, Receiver<Event>) = channel();
 
         thread::spawn(move || {
-            let mut budget = hangup_after;
+            let mut b = behaviour;
             // Accept repeatedly: a disconnect-and-reconnect is part of
             // what these tests exercise.
             while let Ok((mut sock, _)) = listener.accept() {
-                serve(&mut sock, &tx, budget);
-                budget = usize::MAX;
+                serve(&mut sock, &tx, b);
+                // One-shot hangup: the point of that test is that a fresh
+                // connection can finish the job.
+                b.hangup_after = None;
             }
         });
 
@@ -179,7 +215,7 @@ impl Fake {
     }
 }
 
-fn serve(sock: &mut UnixStream, tx: &Sender<Event>, hangup_after: usize) -> Option<()> {
+fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) -> Option<()> {
     read_frame(sock)?;
     let mut reply = SockclntCreateReply {
         context: 1,
@@ -254,11 +290,36 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, hangup_after: usize) -> Opti
                 }));
 
                 routes_seen += 1;
-                if routes_seen > hangup_after {
+                if behaviour.hangup_after.is_some_and(|n| routes_seen > n) {
                     return None;
                 }
+                // Reject deletes for a while, so the retry path is
+                // exercised against a per-route refusal rather than a
+                // connection fault.
+                let retval = if !r.is_add && behaviour.reject_deletes > 0 {
+                    behaviour.reject_deletes -= 1;
+                    -1
+                } else {
+                    0
+                };
                 out = reply_head("ip_route_add_del_reply");
                 IpRouteAddDelReply {
+                    context: ctx,
+                    retval,
+                    stats_index: 0,
+                }
+                .encode(&mut out);
+            }
+            "ip_neighbor_add_del" => {
+                let mut d = Decoder::new(&req);
+                let n = IpNeighborAddDel::decode(&mut d).expect("decodes as a neighbour op");
+                let _ = tx.send(Event::Neighbour {
+                    sw_if_index: n.neighbor.sw_if_index,
+                    mac: n.neighbor.mac_address,
+                    flags: n.neighbor.flags,
+                });
+                out = reply_head("ip_neighbor_add_del_reply");
+                IpNeighborAddDelReply {
                     context: ctx,
                     retval: 0,
                     stats_index: 0,
@@ -376,8 +437,8 @@ impl RouteSource for Mirror {
             visit(*p, &[nh()]);
         }
     }
-    fn for_each_nexthop_device(&self, visit: &mut dyn FnMut(IpAddr, &str)) {
-        visit(nh(), "eth4");
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(nh(), "eth4", MAC);
     }
 }
 
@@ -444,7 +505,7 @@ fn the_convergence_pipeline_composes_over_one_transport() {
         .into_iter()
         .filter_map(|e| match e {
             Event::Msg(n) => Some(n),
-            Event::Route(_) => None,
+            _ => None,
         })
         .collect();
     let first_attach = names.iter().position(|n| n == "dev_attach").unwrap();
@@ -472,7 +533,7 @@ fn routes_install_onto_the_index_vpp_assigned() {
         .into_iter()
         .filter_map(|e| match e {
             Event::Route(r) => Some(r),
-            Event::Msg(_) => None,
+            _ => None,
         })
         .collect();
     assert_eq!(routes.len(), 4);
@@ -577,4 +638,220 @@ fn a_hangup_mid_drain_requeues_and_disconnects() {
     drain_to_empty(&mut e);
     assert_eq!(e.counts().installed, 20);
     assert!(e.run_verify().unwrap().passed());
+}
+
+/// A mirror that still advertises the prefix but no longer resolves its
+/// nexthop — the shape the rebuilt device map produces when a neighbour
+/// disappears.
+struct OrphanedMirror {
+    routes: Vec<IpPrefix>,
+}
+
+impl RouteSource for OrphanedMirror {
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for p in &self.routes {
+            visit(*p, &[nh()]);
+        }
+    }
+    /// No neighbours: the nexthop is gone.
+    fn for_each_neighbour(&self, _visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+}
+
+/// When an advertised prefix loses every VPP-reachable nexthop, the stale
+/// route must leave VPP **and** the prefix must be recorded as
+/// unresolvable.
+///
+/// Recording it before the delete was acknowledged meant a successful
+/// delete hit `forget`, which erased the state — so `verify` saw
+/// `unresolvable == 0`, never sampled the prefix, and the supervisor
+/// could steer traffic into a table with a known hole.
+#[test]
+fn a_prefix_that_loses_its_nexthops_is_deleted_and_recorded_unresolvable() {
+    let fake = Fake::start("orphan");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).unwrap();
+
+    e.begin_resync(&mirror(3));
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 3);
+    let _ = fake.drain_events();
+
+    // Same prefixes, no reachable nexthop.
+    e.begin_resync(&OrphanedMirror {
+        routes: mirror(3).routes,
+    });
+    drain_to_empty(&mut e);
+
+    // The stale routes actually left VPP.
+    let deletes = fake
+        .drain_events()
+        .into_iter()
+        .filter(|ev| matches!(ev, Event::Route(r) if !r.is_add))
+        .count();
+    assert_eq!(deletes, 3, "every stale route must be withdrawn");
+
+    // And the hole is on the books.
+    let c = e.counts();
+    assert_eq!(c.installed, 0);
+    assert_eq!(
+        c.unresolvable, 3,
+        "the prefixes are still advertised and still unreachable"
+    );
+    assert!(
+        c.blocks_first_steer(),
+        "a table with a known hole must not be steered into"
+    );
+    // Verification must agree, not report a clean table.
+    let outcome = e.run_verify().unwrap();
+    assert!(!outcome.passed(), "{}", outcome.summary());
+    assert_eq!(outcome.unresolvable, 3);
+}
+
+/// A per-route refusal of that derived delete must be retried, not
+/// swallowed.
+///
+/// Recording `Unresolvable` before the ack left the requeued upsert
+/// seeing `was_installed == false`, so it stopped re-sending the delete
+/// — a transient refusal became permanent with the stale route still
+/// live in VPP and verification failing forever.
+#[test]
+fn a_refused_derived_delete_is_retried() {
+    let fake = Fake::start_behaving(
+        "orphan-reject",
+        Behaviour {
+            hangup_after: None,
+            reject_deletes: 1,
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).unwrap();
+
+    e.begin_resync(&mirror(1));
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 1);
+    let _ = fake.drain_events();
+
+    // Nexthop vanishes. The first delete is refused.
+    e.begin_resync(&OrphanedMirror {
+        routes: mirror(1).routes,
+    });
+    let (done, stats) = e.drain_batch().unwrap();
+    assert_eq!(stats.rejected, 1, "the fake refused the delete");
+    assert!(!done, "a refused op stays owed");
+    assert_eq!(
+        e.counts().installed,
+        1,
+        "the route is still live in VPP, so the ledger must still say so \
+         — otherwise nothing knows to retry the delete"
+    );
+
+    // The retry goes out and succeeds.
+    drain_to_empty(&mut e);
+    let deletes = fake
+        .drain_events()
+        .into_iter()
+        .filter(|ev| matches!(ev, Event::Route(r) if !r.is_add))
+        .count();
+    assert_eq!(deletes, 2, "one refused delete, one successful retry");
+    assert_eq!(e.counts().installed, 0);
+    assert_eq!(e.counts().unresolvable, 1);
+}
+
+/// Static neighbours must be programmed, on the index VPP assigned, and
+/// **before** the routes that depend on them.
+///
+/// VPP starts without `linux-cp` and MCAM rules match IP fields, so an
+/// ARP frame can never be steered to it — VPP physically cannot learn a
+/// neighbour. Skip this and route installs are still acknowledged and
+/// readback verification still passes (it checks a path exists on an
+/// interface we own, not that the adjacency resolves) while every packet
+/// is dropped on an incomplete adjacency. Nothing else in the module
+/// would report a fault, which is what makes it worth a wire test.
+#[test]
+fn static_neighbours_are_programmed_before_the_routes_that_need_them() {
+    let fake = Fake::start("nbr");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).unwrap();
+
+    let m = mirror(4);
+    // The mapping has to exist before neighbours can be resolved to an
+    // interface, which is what the resync's refresh does.
+    e.begin_resync(&m);
+    assert_eq!(e.program_neighbours(&m).unwrap(), 1);
+    drain_to_empty(&mut e);
+
+    let events = fake.drain_events();
+    let neighbours: Vec<_> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Neighbour {
+                sw_if_index,
+                mac,
+                flags,
+            } => Some((*sw_if_index, *mac, *flags)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(neighbours.len(), 1, "the one reachable nexthop");
+    assert_eq!(
+        neighbours[0].0, ASSIGNED_INDEX,
+        "the adjacency must sit on the index VPP assigned"
+    );
+    assert_eq!(neighbours[0].1, MAC, "the resolved link-layer address");
+    assert_eq!(
+        neighbours[0].2, 1,
+        "STATIC: VPP cannot ARP to refresh it, so an ageing entry would \
+         silently become an unresolved adjacency"
+    );
+
+    // Ordering, on the wire.
+    let names: Vec<&str> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Msg(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    let first_nbr = names.iter().position(|n| *n == "ip_neighbor_add_del");
+    let first_route = names.iter().position(|n| *n == "ip_route_add_del");
+    assert!(
+        first_nbr.is_some() && first_nbr < first_route,
+        "neighbours before routes: {names:?}"
+    );
+}
+
+/// A neighbour whose device is not VPP-owned is skipped, not refused —
+/// same policy the route mapping applies, for the same reason: a
+/// management or tunnel neighbour is not an error, it is not ours.
+#[test]
+fn neighbours_on_foreign_devices_are_skipped() {
+    struct MixedMirror;
+    impl RouteSource for MixedMirror {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0, 0), &[nh()]);
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC);
+            // Management: excluded by the nexthop mapping.
+            visit(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
+                "eth0",
+                [0x02, 0, 0, 0, 0, 9],
+            );
+        }
+    }
+
+    let fake = Fake::start("fgn");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).unwrap();
+    e.begin_resync(&MixedMirror);
+    assert_eq!(
+        e.program_neighbours(&MixedMirror).unwrap(),
+        1,
+        "only the member-port neighbour"
+    );
 }

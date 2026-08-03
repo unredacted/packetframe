@@ -274,7 +274,18 @@ enum Begun {
     /// A request went out; await its reply. `op` is the *effective*
     /// operation, which is not always the pending one — an installed
     /// prefix that becomes unresolvable is sent as a withdrawal.
-    Sent { context: u32, op: PendingOp },
+    ///
+    /// `derived` marks exactly that case: a withdrawal we invented
+    /// because resolution failed, as opposed to one the route source
+    /// asked for. The two must complete differently (see
+    /// [`Drainer::finish`]) — an authoritative withdrawal means the
+    /// prefix is gone, a derived one means the prefix is still
+    /// advertised but unresolvable, and conflating them loses the hole.
+    Sent {
+        context: u32,
+        op: PendingOp,
+        derived: bool,
+    },
     /// Resolved without touching the socket; already counted.
     Done,
     /// Cannot be attempted yet. Must go back into the pending map.
@@ -296,6 +307,9 @@ struct InFlight {
     /// from the original intent, not re-apply a withdrawal we derived
     /// from state that may have changed.
     original: PendingOp,
+    /// Whether `sent` is a withdrawal this drainer derived rather than
+    /// one the route source asked for.
+    derived: bool,
 }
 
 impl Default for Drainer {
@@ -346,11 +360,16 @@ impl Drainer {
                     break;
                 };
                 match self.begin(prefix, &op, ledger, resolve, ports, transport, &mut stats) {
-                    Ok(Begun::Sent { context, op: sent }) => inflight.push(InFlight {
+                    Ok(Begun::Sent {
+                        context,
+                        op: sent,
+                        derived,
+                    }) => inflight.push(InFlight {
                         context,
                         prefix,
                         sent,
                         original: op,
+                        derived,
                     }),
                     // Nothing to send (withheld, unresolvable,
                     // out-of-family): already counted, ledger already
@@ -465,6 +484,35 @@ impl Drainer {
                     ledger.state_of(prefix),
                     Some(RouteState::Installed) | Some(RouteState::Installing { replacing: true })
                 );
+
+                // A live route whose nexthops all left VPP's ports.
+                //
+                // Withdrawn, not left alone: VPP is still forwarding the
+                // PREVIOUS version, so leaving it keeps traffic on a path
+                // the route source has abandoned.
+                //
+                // Sent BEFORE reclassifying, which is the subtle part.
+                // Reclassifying first recorded `Unresolvable` immediately,
+                // and that lost the prefix twice over: a *successful*
+                // delete then hit `forget`, erasing the Unresolvable
+                // state, so `verify` saw `unresolvable == 0`, never
+                // sampled the prefix, and the supervisor could steer into
+                // a table with a known hole; and a *rejected* delete left
+                // the state Unresolvable, so the requeued upsert saw
+                // `was_installed == false` and silently stopped retrying,
+                // making a transient refusal permanent with the stale
+                // route still live. Leaving the prefix `Installed` until
+                // VPP confirms the delete fixes both: rejection retries,
+                // success records the hole.
+                if resolved.is_empty() && was_installed {
+                    let ctx = transport.send(withdraw_msg(prefix))?;
+                    return Ok(Begun::Sent {
+                        context: ctx,
+                        op: PendingOp::Withdraw,
+                        derived: true,
+                    });
+                }
+
                 // Ledger decides installable / withheld / unresolvable
                 // and reserves the capacity slot. It takes the count
                 // because we already resolved — running the mapping
@@ -480,22 +528,10 @@ impl Drainer {
                                 return Ok(Begun::Withhold);
                             }
                             crate::sink::NotInstalled::Unresolvable => {
+                                // Nothing live to withdraw — the
+                                // was-installed case was handled above,
+                                // before classification.
                                 stats.unresolvable += 1;
-                                // An update whose nexthops all moved off
-                                // VPP-owned ports is not a no-op: VPP is
-                                // still forwarding the PREVIOUS version
-                                // of this route. Leaving it would keep
-                                // traffic on a path bird has already
-                                // abandoned, and the ledger now excludes
-                                // the prefix from verification, so
-                                // nothing would ever notice. Withdraw it.
-                                if was_installed {
-                                    let ctx = transport.send(withdraw_msg(prefix))?;
-                                    return Ok(Begun::Sent {
-                                        context: ctx,
-                                        op: PendingOp::Withdraw,
-                                    });
-                                }
                             }
                         }
                         return Ok(Begun::Done);
@@ -527,11 +563,15 @@ impl Drainer {
                     op: PendingOp::Upsert {
                         nexthops: nexthops.clone(),
                     },
+                    derived: false,
                 })
             }
+            // An authoritative withdrawal: the route source no longer
+            // advertises this prefix at all.
             PendingOp::Withdraw => Ok(Begun::Sent {
                 context: transport.send(withdraw_msg(prefix))?,
                 op: PendingOp::Withdraw,
+                derived: false,
             }),
         }
     }
@@ -554,9 +594,22 @@ impl Drainer {
                 ledger.commit_installed(f.prefix);
                 stats.installed += 1;
             }
-            (PendingOp::Withdraw, 0) => {
+            // Authoritative: the source dropped the prefix, so the
+            // ledger should hold no opinion about it any more.
+            (PendingOp::Withdraw, 0) if !f.derived => {
                 ledger.forget(f.prefix);
                 stats.withdrawn += 1;
+            }
+            // Derived: the prefix is still advertised, we simply cannot
+            // reach any of its nexthops. The stale route is gone from
+            // VPP — record the hole NOW, not before, so it survives into
+            // verification. `forget` here would erase it and let the
+            // supervisor steer traffic into a table it knows is
+            // incomplete.
+            (PendingOp::Withdraw, 0) => {
+                ledger.classify_resolved(f.prefix, 0);
+                stats.withdrawn += 1;
+                stats.unresolvable += 1;
             }
             // A per-route rejection is NOT a connection fault: the
             // stream is fine and other routes will succeed. Unwind

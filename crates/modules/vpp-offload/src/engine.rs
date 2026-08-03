@@ -41,11 +41,21 @@ use std::time::Duration;
 use packetframe_common::fib::IpPrefix;
 
 use crate::attach::{attach_ports, AttachError, AttachMode, AttachedPort, PortAttach};
+use crate::fib_sync::to_address;
 use crate::fib_sync::{DrainStats, Drainer, FamilyPolicy, PortIndex, ResolvedPath, DEFAULT_WINDOW};
 use crate::sink::{Capacity, NexthopMap, PendingMap, RouteLedger, SinkCounts};
 use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
+use crate::vpp_api::generated::{IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply};
 use crate::vpp_api::{Transport, TransportError};
+
+/// `IP_API_NEIGHBOR_FLAG_STATIC` from ip_neighbor.api.
+///
+/// Static because VPP cannot refresh a neighbour on this platform: MCAM
+/// rules match IP fields, so an ARP or ND frame can never be steered to
+/// it. An ageing dynamic entry would silently become an unresolved
+/// adjacency and blackhole every route through that nexthop.
+pub const IP_NEIGHBOR_STATIC: u8 = 1;
 
 /// How long to wait for the handshake on a connect attempt.
 ///
@@ -56,27 +66,35 @@ use crate::vpp_api::{Transport, TransportError};
 /// `API_STARTUP_BUDGET`, which is the loop's business, not this call's.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Socket timeout for every request after the handshake.
+/// Socket timeout for requests after the handshake: **exactly the
+/// liveness budget in force**.
 ///
-/// **Must exceed the largest liveness budget**, and that is the whole
-/// reason it is a separate constant. `Transport::connect` installs its
-/// timeout with `set_read_timeout`, so it governs not just the handshake
-/// but every subsequent reply — and using the short handshake value would
-/// make the transport error at 500 ms during a full-table load, when VPP
-/// legitimately takes seconds to answer because it services the API on
-/// the same main thread that is executing our route batch.
+/// `Transport::connect` installs its timeout with `set_read_timeout`, so
+/// it governs every subsequent reply, not just the handshake. Two wrong
+/// answers were tried before this one and both are instructive:
 ///
-/// That would hand the transport a veto over a decision that belongs to
-/// the wedge detector: `SYNC_PING_BUDGET` exists precisely so a resync
-/// can be slow without being declared dead, and a shorter socket timeout
-/// silently defeats it — disconnect, requeue, restart, forever, on a VPP
-/// that was working. Derived from the budget rather than picked so the
-/// two cannot drift.
-pub const OP_TIMEOUT: Duration = crate::liveness::SYNC_PING_BUDGET.saturating_add(TIMEOUT_MARGIN);
-
-/// Headroom between the largest liveness budget and the socket timeout,
-/// so a reply arriving right at the budget is not raced by the socket.
-pub const TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
+/// - Reusing the short handshake value (500 ms) made the transport error
+///   during a full-table load, when VPP legitimately takes seconds to
+///   answer because it services the API on the same main thread that is
+///   executing our route batch. That silently defeats
+///   `SYNC_PING_BUDGET`, whose entire purpose is letting a resync be slow
+///   without being declared dead.
+/// - Using the *largest* budget globally (12 s) fixed that and broke the
+///   other end: `Driver` calls `ping()` synchronously, so a wedged API
+///   parks the whole loop inside one socket read. The loop cannot
+///   evaluate the detector or emit `Wedged` while blocked, so the
+///   published **blackhole-wedge ≤ 2 s** number became ~12 s. The
+///   reasoning that led there — "the socket is only a backstop, the
+///   detector owns wedge decisions" — is wrong, because the detector
+///   only gets to decide if the loop regains control.
+///
+/// So the socket enforces the same deadline the detector would, with no
+/// margin: a reply that takes longer than the budget *is* a wedge by the
+/// detector's own definition, and erroring at precisely that point is the
+/// only value that contradicts neither side.
+fn op_timeout(steered: bool, converging: bool) -> Duration {
+    crate::liveness::budget_for(steered, converging)
+}
 
 /// Route ops handed to VPP per drain call.
 ///
@@ -103,9 +121,22 @@ pub trait RouteSource {
     /// nexthops included. Multipath routes present all their nexthops.
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr]));
 
-    /// Visit each known nexthop → egress device pair, from the same
-    /// neighbour source that supplies VPP's static neighbours.
-    fn for_each_nexthop_device(&self, visit: &mut dyn FnMut(IpAddr, &str));
+    /// Visit each resolved neighbour: nexthop address, egress device, and
+    /// **link-layer address**.
+    ///
+    /// The MAC is not optional here. VPP is started without `linux-cp`
+    /// (it cannot pair kernel-owned PFs), so it begins with an empty
+    /// neighbour table, and MCAM rules match IP fields so an ARP frame
+    /// can never be steered into it — VPP physically cannot learn a
+    /// neighbour. Every adjacency has to be programmed statically from
+    /// this snapshot.
+    ///
+    /// Getting this wrong is a silent blackhole of the worst kind: route
+    /// installs are acknowledged, readback verification passes (it checks
+    /// a path exists on an interface we own, not that the adjacency
+    /// resolves), and traffic is dropped on the floor by an incomplete
+    /// adjacency. Nothing in the module would report a fault.
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6]));
 }
 
 /// What a full-table resync queued.
@@ -132,6 +163,13 @@ pub enum EngineError {
     NotConnected,
     Transport(TransportError),
     Attach(AttachError),
+    /// VPP refused a static neighbour. Fatal to convergence rather than
+    /// skippable: every route through that nexthop would install cleanly
+    /// and then drop traffic on an unresolved adjacency.
+    NeighbourRefused {
+        nexthop: IpAddr,
+        retval: i32,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -140,6 +178,11 @@ impl std::fmt::Display for EngineError {
             Self::NotConnected => write!(f, "binary API is not connected"),
             Self::Transport(e) => write!(f, "{e}"),
             Self::Attach(e) => write!(f, "{e}"),
+            Self::NeighbourRefused { nexthop, retval } => write!(
+                f,
+                "VPP refused the static neighbour for {nexthop} (retval {retval}); \
+                 every route through it would blackhole"
+            ),
         }
     }
 }
@@ -172,6 +215,13 @@ pub struct ConvergenceEngine {
     nexthops: NexthopMap,
     drainer: Drainer,
 
+    /// Whether MCAM rules are diverting traffic right now.
+    ///
+    /// Not the engine's to decide — the supervisor owns it — but the
+    /// engine needs it because the socket timeout must track the liveness
+    /// budget in force, and `budget_for` keys on steered.
+    steered: bool,
+
     phase: Option<Phase>,
     last_verify: Option<VerifyOutcome>,
     /// Advanced once per verify so each pass samples a different set.
@@ -203,6 +253,7 @@ impl ConvergenceEngine {
             ledger: RouteLedger::new(Capacity::new(high_water_routes)),
             nexthops: NexthopMap::new(members),
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
+            steered: false,
             phase: None,
             last_verify: None,
             verify_seed: 0,
@@ -305,6 +356,35 @@ impl ConvergenceEngine {
             .collect()
     }
 
+    /// Tell the engine whether traffic is currently steered.
+    ///
+    /// Only affects the socket timeout, which must match the liveness
+    /// budget in force — a steered dataplane gets the short budget even
+    /// mid-resync, because an adopted resync forwards the whole time and
+    /// a 10 s blind window on live traffic is not affordable.
+    pub fn set_steered(&mut self, steered: bool) {
+        self.steered = steered;
+        // Re-arm immediately: the state can change between operations,
+        // and a stale timeout is the bug this whole mechanism exists to
+        // avoid.
+        self.arm_timeout();
+    }
+
+    /// Re-arm the socket deadline from the budget currently in force.
+    ///
+    /// Called before every request rather than once at connect: two
+    /// `setsockopt` calls per operation (not per route) is nothing, and
+    /// it makes drift structurally impossible.
+    fn arm_timeout(&mut self) {
+        let d = op_timeout(self.steered, self.phase.is_some());
+        if let Some(t) = self.transport.as_mut() {
+            // A socket that will not take a timeout is not one to keep.
+            if t.set_timeout(d).is_err() {
+                self.transport = None;
+            }
+        }
+    }
+
     /// Attempt to connect, reporting whether the API is answering.
     ///
     /// A failure is not an error: VPP takes real time to open its socket
@@ -316,13 +396,15 @@ impl ConvergenceEngine {
         }
         match Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT) {
             Ok(mut t) => {
-                // Re-arm to the operation timeout. The handshake value is
-                // deliberately short so a failed connect costs the loop
-                // one tick, but `connect` installs it as the socket's
-                // persistent read/write timeout — leaving it in force
-                // would make every drain reply time out at 500 ms during
-                // a full-table load and defeat SYNC_PING_BUDGET.
-                if t.set_timeout(OP_TIMEOUT).is_err() {
+                // Re-arm off the handshake value. It is deliberately short
+                // so a failed connect costs the loop one tick, but
+                // `connect` installs it as the socket's persistent
+                // read/write timeout — leaving it in force would make
+                // every drain reply time out at 500 ms during a
+                // full-table load and defeat SYNC_PING_BUDGET.
+                if t.set_timeout(op_timeout(self.steered, self.phase.is_some()))
+                    .is_err()
+                {
                     return false;
                 }
                 self.transport = Some(t);
@@ -346,6 +428,7 @@ impl ConvergenceEngine {
 
     /// One liveness round trip.
     pub fn ping(&mut self) -> Result<(), EngineError> {
+        self.arm_timeout();
         let t = self.transport()?;
         match t.ping() {
             Ok(_) => Ok(()),
@@ -365,6 +448,7 @@ impl ConvergenceEngine {
     /// every single route — which the drainer handles correctly but
     /// which would burn a whole convergence cycle doing nothing.
     pub fn attach_devices(&mut self, mode: AttachMode) -> Result<(), EngineError> {
+        self.arm_timeout();
         let ports = std::mem::take(&mut self.ports);
         let known = std::mem::take(&mut self.recorded_indices);
         let t = match self.transport.as_mut() {
@@ -415,7 +499,101 @@ impl ConvergenceEngine {
             .collect()
     }
 
+    /// Program the static neighbours the resolved routes will depend on.
+    ///
+    /// Runs after `attach_devices` (the adjacency needs the interface
+    /// index) and **before** any route drains: a route installed against
+    /// an unresolved adjacency is acknowledged by VPP and then drops
+    /// every packet, and neither the ledger nor readback verification can
+    /// see it.
+    ///
+    /// Neighbours whose device is not VPP-owned are skipped rather than
+    /// refused — the same policy the nexthop mapping applies to routes,
+    /// and for the same reason: a management or tunnel neighbour is not
+    /// an error, it is simply not ours.
+    ///
+    /// Returns how many were programmed. Sized by the neighbour table
+    /// (~129 nexthops on the reference fleet), not the route table, so
+    /// this is not a batched pipeline like the drainer.
+    pub fn program_neighbours(&mut self, src: &dyn RouteSource) -> Result<u64, EngineError> {
+        self.arm_timeout();
+        if self.transport.is_none() {
+            return Err(EngineError::NotConnected);
+        }
+
+        // Collect first: the visitor borrows `src` while the sends need
+        // `&mut self`.
+        let mut wanted: Vec<(IpAddr, u32, [u8; 6])> = Vec::new();
+        {
+            let nexthops = &self.nexthops;
+            let ports = &self.port_index;
+            src.for_each_neighbour(&mut |ip, _dev, mac| {
+                if let Some(target) = nexthops.resolve(&ip) {
+                    if let Some(idx) = ports.get(&target) {
+                        wanted.push((ip, idx, mac));
+                    }
+                }
+            });
+        }
+
+        let t = self.transport.as_mut().expect("checked just above");
+        let mut programmed = 0u64;
+        for (ip, sw_if_index, mac_address) in wanted {
+            let reply =
+                match t.request::<IpNeighborAddDel, IpNeighborAddDelReply>(IpNeighborAddDel {
+                    context: 0,
+                    is_add: true,
+                    neighbor: IpNeighbor {
+                        sw_if_index,
+                        // Static: VPP must never age this out and never
+                        // ARP to refresh it, because it cannot receive
+                        // the reply.
+                        flags: IP_NEIGHBOR_STATIC,
+                        mac_address,
+                        ip_address: to_address(ip),
+                    },
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.disconnect();
+                        return Err(EngineError::Transport(e));
+                    }
+                };
+            if reply.retval != 0 {
+                // Refused, not a broken socket. Loud rather than skipped:
+                // every route through this nexthop would install cleanly
+                // and then blackhole.
+                return Err(EngineError::NeighbourRefused {
+                    nexthop: ip,
+                    retval: reply.retval,
+                });
+            }
+            programmed += 1;
+        }
+        Ok(programmed)
+    }
+
     /// Queue a full-table resync as a **diff** against the route source.
+    ///
+    /// ## Known gap: adoption cannot compute withdrawals
+    ///
+    /// The diff derives deletions from `ledger.known_prefixes()`, and on
+    /// **adoption** the ledger starts empty while VPP's FIB does not. A
+    /// prefix withdrawn while packetframe was down therefore stays
+    /// installed in the surviving VPP, where a stale more-specific can
+    /// keep overriding the live table — and verification cannot see it,
+    /// because it samples only what the ledger knows.
+    ///
+    /// Closing it needs VPP's own FIB read back, and `ip_route_dump` is
+    /// **not in the generated API whitelist** — so it needs a codegen
+    /// addition plus the regenerate-and-diff CI, not a change here.
+    /// Persisting the installed prefix set to the state file is not the
+    /// alternative: that is 1.05M prefixes rewritten continuously.
+    ///
+    /// Until then an adopted VPP's FIB is only reconciled for prefixes
+    /// the source still advertises. Recorded rather than papered over,
+    /// because the adoption path is precisely the one that keeps
+    /// forwarding while it converges.
     ///
     /// Refreshes the nexthop→device mapping first: a route's
     /// resolvability depends on it, and resolving against a stale map
@@ -440,7 +618,7 @@ impl ConvergenceEngine {
         // neighbour source is broken. Silently keeping stale mappings
         // would forward into the hole instead.
         self.nexthops.forget_devices();
-        src.for_each_nexthop_device(&mut |nh, dev| self.nexthops.set_device(nh, dev));
+        src.for_each_neighbour(&mut |nh, dev, _mac| self.nexthops.set_device(nh, dev));
 
         let mut plan = ResyncPlan::default();
         // The source's prefix set, so withdrawals are everything the
@@ -470,6 +648,7 @@ impl ConvergenceEngine {
 
     /// Push one bounded batch. `Ok(true)` = nothing left pending.
     pub fn drain_batch(&mut self) -> Result<(bool, DrainStats), EngineError> {
+        self.arm_timeout();
         // Resolve through the current map. Captured by reference so the
         // drainer sees the same mapping the ledger was classified
         // against.
@@ -517,6 +696,7 @@ impl ConvergenceEngine {
             return Err(EngineError::NotConnected);
         }
         self.phase = Some(Phase::Verify);
+        self.arm_timeout();
         self.verify_seed = next_seed(self.verify_seed);
         let seed = self.verify_seed;
 
@@ -621,9 +801,9 @@ mod tests {
                 visit(*p, nhs);
             }
         }
-        fn for_each_nexthop_device(&self, visit: &mut dyn FnMut(IpAddr, &str)) {
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
             for (a, d) in &self.devices {
-                visit(*a, d);
+                visit(*a, d, [0x02, 0, 0, 0, 0, 1]);
             }
         }
     }
@@ -877,25 +1057,59 @@ mod tests {
         );
     }
 
-    /// The socket timeout must never be shorter than the largest liveness
-    /// budget, or the transport errors before the wedge detector's budget
-    /// expires and takes a decision that belongs to the detector — a busy
-    /// but healthy VPP gets disconnected, requeued and restarted.
+    /// The socket deadline must equal the budget in force — not the
+    /// largest one.
+    ///
+    /// Too short and the transport errors during a legitimate full-table
+    /// load, defeating SYNC_PING_BUDGET. Too long and `Driver`'s
+    /// synchronous `ping()` parks the whole loop inside one socket read,
+    /// so the detector never gets to emit `Wedged` and the published
+    /// blackhole-wedge <= 2 s number becomes whatever the timeout is.
+    /// Both were shipped, in that order.
     #[test]
-    fn the_operation_timeout_outlasts_every_liveness_budget() {
+    fn the_socket_deadline_tracks_the_budget_in_force() {
         for steered in [false, true] {
             for converging in [false, true] {
-                let budget = crate::liveness::budget_for(steered, converging);
-                assert!(
-                    OP_TIMEOUT > budget,
-                    "OP_TIMEOUT {OP_TIMEOUT:?} must exceed the {budget:?} budget \
-                     (steered={steered}, converging={converging})"
+                assert_eq!(
+                    op_timeout(steered, converging),
+                    crate::liveness::budget_for(steered, converging),
+                    "steered={steered} converging={converging}"
                 );
             }
         }
-        // And it must be clearly distinct from the handshake value, which
-        // is the bug: one constant serving both roles.
-        assert!(OP_TIMEOUT > HANDSHAKE_TIMEOUT * 10);
+        // The worst case must still leave the published wedge bound
+        // intact: a blocked ping returns within the budget, so detection
+        // is budget + interval exactly as `worst_case_detection` says.
+        let steady = op_timeout(true, false);
+        assert!(
+            crate::liveness::worst_case_detection(steady) <= Duration::from_secs(2),
+            "a blocked ping must not push detection past the published 2s"
+        );
+        // A resync that is not forwarding may take much longer.
+        assert!(op_timeout(false, true) > steady);
+    }
+
+    /// The deadline follows the state rather than being fixed at connect,
+    /// because the state changes between operations.
+    #[test]
+    fn arming_follows_steered_and_converging() {
+        let mut e = engine();
+        assert_eq!(
+            op_timeout(e.steered, e.phase.is_some()),
+            crate::liveness::PING_BUDGET
+        );
+        e.begin_resync(&mirror(1));
+        assert_eq!(
+            op_timeout(e.steered, e.phase.is_some()),
+            crate::liveness::SYNC_PING_BUDGET,
+            "an unsteered resync gets the long budget"
+        );
+        e.set_steered(true);
+        assert_eq!(
+            op_timeout(e.steered, e.phase.is_some()),
+            crate::liveness::PING_BUDGET,
+            "a steered resync forwards the whole time and cannot afford it"
+        );
     }
 
     /// Link state must come from an observation. An earlier version
