@@ -68,6 +68,19 @@ pub const API_STARTUP_BUDGET: Duration = Duration::from_secs(60);
 /// exceeding it means something is wrong, not merely slow.
 pub const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
 
+/// A group of states that share one deadline.
+///
+/// Exists so a multi-state phase is bounded as a whole rather than
+/// per-state. Startup is one state today, but naming it keeps the
+/// schedule from having to infer the grouping from a duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseKind {
+    /// Spawned, waiting for the API to answer.
+    Startup,
+    /// Attach → resync → verify, budgeted as one cycle.
+    Convergence,
+}
+
 /// Where the supervised VPP is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -558,9 +571,29 @@ impl Supervisor {
     /// clock — but the *budget* belongs here, next to the states it
     /// bounds.
     pub fn phase_budget(&self) -> Option<Duration> {
+        self.phase().map(|(_, budget)| budget)
+    }
+
+    /// The current phase and its budget, or `None` when no deadline
+    /// applies.
+    ///
+    /// The **kind** matters as much as the duration. `CONVERGENCE_BUDGET`
+    /// is documented as covering a resync *plus* verify, but `Syncing`,
+    /// `AdoptedResyncing` and `Verifying` are three distinct states —
+    /// so re-arming a fresh budget on each transition would hand out
+    /// 120 s for the resync and another 120 s for the verify, twice the
+    /// number the constant claims to be. States that share a kind share
+    /// one deadline, and only a change of kind restarts the clock.
+    ///
+    /// Which states share a deadline is supervisor knowledge, so it
+    /// lives here rather than in [`crate::schedule::Schedule`], which
+    /// only does the arithmetic.
+    pub fn phase(&self) -> Option<(PhaseKind, Duration)> {
         match self.state {
-            State::Starting => Some(API_STARTUP_BUDGET),
-            State::Syncing | State::AdoptedResyncing | State::Verifying => Some(CONVERGENCE_BUDGET),
+            State::Starting => Some((PhaseKind::Startup, API_STARTUP_BUDGET)),
+            State::Syncing | State::AdoptedResyncing | State::Verifying => {
+                Some((PhaseKind::Convergence, CONVERGENCE_BUDGET))
+            }
             _ => None,
         }
     }

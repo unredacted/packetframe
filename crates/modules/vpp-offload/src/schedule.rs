@@ -27,17 +27,24 @@
 
 use std::time::{Duration, Instant};
 
-use crate::supervisor::Event;
+use crate::supervisor::{Event, PhaseKind};
 
 /// Armed deadlines for the current supervisor state.
 #[derive(Debug, Default, Clone)]
 pub struct Schedule {
     /// When the current phase stops being merely slow and becomes hung.
     ///
-    /// Armed from `Supervisor::phase_budget()` on every state change; a
-    /// state with no budget (`Ready`, `Steered`, `Stopped`) disarms it.
+    /// Armed from `Supervisor::phase()` on every state change; a state
+    /// with no budget (`Ready`, `Steered`, `Stopped`) disarms it.
     phase_deadline: Option<Instant>,
+    /// Which phase `phase_deadline` belongs to, so transitions *within*
+    /// a phase keep one deadline instead of restarting the clock.
+    phase_kind: Option<PhaseKind>,
     /// When the restart backoff expires.
+    ///
+    /// Survives elapsing: see [`Schedule::fired`]. Cleared only when the
+    /// restart it authorises is actually permitted and reported — the
+    /// observer is "the retry may proceed", not "time passed".
     backoff_until: Option<Instant>,
 }
 
@@ -48,13 +55,31 @@ impl Schedule {
 
     /// Re-arm the phase deadline for a (possibly new) state.
     ///
-    /// Call on **every** transition, passing `Supervisor::phase_budget()`
-    /// — including when it returns `None`, which disarms. Arming only on
+    /// Call on **every** transition, passing `Supervisor::phase()` —
+    /// including when it returns `None`, which disarms. Arming only on
     /// entry to a timed state would leave a stale deadline behind after
     /// leaving one, and it would fire against a state it does not
     /// describe.
-    pub fn arm_phase(&mut self, now: Instant, budget: Option<Duration>) {
-        self.phase_deadline = budget.map(|b| now + b);
+    ///
+    /// A transition *within* the same [`PhaseKind`] keeps the existing
+    /// deadline. `CONVERGENCE_BUDGET` bounds a resync **plus** verify, so
+    /// `Syncing → Verifying` must not restart it: doing so would let the
+    /// resync spend nearly the whole budget and then hand verification a
+    /// fresh one, making the effective bound twice the documented number.
+    pub fn arm_phase(&mut self, now: Instant, phase: Option<(PhaseKind, Duration)>) {
+        match phase {
+            None => {
+                self.phase_deadline = None;
+                self.phase_kind = None;
+            }
+            Some((kind, budget)) => {
+                let continuing = self.phase_kind == Some(kind) && self.phase_deadline.is_some();
+                if !continuing {
+                    self.phase_deadline = Some(now + budget);
+                    self.phase_kind = Some(kind);
+                }
+            }
+        }
     }
 
     /// Arm the restart backoff, from `Action::ArmBackoff`.
@@ -67,11 +92,13 @@ impl Schedule {
     pub fn arm_backoff(&mut self, now: Instant, delay: Duration) {
         self.backoff_until = Some(now + delay);
         self.phase_deadline = None;
+        self.phase_kind = None;
     }
 
     /// Clear everything. For a clean stop, where no deadline applies.
     pub fn disarm(&mut self) {
         self.phase_deadline = None;
+        self.phase_kind = None;
         self.backoff_until = None;
     }
 
@@ -85,21 +112,32 @@ impl Schedule {
 
     /// Events whose deadlines have elapsed by `now`.
     ///
-    /// **Consuming**: each deadline fires at most once. A deadline left
-    /// armed after firing would produce the same event on every tick,
-    /// and since both events route through the supervisor's failure
-    /// path, that is a spin through teardown-and-restart rather than a
-    /// single recovery.
-    pub fn fired(&mut self, now: Instant) -> Vec<Event> {
+    /// `may_restart` is `Supervisor::may_restart()`. It gates the backoff
+    /// because **an elapsed backoff must survive being un-actionable.**
+    /// A restart can be forbidden when the deadline expires — an aborted
+    /// convergence still unwinding, or a killed process that has not
+    /// died — and the supervisor deliberately has no other retry
+    /// trigger. Reporting `BackoffElapsed` for the caller to discard
+    /// would consume the only one and strand the supervisor in `Backoff`
+    /// forever. So the deadline stays armed until the retry is actually
+    /// permitted, and fires on the first tick after
+    /// `ConvergenceStopped` or `ProcessExited` clears the block.
+    ///
+    /// The phase deadline is unconditional, so it is consumed on firing.
+    /// Both are consumed exactly once: left armed, they would re-emit
+    /// every tick, and since both route through the supervisor's failure
+    /// path that is a teardown-restart spin rather than one recovery.
+    pub fn fired(&mut self, now: Instant, may_restart: bool) -> Vec<Event> {
         let mut out = Vec::new();
         if let Some(d) = self.phase_deadline {
             if now >= d {
                 self.phase_deadline = None;
+                self.phase_kind = None;
                 out.push(Event::PhaseTimedOut);
             }
         }
         if let Some(d) = self.backoff_until {
-            if now >= d {
+            if now >= d && may_restart {
                 self.backoff_until = None;
                 out.push(Event::BackoffElapsed);
             }
@@ -109,17 +147,29 @@ impl Schedule {
 
     /// How long the loop may sleep before something needs attention.
     ///
-    /// `None` = nothing is armed, so the loop may block on its fds
+    /// `None` = nothing needs a timer, so the loop may block on its fds
     /// indefinitely. `Some(ZERO)` = something is already due, so tick
-    /// again immediately — which is not a busy loop precisely because
-    /// [`Self::fired`] consumes what it reports.
+    /// again immediately — not a busy loop, because [`Self::fired`]
+    /// consumes what it reports.
+    ///
+    /// An **elapsed but blocked** backoff is excluded, and that is the
+    /// subtle half: it stays armed by design, so counting it would ask
+    /// for an immediate tick on every pass and spin a core until the
+    /// block cleared. What unblocks it is an event on an fd, not the
+    /// passage of time, so there is nothing to wake up *for*.
     ///
     /// `ping_due_at` comes from
     /// [`crate::liveness::WedgeDetector::next_ping_at`] and is passed in
     /// rather than stored, so there is exactly one owner of that
     /// deadline.
-    pub fn next_wakeup(&self, now: Instant, ping_due_at: Option<Instant>) -> Option<Duration> {
-        [self.phase_deadline, self.backoff_until, ping_due_at]
+    pub fn next_wakeup(
+        &self,
+        now: Instant,
+        ping_due_at: Option<Instant>,
+        may_restart: bool,
+    ) -> Option<Duration> {
+        let backoff = self.backoff_until.filter(|d| *d > now || may_restart);
+        [self.phase_deadline, backoff, ping_due_at]
             .into_iter()
             .flatten()
             .map(|d| d.saturating_duration_since(now))
@@ -145,15 +195,15 @@ mod tests {
     fn a_deadline_fires_exactly_once() {
         let t0 = Instant::now();
         let mut s = Schedule::new();
-        s.arm_phase(t0, Some(Duration::from_secs(10)));
+        s.arm_phase(t0, Some((PhaseKind::Convergence, Duration::from_secs(10))));
 
-        assert!(s.fired(at(t0, 9_999)).is_empty(), "not yet");
-        assert_eq!(s.fired(at(t0, 10_000)), vec![Event::PhaseTimedOut]);
+        assert!(s.fired(at(t0, 9_999), true).is_empty(), "not yet");
+        assert_eq!(s.fired(at(t0, 10_000), true), vec![Event::PhaseTimedOut]);
         assert!(
-            s.fired(at(t0, 10_001)).is_empty(),
+            s.fired(at(t0, 10_001), true).is_empty(),
             "a fired deadline must be consumed"
         );
-        assert!(s.fired(at(t0, 60_000)).is_empty());
+        assert!(s.fired(at(t0, 60_000), true).is_empty());
     }
 
     #[test]
@@ -162,9 +212,9 @@ mod tests {
         let mut s = Schedule::new();
         s.arm_backoff(t0, Duration::from_millis(250));
 
-        assert!(s.fired(at(t0, 249)).is_empty());
-        assert_eq!(s.fired(at(t0, 250)), vec![Event::BackoffElapsed]);
-        assert!(s.fired(at(t0, 500)).is_empty());
+        assert!(s.fired(at(t0, 249), true).is_empty());
+        assert_eq!(s.fired(at(t0, 250), true), vec![Event::BackoffElapsed]);
+        assert!(s.fired(at(t0, 500), true).is_empty());
     }
 
     /// Re-arming on every transition is what stops a deadline from
@@ -173,13 +223,13 @@ mod tests {
     fn a_state_with_no_budget_disarms_the_phase_deadline() {
         let t0 = Instant::now();
         let mut s = Schedule::new();
-        s.arm_phase(t0, Some(API_STARTUP_BUDGET));
+        s.arm_phase(t0, Some((PhaseKind::Startup, API_STARTUP_BUDGET)));
         assert!(s.phase_deadline().is_some());
 
         // Ready/Steered/Stopped report no budget.
         s.arm_phase(at(t0, 100), None);
         assert!(s.phase_deadline().is_none());
-        assert!(s.fired(at(t0, 999_999)).is_empty());
+        assert!(s.fired(at(t0, 999_999), true).is_empty());
     }
 
     /// Moving between timed phases restarts the clock rather than
@@ -188,13 +238,13 @@ mod tests {
     fn re_arming_replaces_rather_than_keeps_the_earlier_deadline() {
         let t0 = Instant::now();
         let mut s = Schedule::new();
-        s.arm_phase(t0, Some(API_STARTUP_BUDGET));
+        s.arm_phase(t0, Some((PhaseKind::Startup, API_STARTUP_BUDGET)));
 
         // 59 s later the API comes up; the convergence budget starts now.
         let t1 = at(t0, 59_000);
-        s.arm_phase(t1, Some(CONVERGENCE_BUDGET));
+        s.arm_phase(t1, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
         assert!(
-            s.fired(at(t0, 60_001)).is_empty(),
+            s.fired(at(t0, 60_001), true).is_empty(),
             "the startup budget must not still fire after the phase changed"
         );
         assert_eq!(s.phase_deadline(), Some(t1 + CONVERGENCE_BUDGET));
@@ -206,12 +256,12 @@ mod tests {
     fn arming_backoff_drops_a_stale_phase_deadline() {
         let t0 = Instant::now();
         let mut s = Schedule::new();
-        s.arm_phase(t0, Some(Duration::from_secs(1)));
+        s.arm_phase(t0, Some((PhaseKind::Convergence, Duration::from_secs(1))));
         s.arm_backoff(t0, Duration::from_secs(30));
 
         assert!(s.phase_deadline().is_none());
         assert!(
-            !s.fired(at(t0, 2_000)).contains(&Event::PhaseTimedOut),
+            !s.fired(at(t0, 2_000), true).contains(&Event::PhaseTimedOut),
             "no event for a phase we are no longer in"
         );
     }
@@ -220,11 +270,157 @@ mod tests {
     fn disarm_clears_everything() {
         let t0 = Instant::now();
         let mut s = Schedule::new();
-        s.arm_phase(t0, Some(Duration::from_secs(1)));
+        s.arm_phase(t0, Some((PhaseKind::Convergence, Duration::from_secs(1))));
         s.arm_backoff(t0, Duration::from_secs(1));
         s.disarm();
-        assert!(s.fired(at(t0, 10_000)).is_empty());
-        assert_eq!(s.next_wakeup(t0, None), None);
+        assert!(s.fired(at(t0, 10_000), true).is_empty());
+        assert_eq!(s.next_wakeup(t0, None, true), None);
+    }
+
+    // ---- An elapsed backoff must survive being un-actionable ----
+
+    /// The supervisor has exactly one retry trigger. If the backoff
+    /// elapses while a restart is forbidden — an aborted convergence
+    /// still unwinding, or a killed process that has not died —
+    /// reporting it for the caller to discard would consume that
+    /// trigger and strand the supervisor in `Backoff` forever.
+    #[test]
+    fn an_elapsed_backoff_is_withheld_not_consumed_while_blocked() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_backoff(t0, Duration::from_millis(250));
+
+        // Elapsed, but a restart is not permitted yet.
+        assert!(
+            s.fired(at(t0, 300), false).is_empty(),
+            "must not report a retry that cannot be taken"
+        );
+        assert!(
+            s.backoff_until().is_some(),
+            "and must not lose it either — this is the only trigger"
+        );
+        // Still blocked several ticks later.
+        assert!(s.fired(at(t0, 5_000), false).is_empty());
+        assert!(s.backoff_until().is_some());
+
+        // ConvergenceStopped / ProcessExited unblocks it; now it fires.
+        assert_eq!(s.fired(at(t0, 5_001), true), vec![Event::BackoffElapsed]);
+        assert!(s.backoff_until().is_none(), "consumed once taken");
+        assert!(s.fired(at(t0, 6_000), true).is_empty());
+    }
+
+    /// The other half: a withheld backoff must not ask for an immediate
+    /// tick on every pass. What unblocks it arrives on an fd, not from
+    /// the clock, so there is nothing to wake up for — and asking would
+    /// spin a core until the block cleared.
+    #[test]
+    fn a_withheld_backoff_does_not_request_a_busy_tick() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_backoff(t0, Duration::from_millis(250));
+        let late = at(t0, 5_000);
+
+        assert!(s.fired(late, false).is_empty());
+        assert_eq!(
+            s.next_wakeup(late, None, false),
+            None,
+            "blocked: sleep on the fds instead of spinning"
+        );
+        // Once permitted, it is due immediately.
+        assert_eq!(
+            s.next_wakeup(late, None, true),
+            Some(Duration::ZERO),
+            "unblocked: tick now"
+        );
+    }
+
+    /// A backoff still in the future is scheduled normally whether or
+    /// not a restart is currently permitted — by the time it elapses the
+    /// block may well be gone.
+    #[test]
+    fn a_future_backoff_is_scheduled_regardless_of_the_block() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_backoff(t0, Duration::from_secs(30));
+        assert_eq!(
+            s.next_wakeup(t0, None, false),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    // ---- One budget across the convergence cycle ----
+
+    /// `CONVERGENCE_BUDGET` bounds a resync PLUS verify. Re-arming on
+    /// the `Syncing → Verifying` transition would let the resync spend
+    /// nearly all of it and hand verification a fresh one, making the
+    /// real bound twice the documented number.
+    #[test]
+    fn moving_between_convergence_substates_keeps_one_deadline() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_phase(t0, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        let armed = s.phase_deadline().expect("armed");
+
+        // 119 s of resync, then SyncComplete → Verifying, same kind.
+        let t1 = at(t0, 119_000);
+        s.arm_phase(t1, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        assert_eq!(
+            s.phase_deadline(),
+            Some(armed),
+            "the cycle's deadline must not restart for the verify"
+        );
+        assert_eq!(
+            s.fired(at(t0, 120_001), true),
+            vec![Event::PhaseTimedOut],
+            "the whole cycle is bounded, not each substate"
+        );
+    }
+
+    /// But entering convergence from startup DOES start a fresh clock —
+    /// they are different phases with different budgets.
+    #[test]
+    fn entering_convergence_from_startup_restarts_the_clock() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_phase(t0, Some((PhaseKind::Startup, API_STARTUP_BUDGET)));
+        let t1 = at(t0, 30_000);
+        s.arm_phase(t1, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        assert_eq!(s.phase_deadline(), Some(t1 + CONVERGENCE_BUDGET));
+    }
+
+    /// And a cycle that ended and began again gets a fresh deadline,
+    /// rather than inheriting the previous attempt's remaining time.
+    #[test]
+    fn a_new_convergence_after_a_gap_starts_fresh() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_phase(t0, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        // Failure → Backoff (no phase), then a new attempt.
+        s.arm_phase(at(t0, 10_000), None);
+        let t2 = at(t0, 20_000);
+        s.arm_phase(t2, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        assert_eq!(s.phase_deadline(), Some(t2 + CONVERGENCE_BUDGET));
+    }
+
+    /// The supervisor is the source of the grouping, so check the real
+    /// states agree rather than only the enum.
+    #[test]
+    fn the_supervisors_convergence_states_share_a_kind() {
+        use crate::supervisor::{Event as E, Supervisor};
+        let mut sup = Supervisor::new();
+        sup.on(E::StartRequested);
+        assert_eq!(sup.phase().map(|(k, _)| k), Some(PhaseKind::Startup));
+        sup.on(E::ApiUp);
+        let syncing = sup.phase();
+        assert_eq!(syncing.map(|(k, _)| k), Some(PhaseKind::Convergence));
+        sup.on(E::SyncComplete);
+        assert_eq!(
+            sup.phase(),
+            syncing,
+            "Syncing and Verifying must report the same phase and budget"
+        );
+        sup.on(E::VerifyPassed);
+        assert_eq!(sup.phase(), None, "Ready has no deadline");
     }
 
     // ---- Sleeping: never miss, never spin ----
@@ -236,7 +432,7 @@ mod tests {
     #[test]
     fn an_idle_schedule_permits_blocking_indefinitely() {
         let t0 = Instant::now();
-        assert_eq!(Schedule::new().next_wakeup(t0, None), None);
+        assert_eq!(Schedule::new().next_wakeup(t0, None, true), None);
     }
 
     /// The wakeup must be the EARLIEST deadline. Sleeping past any
@@ -246,17 +442,17 @@ mod tests {
     fn the_wakeup_is_the_earliest_of_every_deadline() {
         let t0 = Instant::now();
         let mut s = Schedule::new();
-        s.arm_phase(t0, Some(Duration::from_secs(120)));
+        s.arm_phase(t0, Some((PhaseKind::Convergence, Duration::from_secs(120))));
         s.arm_backoff(t0, Duration::from_secs(30));
         // Ping is soonest of the three.
         let ping = at(t0, 500);
 
         assert_eq!(
-            s.next_wakeup(t0, Some(ping)),
+            s.next_wakeup(t0, Some(ping), true),
             Some(Duration::from_millis(500))
         );
         // Without the ping, the backoff is next.
-        assert_eq!(s.next_wakeup(t0, None), Some(Duration::from_secs(30)));
+        assert_eq!(s.next_wakeup(t0, None, true), Some(Duration::from_secs(30)));
     }
 
     /// An already-elapsed deadline asks for an immediate tick, and that
@@ -268,10 +464,10 @@ mod tests {
         s.arm_backoff(t0, Duration::from_millis(100));
 
         let late = at(t0, 5_000);
-        assert_eq!(s.next_wakeup(late, None), Some(Duration::ZERO));
-        assert_eq!(s.fired(late), vec![Event::BackoffElapsed]);
+        assert_eq!(s.next_wakeup(late, None, true), Some(Duration::ZERO));
+        assert_eq!(s.fired(late, true), vec![Event::BackoffElapsed]);
         assert_eq!(
-            s.next_wakeup(late, None),
+            s.next_wakeup(late, None, true),
             None,
             "consuming the deadline must end the immediate-tick request"
         );
@@ -284,7 +480,7 @@ mod tests {
         let t0 = Instant::now();
         let s = Schedule::new();
         assert_eq!(
-            s.next_wakeup(t0, Some(at(t0, 500))),
+            s.next_wakeup(t0, Some(at(t0, 500)), true),
             Some(Duration::from_millis(500))
         );
     }
@@ -302,14 +498,14 @@ mod tests {
         let s = Schedule::new();
 
         assert_eq!(
-            s.next_wakeup(t0, Some(d.next_ping_at())),
+            s.next_wakeup(t0, Some(d.next_ping_at()), true),
             Some(PING_INTERVAL)
         );
 
         // After a ping goes out, the next one is an interval later.
         d.on_ping_sent(at(t0, 500));
         assert_eq!(
-            s.next_wakeup(at(t0, 500), Some(d.next_ping_at())),
+            s.next_wakeup(at(t0, 500), Some(d.next_ping_at()), true),
             Some(PING_INTERVAL)
         );
     }
@@ -323,7 +519,7 @@ mod tests {
         let t0 = Instant::now();
         let d = WedgeDetector::started(t0);
         let s = Schedule::new();
-        let sleep = s.next_wakeup(t0, Some(d.next_ping_at())).unwrap();
+        let sleep = s.next_wakeup(t0, Some(d.next_ping_at()), true).unwrap();
         assert!(
             sleep < worst_case_detection(PING_BUDGET),
             "sleeping {sleep:?} would blow the detection bound"
