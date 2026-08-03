@@ -114,16 +114,21 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
 
     for action in actions {
         match action {
-            Action::Unsteer => match fx.unsteer() {
-                Ok(()) => {}
+            Action::Unsteer => out.events.push(match fx.unsteer() {
+                // Acknowledged, so the supervisor may believe steering
+                // is down. Reporting this rather than letting `fail()`
+                // assume it is what stops a later teardown from
+                // releasing a VF that MCAM is still pointing at.
+                Ok(()) => Event::Unsteered,
                 Err(e) => {
                     // Traffic is still being diverted to a dataplane we
                     // are about to stop supervising. Loud, and it
                     // forfeits the right to release the VF.
                     out.failures.push((*action, e));
                     teardown_clean = false;
+                    Event::UnsteerFailed
                 }
-            },
+            }),
             Action::Kill => {
                 if fx.kill() == Disposition::MustLeak {
                     out.failures.push((
@@ -131,6 +136,10 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         "process survived termination; resources must not be released".into(),
                     ));
                     teardown_clean = false;
+                    // Not just a leaked VF: the restart must not spawn a
+                    // second VPP while this one can still own the API
+                    // socket and DMA through the VF.
+                    out.events.push(Event::TerminationFailed);
                 }
             }
             Action::Spawn => out.events.push(match fx.spawn() {
@@ -678,6 +687,99 @@ mod tests {
         );
         step(&mut sup, &mut r, Event::ConvergenceStopped);
         assert!(sup.may_restart());
+    }
+
+    /// The cross-batch hole. A failed `Unsteer` used to be forgotten
+    /// when `execute` returned, *and* the supervisor cleared `steered`
+    /// optimistically — so a later `StopRequested` emitted no `Unsteer`
+    /// at all and its fresh, clean batch released a VF that MCAM was
+    /// still pointing traffic at.
+    #[test]
+    fn a_failed_unsteer_still_withholds_the_vf_in_a_later_batch() {
+        let mut sup = Supervisor::new();
+        let mut r = Recorder {
+            fail_unsteer: true,
+            ..Default::default()
+        };
+        bring_up_steered(&mut sup, &mut r);
+
+        // Crash while steered. The unsteer fails.
+        step(&mut sup, &mut r, Event::ProcessExited { status: None });
+        assert!(
+            sup.is_steered(),
+            "a failed unsteer must NOT be recorded as unsteered"
+        );
+
+        // Now a clean stop, in a brand-new batch.
+        r.calls.clear();
+        let actions = sup.on(Event::StopRequested);
+        assert!(
+            actions.contains(&Action::Unsteer),
+            "the retry must be attempted because we still believe we steer: {actions:?}"
+        );
+        let out = execute(&actions, &mut r);
+        assert!(
+            !r.calls.contains(&"release"),
+            "the VF is still receiving diverted traffic: {:?}",
+            r.calls
+        );
+        assert!(out.resources_leaked);
+    }
+
+    /// The same path when the unsteer eventually succeeds: the VF is
+    /// then genuinely ours to release.
+    #[test]
+    fn an_unsteer_that_succeeds_on_retry_permits_release() {
+        let mut sup = Supervisor::new();
+        let mut r = Recorder {
+            fail_unsteer: true,
+            ..Default::default()
+        };
+        bring_up_steered(&mut sup, &mut r);
+        step(&mut sup, &mut r, Event::ProcessExited { status: None });
+        assert!(sup.is_steered());
+
+        r.fail_unsteer = false;
+        r.calls.clear();
+        let actions = sup.on(Event::StopRequested);
+        let out = execute(&actions, &mut r);
+        assert_eq!(r.calls, vec!["unsteer", "kill", "release"]);
+        assert!(out.ok());
+        // Feeding the ack back settles the belief.
+        for e in out.events {
+            sup.on(e);
+        }
+        assert!(!sup.is_steered());
+    }
+
+    /// A process that survived termination must not be joined by a
+    /// second one. `ArmBackoff` alone would let `BackoffElapsed` spawn
+    /// another VPP onto the same API socket and VF.
+    #[test]
+    fn a_process_that_survives_kill_blocks_the_restart() {
+        let mut sup = Supervisor::new();
+        let mut r = Recorder {
+            kill_disposition: Some(Disposition::MustLeak),
+            ..Default::default()
+        };
+        step(&mut sup, &mut r, Event::StartRequested);
+        step(&mut sup, &mut r, Event::Wedged);
+
+        assert_eq!(sup.state(), State::Backoff);
+        assert!(sup.is_undead(), "the old process may still be alive");
+        assert!(
+            !sup.may_restart(),
+            "a second VPP on the same VF is worse than staying down"
+        );
+
+        // The pidfd eventually reports the exit; only then may we retry.
+        sup.on(Event::ProcessExited { status: None });
+        assert!(!sup.is_undead());
+        assert!(sup.may_restart());
+        r.calls.clear();
+        r.kill_disposition = None;
+        step(&mut sup, &mut r, Event::BackoffElapsed);
+        assert_eq!(r.calls, vec!["spawn"]);
     }
 
     /// A clean stop releases resources; a stop whose teardown fails does

@@ -741,6 +741,38 @@ fn verify_fails_when_an_owned_interface_has_no_carrier() {
     assert!(out.summary().contains("link_up=false"), "{}", out.summary());
 }
 
+/// An owned index that VPP does not report at all is not healthy by
+/// omission. Only iterating the dump meant a port that vanished after
+/// attach was never examined — and if the random sample happened not to
+/// select a route through it, every probe matched and verify passed on a
+/// port that could not forward.
+#[test]
+fn verify_fails_when_an_owned_interface_is_absent_from_vpp() {
+    let fake = Fake::start_with(
+        "absent",
+        AttachBehaviour::default(),
+        LookupBehaviour::Found { sw_if_index: 7 },
+        // We own 7 and 9; VPP only has 7.
+        vec![(7, "octeon0/0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let (ledger, mut ports) = ledger_with(50);
+    ports.insert("eth2", None, 9);
+
+    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    assert!(
+        out.mismatches.is_empty(),
+        "every route probe still looks perfect: {:?}",
+        out.mismatches
+    );
+    assert_eq!(out.dead_interfaces.len(), 1, "{:?}", out.dead_interfaces);
+    assert_eq!(out.dead_interfaces[0].sw_if_index, 9);
+    assert!(!out.dead_interfaces[0].admin_up);
+    assert!(!out.dead_interfaces[0].link_up);
+    assert!(!out.passed(), "{}", out.summary());
+    assert!(out.summary().contains("absent"), "{}", out.summary());
+}
+
 /// An interface we do NOT own being down is not our problem and must
 /// not fail our verify — otherwise any unrelated down interface on the
 /// box blocks steering forever.

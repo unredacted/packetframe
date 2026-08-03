@@ -167,6 +167,25 @@ pub enum Event {
     /// traffic is NOT diverted — the safe staging state, reported
     /// rather than papered over.
     SteerFailed,
+    /// MCAM rules are confirmed removed.
+    ///
+    /// Steering is only believed *down* on this acknowledgement, for
+    /// the same reason it is only believed *up* on `Steered`: an
+    /// optimistic clear meant a later teardown saw `steered == false`,
+    /// emitted no `Unsteer`, and happily released a VF that MCAM was
+    /// still pointing traffic at.
+    Unsteered,
+    /// Removing the MCAM rules failed. Traffic is still diverted to a
+    /// dataplane we are trying to stop — `steered` stays true so every
+    /// later teardown keeps trying and keeps withholding the VF.
+    UnsteerFailed,
+    /// The process survived termination (uninterruptible sleep, most
+    /// likely on a VFIO or DMA call).
+    ///
+    /// Blocks the restart: spawning a second VPP while the first still
+    /// owns the API socket and can DMA through the VF is worse than
+    /// staying down. Cleared when the pidfd finally reports the exit.
+    TerminationFailed,
     /// An aborted resync or verify has actually finished unwinding.
     ///
     /// The supervisor cannot observe this itself: the work runs in the
@@ -245,6 +264,14 @@ pub struct Supervisor {
     /// Only the caller knows when its task has truly stopped, so this
     /// is cleared by `Event::ConvergenceStopped`, not by a state change.
     converging: bool,
+    /// A previous process survived termination and may still be alive.
+    ///
+    /// Blocks the restart. Spawning a second VPP while the first still
+    /// owns the API socket and can DMA through the VF is worse than
+    /// staying down — and `ArmBackoff` alone would have let
+    /// `BackoffElapsed` do exactly that. Cleared only when the pidfd
+    /// reports the exit.
+    undead: bool,
 }
 
 impl Default for Supervisor {
@@ -261,6 +288,7 @@ impl Supervisor {
             steered: false,
             was_steered: false,
             converging: false,
+            undead: false,
         }
     }
 
@@ -405,11 +433,29 @@ impl Supervisor {
             }
 
             // --- death and wedging ---
-            (s, ProcessExited { .. }) | (s, Wedged) if s.has_process() => {
+            (s, ProcessExited { .. }) if s.has_process() => {
+                // Proof it is gone, whatever we believed before.
+                self.undead = false;
                 if self.steered {
                     self.was_steered = true;
                 }
                 self.fail()
+            }
+            // A wedge says the process is NOT scheduling; it says
+            // nothing about whether it is alive, so `undead` is left
+            // alone here.
+            (s, Wedged) if s.has_process() => {
+                if self.steered {
+                    self.was_steered = true;
+                }
+                self.fail()
+            }
+            // A late exit for a process we had already given up on. Not
+            // a new failure — but it IS the proof the restart has been
+            // waiting for.
+            (s, ProcessExited { .. }) if !s.has_process() => {
+                self.undead = false;
+                vec![]
             }
 
             // Steering could not be installed. We stay verified but
@@ -422,18 +468,31 @@ impl Supervisor {
             // suppress the Unsteer we owe on teardown.
             (Ready, SteerFailed) => vec![],
 
+            // --- steering acknowledgements ---
+            (_, Unsteered) => {
+                self.steered = false;
+                vec![]
+            }
+            // Traffic is still diverted. `steered` stays true so the
+            // next teardown tries again and keeps withholding the VF.
+            (_, UnsteerFailed) => vec![],
+
             // --- convergence bookkeeping ---
             (_, ConvergenceStopped) => {
                 self.converging = false;
+                vec![]
+            }
+            (_, TerminationFailed) => {
+                self.undead = true;
                 vec![]
             }
 
             // --- clean stop ---
             (_, StopRequested) => {
                 let mut actions = Vec::new();
+                // Same rule as `fail()`: believed down only on the ack.
                 if self.steered {
                     actions.push(Action::Unsteer);
-                    self.steered = false;
                 }
                 if self.converging {
                     actions.push(Action::AbortConvergence);
@@ -463,9 +522,14 @@ impl Supervisor {
         // Unsteer FIRST and unconditionally on the current fact, not on
         // the lifecycle state: until the MCAM rules are gone, every
         // steered packet is going to a VF nothing is servicing.
+        //
+        // `steered` is NOT cleared here. Clearing it optimistically
+        // meant a failed unsteer still recorded "not steered", so a
+        // later teardown emitted no Unsteer at all and released a VF
+        // that MCAM was still pointing traffic at. `Event::Unsteered`
+        // is the acknowledgement, symmetric with `Steered`.
         if self.steered {
             actions.push(Action::Unsteer);
-            self.steered = false;
         }
         // Tell the caller to wind down any resync/verify still running.
         // `converging` stays true until it confirms with
@@ -511,7 +575,12 @@ impl Supervisor {
     /// `BackoffElapsed`; starting another attempt would stack two loads
     /// onto one VPP.
     pub fn may_restart(&self) -> bool {
-        !self.converging
+        !self.converging && !self.undead
+    }
+
+    /// Whether a process we tried to kill may still be alive.
+    pub fn is_undead(&self) -> bool {
+        self.undead
     }
 }
 
@@ -633,6 +702,11 @@ mod tests {
             "steering must come down BEFORE the kill: {actions:?}"
         );
         assert!(actions.contains(&Action::Kill));
+        // Still believed steered until the removal is acknowledged —
+        // clearing it optimistically is what let a later teardown skip
+        // the Unsteer and release a VF MCAM still pointed at.
+        assert!(s.is_steered(), "not down until confirmed down");
+        s.on(Event::Unsteered);
         assert!(!s.is_steered());
     }
 
@@ -654,6 +728,10 @@ mod tests {
                 Some(&Action::Unsteer),
                 "{event:?} tore down without unsteering: {actions:?}"
             );
+            // Believed steered until acknowledged; the acknowledgement
+            // is what clears it.
+            assert!(s.is_steered(), "{event:?} cleared it optimistically");
+            s.on(Event::Unsteered);
             assert!(!s.is_steered(), "{event:?} left us believing we steer");
         }
     }

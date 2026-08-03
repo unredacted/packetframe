@@ -211,10 +211,12 @@ pub fn verify(
     // and we steer into an interface that forwards nothing. The runbook
     // treats link-up as the bring-up pass for exactly this reason;
     // `set_admin_up` only ever asserted the administrative flag.
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for iface in crate::attach::interfaces(t)? {
         if !owned.contains(&iface.sw_if_index) {
             continue;
         }
+        seen.insert(iface.sw_if_index);
         let (admin_up, link_up) = (iface.admin_up(), iface.link_up());
         if !admin_up || !link_up {
             out.dead_interfaces.push(DeadInterface {
@@ -225,6 +227,24 @@ pub fn verify(
             });
         }
     }
+    // An owned index that is ABSENT from the dump is not healthy by
+    // omission. Only iterating what the dump returned meant a port that
+    // disappeared after attach was invisible: if the random sample
+    // happened not to select a route through it, every probe matched and
+    // verification passed on a port that could not forward. Report each
+    // missing index as its own failure — nothing about it is up.
+    for idx in owned.iter().copied() {
+        if !seen.contains(&idx) {
+            out.dead_interfaces.push(DeadInterface {
+                sw_if_index: idx,
+                name: format!("<absent from VPP, idx {idx}>"),
+                admin_up: false,
+                link_up: false,
+            });
+        }
+    }
+    // Deterministic order so a failing verify reads the same twice.
+    out.dead_interfaces.sort_by_key(|d| d.sw_if_index);
 
     for prefix in probes {
         let reply = t.request::<IpRouteLookup, IpRouteLookupReply>(IpRouteLookup {

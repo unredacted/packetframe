@@ -60,6 +60,22 @@ pub struct PortState {
     /// Worker cores promised for this port (config echo, used by the
     /// startup.conf renderer on adopt without re-parsing config).
     pub cores: u16,
+    /// The `sw_if_index` VPP assigned this port's interface.
+    ///
+    /// **Adoption depends on this being persisted.**
+    /// [`crate::attach::attach_ports`] reuses a recorded index rather
+    /// than re-issuing `dev_attach` against a surviving VPP — which
+    /// would either be refused (fatal, cycling a healthy and possibly
+    /// steered dataplane) or create a duplicate interface the live FIB
+    /// does not reference. Without this field that mapping cannot be
+    /// reconstructed after a packetframe restart, so the adoption path
+    /// would always take the blind-attach branch it exists to avoid.
+    ///
+    /// `None` = not yet attached, or state written before this field
+    /// existed. Both make adoption fall back to a fresh attach, which
+    /// is correct: the index is unknown, so nothing may be reused.
+    #[serde(default)]
+    pub sw_if_index: Option<u32>,
 }
 
 /// Everything attach acquired, in acquisition order. Release walks it
@@ -513,6 +529,7 @@ mod tests {
             iface: "eth4".into(),
             vf_pci: "0002:07:00.1".into(),
             cores: 1,
+            sw_if_index: Some(7),
         });
         st.steer_rules.push(("eth4".into(), vec![1, 2, 3]));
         st.save(&dir).unwrap();
@@ -646,6 +663,7 @@ mod tests {
             iface: "eth4".into(),
             vf_pci: "0002:07:00.1".into(),
             cores: 1,
+            sw_if_index: None,
         };
 
         // No VF at all → provision-cleared message.
