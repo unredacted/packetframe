@@ -65,11 +65,6 @@ pub enum State {
 }
 
 impl State {
-    /// Whether MCAM rules are currently diverting traffic.
-    pub fn is_steered(self) -> bool {
-        matches!(self, State::Steered | State::AdoptedResyncing)
-    }
-
     /// Whether a supervised process exists that could die or wedge.
     ///
     /// `Backoff` deliberately counts as NO process: the previous one
@@ -97,6 +92,11 @@ pub enum Event {
     StartRequested,
     /// A child was spawned successfully.
     Spawned,
+    /// fork/exec failed — the binary is missing, not yet installed, or
+    /// the mount is briefly unavailable. Distinct from
+    /// `ProcessExited` because no process ever existed, so no pidfd
+    /// will report anything and the retry has to be driven from here.
+    SpawnFailed,
     /// A pre-existing VPP was adopted from the state file. `steered`
     /// records whether its MCAM rules are still in place, which
     /// decides whether we may keep traffic flowing through it.
@@ -158,6 +158,18 @@ pub struct Supervisor {
     state: State,
     /// Consecutive failures since the last verified-healthy moment.
     failures: u32,
+    /// Whether MCAM rules are diverting traffic RIGHT NOW.
+    ///
+    /// A field rather than a property of [`State`], because the two are
+    /// genuinely orthogonal and adoption proves it: an adopted VPP is
+    /// steered while it is still syncing and verifying. Deriving this
+    /// from the lifecycle state meant `AdoptedResyncing → Verifying`
+    /// silently dropped it, so a verify failure — or a crash, wedge, or
+    /// stop during that window — killed VPP *without* removing the
+    /// steering rules first, leaving traffic diverted to a VF nothing
+    /// was servicing. That is precisely the blackhole the ≤50 ms
+    /// teardown rule exists to prevent.
+    steered: bool,
     /// Whether steering was up when the current trouble started —
     /// remembered across the restart so `Ready` knows whether to
     /// re-steer automatically or wait for the operator's canary.
@@ -175,12 +187,18 @@ impl Supervisor {
         Self {
             state: State::Stopped,
             failures: 0,
+            steered: false,
             was_steered: false,
         }
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Whether MCAM rules are currently diverting traffic to VPP.
+    pub fn is_steered(&self) -> bool {
+        self.steered
     }
 
     pub fn failures(&self) -> u32 {
@@ -220,6 +238,12 @@ impl Supervisor {
                 vec![Action::Spawn]
             }
             (Starting, Spawned) => vec![],
+            // fork/exec itself failed — no process exists, so no pidfd
+            // will ever report an exit. Without an explicit event the
+            // supervisor would sit in `Starting` forever: `Starting`
+            // ignores both StartRequested and BackoffElapsed, so the
+            // retry policy it has would never run.
+            (Starting, SpawnFailed) => self.fail(),
             (Starting, ApiUp) => {
                 self.state = Syncing;
                 // Devices first: the FIB paths we are about to install
@@ -231,6 +255,7 @@ impl Supervisor {
 
             // --- adoption (rule 3) ---
             (Stopped | Backoff | Starting, Adopted { steered }) => {
+                self.steered = steered;
                 self.was_steered = steered;
                 // An adopted VPP is presumed good until proven stale:
                 // mark dirty, resync, verify — but do NOT unsteer a
@@ -245,16 +270,25 @@ impl Supervisor {
                 vec![Action::StartVerify]
             }
             (Verifying, VerifyPassed) => {
-                self.state = Ready;
                 self.failures = 0;
-                // Re-steer automatically only if traffic was already
-                // flowing before the disruption. A first attach waits
-                // for the operator's explicit canary — that is the
-                // whole point of `steer on|off` being per port.
-                if self.was_steered {
+                // Steer if traffic was flowing before the disruption —
+                // or is still flowing, in the adopted case. A first
+                // attach waits for the operator's explicit canary;
+                // that is the whole point of `steer on|off` being per
+                // port.
+                //
+                // Steer is emitted even when we believe we are already
+                // steered. On this platform that is not redundant: the
+                // UniFi controller wipes custom classifier state on
+                // provisioning and deploys, so rules we installed
+                // before a restart may simply be gone. Re-asserting
+                // them is the reconcile step, and it is cheap.
+                if self.steered || self.was_steered {
                     self.state = State::Steered;
+                    self.steered = true;
                     vec![Action::Steer]
                 } else {
+                    self.state = Ready;
                     vec![]
                 }
             }
@@ -266,23 +300,25 @@ impl Supervisor {
             }
             (Ready, Event::Steered) => {
                 self.state = State::Steered;
+                self.steered = true;
                 self.was_steered = true;
                 vec![]
             }
 
             // --- death and wedging ---
             (s, ProcessExited { .. }) | (s, Wedged) if s.has_process() => {
-                if s.is_steered() {
+                if self.steered {
                     self.was_steered = true;
                 }
                 self.fail()
             }
 
             // --- clean stop ---
-            (s, StopRequested) => {
+            (_, StopRequested) => {
                 let mut actions = Vec::new();
-                if s.is_steered() {
+                if self.steered {
                     actions.push(Action::Unsteer);
+                    self.steered = false;
                 }
                 actions.push(Action::Kill);
                 actions.push(Action::ReleaseResources);
@@ -306,8 +342,12 @@ impl Supervisor {
     /// steered packet is going to a VF nothing is servicing.
     fn fail(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
-        if self.state.is_steered() {
+        // Unsteer FIRST and unconditionally on the current fact, not on
+        // the lifecycle state: until the MCAM rules are gone, every
+        // steered packet is going to a VF nothing is servicing.
+        if self.steered {
             actions.push(Action::Unsteer);
+            self.steered = false;
         }
         actions.push(Action::Kill);
         self.failures = self.failures.saturating_add(1);
@@ -422,8 +462,104 @@ mod tests {
             !actions.contains(&Action::Unsteer),
             "a correctly-forwarding VPP must keep forwarding"
         );
-        assert!(s.state().is_steered());
+        assert!(s.is_steered());
         assert_eq!(actions, vec![Action::AttachDevices, Action::StartResync]);
+    }
+
+    /// The window the `steered` field exists to protect. An adopted
+    /// VPP is steered while it syncs AND while it verifies; if
+    /// steered-ness is derived from the lifecycle state, the
+    /// `AdoptedResyncing → Verifying` step silently drops it and every
+    /// teardown from there kills VPP with traffic still pointed at it.
+    #[test]
+    fn a_steered_adoptee_that_fails_verification_is_unsteered_first() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::SyncComplete);
+        assert_eq!(s.state(), State::Verifying);
+        assert!(s.is_steered(), "still forwarding while we verify");
+
+        let actions = s.on(Event::VerifyFailed);
+        assert_eq!(
+            actions.first(),
+            Some(&Action::Unsteer),
+            "steering must come down BEFORE the kill: {actions:?}"
+        );
+        assert!(actions.contains(&Action::Kill));
+        assert!(!s.is_steered());
+    }
+
+    /// Same window, reached by the other three exits.
+    #[test]
+    fn every_teardown_during_adopted_verification_unsteers_first() {
+        for event in [
+            Event::VerifyFailed,
+            Event::ProcessExited { status: None },
+            Event::Wedged,
+            Event::StopRequested,
+        ] {
+            let mut s = Supervisor::new();
+            s.on(Event::Adopted { steered: true });
+            s.on(Event::SyncComplete);
+            let actions = s.on(event.clone());
+            assert_eq!(
+                actions.first(),
+                Some(&Action::Unsteer),
+                "{event:?} tore down without unsteering: {actions:?}"
+            );
+            assert!(!s.is_steered(), "{event:?} left us believing we steer");
+        }
+    }
+
+    /// A spawn that never produced a process still has to retry. There
+    /// is no pidfd to report an exit, and `Starting` ignores both
+    /// StartRequested and BackoffElapsed, so without this the
+    /// supervisor sits in `Starting` forever with its retry policy
+    /// intact and unreachable.
+    #[test]
+    fn a_failed_spawn_backs_off_and_retries() {
+        let mut s = Supervisor::new();
+        assert_eq!(s.on(Event::StartRequested), vec![Action::Spawn]);
+        assert_eq!(s.state(), State::Starting);
+
+        let actions = s.on(Event::SpawnFailed);
+        assert_eq!(s.state(), State::Backoff);
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::ArmBackoff(_))),
+            "a failed spawn must arm the retry: {actions:?}"
+        );
+        assert_eq!(s.failures(), 1);
+        assert!(s.may_restart());
+
+        // And the retry actually fires.
+        assert_eq!(s.on(Event::BackoffElapsed), vec![Action::Spawn]);
+        assert_eq!(s.state(), State::Starting);
+    }
+
+    /// Repeated spawn failures escalate rather than hammering.
+    #[test]
+    fn repeated_spawn_failures_escalate_the_backoff() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        let mut last = Duration::ZERO;
+        for _ in 0..5 {
+            s.on(Event::SpawnFailed);
+            let d = s.backoff();
+            assert!(d >= last, "backoff went backwards: {d:?} after {last:?}");
+            last = d;
+            s.on(Event::BackoffElapsed);
+        }
+        assert!(last <= MAX_BACKOFF);
+    }
+
+    /// A spawn failure while nothing was ever steered must not invent
+    /// an Unsteer for rules that do not exist.
+    #[test]
+    fn an_unsteered_failure_does_not_emit_unsteer() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        let actions = s.on(Event::SpawnFailed);
+        assert!(!actions.contains(&Action::Unsteer), "{actions:?}");
     }
 
     #[test]
