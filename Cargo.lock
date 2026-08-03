@@ -750,6 +750,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "packetframe-vpp-api-codegen"
+version = "0.2.7"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "packetframe-vpp-offload"
 version = "0.2.7"
 dependencies = [

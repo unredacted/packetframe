@@ -6,6 +6,7 @@ members = [
     "crates/modules/fast-path",
     "crates/modules/probe",
     "crates/modules/vpp-offload",
+    "crates/tools/vpp-api-codegen",
 ]
 # BPF crates live at `crates/modules/*/bpf/` and are deliberately
 # excluded from the workspace. They target `bpfel-unknown-none` and

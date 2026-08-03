@@ -1,0 +1,305 @@
+{
+    "module": "dev",
+    "types": [],
+    "messages": [
+        [
+            "dev_attach",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "device_id",
+                48
+            ],
+            [
+                "string",
+                "driver_name",
+                16
+            ],
+            [
+                "vl_api_dev_flags_t",
+                "flags"
+            ],
+            [
+                "string",
+                "args",
+                0
+            ],
+            {
+                "crc": "0x44b725fc",
+                "options": {}
+            }
+        ],
+        [
+            "dev_attach_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "dev_index"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "string",
+                "error_string",
+                0
+            ],
+            {
+                "crc": "0x6082b181",
+                "options": {}
+            }
+        ],
+        [
+            "dev_detach",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "dev_index"
+            ],
+            {
+                "crc": "0xafae52d6",
+                "options": {}
+            }
+        ],
+        [
+            "dev_detach_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "string",
+                "error_string",
+                0
+            ],
+            {
+                "crc": "0xc8d74455",
+                "options": {}
+            }
+        ],
+        [
+            "dev_create_port_if",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "dev_index"
+            ],
+            [
+                "string",
+                "intf_name",
+                32
+            ],
+            [
+                "u16",
+                "num_rx_queues"
+            ],
+            [
+                "u16",
+                "num_tx_queues"
+            ],
+            [
+                "u16",
+                "rx_queue_size"
+            ],
+            [
+                "u16",
+                "tx_queue_size"
+            ],
+            [
+                "u16",
+                "port_id"
+            ],
+            [
+                "vl_api_dev_port_flags_t",
+                "flags"
+            ],
+            [
+                "string",
+                "args",
+                0
+            ],
+            {
+                "crc": "0xdbdf06f3",
+                "options": {}
+            }
+        ],
+        [
+            "dev_create_port_if_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "sw_if_index"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "string",
+                "error_string",
+                0
+            ],
+            {
+                "crc": "0x243c2374",
+                "options": {}
+            }
+        ],
+        [
+            "dev_remove_port_if",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0x529cb13f",
+                "options": {}
+            }
+        ],
+        [
+            "dev_remove_port_if_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "string",
+                "error_string",
+                0
+            ],
+            {
+                "crc": "0xc8d74455",
+                "options": {}
+            }
+        ]
+    ],
+    "unions": [],
+    "enums": [],
+    "enumflags": [
+        [
+            "dev_flags",
+            [
+                "VL_API_DEV_FLAG_NO_STATS",
+                1
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "dev_port_flags",
+            [
+                "VL_API_DEV_PORT_FLAG_INTERRUPT_MODE",
+                1
+            ],
+            [
+                "VL_API_DEV_PORT_FLAG_CONSISTENT_QP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ]
+    ],
+    "services": {
+        "dev_attach": {
+            "reply": "dev_attach_reply"
+        },
+        "dev_detach": {
+            "reply": "dev_detach_reply"
+        },
+        "dev_create_port_if": {
+            "reply": "dev_create_port_if_reply"
+        },
+        "dev_remove_port_if": {
+            "reply": "dev_remove_port_if_reply"
+        }
+    },
+    "options": {
+        "version": "0.0.1"
+    },
+    "aliases": {},
+    "vl_api_version": "0x86eacf88",
+    "imports": [],
+    "counters": [],
+    "paths": []
+}

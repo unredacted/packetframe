@@ -24,9 +24,11 @@
 //!   must mean pure stateless L3 transit;
 //! - the eBPF fast-path on the PFs is the permanent failover tier.
 
+pub mod fib_sync;
 pub mod resources;
 pub mod sink;
 pub mod startup_conf;
+pub mod vpp_api;
 
 #[cfg(target_os = "linux")]
 mod probe_linux;

@@ -304,6 +304,18 @@ impl NexthopMap {
 #[derive(Debug, Default)]
 pub struct PendingMap {
     ops: BTreeMap<PrefixKey, PendingOp>,
+    /// Ops parked because the table is at its high-water mark.
+    ///
+    /// Held here rather than in `ops` for a specific reason: the caller
+    /// drains until `ops` is empty, so leaving withheld work there
+    /// would spin — every pass would re-classify routes that cannot
+    /// possibly install yet. Held here rather than dropped for a
+    /// stronger one: the ledger records only the prefix and its
+    /// `Withheld` state, so the nexthops are the only copy of what the
+    /// route should become. Discard them and "retried when headroom
+    /// returns" is unimplementable — the route stays missing until an
+    /// unrelated source event happens to touch the same prefix.
+    withheld: BTreeMap<PrefixKey, PendingOp>,
 }
 
 impl PendingMap {
@@ -317,6 +329,30 @@ impl PendingMap {
 
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    pub fn withheld_len(&self) -> usize {
+        self.withheld.len()
+    }
+
+    /// Park an op that capacity refused. A newer intent for the same
+    /// prefix in the active map always wins, so parking never
+    /// resurrects stale state.
+    pub fn withhold(&mut self, prefix: IpPrefix, op: PendingOp) {
+        self.withheld.insert(prefix.into(), op);
+    }
+
+    /// Move every parked op back into the active map, for a caller
+    /// that has observed headroom returning. Uses the same
+    /// don't-clobber-newer-intent rule as [`Self::requeue`].
+    ///
+    /// Returns how many were released.
+    pub fn release_withheld(&mut self) -> usize {
+        let n = self.withheld.len();
+        for (k, op) in std::mem::take(&mut self.withheld) {
+            self.ops.entry(k).or_insert(op);
+        }
+        n
     }
 
     /// Record an install/replace. Overwrites any pending op for this
@@ -430,6 +466,12 @@ impl RouteLedger {
         self.counts.installed + self.counts.installing
     }
 
+    /// Whether another route would fit under the high-water mark.
+    /// Drives the release of parked (withheld) ops.
+    pub fn has_headroom(&self) -> bool {
+        self.capacity.has_headroom(self.occupied())
+    }
+
     /// Decide the outcome of an upsert and reserve a slot for it.
     ///
     /// Resolution is checked *before* capacity: a route with no
@@ -447,11 +489,24 @@ impl RouteLedger {
         map: &NexthopMap,
     ) -> (RouteState, Vec<NexthopTarget>) {
         let targets = map.resolve_all(nexthops);
+        let st = self.classify_resolved(prefix, targets.len());
+        (st, targets)
+    }
+
+    /// Same decision, for a caller that has already resolved the
+    /// nexthops.
+    ///
+    /// The drainer resolves once and needs the addresses alongside the
+    /// targets to encode FIB paths; making it re-resolve through
+    /// [`Self::classify_upsert`] would run the mapping policy twice per
+    /// route — a million times over on a full-table load — and risk
+    /// the two answers diverging if the map changed in between.
+    pub fn classify_resolved(&mut self, prefix: IpPrefix, n_resolved: usize) -> RouteState {
         let key = PrefixKey::from(prefix);
-        if targets.is_empty() {
+        if n_resolved == 0 {
             let st = RouteState::NotInstalled(NotInstalled::Unresolvable);
             self.set_state(key, st);
-            return (st, targets);
+            return st;
         }
         // A prefix that already holds a slot keeps it on replace — a
         // route update must not be withheld just because the table sits
@@ -471,7 +526,7 @@ impl RouteLedger {
             _ => RouteState::NotInstalled(NotInstalled::Withheld),
         };
         self.set_state(key, st);
-        (st, targets)
+        st
     }
 
     /// VPP acknowledged the route.

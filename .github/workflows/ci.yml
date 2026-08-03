@@ -75,6 +75,22 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: VPP API codegen is up to date
+        # The generated wire types are checked in so reviewers can read
+        # them, but the vendored .api.json is the source of truth. A pin
+        # bump that changes a message shape MUST fail here rather than
+        # ship an encoder that silently disagrees with the VPP it talks
+        # to — which would corrupt a FIB, not error out.
+        run: |
+          set -euo pipefail
+          cargo run -q -p packetframe-vpp-api-codegen -- \
+            crates/modules/vpp-offload/vpp-api \
+            crates/modules/vpp-offload/src/vpp_api/generated.rs
+          if ! git diff --exit-code -- crates/modules/vpp-offload/src/vpp_api/generated.rs; then
+            echo "::error::generated.rs is stale — re-run the codegen and commit the result"
+            exit 1
+          fi
+
       - name: cargo test
         run: cargo test --workspace
 
