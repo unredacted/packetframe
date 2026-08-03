@@ -220,6 +220,71 @@ v26.03 source). Consequences:
   DPDK / marvell-octeon-roc. No local patch — the pin stays in the
   octeontx2 era until an upstream release carries the fix.
 
+### RESULT (2026-08-02, shadow, round 2): **THE MAILBOX WORKS** — and the road is the native driver
+
+The v22.02 rung answered gate 0b's central question:
+
+```
+EAL: Probe PCI driver: net_octeontx2 (177d:a064) device: 0002:07:00.1 (socket 0)
+```
+
+Interface `Ethernet7/0/1` created, MAC assigned, full rx/tx capability
+tables enumerated — all of it AF-mailbox conversation, all of it
+working through the SDK-era AF. **The phase's architecture-killing
+risk is dead**, proven twice (testpmd 20.11 at gate 0a; otx2 21.11
+inside VPP here).
+
+It then failed one layer up, and this failure re-routes the phase:
+
+```
+PMD: otx2_nix_rx_queue_setup():600 mempool ops should be of octeontx2_npa type
+rte_eth_rx_queue_setup[port:0, errno:-22]
+```
+
+Both otx2 (21.11) and cnxk (26.03) **hard-require NPA mempool ops**
+for packet buffers — no bypass, no devarg (verified in both sources) —
+and mainline VPP's buffer manager only provides its own "vpp" mempool
+ops. **The DPDK-PMD-inside-VPP path is therefore dead on this NIC at
+every version.** Not the hardware, not the kernel, not the era: a
+VPP↔PMD buffer-integration wall (Marvell's out-of-tree VPP fork exists
+precisely to bridge it; we don't ship forks).
+
+**The mainline road: VPP's native octeon driver**, and every link is
+source-verified:
+
+- `src/drivers/octeon` builds only under `VPP_PLATFORM=octeon9|octeon10`
+  — which is why the generic artifact never contained it.
+- It links marvell-octeon-roc, and **octeon-roc v26.05's model table
+  HAS the cn9670's stepping**: MIDR (0x43, 0xB2, 3, 0) = **CN96xx D0**.
+  DPDK's copy of the same table is simply stale — that's the whole
+  cnxk-era failure, now explained end to end.
+- CN9K support is first-class (`roc_model_is_cn9k()` paths,
+  `PLATFORM_OCTEON9` defines).
+
+Pin is now `v26.06` + `platform = "octeon9"`. Two consequences for
+this runbook:
+
+1. The artifact tag becomes `vpp-v26.06-octeon9-bullseye-arm64`, and
+   the driver ships as `vpp_drivers/octeon_driver.so` — probe with
+   that name, not `net_*` strings and not `dev_octeon`.
+2. **The startup.conf changes shape**: the native driver is configured
+   through VPP's vnet/dev `devices {}` stanza, not `dpdk {}`. Replace
+   the `dpdk { dev 0002:07:00.1 }` block with:
+
+   ```
+   devices {
+     dev pci/0002:07:00.1 {
+       driver octeon
+     }
+   }
+   ```
+
+   (Exact grammar to be confirmed against the built artifact's
+   `vppctl show dev` on first bring-up; unix/socksvr/memory/cpu
+   sections carry over unchanged.)
+
+The v22.02 tag stays published as the mailbox-proof artifact.
+
 ### Getting the build onto the shadow
 
 Derive the tag from the pin rather than typing a version — otherwise
