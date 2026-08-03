@@ -36,6 +36,7 @@
 //! | `PACKETFRAME_VPP_PORT` | member port names, comma-separated: `eth2,eth3` |
 //! | `PACKETFRAME_VPP_PCI` | VF PCI addresses, comma-separated, **paired by position** with PORT |
 //! | `PACKETFRAME_VPP_SWIFINDEX` | recorded `sw_if_index` per port, required only for adopt |
+//! | `PACKETFRAME_VPP_EXPECT_ROUTES` | **required** — distinct prefixes the dump must contain |
 //! | `PACKETFRAME_VPP_BUDGET_S` | override the 60 s budget |
 //! | `PACKETFRAME_VPP_ADOPT` | adopt interfaces VPP already has (needs SWIFINDEX) |
 //!
@@ -141,11 +142,17 @@ fn load_routes(path: &PathBuf) -> FileSource {
             skipped += 1;
             continue;
         };
-        let nexthops: Vec<IpAddr> = nh.split(',').filter_map(|a| a.parse().ok()).collect();
-        if nexthops.is_empty() {
+        // Every comma-separated nexthop must parse. Dropping only the
+        // bad ones leaves a non-empty vector, so `skipped` stays zero and
+        // a silently shortened multipath route sails past the integrity
+        // assertion below — the route installs, verification passes, and
+        // the measurement is of a table nobody meant to load.
+        let parsed: Vec<Option<IpAddr>> = nh.split(',').map(|a| a.parse().ok()).collect();
+        if parsed.is_empty() || parsed.iter().any(|a| a.is_none()) {
             skipped += 1;
             continue;
         }
+        let nexthops: Vec<IpAddr> = parsed.into_iter().flatten().collect();
         by_prefix
             .entry(p.to_string())
             .and_modify(|(_, existing)| {
@@ -276,25 +283,61 @@ fn full_table_convergence_against_a_real_vpp() {
     println!("  routes     {}", src.routes.len());
     println!("  neighbours {}", src.neighbours.len());
     println!("  budget     {}", secs(budget));
-    assert!(!src.routes.is_empty(), "an empty table measures nothing");
 
-    // Every device the neighbour file names must be a member, or its
-    // routes are unresolvable and verification fails — which is the
-    // correct behaviour, since a packet whose best path exits an unowned
-    // port would blackhole. Check it here rather than discovering it
-    // 1.05M routes later.
-    let devices: std::collections::BTreeSet<&str> =
-        src.neighbours.iter().map(|(_, d, _)| d.as_str()).collect();
-    let unowned: Vec<&str> = devices
+    // A dump truncated at a line boundary is syntactically perfect and
+    // would produce a clean, fast, entirely meaningless "convergence"
+    // result for a fraction of the table — and the installed-count
+    // assertion later would agree, because it only proves every route in
+    // the file went in. This measurement exists to validate the
+    // *full-table* budget, so the expected size is an input, not an
+    // inference. The runbook shows how to compute it from the dump.
+    let expect: usize = required("PACKETFRAME_VPP_EXPECT_ROUTES")
+        .parse()
+        .expect("PACKETFRAME_VPP_EXPECT_ROUTES must be a number");
+    assert_eq!(
+        src.routes.len(),
+        expect,
+        "loaded {} distinct prefixes, expected {expect} — the dump is not \
+         the table you think it is",
+        src.routes.len()
+    );
+
+    // Every nexthop the ROUTES use must land on a member port, or those
+    // routes are unresolvable and verification fails — correctly, since a
+    // packet whose best path exits a port VPP does not own would
+    // blackhole. Checked here rather than discovered 1.05M routes later.
+    //
+    // Scoped to nexthops the routes actually reference, deliberately. The
+    // neighbour dump is the router's whole ARP table and legitimately
+    // contains management and tunnel neighbours; `program_neighbours`
+    // skips those by design, so asserting on every device in the file
+    // would abort the run over entries the engine is built to ignore.
+    // An earlier revision did exactly that — the assertion contradicted
+    // the policy written one file over.
+    let dev_of: std::collections::HashMap<IpAddr, &str> = src
+        .neighbours
         .iter()
-        .copied()
-        .filter(|d| !ports.iter().any(|p| p == d))
+        .map(|(ip, d, _)| (*ip, d.as_str()))
         .collect();
+    let mut unusable: Vec<String> = Vec::new();
+    for (prefix, nexthops) in &src.routes {
+        for nh in nexthops {
+            match dev_of.get(nh) {
+                Some(d) if ports.iter().any(|p| p == d) => {}
+                Some(d) => unusable.push(format!("{nh} on {d} (used by {prefix:?})")),
+                None => unusable.push(format!("{nh} absent from the neighbour file")),
+            }
+        }
+    }
+    unusable.sort();
+    unusable.dedup();
     assert!(
-        unowned.is_empty(),
-        "neighbour file names device(s) {unowned:?} which are not member ports \
-         {ports:?} — add a VF for each, or rewrite the device column onto an \
-         owned port and record the run as reduced"
+        unusable.is_empty(),
+        "{} route nexthop(s) do not resolve to a member port {ports:?}; first few: {:?} \
+         — add a VF per device, or rewrite the neighbour device column onto an owned \
+         port and record the run as reduced",
+        unusable.len(),
+        &unusable[..unusable.len().min(5)]
     );
 
     let mut e = ConvergenceEngine::new(
@@ -337,6 +380,31 @@ fn full_table_convergence_against_a_real_vpp() {
     e.attach_devices(mode)
         .unwrap_or_else(|err| panic!("attach: {err}"));
     let d_attach = t_attach.elapsed();
+
+    // Emit the port→index mapping an adopted re-run needs.
+    //
+    // It cannot be reconstructed afterwards: `sw_interface_dump` reports
+    // indistinguishable `octeonN/P` names with no PCI identity, so an
+    // operator reading `show interface` cannot tell which index belongs
+    // to which member port. Getting the order wrong would program
+    // neighbours and routes through the opposite VFs — and verification
+    // would still pass, because it checks that paths use *an* owned
+    // index, not the intended one per path. Printing it here is the only
+    // moment the mapping is actually known.
+    let idx = e.attached_indices();
+    let ordered: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            idx.iter()
+                .find(|(name, _)| name == p)
+                .map(|(_, i)| i.to_string())
+                .unwrap_or_else(|| panic!("attach reported no index for {p}"))
+        })
+        .collect();
+    println!(
+        "  to re-run adopted:  PACKETFRAME_VPP_ADOPT=1 PACKETFRAME_VPP_SWIFINDEX={}",
+        ordered.join(",")
+    );
 
     let t_resync = Instant::now();
     let plan = e.begin_resync(&src);

@@ -739,7 +739,17 @@ ip -4 neigh show \
 wc -l /tmp/pf-neigh.txt
 ```
 
-**Every device in column 2 must be a member port with its own VF.** The
+Count the distinct prefixes — the bench requires this as an input, so a
+dump truncated at a line boundary fails loudly instead of producing a
+clean, fast, meaningless result for a fraction of the table:
+
+```sh
+awk '{print $1}' /tmp/pf-routes.txt | sort -u | wc -l
+```
+
+**Every device carrying a route nexthop must be a member port with its own
+VF.** Unrelated management and tunnel neighbours in the dump are fine —
+`program_neighbours` skips anything not on a member port. The
 `master4` table egresses via two devices, so a single-port run leaves the
 other device's routes unresolvable and verification fails — correctly: a
 packet whose best path exits a port VPP does not own would blackhole. The
@@ -780,6 +790,7 @@ PACKETFRAME_VPP_PORT=eth2,eth3 \
 PACKETFRAME_VPP_PCI=0002:07:00.0,0002:07:00.1 \
 PACKETFRAME_VPP_ROUTES=/tmp/pf-routes.txt \
 PACKETFRAME_VPP_NEIGH=/tmp/pf-neigh.txt \
+PACKETFRAME_VPP_EXPECT_ROUTES=<the count from above> \
   ./tests/vpp_convergence_bench --include-ignored --nocapture
 ```
 
@@ -790,11 +801,17 @@ and forwards nothing after a `--` — it would try to execute `--` and
 succeeded.
 
 Re-running against a VPP that already has the interfaces needs adoption
-plus the indices VPP assigned (`vppctl show interface`), because attach
-refuses to reuse an index it was not told:
+plus the indices VPP assigned, because attach refuses to reuse an index
+it was not told. **Take them from the line the fresh run printed**, not
+from `show interface`: the dump reports indistinguishable `octeonN/P`
+names with no PCI identity, so it cannot tell you which index belongs to
+which member port, and supplying them in the wrong order programs
+neighbours and routes through the opposite VFs — which verification will
+*not* catch, because it checks that paths use an owned index, not the
+intended one. The fresh run prints exactly the line to reuse:
 
-```sh
-PACKETFRAME_VPP_ADOPT=1 PACKETFRAME_VPP_SWIFINDEX=3,4 ... # plus the vars above
+```
+  to re-run adopted:  PACKETFRAME_VPP_ADOPT=1 PACKETFRAME_VPP_SWIFINDEX=3,4
 ```
 
 Restarting VPP between runs is simpler and is what the timings above
