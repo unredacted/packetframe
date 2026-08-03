@@ -30,6 +30,7 @@ pub mod fib_sync;
 pub mod liveness;
 pub mod process;
 pub mod resources;
+pub mod schedule;
 pub mod sink;
 pub mod startup_conf;
 pub mod supervisor;

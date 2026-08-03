@@ -117,6 +117,14 @@ impl WedgeDetector {
         now.duration_since(self.last_attempt) >= PING_INTERVAL
     }
 
+    /// When the next ping is due, for a caller computing how long it
+    /// may sleep. Without this the loop would have to poll to discover
+    /// that [`Self::ping_due`] became true, which is the busy-wait the
+    /// scheduler exists to avoid.
+    pub fn next_ping_at(&self) -> Instant {
+        self.last_attempt + PING_INTERVAL
+    }
+
     pub fn on_ping_sent(&mut self, now: Instant) {
         self.last_attempt = now;
     }
