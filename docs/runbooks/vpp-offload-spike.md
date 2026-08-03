@@ -333,7 +333,11 @@ Both v6 shapes (drop, VF-steer via ring_cookie) rejected with AF
 mailbox error 710 (NPC flow family); `ethtool -n` confirms zero rules
 landed. The control on the same PF, same slots, same day: **v4 drop
 AND v4 VF-steer both insert cleanly** — ethtool decodes the cookie as
-`Direct to VF 0 queue 0`. Verdict: the vendor firmware's NPC
+`Direct to VF 0 queue 0`. Decoded against the fleet kernel's own enum
+(v5.15 `octeontx2/af/mbox.h`): **-710 = `NPC_FLOW_NOT_SUPPORTED`**,
+raised by `npc_check_unsupported_flows()` exactly when requested match
+fields are absent from the loaded MKEX profile's feature set. Verdict,
+now sourced rather than inferred: the vendor firmware's NPC
 key-extraction profile does not carry v6 fields. Not a regression,
 not fixable from our side. (Beware ethtool's exit code: it printed
 the rmgr error and still exited 0 — judge by `ethtool -n`, not `$?`.)
@@ -363,8 +367,10 @@ Consequences:
   inverts the exception set when the majority device dies) and the
   FIB-mirrors-bird verifiability argument are family-independent —
   the trigger firing shrinks the steady-state *benefit*, not the
-  failure-mode logic. A v4-only full table is also ~20% smaller
-  (~1.05M routes) with proportionally faster resync.
+  failure-mode logic. A v4-only full table is also ~20% smaller —
+  **~1.05M NEXTHOPS** (=routes only under the 0-ECMP observation; the
+  §0 caveat about the uncaptured `show route count` applies to this
+  figure and to the resync-speed corollary equally).
 
   **DECIDED (2026-08-02, user): FULL v4 TABLE.** The failure-behavior
   and verifiability arguments won again on v4-only numbers. v6 stays
@@ -513,8 +519,11 @@ changing `ref` re-runs the workflow and publishes a new tag.
 Reuse the gate-0a staging (VF on a quiet port, vfio-bound, hugepages
 reserved — see the perf-campaign memory / gate-0a notes for the exact
 commands and the rtemap/dpdk.service gotchas). Sizing per the slice-1
-renderer's arithmetic: full table wants ~4.4 GiB ⇒ `vm.nr_hugepages=10`
-at 512 MiB pages.
+renderer's arithmetic, updated for the round-4 decision (v4-only,
+~1.05M nexthops): placeholder math says ~2.2 GiB heap + buffers ⇒
+`vm.nr_hugepages=8` at 512 MiB pages gives comfortable margin. (The
+pre-decision v4+v6 figure was ~4.4 GiB ⇒ 10 pages; item 10's measured
+number supersedes both.)
 
 startup.conf: **hand-write it; do NOT use the slice-1 renderer for
 now.** The renderer (`packetframe-vpp-offload::startup_conf::render`)
@@ -579,18 +588,21 @@ section:
 | 7 | **PMTUD positive test** | >MTU DF packet through a steered path → correctly-sourced frag-needed back at the sender. **Do not skip.** |
 | 8 | VLAN subif egress | `create sub-interface` + tag 1337 toward the br1337-shaped topology |
 | 9 | rx-mode adaptive | `set interface rx-mode <if> adaptive`; watch idle CPU (the heat verdict) |
-| 10 | Full-table load | script `ip route add` via vppctl from a table dump; record wall time, `show memory main-heap` (replaces HEAP_BYTES_PER_ROUTE=2048 in startup_conf.rs), and packetframe daemon RSS for the sizing table |
+| 10 | Full-table load — **v4-ONLY per the round-4 decision** | dump bird's `master4` ONLY (`birdc 'show route primary table master4'` → script `ip route add` via vppctl); record wall time, `show memory main-heap` (replaces HEAP_BYTES_PER_ROUTE=2048 in startup_conf.rs), and packetframe daemon RSS. Loading v4+v6 would measure a table shape the decision rejected |
 | 11 | pps/core + latency | steered constant-rate flow: pps at 1 worker, p50/p99 vs the kernel path |
 | 12 | Watts/thermals | idle + loaded, poll-mode vs adaptive (if 9 works) |
 
 ## 4. Pass / kill / record
 
 - **Pass:** items 1, 2, 7, 10 all WORK (delivery, egress, PMTUD,
-  full-table capacity). Everything else shapes design rather than
-  gating it.
-- **Kill:** VPP's PMD can't handshake the AF at any pinnable version →
-  phase parks with the verdict recorded (the honest outcome the plan
-  endorses).
+  **v4** full-table capacity — the round-4 decision's shape; a v4+v6
+  load would validate a table nobody is shipping). Everything else
+  shapes design rather than gating it. Items 3 and 9 are already
+  FAILED-and-absorbed: v6 stays on XDP by design, poll-mode heat is a
+  recorded cost — neither kills the phase.
+- **Kill:** ~~VPP's PMD can't handshake the AF~~ — RETIRED: the
+  mailbox is proven (rounds 2–3). No kill criterion remains; what is
+  left is measurement.
 - Record every number in this file under a Results heading, then update
   `HEAP_BYTES_PER_ROUTE` and the plan's sizing notes from item 10, and
   pin the VPP version for slice 3.
