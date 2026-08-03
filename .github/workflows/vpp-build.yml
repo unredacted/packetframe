@@ -195,6 +195,39 @@ jobs:
         run: |
           set -euo pipefail
           cd /vpp
+          apt-get update
+
+          # DEB_DEPENDS is evaluated from VPP's own Makefile and
+          # filtered against what bullseye's archive can actually
+          # resolve, because a pinned era's package names drift out
+          # from under it: v22.02 asks for `enchant` (renamed
+          # enchant-2) and `clang-format-10` (bullseye ships 11/13),
+          # and apt refuses the ENTIRE install when any single name is
+          # unlocatable — two dead docs/style tools took every real
+          # build dependency down with them. Same pattern as the DPDK
+          # driver lists: ask make for the effective value, adjust,
+          # override on the command line. No tree modification.
+          #
+          # Dropping unresolvable names is safe by construction here:
+          # a dropped DOCS tool costs nothing (build-release builds no
+          # docs), and a dropped REAL build dependency fails loudly at
+          # build-release — it cannot fail silently, and the dropped
+          # list is printed for exactly that diagnosis.
+          printf 'include Makefile\n__pf_deps:\n\t@echo $(DEB_DEPENDS)\n' > /tmp/pf-deps.mk
+          deps=$(make -s -f /tmp/pf-deps.mk __pf_deps)
+          [ -n "$deps" ] || { echo "::error::DEB_DEPENDS evaluated empty — Makefile layout changed?"; exit 1; }
+          keep=''; dropped=''
+          for p in $deps; do
+            if apt-cache show -- "$p" >/dev/null 2>&1; then
+              keep="$keep $p"
+            else
+              dropped="$dropped $p"
+            fi
+          done
+          if [ -n "$dropped" ]; then
+            echo "::warning::not in bullseye's archive, dropped from install-dep:$dropped"
+          fi
+
           # `< /dev/null` belt-and-braces alongside the job-level
           # DEBIAN_FRONTEND: a container job's stdin is an open pipe
           # that never delivers EOF, so any package whose maintainer
@@ -202,7 +235,7 @@ jobs:
           # first attempt at this build hung here for 26 minutes on
           # wireshark-common's dumpcap question before being cancelled.
           # Redirecting guarantees a read returns instead of parking.
-          UNATTENDED=y make install-dep < /dev/null
+          UNATTENDED=y make install-dep DEB_DEPENDS="${keep# }" < /dev/null
 
       # VPP 26.06's CMakeLists.txt sets cmake_minimum_required(3.19);
       # bullseye ships 3.18.4, so `make build-release` aborts at
