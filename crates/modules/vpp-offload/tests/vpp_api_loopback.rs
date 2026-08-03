@@ -20,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 use packetframe_common::fib::IpPrefix;
-use packetframe_vpp_offload::fib_sync::{Drainer, PortIndex, ResolvedPath};
+use packetframe_vpp_offload::fib_sync::{Drainer, FamilyPolicy, PortIndex, ResolvedPath};
 use packetframe_vpp_offload::sink::{Capacity, NexthopMap, PendingMap, RouteLedger};
 use packetframe_vpp_offload::vpp_api::codec::{
     parse_frame_header, write_frame_header, Encode, MSG_HEADER_LEN, SOCKCLNT_CREATE_MSG_ID,
@@ -392,6 +392,133 @@ fn a_missing_interface_index_defers_instead_of_installing_a_black_hole() {
     assert_eq!(stats.installed, 0);
     assert_eq!(fake.handled.load(Ordering::SeqCst), 0);
     assert_eq!(ledger.counts().installing, 0, "reservation released");
+
+    // Deferred means POSTPONED, not dropped. `drain_batch` already
+    // removed the op, so without an explicit requeue this route would
+    // be gone for good: absent from VPP, absent from pending, and
+    // absent from verification — a hole nothing ever reports.
+    assert_eq!(pending.len(), 1, "a deferred route stays pending");
+
+    // Once the interface index exists, the next drain installs it.
+    let mut ports = PortIndex::default();
+    ports.insert("eth3", None, 7);
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 100)
+        .expect("drain");
+    assert_eq!(stats.installed, 1);
+    assert_eq!(ledger.counts().installed, 1);
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn a_route_that_loses_all_vpp_nexthops_is_withdrawn_not_just_forgotten() {
+    // The silent-stale-route case. An update whose nexthops all move
+    // off VPP-owned ports is not a no-op: VPP is still forwarding the
+    // PREVIOUS version. Recording "unresolvable" and sending nothing
+    // would leave traffic on a path bird has abandoned, and the ledger
+    // drops the prefix from verification, so nothing would notice.
+    let fake = Fake::start("stale", vec![Answer::Ok], None);
+    let mut t = fake.connect();
+    let (mut pending, mut ledger, ports, map) = fixture();
+    let p = v4(10, 0, 0, 0, 16);
+    let resolve = resolver(&map);
+
+    pending.upsert(p, vec![nh(192, 0, 2, 1)]); // resolves to eth3
+    Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 10)
+        .unwrap();
+    assert_eq!(ledger.counts().installed, 1);
+
+    // Now bird moves it to a nexthop VPP does not own.
+    pending.upsert(p, vec![nh(192, 0, 2, 9)]); // mgmt-only
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 10)
+        .expect("drain");
+
+    assert_eq!(stats.unresolvable, 1);
+    assert_eq!(stats.withdrawn, 1, "the stale route must be deleted");
+    assert_eq!(
+        fake.handled.load(Ordering::SeqCst),
+        2,
+        "install then withdraw both reached VPP"
+    );
+    assert_eq!(
+        ledger.counts().installed,
+        0,
+        "nothing is installed for this prefix any more"
+    );
+    assert!(ledger.verifiable_prefixes().is_empty());
+}
+
+#[test]
+fn an_unresolvable_first_install_sends_nothing() {
+    // The counterpart: a prefix VPP never held needs no withdrawal.
+    // Sending one would be a delete for a route that does not exist.
+    let fake = Fake::start("firstunres", vec![Answer::Ok], None);
+    let mut t = fake.connect();
+    let (mut pending, mut ledger, ports, map) = fixture();
+    let resolve = resolver(&map);
+    pending.upsert(v4(10, 0, 0, 0, 16), vec![nh(192, 0, 2, 9)]);
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 10)
+        .expect("drain");
+    assert_eq!(stats.unresolvable, 1);
+    assert_eq!(stats.withdrawn, 0);
+    assert_eq!(fake.handled.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ipv6_routes_never_reach_vpp_and_do_not_pile_up() {
+    // ip6 ntuple is rejected by the AF (gate 0b round 4), so no v6
+    // packet can be steered into VPP. Installing v6 routes would burn
+    // heap and convergence time on a FIB that is never consulted, and
+    // at the capacity mark they would crowd out v4 routes we do
+    // forward on.
+    let fake = Fake::start("v6", vec![Answer::Ok], None);
+    let mut t = fake.connect();
+    let (mut pending, mut ledger, ports, map) = fixture();
+    let resolve = resolver(&map);
+
+    let v6 = IpPrefix::V6 {
+        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        prefix_len: 32,
+    };
+    pending.upsert(v6, vec![nh(192, 0, 2, 1)]);
+    pending.upsert(v4(10, 0, 0, 0, 16), vec![nh(192, 0, 2, 1)]);
+
+    let stats = Drainer::default()
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 100)
+        .expect("drain");
+
+    assert_eq!(stats.out_of_family, 1);
+    assert_eq!(stats.installed, 1, "the v4 route still installs");
+    assert_eq!(fake.handled.load(Ordering::SeqCst), 1);
+    // Dropped, not requeued: a v6 op we will never send must not
+    // accumulate in the pending map forever.
+    assert!(pending.is_empty(), "filtered ops do not pile up");
+    assert_eq!(ledger.counts().installed, 1);
+}
+
+#[test]
+fn a_both_families_policy_installs_v6() {
+    // The policy is a record of hardware behaviour, not a permanent
+    // ban — when a kernel bump makes ip6 ntuple work, flipping this
+    // must be all it takes.
+    let fake = Fake::start("v6both", vec![Answer::Ok], None);
+    let mut t = fake.connect();
+    let (mut pending, mut ledger, ports, map) = fixture();
+    let resolve = resolver(&map);
+    let v6 = IpPrefix::V6 {
+        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        prefix_len: 32,
+    };
+    pending.upsert(v6, vec![nh(192, 0, 2, 1)]);
+    let stats = Drainer::default()
+        .with_families(FamilyPolicy::Both)
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 10)
+        .expect("drain");
+    assert_eq!(stats.out_of_family, 0);
+    assert_eq!(stats.installed, 1);
 }
 
 #[test]

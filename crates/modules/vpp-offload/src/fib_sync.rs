@@ -97,6 +97,24 @@ pub fn to_address(ip: IpAddr) -> Address {
     }
 }
 
+/// A delete for `prefix`. VPP matches deletes on the prefix alone, so
+/// no paths are needed — and sending them would only invite a mismatch
+/// against whatever was actually installed.
+fn withdraw_msg(prefix: IpPrefix) -> IpRouteAddDel {
+    IpRouteAddDel {
+        context: 0,
+        is_add: false,
+        is_multipath: false,
+        route: IpRoute {
+            table_id: 0,
+            stats_index: 0,
+            prefix: to_prefix(prefix),
+            n_paths: 0,
+            paths: Vec::new(),
+        },
+    }
+}
+
 /// Wire form of a prefix.
 pub fn to_prefix(p: IpPrefix) -> Prefix {
     match p {
@@ -185,7 +203,12 @@ pub struct DrainStats {
     /// VPP returned a non-zero retval. Requeued, not dropped.
     pub rejected: u64,
     /// Not attempted because a target had no interface index yet.
+    /// **Requeued**, so a later drain installs it once attach
+    /// completes — a deferred route is postponed, never dropped.
     pub deferred: u64,
+    /// Skipped because the prefix's address family is not carried by
+    /// VPP on this platform. See [`FamilyPolicy`].
+    pub out_of_family: u64,
 }
 
 impl DrainStats {
@@ -194,16 +217,70 @@ impl DrainStats {
     }
 }
 
+/// Which address families VPP carries.
+///
+/// Not a tuning knob — a record of what the hardware will do. Gate 0b
+/// round 4 established that `ip6` ntuple rules are rejected by the AF
+/// (error 710: the vendor NPC profile has no v6 extraction), so **no
+/// IPv6 packet can ever be MCAM-steered into VPP** and v6 stays on the
+/// XDP custom-FIB path. Installing v6 routes into a FIB that will
+/// never be consulted costs heap, costs convergence time against the
+/// 60 s budget, and — worst — lets ~250k unreachable v6 routes consume
+/// capacity slots that would otherwise hold v4 routes we actually
+/// forward on.
+///
+/// It is a policy rather than a hardcoded filter because the v6
+/// roadmap is explicit: retest `ip6` ntuple at every UniFi kernel bump,
+/// since the MKEX profile ships with the AF driver. When it starts
+/// working this becomes [`FamilyPolicy::Both`] and a full resync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FamilyPolicy {
+    /// v4 only — the measured reality on this NIC.
+    #[default]
+    V4Only,
+    /// Both families, for a platform whose classifier can steer v6.
+    Both,
+}
+
+impl FamilyPolicy {
+    pub fn carries(self, prefix: IpPrefix) -> bool {
+        match self {
+            FamilyPolicy::Both => true,
+            FamilyPolicy::V4Only => matches!(prefix, IpPrefix::V4 { .. }),
+        }
+    }
+}
+
 /// Pipelines pending route operations onto a [`Transport`].
 pub struct Drainer {
     window: usize,
+    families: FamilyPolicy,
+}
+
+/// What [`Drainer::begin`] decided to do with one pending op.
+enum Begun {
+    /// A request went out; await its reply. `op` is the *effective*
+    /// operation, which is not always the pending one — an installed
+    /// prefix that becomes unresolvable is sent as a withdrawal.
+    Sent { context: u32, op: PendingOp },
+    /// Resolved without touching the socket; already counted.
+    Done,
+    /// Cannot be attempted yet. Must go back into the pending map.
+    Defer,
 }
 
 /// One request awaiting its reply.
 struct InFlight {
     context: u32,
     prefix: IpPrefix,
-    op: PendingOp,
+    /// The operation actually sent, which decides how the reply is
+    /// applied to the ledger.
+    sent: PendingOp,
+    /// The operation as it sat in the pending map. Requeueing this
+    /// rather than `sent` matters: a retry must re-run classification
+    /// from the original intent, not re-apply a withdrawal we derived
+    /// from state that may have changed.
+    original: PendingOp,
 }
 
 impl Default for Drainer {
@@ -216,7 +293,14 @@ impl Drainer {
     pub fn new(window: usize) -> Self {
         Self {
             window: window.max(1),
+            families: FamilyPolicy::default(),
         }
+    }
+
+    /// Override which families reach VPP. See [`FamilyPolicy`].
+    pub fn with_families(mut self, families: FamilyPolicy) -> Self {
+        self.families = families;
+        self
     }
 
     /// Drain up to `max_ops` pending operations.
@@ -247,15 +331,24 @@ impl Drainer {
                     break;
                 };
                 match self.begin(prefix, &op, ledger, resolve, ports, transport, &mut stats) {
-                    Ok(Some(context)) => inflight.push(InFlight {
+                    Ok(Begun::Sent { context, op: sent }) => inflight.push(InFlight {
                         context,
                         prefix,
-                        op,
+                        sent,
+                        original: op,
                     }),
                     // Nothing to send (withheld, unresolvable,
-                    // deferred): already counted, ledger already
+                    // out-of-family): already counted, ledger already
                     // updated.
-                    Ok(None) => {}
+                    Ok(Begun::Done) => {}
+                    // `drain_batch` already removed this op, so
+                    // "leave it pending" has to be an explicit
+                    // requeue. Without it a route that arrives before
+                    // its interface index does would vanish for good:
+                    // absent from VPP, absent from the pending map,
+                    // and absent from verification — a silent hole
+                    // that nothing ever reports.
+                    Ok(Begun::Defer) => pending.requeue(prefix, op),
                     Err(e) => {
                         self.unwind(pending, ledger, inflight, Some((prefix, op)), iter);
                         return Err((stats, e));
@@ -323,10 +416,25 @@ impl Drainer {
         ports: &PortIndex,
         transport: &mut Transport,
         stats: &mut DrainStats,
-    ) -> Result<Option<u32>, TransportError> {
+    ) -> Result<Begun, TransportError> {
+        // Families VPP cannot be steered cannot benefit from a route
+        // in its FIB. Dropping here (rather than requeueing) is
+        // deliberate: the op was already removed from the pending map,
+        // and requeueing something we will never send would grow that
+        // map without bound.
+        if !self.families.carries(prefix) {
+            stats.out_of_family += 1;
+            return Ok(Begun::Done);
+        }
         match op {
             PendingOp::Upsert { nexthops } => {
                 let resolved = resolve(nexthops);
+                // Whether VPP currently holds a route for this prefix,
+                // captured BEFORE classification overwrites the entry.
+                let was_installed = matches!(
+                    ledger.state_of(prefix),
+                    Some(RouteState::Installed) | Some(RouteState::Installing { replacing: true })
+                );
                 // Ledger decides installable / withheld / unresolvable
                 // and reserves the capacity slot. It takes the count
                 // because we already resolved — running the mapping
@@ -338,19 +446,36 @@ impl Drainer {
                     RouteState::NotInstalled(nf) => {
                         match nf {
                             crate::sink::NotInstalled::Withheld => stats.withheld += 1,
-                            crate::sink::NotInstalled::Unresolvable => stats.unresolvable += 1,
+                            crate::sink::NotInstalled::Unresolvable => {
+                                stats.unresolvable += 1;
+                                // An update whose nexthops all moved off
+                                // VPP-owned ports is not a no-op: VPP is
+                                // still forwarding the PREVIOUS version
+                                // of this route. Leaving it would keep
+                                // traffic on a path bird has already
+                                // abandoned, and the ledger now excludes
+                                // the prefix from verification, so
+                                // nothing would ever notice. Withdraw it.
+                                if was_installed {
+                                    let ctx = transport.send(withdraw_msg(prefix))?;
+                                    return Ok(Begun::Sent {
+                                        context: ctx,
+                                        op: PendingOp::Withdraw,
+                                    });
+                                }
+                            }
                         }
-                        return Ok(None);
+                        return Ok(Begun::Done);
                     }
-                    RouteState::Installed => return Ok(None),
+                    RouteState::Installed => return Ok(Begun::Done),
                 }
                 let Some(paths) = build_paths(&resolved, ports) else {
                     // Interface index not known yet: unwind the
-                    // reservation and leave it pending rather than
+                    // reservation and put it back rather than
                     // installing a route pointed at local0.
                     ledger.fail_install(prefix);
                     stats.deferred += 1;
-                    return Ok(None);
+                    return Ok(Begun::Defer);
                 };
                 let msg = IpRouteAddDel {
                     context: 0,
@@ -364,23 +489,17 @@ impl Drainer {
                         paths,
                     },
                 };
-                Ok(Some(transport.send(msg)?))
-            }
-            PendingOp::Withdraw => {
-                let msg = IpRouteAddDel {
-                    context: 0,
-                    is_add: false,
-                    is_multipath: false,
-                    route: IpRoute {
-                        table_id: 0,
-                        stats_index: 0,
-                        prefix: to_prefix(prefix),
-                        n_paths: 0,
-                        paths: Vec::new(),
+                Ok(Begun::Sent {
+                    context: transport.send(msg)?,
+                    op: PendingOp::Upsert {
+                        nexthops: nexthops.clone(),
                     },
-                };
-                Ok(Some(transport.send(msg)?))
+                })
             }
+            PendingOp::Withdraw => Ok(Begun::Sent {
+                context: transport.send(withdraw_msg(prefix))?,
+                op: PendingOp::Withdraw,
+            }),
         }
     }
 
@@ -393,7 +512,11 @@ impl Drainer {
         ledger: &mut RouteLedger,
         stats: &mut DrainStats,
     ) {
-        match (&f.op, retval) {
+        // Keyed on what was SENT, not on what was pending: an upsert
+        // whose nexthops left VPP's ports goes out as a withdrawal,
+        // and applying it as an install would record a route VPP just
+        // deleted.
+        match (&f.sent, retval) {
             (PendingOp::Upsert { .. }, 0) => {
                 ledger.commit_installed(f.prefix);
                 stats.installed += 1;
@@ -407,9 +530,9 @@ impl Drainer {
             // this one and requeue it so a transient cause (a nexthop
             // whose interface is still coming up) resolves on retry
             // instead of leaving a hole nobody notices.
-            (op, _) => {
+            _ => {
                 ledger.fail_install(f.prefix);
-                pending.requeue(f.prefix, op.clone());
+                pending.requeue(f.prefix, f.original.clone());
                 stats.rejected += 1;
             }
         }
@@ -426,7 +549,10 @@ impl Drainer {
     ) {
         for f in inflight {
             ledger.fail_install(f.prefix);
-            pending.requeue(f.prefix, f.op);
+            // The ORIGINAL op, so a retry re-classifies from bird's
+            // intent rather than replaying a withdrawal we derived
+            // from resolution state that may since have changed back.
+            pending.requeue(f.prefix, f.original);
         }
         if let Some((prefix, op)) = current {
             ledger.fail_install(prefix);
@@ -597,8 +723,10 @@ mod tests {
             unresolvable: 1,
             rejected: 1,
             deferred: 4,
+            out_of_family: 7,
         };
-        // Withheld/unresolvable/deferred never left the process.
+        // Withheld/unresolvable/deferred/out-of-family never left the
+        // process.
         assert_eq!(s.attempted(), 6);
     }
 
