@@ -733,9 +733,25 @@ wc -l /tmp/pf-routes.txt
 ```
 
 ```sh
-ip -4 neigh show nud reachable nud stale nud permanent \
-  | awk '$1 !~ /:/ && $5 ~ /:/ { print $1, $3, $5 }' > /tmp/pf-neigh.txt
+ip -4 neigh show \
+  | awk '$1 !~ /:/ && $5 ~ /:/ && $NF != "FAILED" && $NF != "INCOMPLETE" { print $1, $3, $5 }' \
+  > /tmp/pf-neigh.txt
 wc -l /tmp/pf-neigh.txt
+```
+
+**Every device in column 2 must be a member port with its own VF.** The
+`master4` table egresses via two devices, so a single-port run leaves the
+other device's routes unresolvable and verification fails — correctly: a
+packet whose best path exits a port VPP does not own would blackhole. The
+bench refuses up front rather than discovering it 1.05M routes later.
+
+With only one VF bound, rewrite the device column onto that port and
+record the run as a **reduced** measurement — the drain, wire encoding and
+VPP-side insert are fully exercised, but every adjacency lands on one
+interface:
+
+```sh
+awk '{ print $1, "eth3", $3 }' /tmp/pf-neigh.txt > /tmp/pf-neigh-one.txt
 ```
 
 Copy both to the shadow, then check the nexthops the routes name are
@@ -755,14 +771,34 @@ the device itself, so do **not** pre-run the §3 `vppctl device attach`
 sequence; set `PACKETFRAME_VPP_ADOPT=1` if the interface is already
 attached from an earlier run.
 
+`PORT` and `PCI` are comma-separated and **pair by position**; give one
+VF per member device.
+
 ```sh
 PACKETFRAME_VPP_API_SOCK=/run/vpp/api.sock \
-PACKETFRAME_VPP_PORT=eth3 \
-PACKETFRAME_VPP_PCI=0002:07:00.1 \
+PACKETFRAME_VPP_PORT=eth2,eth3 \
+PACKETFRAME_VPP_PCI=0002:07:00.0,0002:07:00.1 \
 PACKETFRAME_VPP_ROUTES=/tmp/pf-routes.txt \
 PACKETFRAME_VPP_NEIGH=/tmp/pf-neigh.txt \
-  ./run-tests.sh vpp_convergence_bench -- --nocapture
+  ./tests/vpp_convergence_bench --include-ignored --nocapture
 ```
+
+Run the staged binary directly, **not** via `run-tests.sh`: that driver
+takes only test names, supplies `--include-ignored --nocapture` itself,
+and forwards nothing after a `--` — it would try to execute `--` and
+`--nocapture` as test binaries and fail the run even when the bench
+succeeded.
+
+Re-running against a VPP that already has the interfaces needs adoption
+plus the indices VPP assigned (`vppctl show interface`), because attach
+refuses to reuse an index it was not told:
+
+```sh
+PACKETFRAME_VPP_ADOPT=1 PACKETFRAME_VPP_SWIFINDEX=3,4 ... # plus the vars above
+```
+
+Restarting VPP between runs is simpler and is what the timings above
+assume.
 
 ### Reading the result
 

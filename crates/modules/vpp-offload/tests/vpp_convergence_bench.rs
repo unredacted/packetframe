@@ -33,10 +33,21 @@
 //! | `PACKETFRAME_VPP_API_SOCK` | VPP's binary API socket. **Required**; absent = skip. |
 //! | `PACKETFRAME_VPP_ROUTES` | `<prefix> <nexthop>[,<nexthop>…]` per line |
 //! | `PACKETFRAME_VPP_NEIGH` | `<ip> <dev> <mac>` per line |
-//! | `PACKETFRAME_VPP_PORT` | member port name, e.g. `eth3` |
-//! | `PACKETFRAME_VPP_PCI` | VF PCI address, e.g. `0002:07:00.1` |
+//! | `PACKETFRAME_VPP_PORT` | member port names, comma-separated: `eth2,eth3` |
+//! | `PACKETFRAME_VPP_PCI` | VF PCI addresses, comma-separated, **paired by position** with PORT |
+//! | `PACKETFRAME_VPP_SWIFINDEX` | recorded `sw_if_index` per port, required only for adopt |
 //! | `PACKETFRAME_VPP_BUDGET_S` | override the 60 s budget |
-//! | `PACKETFRAME_VPP_ADOPT` | set if VPP already has the interface attached |
+//! | `PACKETFRAME_VPP_ADOPT` | adopt interfaces VPP already has (needs SWIFINDEX) |
+//!
+//! **Every device that appears in the neighbour file must be a member
+//! port with its own VF.** The reference `master4` table egresses via two
+//! devices, so a single-port run leaves the other device's routes
+//! unresolvable and verification fails by design — correctly, since a
+//! packet whose best path exits an unowned port would blackhole. If only
+//! one VF is available, rewrite the neighbour file's device column onto
+//! that port and record the run as a **reduced** measurement: the drain,
+//! wire encoding and VPP-side insert are fully exercised, but every
+//! adjacency lands on one interface.
 //!
 //! The runbook carries the commands that produce the two files.
 
@@ -113,8 +124,17 @@ fn load_routes(path: &PathBuf) -> FileSource {
     let mut by_prefix: BTreeMap<String, (IpPrefix, Vec<IpAddr>)> = BTreeMap::new();
     let mut skipped = 0usize;
     for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let mut f = line.split_whitespace();
         let (Some(p), Some(nh)) = (f.next(), f.next()) else {
+            // A non-blank line that is not `<prefix> <nexthop>` — a
+            // truncated dump, most likely. Counted, not skipped past:
+            // the assertion below exists so a damaged input cannot
+            // produce a trusted measurement, and quietly dropping short
+            // lines is exactly how it would.
+            skipped += 1;
             continue;
         };
         let Some(prefix) = parse_prefix(p) else {
@@ -190,8 +210,21 @@ fn full_table_convergence_against_a_real_vpp() {
         return;
     };
 
-    let port = env("PACKETFRAME_VPP_PORT").unwrap_or_else(|| "eth3".into());
-    let pci = required("PACKETFRAME_VPP_PCI");
+    let ports: Vec<String> = required("PACKETFRAME_VPP_PORT")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let pcis: Vec<String> = required("PACKETFRAME_VPP_PCI")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert_eq!(
+        ports.len(),
+        pcis.len(),
+        "PACKETFRAME_VPP_PORT and PACKETFRAME_VPP_PCI pair by position"
+    );
     let budget = env("PACKETFRAME_VPP_BUDGET_S")
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
@@ -201,30 +234,86 @@ fn full_table_convergence_against_a_real_vpp() {
     } else {
         AttachMode::Fresh
     };
+    // Adoption reuses interfaces VPP already has, and `attach_ports`
+    // refuses a port whose index it was not told — correctly, since
+    // attaching blind would duplicate an interface the live FIB may
+    // reference. Without this the documented adopt path panics on every
+    // run, so the indices are an input rather than an afterthought.
+    let recorded: Vec<(String, u32)> = match env("PACKETFRAME_VPP_SWIFINDEX") {
+        Some(list) => {
+            let idx: Vec<u32> = list
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            assert_eq!(
+                idx.len(),
+                ports.len(),
+                "PACKETFRAME_VPP_SWIFINDEX must give one index per port \
+                 (from `vppctl show interface`)"
+            );
+            ports.iter().cloned().zip(idx).collect()
+        }
+        None => {
+            assert!(
+                mode == AttachMode::Fresh,
+                "PACKETFRAME_VPP_ADOPT needs PACKETFRAME_VPP_SWIFINDEX — \
+                 adoption cannot attach an interface whose index is unknown"
+            );
+            Vec::new()
+        }
+    };
 
     let mut src = load_routes(&PathBuf::from(required("PACKETFRAME_VPP_ROUTES")));
     src.neighbours = load_neighbours(&PathBuf::from(required("PACKETFRAME_VPP_NEIGH")));
 
     println!("== convergence bench ==");
     println!("  socket     {sock}");
-    println!("  port       {port} ({pci}), mode {mode:?}");
+    println!(
+        "  ports      {} / {} , mode {mode:?}",
+        ports.join(","),
+        pcis.join(",")
+    );
     println!("  routes     {}", src.routes.len());
     println!("  neighbours {}", src.neighbours.len());
     println!("  budget     {}", secs(budget));
     assert!(!src.routes.is_empty(), "an empty table measures nothing");
 
+    // Every device the neighbour file names must be a member, or its
+    // routes are unresolvable and verification fails — which is the
+    // correct behaviour, since a packet whose best path exits an unowned
+    // port would blackhole. Check it here rather than discovering it
+    // 1.05M routes later.
+    let devices: std::collections::BTreeSet<&str> =
+        src.neighbours.iter().map(|(_, d, _)| d.as_str()).collect();
+    let unowned: Vec<&str> = devices
+        .iter()
+        .copied()
+        .filter(|d| !ports.iter().any(|p| p == d))
+        .collect();
+    assert!(
+        unowned.is_empty(),
+        "neighbour file names device(s) {unowned:?} which are not member ports \
+         {ports:?} — add a VF for each, or rewrite the device column onto an \
+         owned port and record the run as reduced"
+    );
+
     let mut e = ConvergenceEngine::new(
         &sock,
-        vec![PortAttach {
-            port: port.clone(),
-            pci_addr: pci,
-            port_id: 0,
-            num_rx_queues: 1,
-        }],
-        vec![port.clone()],
+        ports
+            .iter()
+            .zip(&pcis)
+            .map(|(port, pci)| PortAttach {
+                port: port.clone(),
+                pci_addr: pci.clone(),
+                port_id: 0,
+                num_rx_queues: 1,
+            })
+            .collect(),
+        ports.clone(),
         HIGH_WATER,
         FamilyPolicy::V4Only,
-    );
+    )
+    .with_recorded_indices(recorded);
 
     // --- connect
     let t_connect = Instant::now();
@@ -235,15 +324,19 @@ fn full_table_convergence_against_a_real_vpp() {
     );
     let d_connect = t_connect.elapsed();
 
-    // --- attach
+    // --- the measured window starts HERE, before attach.
+    //
+    // The plan defines convergence as attach → resync → verify, and a
+    // restart genuinely has to recreate its interfaces before traffic can
+    // be re-steered. Starting the clock after attach would let a slow
+    // attach hide a budget overrun: the reported TOTAL could pass at 60 s
+    // while the sequence an operator waits through did not.
+    let t_total = Instant::now();
+
     let t_attach = Instant::now();
     e.attach_devices(mode)
         .unwrap_or_else(|err| panic!("attach: {err}"));
     let d_attach = t_attach.elapsed();
-
-    // --- the measured window starts here: everything from this point is
-    // what a restart has to redo before traffic can be re-steered.
-    let t_total = Instant::now();
 
     let t_resync = Instant::now();
     let plan = e.begin_resync(&src);
@@ -290,8 +383,11 @@ fn full_table_convergence_against_a_real_vpp() {
     // blows it is exactly the run whose phase breakdown matters, and a
     // panic that hides it wastes the trip to the hardware.
     println!("-- phases --");
-    println!("  connect       {}", secs(d_connect));
-    println!("  attach        {}", secs(d_attach));
+    println!(
+        "  connect       {}  (outside the budget: one-time socket setup)",
+        secs(d_connect)
+    );
+    println!("  attach        {}  (inside)", secs(d_attach));
     println!(
         "  resync plan   {}  ({} upserts, {} withdrawals)",
         secs(d_plan),

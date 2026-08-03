@@ -223,6 +223,7 @@ jobs:
           cross build --release --target "${TARGET}" \
             --tests --bins \
             -p packetframe-fast-path -p packetframe-probe -p packetframe-cli \
+            -p packetframe-vpp-offload \
             --message-format=json | tee build.json >/dev/null
 
       - name: Stage bundle
@@ -293,6 +294,18 @@ jobs:
               sys.exit("no test executables found in build.json")
           if "packetframe" not in staged_bins:
               sys.exit("packetframe CLI binary missing from build.json")
+          # Named explicitly, because "it is in the workspace" is not why
+          # a binary ends up here — the cross-build takes an explicit
+          # `-p` list, and a test whose package is missing from it is
+          # silently absent rather than failing anything. The convergence
+          # bench measures the plan's ≤60 s budget and is hardware-only,
+          # so an empty bundle would be discovered on the router.
+          for required in ("vpp_convergence_bench",):
+              if required not in staged_tests:
+                  sys.exit(
+                      f"{required} missing from the bundle — is its package "
+                      "in the cross-build's -p list?"
+                  )
           print("tests:", " ".join(sorted(staged_tests)))
           print("bins: ", " ".join(sorted(staged_bins)))
           PY
