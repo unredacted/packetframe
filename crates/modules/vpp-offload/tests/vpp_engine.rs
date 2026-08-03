@@ -494,8 +494,9 @@ fn the_convergence_pipeline_composes_over_one_transport() {
     assert_eq!(e.counts().installing, 0, "nothing left in flight");
     assert!(e.pending().is_empty());
 
-    let outcome = e.run_verify().expect("verify");
-    assert!(outcome.passed(), "{}", outcome.summary());
+    let v = e.run_verify().expect("verify");
+    assert!(v.outcome.passed(), "{}", v.outcome.summary());
+    assert!(v.may_steer, "a complete table may be steered into");
 
     // Ordering: devices attach before any route is installed. FIB paths
     // reference indices VPP has not assigned yet otherwise, and every
@@ -637,7 +638,9 @@ fn a_hangup_mid_drain_requeues_and_disconnects() {
     e.attach_devices(AttachMode::Fresh).unwrap();
     drain_to_empty(&mut e);
     assert_eq!(e.counts().installed, 20);
-    assert!(e.run_verify().unwrap().passed());
+    let v = e.run_verify().unwrap();
+    assert!(v.outcome.passed());
+    assert!(v.may_steer);
 }
 
 /// A mirror that still advertises the prefix but no longer resolves its
@@ -703,9 +706,10 @@ fn a_prefix_that_loses_its_nexthops_is_deleted_and_recorded_unresolvable() {
         "a table with a known hole must not be steered into"
     );
     // Verification must agree, not report a clean table.
-    let outcome = e.run_verify().unwrap();
-    assert!(!outcome.passed(), "{}", outcome.summary());
-    assert_eq!(outcome.unresolvable, 3);
+    let v = e.run_verify().unwrap();
+    assert!(!v.outcome.passed(), "{}", v.outcome.summary());
+    assert_eq!(v.outcome.unresolvable, 3);
+    assert!(!v.may_steer);
 }
 
 /// A per-route refusal of that derived delete must be retried, not

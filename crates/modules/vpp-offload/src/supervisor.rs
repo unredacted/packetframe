@@ -147,6 +147,24 @@ pub enum Event {
     /// Readback verification finished.
     VerifyPassed,
     VerifyFailed,
+    /// Verification found nothing *wrong*, but the FIB is **incomplete**:
+    /// routes are withheld at the capacity high-water mark or
+    /// unresolvable.
+    ///
+    /// A third outcome because collapsing it into either of the other two
+    /// is wrong in a different way. As `VerifyFailed` it would cycle a
+    /// perfectly healthy VPP and turn the designed response to a table
+    /// that outgrew its heap into a restart loop. As `VerifyPassed` it
+    /// re-steers traffic into a FIB known to be missing prefixes —
+    /// `VerifyOutcome::passed()` deliberately ignores `withheld`, and
+    /// `SinkCounts::blocks_first_steer()` was the intended gate but
+    /// nothing consulted it, so a restart of a previously-steered VPP
+    /// would divert traffic into the incomplete table and blackhole
+    /// exactly the prefixes that did not fit.
+    ///
+    /// So: reach `Ready` without restarting, and do **not** steer. The
+    /// want is preserved, so the next complete verify re-steers.
+    VerifyIncomplete,
     /// A step in the attach → resync pipeline failed outright: the
     /// device would not attach, or the transport broke mid-drain.
     ///
@@ -457,6 +475,17 @@ impl Supervisor {
                 } else {
                     vec![]
                 }
+            }
+            // Correct as far as it goes, but incomplete: settle into the
+            // safe staging state rather than diverting traffic into a FIB
+            // with known holes. Not a failure — restarting would trade a
+            // partially-working forwarder for an outage and would loop,
+            // because the next resync withholds the same routes.
+            (Verifying | AdoptedResyncing, VerifyIncomplete) => {
+                self.converging = false;
+                self.failures = 0;
+                self.state = Ready;
+                vec![]
             }
             (Verifying, VerifyFailed) => {
                 // A FIB we cannot verify is not one to divert traffic
@@ -1032,6 +1061,61 @@ mod tests {
         s.on(Event::SyncComplete);
         assert!(!s.on(Event::VerifyPassed).contains(&Action::Steer));
         assert!(!s.steer_intended());
+    }
+
+    /// An incomplete FIB settles into the staging state: no restart, no
+    /// steer.
+    ///
+    /// Both collapses are wrong. As a failure it would cycle a healthy
+    /// VPP and loop, because the next resync withholds the same routes.
+    /// As a pass it would re-steer a previously-steered deployment into a
+    /// FIB missing exactly the prefixes that did not fit — and
+    /// `VerifyOutcome::passed()` ignores `withheld` by design, so nothing
+    /// downstream would have caught it.
+    #[test]
+    fn an_incomplete_verify_reaches_ready_without_steering() {
+        let mut s = running_and_steered();
+        s.on(Event::ProcessExited { status: None });
+        // The executor's acknowledgement that the MCAM rules are gone —
+        // steering is only believed down on this, never optimistically.
+        s.on(Event::Unsteered);
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert_eq!(s.state(), State::Verifying);
+
+        let actions = s.on(Event::VerifyIncomplete);
+        assert_eq!(s.state(), State::Ready, "verified, just not complete");
+        assert!(
+            !actions.contains(&Action::Steer),
+            "must not divert traffic into a FIB with known holes"
+        );
+        assert!(!s.is_steered());
+        assert_eq!(s.failures(), 0, "not a failure — nothing to back off from");
+        assert!(
+            s.steer_intended(),
+            "the want survives, so a later complete verify re-steers"
+        );
+
+        // And that is exactly what happens once the table fits again.
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::Unsteered);
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(s.on(Event::VerifyPassed).contains(&Action::Steer));
+    }
+
+    /// Adoption takes the same path: an adopted VPP whose table is
+    /// incomplete must not have its steering re-asserted on that basis.
+    #[test]
+    fn an_incomplete_adopted_verify_also_declines_to_steer() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::SyncComplete);
+        let actions = s.on(Event::VerifyIncomplete);
+        assert!(!actions.contains(&Action::Steer));
+        assert_eq!(s.state(), State::Ready);
     }
 
     #[test]

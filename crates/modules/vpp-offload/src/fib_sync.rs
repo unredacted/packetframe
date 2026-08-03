@@ -43,6 +43,17 @@ use crate::vpp_api::{Transport, TransportError};
 /// be requeued when a drain fails mid-window.
 pub const DEFAULT_WINDOW: usize = 256;
 
+/// Wire limit on paths per route: `n_paths` is a `u8`.
+///
+/// Load-bearing rather than theoretical. The encoder writes
+/// `paths.len() as u8` while still serialising every element, so a set
+/// larger than this puts a **wrapped count** on the wire followed by more
+/// path records than it declares — VPP either rejects the route or
+/// installs a truncated set, and a surviving owned path would still pass
+/// readback verification. Silent wire corruption is not a shape to leave
+/// reachable, however unlikely the input.
+pub const MAX_FIB_PATHS: usize = u8::MAX as usize;
+
 /// VPP interface indices for the ports the module owns.
 ///
 /// Populated at attach from `dev_create_port_if_reply`, which is where
@@ -221,6 +232,15 @@ pub struct DrainStats {
     /// Previously-withheld ops moved back into the active map because
     /// headroom returned. They install on the next drain.
     pub released: u64,
+    /// Routes whose resolved path set exceeded [`MAX_FIB_PATHS`] and was
+    /// truncated to fit the wire's `u8` count.
+    ///
+    /// Capped rather than refused: 255 of 300 paths still forwards
+    /// correctly, just with less spread, while refusing the route
+    /// blackholes the prefix outright. Counted because a non-zero value
+    /// means the route source is producing ECMP sets nobody designed
+    /// for — the reference fleet measured **zero** ECMP groups.
+    pub paths_capped: u64,
 }
 
 impl DrainStats {
@@ -261,6 +281,27 @@ impl FamilyPolicy {
             FamilyPolicy::V4Only => matches!(prefix, IpPrefix::V4 { .. }),
         }
     }
+}
+
+/// Truncate a path set to what the wire can describe, reporting whether
+/// it had to.
+///
+/// See [`MAX_FIB_PATHS`]: past 255 the declared count wraps while every
+/// element is still serialised, so VPP reads a wrapped count followed by
+/// more path records than it was told about — the route is rejected or
+/// installed with a truncated set, and a surviving owned path would still
+/// pass readback verification.
+///
+/// Capped rather than refused because 255 of 300 paths still forwards
+/// correctly, just with less spread, whereas refusing blackholes the
+/// prefix outright. Deterministic (a plain prefix of the resolved order)
+/// so the same input always produces the same FIB.
+pub fn cap_paths(paths: &mut Vec<FibPath>) -> bool {
+    if paths.len() <= MAX_FIB_PATHS {
+        return false;
+    }
+    paths.truncate(MAX_FIB_PATHS);
+    true
 }
 
 /// Pipelines pending route operations onto a [`Transport`].
@@ -339,6 +380,17 @@ impl Drainer {
     /// reservations unwound, and the untouched tail of the batch goes
     /// back too. The caller may retry against a fresh connection
     /// without having lost or double-counted anything.
+    // The Err variant carries partial `DrainStats` alongside the
+    // transport error, which is the point: the caller needs to know what
+    // did land before the socket broke. That tuple crosses clippy's
+    // 128-byte threshold now that `DrainStats` has ten counters.
+    //
+    // Not boxed. This returns **once per drain batch** (4096 routes), not
+    // per route, so the copy is noise — and boxing would put a heap
+    // allocation on the failure path, at the exact moment the transport
+    // is already failing and we are unwinding a window of in-flight
+    // requests.
+    #[allow(clippy::result_large_err)]
     pub fn drain(
         &self,
         pending: &mut PendingMap,
@@ -538,7 +590,7 @@ impl Drainer {
                     }
                     RouteState::Installed => return Ok(Begun::Done),
                 }
-                let Some(paths) = build_paths(&resolved, ports) else {
+                let Some(mut paths) = build_paths(&resolved, ports) else {
                     // Interface index not known yet: unwind the
                     // reservation and put it back rather than
                     // installing a route pointed at local0.
@@ -546,6 +598,9 @@ impl Drainer {
                     stats.deferred += 1;
                     return Ok(Begun::Defer);
                 };
+                if cap_paths(&mut paths) {
+                    stats.paths_capped += 1;
+                }
                 let msg = IpRouteAddDel {
                     context: 0,
                     is_add: true,
@@ -554,6 +609,7 @@ impl Drainer {
                         table_id: 0,
                         stats_index: 0,
                         prefix: to_prefix(prefix),
+                        // Cannot wrap: truncated above.
                         n_paths: paths.len() as u8,
                         paths,
                     },
@@ -800,6 +856,46 @@ mod tests {
         );
     }
 
+    /// `n_paths` is a `u8` and the encoder writes `paths.len() as u8`
+    /// independently of it, so an oversized set puts a wrapped count on
+    /// the wire followed by more records than it declares.
+    #[test]
+    fn a_path_set_never_exceeds_what_the_wire_can_count() {
+        let one = FibPath {
+            sw_if_index: 3,
+            table_id: 0,
+            rpf_id: 0,
+            weight: 1,
+            preference: 0,
+            r#type: 0,
+            flags: 0,
+            proto: 0,
+            nh: Default::default(),
+            n_labels: 0,
+            label_stack: Default::default(),
+        };
+
+        // The realistic case is untouched: the reference fleet measured
+        // ZERO ECMP groups, so this must not disturb ordinary routes.
+        let mut small = vec![one.clone(); 4];
+        assert!(!cap_paths(&mut small));
+        assert_eq!(small.len(), 4);
+
+        // Exactly at the limit still fits.
+        let mut exact = vec![one.clone(); MAX_FIB_PATHS];
+        assert!(!cap_paths(&mut exact));
+        assert_eq!(exact.len(), MAX_FIB_PATHS);
+        assert_eq!(exact.len() as u8 as usize, exact.len(), "no wrap");
+
+        // One past it wraps to 0 without the cap — which is the whole
+        // point: a declared count of 0 followed by 256 records.
+        let mut over = vec![one; MAX_FIB_PATHS + 1];
+        assert_eq!((MAX_FIB_PATHS + 1) as u8, 0, "this is the corruption");
+        assert!(cap_paths(&mut over));
+        assert_eq!(over.len(), MAX_FIB_PATHS);
+        assert_eq!(over.len() as u8 as usize, over.len());
+    }
+
     #[test]
     fn drain_stats_count_only_what_reached_vpp() {
         let s = DrainStats {
@@ -811,6 +907,7 @@ mod tests {
             deferred: 4,
             out_of_family: 7,
             released: 9,
+            paths_capped: 0,
         };
         // Withheld/unresolvable/deferred/out-of-family never left the
         // process.

@@ -396,6 +396,22 @@ impl PendingMap {
             .collect()
     }
 
+    /// Drop every active op whose prefix fails `keep`.
+    ///
+    /// Used by the full-table resync to discard ops left over from an
+    /// aborted one. Those prefixes live only here — they were never
+    /// classified, so `RouteLedger::known_prefixes` cannot see them, and
+    /// the resync's withdrawal loop walks the ledger. Without this, a
+    /// prefix the source dropped between an aborted resync and the next
+    /// one keeps its stale pending upsert and is installed later, even
+    /// though the current snapshot does not advertise it.
+    ///
+    /// Only the active map: parked (withheld) ops keep their own
+    /// lifecycle, and the resync releases them separately.
+    pub fn retain(&mut self, keep: impl Fn(&IpPrefix) -> bool) {
+        self.ops.retain(|k, _| keep(&IpPrefix::from(*k)));
+    }
+
     /// Re-queue an op the transport could not apply — but only if the
     /// prefix has not been superseded in the meantime. A newer event
     /// that arrived while the batch was in flight is the current intent

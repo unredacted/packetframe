@@ -148,6 +148,43 @@ pub struct ResyncPlan {
     pub withdrawals: u64,
 }
 
+/// What a verify pass concluded, and whether traffic may be diverted
+/// into the result.
+///
+/// Two fields because they answer different questions and collapsing
+/// them is a bug in either direction. `VerifyOutcome::passed()`
+/// deliberately ignores `withheld` — withholding is the designed
+/// response to a table that outgrew its heap, and failing verification
+/// on it would turn graceful degradation into a restart loop. But a FIB
+/// missing prefixes is still not one to divert traffic into.
+///
+/// `#[must_use]` because ignoring `may_steer` is exactly the mistake:
+/// `SinkCounts::blocks_first_steer()` existed as the intended gate and
+/// nothing consulted it, so a restart of a previously-steered VPP would
+/// have re-steered into an incomplete table.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    pub outcome: VerifyOutcome,
+    /// False when the ledger holds routes it could not install.
+    pub may_steer: bool,
+}
+
+impl Verdict {
+    /// The supervisor event this verdict implies. Keeps the mapping in
+    /// one place so a caller cannot pick `VerifyPassed` for an
+    /// incomplete table.
+    pub fn event(&self) -> crate::supervisor::Event {
+        if !self.outcome.passed() {
+            crate::supervisor::Event::VerifyFailed
+        } else if self.may_steer {
+            crate::supervisor::Event::VerifyPassed
+        } else {
+            crate::supervisor::Event::VerifyIncomplete
+        }
+    }
+}
+
 /// Which convergence step is in flight, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -224,6 +261,18 @@ pub struct ConvergenceEngine {
 
     phase: Option<Phase>,
     last_verify: Option<VerifyOutcome>,
+    /// The last handshake failure, and whether it can ever succeed.
+    ///
+    /// `api_ready` returns a bool, which collapses "VPP has not opened
+    /// its socket yet" together with "this VPP speaks a different API
+    /// than the one we generated against". The second is permanent: the
+    /// supervisor would wait out `API_STARTUP_BUDGET` and restart-loop
+    /// forever without anything reporting the version skew that makes
+    /// every attempt fail. CRC mismatch is meant to be a loud refusal by
+    /// construction; a silent retry loop is the opposite.
+    last_api_error: Option<String>,
+    api_incompatible: bool,
+
     /// Advanced once per verify so each pass samples a different set.
     ///
     /// Counter-derived rather than drawn from the OS, for the reason
@@ -254,6 +303,8 @@ impl ConvergenceEngine {
             nexthops: NexthopMap::new(members),
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
             steered: false,
+            last_api_error: None,
+            api_incompatible: false,
             phase: None,
             last_verify: None,
             verify_seed: 0,
@@ -408,10 +459,37 @@ impl ConvergenceEngine {
                     return false;
                 }
                 self.transport = Some(t);
+                self.last_api_error = None;
+                self.api_incompatible = false;
                 true
             }
-            Err(_) => false,
+            Err(e) => {
+                // A version-skew or refusal will fail identically every
+                // time; a missing socket will not. Recording which is
+                // which is what lets the supervisor stop retrying and the
+                // status surface name the actual fault.
+                self.api_incompatible = matches!(
+                    e,
+                    TransportError::CrcMismatch { .. }
+                        | TransportError::MessageUnknown(_)
+                        | TransportError::HandshakeRefused(_)
+                );
+                self.last_api_error = Some(e.to_string());
+                false
+            }
         }
+    }
+
+    /// The last handshake failure, if the API is not up.
+    pub fn last_api_error(&self) -> Option<&str> {
+        self.last_api_error.as_deref()
+    }
+
+    /// Whether the failure is permanent — this VPP cannot ever speak to
+    /// us. Retrying wastes the startup budget and restarting produces the
+    /// same VPP; the fault has to reach an operator instead.
+    pub fn api_incompatible(&self) -> bool {
+        self.api_incompatible
     }
 
     /// Drop the connection. Called when a round trip fails, so the next
@@ -633,12 +711,27 @@ impl ConvergenceEngine {
             plan.upserts += 1;
         });
 
-        for prefix in self.ledger.known_prefixes() {
-            if !seen.contains(&prefix) {
-                self.pending.withdraw(prefix);
+        let known: HashSet<IpPrefix> = self.ledger.known_prefixes().into_iter().collect();
+        for prefix in &known {
+            if !seen.contains(prefix) {
+                self.pending.withdraw(*prefix);
                 plan.withdrawals += 1;
             }
         }
+
+        // Drop leftovers from an aborted resync. Those prefixes live only
+        // in the pending map — never classified, so the ledger cannot see
+        // them and the withdrawal loop above cannot reach them. Without
+        // this, a prefix the source dropped between an aborted resync and
+        // this one keeps its stale upsert and gets installed later,
+        // against a snapshot that no longer advertises it.
+        //
+        // Dropped rather than withdrawn: the ledger never knew them, so
+        // VPP never received them, and a withdrawal for a route that was
+        // never installed is a wasted round trip inside the convergence
+        // budget.
+        self.pending
+            .retain(|p| seen.contains(p) || known.contains(p));
 
         // Anything parked at the high-water mark gets another chance:
         // withdrawals in this same plan may have freed the headroom.
@@ -686,7 +779,7 @@ impl ConvergenceEngine {
     }
 
     /// Readback verification against a fresh random sample.
-    pub fn run_verify(&mut self) -> Result<VerifyOutcome, EngineError> {
+    pub fn run_verify(&mut self) -> Result<Verdict, EngineError> {
         // Transport first. Setting the phase before this check leaves it
         // stuck on `Verify` when the early return fires, and a phase
         // that never clears is a convergence the loop believes is still
@@ -705,7 +798,10 @@ impl ConvergenceEngine {
             Ok(outcome) => {
                 self.last_verify = Some(outcome.clone());
                 self.phase = None;
-                Ok(outcome)
+                // The gate the ledger has always been able to answer and
+                // nothing asked.
+                let may_steer = !self.ledger.counts().blocks_first_steer();
+                Ok(Verdict { outcome, may_steer })
             }
             Err(e) => {
                 self.disconnect();
@@ -1143,6 +1239,96 @@ mod tests {
         assert!(
             !links[0].link_up,
             "a port verify found dead must not report as forwarding"
+        );
+    }
+
+    /// A withheld route must not re-steer traffic into the FIB.
+    ///
+    /// `VerifyOutcome::passed()` deliberately ignores `withheld` — failing
+    /// on it would turn the designed response to a table that outgrew its
+    /// heap into a restart loop — so the gate has to live somewhere else.
+    /// It lived in `blocks_first_steer()`, which nothing consulted, so a
+    /// restart of a previously-steered VPP would have diverted traffic
+    /// into a FIB missing exactly the prefixes that did not fit.
+    #[test]
+    fn an_incomplete_table_verifies_without_permitting_a_steer() {
+        use crate::supervisor::Event;
+
+        let clean = Verdict {
+            outcome: VerifyOutcome {
+                sampled: 64,
+                ..Default::default()
+            },
+            may_steer: true,
+        };
+        assert_eq!(clean.event(), Event::VerifyPassed);
+
+        // Incomplete: correct as far as it goes, so NOT a failure — but
+        // not steerable either.
+        let incomplete = Verdict {
+            outcome: VerifyOutcome {
+                sampled: 64,
+                withheld: 12,
+                ..Default::default()
+            },
+            may_steer: false,
+        };
+        assert!(
+            incomplete.outcome.passed(),
+            "withheld must not fail verification, or a full table \
+             restart-loops"
+        );
+        assert_eq!(
+            incomplete.event(),
+            Event::VerifyIncomplete,
+            "and must not re-steer either"
+        );
+
+        // A genuinely wrong FIB still fails, regardless of steerability.
+        let wrong = Verdict {
+            outcome: VerifyOutcome::default(),
+            may_steer: true,
+        };
+        assert!(!wrong.outcome.passed());
+        assert_eq!(wrong.event(), Event::VerifyFailed);
+    }
+
+    /// Leftovers from an aborted resync live only in the pending map —
+    /// never classified, so the ledger cannot see them and the withdrawal
+    /// loop cannot reach them. A prefix the source drops in between would
+    /// otherwise keep its stale upsert and install later.
+    #[test]
+    fn an_aborted_resyncs_leftovers_do_not_survive_the_next_one() {
+        let mut e = engine();
+        e.begin_resync(&mirror(5));
+        assert_eq!(e.pending().len(), 5);
+        // Aborted before anything was classified.
+        e.abort_convergence();
+        assert_eq!(e.counts(), SinkCounts::default(), "nothing classified");
+
+        // The source drops two prefixes while we were not draining.
+        let mut shrunk = mirror(5);
+        shrunk.routes.truncate(3);
+        e.begin_resync(&shrunk);
+        assert_eq!(
+            e.pending().len(),
+            3,
+            "the two dropped prefixes must not still be queued for install"
+        );
+    }
+
+    /// A permanent handshake failure must be distinguishable from a slow
+    /// start, or the supervisor waits out the startup budget and
+    /// restart-loops forever without anything naming the version skew.
+    #[test]
+    fn a_permanent_handshake_failure_is_named_as_such() {
+        let mut e = engine();
+        // Nothing listening: transient, and retrying is right.
+        assert!(!e.api_ready());
+        assert!(e.last_api_error().is_some(), "the reason must be recorded");
+        assert!(
+            !e.api_incompatible(),
+            "a missing socket is not a version skew"
         );
     }
 
