@@ -738,20 +738,36 @@ file and a shortened count that agree with each other perfectly.
 Now extract, and reconcile against that independent figure:
 
 ```sh
+set -o pipefail
 birdc 'show route primary table master4' > /tmp/pf-raw.txt
-awk '/^[0-9]/ { pfx=$1; nets++ } /via/ { for (i=1;i<=NF;i++) if ($i=="via") print pfx, $(i+1) } END { print "networks_seen", nets > "/tmp/pf-nets.txt" }' /tmp/pf-raw.txt | sort -u > /tmp/pf-routes.txt
+awk '/^[0-9]/ { pfx=$1; nets++ } /via/ { if (!(pfx in seen)) { seen[pfx]=1; vias++ } for (i=1;i<=NF;i++) if ($i=="via") print pfx, $(i+1) } END { print nets, vias > "/tmp/pf-nets.txt" }' /tmp/pf-raw.txt | sort -u > /tmp/pf-routes.txt || echo "EXTRACTION FAILED"
 BIRD_NETS=$(awk '{ for (i=1;i<=NF;i++) if ($i=="networks") print $(i-1) }' /tmp/pf-count.txt)
-SEEN_NETS=$(awk '{print $2}' /tmp/pf-nets.txt)
-VIA_NETS=$(awk '{print $1}' /tmp/pf-routes.txt | sort -u | wc -l)
-echo "bird reports   : ${BIRD_NETS} networks"
-echo "dump contained : ${SEEN_NETS} networks"
-echo "with a via     : ${VIA_NETS}  <-- PACKETFRAME_VPP_EXPECT_ROUTES"
-echo "excluded       : $((SEEN_NETS - VIA_NETS)) (connected/blackhole/unreachable)"
-[ "${BIRD_NETS}" = "${SEEN_NETS}" ] && echo "OK: dump is complete" || echo "TRUNCATED — do not measure this"
+SEEN_NETS=$(awk '{print $1}' /tmp/pf-nets.txt)
+VIA_RAW=$(awk '{print $2}' /tmp/pf-nets.txt)
+VIA_FILE=$(awk '{print $1}' /tmp/pf-routes.txt | sort -u | wc -l | tr -d ' ')
+echo "bird reports    : ${BIRD_NETS} networks"
+echo "raw dump had    : ${SEEN_NETS} networks, ${VIA_RAW} with a via"
+echo "routes file has : ${VIA_FILE} prefixes  <-- PACKETFRAME_VPP_EXPECT_ROUTES"
+echo "excluded        : $((SEEN_NETS - VIA_RAW)) (connected/blackhole/unreachable)"
+[ "${BIRD_NETS}" = "${SEEN_NETS}" ] || echo "!! DUMP TRUNCATED — do not measure this"
+[ "${VIA_RAW}" = "${VIA_FILE}" ] || echo "!! EXTRACTION LOST RECORDS — do not measure this"
+[ "${BIRD_NETS}" = "${SEEN_NETS}" ] && [ "${VIA_RAW}" = "${VIA_FILE}" ] && echo "OK: chain verified"
 ```
 
-**Stop if that last line says TRUNCATED.** The whole point of the
-expectation is that a partial dump cannot produce a clean result.
+**Stop unless the last line says `OK: chain verified`.** Two separate
+things are being checked, and each closes a different way for a partial
+table to look complete:
+
+- `BIRD_NETS == SEEN_NETS` — bird's own count against the raw dump, so a
+  `birdc` that ends cleanly halfway is caught.
+- `VIA_RAW == VIA_FILE` — the via count computed **from the raw dump**
+  against the extracted file, so an `awk | sort` that loses records (disk
+  full, a failed `sort`) is caught too. `VIA_RAW` is what makes this
+  non-circular: it never touches `pf-routes.txt`.
+
+An expectation taken from the file it is meant to validate agrees with a
+truncated file perfectly. An earlier revision of this section did that
+with `wc -l`, and a revision after it validated only the raw dump.
 
 **This is a via-nexthop measurement, not literally every route class.**
 The `excluded` figure is real — `master4` carries connected, blackhole and
@@ -780,7 +796,31 @@ them as owned and program them into VPP. Extra work at best, and a
 refusal aborts the run.
 
 **Every device carrying a route nexthop must be a member port with its own
-VF.** The### Run
+VF.** The bench refuses up front if a route nexthop resolves to a device
+that is not a member — failing there is correct rather than something to
+work around, since a packet whose best path exits a port VPP does not own
+would blackhole.
+
+#### If only one VF is bound
+
+Rewrite the device column of the **filtered** neighbour file onto the one
+owned port, and record the run as a **reduced** measurement: the drain,
+wire encoding and VPP-side insert are all fully exercised, but every
+adjacency lands on a single interface, so it does not exercise the
+multi-port mapping.
+
+```sh
+awk '{ print $1, "eth3", $3 }' /tmp/pf-neigh.txt > /tmp/pf-neigh-one.txt
+```
+
+Rewrite `/tmp/pf-neigh.txt` (route-referenced only), never
+`/tmp/pf-neigh-all.txt` — the router-wide file carries management and
+tunnel neighbours, and relabelling those onto the member port would make
+`program_neighbours` treat them as owned and push them into VPP. Then use
+`PACKETFRAME_VPP_NEIGH=/tmp/pf-neigh-one.txt` with a single-entry
+`PORT`/`PCI` below.
+
+### Run
 
 VPP must already be up with its sized `startup.conf` (§2 — **including
 the `statseg` stanza**, or it aborts partway through). The test attaches
