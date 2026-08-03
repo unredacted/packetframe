@@ -9,14 +9,23 @@
 //! VPP is the upstream program.
 //!
 //! Built so far: slice 1 (config handling, feasibility probes, the
-//! startup.conf renderer and its route-count-driven memory arithmetic)
-//! and slice 2 (VF/vfio/hugepage lifecycle, state file, pidfd adopt,
-//! teardown ordering). [`sink`] carries the wire-format-independent
-//! half of slice 4 — pending map, nexthop mapping policy, three-valued
-//! route ledger — which is testable ahead of the binary-API transport
-//! that slice 3 blocks on.
+//! startup.conf renderer and its route-count-driven memory arithmetic),
+//! slice 2 (VF/vfio/hugepage lifecycle, state file, pidfd adopt,
+//! teardown ordering), slice 3 ([`vpp_api`] — generated wire structs,
+//! socket transport, CRC-checked handshake) and most of slice 4:
+//! [`sink`] (pending map, nexthop mapping, three-valued route ledger),
+//! [`supervisor`] + [`process`] + [`liveness`] + [`schedule`] +
+//! [`executor`] + [`driver`] (the supervision loop), [`attach`] and
+//! [`verify`] (device bring-up and readback), and [`status`]
+//! (health/metrics).
 //!
-//! Design record: `.claude/plans/` phase-4 plan v6. Key invariants
+//! **None of it runs yet.** [`Module::attach`] is still
+//! `not_implemented`, so every piece above is exercised only by unit
+//! tests and a fake-VPP loopback. Merged is not proven; the first real
+//! execution is the attach wiring, and the failover numbers in the plan
+//! stay unmeasured until then.
+//!
+//! Design record: `.claude/plans/` phase-4 plan v7. Key invariants
 //! enforced from day one:
 //! - membership (VF on every possible egress port) is all-or-nothing;
 //!   steering is the per-port canary lever (`Config::validate_vpp_offload`);
@@ -34,6 +43,7 @@ pub mod resources;
 pub mod schedule;
 pub mod sink;
 pub mod startup_conf;
+pub mod status;
 pub mod supervisor;
 pub mod verify;
 pub mod vpp_api;
@@ -171,10 +181,20 @@ impl Module for VppOffloadModule {
     }
 
     fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+        // Nothing to sample: there is no supervised VPP until
+        // `attach()` exists. The rendering itself lives in
+        // [`status::render_metrics`], which takes an observed
+        // [`status::StatusSnapshot`] — the attach wiring supplies one.
+        // Emitting zeroed gauges from here instead would publish a
+        // healthy-looking series for a module that is not running.
         Ok(())
     }
 
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
+        // Same reason. [`status::StatusSnapshot::report`] is the real
+        // surface; it needs a live `Supervisor` to observe, and an
+        // unattached module has none. Reporting healthy here is accurate
+        // for "loaded but not orchestrating anything".
         Ok(HealthReport::healthy())
     }
 }

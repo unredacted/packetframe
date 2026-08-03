@@ -260,10 +260,21 @@ pub struct Supervisor {
     /// was servicing. That is precisely the blackhole the ≤50 ms
     /// teardown rule exists to prevent.
     steered: bool,
-    /// Whether steering was up when the current trouble started —
-    /// remembered across the restart so `Ready` knows whether to
-    /// re-steer automatically or wait for the operator's canary.
-    was_steered: bool,
+    /// Whether steering is *wanted*, as distinct from in place.
+    ///
+    /// Set when steering has been established, when an adopted VPP came
+    /// with rules already live, and when a steer attempt failed —
+    /// remembered across a restart so `Ready` knows whether to re-steer
+    /// automatically or wait for the operator's canary. Cleared only by
+    /// a deliberate full stop.
+    ///
+    /// Named for the want rather than the past tense (it was
+    /// `was_steered`) because the failed-attempt case makes the past
+    /// tense wrong: a
+    /// first attach whose MCAM insert failed never had steering up, yet
+    /// steering is unambiguously wanted. A field whose name mis-describes
+    /// its contents is how the next bug gets written.
+    steer_wanted: bool,
     /// Whether a resync or verify task is still running.
     ///
     /// A field for the same reason `steered` is one: derived from the
@@ -299,7 +310,7 @@ impl Supervisor {
             state: State::Stopped,
             failures: 0,
             steered: false,
-            was_steered: false,
+            steer_wanted: false,
             converging: false,
             undead: false,
         }
@@ -312,6 +323,22 @@ impl Supervisor {
     /// Whether MCAM rules are currently diverting traffic to VPP.
     pub fn is_steered(&self) -> bool {
         self.steered
+    }
+
+    /// Whether steering is *wanted* — in place, or established once and
+    /// not deliberately stopped, or attempted and failed.
+    ///
+    /// This is the predicate `VerifyPassed` uses to decide whether to
+    /// re-steer, exposed so the health surface reports the same thing the
+    /// machine acts on rather than a second guess at it.
+    ///
+    /// **Not** config intent: the machine deliberately never steers a
+    /// first attach on its own (that is the operator's canary), so a
+    /// `steer on` port that has never yet steered and never failed to
+    /// reads as not-wanted here. The distinction is real — one is the
+    /// designed staging state, the other is a rollout that broke.
+    pub fn steer_intended(&self) -> bool {
+        self.steered || self.steer_wanted
     }
 
     pub fn failures(&self) -> u32 {
@@ -373,7 +400,7 @@ impl Supervisor {
             // --- adoption (rule 3) ---
             (Stopped | Backoff | Starting, Adopted { steered }) => {
                 self.steered = steered;
-                self.was_steered = steered;
+                self.steer_wanted = steered;
                 self.converging = true;
                 // An adopted VPP is presumed good until proven stale:
                 // mark dirty, resync, verify — but do NOT unsteer a
@@ -425,7 +452,7 @@ impl Supervisor {
                 // `Event::Steered` is the acknowledgement, exactly as
                 // on the first-attach path.
                 self.state = Ready;
-                if self.steered || self.was_steered {
+                if self.steer_intended() {
                     vec![Action::Steer]
                 } else {
                     vec![]
@@ -441,7 +468,7 @@ impl Supervisor {
             (Ready, Event::Steered) => {
                 self.state = State::Steered;
                 self.steered = true;
-                self.was_steered = true;
+                self.steer_wanted = true;
                 vec![]
             }
 
@@ -450,7 +477,7 @@ impl Supervisor {
                 // Proof it is gone, whatever we believed before.
                 self.undead = false;
                 if self.steered {
-                    self.was_steered = true;
+                    self.steer_wanted = true;
                 }
                 self.fail()
             }
@@ -459,7 +486,7 @@ impl Supervisor {
             // alone here.
             (s, Wedged) if s.has_process() => {
                 if self.steered {
-                    self.was_steered = true;
+                    self.steer_wanted = true;
                 }
                 self.fail()
             }
@@ -479,7 +506,18 @@ impl Supervisor {
             // left untouched, because on the adopted path the previous
             // rules may still be live and claiming otherwise would
             // suppress the Unsteer we owe on teardown.
-            (Ready, SteerFailed) => vec![],
+            //
+            // But the *want* is recorded. On a first attach nothing else
+            // records it — the machine never steers a first attach on
+            // its own — so without this line a failed rollout is
+            // indistinguishable from a deliberate `steer off`: no retry
+            // on the next `VerifyPassed`, and every health surface reads
+            // it as the designed staging state. Same defect shape as the
+            // rest of this file: an attempt that failed left no trace.
+            (Ready, SteerFailed) => {
+                self.steer_wanted = true;
+                vec![]
+            }
 
             // --- steering acknowledgements ---
             (_, Unsteered) => {
@@ -513,7 +551,7 @@ impl Supervisor {
                 actions.push(Action::Kill);
                 actions.push(Action::ReleaseResources);
                 self.state = Stopped;
-                self.was_steered = false;
+                self.steer_wanted = false;
                 self.failures = 0;
                 actions
             }
@@ -932,6 +970,68 @@ mod tests {
         );
         // And it must NOT be reported as a running steered dataplane.
         assert_ne!(s.state(), State::Steered);
+    }
+
+    /// A steer that fails on a **first** attach must record that
+    /// steering is wanted.
+    ///
+    /// Nothing else records it on this path — the machine deliberately
+    /// never steers a first attach on its own — so without it a broken
+    /// rollout is byte-for-byte identical to a deliberate `steer off`:
+    /// never retried on the next convergence cycle, and reported by
+    /// health as the designed staging state. Same shape as the other
+    /// bugs in this file: an attempt that failed left no trace.
+    #[test]
+    fn a_failed_first_attach_steer_is_remembered_and_retried() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(
+            !s.on(Event::VerifyPassed).contains(&Action::Steer),
+            "a first attach is the operator's canary, not ours"
+        );
+        assert!(!s.steer_intended(), "nothing has asked for steering yet");
+
+        // The operator's canary fires and the MCAM insert fails.
+        s.on(Event::SteerFailed);
+        assert!(!s.is_steered());
+        assert!(
+            s.steer_intended(),
+            "the want must survive the failure, or it is indistinguishable \
+             from `steer off`"
+        );
+
+        // The next convergence cycle retries it rather than silently
+        // leaving traffic on the fallback tier forever.
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(
+            s.on(Event::VerifyPassed).contains(&Action::Steer),
+            "a remembered want must drive a retry"
+        );
+    }
+
+    /// The inverse, so the fix above cannot quietly turn every staged
+    /// box into a steering one: a port that was never asked to steer
+    /// stays unsteered across restarts.
+    #[test]
+    fn a_never_steered_dataplane_is_never_auto_steered() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        s.on(Event::VerifyPassed);
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(!s.on(Event::VerifyPassed).contains(&Action::Steer));
+        assert!(!s.steer_intended());
     }
 
     #[test]
