@@ -285,6 +285,47 @@ this runbook:
 
 The v22.02 tag stays published as the mailbox-proof artifact.
 
+### RESULT (2026-08-02, shadow, round 3): **BRING-UP COMPLETE** — link up, first packet received
+
+The octeon9 artifact, end to end on mainline unpatched VPP:
+
+```
+octeon0/0  up  Link speed: 2.500000 Gbps
+rx packets 1 / rx bytes 60 / ip4 1 / drops 1
+octeon/queue 0002:07:00.1: NPA pool created, aura_handle = 0xffff93f70000/...
+```
+
+Every layer now proven: install (guarded) → CN96xx **D0 model gate
+passed** (octeon-roc's table) → AF mailbox → interface `octeon0/0` →
+**NPA hardware buffer pools** (the exact allocation the DPDK PMD path
+structurally could not do) → link up at 2.5 Gbps → an unsolicited
+60-byte IPv4 frame off eth1's wire delivered into VPP's rx node and
+correctly dropped by an unconfigured dataplane.
+
+**The working bring-up sequence** (the `devices {}` startup stanza
+with an EMPTY options block is rejected — `vnet_dev_config_one_device:
+unknown input ''`; use the runtime CLI, which is also the shape the
+vpp-offload module wants, since supervision gets runtime attach/detach
+for free):
+
+```sh
+# VF must be on vfio-pci first (NOTE: vpp package REMOVAL unbinds it —
+# postrm "cleans up" the binding; re-bind after any purge):
+#   echo vfio-pci > /sys/bus/pci/devices/0002:07:00.1/driver_override
+#   echo 0002:07:00.1 > /sys/bus/pci/drivers_probe
+# startup.conf: unix/socksvr/memory/buffers/cpu sections as in §2,
+# plus: plugins { plugin dpdk_plugin.so { disable } }  — no dpdk{} and
+# no devices{} stanza. Then:
+vppctl device attach pci/0002:07:00.1 driver octeon
+vppctl device create-interface pci/0002:07:00.1 port 0 num-rx-queues 1
+vppctl set interface state octeon0/0 up
+vppctl show interface octeon0/0     # link, counters
+```
+
+Checklist status after round 3: bring-up done; **item 1 half-proven**
+(wire → VPP delivery works unsteered; the MCAM-steered variant still
+to run) — items 1–12 now execute on this stack.
+
 ### Getting the build onto the shadow
 
 Derive the tag from the pin rather than typing a version — otherwise
