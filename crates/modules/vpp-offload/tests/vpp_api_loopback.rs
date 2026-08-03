@@ -179,8 +179,13 @@ impl Fake {
                     stats_index: 0,
                 }
                 .encode(&mut payload);
-                write_frame(&mut sock, &payload);
+                // Count BEFORE replying, not after. The test asserts on
+                // this counter as soon as the drain returns, and the drain
+                // returns the moment it reads the last reply — so counting
+                // afterwards races the assertion and fails intermittently
+                // with an off-by-one on a perfectly good drain.
                 handled_thread.fetch_add(1, Ordering::SeqCst);
+                write_frame(&mut sock, &payload);
             }
         });
 
