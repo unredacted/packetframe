@@ -951,13 +951,17 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
         return;
     };
     {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !pending.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // `settle()` is called WHILE the teardown is still running — that
+        // is the case the handle exists for, and waiting for
+        // `is_finished()` first is what hid a defect: `settle` read the
+        // shared snapshot BEFORE joining, so the loop's real final publish
+        // (arriving during the join) was discarded in favour of the
+        // timeout snapshot. Waiting first meant the final publish had
+        // already landed, and the pre-join read happened to be correct.
         assert!(
-            pending.is_finished(),
-            "the background teardown never settled"
+            !pending.is_finished(),
+            "the teardown finished before settle() was called; this test is not exercising \
+             the case it exists for"
         );
         let final_status = pending.settle();
         assert_eq!(
@@ -968,4 +972,87 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
             final_status.teardown_failures
         );
     }
+}
+
+/// The timeout correction must SURVIVE the tick that was in flight.
+///
+/// `stop()` sets the flag and writes its corrected snapshot while a tick is
+/// blocked in a socket read. When that tick returns — up to a full ping
+/// budget later — the loop's ordinary publish overwrote the correction with
+/// a snapshot carrying no timeout failure and `resources_leaked = false`, so
+/// a caller polling the handle lost the warning until teardown finished.
+///
+/// Watched until the teardown settles rather than sampled once: a single
+/// check right after `stop()` returns happens BEFORE the blocked tick can
+/// republish, which is how the first version of this missed it entirely.
+#[test]
+fn the_timeout_correction_survives_the_in_flight_tick() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-window",
+        fake_vpp::Behaviour {
+            hangup_after: None,
+            reject_deletes: 0,
+            garbage_crcs: false,
+            stall_pings_after: Some(1),
+            verify_mismatch: false,
+        },
+    );
+    let sock = fake.path.clone();
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let report = svc.stop();
+    let Some(pending) = report.pending else {
+        // The loop settled inside the budget; nothing was in flight to
+        // overwrite anything, which is also correct.
+        return;
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !pending.is_finished() && Instant::now() < deadline {
+        let s = pending.status().expect("a snapshot");
+        assert!(
+            s.resources_leaked || !s.teardown_failures.is_empty(),
+            "an ordinary publish overwrote the timeout correction; a poller sees no \
+             warning while the teardown is still running: {:?} / {:?}",
+            s.report.overall,
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pending.is_finished(), "the teardown never settled");
 }

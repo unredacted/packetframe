@@ -254,8 +254,16 @@ impl PendingTeardown {
     /// `STOP_PATIENCE` on its own side, so this cannot wait indefinitely on
     /// anything the loop can control.
     pub fn settle(self) -> Published {
-        let last = self.status();
-        match self.thread.join() {
+        // Read AFTER the join, not before. The loop is still running when
+        // `settle` is called in the case that matters — that is the whole
+        // point of the handle — and it publishes its real final status
+        // during the join: whether the release finally succeeded, which VF
+        // refused to unbind. A pre-join read returned the timeout snapshot
+        // instead and threw that away, which is the same "promise the final
+        // word, deliver a stale one" defect this handle was added to fix.
+        let joined = self.thread.join();
+        let last = self.shared.latest.lock().expect("status lock").clone();
+        match joined {
             Ok(()) => last.unwrap_or_else(|| {
                 incomplete_teardown(
                     None,
@@ -817,6 +825,19 @@ fn run_loop(
                     .as_deref()
                     .unwrap_or("(no detail recorded)")
             ));
+            break;
+        }
+        // The stop flag is rechecked HERE, not only at the top of the loop.
+        //
+        // `stop()` can set it — and write its corrected, unhealthy snapshot
+        // into the shared window — while this iteration is blocked inside a
+        // tick. Publishing an ordinary snapshot afterwards overwrote that
+        // correction with one carrying no timeout failure and
+        // `resources_leaked = false`, so a caller polling
+        // `PendingTeardown::status()` lost the warning again until teardown
+        // finished. The teardown below publishes the real final word; this
+        // iteration has nothing left to say.
+        if shared.stop.load(Ordering::SeqCst) {
             break;
         }
         let overall = publish(
