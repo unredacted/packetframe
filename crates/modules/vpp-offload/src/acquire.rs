@@ -24,8 +24,8 @@
 use std::path::PathBuf;
 
 use crate::resources::{
-    bind_vfio_in, ensure_vf_in, release_vf_in, reserve_hugepages_in, unbind_vfio_in,
-    verify_port_in, PortState, ResourceState,
+    bind_vfio_in, ensure_vf_in, release_vf_in, reserve_hugepages_in, sweep_stale_hugepage_maps,
+    unbind_vfio_in, verify_port_in, PortState, ResourceState,
 };
 use crate::runtime::{IdentityStore, ProcessIdentity};
 
@@ -51,6 +51,12 @@ pub struct SysPaths {
     /// Bytes per page in that pool (512 MiB on the fleet). Recorded in
     /// the state file so release restores the right pool.
     pub hugepage_bytes: u64,
+    /// The mounted hugetlbfs (`/dev/hugepages`). Swept for stale
+    /// `rtemap_*` files before the pool is released — a SIGKILLed VPP
+    /// leaves them pinning pages (observed live; the cleanup runbook
+    /// names this), and a release that skips the sweep reports success
+    /// while the next VPP start fails on mappings nothing freed.
+    pub hugetlbfs: PathBuf,
     /// Where the state file lives (`<state-dir>`).
     pub state_dir: PathBuf,
 }
@@ -64,6 +70,11 @@ pub enum Acquired {
     /// caller should attempt process adoption next — the state file
     /// may also name a running VPP.
     Adopted,
+    /// A partial record — a daemon killed between a sysfs mutation and
+    /// its save — was verified, and the missing tail was acquired
+    /// fresh. Process adoption may still apply (the record can name a
+    /// running VPP from before the interruption).
+    Resumed,
 }
 
 /// Acquire everything the config asks for, or leave the box untouched.
@@ -71,10 +82,13 @@ pub enum Acquired {
 /// If a state file exists, this is an **adoption**: every recorded port
 /// is verified against live sysfs (the VF still resolves to the
 /// recorded PCI address and is still on vfio-pci), and the recorded
-/// port set must match the config exactly. Any mismatch is an error
-/// naming `packetframe detach --all` — partially adopting resources
-/// would leave the unverified remainder untracked, which is how leaks
-/// become permanent.
+/// ports must be a clean (iface, cores) prefix of the config — equal
+/// for a completed attach, shorter for one a daemon death interrupted,
+/// in which case acquisition RESUMES from the tail. Anything else is a
+/// config change and is refused with `packetframe detach --all` under
+/// the old config — partially adopting resources would leave the
+/// unverified remainder untracked, which is how leaks become
+/// permanent.
 ///
 /// Fresh acquisition orders hugepages first (an unwindable sysctl-like
 /// write) and VFs after, saving state after each observed step.
@@ -83,52 +97,84 @@ pub fn acquire(
     ports: &[(String, u16)],
     pages: u32,
 ) -> Result<(ResourceState, Acquired), String> {
-    if let Some(mut state) = ResourceState::load(&paths.state_dir)? {
-        verify_adoptable(paths, &state, ports)?;
-        // Hugepages are re-verified, not trusted: `dpdk.service` resets
-        // reservations (observed live on the fleet), so the pool the
-        // state file remembers may hold nothing by now — and adopting
-        // without it lets a replacement VPP spawn straight into an
-        // allocation failure loop. `reserve_hugepages_in` is a no-op
-        // when the pool still suffices.
-        let nr_path = paths.hugepage_pool.join("nr_hugepages");
-        let live: u32 = std::fs::read_to_string(&nr_path)
-            .map_err(|e| format!("read {}: {e}", nr_path.display()))?
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        reserve_hugepages_in(&paths.hugepage_pool, pages)
-            .map_err(|e| format!("re-reserving hugepages on adoption: {e}"))?;
-        if state.hugepage_pages == 0 && live < pages {
-            // The original attach found a sufficient reservation and
-            // owned nothing; that reservation has since shrunk and WE
-            // just raised it — ownership starts now, from the live
-            // prior, and must be durable before anything relies on it.
-            state.hugepage_pool_bytes = paths.hugepage_bytes;
-            state.hugepage_pages = pages;
-            state.hugepage_prior_pages = live;
-            state.save(&paths.state_dir)?;
+    // How many leading ports are already recorded. Adoption with a
+    // complete record returns early below; a PARTIAL record — a daemon
+    // killed between a sysfs mutation and its save — resumes from the
+    // tail instead of being rejected. Rejecting it wedged both doors:
+    // this path refused the config mismatch, and `detach --all` could
+    // release only the recorded prefix, so the half-acquired port's VF
+    // was orphaned for good. Resumption is safe precisely because the
+    // primitives are adoption-aware: re-running ensure/bind on a port
+    // whose VF already exists converges on the same result.
+    let mut resume_from = 0usize;
+
+    let mut state = match ResourceState::load(&paths.state_dir)? {
+        Some(mut state) => {
+            resume_from = verify_adoptable(paths, &state, ports)?;
+
+            // The pool identity check comes BEFORE any reservation
+            // touch. Raising the currently-configured pool while the
+            // state owns a reservation in a DIFFERENT one would create
+            // pages nothing records — and release's own mismatch guard
+            // would then refuse the teardown of either.
+            if state.hugepage_pages > 0 && state.hugepage_pool_bytes != paths.hugepage_bytes {
+                return Err(format!(
+                    "state records a {}-byte-page hugepage pool but this run is configured \
+                     for a {}-byte one; refusing to reserve into the wrong pool — run \
+                     `packetframe detach --all` under the OLD configuration first",
+                    state.hugepage_pool_bytes, paths.hugepage_bytes
+                ));
+            }
+            // Re-verified, not trusted: `dpdk.service` resets
+            // reservations (observed live on the fleet), so the pool
+            // the state file remembers may hold nothing by now — and
+            // adopting without it lets a replacement VPP spawn straight
+            // into an allocation failure loop. `reserve_hugepages_in`
+            // is a no-op when the pool still suffices.
+            let nr_path = paths.hugepage_pool.join("nr_hugepages");
+            let live: u32 = std::fs::read_to_string(&nr_path)
+                .map_err(|e| format!("read {}: {e}", nr_path.display()))?
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            reserve_hugepages_in(&paths.hugepage_pool, pages)
+                .map_err(|e| format!("re-reserving hugepages on adoption: {e}"))?;
+            if state.hugepage_pages == 0 && live < pages {
+                // The original attach found a sufficient reservation
+                // and owned nothing; it has since shrunk and WE just
+                // raised it — ownership starts now, from the live
+                // prior, durable before anything relies on it.
+                state.hugepage_pool_bytes = paths.hugepage_bytes;
+                state.hugepage_pages = pages;
+                state.hugepage_prior_pages = live;
+                state.save(&paths.state_dir)?;
+            }
+            if resume_from == ports.len() {
+                return Ok((state, Acquired::Adopted));
+            }
+            state
         }
-        return Ok((state, Acquired::Adopted));
-    }
-
-    let mut state = ResourceState::empty();
-
-    // Hugepages first. Record the PRIOR count before touching the
-    // pool: release restores this value, because zeroing the pool is
-    // only correct when the reservation was created from nothing.
-    let nr_path = paths.hugepage_pool.join("nr_hugepages");
-    let prior: u32 = std::fs::read_to_string(&nr_path)
-        .map_err(|e| format!("read {}: {e}", nr_path.display()))?
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    reserve_hugepages_in(&paths.hugepage_pool, pages)?;
-    if prior < pages {
-        state.hugepage_pool_bytes = paths.hugepage_bytes;
-        state.hugepage_pages = pages;
-        state.hugepage_prior_pages = prior;
-    } // else: pre-existing reservation suffices; we own nothing.
+        None => {
+            let mut state = ResourceState::empty();
+            // Hugepages first. Record the PRIOR count before touching
+            // the pool: release restores this value, because zeroing
+            // is only correct when the reservation was created from
+            // nothing.
+            let nr_path = paths.hugepage_pool.join("nr_hugepages");
+            let prior: u32 = std::fs::read_to_string(&nr_path)
+                .map_err(|e| format!("read {}: {e}", nr_path.display()))?
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            reserve_hugepages_in(&paths.hugepage_pool, pages)?;
+            if prior < pages {
+                state.hugepage_pool_bytes = paths.hugepage_bytes;
+                state.hugepage_pages = pages;
+                state.hugepage_prior_pages = prior;
+            } // else: pre-existing reservation suffices; we own nothing.
+            state
+        }
+    };
 
     // Every save failure from here rolls back. A `?` instead would
     // return with resources acquired but UNRECORDED — the one
@@ -149,7 +195,7 @@ pub fn acquire(
     };
     save_or_rollback(&state, "the hugepage reservation")?;
 
-    for (iface, cores) in ports {
+    for (iface, cores) in &ports[resume_from..] {
         // The two steps are separated because their failure cleanups
         // differ — and because `ensure_vf_in` can fail AFTER creating
         // the VF (the `virtfn0` readlink). The failed port is not yet
@@ -172,13 +218,41 @@ pub fn acquire(
             msg
         };
 
+        // Whether the cleanup may remove this port's VF is decided by
+        // what was OBSERVED before we touched anything. `ensure_vf_in`
+        // refuses a multi-VF port without mutating it, and adopts a
+        // pre-existing single VF — in both cases a cleanup that writes
+        // `numvfs = 0` would destroy VFs this call never created (in
+        // the multi-VF case, every operator-managed VF on the PF). The
+        // first version of this cleanup did exactly that. Only a
+        // positively-observed `0 → 1` transition is ours to undo; an
+        // unreadable count is treated as not-ours, which at worst
+        // re-leaks what the failure already leaked.
+        let pre_numvfs: u32 = std::fs::read_to_string(
+            paths
+                .sysfs_net
+                .join(iface)
+                .join("device")
+                .join("sriov_numvfs"),
+        )
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(u32::MAX);
+        let cleanup_ours = |paths: &SysPaths| -> Result<(), String> {
+            if pre_numvfs == 0 {
+                release_vf_in(&paths.sysfs_net, iface)
+            } else {
+                Ok(()) // existed before us; not ours to delete
+            }
+        };
+
         let vf_pci = match ensure_vf_in(&paths.sysfs_net, iface) {
             Ok(p) => p,
             Err(e) => {
                 // The VF may exist even though ensure failed (created,
-                // then the virtfn0 readlink raced or failed). Releasing
-                // is idempotent when it does not.
-                let cleanup = release_vf_in(&paths.sysfs_net, iface);
+                // then the virtfn0 readlink raced or failed) — but only
+                // if WE created it just now.
+                let cleanup = cleanup_ours(paths);
                 return Err(unwind(cleanup, e));
             }
         };
@@ -189,8 +263,8 @@ pub fn acquire(
             KERNEL_VF_DRIVER,
         ) {
             // bind_vfio_in restores the kernel driver on its own
-            // failure; the VF itself is this loop's to remove.
-            let cleanup = release_vf_in(&paths.sysfs_net, iface);
+            // failure; the VF is ours to remove only if we created it.
+            let cleanup = cleanup_ours(paths);
             return Err(unwind(cleanup, e));
         }
         state.ports.push(PortState {
@@ -205,7 +279,14 @@ pub fn acquire(
         save_or_rollback(&state, &format!("port {iface}"))?;
     }
 
-    Ok((state, Acquired::Fresh))
+    Ok((
+        state,
+        if resume_from > 0 {
+            Acquired::Resumed
+        } else {
+            Acquired::Fresh
+        },
+    ))
 }
 
 /// Release everything `state` records, in reverse acquisition order.
@@ -263,6 +344,14 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
                 state.hugepage_pool_bytes, paths.hugepage_bytes
             ));
         } else {
+            // Stale EAL/VPP mappings pin pages; releasing the pool
+            // around them reports success while leaving the next VPP
+            // start to fail on memory nothing actually freed.
+            let swept = sweep_stale_hugepage_maps(&paths.hugetlbfs);
+            if swept > 0 {
+                // Informational, carried in the state of the world
+                // rather than a log this module does not own.
+            }
             let nr = paths.hugepage_pool.join("nr_hugepages");
             match std::fs::write(&nr, state.hugepage_prior_pages.to_string()) {
                 Ok(()) => {
@@ -292,13 +381,18 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
     }
 }
 
-/// Adoption checks: every recorded port verifies against live sysfs,
-/// and the recorded port set matches the config exactly.
+/// Adoption checks. Returns how many leading configured ports the
+/// record covers: equal to `ports.len()` for a complete record, fewer
+/// for one interrupted mid-acquisition — the caller resumes from
+/// there. Anything that is not a clean (iface, cores)-tuple prefix is
+/// refused: reordered, renamed, resized or EXTRA recorded ports all
+/// mean the config changed, and that requires a detach under the old
+/// config, not a guess.
 fn verify_adoptable(
     paths: &SysPaths,
     state: &ResourceState,
     ports: &[(String, u16)],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     // The FULL (iface, cores) tuple, not just the name. `cores` is the
     // persisted value the adopted configuration is reconstructed from
     // (rx queues, worker placement), so accepting a name-only match
@@ -311,7 +405,9 @@ fn verify_adoptable(
         .map(|p| (p.iface.as_str(), p.cores))
         .collect();
     let configured: Vec<(&str, u16)> = ports.iter().map(|(i, c)| (i.as_str(), *c)).collect();
-    if recorded != configured {
+    let is_prefix =
+        recorded.len() <= configured.len() && recorded[..] == configured[..recorded.len()];
+    if !is_prefix {
         return Err(format!(
             "state file records ports {recorded:?} but the config says {configured:?}; \
              port membership and core counts cannot change across an adoption — run \
@@ -327,7 +423,7 @@ fn verify_adoptable(
             )
         })?;
     }
-    Ok(())
+    Ok(state.ports.len())
 }
 
 /// The [`IdentityStore`] over the real state file.
@@ -450,12 +546,15 @@ mod tests {
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&pci_dev, dev.join("virtfn0")).unwrap();
             }
+            let hugetlbfs = base.join("dev-hugepages");
+            fs::create_dir_all(&hugetlbfs).unwrap();
             let paths = SysPaths {
                 sysfs_net: net,
                 pci_devices: devices,
                 pci_drivers: drivers,
                 hugepage_pool: pool,
                 hugepage_bytes: 512 << 20,
+                hugetlbfs,
                 state_dir: base.join("state"),
             };
             Self { base, paths }
@@ -782,6 +881,121 @@ mod tests {
                 .trim(),
             "0",
             "the hugepage release must not be blocked by the vanished VF"
+        );
+    }
+    /// A multi-VF refusal must not delete the operator's VFs: ensure_vf
+    /// deliberately made no mutation, so there is nothing of OURS to
+    /// clean up — the first version of the cleanup wrote numvfs=0
+    /// anyway, destroying every VF on the PF.
+    #[test]
+    fn a_refused_multi_vf_port_keeps_the_operators_vfs() {
+        let f = Fixture::new("multivf", &[("eth2", "0002:07:00.0")]);
+        // eth3 carries three operator-managed VFs.
+        let dev = f.paths.sysfs_net.join("eth3").join("device");
+        fs::create_dir_all(&dev).unwrap();
+        fs::write(dev.join("sriov_numvfs"), "3").unwrap();
+
+        let err = acquire(&f.paths, &two_ports(), 8).unwrap_err();
+        assert!(err.contains("refuses to guess"), "{err}");
+        assert_eq!(
+            fs::read_to_string(dev.join("sriov_numvfs")).unwrap(),
+            "3",
+            "VFs this call never created are not its to delete"
+        );
+    }
+
+    /// A record interrupted between a port's sysfs mutation and its
+    /// save is RESUMED, not rejected — rejection wedged both doors,
+    /// since detach could release only the recorded prefix and the
+    /// half-acquired VF was orphaned for good.
+    #[test]
+    fn an_interrupted_acquisition_resumes_from_the_tail() {
+        let f = Fixture::new(
+            "resume",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        // Simulate the interruption: acquire both, then rewrite the
+        // state as if the daemon died before eth3's save — eth3's VF
+        // exists and is vfio-bound, but the record stops at eth2.
+        let (mut state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        state.ports.truncate(1);
+        state.save(&f.paths.state_dir).unwrap();
+        #[cfg(unix)]
+        for pci in ["0002:07:00.0", "0002:07:00.1"] {
+            std::os::unix::fs::symlink(
+                f.paths.pci_drivers.join("vfio-pci"),
+                f.paths.pci_devices.join(pci).join("driver"),
+            )
+            .unwrap();
+        }
+
+        let (resumed, how) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        assert_eq!(how, Acquired::Resumed);
+        assert_eq!(resumed.ports.len(), 2);
+        assert_eq!(
+            resumed.ports[1].vf_pci, "0002:07:00.1",
+            "the half-acquired VF is adopted by the resume, not duplicated"
+        );
+        // And the record is whole again on disk.
+        let on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        assert_eq!(on_disk.ports.len(), 2);
+    }
+
+    /// Adoption under a different hugepage pool config is refused
+    /// BEFORE any reservation touch — raising the new pool while the
+    /// state owns the old one creates pages nothing records.
+    #[test]
+    fn adoption_refuses_a_hugepage_pool_change_before_reserving() {
+        let f = Fixture::new(
+            "poolchg",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let _ = acquire(&f.paths, &two_ports(), 8).unwrap();
+        #[cfg(unix)]
+        for pci in ["0002:07:00.0", "0002:07:00.1"] {
+            std::os::unix::fs::symlink(
+                f.paths.pci_drivers.join("vfio-pci"),
+                f.paths.pci_devices.join(pci).join("driver"),
+            )
+            .unwrap();
+        }
+        let mut wrong = f.paths.clone();
+        wrong.hugepage_bytes = 2 << 20;
+        // Point the "new pool" at a fresh dir so a reservation into it
+        // would be visible.
+        wrong.hugepage_pool = f.base.join("hugepages-2048kB");
+        fs::create_dir_all(&wrong.hugepage_pool).unwrap();
+        fs::write(wrong.hugepage_pool.join("nr_hugepages"), "0").unwrap();
+
+        let err = acquire(&wrong, &two_ports(), 8).unwrap_err();
+        assert!(err.contains("wrong pool"), "{err}");
+        assert_eq!(
+            fs::read_to_string(wrong.hugepage_pool.join("nr_hugepages"))
+                .unwrap()
+                .trim(),
+            "0",
+            "the mismatch must be refused before anything is reserved"
+        );
+    }
+
+    /// Stale rtemap files from a SIGKILLed VPP are swept before the
+    /// pool is released; skipping the sweep reports success while the
+    /// pages stay pinned.
+    #[test]
+    fn release_sweeps_stale_hugepage_maps() {
+        let f = Fixture::new(
+            "sweep",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        fs::write(f.paths.hugetlbfs.join("rtemap_0"), "").unwrap();
+        fs::write(f.paths.hugetlbfs.join("rtemap_7"), "").unwrap();
+
+        release(&f.paths, state).unwrap();
+        assert!(
+            !f.paths.hugetlbfs.join("rtemap_0").exists()
+                && !f.paths.hugetlbfs.join("rtemap_7").exists(),
+            "stale maps must be swept before the pool release"
         );
     }
 }
