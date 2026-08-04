@@ -887,6 +887,51 @@ Failure modes worth recognising rather than debugging from scratch:
   `show memory main-heap`, which reads mostly free during exactly this
   failure. See the item-10 RESULT.
 
+### RESULT (2026-08-03, shadow): **CONVERGENCE BUDGET MET — 40.32 s ≤ 60 s**
+
+**1,053,370 v4 prefixes** from the live `master4`, loaded through the
+`ConvergenceEngine` over the binary API into v26.06/octeon9. Verify
+PASS (64/64 probes), ledger fully installed, `may_steer true`,
+`installed == expect`. The chain-verified inputs reconciled exactly:
+bird 1,053,404 networks, 34 excluded (no via — connected/blackhole/
+unreachable, the real figure for the ~331 §0 estimate), 0 dropped for
+missing ARP.
+
+| phase | time | notes |
+|---|---:|---|
+| connect | 0.18 s | outside the budget (one-time socket setup) |
+| attach | 0.39 s | inside |
+| resync plan | 1.46 s | 1,053,370 upserts, 0 withdrawals |
+| neighbours | 0.00 s | 2 programmed (see below) |
+| drain | 38.42 s | 258 passes, all acked, 0 deferred, 0 rejected |
+| verify | 0.05 s | 64 probes |
+| **TOTAL** | **40.32 s** | **budget 60 s — 33% headroom** |
+
+**27,418 routes/s** over the drain (window 256, batch 4096; 258 × 4096
+covers the table). Drain is ~95% of the total; every other phase is
+noise, so future tuning has exactly one lever that matters.
+
+Cross-validation against item 10, which is the quiet headline: **main
+heap used 803.17M vs item 10's 803.49 MiB; stat segment populated
+101.94M — identical.** Two independent load paths (CLI exec, binary
+API) landing on the same memory figures makes the sizing constants in
+`startup_conf.rs` about as trustworthy as measurement gets.
+
+Also settled by reality: the plan's worry about "1.05M round trips
+against the real 129 nexthops" — the route-referenced via set is **2**
+(the two upstreams). 129/134 is the ARP table, not the nexthop set, so
+item 10's single-synthetic-nexthop method note was closer to production
+shape than anyone expected.
+
+Caveats, recorded not buried:
+- **REDUCED RUN**: one VF bound, so both upstream adjacencies were
+  relabelled onto eth3. The multi-port nexthop mapping is unexercised —
+  though with 2 vias, a two-VF run differs only in which sw_if_index
+  two adjacencies carry; the drain and wire path are identical.
+- **Fresh attach only.** Adoption (`PACKETFRAME_VPP_ADOPT`) not run.
+- This validates table *load*, not forwarding — items 1 (steered half)
+  and 7 (PMTUD) still need a traffic peer.
+
 ## 4. Pass / kill / record
 
 - **Pass:** items 1, 2, 7, 10 all WORK (delivery, egress, PMTUD,
