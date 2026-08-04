@@ -316,13 +316,48 @@ impl Drop for SupervisionService {
 /// One action failure per line, `Action: reason`, for the published
 /// diagnostics. Shared so an ordinary tick, an injected event and the
 /// teardown all render identically.
-/// Whether a supervised process exists right now.
+/// Drop a verify verdict that no longer describes a live process, keeping
+/// the REASON if it was a failure.
 ///
-/// `Backoff` and `Stopped` are deliberately "no process": the previous one
-/// is already gone. Anything learned FROM that process — notably a verify
-/// verdict — stops describing reality here.
-fn has_process_now(driver: &Driver) -> bool {
-    driver.state().has_process()
+/// A free function with exactly two callers — the main loop and the final
+/// publish after teardown — because that is the shape the alternative kept
+/// getting wrong. The rule first lived inline in the loop, which meant the
+/// stopped snapshot published after `StopRequested` killed the process still
+/// carried the passing verdict: `packetframe_vpp_fib_verified 1` for a VPP
+/// that had just been killed. Teardown is a second exit path, and a rule
+/// written at one exit is not a rule.
+///
+/// The verdict's lifetime is the process's, in BOTH polarities. A passing
+/// one kept past the process claims a verified FIB that no longer exists; a
+/// failing one kept past it survived into the *replacement* and described a
+/// process it had never seen. What keeps the second case from losing
+/// information is that the summary moves to `last_failures`, the field that
+/// exists to retain reasons across ticks — the FIB subsystem reports on the
+/// current instance, "why are we in backoff" does not.
+///
+/// Not keyed on any state name: `Starting` never fires (a lost process lands
+/// in `Backoff`), and the false→true edge of a replacement cannot be
+/// sampled at all, since `BackoffElapsed` enters `Starting` and a failed
+/// spawn returns to `Backoff` inside one tick. `has_process()` is stable for
+/// as long as it matters.
+fn expire_verdict(
+    driver: &Driver,
+    last_verify: &mut Option<crate::verify::VerifyOutcome>,
+    last_verify_at: &mut Option<Instant>,
+    last_failures: &mut Vec<String>,
+) {
+    if driver.state().has_process() {
+        return;
+    }
+    if let Some(v) = last_verify.take() {
+        if !v.passed() {
+            let summary = format!("Verify: {}", v.summary());
+            if !last_failures.contains(&summary) {
+                last_failures.push(summary);
+            }
+        }
+    }
+    *last_verify_at = None;
 }
 
 fn fmt_failures(outcome: &crate::executor::Outcome) -> Vec<String> {
@@ -532,40 +567,13 @@ fn run_loop(
             last_failures = failures;
         }
 
-        // The retained verdict describes ONE process instance, and it dies
-        // with it — in BOTH polarities.
-        //
-        // Three attempts got this wrong before the reason became clear, so
-        // the reasoning is worth keeping. Keying on `Starting` never fired
-        // (a lost process lands in `Backoff`, never passing through
-        // `Starting`). Keying on `!has_process()` fired on loss but not on
-        // replacement. Trying to detect the replacement as a false→true
-        // edge failed too, and instructively: `BackoffElapsed` enters
-        // `Starting` and a failed spawn returns to `Backoff` inside ONE
-        // tick, so a once-per-pass sample never observes it — a transient
-        // state cannot be detected by polling.
-        //
-        // The asymmetry was the real mistake. It existed to keep a failed
-        // verdict visible as the explanation for backoff, which conflated
-        // two jobs: the FIB subsystem reports on the CURRENT instance,
-        // while "why are we in backoff" belongs to `last_failures`, the
-        // field that already retains reasons across the empty ticks. Split
-        // them and the transient-state problem disappears — the condition
-        // becomes `!has_process()`, which is stable for as long as it
-        // matters.
-        if !has_process_now(&driver) {
-            if let Some(v) = last_verify.take() {
-                if !v.passed() {
-                    // Retain the WHY where reasons live, before dropping
-                    // the verdict that can no longer describe anything.
-                    let summary = format!("Verify: {}", v.summary());
-                    if !last_failures.contains(&summary) {
-                        last_failures.push(summary);
-                    }
-                }
-            }
-            last_verify_at = None;
-        }
+        // One call, one rule. See `expire_verdict`.
+        expire_verdict(
+            &driver,
+            &mut last_verify,
+            &mut last_verify_at,
+            &mut last_failures,
+        );
 
         // The check `api_incompatible` exists FOR, in the loop it was
         // built for. A CRC mismatch or handshake refusal fails
@@ -693,6 +701,16 @@ fn run_loop(
             &mut resources_leaked,
         );
     }
+    // The teardown just killed the process, so the verdict it produced no
+    // longer describes anything. Same rule, same function — this is the
+    // second exit path the inline version missed.
+    expire_verdict(
+        &driver,
+        &mut last_verify,
+        &mut last_verify_at,
+        &mut last_failures,
+    );
+
     // The final word: whatever the teardown left behind — an undead VPP
     // that refused to die, a release that failed after `Stopped`, the
     // incompatibility that ended supervision — is on the record.

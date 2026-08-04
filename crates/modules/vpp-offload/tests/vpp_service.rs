@@ -146,6 +146,25 @@ fn the_service_converges_publishes_health_and_stops_clean() {
         "the refused resource release must be on the record: {:?}",
         last.teardown_failures
     );
+    // The teardown killed the process, so the verdict it produced no longer
+    // describes anything. The stopped snapshot used to carry it — the
+    // invalidation lived inside the main loop, and teardown is a second exit
+    // path — so `packetframe_vpp_fib_verified 1` went out for a VPP that had
+    // just been killed.
+    assert!(
+        last.metrics
+            .contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"),
+        "the stopped snapshot claims a verified FIB for a killed process: {}",
+        last.metrics
+    );
+    assert!(
+        !last.report.subsystems.iter().any(|s| s.name == "fib-synced"
+            && s.message
+                .as_deref()
+                .is_some_and(|m| m.contains("verified on"))),
+        "and the report must agree with the gauge: {:?}",
+        last.report.subsystems
+    );
 }
 
 /// A VPP speaking a different API version must fail ATTACH, with the
