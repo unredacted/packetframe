@@ -248,20 +248,43 @@ fn run_loop(
     // The most recent nonempty failure set, retained across the empty
     // backoff ticks that follow it. See the publish site for why.
     let mut last_failures: Vec<String> = Vec::new();
-    // When the last passing verify was observed, for the freshness the
-    // health surface reports. Tracked here because `VerifyOutcome`
-    // deliberately carries no clock.
+    // The last COMPLETED verify verdict and when it completed.
+    //
+    // Held here rather than read from the engine at publish time,
+    // because the engine's copy is per-process state and the verdict's
+    // own teardown destroys it: `VerifyFailed` injects `Kill`, `kill`
+    // calls `process_gone`, and `on_process_gone` sets
+    // `last_verify = None`. The publish that followed therefore paired a
+    // fresh timestamp with no outcome and reported `NeverVerified` —
+    // hiding a concrete failure summary behind "not yet verified",
+    // which is the same disappearance an earlier round fixed for the
+    // timestamp alone, arriving through the engine's state reset instead.
+    //
+    // `VerifyOutcome` deliberately carries no clock, hence the pair.
+    let mut last_verify: Option<crate::verify::VerifyOutcome> = None;
     let mut last_verify_at: Option<Instant> = None;
 
+    // The initial injection is a real attach step, and its failures are
+    // no less actionable than an ordinary tick's — a `StartRequested`
+    // whose `Spawn` fails, or an `Adopted` whose `AttachDevices` is
+    // refused, has its only detailed reason in this Tick. Discarding it
+    // published a first snapshot with an empty `last_failures`, and if
+    // the failure left an undead process blocking retries, no later tick
+    // could ever reconstruct the reason.
     for e in initial {
         let now = Instant::now();
-        let _ = driver.inject(now, e, &mut fx);
+        let injected = driver.inject(now, e, &mut fx);
+        let f = fmt_failures(&injected.outcome);
+        if !f.is_empty() {
+            last_failures = f;
+        }
     }
 
     // Returns the overall health it published, which is what decides
     // whether a retained failure reason may finally be dropped.
     let publish = |driver: &Driver,
                    runtime: &Runtime,
+                   last_verify: &Option<crate::verify::VerifyOutcome>,
                    last_verify_at: &Option<Instant>,
                    terminal: &Option<String>,
                    teardown_failures: &[String],
@@ -270,7 +293,7 @@ fn run_loop(
      -> packetframe_common::module::HealthState {
         let now = Instant::now();
         let rs = runtime.status();
-        let fib = match (&rs.last_verify, last_verify_at) {
+        let fib = match (last_verify, last_verify_at) {
             (Some(outcome), Some(at)) => FibSync::from_outcome(outcome, now - *at),
             _ => FibSync::NeverVerified,
         };
@@ -313,7 +336,16 @@ fn run_loop(
     // First snapshot before the first tick; the handshake below is
     // what makes `start()`'s "status() is Some on return" guarantee
     // actually true rather than a race the test suite happens to win.
-    publish(&driver, &runtime, &last_verify_at, &None, &[], false, &[]);
+    publish(
+        &driver,
+        &runtime,
+        &last_verify,
+        &last_verify_at,
+        &None,
+        &[],
+        false,
+        &last_failures,
+    );
     let _ = ready.send(Ok(()));
 
     while !shared.stop.load(Ordering::SeqCst) {
@@ -330,6 +362,13 @@ fn run_loop(
                 e,
                 Event::VerifyPassed | Event::VerifyFailed | Event::VerifyIncomplete
             ) {
+                // BEFORE the injection, because the injection may destroy
+                // it: `VerifyFailed`'s teardown runs `Kill` →
+                // `process_gone` → `on_process_gone`, which clears the
+                // engine's `last_verify`. Reading it afterwards yields
+                // `None` and reports `NeverVerified` over a verify that
+                // definitely completed and definitely failed.
+                last_verify = runtime.status().last_verify;
                 last_verify_at = Some(Instant::now());
             }
             // The injected event's actions run synchronously HERE, and
@@ -343,6 +382,15 @@ fn run_loop(
             failures.extend(fmt_failures(&injected.outcome));
         }
         runtime.set_steered(driver.supervisor().is_steered());
+        // The retained verdict describes ONE process instance. Once a
+        // replacement is being started it describes nothing live, and
+        // reporting it would claim a verified FIB for a VPP that has not
+        // built one yet. `Backoff` deliberately still reports it — the
+        // failed verify is precisely why we are backing off.
+        if driver.state() == State::Starting {
+            last_verify = None;
+            last_verify_at = None;
+        }
 
         // The check `api_incompatible` exists FOR, in the loop it was
         // built for. A CRC mismatch or handshake refusal fails
@@ -393,6 +441,7 @@ fn run_loop(
         let overall = publish(
             &driver,
             &runtime,
+            &last_verify,
             &last_verify_at,
             &terminal,
             &[],
@@ -451,11 +500,12 @@ fn run_loop(
     publish(
         &driver,
         &runtime,
+        &last_verify,
         &last_verify_at,
         &terminal,
         &teardown_failures,
         resources_leaked,
-        &[],
+        &last_failures,
     );
 }
 

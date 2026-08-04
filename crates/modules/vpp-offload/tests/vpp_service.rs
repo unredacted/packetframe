@@ -422,6 +422,16 @@ fn a_failing_verifys_teardown_failures_are_published_and_retained() {
          discarded and its failures lost: {first:?}"
     );
 
+    // NOTE: the FIB subsystem's reporting of this verdict is deliberately
+    // NOT asserted here. `VerifyFailed` injects `Kill`, and `kill`
+    // returns early when nothing is supervised — this test has no real
+    // process — so `on_process_gone` never runs and the engine's verdict
+    // survives. Asserting on it would pass whether or not the loop
+    // retains its own copy, which is worse than no assertion: it reads as
+    // coverage. The premise the retention defends against is pinned in
+    // `engine.rs` (`on_process_gone` clears `last_verify`), and the
+    // loop-level consequence needs a real spawn — the failover drills.
+
     // And it is RETAINED. The teardown is followed by backoff ticks with
     // empty outcomes; republishing those verbatim cleared the reason
     // within one 50 ms poll while the service stayed unwell for seconds,
@@ -443,6 +453,69 @@ fn a_failing_verifys_teardown_failures_are_published_and_retained() {
         );
         std::thread::sleep(Duration::from_millis(15));
     }
+
+    let _ = svc.stop();
+}
+
+/// The INITIAL injection's failures must reach the first published
+/// snapshot.
+///
+/// `attach` hands the loop a `StartRequested` (or an `Adopted`), and its
+/// actions run before the first publish. Discarding that Tick meant the
+/// snapshot `SupervisionService::start` guarantees to have published came
+/// out with an empty `last_failures` — and if the failed spawn left an
+/// undead process blocking retries, no later tick could ever reconstruct
+/// the reason. The first thing an operator looks at would be blank about
+/// the only thing that had happened.
+///
+/// `/nonexistent/vpp` fails identically on macOS (the Linux-only pidfd
+/// stub) and Linux (ENOENT), so the assertion is on the action rather
+/// than the platform's wording.
+#[test]
+fn the_initial_injections_failures_reach_the_first_snapshot() {
+    let fake = Fake::start("svc-initial");
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                Vec::new(),
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror(Vec::new())),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                "/nonexistent/vpp",
+                "/tmp/startup.conf",
+            );
+            // StartRequested, not Adopted: the loop does the spawning,
+            // exactly as the attach wiring arranges it.
+            Ok((Driver::new(), runtime, vec![Event::StartRequested]))
+        }),
+    )
+    .expect("the service starts even though the spawn cannot");
+
+    // `start()` blocked on the first publish, so this is the FIRST
+    // snapshot and not a later one that happened to catch a retry.
+    let first = svc.status().expect("start guarantees a published snapshot");
+    assert!(
+        first.last_failures.iter().any(|f| f.starts_with("Spawn:")),
+        "the initial injection's failure was discarded; the first snapshot an operator \
+         reads says nothing about the only thing that happened: {:?}",
+        first.last_failures
+    );
+    assert_ne!(
+        first.report.overall,
+        HealthState::Healthy,
+        "a VPP that never started must not read as healthy: {:?}",
+        first.report
+    );
 
     let _ = svc.stop();
 }
