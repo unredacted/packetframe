@@ -348,10 +348,31 @@ impl Core {
         self.process = None;
         self.attach_mode = crate::attach::AttachMode::Fresh;
         self.engine.on_process_gone();
-        if let Err(e) = self.store.process_changed(None) {
-            // The exit is a fact whether or not it can be recorded;
-            // surface the failure, do not block on it.
-            self.last_store_error = Some(e);
+        // The exit is a fact whether or not it can be recorded; surface
+        // the failure, do not block on it.
+        let r = self.store.process_changed(None);
+        self.note_persist(r);
+    }
+
+    /// The single place a persist outcome is recorded — and the only
+    /// place it is cleared.
+    ///
+    /// Clearing on success matters because the degradation is otherwise
+    /// permanent: `last_store_error` was set on every failure and never
+    /// reset, so one transient failure (a briefly read-only state dir, a
+    /// full filesystem) kept the module out of `nominal()` for the life of
+    /// the service even after the record became durable again.
+    ///
+    /// And a single successful write really does restore the whole
+    /// record: [`crate::acquire::FileStore`] saves the entire
+    /// `ResourceState` on every observation rather than a delta, so any
+    /// write that lands makes the file current — hugepages, VFs,
+    /// interface indices and process identity together. That is what
+    /// makes "adoption is safe again" a fact rather than a hope.
+    fn note_persist(&mut self, r: Result<(), String>) {
+        match r {
+            Ok(()) => self.last_store_error = None,
+            Err(e) => self.last_store_error = Some(e),
         }
     }
 }
@@ -477,14 +498,14 @@ impl Effects for EffectsView {
         let mode = c.attach_mode;
         c.engine.attach_devices(mode).map_err(|e| e.to_string())?;
         let indices = c.engine.attached_indices();
-        if let Err(e) = c.store.interfaces_attached(&indices) {
-            // Unlike spawn, do not tear anything down: the interfaces
-            // exist and work. The cost of a lost record is one refused
-            // adoption after a daemon restart (UnknownIndexOnAdopt →
-            // clean restart), which is the designed safe fallback.
-            // Surfaced, not fatal.
-            c.last_store_error = Some(e);
-        }
+        // Unlike spawn, do not tear anything down: the interfaces exist
+        // and work. The cost of a lost record is one refused adoption
+        // after a daemon restart (UnknownIndexOnAdopt → clean restart),
+        // which is the designed safe fallback. Surfaced, not fatal — and
+        // a success here CLEARS an earlier failure, since the save is
+        // whole-record (see `note_persist`).
+        let r = c.store.interfaces_attached(&indices);
+        c.note_persist(r);
         Ok(())
     }
 

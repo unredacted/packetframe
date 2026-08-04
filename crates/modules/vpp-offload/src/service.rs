@@ -185,13 +185,53 @@ impl SupervisionService {
     /// is returned.
     pub fn stop(mut self) -> Option<Published> {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            // A panicked loop already published nothing further; the
-            // join error carries no more than the panic message the
-            // thread printed, so it is not propagated as a second
-            // panic here.
-            let _ = t.join();
+        let Some(t) = self.thread.take() else {
+            return self.status();
+        };
+        // Bounded and interruptible, NOT `join()`.
+        //
+        // An unconditional join cannot observe `STOP_PATIENCE` or the
+        // stop flag until the tick in progress returns — and a tick can
+        // legitimately sit in a synchronous API call for a full
+        // `SYNC_PING_BUDGET` (10 s unsteered), with verification issuing
+        // several such calls in a row. The teardown deadline only starts
+        // counting after that, so the honest worst case was ~20 s with no
+        // ceiling anywhere, against a `Module::detach` contract of under
+        // one second (SPEC.md §3.2).
+        //
+        // Under one second is not achievable on this platform and the plan
+        // says so: VPP sits on VFIO/DMA, SIGKILL cannot interrupt an
+        // uninterruptible sleep, and the kill path alone budgets 500 ms of
+        // SIGTERM grace plus a bounded SIGKILL wait. So the contract is
+        // relaxed to a documented best-effort bound, and this is where
+        // that bound is enforced: `STOP_PATIENCE`, the same budget the
+        // loop gives its own teardown, so a teardown that completes
+        // normally always completes inside it.
+        let deadline = Instant::now() + STOP_PATIENCE;
+        while !t.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(STOP_POLL_CAP);
         }
+        if !t.is_finished() {
+            // Deliberately NOT joined: blocking past the stated bound is
+            // the thing being fixed. The thread is left to finish its own
+            // teardown — it has the same deadline and will release what it
+            // can — but the caller is told, because a detach that reports
+            // success over a teardown still in flight is exactly the lie
+            // `teardown_failures` exists to prevent.
+            let mut last = self.status()?;
+            last.teardown_failures.push(format!(
+                "the supervision loop was still working after {}s and was not waited on \
+                 further; VPP and its resources may still be held — check `packetframe \
+                 status` and the state file before re-attaching",
+                STOP_PATIENCE.as_secs()
+            ));
+            last.resources_leaked = true;
+            return Some(last);
+        }
+        // A panicked loop already published nothing further; the join
+        // error carries no more than the panic message the thread
+        // printed, so it is not propagated as a second panic here.
+        let _ = t.join();
         self.status()
     }
 
@@ -382,12 +422,24 @@ fn run_loop(
             failures.extend(fmt_failures(&injected.outcome));
         }
         runtime.set_steered(driver.supervisor().is_steered());
-        // The retained verdict describes ONE process instance. Once a
-        // replacement is being started it describes nothing live, and
-        // reporting it would claim a verified FIB for a VPP that has not
-        // built one yet. `Backoff` deliberately still reports it — the
-        // failed verify is precisely why we are backing off.
-        if driver.state() == State::Starting {
+        // The retained verdict describes ONE process instance, so process
+        // loss has to invalidate it — but asymmetrically, and the
+        // asymmetry is the whole point:
+        //
+        // - a **passing** verdict must go. Keeping it reported a verified
+        //   FIB, and `packetframe_vpp_fib_verified 1`, for a process that
+        //   no longer exists — through the entire backoff interval and in
+        //   the final stopped snapshot.
+        // - a **failing** verdict must stay. It is the reason we are in
+        //   backoff at all, and dropping it puts "not yet verified" where
+        //   the explanation should be.
+        //
+        // Keyed on `has_process()`, not on a state guess. The first
+        // version keyed on `Starting`, which a lost process does not pass
+        // through: a crash, a wedge or a stop lands in `Backoff` or
+        // `Stopped`, so the invalidation never fired for any of the cases
+        // it existed to cover.
+        if !driver.state().has_process() && last_verify.as_ref().is_some_and(|v| v.passed()) {
             last_verify = None;
             last_verify_at = None;
         }
@@ -462,37 +514,88 @@ fn run_loop(
         }
     }
 
-    // Orderly teardown: hand the machine the stop and tick it until it
-    // settles or the bounded patience expires. `StopRequested` on an
-    // already-Stopped machine is a no-op, so the redundant case is
-    // harmless.
+    // Orderly teardown: hand the machine the stop, then keep working until
+    // the resources are actually released or the bounded patience expires.
     //
     // Outcomes are ACCUMULATED here, not dropped. The stop transition's
     // `ReleaseResources` can fail after the supervisor is already
     // `Stopped`, so no event will ever carry that failure — the
     // discarded Tick was the only witness, and discarding it made
     // `stop()` return a clean-looking snapshot over still-held VFs.
-    let mut absorb = |outcome: crate::executor::Outcome| {
-        teardown_failures.extend(fmt_failures(&outcome));
-        resources_leaked |= outcome.resources_leaked;
-    };
+    // A free function rather than a closure: the retry below has to read
+    // and reset `resources_leaked`, which a closure capturing it mutably
+    // would forbid.
+    fn absorb(outcome: crate::executor::Outcome, failures: &mut Vec<String>, leaked: &mut bool) {
+        failures.extend(fmt_failures(&outcome));
+        *leaked |= outcome.resources_leaked;
+    }
     let deadline = Instant::now() + STOP_PATIENCE;
     absorb(
         driver
             .inject(Instant::now(), Event::StopRequested, &mut fx)
             .outcome,
+        &mut teardown_failures,
+        &mut resources_leaked,
     );
-    while driver.state() != State::Stopped && Instant::now() < deadline {
+    // The loop waits on the ONE condition that waiting can resolve: an
+    // undead process.
+    //
+    // Two bugs met here. `(_, StopRequested)` assigns `Stopped`
+    // unconditionally — before knowing whether `Unsteer` succeeded or
+    // `Kill` reported `MustLeak` — so the old `while state != Stopped`
+    // condition was false on its first evaluation and the whole patience
+    // window was dead code: a VPP that exits a moment after SIGKILL, whose
+    // VF could then have been released well inside the budget, produced an
+    // immediate leaked-resources snapshot instead.
+    //
+    // But the fix must not be "retry while anything is still held". On a
+    // structural refusal — `SteeringUnavailable` declining to unsteer, a VF
+    // that will not unbind — nothing changes by waiting, and looping to the
+    // deadline would add ten seconds to every such detach. `undead` is
+    // different in kind: it means SIGKILL could not bite (VFIO/DMA), and
+    // the pidfd will report the exit whenever it comes. Ticking is what
+    // observes it.
+    //
+    // Retrying is possible because `StopRequested` is NOT a no-op on an
+    // already-`Stopped` machine (the comment here used to claim it was):
+    // it matches any state and re-emits Unsteer/Kill/ReleaseResources
+    // against a world that has since changed.
+    let was_undead = driver.supervisor().is_undead();
+    while driver.supervisor().is_undead() && Instant::now() < deadline {
         let now = Instant::now();
         let tick = driver.tick(now, &mut obs, &mut fx);
-        absorb(tick.outcome.clone());
+        absorb(
+            tick.outcome.clone(),
+            &mut teardown_failures,
+            &mut resources_leaked,
+        );
         for e in runtime.take_pending() {
-            absorb(driver.inject(Instant::now(), e, &mut fx).outcome);
+            absorb(
+                driver.inject(Instant::now(), e, &mut fx).outcome,
+                &mut teardown_failures,
+                &mut resources_leaked,
+            );
         }
         match tick.sleep {
             Some(d) if d.is_zero() => {}
             _ => std::thread::sleep(Duration::from_millis(10)),
         }
+    }
+    if was_undead && !driver.supervisor().is_undead() {
+        // The process that survived SIGKILL has since exited, so its VF and
+        // hugepages are releasable now. Clear the verdict from the attempt
+        // that could not proceed before re-running the teardown, or the
+        // stale `true` would outlive the condition that produced it.
+        resources_leaked = false;
+        teardown_failures
+            .push("the process survived SIGKILL and then exited; teardown re-run".into());
+        absorb(
+            driver
+                .inject(Instant::now(), Event::StopRequested, &mut fx)
+                .outcome,
+            &mut teardown_failures,
+            &mut resources_leaked,
+        );
     }
     // The final word: whatever the teardown left behind — an undead VPP
     // that refused to die, a release that failed after `Stopped`, the
