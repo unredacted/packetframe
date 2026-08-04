@@ -823,9 +823,14 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         ),
     };
 
-    // v0.1 has one module (fast-path), so `--all` and the default case
-    // behave identically, both tear down every pin under the module's
-    // pin root. `--all` becomes meaningful once a second module ships.
+    // `--all` used to be a no-op with a comment saying it would "become
+    // meaningful once a second module ships". A second module has now
+    // shipped, and the comment outlived its truth: every message this
+    // codebase prints about held VFs — from the module, from `bring_up`'s
+    // rollback, from the supervision service's timeout and panic paths —
+    // tells the operator to run `packetframe detach --all`, and that command
+    // touched nothing but fast-path pins. The recovery path advertised
+    // everywhere did not exist.
     let _ = all;
 
     #[cfg(feature = "fast-path")]
@@ -884,6 +889,101 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             .map_err(|e| format!("registry remove: {e}"))?;
     }
 
+    #[cfg(feature = "vpp-offload")]
+    detach_vpp_offload(&state_dir)?;
+
+    Ok(())
+}
+
+/// Release what vpp-offload's state file records: the supervised VPP, its
+/// VFs and vfio bindings, and the hugepage reservation.
+///
+/// This is the standalone recovery path, and it has to exist separately from
+/// `Module::detach` because the two run at different times. `Module::detach`
+/// needs a live daemon holding the supervision handle; but the daemon's
+/// ordinary SIGTERM exit deliberately PRESERVES VPP for adoption (SPEC.md
+/// §8.5), and `packetframe detach` refuses to run while a daemon is alive.
+/// So by the time an operator can invoke this, the in-memory handle is gone
+/// and the state file is the only record of what is held.
+///
+/// **Ordering is the same discipline the module's teardown uses, for the same
+/// reason.** VPP is killed first and resources are released only if it is
+/// confirmed gone: unbinding a VF or handing back hugepages while a process
+/// can still DMA through them is memory corruption, whereas leaking a VF is a
+/// line in `packetframe status` and a reboot's worth of inconvenience.
+/// Steering is not unwound here because MCAM is not implemented yet; when it
+/// is, it must come first (before the kill), or traffic is left pointed at a
+/// VF nothing services.
+#[cfg(feature = "vpp-offload")]
+fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
+    use packetframe_vpp_offload::acquire::{release, SysPaths};
+    use packetframe_vpp_offload::process::{terminate_or_leak, Disposition, VppProcess};
+    use packetframe_vpp_offload::resources::ResourceState;
+    use packetframe_vpp_offload::runtime::TERM_GRACE;
+
+    let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
+        return Ok(()); // nothing was ever acquired
+    };
+
+    // Kill the recorded VPP first, if it is still the process we recorded.
+    // `adopt` verifies (pid, start_ticks, boot_id), so a recycled PID cannot
+    // be signalled and a reboot invalidates the record entirely.
+    if let Some(pid) = state.vpp_pid {
+        let identity = (pid, state.vpp_start_ticks, state.vpp_boot_id.clone());
+        match identity {
+            (pid, Some(ticks), boot) => {
+                match VppProcess::adopt(pid, ticks, boot.as_deref()) {
+                    Ok(Some(mut p)) => {
+                        tracing::info!(pid, "vpp-offload: terminating the recorded VPP");
+                        if terminate_or_leak(&mut p, TERM_GRACE) == Disposition::MustLeak {
+                            // Refuse to release. The process survived
+                            // SIGKILL — most likely parked in an
+                            // uninterruptible VFIO/DMA call — and the state
+                            // file stays intact so a later attempt can
+                            // finish the job.
+                            return Err(format!(
+                                "vpp-offload: VPP (pid {pid}) survived SIGKILL, so its VF \
+                                 and hugepages were deliberately NOT released — releasing \
+                                 them under a process that can still DMA through them is \
+                                 worse than leaking them. The state file still records \
+                                 everything; retry once `ps {pid}` is empty."
+                            ));
+                        }
+                    }
+                    // Gone already, or not ours: nothing to kill.
+                    Ok(None) => tracing::info!(
+                        pid,
+                        "vpp-offload: the recorded VPP is gone; releasing its resources"
+                    ),
+                    Err(e) => {
+                        return Err(format!(
+                            "vpp-offload: could not establish whether the recorded VPP \
+                             (pid {pid}) is still running ({e}); refusing to release its \
+                             VF and hugepages while that is unknown"
+                        ))
+                    }
+                }
+            }
+            // A pid with no start-time cookie cannot be identified, so it
+            // cannot be safely signalled — and it cannot be ruled out
+            // either. `(pid, start_ticks)` is what makes an identity
+            // verifiable across PID reuse; signalling without it risks
+            // SIGKILLing a stranger as root, and releasing without it risks
+            // unbinding a VF under a live VPP.
+            (pid, None, _) => {
+                return Err(format!(
+                    "vpp-offload: the state file records pid {pid} with no start-time \
+                     cookie, so that process cannot be identified and must not be \
+                     signalled. Confirm by hand that no VPP is running, then remove the \
+                     state file."
+                ))
+            }
+        }
+    }
+
+    let paths = SysPaths::live(state_dir, packetframe_vpp_offload::default_hugepage_bytes());
+    release(&paths, state).map_err(|e| format!("vpp-offload: {e}"))?;
+    tracing::info!("vpp-offload: VFs rebound and hugepages restored");
     Ok(())
 }
 
@@ -1052,4 +1152,51 @@ fn trial_attach_probes(ifaces: &[String]) -> Vec<(String, String)> {
 #[cfg(not(all(target_os = "linux", feature = "fast-path")))]
 fn trial_attach_probes(_ifaces: &[String]) -> Vec<(String, String)> {
     Vec::new()
+}
+
+#[cfg(all(test, feature = "vpp-offload"))]
+mod vpp_detach_tests {
+    use super::*;
+
+    /// A recorded pid with no start-time cookie must not be signalled, and
+    /// its resources must not be released either.
+    ///
+    /// The pair `(pid, start_ticks)` is what makes a process identity
+    /// verifiable across PID reuse; without the cookie we can neither
+    /// confirm the recorded VPP is still running nor rule it out. Signalling
+    /// would risk SIGKILLing a stranger as root; releasing would risk
+    /// unbinding a VF under a live VPP. So it refuses and says what to do —
+    /// and it refuses BEFORE touching sysfs, which is what makes this
+    /// testable off a router.
+    #[test]
+    fn a_pid_without_a_start_cookie_is_refused() {
+        use packetframe_vpp_offload::resources::ResourceState;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ResourceState::empty();
+        state.vpp_pid = Some(4242);
+        state.vpp_start_ticks = None; // the cookie is missing
+        state.save(&dir).unwrap();
+
+        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        assert!(e.contains("4242"), "{e}");
+        assert!(
+            e.contains("must not be signalled"),
+            "the reason must be stated: {e}"
+        );
+        // The record survives, so a later attempt can still act on it.
+        assert!(ResourceState::load(&dir).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No state file means nothing was ever acquired: a clean no-op, so
+    /// `detach --all` stays idempotent for operators who run it habitually.
+    #[test]
+    fn no_state_file_is_a_clean_no_op() {
+        let dir = std::env::temp_dir().join(format!("pf-detach-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(detach_vpp_offload(&dir).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -196,6 +196,37 @@ impl VppOffloadModule {
         self.source = Some(source);
     }
 
+    /// Settle a finished background teardown and replace the provisional
+    /// verdict with what actually happened.
+    ///
+    /// `stop()` bounds its wait at the detach budget, so a teardown delayed
+    /// by an in-flight API call gets recorded as a failure while it is still
+    /// in progress. That verdict is provisional by construction: the loop
+    /// runs on under `STOP_PATIENCE` and usually finishes. Without this,
+    /// the provisional failure was permanent — `health_check` reported
+    /// Unhealthy and every `detach` retried into an error, over resources
+    /// that had in fact been released.
+    ///
+    /// Only consumes the handle once the thread has finished, so a teardown
+    /// still in flight keeps being reported as in flight rather than being
+    /// waited on inside a health check.
+    fn reconcile_pending_teardown(&mut self) {
+        let Some(pending) = &self.teardown_pending else {
+            return;
+        };
+        if !pending.is_finished() {
+            return;
+        }
+        let final_status = self
+            .teardown_pending
+            .take()
+            .expect("checked just above")
+            .settle();
+        // `None` clears the provisional failure: it finished cleanly after
+        // all, and the failure was about the budget rather than the outcome.
+        self.teardown_failure = settled_verdict(&final_status);
+    }
+
     /// Record a teardown that could not be confirmed, and build the error
     /// for it. One place, so the recording cannot be forgotten at one of
     /// `detach`'s two failure exits.
@@ -208,6 +239,34 @@ impl VppOffloadModule {
     pub fn published(&self) -> Option<service::Published> {
         self.attached.as_ref().and_then(|a| a.service.status())
     }
+}
+
+/// What a FINISHED teardown actually amounted to: `Some(reason)` if
+/// something is still held, `None` if everything was released.
+///
+/// Pure, because the alternative is untestable. The verdict recorded when
+/// `stop()` times out is provisional — the loop keeps working under its own
+/// patience — and getting the reconciliation wrong in the clearing direction
+/// reports a leak that does not exist, while getting it wrong the other way
+/// reports a clean detach over held VFs. Both need to be checkable without
+/// standing up a supervision thread that misses its budget.
+fn settled_verdict(final_status: &service::Published) -> Option<String> {
+    if !final_status.resources_leaked && final_status.teardown_failures.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "teardown finished but did not complete{}{}",
+        if final_status.resources_leaked {
+            "; VF/hugepage resources are still held"
+        } else {
+            ""
+        },
+        if final_status.teardown_failures.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", final_status.teardown_failures.join("; "))
+        }
+    ))
 }
 
 /// Turn a published snapshot into the module's health report.
@@ -401,7 +460,16 @@ impl Module for VppOffloadModule {
     }
 
     fn detach(&mut self) -> ModuleResult<()> {
-        // A teardown that already failed keeps failing. The service is
+        // Reconcile a background teardown before answering. The failure
+        // recorded when `stop()` timed out is PROVISIONAL: the loop kept
+        // working under its own patience and may have released everything
+        // after `detach` returned. Reporting the provisional failure forever
+        // — which is what happens without this — makes an
+        // otherwise-successful teardown permanently Unhealthy and every
+        // retry an error, purely because an in-flight API call pushed it
+        // past the 900 ms budget.
+        self.reconcile_pending_teardown();
+        // A teardown that really did fail keeps failing. The service is
         // consumed by `stop()`, so there is nothing left to retry — but
         // answering `Ok` because `attached` is now `None` would report a
         // clean detach over resources that are still held, on exactly the
@@ -471,6 +539,11 @@ impl Module for VppOffloadModule {
         if let Some(pending) = &self.teardown_pending {
             use packetframe_common::module::{HealthState, SubsystemHealth};
             let settled = pending.is_finished();
+            // `&self` cannot consume the handle, so this reports what the
+            // loop has published so far. A finished teardown that released
+            // everything is reconciled — and the provisional failure
+            // cleared — on the next `detach`; see
+            // `reconcile_pending_teardown`.
             let detail = pending
                 .status()
                 .map(|p| {
@@ -656,6 +729,41 @@ mod tests {
                 && s.message.as_deref() == Some("Start: no such file or directory")),
             "{r:?}"
         );
+    }
+
+    /// A teardown that finished cleanly clears the provisional failure.
+    ///
+    /// `stop()` records a failure when it times out, but that verdict is
+    /// about the BUDGET, not the outcome: the loop keeps working under its
+    /// own patience and usually finishes. Without reconciliation the
+    /// provisional failure was permanent — health Unhealthy forever and
+    /// every retry an error — over resources that had in fact been released.
+    #[test]
+    fn a_clean_finish_clears_the_provisional_failure() {
+        let clean = healthy_published();
+        assert!(
+            settled_verdict(&clean).is_none(),
+            "a teardown that released everything must not stay reported as failed"
+        );
+    }
+
+    /// And a teardown that finished BADLY must be reported, with the detail.
+    /// Clearing on any finish would report a clean detach over held VFs,
+    /// which is the opposite and worse mistake.
+    #[test]
+    fn a_dirty_finish_is_reported_with_its_detail() {
+        let mut leaked = healthy_published();
+        leaked.resources_leaked = true;
+        leaked.teardown_failures = vec!["Unsteer: rules could not be removed".into()];
+        let why = settled_verdict(&leaked).expect("must be reported");
+        assert!(why.contains("still held"), "{why}");
+        assert!(why.contains("Unsteer"), "the detail must survive: {why}");
+
+        // Failures without the leak flag still count: the teardown said
+        // something went wrong.
+        let mut failed = healthy_published();
+        failed.teardown_failures = vec!["Kill: process did not exit".into()];
+        assert!(settled_verdict(&failed).is_some());
     }
 
     /// A `detach` that could not confirm the teardown must keep saying so.

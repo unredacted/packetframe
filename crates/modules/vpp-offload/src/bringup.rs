@@ -122,6 +122,37 @@ pub fn bring_up(
     if cfg.ports.is_empty() {
         return Err("no `port` lines; there is no forwarding domain to bring up".into());
     }
+    // `steer on` is REFUSED until slice 5 builds MCAM, in the pure phase
+    // before anything is touched.
+    //
+    // Accepting it was a silent no-op with a healthy face on it. The steering
+    // flag is dropped here (the attach step needs only iface and cores), a
+    // fresh supervisor starts with `steer_wanted = false`, and a first attach
+    // deliberately never steers itself — so `SteeringUnavailable` is never
+    // called, convergence settles in `Ready`, and `nominal()` returns true
+    // because `steer_intended()` is false. An operator who asked for traffic
+    // diversion would get a Healthy module that never attempted it, which is
+    // precisely the "requested, not observed" shape this phase keeps
+    // producing.
+    //
+    // Refusing is safe: the plan's staging state is every port `steer off`
+    // (members up, FIB synced and verified, zero traffic diverted), and that
+    // is exactly what this module can honestly deliver today.
+    let asked_to_steer: Vec<&str> = cfg
+        .ports
+        .iter()
+        .filter(|(_, _, steer)| *steer)
+        .map(|(iface, _, _)| iface.as_str())
+        .collect();
+    if !asked_to_steer.is_empty() {
+        return Err(format!(
+            "port(s) {} are configured `steer on`, but MCAM steering is not implemented \
+             until slice 5 — attaching would report Healthy while diverting nothing. Set \
+             every port to `steer off` (the designed staging state: members up, FIB synced \
+             and verified, no traffic diverted) until steering ships.",
+            asked_to_steer.join(", ")
+        ));
+    }
     let workers = cfg.total_workers();
     let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;
     let core_map = cores::derive_from_sysfs(&paths.sysfs_cpu, workers)?;

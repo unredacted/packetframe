@@ -390,3 +390,46 @@ fn attaching_without_a_route_source_is_refused() {
     );
     assert!(msg.contains("before load()"), "{msg}");
 }
+
+/// `steer on` must be REFUSED, not silently ignored.
+///
+/// The steering flag is dropped when ports are mapped for the attach step,
+/// a fresh supervisor starts with `steer_wanted = false`, and a first attach
+/// deliberately never steers itself — so `SteeringUnavailable` is never
+/// called, convergence settles in `Ready`, and `nominal()` returns true
+/// because `steer_intended()` is false. An operator who asked for traffic
+/// diversion would get a Healthy module that never attempted it.
+///
+/// Refused in the pure phase, so nothing is touched.
+#[test]
+fn a_steer_on_port_is_refused_until_mcam_exists() {
+    let fake = fake_vpp::Fake::start("bringup-steer");
+    let host = Host::new(
+        "steer",
+        &[("eth4", "0002:07:00.0"), ("eth5", "0002:07:00.1")],
+        fake.path.clone(),
+    );
+
+    let cfg = host.cfg(&[("eth4", 1, false), ("eth5", 1, true)]);
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+        .err()
+        .expect("a steer-on port must be refused");
+    assert!(e.contains("eth5"), "the offending port must be named: {e}");
+    assert!(e.contains("steer off"), "and the remedy stated: {e}");
+
+    // Refused BEFORE any mutation: no VF, no reservation, no state file.
+    assert!(host.state().is_none(), "a refused config left a state file");
+    assert_eq!(
+        fs::read_to_string(host.paths.sys.hugepage_pool.join("nr_hugepages"))
+            .unwrap()
+            .trim(),
+        "0",
+        "a refused config reserved hugepages"
+    );
+
+    // All-off is the designed staging state and must still work.
+    let cfg_ok = host.cfg(&[("eth4", 1, false), ("eth5", 1, false)]);
+    let attached = bring_up(&cfg_ok, &host.paths, Box::new(Mirror))
+        .expect("every port steer off is the staging state and must attach");
+    let _ = attached.service.stop();
+}
