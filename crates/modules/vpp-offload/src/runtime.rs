@@ -351,7 +351,7 @@ impl Core {
         // The exit is a fact whether or not it can be recorded; surface
         // the failure, do not block on it.
         let r = self.store.process_changed(None);
-        self.note_persist(r);
+        let _ = self.note_persist(r);
     }
 
     /// The single place a persist outcome is recorded — and the only
@@ -369,11 +369,19 @@ impl Core {
     /// write that lands makes the file current — hugepages, VFs,
     /// interface indices and process identity together. That is what
     /// makes "adoption is safe again" a fact rather than a hope.
-    fn note_persist(&mut self, r: Result<(), String>) {
-        match r {
+    /// Returns the outcome so callers that must ACT on a failure — spawn's
+    /// persist-or-kill — can still branch on it without bypassing the
+    /// recorder. The first version returned `()`, which is precisely why
+    /// `spawn` kept its own direct `store.process_changed` call and a
+    /// successful spawn-persist never cleared an earlier failure: the
+    /// helper's own doc claimed to be the single recorder while one writer
+    /// in the same file went around it.
+    fn note_persist(&mut self, r: Result<(), String>) -> Result<(), String> {
+        match &r {
             Ok(()) => self.last_store_error = None,
-            Err(e) => self.last_store_error = Some(e),
+            Err(e) => self.last_store_error = Some(e.clone()),
         }
+        r
     }
 }
 
@@ -453,9 +461,12 @@ impl Effects for EffectsView {
             start_ticks: p.start_ticks(),
             boot_id: Some(boot_id),
         };
-        if let Err(e) = c.store.process_changed(Some(identity)) {
-            // Persist-or-kill: a VPP whose identity is not on disk
-            // cannot be adopted after a daemon restart.
+        // Through `note_persist`, not around it: a spawn that persists
+        // successfully must also CLEAR any earlier failure, since the save
+        // is whole-record. Persist-or-kill still applies — a VPP whose
+        // identity is not on disk cannot be adopted after a daemon restart.
+        let recorded = c.store.process_changed(Some(identity));
+        if let Err(e) = c.note_persist(recorded) {
             return Err(c.abandon_spawn(p, format!("could not record it: {e}")));
         }
         c.process = Some(p);
@@ -505,7 +516,7 @@ impl Effects for EffectsView {
         // a success here CLEARS an earlier failure, since the save is
         // whole-record (see `note_persist`).
         let r = c.store.interfaces_attached(&indices);
-        c.note_persist(r);
+        let _ = c.note_persist(r);
         Ok(())
     }
 

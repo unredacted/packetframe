@@ -339,13 +339,36 @@ impl SupervisionService {
 }
 
 impl Drop for SupervisionService {
+    /// **Deliberately does not tear anything down.**
+    ///
+    /// The loader's SIGTERM/SIGINT path is `drop(modules)`, and it means
+    /// that literally: SPEC.md §7.3/§8.5 exit *without* detaching, so the
+    /// dataplane survives a daemon restart. For the eBPF modules that works
+    /// because bpffs pins hold the kernel references. For this one it works
+    /// because VPP is a separate process that a later daemon adopts —
+    /// which is drill (d) in the plan: restart packetframe with VPP alive,
+    /// adopt, dirty-resync, WITHOUT unsteering, zero loss.
+    ///
+    /// This used to set the stop flag, which raced that: if the supervision
+    /// thread got scheduled before the process exited it would unsteer and
+    /// kill the very VPP the loader was preserving, and if it did not the
+    /// attachment survived. Same signal, two different outcomes, decided by
+    /// the scheduler — and the losing case is a blackhole plus a full
+    /// reconvergence on the next start.
+    ///
+    /// So teardown has exactly one entrance: [`SupervisionService::stop`],
+    /// which `Module::detach` calls. A drop that still holds the thread
+    /// handle is by definition NOT that path, and is either a preserving
+    /// exit (the thread dies with the process — correct) or a caller that
+    /// dropped without detaching, which leaks one thread and is logged
+    /// rather than silently converted into a teardown.
     fn drop(&mut self) {
-        // A dropped-without-stop service still signals the loop; the
-        // thread is detached rather than joined, because blocking an
-        // arbitrary drop site for the teardown's duration is worse
-        // than letting shutdown proceed in the background. `stop()` is
-        // the orderly path and the module's detach uses it.
-        self.shared.stop.store(true, Ordering::SeqCst);
+        if self.thread.is_some() {
+            tracing::info!(
+                "vpp-offload supervision dropped without stop(); VPP is left running and \
+                 adoptable (§8.5 preserve-on-exit). `packetframe detach` is what tears it down."
+            );
+        }
     }
 }
 

@@ -317,3 +317,77 @@ fn a_persist_that_recovers_clears_the_recorded_failure() {
         rt.status().store_error
     );
 }
+
+/// A successful SPAWN persist clears an earlier store failure too.
+///
+/// `spawn` kept its own direct `store.process_changed` call while
+/// `note_persist`'s doc claimed to be the single recorder — so a store that
+/// failed on an exit and recovered before the retry spawn went on reporting
+/// "observed state is not durable" until a later device attach happened to
+/// succeed, potentially for the whole API startup interval. The class is
+/// exactly the one this module keeps producing: prose asserting a single
+/// owner, with a writer in the same file going around it.
+///
+/// Linux-only because it needs a real spawn; `/bin/true` is enough — the
+/// child's behaviour is irrelevant, only that a pid was recorded.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
+    use packetframe_vpp_offload::executor::Effects as _;
+    use packetframe_vpp_offload::runtime::{IdentityStore, ProcessIdentity};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct Flaky(Arc<AtomicBool>);
+    impl IdentityStore for Flaky {
+        fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+            if self.0.load(Ordering::SeqCst) {
+                Err("state dir is read-only".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let fake = Fake::start("spawn-clears");
+    let failing = Arc::new(AtomicBool::new(true));
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        Vec::new(),
+        vec!["eth4".into()],
+        1_000,
+        FamilyPolicy::V4Only,
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(Mirror { routes: vec![] }),
+        Box::new(SteeringUnavailable),
+        Box::new(Flaky(Arc::clone(&failing))),
+        // `spawn(binary, conf)` execs `binary -c conf`; /bin/true exits
+        // immediately regardless, which is all this needs.
+        "/bin/true",
+        "/dev/null",
+    );
+
+    // First spawn: the child starts, the record fails, and persist-or-kill
+    // abandons it — with the failure recorded.
+    let (_, mut fx) = rt.views();
+    assert!(fx.spawn().is_err(), "persist-or-kill must refuse");
+    assert!(
+        rt.status().store_error.is_some(),
+        "the failed persist must be surfaced"
+    );
+
+    // The store recovers, and the retry spawn persists. That success makes
+    // the whole record durable again, so the degradation must end with it.
+    failing.store(false, Ordering::SeqCst);
+    fx.spawn().expect("the retry spawn records cleanly");
+    assert!(
+        rt.status().store_error.is_none(),
+        "a successful spawn persist left the earlier failure reported: {:?}",
+        rt.status().store_error
+    );
+}
