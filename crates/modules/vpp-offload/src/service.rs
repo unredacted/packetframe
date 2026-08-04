@@ -422,6 +422,49 @@ fn run_loop(
             failures.extend(fmt_failures(&injected.outcome));
         }
         runtime.set_steered(driver.supervisor().is_steered());
+        // Retained BEFORE the terminal check below, which `break`s.
+        //
+        // With the assignment after it, a tick whose failures coincided
+        // with detecting a permanently-incompatible API had those failures
+        // discarded — on the one path where supervision ends for good and
+        // the final snapshot is all an operator has. `terminal` carries
+        // the API error itself, but not the refused attach or steer beside
+        // it.
+        //
+        // Found by re-reading rather than by review, and deliberately NOT
+        // accompanied by a test: the window is a single tick's
+        // coincidence, and every test I could construct for it reached the
+        // assertion without ever setting `terminal`, which is coverage
+        // theatre. The ordering is defensive and free; the honest note is
+        // that it is unproven.
+        // The supervisor counts failures; only the outcome carries WHY —
+        // and the reason has to OUTLIVE the tick that produced it.
+        //
+        // A failing tick is followed immediately by backoff ticks whose
+        // outcomes are empty, and republishing those verbatim overwrote
+        // `last_failures` with nothing within one 50 ms poll while the
+        // service sat in the same failed retry state for seconds. An
+        // operator running `packetframe status` would essentially always
+        // land in the empty window and see a bare failure count.
+        //
+        // So it is sticky, and the release condition is an *observation*
+        // of recovery: the reason is dropped only once the published
+        // health returns to `Healthy`. A newer failure supersedes an
+        // older one.
+        //
+        // The obvious release condition — the supervisor's own
+        // consecutive-failure count reaching zero — is WRONG, and
+        // instructively so. A refused `Steer` deliberately does not count
+        // as a supervisor failure (a failed canary must not cycle a VPP
+        // that is forwarding fine), so `failures()` is already zero at
+        // the moment the steer is refused, and keying on it wiped the
+        // reason on the very next tick. `Healthy` is the condition that
+        // actually covers every way this module can be unwell, because it
+        // is the same whitelist `nominal()` applies.
+        if !failures.is_empty() {
+            last_failures = failures;
+        }
+
         // The retained verdict describes ONE process instance, so process
         // loss has to invalidate it — but asymmetrically, and the
         // asymmetry is the whole point:
@@ -462,33 +505,6 @@ fn run_loop(
                     .unwrap_or("(no detail recorded)")
             ));
             break;
-        }
-        // The supervisor counts failures; only the outcome carries WHY —
-        // and the reason has to OUTLIVE the tick that produced it.
-        //
-        // A failing tick is followed immediately by backoff ticks whose
-        // outcomes are empty, and republishing those verbatim overwrote
-        // `last_failures` with nothing within one 50 ms poll while the
-        // service sat in the same failed retry state for seconds. An
-        // operator running `packetframe status` would essentially always
-        // land in the empty window and see a bare failure count.
-        //
-        // So it is sticky, and the release condition is an *observation*
-        // of recovery: the reason is dropped only once the published
-        // health returns to `Healthy`. A newer failure supersedes an
-        // older one.
-        //
-        // The obvious release condition — the supervisor's own
-        // consecutive-failure count reaching zero — is WRONG, and
-        // instructively so. A refused `Steer` deliberately does not count
-        // as a supervisor failure (a failed canary must not cycle a VPP
-        // that is forwarding fine), so `failures()` is already zero at
-        // the moment the steer is refused, and keying on it wiped the
-        // reason on the very next tick. `Healthy` is the condition that
-        // actually covers every way this module can be unwell, because it
-        // is the same whitelist `nominal()` applies.
-        if !failures.is_empty() {
-            last_failures = failures;
         }
         let overall = publish(
             &driver,
