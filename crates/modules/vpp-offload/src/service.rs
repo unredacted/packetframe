@@ -315,6 +315,17 @@ impl SupervisionService {
         last.teardown_failures.push(why);
         last.resources_leaked = true;
         last.metrics.clear();
+        // `state` is deliberately LEFT as the last observed one, and this
+        // note exists because leaving it unremarked is what made the
+        // metrics case a review finding.
+        //
+        // It cannot be corrected truthfully: the machine may be anywhere,
+        // `Stopped` would claim a completed teardown that did not happen,
+        // and there is no `Unknown` variant to reach for. So it stays a
+        // factual record of the last publish — with `report.overall` now
+        // `Unhealthy` and a named subsystem saying why, which is what a
+        // reader consults. If a consumer is ever added that keys on `state`
+        // rather than on the report, this is the line it will need.
         last
     }
 
