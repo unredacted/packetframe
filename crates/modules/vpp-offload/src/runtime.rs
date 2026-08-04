@@ -210,15 +210,29 @@ impl Runtime {
         }
     }
 
-    /// Hand over an adopted process. The caller injects
-    /// `Event::Adopted { steered }` itself — adoption is an external
-    /// fact, not something the runtime infers — and this records the
-    /// matching handle and switches the next attach to `Adopted` so
-    /// recorded interface indices are reused rather than duplicated.
-    pub fn adopt_process(&self, p: VppProcess) {
+    /// Hand over an adopted process, with the steering fact attached.
+    ///
+    /// The caller injects `Event::Adopted { steered }` itself — adoption
+    /// is an external fact, not something the runtime infers — and MUST
+    /// call this first, passing the same `steered`. This records the
+    /// handle, switches the next attach to `Adopted` so recorded
+    /// interface indices are reused rather than duplicated, and applies
+    /// the steering fact to the engine's socket deadline **atomically
+    /// with the handover**.
+    ///
+    /// The last part is why `steered` is a parameter here instead of the
+    /// loop's post-tick `set_steered` sync: `Driver::inject(Adopted)`
+    /// synchronously runs `AttachDevices` and `StartResync` before any
+    /// post-tick call can happen, and an adopted VPP is the one case
+    /// still carrying live traffic while it converges. With the engine
+    /// still thinking `steered == false`, those requests would run under
+    /// the relaxed 10 s resync budget — a stall the published ≤ 2 s
+    /// wedge bound is supposed to catch while packets are on VPP.
+    pub fn adopt_process(&self, p: VppProcess, steered: bool) {
         let mut c = self.core.borrow_mut();
         c.process = Some(p);
         c.attach_mode = crate::attach::AttachMode::Adopted;
+        c.engine.set_steered(steered);
     }
 
     /// The two trait views the driver's tick takes.
@@ -294,11 +308,20 @@ impl Core {
     /// version of this path dropped the handle anyway — discarding the
     /// one observer (the pidfd) that will ever report the late exit,
     /// and leaving `SpawnFailed`'s retry free to start a second VPP
-    /// over a VF the survivor may still be DMAing through. Now the
-    /// handle is retained (so `spawn` refuses while it exists) and
-    /// `TerminationFailed` is queued so the supervisor's `undead` flag
-    /// blocks the restart through the designed mechanism rather than by
-    /// accident of backoff timing.
+    /// over a VF the survivor may still be DMAing through. The handle
+    /// is retained, so `spawn` refuses while it exists.
+    ///
+    /// Deliberately, **no `TerminationFailed` is queued here.** The
+    /// `SpawnFailed` this returns drives the supervisor's `fail()`,
+    /// whose `Kill` action re-runs termination against the retained
+    /// handle — and the *executor* emits `TerminationFailed` if that
+    /// kill still reports `MustLeak`. Queuing one here as well was a
+    /// second clock for one deadline, and a stale one: if the child
+    /// died between the two kills, the second returned `SafeToRelease`
+    /// and dropped the handle, and the queued event then set `undead`
+    /// with no pidfd left alive to ever clear it — permanently
+    /// suppressing restarts. Letting the kill path be the sole emitter
+    /// means the event exists exactly when the survivor does.
     fn abandon_spawn(&mut self, mut p: VppProcess, why: String) -> String {
         let pid = p.pid();
         match terminate_or_leak(&mut p, TERM_GRACE) {
@@ -307,10 +330,9 @@ impl Core {
             }
             Disposition::MustLeak => {
                 self.process = Some(p);
-                self.pending.push(Event::TerminationFailed);
                 format!(
                     "spawned pid {pid} but {why}; the child SURVIVED termination — \
-                     handle retained, restart blocked until its exit is observed"
+                     handle retained, the follow-up kill will report it"
                 )
             }
         }

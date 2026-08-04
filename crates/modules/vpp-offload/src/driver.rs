@@ -42,6 +42,21 @@
 
 use std::time::{Duration, Instant};
 
+/// How often to poll `api_ready` while a process exists but the API has
+/// not answered yet.
+///
+/// Load-bearing, not a tuning nicety. In that window there is no
+/// detector (it must not exist before the first pong, or startup counts
+/// as silence) and the only armed deadline is the 60 s startup budget —
+/// so without this cap, `Tick::sleep` says "wake me at the deadline",
+/// and a loop that honours it never calls `api_ready` again. The next
+/// tick then queues `PhaseTimedOut` ahead of the `ApiUp` observed on
+/// the very same pass, and a perfectly healthy VPP that was merely slow
+/// to fault in its heap is killed and restarted, every 60 s, forever.
+/// The driver is the thing that knows polling is how progress happens
+/// here, so the cadence lives in the driver, not in every caller.
+pub const API_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 use crate::executor::{execute, Effects, Outcome};
 use crate::liveness::{budget_for, WedgeDetector};
 use crate::schedule::Schedule;
@@ -225,6 +240,18 @@ impl Driver {
         }
 
         tick.sleep = self.sleep(now);
+        // A process whose API has not answered yet has exactly one
+        // source of progress: polling `api_ready`. Nothing wakes the
+        // loop for that — no detector exists yet, and the only armed
+        // deadline is the startup budget itself — so cap the sleep at
+        // the poll cadence, or a sleep-honouring caller dozes to the
+        // deadline and kills a VPP whose API came up in the meantime.
+        if self.sup.state().has_process() && self.detector.is_none() {
+            tick.sleep = Some(
+                tick.sleep
+                    .map_or(API_POLL_INTERVAL, |s| s.min(API_POLL_INTERVAL)),
+            );
+        }
         // A partly-drained table must not wait for the ping interval.
         // At ~256 routes a batch, one batch per 500 ms would take the
         // full v4 table over half an hour against a 60 s budget.
@@ -726,6 +753,50 @@ mod tests {
         assert!(t.events.contains(&Event::PhaseTimedOut), "{:?}", t.events);
         assert_eq!(d.state(), State::Backoff);
         assert!(fx.calls.contains(&"kill"));
+    }
+
+    /// While a process exists but the API has not answered, the sleep
+    /// must be the poll cadence — never the startup deadline. A
+    /// sleep-honouring loop offered the deadline would wake exactly
+    /// there, queue `PhaseTimedOut` ahead of the `ApiUp` observed on
+    /// the same pass, and kill a healthy VPP that was merely slow to
+    /// fault in its heap — every 60 s, forever.
+    #[test]
+    fn starting_polls_for_the_api_instead_of_sleeping_to_the_deadline() {
+        let mut d = Driver::new();
+        let mut w = World::default(); // api: false
+        let mut fx = Fx::default();
+        let t0 = Instant::now();
+
+        // Both entry points must cap: the injected start (whose settle
+        // path had exactly this bug shape before, per its doc) and the
+        // ordinary tick.
+        let it = d.inject(t0, Event::StartRequested, &mut fx);
+        assert!(
+            it.sleep.is_some_and(|s| s <= API_POLL_INTERVAL),
+            "inject offered {:?}, letting a caller doze past api_ready",
+            it.sleep
+        );
+        let t = d.tick(at(t0, 1), &mut w, &mut fx);
+        assert!(
+            t.sleep.is_some_and(|s| s <= API_POLL_INTERVAL),
+            "tick offered {:?}",
+            t.sleep
+        );
+
+        // The API answers mid-budget; a loop honouring the advertised
+        // cadence reaches ApiUp long before any timeout fires.
+        w.api = true;
+        let t = d.tick(at(t0, 260), &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::ApiUp),
+            "the poll must observe the API coming up: {:?}",
+            t.events
+        );
+        assert_eq!(d.state(), State::Syncing);
+        // (The tick that transitioned asks for an immediate re-run —
+        // that is settle behaviour, covered by its own tests. The cap
+        // itself no longer applies once the detector exists.)
     }
 
     /// The loop must not spin. In steady state the only timer is the
