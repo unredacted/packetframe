@@ -88,6 +88,17 @@ pub struct Published {
     /// The teardown declined to release resources (unsteer failed or
     /// the process survived); they are deliberately still held.
     pub resources_leaked: bool,
+    /// Failures from the most recent ORDINARY tick — a missing VPP
+    /// binary, a refused device attach, a broken resync. The supervisor
+    /// only counts these ("restarting after N failures"); the actionable
+    /// reason lives here and nowhere else, so dropping it left an
+    /// operator watching a retry loop with no way to learn why.
+    pub last_failures: Vec<String>,
+    /// The runtime could not persist something it observed. Not fatal
+    /// to convergence by design — but it means the next daemon restart
+    /// will refuse adoption, so it degrades health rather than passing
+    /// silently.
+    pub store_error: Option<String>,
 }
 
 /// Shared between the loop and the module.
@@ -226,7 +237,8 @@ fn run_loop(
                    last_verify_at: &Option<Instant>,
                    terminal: &Option<String>,
                    teardown_failures: &[String],
-                   resources_leaked: bool| {
+                   resources_leaked: bool,
+                   last_failures: &[String]| {
         let now = Instant::now();
         let rs = runtime.status();
         let fib = match (&rs.last_verify, last_verify_at) {
@@ -242,14 +254,41 @@ fn run_loop(
             fib,
             rs.port_links,
         );
+        // A store failure is a real degradation: convergence continues
+        // (correctly — the interfaces work), but the next daemon
+        // restart will refuse adoption because the index it needs was
+        // never persisted. Reporting Healthy over that would hide a
+        // problem whose consequence only appears at the worst moment.
+        let mut report = snap.report();
+        if let Some(e) = &rs.store_error {
+            report.overall = match report.overall {
+                packetframe_common::module::HealthState::Healthy => {
+                    packetframe_common::module::HealthState::Degraded
+                }
+                other => other,
+            };
+            report
+                .subsystems
+                .push(packetframe_common::module::SubsystemHealth {
+                    name: "state-file".into(),
+                    state: packetframe_common::module::HealthState::Degraded,
+                    message: Some(format!(
+                        "could not persist observed state ({e}); a daemon restart will \
+                     refuse adoption and cycle VPP instead"
+                    )),
+                    last_success_age_seconds: None,
+                });
+        }
         let published = Published {
-            report: snap.report(),
+            report,
             metrics: crate::status::render_metrics(&snap, module),
             state: driver.state(),
             api_error: rs.api_error,
             terminal: terminal.clone(),
             teardown_failures: teardown_failures.to_vec(),
             resources_leaked,
+            last_failures: last_failures.to_vec(),
+            store_error: rs.store_error,
         };
         *shared.latest.lock().expect("status lock") = Some(published);
     };
@@ -257,7 +296,7 @@ fn run_loop(
     // First snapshot before the first tick; the handshake below is
     // what makes `start()`'s "status() is Some on return" guarantee
     // actually true rather than a race the test suite happens to win.
-    publish(&driver, &runtime, &last_verify_at, &None, &[], false);
+    publish(&driver, &runtime, &last_verify_at, &None, &[], false, &[]);
     let _ = ready.send(Ok(()));
 
     while !shared.stop.load(Ordering::SeqCst) {
@@ -298,7 +337,24 @@ fn run_loop(
             ));
             break;
         }
-        publish(&driver, &runtime, &last_verify_at, &terminal, &[], false);
+        // The supervisor counts failures; only the outcome carries WHY.
+        // Republished every pass so a retry loop is diagnosable from
+        // status alone, which is all an operator on the box has.
+        let failures: Vec<String> = tick
+            .outcome
+            .failures
+            .iter()
+            .map(|(action, why)| format!("{action:?}: {why}"))
+            .collect();
+        publish(
+            &driver,
+            &runtime,
+            &last_verify_at,
+            &terminal,
+            &[],
+            false,
+            &failures,
+        );
 
         match tick.sleep {
             Some(d) if d.is_zero() => {} // more work queued; go again
@@ -354,6 +410,7 @@ fn run_loop(
         &terminal,
         &teardown_failures,
         resources_leaked,
+        &[],
     );
 }
 

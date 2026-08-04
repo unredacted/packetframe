@@ -19,7 +19,9 @@ use packetframe_vpp_offload::attach::PortAttach;
 use packetframe_vpp_offload::driver::Driver;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
-use packetframe_vpp_offload::runtime::{NullStore, Runtime, SteeringUnavailable};
+use packetframe_vpp_offload::runtime::{
+    IdentityStore, NullStore, ProcessIdentity, Runtime, SteeringUnavailable,
+};
 use packetframe_vpp_offload::service::SupervisionService;
 use packetframe_vpp_offload::supervisor::{Event, State};
 
@@ -208,4 +210,106 @@ fn an_incompatible_api_fails_attach_with_the_reason() {
         err.contains("permanently incompatible"),
         "and it must be marked terminal, not retryable: {err}"
     );
+}
+
+/// A store that cannot persist the interface indices.
+struct RefusingStore;
+impl IdentityStore for RefusingStore {
+    fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+        Ok(())
+    }
+    fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+        Err("state dir is read-only".into())
+    }
+}
+
+/// An unpersisted interface identity must DEGRADE health, not pass
+/// silently. Convergence continues by design — the interfaces work —
+/// but the consequence lands at the worst moment: the next daemon
+/// restart cannot adopt, and cycles VPP instead of taking it over.
+#[test]
+fn an_unpersisted_identity_degrades_health_and_is_named() {
+    let fake = Fake::start("svc-store");
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SteeringUnavailable),
+                Box::new(RefusingStore),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ready = loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Ready {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not reach Ready: {:?}",
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Converged — the interfaces really do work.
+    assert!(
+        ready
+            .store_error
+            .as_deref()
+            .is_some_and(|e| e.contains("read-only")),
+        "the persistence failure must be carried, not dropped: {:?}",
+        ready.store_error
+    );
+    assert_eq!(
+        ready.report.overall,
+        HealthState::Degraded,
+        "Healthy over an unpersisted identity hides a restart that will fail: {:?}",
+        ready.report
+    );
+    assert!(
+        ready
+            .report
+            .subsystems
+            .iter()
+            .any(|s| s.name == "state-file"
+                && s.message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("refuse adoption"))),
+        "and it must name the consequence: {:?}",
+        ready.report.subsystems
+    );
+
+    let _ = svc.stop();
 }
