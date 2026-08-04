@@ -33,6 +33,7 @@
 //!   must mean pure stateless L3 transit;
 //! - the eBPF fast-path on the PFs is the permanent failover tier.
 
+pub mod acquire;
 pub mod attach;
 pub mod driver;
 pub mod engine;
