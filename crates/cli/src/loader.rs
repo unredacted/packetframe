@@ -1002,6 +1002,36 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
         return Ok(()); // nothing was ever acquired
     };
 
+    // Recorded MCAM rules mean traffic is DIVERTED to a VF this function is
+    // about to unbind. Refuse.
+    //
+    // The module's teardown ordering is unsteer → abort → kill → release, and
+    // the first step is not decoration: releasing a VF that MCAM still points
+    // at leaves steered traffic arriving at a function nothing services — a
+    // blackhole, which is the failure the whole `Disposition::MustLeak`
+    // discipline exists to avoid, reached from the other direction. This path
+    // cannot unsteer, because MCAM is not implemented until slice 5.
+    //
+    // `steer_rules` is always empty today for exactly that reason, so this is
+    // a guard against a future state rather than a live bug. It is a guard
+    // and not a comment deliberately: "when steering ships, unsteer here
+    // first" is the kind of note this session has watched expire more than
+    // once, and a refusal cannot be forgotten.
+    if !state.steer_rules.is_empty() {
+        let ifaces: Vec<&str> = state
+            .steer_rules
+            .iter()
+            .map(|(iface, _)| iface.as_str())
+            .collect();
+        return Err(format!(
+            "vpp-offload: the state file records MCAM steering rules on {}, so traffic is \
+             being diverted to VF(s) this teardown would unbind — that would blackhole it. \
+             This command cannot remove those rules (MCAM steering is not implemented yet); \
+             clear them first, then re-run.",
+            ifaces.join(", ")
+        ));
+    }
+
     // Kill the recorded VPP first, if it is still the process we recorded.
     //
     // The identity must be COMPLETE — pid, start_ticks AND boot_id — before
@@ -1323,6 +1353,33 @@ mod vpp_detach_tests {
         assert!(
             ResourceState::load(&dir).unwrap().is_some(),
             "the record must survive so a later attempt can act on it"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Recorded steering rules must block the teardown.
+    ///
+    /// The module unsteers before it releases, because releasing a VF that
+    /// MCAM still points at blackholes the traffic it diverts. This path
+    /// cannot unsteer (no MCAM yet), so it must refuse rather than release.
+    /// Latent today — `steer_rules` is always empty — which is precisely why
+    /// it is a guard with a test rather than a note for later.
+    #[test]
+    fn recorded_steering_rules_block_the_teardown() {
+        use packetframe_vpp_offload::resources::ResourceState;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-steer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ResourceState::empty();
+        state.steer_rules = vec![("eth5".to_string(), vec![0, 1])];
+        state.save(&dir).unwrap();
+
+        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        assert!(e.contains("eth5"), "the steered port must be named: {e}");
+        assert!(e.contains("blackhole"), "and the consequence stated: {e}");
+        assert!(
+            ResourceState::load(&dir).unwrap().is_some(),
+            "the record must survive"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
