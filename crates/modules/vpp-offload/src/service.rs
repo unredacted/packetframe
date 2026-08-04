@@ -147,6 +147,68 @@ struct Shared {
     latest: Mutex<Option<Published>>,
 }
 
+/// The one place a shutdown that did not complete is turned into a snapshot.
+///
+/// Three callers now — the detach-budget timeout, a panicked loop, and a
+/// background teardown that panics after `stop()` has already returned — and
+/// they had started to diverge at two. All three need the same three things:
+/// the reason on `teardown_failures`, `resources_leaked` set because nothing
+/// confirmed a release, and the health snapshot corrected.
+///
+/// The correction matters as much as the reason. The rest of the snapshot
+/// comes from the last ORDINARY publish, which may well say `Ready`/Healthy —
+/// true when it was published, not true now — so returning it unchanged
+/// advertised a healthy dataplane alongside "teardown unfinished, resources
+/// may be held", in one object. Metrics are CLEARED rather than adjusted:
+/// they were rendered from a snapshot that no longer describes anything, and
+/// rewriting gauge lines by string surgery would be a second, divergent
+/// renderer. No data beats stale data that reads as healthy.
+///
+/// A free function because `PendingTeardown` needs it too and does not own a
+/// `SupervisionService`; making it a method is what made the pending path
+/// grow its own, absent, version of this correction.
+fn incomplete_teardown(last: Option<Published>, why: String) -> Published {
+    // `status()` is `Some` for any started service — `start` blocks on
+    // the first publish — so the fallback is unreachable in practice
+    // and is written as a real snapshot rather than a `?` that would
+    // silently discard the reason.
+    let mut last = last.unwrap_or_else(|| Published {
+        report: HealthReport::healthy(),
+        metrics: String::new(),
+        state: State::Stopped,
+        api_error: None,
+        terminal: None,
+        teardown_failures: Vec::new(),
+        resources_leaked: false,
+        last_failures: Vec::new(),
+        store_error: None,
+    });
+    last.report.overall = packetframe_common::module::HealthState::Unhealthy;
+    last.report
+        .subsystems
+        .push(packetframe_common::module::SubsystemHealth {
+            name: "supervision".into(),
+            state: packetframe_common::module::HealthState::Unhealthy,
+            message: Some(why.clone()),
+            last_success_age_seconds: None,
+        });
+    last.teardown_failures.push(why);
+    last.resources_leaked = true;
+    last.metrics.clear();
+    // `state` is deliberately LEFT as the last observed one, and this
+    // note exists because leaving it unremarked is what made the
+    // metrics case a review finding.
+    //
+    // It cannot be corrected truthfully: the machine may be anywhere,
+    // `Stopped` would claim a completed teardown that did not happen,
+    // and there is no `Unknown` variant to reach for. So it stays a
+    // factual record of the last publish — with `report.overall` now
+    // `Unhealthy` and a named subsystem saying why, which is what a
+    // reader consults. If a consumer is ever added that keys on `state`
+    // rather than on the report, this is the line it will need.
+    last
+}
+
 /// A teardown that outlived the detach budget, and the way to watch it.
 ///
 /// `stop()` returns one of these instead of simply dropping the thread
@@ -170,10 +232,44 @@ impl PendingTeardown {
         self.shared.latest.lock().expect("status lock").clone()
     }
 
-    /// Whether the loop has finished. Once true, [`Self::status`] is the
-    /// FINAL word on the teardown — what was released and what was not.
+    /// Whether the loop has stopped running. **Not** the same as "the
+    /// result is trustworthy": a thread that panicked is also finished, and
+    /// published nothing after it. [`Self::settle`] is the authoritative
+    /// end.
     pub fn is_finished(&self) -> bool {
         self.thread.is_finished()
+    }
+
+    /// Join the background teardown and return its FINAL snapshot.
+    ///
+    /// The panic case is why this exists. `is_finished()` goes true for a
+    /// panicked thread just as it does for a clean one, and a panicked
+    /// thread publishes nothing further — so a caller polling `status()`
+    /// would take the last ordinary snapshot as the promised final result,
+    /// which is the same "a panic reads as a clean stop" defect `stop()`
+    /// already fixes on its own path. Same reason, same report: this routes
+    /// through the one `incomplete_teardown`.
+    ///
+    /// Blocks until the loop exits. It is already bounded by
+    /// `STOP_PATIENCE` on its own side, so this cannot wait indefinitely on
+    /// anything the loop can control.
+    pub fn settle(self) -> Published {
+        let last = self.status();
+        match self.thread.join() {
+            Ok(()) => last.unwrap_or_else(|| {
+                incomplete_teardown(
+                    None,
+                    "the supervision loop finished without publishing a final status".into(),
+                )
+            }),
+            Err(_) => incomplete_teardown(
+                last,
+                "the background teardown PANICKED after detach returned; VPP may still be \
+                 running and holding its VF and hugepages — check `ip link show`, the state \
+                 file and the log, and run `packetframe detach --all` before re-attaching"
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -321,18 +417,27 @@ impl SupervisionService {
             // in flight is exactly the lie `teardown_failures` exists to
             // prevent.
             //
-            let published = Some(self.incomplete_teardown(format!(
-                "the supervision loop was still working after {} ms and was not waited on \
+            let corrected = incomplete_teardown(
+                self.status(),
+                format!(
+                    "the supervision loop was still working after {} ms and was not waited on \
                  further; VPP and its resources may still be held — it continues tearing \
                  down in the background, but check `packetframe status` and the state file \
                  before re-attaching",
-                DETACH_BUDGET.as_millis()
-            )));
+                    DETACH_BUDGET.as_millis()
+                ),
+            );
+            // Written INTO the shared window, not just returned. The
+            // correction existed only in the returned value, so a caller
+            // polling `PendingTeardown::status()` — which is what the
+            // message tells the operator to do — kept reading the stale
+            // `Ready`/Healthy snapshot for the rest of `STOP_PATIENCE`. One
+            // window, one truth.
+            *self.shared.latest.lock().expect("status lock") = Some(corrected.clone());
             // The thread keeps its own `Arc<Shared>`, so handing the caller
-            // one keeps the eventual final publish reachable — which is
-            // exactly what the message above sends the operator to read.
+            // one keeps the eventual final publish reachable.
             return StopReport {
-                published,
+                published: Some(corrected),
                 pending: Some(PendingTeardown {
                     shared: Arc::clone(&self.shared),
                     thread: t,
@@ -352,81 +457,20 @@ impl SupervisionService {
         // status, not an unwind.
         let published = match t.join() {
             Ok(()) => self.status(),
-            Err(_) => Some(
-                self.incomplete_teardown(
-                    "the supervision loop PANICKED; the stop transition never ran, so VPP may \
+            Err(_) => Some(incomplete_teardown(
+                self.status(),
+                "the supervision loop PANICKED; the stop transition never ran, so VPP may \
                  still be running and holding its VF and hugepages — check `ip link show`, \
                  the state file and the log, and run `packetframe detach --all` before \
                  re-attaching"
-                        .to_string(),
-                ),
-            ),
+                    .to_string(),
+            )),
         };
         // Settled — the loop is gone, so there is nothing left to watch.
         StopReport {
             published,
             pending: None,
         }
-    }
-
-    /// The one place a shutdown that did not complete is turned into a
-    /// snapshot.
-    ///
-    /// Two callers — the detach-budget timeout and a panicked loop — and
-    /// they had started to diverge, which is the shape that has cost this
-    /// file seven review rounds. Both need exactly the same three things:
-    /// the reason on `teardown_failures`, `resources_leaked` set because
-    /// nothing confirmed a release, and the health snapshot corrected.
-    ///
-    /// The correction matters as much as the reason. The rest of the
-    /// snapshot comes from the last ORDINARY publish, which may well say
-    /// `Ready`/Healthy — true when it was published, not true now — so
-    /// returning it unchanged advertised a healthy dataplane alongside
-    /// "teardown unfinished, resources may be held", in one object.
-    /// Metrics are CLEARED rather than adjusted: they were rendered from a
-    /// snapshot that no longer describes anything, and rewriting gauge
-    /// lines by string surgery would be a second, divergent renderer. No
-    /// data beats stale data that reads as healthy.
-    fn incomplete_teardown(&self, why: String) -> Published {
-        // `status()` is `Some` for any started service — `start` blocks on
-        // the first publish — so the fallback is unreachable in practice
-        // and is written as a real snapshot rather than a `?` that would
-        // silently discard the reason.
-        let mut last = self.status().unwrap_or_else(|| Published {
-            report: HealthReport::healthy(),
-            metrics: String::new(),
-            state: State::Stopped,
-            api_error: None,
-            terminal: None,
-            teardown_failures: Vec::new(),
-            resources_leaked: false,
-            last_failures: Vec::new(),
-            store_error: None,
-        });
-        last.report.overall = packetframe_common::module::HealthState::Unhealthy;
-        last.report
-            .subsystems
-            .push(packetframe_common::module::SubsystemHealth {
-                name: "supervision".into(),
-                state: packetframe_common::module::HealthState::Unhealthy,
-                message: Some(why.clone()),
-                last_success_age_seconds: None,
-            });
-        last.teardown_failures.push(why);
-        last.resources_leaked = true;
-        last.metrics.clear();
-        // `state` is deliberately LEFT as the last observed one, and this
-        // note exists because leaving it unremarked is what made the
-        // metrics case a review finding.
-        //
-        // It cannot be corrected truthfully: the machine may be anywhere,
-        // `Stopped` would claim a completed teardown that did not happen,
-        // and there is no `Unknown` variant to reach for. So it stays a
-        // factual record of the last publish — with `report.overall` now
-        // `Unhealthy` and a named subsystem saying why, which is what a
-        // reader consults. If a consumer is ever added that keys on `state`
-        // rather than on the report, this is the line it will need.
-        last
     }
 
     /// Whether the loop thread is still running. `false` after `stop`,

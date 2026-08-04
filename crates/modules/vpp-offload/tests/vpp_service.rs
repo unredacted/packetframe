@@ -912,16 +912,36 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
     .expect("service starts");
 
     let report = svc.stop();
-    assert!(
-        report.published.is_some(),
-        "a snapshot must come back either way"
-    );
+    let published = report
+        .published
+        .clone()
+        .expect("a snapshot must come back either way");
 
     // Whether the budget expires is a race against the stalled ping, so
     // BOTH outcomes assert something — a conditional assertion that can
     // silently do nothing is the shape this PR has produced five times.
     // Locally this takes the pending branch; the settled branch is asserted
     // in case a slower runner beats the stall.
+    // When the budget expired, the CORRECTION must already be in the shared
+    // window — not only in the returned value. A caller polling the handle
+    // (which is what the timeout message tells the operator to do) used to
+    // read the stale `Ready`/Healthy snapshot for the rest of
+    // `STOP_PATIENCE`.
+    if let Some(p) = &report.pending {
+        assert_eq!(
+            published.report.overall,
+            HealthState::Unhealthy,
+            "the returned snapshot must carry the correction"
+        );
+        let via_handle = p.status().expect("the shared window must have a snapshot");
+        assert_eq!(
+            via_handle.report.overall,
+            HealthState::Unhealthy,
+            "the shared window still advertises health: {:?}",
+            via_handle.report
+        );
+    }
+
     let Some(pending) = report.pending else {
         assert_eq!(
             report.published.as_ref().map(|p| p.state),
@@ -939,9 +959,7 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
             pending.is_finished(),
             "the background teardown never settled"
         );
-        let final_status = pending
-            .status()
-            .expect("the final publish must be reachable through the handle");
+        let final_status = pending.settle();
         assert_eq!(
             final_status.state,
             State::Stopped,
