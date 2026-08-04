@@ -329,6 +329,7 @@ fn a_refused_derived_delete_is_retried() {
             hangup_after: None,
             reject_deletes: 1,
             garbage_crcs: false,
+            verify_mismatch: false,
         },
     );
     let mut e = engine_for(&fake);
@@ -474,6 +475,7 @@ fn a_crc_mismatch_is_recorded_as_permanent() {
             hangup_after: None,
             reject_deletes: 0,
             garbage_crcs: true,
+            verify_mismatch: false,
         },
     );
     let mut e = engine_for(&fake);

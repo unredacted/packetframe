@@ -88,11 +88,23 @@ pub struct Published {
     /// The teardown declined to release resources (unsteer failed or
     /// the process survived); they are deliberately still held.
     pub resources_leaked: bool,
-    /// Failures from the most recent ORDINARY tick — a missing VPP
-    /// binary, a refused device attach, a broken resync. The supervisor
+    /// Why the last failure happened — a missing VPP binary, a refused
+    /// device attach, a broken resync, a refused steer. The supervisor
     /// only counts these ("restarting after N failures"); the actionable
-    /// reason lives here and nowhere else, so dropping it left an
-    /// operator watching a retry loop with no way to learn why.
+    /// reason lives here and nowhere else.
+    ///
+    /// **Retained until recovery**, not just for the tick that produced
+    /// it. Failures are followed by backoff ticks with empty outcomes, so
+    /// republishing each tick verbatim cleared this within ~50 ms while
+    /// the service stayed in the same failed state for seconds — an
+    /// operator polling status would essentially always miss it. Cleared
+    /// when the supervisor's consecutive-failure count returns to zero,
+    /// which it does only on a verified-healthy cycle.
+    ///
+    /// Covers failures from injected events too (a `VerifyPassed` whose
+    /// `Steer` was refused, a `VerifyFailed` whose teardown failed);
+    /// those run synchronously inside the injection and can never appear
+    /// in an ordinary tick's outcome.
     pub last_failures: Vec<String>,
     /// The runtime could not persist something it observed. Not fatal
     /// to convergence by design — but it means the next daemon restart
@@ -203,6 +215,17 @@ impl Drop for SupervisionService {
     }
 }
 
+/// One action failure per line, `Action: reason`, for the published
+/// diagnostics. Shared so an ordinary tick, an injected event and the
+/// teardown all render identically.
+fn fmt_failures(outcome: &crate::executor::Outcome) -> Vec<String> {
+    outcome
+        .failures
+        .iter()
+        .map(|(action, why)| format!("{action:?}: {why}"))
+        .collect()
+}
+
 fn run_loop(
     module: &'static str,
     factory: LoopFactory,
@@ -222,6 +245,9 @@ fn run_loop(
     let mut terminal: Option<String> = None;
     let mut teardown_failures: Vec<String> = Vec::new();
     let mut resources_leaked = false;
+    // The most recent nonempty failure set, retained across the empty
+    // backoff ticks that follow it. See the publish site for why.
+    let mut last_failures: Vec<String> = Vec::new();
     // When the last passing verify was observed, for the freshness the
     // health surface reports. Tracked here because `VerifyOutcome`
     // deliberately carries no clock.
@@ -232,19 +258,31 @@ fn run_loop(
         let _ = driver.inject(now, e, &mut fx);
     }
 
+    // Returns the overall health it published, which is what decides
+    // whether a retained failure reason may finally be dropped.
     let publish = |driver: &Driver,
                    runtime: &Runtime,
                    last_verify_at: &Option<Instant>,
                    terminal: &Option<String>,
                    teardown_failures: &[String],
                    resources_leaked: bool,
-                   last_failures: &[String]| {
+                   last_failures: &[String]|
+     -> packetframe_common::module::HealthState {
         let now = Instant::now();
         let rs = runtime.status();
         let fib = match (&rs.last_verify, last_verify_at) {
             (Some(outcome), Some(at)) => FibSync::from_outcome(outcome, now - *at),
             _ => FibSync::NeverVerified,
         };
+        // The store failure goes INTO the snapshot, not onto the report
+        // afterwards. A store failure is a real degradation — convergence
+        // continues correctly, but the next daemon restart will refuse
+        // adoption because the index it needs was never persisted — and
+        // patching `report()` here left `render_metrics` rendering
+        // `packetframe_vpp_health` from the unpatched snapshot. The health
+        // check said Degraded and Prometheus said Healthy, about the same
+        // instant, during exactly the failure the patch existed to
+        // surface. One condition, one place: `StatusSnapshot`.
         let snap = StatusSnapshot::observe_parts(
             driver.supervisor(),
             rs.counts,
@@ -253,32 +291,10 @@ fn run_loop(
             driver.api_health(now),
             fib,
             rs.port_links,
+            rs.store_error.clone(),
         );
-        // A store failure is a real degradation: convergence continues
-        // (correctly — the interfaces work), but the next daemon
-        // restart will refuse adoption because the index it needs was
-        // never persisted. Reporting Healthy over that would hide a
-        // problem whose consequence only appears at the worst moment.
-        let mut report = snap.report();
-        if let Some(e) = &rs.store_error {
-            report.overall = match report.overall {
-                packetframe_common::module::HealthState::Healthy => {
-                    packetframe_common::module::HealthState::Degraded
-                }
-                other => other,
-            };
-            report
-                .subsystems
-                .push(packetframe_common::module::SubsystemHealth {
-                    name: "state-file".into(),
-                    state: packetframe_common::module::HealthState::Degraded,
-                    message: Some(format!(
-                        "could not persist observed state ({e}); a daemon restart will \
-                     refuse adoption and cycle VPP instead"
-                    )),
-                    last_success_age_seconds: None,
-                });
-        }
+        let report = snap.report();
+        let overall = report.overall;
         let published = Published {
             report,
             metrics: crate::status::render_metrics(&snap, module),
@@ -291,6 +307,7 @@ fn run_loop(
             store_error: rs.store_error,
         };
         *shared.latest.lock().expect("status lock") = Some(published);
+        overall
     };
 
     // First snapshot before the first tick; the handshake below is
@@ -302,6 +319,7 @@ fn run_loop(
     while !shared.stop.load(Ordering::SeqCst) {
         let now = Instant::now();
         let tick = driver.tick(now, &mut obs, &mut fx);
+        let mut failures: Vec<String> = fmt_failures(&tick.outcome);
         for e in runtime.take_pending() {
             // Every COMPLETED verify gets the timestamp, not only a
             // pass. Stamping only `VerifyPassed` converted a first
@@ -314,7 +332,15 @@ fn run_loop(
             ) {
                 last_verify_at = Some(Instant::now());
             }
-            let _ = driver.inject(Instant::now(), e, &mut fx);
+            // The injected event's actions run synchronously HERE, and
+            // its failures exist only in this Tick. Discarding it lost a
+            // whole class of diagnostic: `VerifyPassed` triggers `Steer`,
+            // so a refused steer — the canary failing — never appeared
+            // anywhere, and `VerifyFailed`'s teardown failures went the
+            // same way. Neither can ever show up in the ordinary tick's
+            // outcome, because neither is produced by one.
+            let injected = driver.inject(Instant::now(), e, &mut fx);
+            failures.extend(fmt_failures(&injected.outcome));
         }
         runtime.set_steered(driver.supervisor().is_steered());
 
@@ -337,24 +363,45 @@ fn run_loop(
             ));
             break;
         }
-        // The supervisor counts failures; only the outcome carries WHY.
-        // Republished every pass so a retry loop is diagnosable from
-        // status alone, which is all an operator on the box has.
-        let failures: Vec<String> = tick
-            .outcome
-            .failures
-            .iter()
-            .map(|(action, why)| format!("{action:?}: {why}"))
-            .collect();
-        publish(
+        // The supervisor counts failures; only the outcome carries WHY —
+        // and the reason has to OUTLIVE the tick that produced it.
+        //
+        // A failing tick is followed immediately by backoff ticks whose
+        // outcomes are empty, and republishing those verbatim overwrote
+        // `last_failures` with nothing within one 50 ms poll while the
+        // service sat in the same failed retry state for seconds. An
+        // operator running `packetframe status` would essentially always
+        // land in the empty window and see a bare failure count.
+        //
+        // So it is sticky, and the release condition is an *observation*
+        // of recovery: the reason is dropped only once the published
+        // health returns to `Healthy`. A newer failure supersedes an
+        // older one.
+        //
+        // The obvious release condition — the supervisor's own
+        // consecutive-failure count reaching zero — is WRONG, and
+        // instructively so. A refused `Steer` deliberately does not count
+        // as a supervisor failure (a failed canary must not cycle a VPP
+        // that is forwarding fine), so `failures()` is already zero at
+        // the moment the steer is refused, and keying on it wiped the
+        // reason on the very next tick. `Healthy` is the condition that
+        // actually covers every way this module can be unwell, because it
+        // is the same whitelist `nominal()` applies.
+        if !failures.is_empty() {
+            last_failures = failures;
+        }
+        let overall = publish(
             &driver,
             &runtime,
             &last_verify_at,
             &terminal,
             &[],
             false,
-            &failures,
+            &last_failures,
         );
+        if overall == packetframe_common::module::HealthState::Healthy {
+            last_failures.clear();
+        }
 
         match tick.sleep {
             Some(d) if d.is_zero() => {} // more work queued; go again
@@ -377,9 +424,7 @@ fn run_loop(
     // discarded Tick was the only witness, and discarding it made
     // `stop()` return a clean-looking snapshot over still-held VFs.
     let mut absorb = |outcome: crate::executor::Outcome| {
-        for (action, why) in outcome.failures {
-            teardown_failures.push(format!("{action:?}: {why}"));
-        }
+        teardown_failures.extend(fmt_failures(&outcome));
         resources_leaked |= outcome.resources_leaked;
     };
     let deadline = Instant::now() + STOP_PATIENCE;

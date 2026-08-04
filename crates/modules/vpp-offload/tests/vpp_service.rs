@@ -169,6 +169,7 @@ fn an_incompatible_api_fails_attach_with_the_reason() {
             hangup_after: None,
             reject_deletes: 0,
             garbage_crcs: true,
+            verify_mismatch: false,
         },
     );
     let sock = fake.path.clone();
@@ -310,6 +311,138 @@ fn an_unpersisted_identity_degrades_health_and_is_named() {
         "and it must name the consequence: {:?}",
         ready.report.subsystems
     );
+    // The gauge has to agree with the report. It did not, once: the
+    // service patched `report` after building the snapshot, while
+    // `render_metrics` rendered from the snapshot — so Prometheus kept
+    // reporting healthy through the whole degradation.
+    assert!(
+        ready
+            .metrics
+            .contains("packetframe_vpp_health{module=\"vpp-offload\",state=\"degraded\"} 1"),
+        "metrics and health_check disagree: {}",
+        ready.metrics
+    );
+
+    let _ = svc.stop();
+}
+
+/// A failing verify's teardown failures must reach the published
+/// diagnostics — and stay there until recovery.
+///
+/// This is the only path in the module where an action's failure exists
+/// **solely** inside an injected event. Verify verdicts arrive through
+/// `runtime.take_pending()`, and `driver.inject(VerifyFailed)` runs the
+/// resulting teardown (`Unsteer` → `Kill` → backoff) synchronously; the
+/// loop used to discard that Tick, so `SteeringUnavailable` refusing to
+/// unsteer — traffic left pointed at a VPP about to be killed — appeared
+/// nowhere at all. Nothing an ordinary tick produces can substitute,
+/// because no ordinary tick produces it.
+///
+/// `Adopted { steered: true }` is what puts an `Unsteer` in the teardown
+/// at all: an unsteered VPP has nothing to tear down first.
+#[test]
+fn a_failing_verifys_teardown_failures_are_published_and_retained() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-verifyfail",
+        fake_vpp::Behaviour {
+            hangup_after: None,
+            reject_deletes: 0,
+            garbage_crcs: false,
+            // Routes install and ack; only the readback disagrees.
+            verify_mismatch: true,
+        },
+    );
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
+                // Refuses both directions until slice 5 builds MCAM.
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: true }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    // The FIRST nonempty failure set is the discriminator, and it has to
+    // be: a loop that discarded the injection still reports an `Unsteer`
+    // failure eventually, because the backoff's next `Spawn` fails and
+    // fails again into the same teardown. What only the injected verdict
+    // can produce is a refused `Unsteer` with **no `Spawn` beside it** —
+    // the teardown that ran the moment verification failed, before any
+    // retry existed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        let s = svc.status().expect("published");
+        if !s.last_failures.is_empty() {
+            break s.last_failures;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no failure was ever published; state {:?}",
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        first.iter().any(|f| f.starts_with("Unsteer:")),
+        "the failing verify's teardown must be the first thing reported: {first:?}"
+    );
+    assert!(
+        !first.iter().any(|f| f.starts_with("Spawn:")),
+        "this is the retry cycle's teardown, not the verdict's — the injected Tick was \
+         discarded and its failures lost: {first:?}"
+    );
+
+    // And it is RETAINED. The teardown is followed by backoff ticks with
+    // empty outcomes; republishing those verbatim cleared the reason
+    // within one 50 ms poll while the service stayed unwell for seconds,
+    // so an operator polling status would essentially always miss it.
+    // Held across many times the poll cap here.
+    let hold_until = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < hold_until {
+        let s = svc.status().expect("published");
+        assert!(
+            !s.last_failures.is_empty(),
+            "the reason was dropped by a later tick, leaving only a failure count: {:?}",
+            s.state
+        );
+        assert_ne!(
+            s.report.overall,
+            HealthState::Healthy,
+            "a VPP whose FIB failed verification must not read as healthy: {:?}",
+            s.report
+        );
+        std::thread::sleep(Duration::from_millis(15));
+    }
 
     let _ = svc.stop();
 }

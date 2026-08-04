@@ -57,6 +57,9 @@ pub const SUBSYS_API: &str = "api-ping";
 pub const SUBSYS_FIB: &str = "fib-synced";
 pub const SUBSYS_STEERING: &str = "steering";
 pub const SUBSYS_PORTS: &str = "ports";
+/// Reported only when a persist failed; see
+/// [`StatusSnapshot::store_error`].
+pub const SUBSYS_STATE_FILE: &str = "state-file";
 
 /// Liveness of the binary API, as observed from ping/pong timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +239,17 @@ pub struct StatusSnapshot {
     pub api: ApiHealth,
     pub fib: FibSync,
     pub ports: Vec<PortLink>,
+    /// The runtime could not persist something it observed.
+    ///
+    /// Part of the **snapshot**, not something a caller layers on top of
+    /// the report afterwards. It was that at first, in the supervision
+    /// service — and the consequence was precise: `report()` was patched
+    /// to `Degraded` while [`render_metrics`] rendered its health gauge
+    /// from the unpatched snapshot, so `packetframe_vpp_health` went on
+    /// reporting `healthy` during exactly the persistence failure the
+    /// patch existed to surface. Two surfaces, one condition, one place
+    /// to encode it.
+    pub store_error: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -260,6 +274,7 @@ impl StatusSnapshot {
             api,
             fib,
             ports,
+            None,
         )
     }
 
@@ -268,6 +283,7 @@ impl StatusSnapshot {
     /// [`crate::runtime::RuntimeStatus`] rather than holding the
     /// `PendingMap` itself. Every supervisor-derived field still comes
     /// from `sup`, never from a caller's belief.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe_parts(
         sup: &Supervisor,
         counts: SinkCounts,
@@ -276,6 +292,7 @@ impl StatusSnapshot {
         api: ApiHealth,
         fib: FibSync,
         ports: Vec<PortLink>,
+        store_error: Option<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -289,6 +306,7 @@ impl StatusSnapshot {
             api,
             fib,
             ports,
+            store_error,
         }
     }
 
@@ -315,13 +333,27 @@ impl StatusSnapshot {
     /// Structured report for `packetframe status`, circuit breakers and
     /// the Prometheus surface.
     pub fn report(&self) -> HealthReport {
-        let subsystems = vec![
+        let mut subsystems = vec![
             self.process_health(),
             self.api_health(),
             self.fib_health(),
             self.steering_health(),
             self.ports_health(),
         ];
+        // Only present when the runtime actually failed to persist
+        // something, so the subsystem list does not carry a permanent
+        // "state-file: fine" row nobody reads.
+        if let Some(e) = &self.store_error {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_STATE_FILE.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "could not persist observed state ({e}); a daemon restart will refuse \
+                     adoption and cycle VPP instead"
+                )),
+                last_success_age_seconds: None,
+            });
+        }
         HealthReport {
             overall: self.overall(),
             subsystems,
@@ -393,6 +425,12 @@ impl StatusSnapshot {
             && self.dead_ports().is_empty()
             // Steering wanted but absent: a broken rollout, not staging.
             && (self.steered || !self.steer_intended)
+            // Convergence is fine and the interfaces work, but the next
+            // daemon restart will refuse adoption and cycle a VPP that
+            // was forwarding. Nominal has to mean "and it will survive a
+            // restart", or the whitelist quietly stops covering the one
+            // failure whose consequence is deferred.
+            && self.store_error.is_none()
     }
 
     fn process_health(&self) -> SubsystemHealth {
@@ -1286,6 +1324,68 @@ mod tests {
         // The gauge and the structured report must never disagree.
         assert_eq!(s.report().overall, HealthState::Degraded);
         assert!(m.contains("packetframe_vpp_health{module=\"vpp-offload\",state=\"degraded\"} 1"));
+    }
+
+    /// The agreement above must hold for **every** condition, including
+    /// the ones added last. A store failure used to be layered onto the
+    /// report by the supervision service *after* the snapshot, so
+    /// `health_check` said Degraded while `packetframe_vpp_health` — which
+    /// renders from `report()` on the unmodified snapshot — went on saying
+    /// healthy, during exactly the failure the layering existed to
+    /// surface. Asserted here rather than at the service, because this is
+    /// where the two surfaces have to come from one input.
+    #[test]
+    fn a_store_failure_degrades_the_report_and_the_gauge_together() {
+        let clean = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            ports_up(),
+        );
+        assert_eq!(
+            clean.report().overall,
+            HealthState::Healthy,
+            "the control must be healthy or this proves nothing"
+        );
+
+        let mut degraded = clean.clone();
+        degraded.store_error = Some("state dir is read-only".into());
+        assert_eq!(degraded.report().overall, HealthState::Degraded);
+        let m = render_metrics(&degraded, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_health{module=\"vpp-offload\",state=\"degraded\"} 1"),
+            "the gauge disagrees with the report: {m}"
+        );
+        assert!(
+            m.contains("packetframe_vpp_health{module=\"vpp-offload\",state=\"healthy\"} 0"),
+            "{m}"
+        );
+        // And it is NAMED, with the consequence spelled out — the
+        // degradation is invisible until a restart, so the message has to
+        // say what that restart will do.
+        let sub = degraded
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|s| s.name == SUBSYS_STATE_FILE)
+            .expect("the state-file subsystem must be present");
+        let msg = sub.message.unwrap_or_default();
+        assert!(msg.contains("read-only"), "{msg}");
+        assert!(msg.contains("refuse adoption"), "{msg}");
+
+        // No row at all when nothing failed, rather than a permanent
+        // "state-file: fine" nobody reads.
+        assert!(
+            !clean
+                .report()
+                .subsystems
+                .iter()
+                .any(|s| s.name == SUBSYS_STATE_FILE),
+            "a healthy snapshot grew a state-file row"
+        );
     }
 
     #[test]
