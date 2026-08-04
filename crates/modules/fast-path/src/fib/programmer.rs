@@ -47,6 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aya::maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, Map, MapData};
@@ -55,7 +56,7 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
+use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 
 use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::types::{
@@ -523,6 +524,18 @@ pub struct FibProgrammer {
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
 
+    // --- Second tier (Phase 4) ---
+    /// Where the resolved FIB is announced, when a second forwarding
+    /// tier is configured. `None` in every harness and in any run
+    /// without `module vpp-offload`, and the notification sites are
+    /// `if let Some(..)` — so an absent sink costs one branch per
+    /// mirror commit and nothing else.
+    ///
+    /// See [`ResolvedRouteSink`] for why this carries the *resolved*
+    /// union rather than the events that produced it, and why it cannot
+    /// report failure back to this task.
+    route_sink: Option<Arc<dyn ResolvedRouteSink>>,
+
     // --- Destination cache (v0.2.8, default-off experiment) ---
     /// FIB_CACHE_CFG handle. `None` in harnesses that don't exercise
     /// the cache; production (RouteController) always passes `Some`.
@@ -688,6 +701,7 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
+                route_sink: None,
                 cache_cfg,
                 cache_enabled: false,
                 cache_generation: 1,
@@ -696,6 +710,23 @@ impl FibProgrammer {
             },
             FibProgrammerHandle { tx: cmd_tx },
         )
+    }
+
+    /// Register the second forwarding tier's sink.
+    ///
+    /// Deliberately a setter taking `&mut self` rather than a
+    /// constructor argument, which pins it to the only window where it
+    /// is sound: `run` consumes `self` into the task, so a sink can only
+    /// be attached before the programmer starts. Registering one
+    /// mid-flight would hand it a mirror whose earlier commits it never
+    /// saw — a second tier silently missing every prefix resolved before
+    /// it arrived, which is the shape of bug that reports healthy and
+    /// black-holes.
+    ///
+    /// A consumer that needs to attach later must therefore do its own
+    /// full-table resync; it cannot get here.
+    pub fn set_route_sink(&mut self, sink: Arc<dyn ResolvedRouteSink>) {
+        self.route_sink = Some(sink);
     }
 
     /// Main event loop. Drains NeighEvents + Commands + the reclaim
@@ -1066,6 +1097,18 @@ impl FibProgrammer {
             None => return,
         };
 
+        // Captured before the match consumes `evt`, and captured
+        // **pre-pin**: the FDB-pin rewrite below swaps `ifindex` for a
+        // bridge-member port so the XDP path can skip the bridge stack,
+        // which is a fact about this tier's datapath shortcut, not about
+        // where the neighbour lives. A second tier maps its own ports
+        // from the kernel egress device, so handing it the pinned port
+        // would name an interface it has no VF for.
+        let learned = match &evt {
+            NeighEvent::Learned { mac, ifindex, .. } => Some((*mac, *ifindex)),
+            NeighEvent::Failed { .. } | NeighEvent::Gone { .. } => None,
+        };
+
         let entry = match evt {
             NeighEvent::Learned {
                 mac,
@@ -1144,6 +1187,23 @@ impl FibProgrammer {
 
         if let Err(e) = self.write_seqlock(id, entry) {
             warn!(?ip, id, error = %e, "NEXTHOPS update failed");
+        }
+
+        // Announced regardless of whether that write landed, which is the
+        // opposite of the rule the route path follows — and the asymmetry
+        // is the point. A route's nexthop union is *computed here*, so
+        // this tier's commit is what makes it true. A neighbour's
+        // resolution is the **kernel's**, and both tiers are downstream
+        // consumers of it; our own map write failing says nothing about
+        // the kernel's answer. Withholding it would turn one tier's map
+        // failure into an incomplete adjacency in the other tier as well,
+        // which is precisely the single-point-of-failure the second tier
+        // exists to avoid.
+        if let Some(sink) = self.route_sink.as_deref() {
+            match learned {
+                Some((mac, ifindex)) => sink.neighbour_resolved(ip, mac, ifindex),
+                None => sink.neighbour_lost(ip),
+            }
         }
     }
 
@@ -1496,6 +1556,17 @@ impl FibProgrammer {
             // of closing it, so the deferral is unconditional rather
             // than cache-gated — one lifecycle, strictly safer.
             self.reclaim_prior(Some(rec.fib_value), rec.nexthop_ips);
+            // The only place a prefix leaves the mirror — `desired_nhs`
+            // empty covers an explicit Withdraw, the last advertisement
+            // going away, and PeerDown, because all three arrive here by
+            // recomputing the union. `remove_mirror_direct` has exactly
+            // one caller (this one), which is what makes that claim
+            // checkable rather than hopeful: a second removal path would
+            // be a route the second tier keeps forwarding after this one
+            // stopped.
+            if let Some(sink) = self.route_sink.as_deref() {
+                sink.route_withdrawn(prefix);
+            }
             return Ok(());
         }
 
@@ -1568,6 +1639,20 @@ impl FibProgrammer {
             rec.nexthop_ips = allocated_ips;
         }
         self.reclaim_prior(prior_fib, prior_nh_ips);
+        // After the mirror commit, never before. The second tier is told
+        // what this one *installed*, so the announcement has to follow
+        // the write it describes — announcing the intent would republish
+        // a set that a later failure in this function had abandoned, and
+        // every `?` above returns before reaching here.
+        //
+        // Read back out of the mirror rather than cloning `allocated_ips`
+        // on the way in: it is the same bytes, and it keeps the no-sink
+        // case free of an allocation on the route-install path.
+        if let Some(sink) = self.route_sink.as_deref() {
+            if let Some(rec) = self.lookup_mirror(&prefix) {
+                sink.route_resolved(prefix, &rec.nexthop_ips);
+            }
+        }
         Ok(())
     }
 
