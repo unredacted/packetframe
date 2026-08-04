@@ -83,8 +83,32 @@ pub fn acquire(
     ports: &[(String, u16)],
     pages: u32,
 ) -> Result<(ResourceState, Acquired), String> {
-    if let Some(state) = ResourceState::load(&paths.state_dir)? {
+    if let Some(mut state) = ResourceState::load(&paths.state_dir)? {
         verify_adoptable(paths, &state, ports)?;
+        // Hugepages are re-verified, not trusted: `dpdk.service` resets
+        // reservations (observed live on the fleet), so the pool the
+        // state file remembers may hold nothing by now — and adopting
+        // without it lets a replacement VPP spawn straight into an
+        // allocation failure loop. `reserve_hugepages_in` is a no-op
+        // when the pool still suffices.
+        let nr_path = paths.hugepage_pool.join("nr_hugepages");
+        let live: u32 = std::fs::read_to_string(&nr_path)
+            .map_err(|e| format!("read {}: {e}", nr_path.display()))?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        reserve_hugepages_in(&paths.hugepage_pool, pages)
+            .map_err(|e| format!("re-reserving hugepages on adoption: {e}"))?;
+        if state.hugepage_pages == 0 && live < pages {
+            // The original attach found a sufficient reservation and
+            // owned nothing; that reservation has since shrunk and WE
+            // just raised it — ownership starts now, from the live
+            // prior, and must be durable before anything relies on it.
+            state.hugepage_pool_bytes = paths.hugepage_bytes;
+            state.hugepage_pages = pages;
+            state.hugepage_prior_pages = live;
+            state.save(&paths.state_dir)?;
+        }
         return Ok((state, Acquired::Adopted));
     }
 
@@ -105,45 +129,80 @@ pub fn acquire(
         state.hugepage_pages = pages;
         state.hugepage_prior_pages = prior;
     } // else: pre-existing reservation suffices; we own nothing.
-    state.save(&paths.state_dir)?;
+
+    // Every save failure from here rolls back. A `?` instead would
+    // return with resources acquired but UNRECORDED — the one
+    // combination the state file exists to make impossible, since a
+    // later `detach --all` can only release what the file describes.
+    let save_or_rollback = |state: &ResourceState, what: &str| -> Result<(), String> {
+        let Err(e) = state.save(&paths.state_dir) else {
+            return Ok(());
+        };
+        Err(match release(paths, state.clone()) {
+            Ok(()) => format!("could not record {what} ({e}); everything acquired was rolled back"),
+            Err(re) => format!(
+                "could not record {what} ({e}); ROLLBACK ALSO FAILED ({re}) — \
+                     resources are held but NOT durably recorded; do not restart the \
+                     daemon before releasing them manually"
+            ),
+        })
+    };
+    save_or_rollback(&state, "the hugepage reservation")?;
 
     for (iface, cores) in ports {
-        let acquired_port = ensure_vf_in(&paths.sysfs_net, iface).and_then(|vf_pci| {
-            bind_vfio_in(
-                &paths.pci_devices,
-                &paths.pci_drivers,
-                &vf_pci,
-                KERNEL_VF_DRIVER,
-            )
-            .map(|()| vf_pci)
-        });
-        match acquired_port {
-            Ok(vf_pci) => {
-                state.ports.push(PortState {
-                    iface: iface.clone(),
-                    vf_pci,
-                    cores: *cores,
-                    sw_if_index: None,
-                });
-                // Saved per port, not once at the end: a crash between
-                // ports must leave a file describing exactly what a
-                // later `detach --all` has to release.
-                state.save(&paths.state_dir)?;
+        // The two steps are separated because their failure cleanups
+        // differ — and because `ensure_vf_in` can fail AFTER creating
+        // the VF (the `virtfn0` readlink). The failed port is not yet
+        // in `state`, so the shared rollback below cannot see it; it
+        // has to be unwound here, or "rolled back" is a false report
+        // and the box keeps a VF nothing tracks.
+        let unwind = |port_cleanup: Result<(), String>, e: String| -> String {
+            let mut msg = match release(paths, state.clone()) {
+                Ok(()) => format!("acquiring {iface}: {e} (partial acquisition rolled back)"),
+                Err(re) => format!(
+                    "acquiring {iface}: {e}; ROLLBACK ALSO FAILED ({re}) — resources \
+                     remain held and recorded, run `packetframe detach --all`"
+                ),
+            };
+            if let Err(ce) = port_cleanup {
+                msg.push_str(&format!(
+                    "; ALSO: the failed port's own VF could not be released ({ce})"
+                ));
             }
+            msg
+        };
+
+        let vf_pci = match ensure_vf_in(&paths.sysfs_net, iface) {
+            Ok(p) => p,
             Err(e) => {
-                // Unwind everything this call acquired. If the unwind
-                // itself fails, BOTH stories are reported and the state
-                // file is left in place — it describes what is still
-                // held, which is the whole reason it exists.
-                return Err(match release(paths, state) {
-                    Ok(()) => format!("acquiring {iface}: {e} (partial acquisition rolled back)"),
-                    Err(re) => format!(
-                        "acquiring {iface}: {e}; ROLLBACK ALSO FAILED ({re}) — resources \
-                         remain held and recorded, run `packetframe detach --all`"
-                    ),
-                });
+                // The VF may exist even though ensure failed (created,
+                // then the virtfn0 readlink raced or failed). Releasing
+                // is idempotent when it does not.
+                let cleanup = release_vf_in(&paths.sysfs_net, iface);
+                return Err(unwind(cleanup, e));
             }
+        };
+        if let Err(e) = bind_vfio_in(
+            &paths.pci_devices,
+            &paths.pci_drivers,
+            &vf_pci,
+            KERNEL_VF_DRIVER,
+        ) {
+            // bind_vfio_in restores the kernel driver on its own
+            // failure; the VF itself is this loop's to remove.
+            let cleanup = release_vf_in(&paths.sysfs_net, iface);
+            return Err(unwind(cleanup, e));
         }
+        state.ports.push(PortState {
+            iface: iface.clone(),
+            vf_pci,
+            cores: *cores,
+            sw_if_index: None,
+        });
+        // Saved per port, not once at the end: a crash between ports
+        // must leave a file describing exactly what a later
+        // `detach --all` has to release.
+        save_or_rollback(&state, &format!("port {iface}"))?;
     }
 
     Ok((state, Acquired::Fresh))
@@ -162,12 +221,25 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
     let mut remaining = state.clone();
 
     for port in state.ports.iter().rev() {
-        let freed = unbind_vfio_in(
-            &paths.pci_devices,
-            &paths.pci_drivers,
-            &port.vf_pci,
-            KERNEL_VF_DRIVER,
-        )
+        // A recorded VF whose PCI device no longer exists is already
+        // released — PF reprovisioning (udapi cycles do this) and
+        // external resets both remove it out from under the record.
+        // Trying to unbind it anyway fails on the missing sysfs node,
+        // and that failure used to retain the port in state FOREVER:
+        // hugepages never released, every later `detach --all`
+        // refailing on a device that cannot come back. Gone is
+        // released; only the numvfs write below still applies.
+        let vf_present = paths.pci_devices.join(&port.vf_pci).exists();
+        let freed = if vf_present {
+            unbind_vfio_in(
+                &paths.pci_devices,
+                &paths.pci_drivers,
+                &port.vf_pci,
+                KERNEL_VF_DRIVER,
+            )
+        } else {
+            Ok(())
+        }
         .and_then(|()| release_vf_in(&paths.sysfs_net, &port.iface));
         match freed {
             Ok(()) => remaining.ports.retain(|p| p.iface != port.iface),
@@ -175,16 +247,31 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
         }
     }
 
-    // Hugepages last, and only the reservation this state owns.
+    // Hugepages last, and only the reservation this state owns — in
+    // the pool the STATE names, not whichever pool this invocation was
+    // pointed at. A daemon restarted with different pool config (the
+    // 2 MiB fallback, a changed default) would otherwise leak the real
+    // reservation while shrinking an unrelated pool to the recorded
+    // prior count. `hugepage_pool_bytes` was recorded for exactly this
+    // check and nothing consulted it.
     if remaining.ports.is_empty() && state.hugepage_pages > 0 {
-        let nr = paths.hugepage_pool.join("nr_hugepages");
-        match std::fs::write(&nr, state.hugepage_prior_pages.to_string()) {
-            Ok(()) => {
-                remaining.hugepage_pool_bytes = 0;
-                remaining.hugepage_pages = 0;
-                remaining.hugepage_prior_pages = 0;
+        if state.hugepage_pool_bytes != paths.hugepage_bytes {
+            errors.push(format!(
+                "state records a {}-byte-page pool but release was pointed at a {}-byte \
+                 one; refusing to touch the wrong pool — re-run detach with the original \
+                 hugepage configuration",
+                state.hugepage_pool_bytes, paths.hugepage_bytes
+            ));
+        } else {
+            let nr = paths.hugepage_pool.join("nr_hugepages");
+            match std::fs::write(&nr, state.hugepage_prior_pages.to_string()) {
+                Ok(()) => {
+                    remaining.hugepage_pool_bytes = 0;
+                    remaining.hugepage_pages = 0;
+                    remaining.hugepage_prior_pages = 0;
+                }
+                Err(e) => errors.push(format!("restore {}: {e}", nr.display())),
             }
-            Err(e) => errors.push(format!("restore {}: {e}", nr.display())),
         }
     }
 
@@ -212,12 +299,22 @@ fn verify_adoptable(
     state: &ResourceState,
     ports: &[(String, u16)],
 ) -> Result<(), String> {
-    let recorded: Vec<&str> = state.ports.iter().map(|p| p.iface.as_str()).collect();
-    let configured: Vec<&str> = ports.iter().map(|(i, _)| i.as_str()).collect();
+    // The FULL (iface, cores) tuple, not just the name. `cores` is the
+    // persisted value the adopted configuration is reconstructed from
+    // (rx queues, worker placement), so accepting a name-only match
+    // would let a config edit silently keep the OLD sizing on the next
+    // restart — and the plan is explicit that port/cores changes are
+    // restart-only, meaning a full detach, not a drifted adoption.
+    let recorded: Vec<(&str, u16)> = state
+        .ports
+        .iter()
+        .map(|p| (p.iface.as_str(), p.cores))
+        .collect();
+    let configured: Vec<(&str, u16)> = ports.iter().map(|(i, c)| (i.as_str(), *c)).collect();
     if recorded != configured {
         return Err(format!(
             "state file records ports {recorded:?} but the config says {configured:?}; \
-             port membership cannot change across an adoption — run \
+             port membership and core counts cannot change across an adoption — run \
              `packetframe detach --all` under the OLD config first"
         ));
     }
@@ -413,6 +510,16 @@ mod tests {
             fs::read_to_string(f.paths.sysfs_net.join("eth2/device/sriov_numvfs")).unwrap(),
             "0"
         );
+        // ...and the FAILED port's own VF too. ensure_vf created it
+        // (numvfs 0→1) before the virtfn0 readlink failed, and the
+        // first version of this test never looked: the port was not in
+        // `state`, the shared rollback could not see it, and "rolled
+        // back" was a false report over a leaked VF.
+        assert_eq!(
+            fs::read_to_string(f.paths.sysfs_net.join("eth3/device/sriov_numvfs")).unwrap(),
+            "0",
+            "the failed port's VF must not survive the rollback"
+        );
         // ...hugepages restored to the prior count...
         assert_eq!(
             fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
@@ -450,7 +557,7 @@ mod tests {
 
         // A config whose port set changed must be refused, not merged.
         let err = acquire(&f.paths, &[("eth2".into(), 1)], 8).unwrap_err();
-        assert!(err.contains("membership cannot change"), "{err}");
+        assert!(err.contains("cannot change across an adoption"), "{err}");
     }
 
     /// Release restores the PRIOR hugepage count, not zero: an
@@ -546,5 +653,135 @@ mod tests {
         // in-memory copy on process death; the file must agree.
         assert_eq!(on_disk.ports[0].sw_if_index, None);
         assert_eq!(on_disk.ports[1].sw_if_index, None);
+    }
+
+    /// A save failure mid-acquire must roll back, not return with
+    /// resources acquired and unrecorded — the one combination the
+    /// state file exists to make impossible.
+    #[test]
+    fn an_unrecordable_acquisition_is_rolled_back() {
+        let f = Fixture::new(
+            "nosave",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        // Break SAVE specifically, in a way that also fails under the
+        // qemu jobs (which run as root, so permission tricks pass
+        // there): a DIRECTORY squatting on the temp-file path collides
+        // with save's O_EXCL create, and its remove-stale retry cannot
+        // remove_file a directory — root or not. Load still sees no
+        // state file, so the fresh path runs and only persistence
+        // breaks.
+        fs::create_dir_all(f.paths.state_dir.join("vpp-offload.json.tmp")).unwrap();
+
+        let err = acquire(&f.paths, &two_ports(), 8).unwrap_err();
+        assert!(err.contains("could not record"), "{err}");
+        assert!(err.contains("rolled back"), "{err}");
+        // Nothing survives: the hugepage reservation is back to prior.
+        assert_eq!(
+            fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+    }
+
+    /// Adoption re-verifies the hugepage pool. dpdk.service resets
+    /// reservations (observed live on the fleet); trusting the record
+    /// would let a replacement VPP spawn straight into an allocation
+    /// failure loop.
+    #[test]
+    fn adoption_re_reserves_a_reset_hugepage_pool() {
+        let f = Fixture::new(
+            "hpadopt",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (_state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        #[cfg(unix)]
+        for pci in ["0002:07:00.0", "0002:07:00.1"] {
+            std::os::unix::fs::symlink(
+                f.paths.pci_drivers.join("vfio-pci"),
+                f.paths.pci_devices.join(pci).join("driver"),
+            )
+            .unwrap();
+        }
+        // The reset nobody asked for.
+        fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "0").unwrap();
+
+        let (_, how) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        assert_eq!(how, Acquired::Adopted);
+        assert_eq!(
+            fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
+                .unwrap()
+                .trim(),
+            "8",
+            "the reservation must be re-established, not trusted from the record"
+        );
+    }
+
+    /// A cores change across a restart is refused, not silently kept at
+    /// the old sizing — port/cores changes are restart-only by plan,
+    /// and restart-only means a full detach.
+    #[test]
+    fn adoption_refuses_a_cores_change() {
+        let f = Fixture::new(
+            "cores",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let _ = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let changed = vec![("eth2".to_string(), 1u16), ("eth3".to_string(), 4u16)];
+        let err = acquire(&f.paths, &changed, 8).unwrap_err();
+        assert!(err.contains("core counts"), "{err}");
+    }
+
+    /// Release refuses to restore into a different pool than the state
+    /// records — shrinking an unrelated pool while leaking the real
+    /// reservation is worse than failing loudly.
+    #[test]
+    fn release_refuses_the_wrong_hugepage_pool() {
+        let f = Fixture::new(
+            "wrongpool",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let mut wrong = f.paths.clone();
+        wrong.hugepage_bytes = 2 << 20; // detach pointed at the 2 MiB pool
+        let err = release(&wrong, state).unwrap_err();
+        assert!(err.contains("wrong pool"), "{err}");
+        // The pool this invocation pointed at is untouched.
+        assert_eq!(
+            fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
+                .unwrap()
+                .trim(),
+            "8"
+        );
+    }
+
+    /// A recorded VF whose PCI device vanished (PF reprovisioning, an
+    /// external reset) is already released. Failing on it forever used
+    /// to strand the port in state and block the hugepage release —
+    /// every later `detach --all` refailing on a device that cannot
+    /// come back.
+    #[test]
+    fn release_treats_a_vanished_vf_as_already_released() {
+        let f = Fixture::new(
+            "gonevf",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        // eth3's VF disappears out from under the record.
+        fs::remove_dir_all(f.paths.pci_devices.join("0002:07:00.1")).unwrap();
+
+        release(&f.paths, state).unwrap();
+        assert!(
+            ResourceState::load(&f.paths.state_dir).unwrap().is_none(),
+            "everything released, nothing stranded"
+        );
+        assert_eq!(
+            fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
+                .unwrap()
+                .trim(),
+            "0",
+            "the hugepage release must not be blocked by the vanished VF"
+        );
     }
 }
