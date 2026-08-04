@@ -184,6 +184,27 @@ impl<'a> MetricsWriter<'a> {
 /// modules so the loader can drive them polymorphically; see SPEC.md §3.2 for
 /// the per-method contract (notably: `detach` must complete in under 1s, and
 /// `reconfigure` must not reload programs, only mutate maps).
+///
+/// ## What the `detach` deadline requires
+///
+/// It bounds **returning**, not finishing. A module whose teardown cannot
+/// complete in time must return inside the deadline and report what is
+/// still held — never block the loader past it.
+///
+/// The distinction became load-bearing with vpp-offload, whose teardown
+/// legitimately cannot fit: it supervises a process on VFIO/DMA, where
+/// SIGKILL may not bite at all, and its kill path alone budgets 500 ms of
+/// SIGTERM grace plus a bounded SIGKILL wait. Reading the deadline as
+/// "finish within 1 s" leaves only two options for such a module, and both
+/// are worse than reporting: block the loader for tens of seconds, or
+/// release a VF while a live process may still be DMAing into it. Reading
+/// it as "return within 1 s" keeps the loader responsive and puts the
+/// incomplete teardown on the record where an operator and the next
+/// `detach --all` can act on it.
+///
+/// This is a clarification of an existing requirement rather than a change
+/// to it: no method signature moves, and a module that genuinely finishes
+/// in time is unaffected.
 pub trait Module: Send + Sync {
     fn name(&self) -> &'static str;
 

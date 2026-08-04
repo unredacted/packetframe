@@ -148,6 +148,27 @@ pub struct Behaviour {
     /// Reject this many *deletes* with a non-zero retval before
     /// accepting them.
     pub reject_deletes: usize,
+    /// Advertise garbage CRCs in the handshake's message table — the
+    /// version-skew shape the transport must refuse loudly.
+    pub garbage_crcs: bool,
+    /// Stop answering `control_ping` after this many of them, WITHOUT
+    /// closing the connection.
+    ///
+    /// Models a VPP whose main thread is busy: the client blocks in its
+    /// synchronous socket read until the timeout in force. That is the
+    /// shape that made `stop()` unbounded — a tick sitting inside an API
+    /// call cannot observe the stop flag — and a hangup cannot model it,
+    /// because a closed socket returns immediately.
+    pub stall_pings_after: Option<usize>,
+    /// Answer `ip_route_lookup` with a path on an interface the module
+    /// does not own, so readback verification FAILS.
+    ///
+    /// The shape that matters: routes install cleanly, the drain
+    /// completes, and only the verify catches that VPP's FIB is not what
+    /// we asked for. It is also the only way to reach the supervisor's
+    /// `VerifyFailed` teardown from a test, because the verdict arrives
+    /// as an INJECTED event rather than from an ordinary tick.
+    pub verify_mismatch: bool,
 }
 
 impl Fake {
@@ -215,9 +236,14 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
         message_table: Vec::new(),
     };
     for (i, m) in MESSAGE_META.iter().enumerate() {
+        let crc = if behaviour.garbage_crcs {
+            "deadbeef".to_string()
+        } else {
+            m.crc.trim_start_matches("0x").to_string()
+        };
         reply.message_table.push(MessageTableEntry {
             index: 100 + i as u16,
-            name: format!("{}_{}", m.name, m.crc.trim_start_matches("0x")),
+            name: format!("{}_{crc}", m.name),
         });
     }
     let mut payload = Vec::new();
@@ -318,6 +344,13 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
             }
             "ip_route_lookup" => {
                 out = reply_head("ip_route_lookup_reply");
+                // A path on an index we never attached: present, ack'd,
+                // and forwarding nowhere we control.
+                let idx = if behaviour.verify_mismatch {
+                    ASSIGNED_INDEX + 100
+                } else {
+                    ASSIGNED_INDEX
+                };
                 IpRouteLookupReply {
                     context: ctx,
                     retval: 0,
@@ -326,7 +359,7 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
                         stats_index: 0,
                         prefix: prefix_of(v4(10, 0)),
                         n_paths: 1,
-                        paths: vec![path_on(ASSIGNED_INDEX)],
+                        paths: vec![path_on(idx)],
                     },
                 }
                 .encode(&mut out);
@@ -339,7 +372,15 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
                 write_frame(sock, &d);
                 continue;
             }
+            "control_ping" if behaviour.stall_pings_after == Some(0) => {
+                // Silence, connection held open: the client blocks until
+                // its read timeout.
+                continue;
+            }
             "control_ping" => {
+                if let Some(n) = behaviour.stall_pings_after.as_mut() {
+                    *n -= 1;
+                }
                 out = reply_head("control_ping_reply");
                 ControlPingReply {
                     context: ctx,

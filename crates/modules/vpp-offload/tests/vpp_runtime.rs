@@ -232,3 +232,162 @@ fn a_broken_socket_mid_resync_fails_convergence_and_retries() {
         "only routes the fake acknowledged before hanging up may count"
     );
 }
+
+/// A persist that fails and later succeeds must stop being reported.
+///
+/// `last_store_error` was set on every failure and never cleared, so one
+/// transient failure — a briefly read-only state dir, a full filesystem —
+/// kept the module out of `nominal()` for the life of the service even
+/// once the record was durable again. Clearing is safe precisely because
+/// the save is whole-record: `FileStore` writes the entire
+/// `ResourceState` on every observation, so any write that lands makes
+/// hugepages, VFs, indices and process identity current together.
+///
+/// Driven through the real seam (`Effects::attach_devices` against the
+/// fake VPP) rather than at the loop level: the loop only re-persists
+/// during a fresh convergence, which needs a restart and therefore a real
+/// process. Two calls here is the same event the loop would produce.
+#[test]
+fn a_persist_that_recovers_clears_the_recorded_failure() {
+    use packetframe_vpp_offload::executor::Effects as _;
+    use packetframe_vpp_offload::runtime::{IdentityStore, ProcessIdentity};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct Flaky(Arc<AtomicBool>);
+    impl IdentityStore for Flaky {
+        fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+            Ok(())
+        }
+        fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            if self.0.load(Ordering::SeqCst) {
+                Err("state dir is read-only".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let fake = Fake::start("store-recover");
+    let failing = Arc::new(AtomicBool::new(true));
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(Mirror {
+            routes: vec![fake_vpp::v4(0, 0)],
+        }),
+        Box::new(SteeringUnavailable),
+        Box::new(Flaky(Arc::clone(&failing))),
+        "/usr/bin/vpp",
+        "/dev/null",
+    );
+    {
+        use packetframe_vpp_offload::driver::Observe as _;
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+
+    let (_, mut fx) = rt.views();
+    fx.attach_devices()
+        .expect("attach succeeds; only the RECORD fails");
+    assert!(
+        rt.status().store_error.is_some(),
+        "the failed persist must be surfaced"
+    );
+
+    // The underlying problem goes away; the next successful persist makes
+    // the whole record durable, so the degradation must end with it.
+    failing.store(false, Ordering::SeqCst);
+    fx.attach_devices().expect("attach still succeeds");
+    assert!(
+        rt.status().store_error.is_none(),
+        "a successful persist left the earlier failure reported; health would stay \
+         Degraded for the life of the service: {:?}",
+        rt.status().store_error
+    );
+}
+
+/// A successful SPAWN persist clears an earlier store failure too.
+///
+/// `spawn` kept its own direct `store.process_changed` call while
+/// `note_persist`'s doc claimed to be the single recorder — so a store that
+/// failed on an exit and recovered before the retry spawn went on reporting
+/// "observed state is not durable" until a later device attach happened to
+/// succeed, potentially for the whole API startup interval. The class is
+/// exactly the one this module keeps producing: prose asserting a single
+/// owner, with a writer in the same file going around it.
+///
+/// Linux-only because it needs a real spawn; `/bin/true` is enough — the
+/// child's behaviour is irrelevant, only that a pid was recorded.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
+    use packetframe_vpp_offload::executor::Effects as _;
+    use packetframe_vpp_offload::runtime::{IdentityStore, ProcessIdentity};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct Flaky(Arc<AtomicBool>);
+    impl IdentityStore for Flaky {
+        fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+            if self.0.load(Ordering::SeqCst) {
+                Err("state dir is read-only".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let fake = Fake::start("spawn-clears");
+    let failing = Arc::new(AtomicBool::new(true));
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        Vec::new(),
+        vec!["eth4".into()],
+        1_000,
+        FamilyPolicy::V4Only,
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(Mirror { routes: vec![] }),
+        Box::new(SteeringUnavailable),
+        Box::new(Flaky(Arc::clone(&failing))),
+        // `spawn(binary, conf)` execs `binary -c conf`; /bin/true exits
+        // immediately regardless, which is all this needs.
+        "/bin/true",
+        "/dev/null",
+    );
+
+    // First spawn: the child starts, the record fails, and persist-or-kill
+    // abandons it — with the failure recorded.
+    let (_, mut fx) = rt.views();
+    assert!(fx.spawn().is_err(), "persist-or-kill must refuse");
+    assert!(
+        rt.status().store_error.is_some(),
+        "the failed persist must be surfaced"
+    );
+
+    // The store recovers, and the retry spawn persists. That success makes
+    // the whole record durable again, so the degradation must end with it.
+    failing.store(false, Ordering::SeqCst);
+    fx.spawn().expect("the retry spawn records cleanly");
+    assert!(
+        rt.status().store_error.is_none(),
+        "a successful spawn persist left the earlier failure reported: {:?}",
+        rt.status().store_error
+    );
+}

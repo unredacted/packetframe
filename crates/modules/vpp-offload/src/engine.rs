@@ -1054,6 +1054,43 @@ mod tests {
         );
     }
 
+    /// `on_process_gone` clears the last verify verdict, and it must —
+    /// the verdict describes a FIB that died with the instance.
+    ///
+    /// Pinned because the supervision loop depends on it in the awkward
+    /// direction: `VerifyFailed`'s own teardown kills the process, so the
+    /// engine erases the verdict as a side effect of acting on it. The
+    /// loop therefore keeps its own copy, captured before the injection
+    /// (see `service::run_loop`), and without that a completed, failed
+    /// verification was reported as "never verified" — a concrete failure
+    /// summary replaced by something indistinguishable from a VPP still
+    /// converging. If this clearing is ever removed, the retention in the
+    /// loop becomes redundant rather than load-bearing; this test is where
+    /// that shows up.
+    #[test]
+    fn a_dead_process_takes_its_verify_verdict_with_it() {
+        let mut e = ConvergenceEngine::new(
+            "/nonexistent/api.sock",
+            Vec::new(),
+            vec!["eth4".into()],
+            1_000,
+            FamilyPolicy::V4Only,
+        );
+        e.last_verify = Some(crate::verify::VerifyOutcome {
+            sampled: 4,
+            mismatches: vec![],
+            unresolvable: 0,
+            withheld: 0,
+            dead_interfaces: vec![],
+        });
+        assert!(e.last_verify().is_some());
+        e.on_process_gone();
+        assert!(
+            e.last_verify().is_none(),
+            "the verdict outlived the instance it describes"
+        );
+    }
+
     /// Every operation must refuse rather than pretend when there is no
     /// socket. An engine that silently no-ops would report a converged
     /// FIB it never sent.
