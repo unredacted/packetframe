@@ -1003,56 +1003,64 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     };
 
     // Kill the recorded VPP first, if it is still the process we recorded.
-    // `adopt` verifies (pid, start_ticks, boot_id), so a recycled PID cannot
-    // be signalled and a reboot invalidates the record entirely.
+    //
+    // The identity must be COMPLETE — pid, start_ticks AND boot_id — before
+    // either action is safe, and that is the whole of this block's caution.
+    // `VppProcess::adopt` returns `Ok(None)` for two very different reasons:
+    // the process is genuinely gone, or the identity could not be verified
+    // and it refused to guess. Reading the second as the first is what makes
+    // it dangerous — this code passed `boot_id: None` straight through and
+    // then treated the refusal as "gone", releasing the VF under a VPP that
+    // may well have still been running. `process.rs` has a test named
+    // `adoption_without_a_recorded_boot_id_is_refused` whose doc says exactly
+    // that a boot-id-less record "cannot establish identity at all, and must
+    // be refused rather than trusted".
+    //
+    // With a complete identity, `Ok(None)` really does mean gone: the pid is
+    // dead, or its start time or boot id no longer match, and in every one of
+    // those cases the process we recorded does not exist.
     if let Some(pid) = state.vpp_pid {
-        let identity = (pid, state.vpp_start_ticks, state.vpp_boot_id.clone());
-        match identity {
-            (pid, Some(ticks), boot) => {
-                match VppProcess::adopt(pid, ticks, boot.as_deref()) {
-                    Ok(Some(mut p)) => {
-                        tracing::info!(pid, "vpp-offload: terminating the recorded VPP");
-                        if terminate_or_leak(&mut p, TERM_GRACE) == Disposition::MustLeak {
-                            // Refuse to release. The process survived
-                            // SIGKILL — most likely parked in an
-                            // uninterruptible VFIO/DMA call — and the state
-                            // file stays intact so a later attempt can
-                            // finish the job.
-                            return Err(format!(
-                                "vpp-offload: VPP (pid {pid}) survived SIGKILL, so its VF \
-                                 and hugepages were deliberately NOT released — releasing \
-                                 them under a process that can still DMA through them is \
-                                 worse than leaking them. The state file still records \
-                                 everything; retry once `ps {pid}` is empty."
-                            ));
-                        }
-                    }
-                    // Gone already, or not ours: nothing to kill.
-                    Ok(None) => tracing::info!(
-                        pid,
-                        "vpp-offload: the recorded VPP is gone; releasing its resources"
-                    ),
-                    Err(e) => {
-                        return Err(format!(
-                            "vpp-offload: could not establish whether the recorded VPP \
-                             (pid {pid}) is still running ({e}); refusing to release its \
-                             VF and hugepages while that is unknown"
-                        ))
-                    }
+        let (Some(ticks), Some(boot)) = (state.vpp_start_ticks, state.vpp_boot_id.clone()) else {
+            let missing = match (state.vpp_start_ticks, &state.vpp_boot_id) {
+                (None, None) => "start-time cookie and boot id",
+                (None, Some(_)) => "start-time cookie",
+                _ => "boot id",
+            };
+            return Err(format!(
+                "vpp-offload: the state file records pid {pid} with no {missing}, so that \
+                 process can neither be identified nor ruled out. It must not be signalled \
+                 (that risks SIGKILLing an unrelated process as root) and its VF and \
+                 hugepages must not be released (that risks unbinding under a live VPP). \
+                 Confirm by hand that no VPP is running, then remove the state file."
+            ));
+        };
+        match VppProcess::adopt(pid, ticks, Some(&boot)) {
+            Ok(Some(mut p)) => {
+                tracing::info!(pid, "vpp-offload: terminating the recorded VPP");
+                if terminate_or_leak(&mut p, TERM_GRACE) == Disposition::MustLeak {
+                    // Refuse to release. The process survived SIGKILL — most
+                    // likely parked in an uninterruptible VFIO/DMA call — and
+                    // the state file stays intact so a later attempt can
+                    // finish the job.
+                    return Err(format!(
+                        "vpp-offload: VPP (pid {pid}) survived SIGKILL, so its VF and \
+                         hugepages were deliberately NOT released — releasing them under a \
+                         process that can still DMA through them is worse than leaking \
+                         them. The state file still records everything; retry once \
+                         `ps {pid}` is empty."
+                    ));
                 }
             }
-            // A pid with no start-time cookie cannot be identified, so it
-            // cannot be safely signalled — and it cannot be ruled out
-            // either. `(pid, start_ticks)` is what makes an identity
-            // verifiable across PID reuse; signalling without it risks
-            // SIGKILLing a stranger as root, and releasing without it risks
-            // unbinding a VF under a live VPP.
-            (pid, None, _) => {
+            // Verified against a complete identity, so this is genuinely gone.
+            Ok(None) => tracing::info!(
+                pid,
+                "vpp-offload: the recorded VPP is gone; releasing its resources"
+            ),
+            Err(e) => {
                 return Err(format!(
-                    "vpp-offload: the state file records pid {pid} with no start-time \
-                     cookie, so that process cannot be identified and must not be \
-                     signalled. Confirm by hand that no VPP is running, then remove the \
-                     state file."
+                    "vpp-offload: could not establish whether the recorded VPP (pid {pid}) \
+                     is still running ({e}); refusing to release its VF and hugepages while \
+                     that is unknown"
                 ))
             }
         }
@@ -1286,6 +1294,39 @@ mod vpp_detach_tests {
 
     /// No state file means nothing was ever acquired: a clean no-op, so
     /// `detach --all` stays idempotent for operators who run it habitually.
+    /// A record with a start-time cookie but NO boot id must be refused too.
+    ///
+    /// `VppProcess::adopt` returns `Ok(None)` here because it cannot verify
+    /// the identity, not because the process is gone — `start_ticks` counts
+    /// from boot while the state file under /var/lib survives a reboot, so
+    /// without the boot id an unrelated process can satisfy a (pid, ticks)
+    /// check. Treating that refusal as "gone" released the VF under a VPP
+    /// that may still have been running.
+    #[test]
+    fn a_pid_without_a_boot_id_is_refused() {
+        use packetframe_vpp_offload::resources::ResourceState;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-boot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ResourceState::empty();
+        state.vpp_pid = Some(4242);
+        state.vpp_start_ticks = Some(99_999);
+        state.vpp_boot_id = None; // the third leg is missing
+        state.save(&dir).unwrap();
+
+        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        assert!(e.contains("boot id"), "the missing leg must be named: {e}");
+        assert!(
+            e.contains("must not be signalled"),
+            "and the reason stated: {e}"
+        );
+        assert!(
+            ResourceState::load(&dir).unwrap().is_some(),
+            "the record must survive so a later attempt can act on it"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn no_state_file_is_a_clean_no_op() {
         let dir = std::env::temp_dir().join(format!("pf-detach-none-{}", std::process::id()));
