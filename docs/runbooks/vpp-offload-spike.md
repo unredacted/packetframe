@@ -706,6 +706,187 @@ best-path nexthops. Those agree to within ~331, confirming **0 ECMP
 among selected routes** — so "nexthops as prefixes" is now measured
 rather than inferred, and the `expected-routes` sizing stands.
 
+## 3b. Convergence over the binary API (the ≤60 s budget)
+
+**This is the number item 10 explicitly did NOT measure.** Item 10 timed
+VPP's *CLI parser* absorbing the table — ~35 s for 1,053,360 routes via
+`vppctl exec`, with one shared path-list — and recorded it as a lower
+bound only. Production is 1.05M **binary-API round trips** driven by the
+module's `ConvergenceEngine`, against the real nexthop set. The plan
+publishes ≤60 s; nothing has ever checked it.
+
+Needs **no traffic peer**: nothing is steered, so this can run on the
+shadow any time VPP is up.
+
+### Inputs
+
+Two plain files, produced on the **primary** (bird has the table) and
+copied to the shadow. Note the source is bird, not the kernel — bird's
+kernel export was dropped at custom-fib cutover, so `ip route show` is
+deliberately near-empty.
+
+```sh
+birdc 'show route table master4 count' | tee /tmp/pf-count.txt
+```
+
+Note the `networks` figure. That is **bird's own count, independent of the
+extraction below**, and it is what makes the check meaningful — an
+expectation derived from the same pipeline it is meant to validate proves
+nothing, because a `birdc` that ends cleanly halfway produces a shortened
+file and a shortened count that agree with each other perfectly.
+
+Now extract, and reconcile against that independent figure:
+
+```sh
+set -o pipefail
+birdc 'show route primary table master4' > /tmp/pf-raw.txt
+awk '/^[0-9]/ { pfx=$1; nets++ } /via/ { if (!(pfx in seen)) { seen[pfx]=1; vias++ } for (i=1;i<=NF;i++) if ($i=="via") print pfx, $(i+1) } END { print nets, vias > "/tmp/pf-nets.txt" }' /tmp/pf-raw.txt | sort -u > /tmp/pf-routes.txt || echo "EXTRACTION FAILED"
+BIRD_NETS=$(awk '{ for (i=1;i<=NF;i++) if ($i=="networks") print $(i-1) }' /tmp/pf-count.txt)
+SEEN_NETS=$(awk '{print $1}' /tmp/pf-nets.txt)
+VIA_RAW=$(awk '{print $2}' /tmp/pf-nets.txt)
+VIA_FILE=$(awk '{print $1}' /tmp/pf-routes.txt | sort -u | wc -l | tr -d ' ')
+echo "bird reports    : ${BIRD_NETS} networks"
+echo "raw dump had    : ${SEEN_NETS} networks, ${VIA_RAW} with a via"
+echo "routes file has : ${VIA_FILE} prefixes  <-- PACKETFRAME_VPP_EXPECT_ROUTES"
+echo "excluded        : $((SEEN_NETS - VIA_RAW)) (connected/blackhole/unreachable)"
+[ "${BIRD_NETS}" = "${SEEN_NETS}" ] || echo "!! DUMP TRUNCATED — do not measure this"
+[ "${VIA_RAW}" = "${VIA_FILE}" ] || echo "!! EXTRACTION LOST RECORDS — do not measure this"
+[ "${BIRD_NETS}" = "${SEEN_NETS}" ] && [ "${VIA_RAW}" = "${VIA_FILE}" ] && echo "OK: chain verified"
+```
+
+**Stop unless the last line says `OK: chain verified`.** Two separate
+things are being checked, and each closes a different way for a partial
+table to look complete:
+
+- `BIRD_NETS == SEEN_NETS` — bird's own count against the raw dump, so a
+  `birdc` that ends cleanly halfway is caught.
+- `VIA_RAW == VIA_FILE` — the via count computed **from the raw dump**
+  against the extracted file, so an `awk | sort` that loses records (disk
+  full, a failed `sort`) is caught too. `VIA_RAW` is what makes this
+  non-circular: it never touches `pf-routes.txt`.
+
+An expectation taken from the file it is meant to validate agrees with a
+truncated file perfectly. An earlier revision of this section did that
+with `wc -l`, and a revision after it validated only the raw dump.
+
+**This is a via-nexthop measurement, not literally every route class.**
+The `excluded` figure is real — `master4` carries connected, blackhole and
+unreachable primaries that have no `via`, and the §0 numbers show the gap
+(1,053,380 networks against 1,053,049 best-path via-nexthops, so ~331).
+Those are exactly the routes the sink would classify unresolvable, since
+they present no nexthop that can map to a VPP-owned port, so excluding
+them measures what production installs rather than hiding a shortfall.
+Record `excluded` alongside the timings so the scope of the number is on
+the record rather than implied.
+
+```sh
+ip -4 neigh show \
+  | awk '$1 !~ /:/ && $5 ~ /:/ && $NF != "FAILED" && $NF != "INCOMPLETE" { print $1, $3, $5 }' \
+  > /tmp/pf-neigh-all.txt
+awk 'NR==FNR { for (n=split($2,a,","); n>0; n--) want[a[n]]=1; next } want[$1]' \
+  /tmp/pf-routes.txt /tmp/pf-neigh-all.txt > /tmp/pf-neigh.txt
+wc -l /tmp/pf-neigh-all.txt /tmp/pf-neigh.txt
+```
+
+The second step keeps only neighbours the routes actually use. Management
+and tunnel entries are harmless to the *bench* — it checks ownership only
+for route nexthops — but they matter for the one-VF rewrite below, where
+rewriting them onto the member port would make `program_neighbours` treat
+them as owned and program them into VPP. Extra work at best, and a
+refusal aborts the run.
+
+**Every device carrying a route nexthop must be a member port with its own
+VF.** The bench refuses up front if a route nexthop resolves to a device
+that is not a member — failing there is correct rather than something to
+work around, since a packet whose best path exits a port VPP does not own
+would blackhole.
+
+#### If only one VF is bound
+
+Rewrite the device column of the **filtered** neighbour file onto the one
+owned port, and record the run as a **reduced** measurement: the drain,
+wire encoding and VPP-side insert are all fully exercised, but every
+adjacency lands on a single interface, so it does not exercise the
+multi-port mapping.
+
+```sh
+awk '{ print $1, "eth3", $3 }' /tmp/pf-neigh.txt > /tmp/pf-neigh-one.txt
+```
+
+Rewrite `/tmp/pf-neigh.txt` (route-referenced only), never
+`/tmp/pf-neigh-all.txt` — the router-wide file carries management and
+tunnel neighbours, and relabelling those onto the member port would make
+`program_neighbours` treat them as owned and push them into VPP. Then use
+`PACKETFRAME_VPP_NEIGH=/tmp/pf-neigh-one.txt` with a single-entry
+`PORT`/`PCI` below.
+
+### Run
+
+VPP must already be up with its sized `startup.conf` (§2 — **including
+the `statseg` stanza**, or it aborts partway through). The test attaches
+the device itself, so do **not** pre-run the §3 `vppctl device attach`
+sequence; set `PACKETFRAME_VPP_ADOPT=1` if the interface is already
+attached from an earlier run.
+
+`PORT` and `PCI` are comma-separated and **pair by position**; give one
+VF per member device.
+
+```sh
+PACKETFRAME_VPP_API_SOCK=/run/vpp/api.sock \
+PACKETFRAME_VPP_PORT=eth2,eth3 \
+PACKETFRAME_VPP_PCI=0002:07:00.0,0002:07:00.1 \
+PACKETFRAME_VPP_ROUTES=/tmp/pf-routes.txt \
+PACKETFRAME_VPP_NEIGH=/tmp/pf-neigh.txt \
+PACKETFRAME_VPP_EXPECT_ROUTES=<the count from above> \
+  ./tests/vpp_convergence_bench --include-ignored --nocapture
+```
+
+Run the staged binary directly, **not** via `run-tests.sh`: that driver
+takes only test names, supplies `--include-ignored --nocapture` itself,
+and forwards nothing after a `--` — it would try to execute `--` and
+`--nocapture` as test binaries and fail the run even when the bench
+succeeded.
+
+Re-running against a VPP that already has the interfaces needs adoption
+plus the indices VPP assigned, because attach refuses to reuse an index
+it was not told. **Take them from the line the fresh run printed**, not
+from `show interface`: the dump reports indistinguishable `octeonN/P`
+names with no PCI identity, so it cannot tell you which index belongs to
+which member port, and supplying them in the wrong order programs
+neighbours and routes through the opposite VFs — which verification will
+*not* catch, because it checks that paths use an owned index, not the
+intended one. The fresh run prints exactly the line to reuse:
+
+```
+  to re-run adopted:  PACKETFRAME_VPP_ADOPT=1 PACKETFRAME_VPP_SWIFINDEX=3,4
+```
+
+Restarting VPP between runs is simpler and is what the timings above
+assume.
+
+### Reading the result
+
+The phase breakdown prints **before** any budget assertion, deliberately:
+a run that blows the budget is exactly the one whose breakdown matters,
+and a panic that hid it would waste the trip. Record `connect / attach /
+resync plan / neighbours / drain / verify / TOTAL`, the routes/s rate,
+and the ledger line.
+
+Failure modes worth recognising rather than debugging from scratch:
+
+- **`unresolvable > 0`** — the neighbour file does not cover every
+  nexthop the routes name. Verification fails by design; fix the input,
+  do not lower the bar.
+- **`deferred` large** — interface indices were not known when the drain
+  started, i.e. attach did not land. The attach step failing is louder;
+  check `show interface` first.
+- **drain not converging** — the run aborts after 10× budget rather than
+  hanging.
+- **abort with `Out-of-memory, calling os_panic()`** — the `statseg` is
+  undersized. Use `show memory` (**all** heaps), never
+  `show memory main-heap`, which reads mostly free during exactly this
+  failure. See the item-10 RESULT.
+
 ## 4. Pass / kill / record
 
 - **Pass:** items 1, 2, 7, 10 all WORK (delivery, egress, PMTUD,
