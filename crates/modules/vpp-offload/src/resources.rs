@@ -102,6 +102,16 @@ pub struct ResourceState {
     /// and owns nothing (release then leaves reservations alone).
     pub hugepage_pool_bytes: u64,
     pub hugepage_pages: u32,
+    /// What the pool's `nr_hugepages` read BEFORE attach raised it —
+    /// the value release restores. Zeroing the pool instead would be
+    /// right only when we created the reservation from nothing, which
+    /// is the common case on the fleet but not a safe assumption: an
+    /// operator's pre-existing partial reservation would be destroyed
+    /// by our teardown. `serde(default)` keeps older state files
+    /// readable; their `0` restores to zero, which matches what those
+    /// runs actually found.
+    #[serde(default)]
+    pub hugepage_prior_pages: u32,
     pub ports: Vec<PortState>,
     /// ntuple rule locations installed per PF iface (slice 5).
     /// Present in the schema from day one so adopting a newer state
@@ -144,6 +154,7 @@ impl ResourceState {
             version: STATE_VERSION,
             hugepage_pool_bytes: 0,
             hugepage_pages: 0,
+            hugepage_prior_pages: 0,
             ports: Vec::new(),
             steer_rules: Vec::new(),
             vpp_pid: None,
