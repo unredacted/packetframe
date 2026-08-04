@@ -199,6 +199,22 @@ pub fn bring_up(
             vpp_binary.display()
         ));
     }
+    // Existing is not enough: `is_file()` says nothing about the execute
+    // bit or the mount it sits on. A `chmod -x` binary, or one dropped
+    // somewhere mounted `noexec` (which is how UniFi OS mounts `/tmp` —
+    // the obvious place to park a hand-built VPP), fails at execve with
+    // EACCES. That would be discovered by the loop's first `Start`, i.e.
+    // one step too late: it is permanent, the supervisor answers a failed
+    // spawn with backoff-and-retry, and so attach would report success
+    // and hold the VFs and hugepages forever — the exact outcome the
+    // existence check above exists to prevent, arriving one stat later.
+    if let Err(e) = check_executable(&vpp_binary) {
+        return Err(format!(
+            "VPP binary {} is not executable ({e}); `chmod +x` it, or move it off a \
+             `noexec` mount (`/tmp` is one on UniFi OS)",
+            vpp_binary.display()
+        ));
+    }
 
     // --- The first mutation.
     let ports: Vec<(String, u16)> = cfg
@@ -252,6 +268,27 @@ pub fn bring_up(
                 "{e}; AND the rollback did not complete: {re} — run `packetframe detach --all`"
             ),
         }),
+    }
+}
+
+/// Can this process actually `execve` `path`?
+///
+/// `access(2)` rather than the mode bits, because the mode bits are only
+/// half the question: the kernel's `do_faccessat` checks `path_noexec()`
+/// for `X_OK` on a regular file, so this is the one call that answers for
+/// the permission *and* the mount. Real-uid semantics (`access`, not
+/// `faccessat(AT_EACCESS)`) — packetframe is not setuid, so the two
+/// coincide, and it keeps libc out of its AT_EACCESS emulation paths.
+fn check_executable(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is NUL-terminated and outlives the call, which does not
+    // retain it.
+    if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

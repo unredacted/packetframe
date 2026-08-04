@@ -142,17 +142,37 @@ pub fn acquire(
             // Sizing identity. Checked alongside the pool identity below
             // and for the same reason: both describe memory a running
             // VPP committed to at start, and neither can be renegotiated
-            // by adopting it. See `ResourceState::expected_routes`. A
-            // recorded `0` predates the field and cannot be compared.
-            if state.expected_routes != 0 && state.expected_routes != expected_routes {
-                return Err(format!(
-                    "state was sized for expected-routes {} but this run is configured for \
-                     {expected_routes}; VPP fixes its main heap and stats segment at start, \
-                     so adopting it under the new figure would let the route ledger fill \
-                     past what the running instance holds — run `packetframe detach --all` \
-                     and start fresh to apply the new sizing",
-                    state.expected_routes
-                ));
+            // by adopting it. See `ResourceState::expected_routes`.
+            //
+            // A recorded `0` is refused too, rather than read as "no
+            // constraint". It means the sizing this VPP started under is
+            // UNKNOWN, and nothing can recover it — VPP does not report
+            // the figure back, so stamping the current config's number
+            // onto the record would be an observation we fabricated.
+            // That is the same call made for the process identity: a pid
+            // without its boot_id is refused rather than guessed. The
+            // configured value cannot itself be `0` (config parse
+            // requires >= 1, absence defaults to
+            // `DEFAULT_EXPECTED_ROUTES`), so the sentinel is unambiguous.
+            if state.expected_routes != expected_routes {
+                return Err(if state.expected_routes == 0 {
+                    format!(
+                        "state records no `expected-routes`, so the sizing the running VPP \
+                         started under cannot be established; adopting it under this run's \
+                         {expected_routes} would apply a route ceiling its main heap and \
+                         stats segment may not hold — run `packetframe detach --all` and \
+                         start fresh"
+                    )
+                } else {
+                    format!(
+                        "state was sized for expected-routes {} but this run is configured \
+                         for {expected_routes}; VPP fixes its main heap and stats segment at \
+                         start, so adopting it under the new figure would let the route \
+                         ledger fill past what the running instance holds — run \
+                         `packetframe detach --all` and start fresh to apply the new sizing",
+                        state.expected_routes
+                    )
+                });
             }
             // The pool identity check comes BEFORE any reservation
             // touch. Raising the currently-configured pool while the
@@ -194,11 +214,11 @@ pub fn acquire(
             if resume_from == ports.len() {
                 return Ok((state, Acquired::Adopted));
             }
-            // Resuming an interrupted acquisition: the tail is acquired
-            // fresh below and saved, so this is the moment a pre-field
-            // record can record its sizing. Equal values make it a no-op;
-            // a differing one was already refused above.
-            state.expected_routes = expected_routes;
+            // Resuming an interrupted acquisition. No sizing assignment
+            // here on purpose: the check above leaves
+            // `state.expected_routes == expected_routes` on every path
+            // that reaches this line, so writing it would be a no-op
+            // that reads like a migration.
             state
         }
         None => {
@@ -1047,12 +1067,18 @@ mod tests {
         assert_eq!(how, Acquired::Adopted);
     }
 
-    /// A state file written before the field existed records `0`, which
-    /// means "unknown" and must not be compared — those files predate
-    /// any release that could adopt a VPP at all, so refusing them would
-    /// wedge an upgrade for no safety gain.
+    /// A record with no sizing is refused rather than adopted under the
+    /// current figure. `0` means the heap and stats segment the running
+    /// VPP started under are **unknown**, not unconstrained: VPP does not
+    /// report the figure back, so writing this run's number onto the
+    /// record would be an observation we invented, and the adoption it
+    /// permitted could then fill the ledger past what that instance
+    /// holds — gate 0b's OOM abort by a longer route. It cannot happen in
+    /// practice (no released build wrote such a file), which is why the
+    /// answer is a clean refusal naming `detach --all` rather than a
+    /// migration path.
     #[test]
-    fn an_unrecorded_sizing_does_not_refuse_adoption() {
+    fn an_unrecorded_sizing_refuses_adoption() {
         let f = Fixture::new(
             "sizing-old",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
@@ -1062,8 +1088,18 @@ mod tests {
         state.expected_routes = 0;
         state.save(&f.paths.state_dir).unwrap();
 
-        let (_, how) = acquire(&f.paths, &two_ports(), 8, 2_000_000).unwrap();
-        assert_eq!(how, Acquired::Adopted);
+        // Refused under a raised figure AND under the one that actually
+        // sized it — the point is that neither can be *established*, so
+        // agreeing by luck must not be the difference.
+        for routes in [2_000_000, 1_600_000] {
+            let err = acquire(&f.paths, &two_ports(), 8, routes).unwrap_err();
+            assert!(err.contains("records no `expected-routes`"), "{err}");
+            assert!(err.contains("detach --all"), "{err}");
+        }
+        // And the refusal is inert: the record still says what it said,
+        // so `detach --all` can still release against it.
+        let after = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        assert_eq!(after.expected_routes, 0);
     }
 
     /// Release refuses to restore into a different pool than the state

@@ -11,6 +11,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unconditional, as in `common` and `cli`: most of the syscall surface
+# here is Linux-only, but `bringup`'s executability check runs on the
+# macOS dev loop too, and one implementation of it beats a cfg-split pair
+# that can disagree.
 libc = { workspace = true }

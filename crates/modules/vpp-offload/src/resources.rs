@@ -110,10 +110,14 @@ pub struct ResourceState {
     /// abort gate 0b found, arriving through the adoption door instead of
     /// the sizing one, so `acquire` refuses the change.
     ///
-    /// `serde(default)` for state files written before this field: their
-    /// `0` reads as "unknown", which cannot be compared and so does not
-    /// refuse. Those files predate any release that could have adopted
-    /// a VPP at all.
+    /// `serde(default)` so a file written before this field still
+    /// **parses** — `detach --all` never reads the sizing, and a parse
+    /// error would wedge the release door as well as the adoption one.
+    /// Its `0` is then refused for adoption: unknown sizing is not the
+    /// same as no constraint, and nothing can recover the figure a
+    /// running VPP started under. (No such file can exist in practice —
+    /// `acquire` has only ever been reachable from `bringup`, which is
+    /// newer than this field.)
     #[serde(default)]
     pub expected_routes: u64,
     /// Hugepages reserved at attach: (pool bytes, page count).

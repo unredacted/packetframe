@@ -12,8 +12,9 @@
 //!   derived core map, health reporting through the real `Module` trait,
 //!   and a detach that stops the loop and releases everything.
 //! - **Not proven here:** anything requiring a real VPP process. Spawn
-//!   is deliberately made to fail (the configured binary is a
-//!   non-executable file), so the loop lands in backoff. That makes the
+//!   is deliberately made to fail (the configured binary is executable,
+//!   as `bring_up` insists, but is not a program), so the loop lands in
+//!   backoff. That makes the
 //!   test deterministic on both macOS — where `VppProcess::spawn` is an
 //!   `ENOSYS` stub — and Linux, and it means the convergence path is
 //!   exercised by `vpp_service.rs` (which injects an adoption against
@@ -21,6 +22,7 @@
 
 use std::fs;
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -86,12 +88,16 @@ impl Host {
         fs::write(cpu.join("online"), "0-17\n").unwrap();
         fs::write(cpu.join("isolated"), "12\n").unwrap();
 
-        // A plain, NON-executable file: `bring_up`'s existence check
-        // passes, and the loop's first spawn fails identically on macOS
-        // (ENOSYS stub) and Linux (EACCES). Keeping the process out of
-        // the picture is what makes this test deterministic.
+        // Executable — `bring_up` requires it, and requires it before
+        // acquiring anything — but not a program: an exec of a file with
+        // no shebang and no ELF header fails ENOEXEC on Linux, and on
+        // macOS the process layer is the ENOSYS stub, so the loop's first
+        // spawn fails on both without ever producing a process. Keeping
+        // the process out of the picture is what makes these tests
+        // deterministic.
         let vpp_binary = base.join("vpp");
         fs::write(&vpp_binary, "not really vpp").unwrap();
+        fs::set_permissions(&vpp_binary, fs::Permissions::from_mode(0o755)).unwrap();
 
         Self {
             paths: AttachPaths {
@@ -272,7 +278,20 @@ fn a_config_that_cannot_work_touches_nothing() {
         .expect("must fail");
     assert!(e.contains("does not exist"), "{e}");
 
-    // Neither attempt may have created a VF, a reservation, or a record.
+    // A VPP binary that is there but cannot be executed. Distinct from
+    // the above, and worth its own case: this one used to pass the check
+    // and be discovered by the loop's first spawn — permanent, retried
+    // forever, with the VFs and the reservation already taken.
+    let unexecutable = host.base.join("vpp-no-x");
+    fs::write(&unexecutable, "not really vpp").unwrap();
+    fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644)).unwrap();
+    cfg.vpp_binary = Some(unexecutable.to_string_lossy().into_owned());
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+        .err()
+        .expect("must fail");
+    assert!(e.contains("is not executable"), "{e}");
+
+    // No attempt may have created a VF, a reservation, or a record.
     assert!(host.state().is_none(), "a refused attach left a state file");
     assert_eq!(
         fs::read_to_string(host.paths.sys.hugepage_pool.join("nr_hugepages"))
