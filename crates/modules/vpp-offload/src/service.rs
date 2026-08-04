@@ -54,16 +54,35 @@ const STOP_POLL_CAP: Duration = Duration::from_millis(50);
 /// the final published status says which.
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
-/// Marker prefixed to the error from a pre-publish panic.
+/// Marker prefixed to any error meaning **a VPP may still be running and
+/// holding its VF and hugepages**.
 ///
 /// Exists so a caller can distinguish "attach failed and left nothing
 /// behind" from "attach failed and may have left a live VPP holding a VF".
 /// The two demand opposite handling: the first should roll back, the second
 /// must NOT, because releasing a VF under a process that can still DMA
-/// through it is worse than leaking it. Matching on a string is crude, and
-/// preferable to the alternative that was there — a generic message that
-/// made the distinction invisible.
-pub const PANIC_MAY_HOLD_RESOURCES: &str = "SUPERVISION PANIC (resources may be held)";
+/// through it is worse than leaking it.
+///
+/// Two producers, and it started with only one. The pre-publish panic path
+/// sets it here. But a **factory** must set it too, on any error it returns
+/// after it has adopted or spawned a VPP — an adoption that fails partway
+/// (an unreadable boot id, a pidfd that will not open) leaves the recorded
+/// process running exactly as a panic does, and forwarding that as an
+/// ordinary error let the caller roll back and unbind the VF underneath it.
+/// [`may_hold_resources`] is the check; use it rather than re-spelling the
+/// prefix.
+pub const MAY_HOLD_RESOURCES: &str = "RESOURCES MAY BE HELD";
+
+/// Whether an error from [`SupervisionService::start`] means resources may
+/// still be held.
+///
+/// A function rather than leaving callers to `starts_with` by hand: the one
+/// caller that must branch on this is deciding whether to unbind a VF, and
+/// a check spelled slightly differently at a second call site fails open
+/// into memory corruption.
+pub fn may_hold_resources(e: &str) -> bool {
+    e.starts_with(MAY_HOLD_RESOURCES)
+}
 
 /// Cap on distinct reasons retained for one unhealthy episode.
 ///
@@ -353,13 +372,13 @@ impl SupervisionService {
                 // reach it. The only remedy is telling the operator, in
                 // words that say what to do.
                 //
-                // `PANIC_MAY_HOLD_RESOURCES` is a marker the caller can
+                // `MAY_HOLD_RESOURCES` is a marker the caller can
                 // match on: `bring_up`'s rollback must NOT release VFs and
                 // hugepages after this, because releasing them under a live
                 // VPP is the DMA hazard the whole `MustLeak` path exists to
                 // avoid.
                 Err(format!(
-                    "{PANIC_MAY_HOLD_RESOURCES}: the supervision loop panicked before \
+                    "{MAY_HOLD_RESOURCES}: the supervision loop panicked before \
                      publishing its first status (see the log). If it had already adopted \
                      or started VPP, that process is STILL RUNNING and still holds its VF \
                      and hugepages — nothing here can reach it any more. Run `packetframe \
@@ -989,6 +1008,47 @@ mod tests {
         assert!(err.contains("API mismatch"), "{err}");
     }
 
+    /// A factory error carrying the marker survives to the caller, so a
+    /// rollback can be suppressed.
+    ///
+    /// The pre-publish panic is not the only way a failed attach can leave a
+    /// live VPP: a factory that adopted a recorded process and THEN failed —
+    /// an unreadable boot id, a pidfd that will not open — leaves it running
+    /// just the same. `start` forwards factory errors verbatim, so the
+    /// marker has to survive that forwarding for the distinction to reach
+    /// the caller who decides whether to unbind a VF.
+    #[test]
+    fn a_marked_factory_error_reaches_the_caller_intact() {
+        let err = SupervisionService::start(
+            "vpp-offload",
+            Box::new(|| {
+                Err(format!(
+                    "{MAY_HOLD_RESOURCES}: adopted pid 4242, then failed"
+                ))
+            }),
+        )
+        .err()
+        .expect("start must fail");
+        assert!(
+            may_hold_resources(&err),
+            "the caller cannot tell this from a clean failure and will roll back: {err}"
+        );
+        assert!(err.contains("adopted pid 4242"), "{err}");
+    }
+
+    /// An ordinary factory error must NOT be marked, or every failed attach
+    /// would leak its VF rather than rolling back.
+    #[test]
+    fn an_ordinary_factory_error_is_not_marked() {
+        let err = SupervisionService::start(
+            "vpp-offload",
+            Box::new(|| Err("API mismatch for `ip_route_add_del`".into())),
+        )
+        .err()
+        .expect("start must fail");
+        assert!(!may_hold_resources(&err), "{err}");
+    }
+
     /// A pre-publish panic must SAY that resources may be held.
     ///
     /// The twin of the post-publish panic path, and it was left uncovered
@@ -1007,7 +1067,7 @@ mod tests {
         .err()
         .expect("start must fail");
         assert!(
-            err.starts_with(PANIC_MAY_HOLD_RESOURCES),
+            err.starts_with(MAY_HOLD_RESOURCES),
             "the caller cannot distinguish this from a clean failure: {err}"
         );
         assert!(err.contains("STILL RUNNING"), "{err}");
