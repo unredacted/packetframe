@@ -236,61 +236,86 @@ impl SupervisionService {
             // in flight is exactly the lie `teardown_failures` exists to
             // prevent.
             //
-            // `status()` is `Some` for any started service —
-            // `SupervisionService::start` blocks on the first publish — so
-            // the fallback below is unreachable in practice and is written
-            // as a real snapshot rather than a `?` that would silently
-            // discard the timeout.
-            let mut last = self.status().unwrap_or_else(|| Published {
-                report: HealthReport::healthy(),
-                metrics: String::new(),
-                state: State::Stopped,
-                api_error: None,
-                terminal: None,
-                teardown_failures: Vec::new(),
-                resources_leaked: false,
-                last_failures: Vec::new(),
-                store_error: None,
-            });
-            last.teardown_failures.push(format!(
+            return Some(self.incomplete_teardown(format!(
                 "the supervision loop was still working after {} ms and was not waited on \
                  further; VPP and its resources may still be held — it continues tearing \
                  down in the background, but check `packetframe status` and the state file \
                  before re-attaching",
                 DETACH_BUDGET.as_millis()
-            ));
-            last.resources_leaked = true;
-            // The rest of the snapshot is from the last ORDINARY publish,
-            // which may well say `Ready`/Healthy — it was true when the
-            // loop published it and is not true now. Returning it unchanged
-            // advertised healthy-and-ready alongside "teardown unfinished,
-            // resources may be held", in one object.
-            last.report.overall = packetframe_common::module::HealthState::Unhealthy;
-            last.report
-                .subsystems
-                .push(packetframe_common::module::SubsystemHealth {
-                    name: "supervision".into(),
-                    state: packetframe_common::module::HealthState::Unhealthy,
-                    message: Some(
-                        "shutdown did not complete within the detach budget; the loop is \
-                         still running"
-                            .into(),
-                    ),
-                    last_success_age_seconds: None,
-                });
-            // Metrics are emptied rather than adjusted. They were rendered
-            // from a snapshot that no longer describes anything, and
-            // rewriting individual gauge lines by string surgery would be a
-            // second, divergent renderer. No data beats stale data that
-            // reads as healthy.
-            last.metrics.clear();
-            return Some(last);
+            )));
         }
-        // A panicked loop already published nothing further; the join
-        // error carries no more than the panic message the thread
-        // printed, so it is not propagated as a second panic here.
-        let _ = t.join();
-        self.status()
+        // A panic is NOT a clean stop, and discarding the join error made
+        // it look like one. `is_finished()` is true for a panicked thread,
+        // so this path was reached with the last snapshot possibly saying
+        // `Ready`/Healthy — while the stop transition never ran at all.
+        // Dropping `Runtime` drops the process handle; it does not
+        // terminate VPP. So the process and its VF can still be live while
+        // `stop()` reports success.
+        //
+        // The panic payload itself is not propagated as a second panic
+        // here: the thread already printed it, and the caller needs a
+        // status, not an unwind.
+        match t.join() {
+            Ok(()) => self.status(),
+            Err(_) => Some(
+                self.incomplete_teardown(
+                    "the supervision loop PANICKED; the stop transition never ran, so VPP may \
+                 still be running and holding its VF and hugepages — check `ip link show`, \
+                 the state file and the log, and run `packetframe detach --all` before \
+                 re-attaching"
+                        .to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// The one place a shutdown that did not complete is turned into a
+    /// snapshot.
+    ///
+    /// Two callers — the detach-budget timeout and a panicked loop — and
+    /// they had started to diverge, which is the shape that has cost this
+    /// file seven review rounds. Both need exactly the same three things:
+    /// the reason on `teardown_failures`, `resources_leaked` set because
+    /// nothing confirmed a release, and the health snapshot corrected.
+    ///
+    /// The correction matters as much as the reason. The rest of the
+    /// snapshot comes from the last ORDINARY publish, which may well say
+    /// `Ready`/Healthy — true when it was published, not true now — so
+    /// returning it unchanged advertised a healthy dataplane alongside
+    /// "teardown unfinished, resources may be held", in one object.
+    /// Metrics are CLEARED rather than adjusted: they were rendered from a
+    /// snapshot that no longer describes anything, and rewriting gauge
+    /// lines by string surgery would be a second, divergent renderer. No
+    /// data beats stale data that reads as healthy.
+    fn incomplete_teardown(&self, why: String) -> Published {
+        // `status()` is `Some` for any started service — `start` blocks on
+        // the first publish — so the fallback is unreachable in practice
+        // and is written as a real snapshot rather than a `?` that would
+        // silently discard the reason.
+        let mut last = self.status().unwrap_or_else(|| Published {
+            report: HealthReport::healthy(),
+            metrics: String::new(),
+            state: State::Stopped,
+            api_error: None,
+            terminal: None,
+            teardown_failures: Vec::new(),
+            resources_leaked: false,
+            last_failures: Vec::new(),
+            store_error: None,
+        });
+        last.report.overall = packetframe_common::module::HealthState::Unhealthy;
+        last.report
+            .subsystems
+            .push(packetframe_common::module::SubsystemHealth {
+                name: "supervision".into(),
+                state: packetframe_common::module::HealthState::Unhealthy,
+                message: Some(why.clone()),
+                last_success_age_seconds: None,
+            });
+        last.teardown_failures.push(why);
+        last.resources_leaked = true;
+        last.metrics.clear();
+        last
     }
 
     /// Whether the loop thread is still running. `false` after `stop`,

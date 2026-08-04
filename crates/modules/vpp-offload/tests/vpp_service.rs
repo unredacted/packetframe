@@ -644,3 +644,113 @@ fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
 
     let _ = svc.stop();
 }
+
+/// A loop that panics AFTER its first publish must not read as a clean stop.
+///
+/// `is_finished()` is true for a panicked thread, so `stop()` reached its
+/// success path and returned the last snapshot — which may well say
+/// `Ready`/Healthy. Meanwhile the stop transition never ran, and dropping
+/// `Runtime` drops the process handle rather than terminating VPP: the
+/// process and its VF can still be live while detach reports success.
+///
+/// Timing is the whole difficulty. Everything that can fail during a SMALL
+/// convergence fails inside the initial injection, before the first publish —
+/// which makes `start()` return the factory-panicked error instead, a
+/// different and already-handled path. So the table here is large enough that
+/// the drain spans ticks: the first publish happens mid-drain, and the verify
+/// and the steer that follows it land after it. `Adopted { steered: true }` is
+/// what makes the machine steer at all.
+#[test]
+fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
+    struct PanicOnSteer;
+    impl packetframe_vpp_offload::runtime::Steering for PanicOnSteer {
+        fn steer(&mut self) -> Result<(), String> {
+            panic!("supervision loop panic, on purpose");
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let fake = Fake::start("svc-panic");
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                // Large enough that the drain spans several ticks
+                // (DRAIN_BATCH bounds one tick's work), so verify and the
+                // steer that follows it land AFTER the first publish.
+                Box::new(Mirror(
+                    (0..12_000u32)
+                        .map(|i| fake_vpp::v4((i >> 8) as u8, (i & 0xff) as u8))
+                        .collect(),
+                )),
+                Box::new(PanicOnSteer),
+                Box::new(NullStore),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready(), "the fake must answer the handshake");
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: true }],
+            ))
+        }),
+    )
+    .expect("start succeeds: the panic comes later");
+    assert!(
+        svc.status().is_some(),
+        "the first publish must have happened; that is the precondition"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while svc.is_alive() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!svc.is_alive(), "the loop was expected to panic");
+
+    let last = svc.stop().expect("a status, even after a panic");
+    assert!(
+        last.resources_leaked,
+        "nothing confirmed a release, so resources must be reported as possibly held: {:?}",
+        last.teardown_failures
+    );
+    assert!(
+        last.teardown_failures
+            .iter()
+            .any(|f| f.contains("PANICKED")),
+        "the panic must be named, not swallowed: {:?}",
+        last.teardown_failures
+    );
+    assert_eq!(
+        last.report.overall,
+        HealthState::Unhealthy,
+        "a panicked supervisor reported as healthy: {:?}",
+        last.report
+    );
+    assert!(
+        last.metrics.is_empty(),
+        "stale gauges outlived the loop that rendered them: {}",
+        last.metrics
+    );
+}
