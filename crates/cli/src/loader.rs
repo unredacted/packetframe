@@ -807,19 +807,31 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         ));
     }
 
-    let (bpffs_root, state_dir, settle_time) = match config {
+    // `config_has_vpp` decides whether a SCOPED detach may touch VPP.
+    //
+    // `--all` means "tear down modules beyond those in the supplied config",
+    // so `detach --config fast-path-only.conf` must leave the VPP dataplane
+    // alone — the first version of this teardown ran unconditionally and
+    // would have terminated a VPP the operator never asked about, purely
+    // because it shares the state dir.
+    let (bpffs_root, state_dir, settle_time, config_has_vpp) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
+            let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
             (
                 c.global.bpffs_root,
                 c.global.state_dir,
                 c.global.attach_settle_time,
+                has_vpp,
             )
         }
+        // No config at all: nothing scopes the request, so only `--all`
+        // authorises reaching past fast-path.
         None => (
             PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
             packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
+            false,
         ),
     };
 
@@ -831,12 +843,59 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // tells the operator to run `packetframe detach --all`, and that command
     // touched nothing but fast-path pins. The recovery path advertised
     // everywhere did not exist.
-    let _ = all;
+    //
+    // Every module is attempted and the failures are aggregated, rather than
+    // the first `?` ending the run. These teardowns are independent, and this
+    // command IS the recovery path: a corrupt fast-path registry must not be
+    // the reason a supervised VPP keeps holding its VF and hugepages.
+    // `mut` is unused in the build with neither module feature enabled —
+    // nothing can push. Not a CI configuration (clippy runs
+    // `--all-features`), but a warning is a warning.
+    #[cfg_attr(
+        not(any(feature = "fast-path", feature = "vpp-offload")),
+        allow(unused_mut)
+    )]
+    let mut errors: Vec<String> = Vec::new();
 
     #[cfg(feature = "fast-path")]
+    if let Err(e) = detach_fast_path(&bpffs_root, &state_dir, settle_time) {
+        errors.push(e);
+    }
+
+    #[cfg(feature = "vpp-offload")]
+    if all || config_has_vpp {
+        if let Err(e) = detach_vpp_offload(&state_dir) {
+            errors.push(e);
+        }
+    } else {
+        tracing::info!(
+            "vpp-offload state left alone: this detach is scoped to the supplied config; \
+             use `--all` to tear down modules it does not declare"
+        );
+    }
+    #[cfg(not(feature = "vpp-offload"))]
+    let _ = (all, config_has_vpp);
+
+    if !errors.is_empty() {
+        return Err(errors.join("; AND "));
+    }
+    Ok(())
+}
+
+/// The fast-path half of `detach`, unchanged except for being callable.
+///
+/// Split out so its `?`s abort only its own teardown: as one inline block its
+/// first error returned from `detach` entirely, which meant an unrelated
+/// module's failure could strand VPP's VFs.
+#[cfg(feature = "fast-path")]
+fn detach_fast_path(
+    bpffs_root: &Path,
+    state_dir: &Path,
+    settle_time: std::time::Duration,
+) -> Result<(), String> {
     {
         use packetframe_fast_path::registry::load as registry_load;
-        match registry_load(&state_dir) {
+        match registry_load(state_dir) {
             Ok(Some(file)) => {
                 tracing::info!(
                     module = %file.module,
@@ -865,10 +924,10 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         // post-rc5 fix for the EFG kernel-panic-on-detach observed
         // during Phase 4 cutover testing. Map + program pins are
         // housekeeping with no kernel-link side effects, no pacing.
-        packetframe_fast_path::pin::remove_all_paced(&bpffs_root, settle_time)
+        packetframe_fast_path::pin::remove_all_paced(bpffs_root, settle_time)
             .map_err(|e| format!("remove pins under {}: {e}", bpffs_root.display()))?;
         tracing::info!(
-            pin_root = %packetframe_fast_path::pin::module_root(&bpffs_root).display(),
+            pin_root = %packetframe_fast_path::pin::module_root(bpffs_root).display(),
             settle_secs = settle_time.as_secs_f64(),
             "pins removed; kernel detached"
         );
@@ -878,19 +937,16 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         // record. No-op when tc-links.json doesn't exist.
         #[cfg(target_os = "linux")]
         {
-            let n = packetframe_fast_path::tc_detach_from_state_dir(&state_dir)
+            let n = packetframe_fast_path::tc_detach_from_state_dir(state_dir)
                 .map_err(|e| format!("tc filter teardown: {e}"))?;
             if n > 0 {
                 tracing::info!(count = n, "tc filters detached");
             }
         }
 
-        packetframe_fast_path::registry::remove(&state_dir)
+        packetframe_fast_path::registry::remove(state_dir)
             .map_err(|e| format!("registry remove: {e}"))?;
     }
-
-    #[cfg(feature = "vpp-offload")]
-    detach_vpp_offload(&state_dir)?;
 
     Ok(())
 }
