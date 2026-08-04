@@ -54,6 +54,17 @@ const STOP_POLL_CAP: Duration = Duration::from_millis(50);
 /// the final published status says which.
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
+/// Marker prefixed to the error from a pre-publish panic.
+///
+/// Exists so a caller can distinguish "attach failed and left nothing
+/// behind" from "attach failed and may have left a live VPP holding a VF".
+/// The two demand opposite handling: the first should roll back, the second
+/// must NOT, because releasing a VF under a process that can still DMA
+/// through it is worse than leaking it. Matching on a string is crude, and
+/// preferable to the alternative that was there — a generic message that
+/// made the distinction invisible.
+pub const PANIC_MAY_HOLD_RESOURCES: &str = "SUPERVISION PANIC (resources may be held)";
+
 /// Cap on distinct reasons retained for one unhealthy episode.
 ///
 /// Enough for a cause plus a few symptoms, small enough that a backoff loop
@@ -181,11 +192,33 @@ impl SupervisionService {
             }
             Err(_) => {
                 let _ = thread.join();
-                Err(
-                    "the supervision loop died before publishing its first status — the \
-                     factory panicked (see the log)"
-                        .into(),
-                )
+                // A panic BEFORE the first publish, which is the twin of
+                // the post-publish one `stop()` handles — and it was left
+                // uncovered when that one was fixed.
+                //
+                // There is nothing to tear down from here and no snapshot
+                // to correct: the thread unwound, and unwinding dropped
+                // `Runtime`, which drops the VPP process handle WITHOUT
+                // terminating the process. So if the factory had already
+                // adopted (or the initial injection had already spawned) a
+                // VPP, it is still running, still holding its VF and
+                // hugepages, and nothing left in this address space can
+                // reach it. The only remedy is telling the operator, in
+                // words that say what to do.
+                //
+                // `PANIC_MAY_HOLD_RESOURCES` is a marker the caller can
+                // match on: `bring_up`'s rollback must NOT release VFs and
+                // hugepages after this, because releasing them under a live
+                // VPP is the DMA hazard the whole `MustLeak` path exists to
+                // avoid.
+                Err(format!(
+                    "{PANIC_MAY_HOLD_RESOURCES}: the supervision loop panicked before \
+                     publishing its first status (see the log). If it had already adopted \
+                     or started VPP, that process is STILL RUNNING and still holds its VF \
+                     and hugepages — nothing here can reach it any more. Run `packetframe \
+                     detach --all` and check `ip link show` and the state file before \
+                     re-attaching."
+                ))
             }
         }
     }
@@ -828,6 +861,34 @@ mod tests {
         );
         let err = result.err().expect("start must fail");
         assert!(err.contains("API mismatch"), "{err}");
+    }
+
+    /// A pre-publish panic must SAY that resources may be held.
+    ///
+    /// The twin of the post-publish panic path, and it was left uncovered
+    /// when that one was fixed. Nothing here can tear down: the thread
+    /// unwound, and unwinding dropped `Runtime`, which drops the VPP
+    /// process handle without terminating the process. So the only remedy
+    /// is an error an operator can act on — and a marker `bring_up` can
+    /// match on, because its rollback must NOT release a VF that a live VPP
+    /// may still be DMAing through.
+    #[test]
+    fn a_pre_publish_panic_says_resources_may_be_held() {
+        let err = SupervisionService::start(
+            "vpp-offload",
+            Box::new(|| panic!("initial injection panicked on purpose")),
+        )
+        .err()
+        .expect("start must fail");
+        assert!(
+            err.starts_with(PANIC_MAY_HOLD_RESOURCES),
+            "the caller cannot distinguish this from a clean failure: {err}"
+        );
+        assert!(err.contains("STILL RUNNING"), "{err}");
+        assert!(
+            err.contains("detach --all"),
+            "the remedy must be named: {err}"
+        );
     }
 
     /// A factory that PANICS must not leave a dead thread behind a
