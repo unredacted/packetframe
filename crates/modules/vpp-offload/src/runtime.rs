@@ -94,6 +94,28 @@ pub trait IdentityStore {
     fn interfaces_attached(&mut self, indices: &[(String, u32)]) -> Result<(), String>;
 }
 
+/// Hands back the VF/vfio/hugepage resources attach acquired.
+///
+/// Separate from [`IdentityStore`] because the two are called by
+/// different actors at different moments — the store on every observed
+/// identity change, this exactly once, from the executor's
+/// `ReleaseResources`, and only when teardown reported clean. It is a
+/// constructor argument rather than an optional setter for the reason
+/// this phase keeps relearning: an omitted-by-default seam is one nobody
+/// notices is unwired, and the symptom here would be a `detach` that
+/// reports success over still-held VFs.
+///
+/// The implementation ([`crate::acquire::ResourceOwner`]) shares one
+/// [`crate::resources::ResourceState`] with the identity store, so that
+/// a `process_changed` arriving after the release cannot re-create a
+/// state file describing resources that are gone.
+pub trait ResourceRelease {
+    /// `Ok` means everything the state recorded is confirmed released
+    /// and the state file is gone. `Err` means some of it is still held,
+    /// and the message names what.
+    fn release(&mut self) -> Result<(), String>;
+}
+
 /// Store that records nothing. Tests only — a production runtime with a
 /// null store produces orphans no future daemon can adopt.
 #[derive(Debug, Default)]
@@ -105,6 +127,19 @@ impl IdentityStore for NullStore {
     }
     fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// Releases nothing, and says so. Tests only, and it must keep
+/// **refusing**: `Ok` from a release the supervisor believes is real
+/// would clear `resources_leaked` and let `detach` report freed VFs that
+/// are still bound to vfio.
+#[derive(Debug, Default)]
+pub struct NoResources;
+
+impl ResourceRelease for NoResources {
+    fn release(&mut self) -> Result<(), String> {
+        Err("this runtime holds no resources to release".into())
     }
 }
 
@@ -151,6 +186,7 @@ struct Core {
     source: Box<dyn RouteSource>,
     steering: Box<dyn Steering>,
     store: Box<dyn IdentityStore>,
+    resources: Box<dyn ResourceRelease>,
     vpp_binary: PathBuf,
     startup_conf: PathBuf,
     /// Whether this convergence adopts interfaces VPP already has.
@@ -191,6 +227,7 @@ impl Runtime {
         source: Box<dyn RouteSource>,
         steering: Box<dyn Steering>,
         store: Box<dyn IdentityStore>,
+        resources: Box<dyn ResourceRelease>,
         vpp_binary: impl Into<PathBuf>,
         startup_conf: impl Into<PathBuf>,
     ) -> Self {
@@ -201,6 +238,7 @@ impl Runtime {
                 source,
                 steering,
                 store,
+                resources,
                 vpp_binary: vpp_binary.into(),
                 startup_conf: startup_conf.into(),
                 attach_mode: crate::attach::AttachMode::Fresh,
@@ -569,11 +607,12 @@ impl Effects for EffectsView {
     }
 
     fn release_resources(&mut self) -> Result<(), String> {
-        // Owned by the attach wiring, which holds the ResourceState
-        // and the sysfs paths. The runtime cannot release what it
-        // never acquired; wiring this to a no-op Ok would report
-        // resources freed that are still held.
-        Err("resource release is owned by the attach wiring (not yet built)".into())
+        // The state file and the sysfs paths belong to the attach
+        // wiring, so this delegates rather than reaching for them; see
+        // [`ResourceRelease`]. The executor only ever calls this after
+        // teardown reported clean, so a live VPP cannot be DMAing into
+        // what it releases.
+        self.core.borrow_mut().resources.release()
     }
 }
 
@@ -609,6 +648,7 @@ mod tests {
             Box::new(EmptySource),
             Box::new(SteeringUnavailable),
             Box::new(NullStore),
+            Box::new(NoResources),
             "/usr/bin/vpp",
             "/tmp/startup.conf",
         )
@@ -669,9 +709,15 @@ mod tests {
         assert_eq!(fx.kill(), Disposition::SafeToRelease);
     }
 
-    /// `release_resources` refuses rather than no-ops: reporting
-    /// resources freed that the (unbuilt) attach wiring still holds is
-    /// the requested-vs-observed bug in its purest form.
+    /// `release_resources` refuses rather than no-ops: reporting resources
+    /// freed that something else still holds is the requested-vs-observed
+    /// bug in its purest form.
+    ///
+    /// This runtime is built with [`NoResources`], so the refusal comes from
+    /// the seam having nothing to release — not from the attach wiring being
+    /// absent, which it no longer is. (The earlier wording said "unbuilt".
+    /// A comment whose truth expires is how `detach --all` came to promise a
+    /// recovery path it did not have.)
     #[test]
     fn release_refuses_until_the_owner_exists() {
         let rt = runtime();
@@ -715,6 +761,7 @@ mod tests {
             Box::new(EmptySource),
             Box::new(SteeringUnavailable),
             Box::new(FailingStore),
+            Box::new(NoResources),
             // Any spawnable binary will do; it is killed immediately.
             "/bin/sleep",
             "/dev/null",
@@ -749,6 +796,7 @@ mod tests {
             Box::new(EmptySource),
             Box::new(SteeringUnavailable),
             Box::new(Recording(Arc::clone(&log))),
+            Box::new(NoResources),
             // `VppProcess::spawn(binary, conf)` execs `binary -c conf`;
             // /bin/true exits immediately regardless of arguments,
             // which is exactly what this test wants.

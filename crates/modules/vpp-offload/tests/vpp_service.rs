@@ -20,7 +20,7 @@ use packetframe_vpp_offload::driver::Driver;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 use packetframe_vpp_offload::runtime::{
-    IdentityStore, NullStore, ProcessIdentity, Runtime, SteeringUnavailable,
+    IdentityStore, NoResources, NullStore, ProcessIdentity, Runtime, SteeringUnavailable,
 };
 use packetframe_vpp_offload::service::SupervisionService;
 use packetframe_vpp_offload::supervisor::{Event, State};
@@ -62,6 +62,7 @@ fn the_service_converges_publishes_health_and_stops_clean() {
                 Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/usr/bin/vpp",
                 "/tmp/startup.conf",
             );
@@ -129,9 +130,13 @@ fn the_service_converges_publishes_health_and_stops_clean() {
     // Stop: the machine is handed StopRequested, settles in Stopped,
     // and the final snapshot says so — INCLUDING the failures the stop
     // transition produced after the supervisor was already Stopped.
-    // The runtime's release_resources refuses by design until the
-    // attach wiring exists, and that refusal must reach the caller
-    // rather than vanish with a discarded Tick.
+    // This runtime holds no resources, so its release seam refuses; that
+    // refusal must reach the caller rather than vanish with a discarded
+    // Tick, which is the property under test. Asserted on the ACTION,
+    // not on the seam's wording: the message belongs to whichever
+    // `ResourceRelease` is installed, and a test keyed to one
+    // implementation's prose stops checking anything the moment a real
+    // one is wired in.
     let last = svc.stop().published.expect("final status");
     assert_eq!(last.state, State::Stopped, "{:?}", last.report);
     assert!(
@@ -142,7 +147,7 @@ fn the_service_converges_publishes_health_and_stops_clean() {
     assert!(
         last.teardown_failures
             .iter()
-            .any(|f| f.contains("attach wiring")),
+            .any(|f| f.starts_with("ReleaseResources:")),
         "the refused resource release must be on the record: {:?}",
         last.teardown_failures
     );
@@ -273,6 +278,7 @@ fn an_unpersisted_identity_degrades_health_and_is_named() {
                 Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
                 Box::new(SteeringUnavailable),
                 Box::new(RefusingStore),
+                Box::new(NoResources),
                 "/usr/bin/vpp",
                 "/tmp/startup.conf",
             );
@@ -396,6 +402,7 @@ fn a_failing_verifys_teardown_failures_are_published_and_retained() {
                 // Refuses both directions until slice 5 builds MCAM.
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/usr/bin/vpp",
                 "/tmp/startup.conf",
             );
@@ -512,6 +519,7 @@ fn the_initial_injections_failures_reach_the_first_snapshot() {
                 Box::new(Mirror(Vec::new())),
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/nonexistent/vpp",
                 "/tmp/startup.conf",
             );
@@ -586,6 +594,7 @@ fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
                 Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/nonexistent/vpp",
                 "/tmp/startup.conf",
             );
@@ -702,6 +711,7 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
                 )),
                 Box::new(PanicOnSteer),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/usr/bin/vpp",
                 "/tmp/startup.conf",
             );
@@ -797,6 +807,7 @@ fn an_episode_keeps_its_root_cause_alongside_the_latest_symptom() {
                 Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 // And the respawn cannot succeed, which is the symptom.
                 "/nonexistent/vpp",
                 "/tmp/startup.conf",
@@ -894,6 +905,7 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
                 Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/usr/bin/vpp",
                 "/tmp/startup.conf",
             );
@@ -1018,6 +1030,7 @@ fn the_timeout_correction_survives_the_in_flight_tick() {
                 Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
                 Box::new(SteeringUnavailable),
                 Box::new(NullStore),
+                Box::new(NoResources),
                 "/usr/bin/vpp",
                 "/tmp/startup.conf",
             );

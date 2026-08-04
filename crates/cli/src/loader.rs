@@ -174,10 +174,31 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 Box::new(FastPathModule::new()) as Box<dyn Module>,
             )),
             #[cfg(feature = "vpp-offload")]
-            "vpp-offload" => modules.push((
-                section.name.clone(),
-                Box::new(packetframe_vpp_offload::VppOffloadModule::new()) as Box<dyn Module>,
-            )),
+            "vpp-offload" => {
+                // Refused HERE, before fast-path attaches, rather than
+                // discovered as a mid-attach unwind.
+                //
+                // The module is complete except for its route feed: nothing
+                // calls `set_route_source`, because reaching across to the
+                // fast-path RouteController's mirror touches the live
+                // control plane and carries an unresolved access decision
+                // (the mirror lives inside the programmer task and is
+                // reachable only by command; a full-table reply, a shared
+                // lock, and a second mirror all trade differently). Until
+                // that lands, `attach` correctly refuses — a VPP with an
+                // empty FIB passes every health check and blackholes every
+                // steered packet — and letting startup discover that after
+                // fast-path has already attached just makes the operator
+                // read an unwind log to learn it.
+                return Err(RunError::Startup(
+                    "module vpp-offload cannot run yet: its route feed is not wired, so \
+                     VPP would come up with an empty FIB. Remove the `module vpp-offload` \
+                     section to start. (Everything else — resources, supervision, \
+                     convergence, health — is in place; `packetframe feasibility` still \
+                     reports its probes.)"
+                        .into(),
+                ));
+            }
             other => {
                 return Err(RunError::Startup(format!(
                     "unknown module `{other}` in {}",
@@ -807,31 +828,95 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         ));
     }
 
-    let (bpffs_root, state_dir, settle_time) = match config {
+    // `config_has_vpp` decides whether a SCOPED detach may touch VPP.
+    //
+    // `--all` means "tear down modules beyond those in the supplied config",
+    // so `detach --config fast-path-only.conf` must leave the VPP dataplane
+    // alone — the first version of this teardown ran unconditionally and
+    // would have terminated a VPP the operator never asked about, purely
+    // because it shares the state dir.
+    let (bpffs_root, state_dir, settle_time, config_has_vpp) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
+            let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
             (
                 c.global.bpffs_root,
                 c.global.state_dir,
                 c.global.attach_settle_time,
+                has_vpp,
             )
         }
+        // No config at all: nothing scopes the request, so only `--all`
+        // authorises reaching past fast-path.
         None => (
             PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
             packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
+            false,
         ),
     };
 
-    // v0.1 has one module (fast-path), so `--all` and the default case
-    // behave identically, both tear down every pin under the module's
-    // pin root. `--all` becomes meaningful once a second module ships.
-    let _ = all;
+    // `--all` used to be a no-op with a comment saying it would "become
+    // meaningful once a second module ships". A second module has now
+    // shipped, and the comment outlived its truth: every message this
+    // codebase prints about held VFs — from the module, from `bring_up`'s
+    // rollback, from the supervision service's timeout and panic paths —
+    // tells the operator to run `packetframe detach --all`, and that command
+    // touched nothing but fast-path pins. The recovery path advertised
+    // everywhere did not exist.
+    //
+    // Every module is attempted and the failures are aggregated, rather than
+    // the first `?` ending the run. These teardowns are independent, and this
+    // command IS the recovery path: a corrupt fast-path registry must not be
+    // the reason a supervised VPP keeps holding its VF and hugepages.
+    // `mut` is unused in the build with neither module feature enabled —
+    // nothing can push. Not a CI configuration (clippy runs
+    // `--all-features`), but a warning is a warning.
+    #[cfg_attr(
+        not(any(feature = "fast-path", feature = "vpp-offload")),
+        allow(unused_mut)
+    )]
+    let mut errors: Vec<String> = Vec::new();
 
     #[cfg(feature = "fast-path")]
+    if let Err(e) = detach_fast_path(&bpffs_root, &state_dir, settle_time) {
+        errors.push(e);
+    }
+
+    #[cfg(feature = "vpp-offload")]
+    if all || config_has_vpp {
+        if let Err(e) = detach_vpp_offload(&state_dir) {
+            errors.push(e);
+        }
+    } else {
+        tracing::info!(
+            "vpp-offload state left alone: this detach is scoped to the supplied config; \
+             use `--all` to tear down modules it does not declare"
+        );
+    }
+    #[cfg(not(feature = "vpp-offload"))]
+    let _ = (all, config_has_vpp);
+
+    if !errors.is_empty() {
+        return Err(errors.join("; AND "));
+    }
+    Ok(())
+}
+
+/// The fast-path half of `detach`, unchanged except for being callable.
+///
+/// Split out so its `?`s abort only its own teardown: as one inline block its
+/// first error returned from `detach` entirely, which meant an unrelated
+/// module's failure could strand VPP's VFs.
+#[cfg(feature = "fast-path")]
+fn detach_fast_path(
+    bpffs_root: &Path,
+    state_dir: &Path,
+    settle_time: std::time::Duration,
+) -> Result<(), String> {
     {
         use packetframe_fast_path::registry::load as registry_load;
-        match registry_load(&state_dir) {
+        match registry_load(state_dir) {
             Ok(Some(file)) => {
                 tracing::info!(
                     module = %file.module,
@@ -860,10 +945,10 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         // post-rc5 fix for the EFG kernel-panic-on-detach observed
         // during Phase 4 cutover testing. Map + program pins are
         // housekeeping with no kernel-link side effects, no pacing.
-        packetframe_fast_path::pin::remove_all_paced(&bpffs_root, settle_time)
+        packetframe_fast_path::pin::remove_all_paced(bpffs_root, settle_time)
             .map_err(|e| format!("remove pins under {}: {e}", bpffs_root.display()))?;
         tracing::info!(
-            pin_root = %packetframe_fast_path::pin::module_root(&bpffs_root).display(),
+            pin_root = %packetframe_fast_path::pin::module_root(bpffs_root).display(),
             settle_secs = settle_time.as_secs_f64(),
             "pins removed; kernel detached"
         );
@@ -873,17 +958,164 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         // record. No-op when tc-links.json doesn't exist.
         #[cfg(target_os = "linux")]
         {
-            let n = packetframe_fast_path::tc_detach_from_state_dir(&state_dir)
+            let n = packetframe_fast_path::tc_detach_from_state_dir(state_dir)
                 .map_err(|e| format!("tc filter teardown: {e}"))?;
             if n > 0 {
                 tracing::info!(count = n, "tc filters detached");
             }
         }
 
-        packetframe_fast_path::registry::remove(&state_dir)
+        packetframe_fast_path::registry::remove(state_dir)
             .map_err(|e| format!("registry remove: {e}"))?;
     }
 
+    Ok(())
+}
+
+/// Release what vpp-offload's state file records: the supervised VPP, its
+/// VFs and vfio bindings, and the hugepage reservation.
+///
+/// This is the standalone recovery path, and it has to exist separately from
+/// `Module::detach` because the two run at different times. `Module::detach`
+/// needs a live daemon holding the supervision handle; but the daemon's
+/// ordinary SIGTERM exit deliberately PRESERVES VPP for adoption (SPEC.md
+/// §8.5), and `packetframe detach` refuses to run while a daemon is alive.
+/// So by the time an operator can invoke this, the in-memory handle is gone
+/// and the state file is the only record of what is held.
+///
+/// **Ordering is the same discipline the module's teardown uses, for the same
+/// reason.** VPP is killed first and resources are released only if it is
+/// confirmed gone: unbinding a VF or handing back hugepages while a process
+/// can still DMA through them is memory corruption, whereas leaking a VF is a
+/// line in `packetframe status` and a reboot's worth of inconvenience.
+/// Steering is not unwound here because MCAM is not implemented yet; when it
+/// is, it must come first (before the kill), or traffic is left pointed at a
+/// VF nothing services.
+#[cfg(feature = "vpp-offload")]
+fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
+    use packetframe_vpp_offload::acquire::{release, SysPaths};
+    use packetframe_vpp_offload::process::{terminate_or_leak, Disposition, VppProcess};
+    use packetframe_vpp_offload::resources::ResourceState;
+    use packetframe_vpp_offload::runtime::TERM_GRACE;
+
+    let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
+        return Ok(()); // nothing was ever acquired
+    };
+
+    // Recorded MCAM rules mean traffic is DIVERTED to a VF this function is
+    // about to unbind. Refuse.
+    //
+    // The module's teardown ordering is unsteer → abort → kill → release, and
+    // the first step is not decoration: releasing a VF that MCAM still points
+    // at leaves steered traffic arriving at a function nothing services — a
+    // blackhole, which is the failure the whole `Disposition::MustLeak`
+    // discipline exists to avoid, reached from the other direction. This path
+    // cannot unsteer, because MCAM is not implemented until slice 5.
+    //
+    // `steer_rules` is always empty today for exactly that reason, so this is
+    // a guard against a future state rather than a live bug. It is a guard
+    // and not a comment deliberately: "when steering ships, unsteer here
+    // first" is the kind of note this session has watched expire more than
+    // once, and a refusal cannot be forgotten.
+    if !state.steer_rules.is_empty() {
+        let ifaces: Vec<&str> = state
+            .steer_rules
+            .iter()
+            .map(|(iface, _)| iface.as_str())
+            .collect();
+        return Err(format!(
+            "vpp-offload: the state file records MCAM steering rules on {}, so traffic is \
+             being diverted to VF(s) this teardown would unbind — that would blackhole it. \
+             This command cannot remove those rules (MCAM steering is not implemented yet); \
+             clear them first, then re-run.",
+            ifaces.join(", ")
+        ));
+    }
+
+    // Kill the recorded VPP first, if it is still the process we recorded.
+    //
+    // The identity must be COMPLETE — pid, start_ticks AND boot_id — before
+    // either action is safe, and that is the whole of this block's caution.
+    // `VppProcess::adopt` returns `Ok(None)` for two very different reasons:
+    // the process is genuinely gone, or the identity could not be verified
+    // and it refused to guess. Reading the second as the first is what makes
+    // it dangerous — this code passed `boot_id: None` straight through and
+    // then treated the refusal as "gone", releasing the VF under a VPP that
+    // may well have still been running. `process.rs` has a test named
+    // `adoption_without_a_recorded_boot_id_is_refused` whose doc says exactly
+    // that a boot-id-less record "cannot establish identity at all, and must
+    // be refused rather than trusted".
+    //
+    // With a complete identity, `Ok(None)` really does mean gone: the pid is
+    // dead, or its start time or boot id no longer match, and in every one of
+    // those cases the process we recorded does not exist.
+    if let Some(pid) = state.vpp_pid {
+        let (Some(ticks), Some(boot)) = (state.vpp_start_ticks, state.vpp_boot_id.clone()) else {
+            let missing = match (state.vpp_start_ticks, &state.vpp_boot_id) {
+                (None, None) => "start-time cookie and boot id",
+                (None, Some(_)) => "start-time cookie",
+                _ => "boot id",
+            };
+            return Err(format!(
+                "vpp-offload: the state file records pid {pid} with no {missing}, so that \
+                 process can neither be identified nor ruled out. It must not be signalled \
+                 (that risks SIGKILLing an unrelated process as root) and its VF and \
+                 hugepages must not be released (that risks unbinding under a live VPP). \
+                 Confirm by hand that no VPP is running, then remove the state file."
+            ));
+        };
+        match VppProcess::adopt(pid, ticks, Some(&boot)) {
+            Ok(Some(mut p)) => {
+                tracing::info!(pid, "vpp-offload: terminating the recorded VPP");
+                if terminate_or_leak(&mut p, TERM_GRACE) == Disposition::MustLeak {
+                    // Refuse to release. The process survived SIGKILL — most
+                    // likely parked in an uninterruptible VFIO/DMA call — and
+                    // the state file stays intact so a later attempt can
+                    // finish the job.
+                    return Err(format!(
+                        "vpp-offload: VPP (pid {pid}) survived SIGKILL, so its VF and \
+                         hugepages were deliberately NOT released — releasing them under a \
+                         process that can still DMA through them is worse than leaking \
+                         them. The state file still records everything; retry once \
+                         `ps {pid}` is empty."
+                    ));
+                }
+            }
+            // Verified against a complete identity, so this is genuinely gone.
+            Ok(None) => tracing::info!(
+                pid,
+                "vpp-offload: the recorded VPP is gone; releasing its resources"
+            ),
+            Err(e) => {
+                return Err(format!(
+                    "vpp-offload: could not establish whether the recorded VPP (pid {pid}) \
+                     is still running ({e}); refusing to release its VF and hugepages while \
+                     that is unknown"
+                ))
+            }
+        }
+    }
+
+    // Point release at the pool the state file RECORDS, not the pool that
+    // happens to be the default now.
+    //
+    // `release` deliberately refuses a pool mismatch — freeing the wrong
+    // pool while leaking the real reservation is worse than failing — so
+    // using the current default meant that if the kernel's default page size
+    // changed between attach and detach (a reboot between the fleet's 512 MiB
+    // and 2 MiB defaults does it), release would free the VFs, refuse the
+    // pool, keep the reservation in state, and then recompute the same wrong
+    // default on every retry. The advertised recovery command could never
+    // restore that pool. A recorded `0` means attach owned no reservation, so
+    // there is nothing to match and the current default is fine.
+    let pool_bytes = if state.hugepage_pool_bytes != 0 {
+        state.hugepage_pool_bytes
+    } else {
+        packetframe_vpp_offload::default_hugepage_bytes()
+    };
+    let paths = SysPaths::live(state_dir, pool_bytes);
+    release(&paths, state).map_err(|e| format!("vpp-offload: {e}"))?;
+    tracing::info!("vpp-offload: VFs rebound and hugepages restored");
     Ok(())
 }
 
@@ -1052,4 +1284,111 @@ fn trial_attach_probes(ifaces: &[String]) -> Vec<(String, String)> {
 #[cfg(not(all(target_os = "linux", feature = "fast-path")))]
 fn trial_attach_probes(_ifaces: &[String]) -> Vec<(String, String)> {
     Vec::new()
+}
+
+#[cfg(all(test, feature = "vpp-offload"))]
+mod vpp_detach_tests {
+    use super::*;
+
+    /// A recorded pid with no start-time cookie must not be signalled, and
+    /// its resources must not be released either.
+    ///
+    /// The pair `(pid, start_ticks)` is what makes a process identity
+    /// verifiable across PID reuse; without the cookie we can neither
+    /// confirm the recorded VPP is still running nor rule it out. Signalling
+    /// would risk SIGKILLing a stranger as root; releasing would risk
+    /// unbinding a VF under a live VPP. So it refuses and says what to do —
+    /// and it refuses BEFORE touching sysfs, which is what makes this
+    /// testable off a router.
+    #[test]
+    fn a_pid_without_a_start_cookie_is_refused() {
+        use packetframe_vpp_offload::resources::ResourceState;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ResourceState::empty();
+        state.vpp_pid = Some(4242);
+        state.vpp_start_ticks = None; // the cookie is missing
+        state.save(&dir).unwrap();
+
+        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        assert!(e.contains("4242"), "{e}");
+        assert!(
+            e.contains("must not be signalled"),
+            "the reason must be stated: {e}"
+        );
+        // The record survives, so a later attempt can still act on it.
+        assert!(ResourceState::load(&dir).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No state file means nothing was ever acquired: a clean no-op, so
+    /// `detach --all` stays idempotent for operators who run it habitually.
+    /// A record with a start-time cookie but NO boot id must be refused too.
+    ///
+    /// `VppProcess::adopt` returns `Ok(None)` here because it cannot verify
+    /// the identity, not because the process is gone — `start_ticks` counts
+    /// from boot while the state file under /var/lib survives a reboot, so
+    /// without the boot id an unrelated process can satisfy a (pid, ticks)
+    /// check. Treating that refusal as "gone" released the VF under a VPP
+    /// that may still have been running.
+    #[test]
+    fn a_pid_without_a_boot_id_is_refused() {
+        use packetframe_vpp_offload::resources::ResourceState;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-boot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ResourceState::empty();
+        state.vpp_pid = Some(4242);
+        state.vpp_start_ticks = Some(99_999);
+        state.vpp_boot_id = None; // the third leg is missing
+        state.save(&dir).unwrap();
+
+        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        assert!(e.contains("boot id"), "the missing leg must be named: {e}");
+        assert!(
+            e.contains("must not be signalled"),
+            "and the reason stated: {e}"
+        );
+        assert!(
+            ResourceState::load(&dir).unwrap().is_some(),
+            "the record must survive so a later attempt can act on it"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Recorded steering rules must block the teardown.
+    ///
+    /// The module unsteers before it releases, because releasing a VF that
+    /// MCAM still points at blackholes the traffic it diverts. This path
+    /// cannot unsteer (no MCAM yet), so it must refuse rather than release.
+    /// Latent today — `steer_rules` is always empty — which is precisely why
+    /// it is a guard with a test rather than a note for later.
+    #[test]
+    fn recorded_steering_rules_block_the_teardown() {
+        use packetframe_vpp_offload::resources::ResourceState;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-steer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = ResourceState::empty();
+        state.steer_rules = vec![("eth5".to_string(), vec![0, 1])];
+        state.save(&dir).unwrap();
+
+        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        assert!(e.contains("eth5"), "the steered port must be named: {e}");
+        assert!(e.contains("blackhole"), "and the consequence stated: {e}");
+        assert!(
+            ResourceState::load(&dir).unwrap().is_some(),
+            "the record must survive"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_state_file_is_a_clean_no_op() {
+        let dir = std::env::temp_dir().join(format!("pf-detach-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(detach_vpp_offload(&dir).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

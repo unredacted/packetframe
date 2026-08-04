@@ -97,6 +97,29 @@ pub struct PortState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceState {
     pub version: u32,
+    /// The `expected-routes` this attach sized VPP for.
+    ///
+    /// Recorded because it is the independent variable of the memory
+    /// arithmetic: it sets the main heap and the stats segment in the
+    /// rendered startup.conf, and VPP fixes both **at start**. An
+    /// adoption under a raised `expected-routes` would therefore apply
+    /// the new, larger route ceiling
+    /// ([`crate::startup_conf::route_capacity`]) to a VPP still running
+    /// on the old, smaller segments — and the route ledger would happily
+    /// fill past what they hold. That is precisely the mid-resync OOM
+    /// abort gate 0b found, arriving through the adoption door instead of
+    /// the sizing one, so `acquire` refuses the change.
+    ///
+    /// `serde(default)` so a file written before this field still
+    /// **parses** — `detach --all` never reads the sizing, and a parse
+    /// error would wedge the release door as well as the adoption one.
+    /// Its `0` is then refused for adoption: unknown sizing is not the
+    /// same as no constraint, and nothing can recover the figure a
+    /// running VPP started under. (No such file can exist in practice —
+    /// `acquire` has only ever been reachable from `bringup`, which is
+    /// newer than this field.)
+    #[serde(default)]
+    pub expected_routes: u64,
     /// Hugepages reserved at attach: (pool bytes, page count).
     /// `(0, 0)` = attach found a sufficient pre-existing reservation
     /// and owns nothing (release then leaves reservations alone).
@@ -152,6 +175,7 @@ impl ResourceState {
     pub fn empty() -> Self {
         Self {
             version: STATE_VERSION,
+            expected_routes: 0,
             hugepage_pool_bytes: 0,
             hugepage_pages: 0,
             hugepage_prior_pages: 0,
