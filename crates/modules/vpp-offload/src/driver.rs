@@ -139,6 +139,20 @@ impl Driver {
         &self.sup
     }
 
+    /// The API's liveness as the health surface classifies it, from
+    /// the driver's own detector and budget selection.
+    ///
+    /// Lives here because the detector is deliberately private: it must
+    /// not exist before the first pong, and exposing it raw invites a
+    /// caller to consult it in exactly that window. The budget comes
+    /// from the same `budget_for` the wedge decision uses, so status
+    /// can never disagree with the detector about what "too silent"
+    /// means.
+    pub fn api_health(&self, now: Instant) -> crate::status::ApiHealth {
+        let budget = budget_for(self.sup.is_steered(), self.sup.is_converging());
+        crate::status::ApiHealth::observe(self.sup.state(), self.detector.as_ref(), now, budget)
+    }
+
     /// Feed an externally-sourced event (an operator's start/stop, an
     /// adoption) and run its actions.
     pub fn inject(&mut self, now: Instant, event: Event, fx: &mut dyn Effects) -> Tick {

@@ -44,6 +44,7 @@ pub mod process;
 pub mod resources;
 pub mod runtime;
 pub mod schedule;
+pub mod service;
 pub mod sink;
 pub mod startup_conf;
 pub mod status;

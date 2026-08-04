@@ -252,6 +252,31 @@ impl StatusSnapshot {
         fib: FibSync,
         ports: Vec<PortLink>,
     ) -> Self {
+        Self::observe_parts(
+            sup,
+            counts,
+            pending.len() as u64,
+            pending.withheld_len() as u64,
+            api,
+            fib,
+            ports,
+        )
+    }
+
+    /// Same observation, from already-extracted pending counts — for
+    /// the supervision service, which reads them out of the runtime's
+    /// [`crate::runtime::RuntimeStatus`] rather than holding the
+    /// `PendingMap` itself. Every supervisor-derived field still comes
+    /// from `sup`, never from a caller's belief.
+    pub fn observe_parts(
+        sup: &Supervisor,
+        counts: SinkCounts,
+        pending_ops: u64,
+        parked_ops: u64,
+        api: ApiHealth,
+        fib: FibSync,
+        ports: Vec<PortLink>,
+    ) -> Self {
         Self {
             state: sup.state(),
             steered: sup.is_steered(),
@@ -259,8 +284,8 @@ impl StatusSnapshot {
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
-            pending_ops: pending.len() as u64,
-            parked_ops: pending.withheld_len() as u64,
+            pending_ops,
+            parked_ops,
             api,
             fib,
             ports,
