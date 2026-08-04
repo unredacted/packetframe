@@ -709,9 +709,15 @@ mod tests {
         assert_eq!(fx.kill(), Disposition::SafeToRelease);
     }
 
-    /// `release_resources` refuses rather than no-ops: reporting
-    /// resources freed that the (unbuilt) attach wiring still holds is
-    /// the requested-vs-observed bug in its purest form.
+    /// `release_resources` refuses rather than no-ops: reporting resources
+    /// freed that something else still holds is the requested-vs-observed
+    /// bug in its purest form.
+    ///
+    /// This runtime is built with [`NoResources`], so the refusal comes from
+    /// the seam having nothing to release — not from the attach wiring being
+    /// absent, which it no longer is. (The earlier wording said "unbuilt".
+    /// A comment whose truth expires is how `detach --all` came to promise a
+    /// recovery path it did not have.)
     #[test]
     fn release_refuses_until_the_owner_exists() {
         let rt = runtime();
