@@ -27,7 +27,7 @@ use crate::resources::{
     bind_vfio_in, ensure_vf_in, release_vf_in, reserve_hugepages_in, sweep_stale_hugepage_maps,
     unbind_vfio_in, verify_port_in, PortState, ResourceState,
 };
-use crate::runtime::{IdentityStore, ProcessIdentity};
+use crate::runtime::{IdentityStore, ProcessIdentity, ResourceRelease};
 
 /// The kernel driver that owns cnxk VFs when vfio does not.
 /// Rebinding to it on release is what hands the VF back to the kernel
@@ -59,6 +59,32 @@ pub struct SysPaths {
     pub hugetlbfs: PathBuf,
     /// Where the state file lives (`<state-dir>`).
     pub state_dir: PathBuf,
+}
+
+impl SysPaths {
+    /// The real locations on a running kernel.
+    ///
+    /// `hugepage_bytes` is the **default** page size from
+    /// `/proc/meminfo` (`crate::default_hugepage_bytes`), which selects
+    /// the pool directory — the fleet's 64 K-page kernel offers a 2 MiB
+    /// and a 512 MiB pool, and reserving from the wrong one is how a
+    /// startup.conf asking for `default-hugepage` pages finds none.
+    /// Callers must reject a `0` (unknown) page size before getting
+    /// here; the pool path it would build does not exist.
+    pub fn live(state_dir: impl Into<PathBuf>, hugepage_bytes: u64) -> Self {
+        Self {
+            sysfs_net: PathBuf::from("/sys/class/net"),
+            pci_devices: PathBuf::from("/sys/bus/pci/devices"),
+            pci_drivers: PathBuf::from("/sys/bus/pci/drivers"),
+            hugepage_pool: PathBuf::from(format!(
+                "/sys/kernel/mm/hugepages/hugepages-{}kB",
+                hugepage_bytes / 1024
+            )),
+            hugepage_bytes,
+            hugetlbfs: PathBuf::from("/dev/hugepages"),
+            state_dir: state_dir.into(),
+        }
+    }
 }
 
 /// What acquisition produced, and how.
@@ -96,6 +122,7 @@ pub fn acquire(
     paths: &SysPaths,
     ports: &[(String, u16)],
     pages: u32,
+    expected_routes: u64,
 ) -> Result<(ResourceState, Acquired), String> {
     // How many leading ports are already recorded. Adoption with a
     // complete record returns early below; a PARTIAL record — a daemon
@@ -112,6 +139,21 @@ pub fn acquire(
         Some(mut state) => {
             resume_from = verify_adoptable(paths, &state, ports)?;
 
+            // Sizing identity. Checked alongside the pool identity below
+            // and for the same reason: both describe memory a running
+            // VPP committed to at start, and neither can be renegotiated
+            // by adopting it. See `ResourceState::expected_routes`. A
+            // recorded `0` predates the field and cannot be compared.
+            if state.expected_routes != 0 && state.expected_routes != expected_routes {
+                return Err(format!(
+                    "state was sized for expected-routes {} but this run is configured for \
+                     {expected_routes}; VPP fixes its main heap and stats segment at start, \
+                     so adopting it under the new figure would let the route ledger fill \
+                     past what the running instance holds — run `packetframe detach --all` \
+                     and start fresh to apply the new sizing",
+                    state.expected_routes
+                ));
+            }
             // The pool identity check comes BEFORE any reservation
             // touch. Raising the currently-configured pool while the
             // state owns a reservation in a DIFFERENT one would create
@@ -152,10 +194,16 @@ pub fn acquire(
             if resume_from == ports.len() {
                 return Ok((state, Acquired::Adopted));
             }
+            // Resuming an interrupted acquisition: the tail is acquired
+            // fresh below and saved, so this is the moment a pre-field
+            // record can record its sizing. Equal values make it a no-op;
+            // a differing one was already refused above.
+            state.expected_routes = expected_routes;
             state
         }
         None => {
             let mut state = ResourceState::empty();
+            state.expected_routes = expected_routes;
             // Hugepages first. Record the PRIOR count before touching
             // the pool: release restores this value, because zeroing
             // is only correct when the reservation was created from
@@ -440,7 +488,8 @@ pub struct FileStore {
 
 impl FileStore {
     /// Wrap the state `acquire` produced. The store owns it from here;
-    /// `into_state` gives it back for release at detach.
+    /// release goes through [`ResourceOwner`], which shares this record
+    /// rather than taking it back.
     pub fn new(state: ResourceState, state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state,
@@ -452,8 +501,14 @@ impl FileStore {
         &self.state
     }
 
-    pub fn into_state(self) -> ResourceState {
-        self.state
+    /// Adopt what the file now says, without writing.
+    ///
+    /// For [`ResourceOwner::release`], which changes the file
+    /// underneath this record: a release that partially fails rewrites
+    /// it with only what is still held, and an in-memory copy that kept
+    /// the pre-release ports would resurrect them on the next save.
+    pub fn replace_state(&mut self, state: ResourceState) {
+        self.state = state;
     }
 }
 
@@ -499,6 +554,129 @@ impl IdentityStore for FileStore {
             port.sw_if_index = Some(*idx);
         }
         self.state.save(&self.state_dir)
+    }
+}
+
+/// The single owner of everything attach acquired: the state file and
+/// the sysfs paths needed to hand the resources back.
+///
+/// Exists because the runtime needs two seams —
+/// [`IdentityStore`] and [`ResourceRelease`] — over **one** record. The
+/// obvious alternative, giving the releaser its own clone of the
+/// [`ResourceState`], has a specific failure: `release` removes the
+/// state file on success, and the supervision loop keeps ticking
+/// afterwards (it runs until the machine settles in `Stopped`). A
+/// `process_changed(None)` arriving in that window would save the
+/// releaser-unaware clone straight back to disk, re-creating a file that
+/// claims VFs which are already unbound — and the next daemon start
+/// would then refuse to attach, or try to adopt them.
+///
+/// Share it with `Rc<RefCell<_>>`; the runtime is single-threaded by
+/// construction (see the module docs on `!Send`), so there is no lock to
+/// contend and no ordering to reason about.
+pub struct ResourceOwner {
+    store: FileStore,
+    paths: SysPaths,
+    /// Set once `release` has confirmed everything gone. A second call
+    /// then answers `Ok` from this rather than re-running a teardown
+    /// against an emptied record — `release` on an empty state would
+    /// find no ports, skip the hugepage branch, and try to remove a
+    /// state file that is already gone.
+    released: bool,
+}
+
+impl ResourceOwner {
+    pub fn new(state: ResourceState, paths: SysPaths) -> Self {
+        let store = FileStore::new(state, paths.state_dir.clone());
+        Self {
+            store,
+            paths,
+            released: false,
+        }
+    }
+}
+
+impl IdentityStore for ResourceOwner {
+    fn process_changed(&mut self, identity: Option<ProcessIdentity>) -> Result<(), String> {
+        if self.released {
+            // The resources are gone and the file with them. Recording
+            // an identity now would re-create a state file describing
+            // VFs nothing holds — see the type docs. The process fact
+            // itself is still true, and still surfaces: the runtime
+            // reports store failures rather than swallowing them.
+            return Err(
+                "resources were already released; refusing to re-create the state file".into(),
+            );
+        }
+        self.store.process_changed(identity)
+    }
+
+    fn interfaces_attached(&mut self, indices: &[(String, u32)]) -> Result<(), String> {
+        if self.released {
+            return Err(
+                "resources were already released; refusing to re-create the state file".into(),
+            );
+        }
+        self.store.interfaces_attached(indices)
+    }
+}
+
+impl ResourceRelease for ResourceOwner {
+    fn release(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        // `release` consumes a copy of the state and, on PARTIAL
+        // failure, writes back what is still held. The store's own copy
+        // therefore goes stale in exactly the case that matters: a later
+        // `process_changed` would save the pre-release record and
+        // resurrect ports the teardown did free. So re-read the file the
+        // release just wrote — that file IS the record of what remains,
+        // and re-deriving the subtraction here would be a second
+        // implementation of it.
+        let outcome = release(&self.paths, self.store.state().clone());
+        match ResourceState::load(&self.paths.state_dir) {
+            // Released cleanly: the file is gone and so is the record.
+            Ok(None) => self.store.replace_state(ResourceState::empty()),
+            Ok(Some(remaining)) => self.store.replace_state(remaining),
+            // The file cannot be read back. The in-memory copy is now of
+            // unknown accuracy, so it must not be written again; treat
+            // that as released-for-writing purposes regardless of the
+            // release outcome below, which still reports the truth.
+            Err(_) => self.released = true,
+        }
+        outcome?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+/// Shared handle: the same owner behind both runtime seams.
+///
+/// `Rc<RefCell<ResourceOwner>>` cannot implement the traits directly
+/// (the borrow has to happen per call), so this thin wrapper does, and
+/// two clones of it go into [`crate::runtime::Runtime::new`].
+#[derive(Clone)]
+pub struct SharedOwner(std::rc::Rc<std::cell::RefCell<ResourceOwner>>);
+
+impl SharedOwner {
+    pub fn new(owner: ResourceOwner) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(owner)))
+    }
+}
+
+impl IdentityStore for SharedOwner {
+    fn process_changed(&mut self, identity: Option<ProcessIdentity>) -> Result<(), String> {
+        self.0.borrow_mut().process_changed(identity)
+    }
+    fn interfaces_attached(&mut self, indices: &[(String, u32)]) -> Result<(), String> {
+        self.0.borrow_mut().interfaces_attached(indices)
+    }
+}
+
+impl ResourceRelease for SharedOwner {
+    fn release(&mut self) -> Result<(), String> {
+        self.0.borrow_mut().release()
     }
 }
 
@@ -571,13 +749,35 @@ mod tests {
         vec![("eth2".into(), 1), ("eth3".into(), 1)]
     }
 
+    /// The `expected-routes` these fixtures acquire under. Only its
+    /// stability matters to most of them; the tests that care about the
+    /// sizing-identity check pass their own.
+    const ROUTES: u64 = 1_600_000;
+
+    /// The fixture's `bind` files are plain files; a real kernel responds
+    /// to the bind write by creating the `driver` symlink that
+    /// `verify_port_in` checks. Play the kernel's part so a second
+    /// `acquire` can reach the adoption path.
+    fn plant_vfio_links(f: &Fixture, pcis: &[&str]) {
+        #[cfg(unix)]
+        for pci in pcis {
+            std::os::unix::fs::symlink(
+                f.paths.pci_drivers.join("vfio-pci"),
+                f.paths.pci_devices.join(pci).join("driver"),
+            )
+            .unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = (f, pcis);
+    }
+
     #[test]
     fn fresh_acquisition_records_everything_it_holds() {
         let f = Fixture::new(
             "fresh",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, how) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         assert_eq!(how, Acquired::Fresh);
         assert_eq!(state.hugepage_pages, 8);
         assert_eq!(state.hugepage_prior_pages, 0);
@@ -600,7 +800,7 @@ mod tests {
         fs::create_dir_all(&dev).unwrap();
         fs::write(dev.join("sriov_numvfs"), "0").unwrap(); // no virtfn0
 
-        let err = acquire(&f.paths, &two_ports(), 8).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap_err();
         assert!(err.contains("eth3"), "{err}");
         assert!(err.contains("rolled back"), "{err}");
 
@@ -638,24 +838,14 @@ mod tests {
             "adopt",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (first, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
-        // The fixture's `bind` files are plain files; a real kernel
-        // responds to the bind write by creating the `driver` symlink
-        // that verify_port_in checks. Play the kernel's part.
-        #[cfg(unix)]
-        for pci in ["0002:07:00.0", "0002:07:00.1"] {
-            std::os::unix::fs::symlink(
-                f.paths.pci_drivers.join("vfio-pci"),
-                f.paths.pci_devices.join(pci).join("driver"),
-            )
-            .unwrap();
-        }
-        let (second, how) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (first, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        plant_vfio_links(&f, &["0002:07:00.0", "0002:07:00.1"]);
+        let (second, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         assert_eq!(how, Acquired::Adopted);
         assert_eq!(second, first);
 
         // A config whose port set changed must be refused, not merged.
-        let err = acquire(&f.paths, &[("eth2".into(), 1)], 8).unwrap_err();
+        let err = acquire(&f.paths, &[("eth2".into(), 1)], 8, ROUTES).unwrap_err();
         assert!(err.contains("cannot change across an adoption"), "{err}");
     }
 
@@ -669,7 +859,7 @@ mod tests {
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
         fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "3").unwrap();
-        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         assert_eq!(state.hugepage_prior_pages, 3);
 
         release(&f.paths, state).unwrap();
@@ -692,7 +882,7 @@ mod tests {
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
         fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "10").unwrap();
-        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         assert_eq!(state.hugepage_pages, 0, "we own nothing");
 
         release(&f.paths, state).unwrap();
@@ -713,7 +903,7 @@ mod tests {
             "store",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         let mut store = FileStore::new(state, &f.paths.state_dir);
 
         store
@@ -772,7 +962,7 @@ mod tests {
         // breaks.
         fs::create_dir_all(f.paths.state_dir.join("vpp-offload.json.tmp")).unwrap();
 
-        let err = acquire(&f.paths, &two_ports(), 8).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap_err();
         assert!(err.contains("could not record"), "{err}");
         assert!(err.contains("rolled back"), "{err}");
         // Nothing survives: the hugepage reservation is back to prior.
@@ -794,7 +984,7 @@ mod tests {
             "hpadopt",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (_state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (_state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         #[cfg(unix)]
         for pci in ["0002:07:00.0", "0002:07:00.1"] {
             std::os::unix::fs::symlink(
@@ -806,7 +996,7 @@ mod tests {
         // The reset nobody asked for.
         fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "0").unwrap();
 
-        let (_, how) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (_, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         assert_eq!(how, Acquired::Adopted);
         assert_eq!(
             fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
@@ -826,10 +1016,54 @@ mod tests {
             "cores",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let _ = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let _ = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         let changed = vec![("eth2".to_string(), 1u16), ("eth3".to_string(), 4u16)];
-        let err = acquire(&f.paths, &changed, 8).unwrap_err();
+        let err = acquire(&f.paths, &changed, 8, ROUTES).unwrap_err();
         assert!(err.contains("core counts"), "{err}");
+    }
+
+    /// A raised `expected-routes` is refused for the same reason a
+    /// `cores` change is: VPP fixes its main heap and stats segment at
+    /// start, so the adopted instance cannot hold the larger table the
+    /// new figure would let the ledger install. Accepting it would
+    /// reproduce gate 0b's mid-resync OOM abort through the adoption
+    /// door.
+    #[test]
+    fn adoption_refuses_a_sizing_change() {
+        let f = Fixture::new(
+            "sizing",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, 1_600_000).unwrap();
+        assert_eq!(state.expected_routes, 1_600_000, "sizing was not recorded");
+        plant_vfio_links(&f, &["0002:07:00.0", "0002:07:00.1"]);
+
+        let err = acquire(&f.paths, &two_ports(), 8, 2_000_000).unwrap_err();
+        assert!(err.contains("expected-routes 1600000"), "{err}");
+        assert!(err.contains("detach --all"), "{err}");
+
+        // The unchanged figure still adopts.
+        let (_, how) = acquire(&f.paths, &two_ports(), 8, 1_600_000).unwrap();
+        assert_eq!(how, Acquired::Adopted);
+    }
+
+    /// A state file written before the field existed records `0`, which
+    /// means "unknown" and must not be compared — those files predate
+    /// any release that could adopt a VPP at all, so refusing them would
+    /// wedge an upgrade for no safety gain.
+    #[test]
+    fn an_unrecorded_sizing_does_not_refuse_adoption() {
+        let f = Fixture::new(
+            "sizing-old",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (mut state, _) = acquire(&f.paths, &two_ports(), 8, 1_600_000).unwrap();
+        plant_vfio_links(&f, &["0002:07:00.0", "0002:07:00.1"]);
+        state.expected_routes = 0;
+        state.save(&f.paths.state_dir).unwrap();
+
+        let (_, how) = acquire(&f.paths, &two_ports(), 8, 2_000_000).unwrap();
+        assert_eq!(how, Acquired::Adopted);
     }
 
     /// Release refuses to restore into a different pool than the state
@@ -841,7 +1075,7 @@ mod tests {
             "wrongpool",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         let mut wrong = f.paths.clone();
         wrong.hugepage_bytes = 2 << 20; // detach pointed at the 2 MiB pool
         let err = release(&wrong, state).unwrap_err();
@@ -866,7 +1100,7 @@ mod tests {
             "gonevf",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         // eth3's VF disappears out from under the record.
         fs::remove_dir_all(f.paths.pci_devices.join("0002:07:00.1")).unwrap();
 
@@ -895,7 +1129,7 @@ mod tests {
         fs::create_dir_all(&dev).unwrap();
         fs::write(dev.join("sriov_numvfs"), "3").unwrap();
 
-        let err = acquire(&f.paths, &two_ports(), 8).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap_err();
         assert!(err.contains("refuses to guess"), "{err}");
         assert_eq!(
             fs::read_to_string(dev.join("sriov_numvfs")).unwrap(),
@@ -917,7 +1151,7 @@ mod tests {
         // Simulate the interruption: acquire both, then rewrite the
         // state as if the daemon died before eth3's save — eth3's VF
         // exists and is vfio-bound, but the record stops at eth2.
-        let (mut state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (mut state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         state.ports.truncate(1);
         state.save(&f.paths.state_dir).unwrap();
         #[cfg(unix)]
@@ -929,7 +1163,7 @@ mod tests {
             .unwrap();
         }
 
-        let (resumed, how) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (resumed, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         assert_eq!(how, Acquired::Resumed);
         assert_eq!(resumed.ports.len(), 2);
         assert_eq!(
@@ -950,7 +1184,7 @@ mod tests {
             "poolchg",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let _ = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let _ = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         #[cfg(unix)]
         for pci in ["0002:07:00.0", "0002:07:00.1"] {
             std::os::unix::fs::symlink(
@@ -967,7 +1201,7 @@ mod tests {
         fs::create_dir_all(&wrong.hugepage_pool).unwrap();
         fs::write(wrong.hugepage_pool.join("nr_hugepages"), "0").unwrap();
 
-        let err = acquire(&wrong, &two_ports(), 8).unwrap_err();
+        let err = acquire(&wrong, &two_ports(), 8, ROUTES).unwrap_err();
         assert!(err.contains("wrong pool"), "{err}");
         assert_eq!(
             fs::read_to_string(wrong.hugepage_pool.join("nr_hugepages"))
@@ -987,7 +1221,7 @@ mod tests {
             "sweep",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
         fs::write(f.paths.hugetlbfs.join("rtemap_0"), "").unwrap();
         fs::write(f.paths.hugetlbfs.join("rtemap_7"), "").unwrap();
 
@@ -997,5 +1231,85 @@ mod tests {
                 && !f.paths.hugetlbfs.join("rtemap_7").exists(),
             "stale maps must be swept before the pool release"
         );
+    }
+
+    /// The reason [`ResourceOwner`] exists. The supervision loop keeps
+    /// ticking after `ReleaseResources` — it runs until the machine
+    /// settles in `Stopped` — so a `process_changed(None)` can arrive
+    /// after the release. With a releaser holding its own copy of the
+    /// state, that save re-creates a state file naming VFs which are
+    /// already unbound, and the next daemon start then tries to adopt
+    /// them.
+    #[test]
+    fn a_record_written_after_release_cannot_resurrect_the_state_file() {
+        let f = Fixture::new(
+            "owner",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let mut owner = SharedOwner::new(ResourceOwner::new(state, f.paths.clone()));
+
+        // A spawn is recorded the ordinary way, while resources are held.
+        owner
+            .process_changed(Some(ProcessIdentity {
+                pid: 4242,
+                start_ticks: 99,
+                boot_id: Some("boot".into()),
+            }))
+            .unwrap();
+        assert!(ResourceState::load(&f.paths.state_dir).unwrap().is_some());
+
+        owner.release().unwrap();
+        assert!(
+            ResourceState::load(&f.paths.state_dir).unwrap().is_none(),
+            "a clean release must remove the state file"
+        );
+
+        // The late observation. It must be refused, and above all it
+        // must not write.
+        let e = owner.process_changed(None).unwrap_err();
+        assert!(e.contains("already released"), "{e}");
+        assert!(
+            ResourceState::load(&f.paths.state_dir).unwrap().is_none(),
+            "the state file was resurrected after release"
+        );
+        // Idempotent: a second release is not a second teardown.
+        owner.release().unwrap();
+    }
+
+    /// A release that only partially succeeds leaves the file describing
+    /// what is STILL held — and the owner's in-memory copy has to follow
+    /// it. Keeping the pre-release copy would let a later save put the
+    /// freed ports back.
+    #[test]
+    fn a_partial_release_leaves_the_owner_agreeing_with_the_file() {
+        let f = Fixture::new(
+            "owner-partial",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let mut owner = SharedOwner::new(ResourceOwner::new(state, f.paths.clone()));
+
+        // Make eth2's release fail: remove the netdev dir the numvfs
+        // write targets, leaving eth3 releasable.
+        fs::remove_dir_all(f.paths.sysfs_net.join("eth2")).unwrap();
+
+        let e = owner.release().unwrap_err();
+        assert!(e.contains("eth2"), "{e}");
+
+        let on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        assert_eq!(
+            on_disk
+                .ports
+                .iter()
+                .map(|p| p.iface.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eth2"],
+            "the file must name only what is still held"
+        );
+        // And a save from that state must not put eth3 back.
+        owner.process_changed(None).unwrap();
+        let after = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        assert_eq!(after.ports.len(), 1, "eth3 was resurrected by a later save");
     }
 }

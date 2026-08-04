@@ -25,7 +25,7 @@ use packetframe_vpp_offload::attach::PortAttach;
 use packetframe_vpp_offload::driver::Driver;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
-use packetframe_vpp_offload::runtime::{NullStore, Runtime, SteeringUnavailable};
+use packetframe_vpp_offload::runtime::{NoResources, NullStore, Runtime, SteeringUnavailable};
 use packetframe_vpp_offload::supervisor::{Event, State};
 
 struct Mirror {
@@ -64,6 +64,7 @@ fn runtime_for(fake: &Fake, n_routes: u8) -> Runtime {
         Box::new(mirror),
         Box::new(SteeringUnavailable),
         Box::new(NullStore),
+        Box::new(NoResources),
         "/usr/bin/vpp",
         "/tmp/startup.conf",
     )
@@ -289,6 +290,7 @@ fn a_persist_that_recovers_clears_the_recorded_failure() {
         }),
         Box::new(SteeringUnavailable),
         Box::new(Flaky(Arc::clone(&failing))),
+        Box::new(packetframe_vpp_offload::runtime::NoResources),
         "/usr/bin/vpp",
         "/dev/null",
     );
@@ -366,6 +368,7 @@ fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
         Box::new(Mirror { routes: vec![] }),
         Box::new(SteeringUnavailable),
         Box::new(Flaky(Arc::clone(&failing))),
+        Box::new(packetframe_vpp_offload::runtime::NoResources),
         // `spawn(binary, conf)` execs `binary -c conf`; /bin/true exits
         // immediately regardless, which is all this needs.
         "/bin/true",

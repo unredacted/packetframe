@@ -198,6 +198,71 @@ pub fn check_hugepage_budget(
     Ok(())
 }
 
+/// Main-heap bytes per route as **measured**, not as provisioned.
+///
+/// [`HEAP_BYTES_PER_ROUTE`] is this figure with ~2.2× of deliberate
+/// margin, because being wrong low there aborts VPP mid-resync. The
+/// margin is exactly what makes it the wrong number for a *capacity*
+/// question: sizing asks "how much do I reserve", capacity asks "how
+/// many routes actually fit in what was reserved", and answering the
+/// second with the padded figure would report the forecast back as the
+/// ceiling.
+pub const HEAP_BYTES_PER_ROUTE_MEASURED: u64 = 463;
+
+/// Stats-segment bytes per route per thread as **measured**: 97 B/route
+/// at two threads ⇒ 48.5, rounded up. Same relationship to
+/// [`STATSEG_BYTES_PER_ROUTE_PER_THREAD`] as above.
+pub const STATSEG_BYTES_PER_ROUTE_PER_THREAD_MEASURED: u64 = 49;
+
+/// How much of each segment the route ledger may fill before it starts
+/// withholding.
+///
+/// Not 100%: the measured per-route costs come from **one** table shape
+/// (the reference fleet's v4 table, gate 0b item 10). A table with more
+/// distinct path-lists or more ECMP groups costs more per route, and the
+/// consequence of being wrong at 100% is the OOM abort this whole
+/// arithmetic exists to prevent. 80% turns that into withheld routes and
+/// a Degraded health report, which is the designed degradation.
+pub const CAPACITY_UTILISATION_PCT: u64 = 80;
+
+/// How many routes actually fit in the VPP this sizing describes.
+///
+/// The high-water mark the route ledger withholds above. Plan v5 asks
+/// for this to come from a measured heap gauge rather than from
+/// `expected-routes` "wearing a second hat", and that gauge needs a
+/// stats-segment reader that does not exist yet. This is the honest
+/// interim: the capacity of the segments **as rendered**, computed at
+/// the measured per-route costs rather than the padded ones, and
+/// derated. It tracks `expected-routes` because the segments do — but it
+/// is meaningfully larger than it (the padding becomes real headroom),
+/// so a table that outgrows the operator's forecast keeps forwarding
+/// instead of being withheld at the forecast line.
+///
+/// **Both** segments are considered, and the smaller wins. The heap is
+/// the one everybody thinks of; the stats segment is the one that
+/// actually aborted VPP at gate 0b, and at these constants it is the
+/// binding constraint at every configuration. Deriving this from the
+/// heap alone would have put the ceiling above the segment that fails
+/// first.
+pub fn route_capacity(sizing: &Sizing) -> u64 {
+    let heap_for_routes = sizing
+        .main_heap_bytes
+        .saturating_sub(HEAP_FLOOR_BYTES)
+        .saturating_mul(CAPACITY_UTILISATION_PCT)
+        / 100;
+    let heap_routes = heap_for_routes / HEAP_BYTES_PER_ROUTE_MEASURED;
+
+    let statseg_per_route =
+        STATSEG_BYTES_PER_ROUTE_PER_THREAD_MEASURED * thread_count(sizing.workers);
+    let statseg_routes = sizing
+        .statseg_bytes
+        .saturating_mul(CAPACITY_UTILISATION_PCT)
+        / 100
+        / statseg_per_route;
+
+    heap_routes.min(statseg_routes)
+}
+
 /// One VPP dataplane port: the VF's PCI address plus the worker count
 /// the operator promised for it.
 ///
@@ -624,6 +689,90 @@ mod tests {
                 "routes={routes}: rendered {mib} MiB < derived {} bytes",
                 s.main_heap_bytes
             );
+        }
+    }
+
+    /// The ledger's high-water mark must sit **above** the operator's
+    /// forecast. If it landed at or below `expected-routes`, a table that
+    /// merely reached the forecast would start withholding routes — the
+    /// forecast is an estimate of the table, not a limit on it, and the
+    /// padding in the sizing constants exists precisely so that reaching
+    /// it is uneventful.
+    #[test]
+    fn capacity_exceeds_the_forecast_at_every_worker_count() {
+        for workers in 0..=16u32 {
+            for routes in [100_000u64, 1_053_370, 1_600_000, 4_000_000] {
+                let s = derive_sizing(routes, workers).unwrap();
+                assert!(
+                    route_capacity(&s) > routes,
+                    "workers={workers} routes={routes}: capacity {} would withhold at the \
+                     forecast",
+                    route_capacity(&s)
+                );
+            }
+        }
+    }
+
+    /// And **below** the point where either segment actually runs out at
+    /// the measured per-route costs. This is the invariant, asserted
+    /// against the measured constants rather than against a copy of the
+    /// expected output: a capacity computed from itself passes for any
+    /// value, which is how a constant gets checked against nothing.
+    #[test]
+    fn capacity_stays_under_what_each_segment_really_holds() {
+        for workers in 0..=16u32 {
+            for routes in [100_000u64, 1_053_370, 1_600_000] {
+                let s = derive_sizing(routes, workers).unwrap();
+                let cap = route_capacity(&s);
+
+                let heap_exhausts_at =
+                    (s.main_heap_bytes - HEAP_FLOOR_BYTES) / HEAP_BYTES_PER_ROUTE_MEASURED;
+                let statseg_exhausts_at = s.statseg_bytes
+                    / (STATSEG_BYTES_PER_ROUTE_PER_THREAD_MEASURED * thread_count(workers));
+                assert!(
+                    cap < heap_exhausts_at,
+                    "workers={workers} routes={routes}: capacity {cap} reaches the heap's \
+                     real limit {heap_exhausts_at}"
+                );
+                assert!(
+                    cap < statseg_exhausts_at,
+                    "workers={workers} routes={routes}: capacity {cap} reaches the stats \
+                     segment's real limit {statseg_exhausts_at} — the segment that actually \
+                     aborted VPP at gate 0b"
+                );
+            }
+        }
+    }
+
+    /// The stats segment is the binding constraint, and the `min` is
+    /// what makes that true. Dropping it — deriving capacity from the
+    /// heap alone, which is the intuitive reading — would put the
+    /// ceiling above the segment that fails first.
+    #[test]
+    fn the_stats_segment_is_the_constraint_that_binds() {
+        let s = derive_sizing(1_600_000, 4).unwrap();
+        let heap_routes = (s.main_heap_bytes - HEAP_FLOOR_BYTES) * CAPACITY_UTILISATION_PCT
+            / 100
+            / HEAP_BYTES_PER_ROUTE_MEASURED;
+        assert!(
+            route_capacity(&s) < heap_routes,
+            "capacity {} is the heap figure {heap_routes}; the stats segment was not \
+             considered",
+            route_capacity(&s)
+        );
+    }
+
+    /// A bigger forecast must never buy a smaller ceiling.
+    #[test]
+    fn capacity_grows_with_the_forecast() {
+        let mut last = 0;
+        for routes in [50_000u64, 500_000, 1_053_370, 1_600_000, 3_000_000] {
+            let cap = route_capacity(&derive_sizing(routes, 2).unwrap());
+            assert!(
+                cap > last,
+                "capacity fell at routes={routes}: {cap} <= {last}"
+            );
+            last = cap;
         }
     }
 }

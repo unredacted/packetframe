@@ -119,6 +119,31 @@ pub enum HealthState {
     Unhealthy,
 }
 
+impl HealthState {
+    /// The more severe of two states.
+    ///
+    /// `HealthState` deliberately does not derive `Ord` — the variants
+    /// are a severity scale, but a derived ordering would also imply
+    /// comparisons like `Degraded > Healthy` are meaningful in
+    /// arithmetic, and callers writing their own `match` to escalate got
+    /// it right only for the cases they thought of. This is the one
+    /// operation that is actually wanted: adding a finding to a report
+    /// may make it worse, never better.
+    #[must_use]
+    pub fn worse_of(self, other: Self) -> Self {
+        let rank = |s: Self| match s {
+            Self::Healthy => 0u8,
+            Self::Degraded => 1,
+            Self::Unhealthy => 2,
+        };
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
 /// Per-subsystem health entry within a [`HealthReport`]. `name` is
 /// stable for dashboards; changing it breaks operator tooling that
 /// keys on the string.

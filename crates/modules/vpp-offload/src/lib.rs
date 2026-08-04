@@ -12,18 +12,32 @@
 //! startup.conf renderer and its route-count-driven memory arithmetic),
 //! slice 2 (VF/vfio/hugepage lifecycle, state file, pidfd adopt,
 //! teardown ordering), slice 3 ([`vpp_api`] — generated wire structs,
-//! socket transport, CRC-checked handshake) and most of slice 4:
+//! socket transport, CRC-checked handshake) and slice 4:
 //! [`sink`] (pending map, nexthop mapping, three-valued route ledger),
 //! [`supervisor`] + [`process`] + [`liveness`] + [`schedule`] +
 //! [`executor`] + [`driver`] (the supervision loop), [`attach`] and
-//! [`verify`] (device bring-up and readback), and [`status`]
-//! (health/metrics).
+//! [`verify`] (device bring-up and readback), [`status`]
+//! (health/metrics), [`engine`] (transport, ledger, diffing resync,
+//! static neighbours), [`runtime`] + [`service`] (the loop, on a
+//! thread, with a published status window), and [`bringup`] — the
+//! composition [`Module::attach`] performs.
 //!
-//! **None of it runs yet.** [`Module::attach`] is still
-//! `not_implemented`, so every piece above is exercised only by unit
-//! tests and a fake-VPP loopback. Merged is not proven; the first real
-//! execution is the attach wiring, and the failover numbers in the plan
-//! stay unmeasured until then.
+//! ## What "built" does and does not mean here
+//!
+//! [`Module::attach`] runs, end to end, against a fixture sysfs and a
+//! fake VPP on a real socket (`tests/vpp_bringup.rs`). What has **never**
+//! run is any of it against a real VPP process on real hardware: spawn,
+//! the octeon device attach, a full-table convergence through this path,
+//! and every one of the three published failover numbers. The
+//! convergence budget was measured separately (gate 0b, 40.32 s of 60 s)
+//! by a bench driving the same engine, not by this module.
+//!
+//! Two things are deliberately absent rather than stubbed:
+//! **MCAM steering** ([`runtime::SteeringUnavailable`] refuses both
+//! directions until slice 5) and **stats-segment gauges** (they need a
+//! shared-memory parser that does not exist). A config with every port
+//! `steer off` — the designed staging state — never reaches the steering
+//! seam.
 //!
 //! Design record: `.claude/plans/` phase-4 plan v7. Key invariants
 //! enforced from day one:
@@ -35,6 +49,8 @@
 
 pub mod acquire;
 pub mod attach;
+pub mod bringup;
+pub mod cores;
 pub mod driver;
 pub mod engine;
 pub mod executor;
@@ -123,6 +139,30 @@ impl VppOffloadConfig {
 
 pub struct VppOffloadModule {
     cfg: VppOffloadConfig,
+    /// From [`LoaderCtx`] at load; `attach` has no ctx of its own.
+    state_dir: std::path::PathBuf,
+    /// Where routes and neighbours come from. Set before `attach` by
+    /// whoever owns the RouteController; see [`Self::set_route_source`].
+    source: Option<Box<dyn engine::RouteSource + Send + Sync>>,
+    /// `Some` once supervision is running.
+    attached: Option<bringup::Attached>,
+    /// A teardown still running in the background after `detach` returned.
+    ///
+    /// `stop()` bounds its wait at the `Module::detach` budget and hands
+    /// back a handle when the loop has not settled; keeping it is what lets
+    /// `health_check` report the eventual result — released, or still held
+    /// and why — instead of the message pointing at a status nobody can
+    /// reach.
+    teardown_pending: Option<service::PendingTeardown>,
+    /// Set when a `detach` could not confirm the teardown.
+    ///
+    /// Outlives the attachment on purpose. `detach` takes `attached` before
+    /// it can discover a failure — the service is consumed by `stop()` — so
+    /// without this a second `detach` found `None` and returned `Ok`,
+    /// reporting a clean detach over VFs and hugepages that were still
+    /// held. `packetframe detach --all` retries, so that is the likely
+    /// path, not a hypothetical one.
+    teardown_failure: Option<String>,
 }
 
 impl VppOffloadModule {
@@ -130,8 +170,124 @@ impl VppOffloadModule {
     pub fn new() -> Self {
         Self {
             cfg: VppOffloadConfig::default(),
+            state_dir: std::path::PathBuf::new(),
+            source: None,
+            attached: None,
+            teardown_pending: None,
+            teardown_failure: None,
         }
     }
+
+    /// Hand the module its route source.
+    ///
+    /// Required before [`Module::attach`], which refuses without one.
+    /// That refusal is the point: the source is the fast-path
+    /// RouteController's mirror, and a VPP brought up without it would
+    /// pass every check this module makes — process alive, API
+    /// answering, devices attached, zero routes installed, verify
+    /// trivially passing on an empty sample — and then blackhole every
+    /// steered packet. An empty FIB is indistinguishable from a healthy
+    /// one to everything except the traffic.
+    ///
+    /// Separate from `load` because the wiring across to the fast-path
+    /// crate is its own change (it touches the live control plane); this
+    /// is the seam it plugs into.
+    pub fn set_route_source(&mut self, source: Box<dyn engine::RouteSource + Send + Sync>) {
+        self.source = Some(source);
+    }
+
+    /// Record a teardown that could not be confirmed, and build the error
+    /// for it. One place, so the recording cannot be forgotten at one of
+    /// `detach`'s two failure exits.
+    fn remember_teardown_failure(&mut self, why: String) -> ModuleError {
+        self.teardown_failure = Some(why.clone());
+        ModuleError::other(MODULE_NAME, why)
+    }
+
+    /// The last published supervision snapshot, if the loop has run.
+    pub fn published(&self) -> Option<service::Published> {
+        self.attached.as_ref().and_then(|a| a.service.status())
+    }
+}
+
+/// Turn a published snapshot into the module's health report.
+///
+/// Pure, so the reporting rules are testable without a supervision
+/// thread — and so the several failure kinds `Published` carries cannot
+/// be dropped on the way out, which is exactly what happened to two of
+/// them at the publish boundary one layer down.
+fn report_from(published: Option<&service::Published>, alive: bool) -> HealthReport {
+    use packetframe_common::module::{HealthState, SubsystemHealth};
+
+    let Some(p) = published else {
+        // Attached but nothing published yet cannot happen —
+        // `SupervisionService::start` blocks on the first publish — so
+        // this is the unattached case: loaded, orchestrating nothing.
+        return HealthReport::healthy();
+    };
+    let mut report = p.report.clone();
+    fn degrade_to(report: &mut HealthReport, state: HealthState) {
+        report.overall = report.overall.worse_of(state);
+    }
+
+    // A dead loop thread means nothing is supervising VPP. The last
+    // published report is frozen at whatever it said, so reporting it
+    // as-is would show a healthy dataplane nobody is watching.
+    if !alive {
+        degrade_to(&mut report, HealthState::Unhealthy);
+        report.subsystems.push(SubsystemHealth {
+            name: "supervision".into(),
+            state: HealthState::Unhealthy,
+            message: Some(
+                "the supervision loop is not running; VPP is unmonitored and will not be \
+                 restarted or unsteered — `packetframe detach` then re-attach"
+                    .into(),
+            ),
+            last_success_age_seconds: None,
+        });
+    }
+    // Supervision ended itself: an API this VPP can never speak. Not a
+    // transient failure and not retried, so it must not read as one.
+    if let Some(why) = &p.terminal {
+        degrade_to(&mut report, HealthState::Unhealthy);
+        report.subsystems.push(SubsystemHealth {
+            name: "supervision".into(),
+            state: HealthState::Unhealthy,
+            message: Some(format!("supervision ended and will not resume: {why}")),
+            last_success_age_seconds: None,
+        });
+    }
+    // Held resources after a teardown. Deliberate — releasing a VF a
+    // live process may still DMA into is worse — but it needs an
+    // operator, because nothing else will ever free them.
+    if p.resources_leaked {
+        degrade_to(&mut report, HealthState::Unhealthy);
+        report.subsystems.push(SubsystemHealth {
+            name: "resources".into(),
+            state: HealthState::Unhealthy,
+            message: Some(format!(
+                "VF/hugepage resources are still held after teardown{}",
+                if p.teardown_failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", p.teardown_failures.join("; "))
+                }
+            )),
+            last_success_age_seconds: None,
+        });
+    }
+    // The reason behind a retry loop. The supervisor counts failures;
+    // only this says what they were.
+    if !p.last_failures.is_empty() {
+        degrade_to(&mut report, HealthState::Degraded);
+        report.subsystems.push(SubsystemHealth {
+            name: "last-tick".into(),
+            state: HealthState::Degraded,
+            message: Some(p.last_failures.join("; ")),
+            last_success_age_seconds: None,
+        });
+    }
+    report
 }
 
 impl Module for VppOffloadModule {
@@ -145,8 +301,12 @@ impl Module for VppOffloadModule {
         Vec::new()
     }
 
-    fn load(&mut self, cfg: &ModuleConfig<'_>, _ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
+    fn load(&mut self, cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
         self.cfg = VppOffloadConfig::from_directives(&cfg.section.directives);
+        // `attach` gets no ctx of its own, and the state file is the
+        // whole basis of adoption and of `detach --all` — so capture the
+        // directory here rather than assuming a default location.
+        self.state_dir = ctx.state_dir.to_path_buf();
         if self.cfg.ports.is_empty() {
             return Err(ModuleError::other(
                 MODULE_NAME,
@@ -168,38 +328,192 @@ impl Module for VppOffloadModule {
         Ok(())
     }
 
+    /// hugepages → VF → vfio → startup.conf → adopt-or-arm → supervise.
+    ///
+    /// Returns **no [`Attachment`]s**: the module owns no BPF programs
+    /// or links, which is what `hook_spec() == []` already declares. Its
+    /// attachment is a supervised process and a set of held host
+    /// resources, both tracked in the state file rather than in the
+    /// loader's registry.
+    ///
+    /// Blocks only until the supervision loop publishes its first
+    /// snapshot — long enough for a dead API socket or a version-skewed
+    /// VPP to surface here as the attach failure it is, and no longer.
+    /// Convergence (up to the ≤60 s budget) continues on the loop
+    /// thread; `health_check` reports where it got to.
     fn attach(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
-        // Slice 2: hugepages → VF → vfio → startup.conf → spawn/adopt
-        // → resync-verify → steer.
-        Err(ModuleError::not_implemented(MODULE_NAME))
+        if self.attached.is_some() {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                "vpp-offload is already attached; detach first",
+            ));
+        }
+        let source = self.source.take().ok_or_else(|| {
+            ModuleError::other(
+                MODULE_NAME,
+                "no route source is wired to vpp-offload; refusing to attach — VPP would come \
+                 up with an empty FIB, pass every health check, and blackhole every steered \
+                 packet (see `set_route_source`)",
+            )
+        })?;
+        // `load` supplies the state directory, and the state file is the
+        // whole basis of adoption and of `detach --all`. Without it,
+        // `AttachPaths::live` would build a RELATIVE state path — a
+        // record written into whatever the daemon's cwd happens to be,
+        // which the next start would not find and no detach could act on.
+        // Reachable only by attaching an unloaded module, which is a
+        // programming error, so it says so.
+        if self.state_dir.as_os_str().is_empty() {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                "attach() called before load(): no state directory, so nothing acquired could \
+                 be recorded or later released",
+            ));
+        }
+        let paths = bringup::AttachPaths::live(&self.state_dir, default_hugepage_bytes());
+        let attached = match bringup::bring_up(&self.cfg, &paths, source) {
+            Ok(a) => a,
+            Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
+        };
+        // The derived worker placement, logged because it is an operator
+        // input: on the reference NIC every CPU carries an rx-queue IRQ
+        // 1:1, so nothing this module can do keeps a poll-mode worker off
+        // one — moving the PF IRQs is manual, and this names the set to
+        // move them off. See [`cores`].
+        tracing::info!(
+            main_core = attached.cores.main,
+            workers = ?attached.cores.workers,
+            acquired = ?attached.acquired,
+            adopted_process = attached.adopted_process,
+            "vpp-offload attached; move PF IRQ affinity off the worker cores"
+        );
+        self.attached = Some(attached);
+        Ok(Vec::new())
     }
 
     fn reconfigure(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+        // Allowlist deltas become steering deltas, which needs the MCAM
+        // implementation (slice 5). Port and cores changes are
+        // restart-only by design — `acquire` refuses to adopt across
+        // them, and so does a changed `expected-routes`, because VPP
+        // fixes its heap and stats segment at start.
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
     fn detach(&mut self) -> ModuleResult<()> {
-        // Nothing attached in slice 1; detach of nothing succeeds so
-        // `packetframe detach --all` stays idempotent.
+        // A teardown that already failed keeps failing. The service is
+        // consumed by `stop()`, so there is nothing left to retry — but
+        // answering `Ok` because `attached` is now `None` would report a
+        // clean detach over resources that are still held, on exactly the
+        // retry an operator is most likely to run.
+        if let Some(why) = &self.teardown_failure {
+            return Err(ModuleError::other(MODULE_NAME, why.clone()));
+        }
+        // Detach of nothing succeeds, so `packetframe detach --all`
+        // stays idempotent.
+        let Some(attached) = self.attached.take() else {
+            return Ok(());
+        };
+        // `stop` drives the supervisor's full teardown ordering —
+        // unsteer if steered, abort convergence, kill, release — and
+        // waits out its bounded patience. The final snapshot is the only
+        // record of what that left behind.
+        let report = attached.service.stop();
+        // A teardown still running past the detach budget is kept, not
+        // dropped: `stop()`'s message sends the operator to `packetframe
+        // status`, and this is what makes that reachable — `health_check`
+        // below reports through it until the loop settles.
+        self.teardown_pending = report.pending;
+        let Some(p) = report.published else {
+            return Err(self.remember_teardown_failure(
+                "the supervision loop published no final status; whether VPP stopped and \
+                 whether its VFs were released are both unknown — check `ip link show` and \
+                 the state file before re-attaching"
+                    .to_string(),
+            ));
+        };
+        if p.resources_leaked || !p.teardown_failures.is_empty() {
+            // Loud, and NOT converted into a clean detach. The resources
+            // are deliberately still held (releasing a VF a live process
+            // may still DMA into is worse), but only an operator can
+            // finish this.
+            return Err(self.remember_teardown_failure(format!(
+                "teardown did not complete{}{}",
+                if p.resources_leaked {
+                    "; VF/hugepage resources are still held"
+                } else {
+                    ""
+                },
+                if p.teardown_failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", p.teardown_failures.join("; "))
+                }
+            )));
+        }
         Ok(())
     }
 
-    fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
-        // Nothing to sample: there is no supervised VPP until
-        // `attach()` exists. The rendering itself lives in
-        // [`status::render_metrics`], which takes an observed
-        // [`status::StatusSnapshot`] — the attach wiring supplies one.
-        // Emitting zeroed gauges from here instead would publish a
-        // healthy-looking series for a module that is not running.
+    fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+        // Only what the loop actually published. An unattached module
+        // emits nothing rather than zeroed gauges — a zero series is
+        // indistinguishable from a healthy idle one, and would keep
+        // reporting after a detach.
+        if let Some(p) = self.published() {
+            out.out.push_str(&p.metrics);
+        }
         Ok(())
     }
 
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
-        // Same reason. [`status::StatusSnapshot::report`] is the real
-        // surface; it needs a live `Supervisor` to observe, and an
-        // unattached module has none. Reporting healthy here is accurate
-        // for "loaded but not orchestrating anything".
-        Ok(HealthReport::healthy())
+        // A teardown still in flight outranks a recorded failure: it is
+        // the more current fact, and it may yet resolve to success.
+        if let Some(pending) = &self.teardown_pending {
+            use packetframe_common::module::{HealthState, SubsystemHealth};
+            let settled = pending.is_finished();
+            let detail = pending
+                .status()
+                .map(|p| {
+                    if p.resources_leaked || !p.teardown_failures.is_empty() {
+                        format!("resources still held: {}", p.teardown_failures.join("; "))
+                    } else {
+                        "everything was released".into()
+                    }
+                })
+                .unwrap_or_else(|| "no snapshot published".into());
+            return Ok(HealthReport {
+                overall: HealthState::Unhealthy,
+                subsystems: vec![SubsystemHealth {
+                    name: "resources".into(),
+                    state: HealthState::Unhealthy,
+                    message: Some(if settled {
+                        format!("teardown finished after detach returned; {detail}")
+                    } else {
+                        format!("teardown still running after detach returned; {detail}")
+                    }),
+                    last_success_age_seconds: None,
+                }],
+            });
+        }
+        // An unconfirmed teardown outranks everything else. The module is
+        // no longer attached, so there is no snapshot left to report, and
+        // `report_from(None, _)` answers "loaded, orchestrating nothing" —
+        // which over still-held VFs is the same lie the `detach` retry used
+        // to tell.
+        if let Some(why) = &self.teardown_failure {
+            use packetframe_common::module::{HealthState, SubsystemHealth};
+            return Ok(HealthReport {
+                overall: HealthState::Unhealthy,
+                subsystems: vec![SubsystemHealth {
+                    name: "resources".into(),
+                    state: HealthState::Unhealthy,
+                    message: Some(why.clone()),
+                    last_success_age_seconds: None,
+                }],
+            });
+        }
+        let alive = self.attached.as_ref().is_some_and(|a| a.service.is_alive());
+        Ok(report_from(self.published().as_ref(), alive))
     }
 }
 
@@ -230,5 +544,221 @@ pub fn default_hugepage_bytes() -> u64 {
     #[cfg(not(target_os = "linux"))]
     {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packetframe_common::module::{HealthState, SubsystemHealth};
+    use supervisor::State;
+
+    /// A published snapshot the loop would produce in the designed
+    /// resting state: verified, nothing steered, nothing wrong.
+    fn healthy_published() -> service::Published {
+        service::Published {
+            report: HealthReport::healthy(),
+            metrics: String::new(),
+            state: State::Ready,
+            api_error: None,
+            terminal: None,
+            teardown_failures: Vec::new(),
+            resources_leaked: false,
+            last_failures: Vec::new(),
+            store_error: None,
+        }
+    }
+
+    /// An unattached module orchestrates nothing, and says so honestly
+    /// rather than inventing a fault.
+    #[test]
+    fn nothing_attached_reports_healthy() {
+        assert_eq!(report_from(None, false).overall, HealthState::Healthy);
+    }
+
+    /// A dead loop thread is the worst thing this surface can report:
+    /// the last published snapshot is frozen, so it may well say
+    /// "Healthy, steered, verified" — about a VPP that will never be
+    /// restarted, never unsteered, and never observed again.
+    #[test]
+    fn a_dead_supervision_thread_is_unhealthy_and_named() {
+        let p = healthy_published();
+        let r = report_from(Some(&p), false);
+        assert_eq!(r.overall, HealthState::Unhealthy, "{r:?}");
+        let s = r
+            .subsystems
+            .iter()
+            .find(|s| s.name == "supervision")
+            .expect("the dead loop must be named");
+        assert_eq!(s.state, HealthState::Unhealthy);
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unmonitored"),
+            "{s:?}"
+        );
+    }
+
+    /// A terminal reason means supervision ENDED. Reporting it as an
+    /// ordinary degradation would read as "retrying", which is exactly
+    /// what it is not.
+    #[test]
+    fn a_terminal_reason_is_unhealthy_and_says_it_will_not_resume() {
+        let mut p = healthy_published();
+        p.terminal = Some("VPP's API is permanently incompatible: CRC mismatch".into());
+        let r = report_from(Some(&p), true);
+        assert_eq!(r.overall, HealthState::Unhealthy);
+        assert!(
+            r.subsystems.iter().any(|s| s
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("will not resume")),
+            "{r:?}"
+        );
+    }
+
+    /// Leaked resources need an operator: nothing else will ever free
+    /// them, and the state file is the only record that they exist.
+    #[test]
+    fn leaked_resources_are_unhealthy_and_carry_the_teardown_detail() {
+        let mut p = healthy_published();
+        p.resources_leaked = true;
+        p.teardown_failures = vec!["Unsteer: MCAM rules could not be removed".into()];
+        let r = report_from(Some(&p), true);
+        assert_eq!(r.overall, HealthState::Unhealthy);
+        let s = r
+            .subsystems
+            .iter()
+            .find(|s| s.name == "resources")
+            .expect("held resources must be named");
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("MCAM rules"),
+            "the teardown reason must survive: {s:?}"
+        );
+    }
+
+    /// The supervisor counts failures; only `last_failures` says what
+    /// they were. Dropping it leaves an operator watching a retry loop
+    /// with no way to learn why.
+    #[test]
+    fn tick_failures_degrade_and_are_reported_verbatim() {
+        let mut p = healthy_published();
+        p.last_failures = vec!["Start: no such file or directory".into()];
+        let r = report_from(Some(&p), true);
+        assert_eq!(r.overall, HealthState::Degraded);
+        assert!(
+            r.subsystems.iter().any(|s| s.name == "last-tick"
+                && s.message.as_deref() == Some("Start: no such file or directory")),
+            "{r:?}"
+        );
+    }
+
+    /// A `detach` that could not confirm the teardown must keep saying so.
+    ///
+    /// `detach` takes `attached` before it can discover a failure — the
+    /// service is consumed by `stop()` — so the second call found `None`
+    /// and answered `Ok`, reporting a clean detach over VFs and hugepages
+    /// that were still held. `packetframe detach --all` retries, which
+    /// makes that the likely path rather than a hypothetical one.
+    ///
+    /// Driven through the recorder rather than a real teardown: reaching a
+    /// failed `stop()` needs a supervision thread, and what is under test
+    /// is that the record OUTLIVES the attachment.
+    #[test]
+    fn an_unconfirmed_teardown_keeps_failing_and_stays_unhealthy() {
+        use packetframe_common::config::{GlobalConfig, ModuleSection};
+        use packetframe_common::module::{Module as _, ModuleConfig};
+
+        let mut m = VppOffloadModule::new();
+        let e = m.remember_teardown_failure(
+            "teardown did not complete; VF/hugepage resources are still held".to_string(),
+        );
+        assert!(e.to_string().contains("still held"));
+
+        // The retry must NOT read as a clean detach just because there is
+        // no attachment left.
+        let again = m
+            .detach()
+            .expect_err("a retry after an unconfirmed teardown must not report success");
+        assert!(again.to_string().contains("still held"), "{again}");
+
+        // And health must not read as "loaded, orchestrating nothing".
+        let r = m.health_check(&HealthCtx::new()).unwrap();
+        assert_eq!(r.overall, HealthState::Unhealthy, "{r:?}");
+        assert!(
+            r.subsystems.iter().any(|s| s.name == "resources"
+                && s.message
+                    .as_deref()
+                    .is_some_and(|x| x.contains("still held"))),
+            "{:?}",
+            r.subsystems
+        );
+
+        // Re-attaching must not paper over it either: the route-source
+        // refusal comes first, but the record is still there afterwards.
+        let section = ModuleSection {
+            name: "vpp-offload".into(),
+            directives: Vec::new(),
+        };
+        let global = GlobalConfig::default();
+        let _ = m.attach(&ModuleConfig::new(&section, &global));
+        assert!(m.teardown_failure.is_some(), "the record was lost");
+    }
+
+    /// The invariant, asserted as an invariant: whatever this function
+    /// adds, the result may never be cheerier than the worst thing in
+    /// it. A `match` that escalated only from `Healthy` — the shape this
+    /// replaced — would silently downgrade an Unhealthy report to
+    /// Degraded when a tick failure arrived after a leak.
+    #[test]
+    fn the_overall_state_is_never_cheerier_than_its_worst_finding() {
+        let mut p = healthy_published();
+        p.report.overall = HealthState::Unhealthy;
+        p.report.subsystems.push(SubsystemHealth {
+            name: "vpp-process".into(),
+            state: HealthState::Unhealthy,
+            message: None,
+            last_success_age_seconds: None,
+        });
+        // A merely-Degraded finding arrives on top of an Unhealthy
+        // report.
+        p.last_failures = vec!["Resync: socket closed".into()];
+        let r = report_from(Some(&p), true);
+        assert_eq!(r.overall, HealthState::Unhealthy, "{r:?}");
+
+        for worst in [HealthState::Degraded, HealthState::Unhealthy] {
+            let mut p = healthy_published();
+            p.report.subsystems.push(SubsystemHealth {
+                name: "x".into(),
+                state: worst,
+                message: None,
+                last_success_age_seconds: None,
+            });
+            p.report.overall = worst;
+            let r = report_from(Some(&p), true);
+            assert_eq!(r.overall, worst, "a clean pass must not improve {worst:?}");
+        }
+    }
+
+    /// `worse_of` is the ordering the report relies on; check it directly
+    /// rather than only through its callers.
+    #[test]
+    fn severity_escalates_in_one_direction_only() {
+        use HealthState::*;
+        for (a, b, want) in [
+            (Healthy, Degraded, Degraded),
+            (Degraded, Healthy, Degraded),
+            (Degraded, Unhealthy, Unhealthy),
+            (Unhealthy, Degraded, Unhealthy),
+            (Unhealthy, Healthy, Unhealthy),
+            (Healthy, Healthy, Healthy),
+        ] {
+            assert_eq!(a.worse_of(b), want, "{a:?}.worse_of({b:?})");
+        }
     }
 }
