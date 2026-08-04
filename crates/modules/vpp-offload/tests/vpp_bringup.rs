@@ -433,3 +433,63 @@ fn a_steer_on_port_is_refused_until_mcam_exists() {
         .expect("every port steer off is the staging state and must attach");
     let _ = attached.service.stop();
 }
+
+/// An incomplete recorded identity must REFUSE, not fall through to a fresh
+/// spawn.
+///
+/// `VppProcess::adopt` returns `Ok(None)` when it cannot verify an identity —
+/// not when the process is confirmed gone — so a record with a pid but no
+/// boot id used to read as "nothing running" and inject `StartRequested`:
+/// a second VPP on the same VF and the same API socket, with the recorded pid
+/// overwritten and the first process orphaned holding the hardware.
+///
+/// Refused before `adopt` is called at all, which is what makes it testable
+/// off a router.
+#[test]
+fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
+    let fake = fake_vpp::Fake::start("bringup-identity");
+    let host = Host::new("identity", &[("eth4", "0002:07:00.0")], fake.path.clone());
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+
+    // First attach records the ports. DROPPED rather than stopped: `stop()`
+    // releases and removes the state file, and dropping deliberately does not
+    // tear down (that is preserve-on-exit, §8.5), so the record survives —
+    // which is exactly the situation a daemon restart finds.
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror)).expect("first attach");
+    drop(attached);
+
+    // Play the kernel's part: a real bind creates the `driver` symlink that
+    // adoption verifies against.
+    let link = host
+        .paths
+        .sys
+        .pci_devices
+        .join("0002:07:00.0")
+        .join("driver");
+    if !link.exists() {
+        std::os::unix::fs::symlink(host.paths.sys.pci_drivers.join("vfio-pci"), &link).unwrap();
+    }
+
+    // Plant a record naming a VPP with an unverifiable identity.
+    let mut state = host.state().expect("state file");
+    state.vpp_pid = Some(4242);
+    state.vpp_start_ticks = Some(99_999);
+    state.vpp_boot_id = None; // the third leg is missing
+    state.save(&host.paths.sys.state_dir).unwrap();
+
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+        .err()
+        .expect("an unverifiable identity must refuse");
+    assert!(e.contains("4242"), "the pid must be named: {e}");
+    assert!(e.contains("boot id"), "and the missing leg: {e}");
+    assert!(
+        e.contains("second process") || e.contains("second VPP"),
+        "and the consequence of spawning anyway: {e}"
+    );
+    // Marked, so the caller does not roll back and unbind the VF under a
+    // process that may still be running.
+    assert!(
+        e.starts_with("RESOURCES MAY BE HELD"),
+        "the rollback must be suppressed: {e}"
+    );
+}

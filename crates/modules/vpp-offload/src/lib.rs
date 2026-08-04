@@ -407,6 +407,31 @@ impl Module for VppOffloadModule {
                 "vpp-offload is already attached; detach first",
             ));
         }
+        // A previous teardown must be RESOLVED before another attach.
+        //
+        // `detach` takes `attached` before it can discover a failure, so
+        // `attached.is_none()` is not evidence that nothing is going on: the
+        // background loop may still be killing VPP and releasing the VF, or a
+        // recorded failure may mean resources are still held. Attaching over
+        // either starts a new supervisor against hardware the old teardown is
+        // concurrently releasing — two supervisors, one VF — and even after a
+        // clean background finish the stale handle would make `health_check`
+        // report the old teardown instead of the new attachment.
+        self.reconcile_pending_teardown();
+        if self.teardown_pending.is_some() {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                "a previous teardown is still running in the background (it kills VPP and                  releases its VF); attaching now would race it. Wait for it to settle —                  `health_check` reports when it has — and retry.",
+            ));
+        }
+        if let Some(why) = &self.teardown_failure {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!(
+                    "a previous teardown did not complete, so its resources may still be                      held: {why}. Resolve that first (`packetframe detach --all` once VPP                      is confirmed gone); attaching over it would put a second supervisor on                      the same VF."
+                ),
+            ));
+        }
         let source = self.source.take().ok_or_else(|| {
             ModuleError::other(
                 MODULE_NAME,
@@ -626,6 +651,16 @@ mod tests {
     use packetframe_common::module::{HealthState, SubsystemHealth};
     use supervisor::State;
 
+    struct NoRoutes;
+    impl engine::RouteSource for NoRoutes {
+        fn for_each_route(
+            &self,
+            _: &mut dyn FnMut(packetframe_common::fib::IpPrefix, &[std::net::IpAddr]),
+        ) {
+        }
+        fn for_each_neighbour(&self, _: &mut dyn FnMut(std::net::IpAddr, &str, [u8; 6])) {}
+    }
+
     /// A published snapshot the loop would produce in the designed
     /// resting state: verified, nothing steered, nothing wrong.
     fn healthy_published() -> service::Published {
@@ -728,6 +763,41 @@ mod tests {
             r.subsystems.iter().any(|s| s.name == "last-tick"
                 && s.message.as_deref() == Some("Start: no such file or directory")),
             "{r:?}"
+        );
+    }
+
+    /// An unresolved teardown must block another attach.
+    ///
+    /// `detach` takes `attached` before it can discover a failure, so
+    /// `attached.is_none()` is not evidence that nothing is happening. A
+    /// caller that rewires the route source and retries `attach` would start a
+    /// second supervisor against a VF the previous teardown may still be
+    /// releasing.
+    #[test]
+    fn a_failed_teardown_blocks_a_reattach() {
+        use packetframe_common::config::{GlobalConfig, ModuleSection};
+        use packetframe_common::module::{Module as _, ModuleConfig};
+
+        let mut m = VppOffloadModule::new();
+        m.state_dir = std::path::PathBuf::from("/tmp/pf-reattach-guard");
+        m.set_route_source(Box::new(NoRoutes));
+        let _ = m.remember_teardown_failure(
+            "teardown did not complete; VF/hugepage resources are still held".to_string(),
+        );
+
+        let section = ModuleSection {
+            name: "vpp-offload".into(),
+            directives: Vec::new(),
+        };
+        let global = GlobalConfig::default();
+        let e = m
+            .attach(&ModuleConfig::new(&section, &global))
+            .expect_err("must refuse while the teardown is unresolved");
+        let msg = e.to_string();
+        assert!(msg.contains("did not complete"), "{msg}");
+        assert!(
+            msg.contains("second supervisor"),
+            "the consequence must be stated: {msg}"
         );
     }
 

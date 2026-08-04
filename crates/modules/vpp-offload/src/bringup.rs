@@ -318,9 +318,42 @@ fn finish(
     // alive? `adopt` verifies (pid, start_ticks, boot_id) and declines
     // on any mismatch, so a recycled PID cannot be adopted — and a
     // decline simply means we start one instead.
-    let prior = match (state.vpp_pid, state.vpp_start_ticks) {
-        (Some(pid), Some(ticks)) => Some((pid, ticks, state.vpp_boot_id.clone())),
-        _ => None,
+    // The recorded identity must be COMPLETE before adoption is attempted,
+    // and an incomplete one with a pid is a refusal, not a "no process".
+    //
+    // This is the same defect the standalone detach had, in the startup path,
+    // and it is worse here. `VppProcess::adopt` returns `Ok(None)` when it
+    // cannot verify an identity — not when the process is confirmed gone — so
+    // passing `boot_id: None` through and reading the refusal as "nothing
+    // running" made `finish` emit `StartRequested`: a SECOND VPP on the same
+    // VF and the same API socket, with the recorded pid overwritten and the
+    // original orphaned holding the hardware.
+    //
+    // (I fixed this in the CLI and did not check this path, having audited
+    // the CLI against the module's rules and not the module against itself.)
+    let prior = match (state.vpp_pid, state.vpp_start_ticks, &state.vpp_boot_id) {
+        (Some(pid), Some(ticks), Some(boot)) => Some((pid, ticks, boot.clone())),
+        // Nothing was running when the record was last written.
+        (None, _, _) => None,
+        // A pid with an incomplete cookie: it can be neither identified nor
+        // ruled out, so it must not be adopted, and a fresh spawn on the same
+        // VF is exactly what must not happen.
+        (Some(pid), ticks, boot) => {
+            let missing = match (ticks, boot) {
+                (None, None) => "start-time cookie and boot id",
+                (None, Some(_)) => "start-time cookie",
+                _ => "boot id",
+            };
+            return Err(format!(
+                "{}: the state file records VPP pid {pid} with no {missing}, so it can \
+                 neither be adopted nor ruled out. Starting a fresh VPP would put a second \
+                 process on the same VF and API socket and orphan the first, so this \
+                 refuses. Confirm by hand whether that process is running: if it is, \
+                 `packetframe detach --all` after stopping it; if not, remove the state \
+                 file.",
+                crate::service::MAY_HOLD_RESOURCES
+            ));
+        }
     };
     let adopted: Option<VppProcess> = match prior {
         // A FAILED adoption is marked, because failing is not the same as
@@ -330,15 +363,13 @@ fn finish(
         // id, a pidfd that would not open. Rolling back then unbinds the VF
         // underneath a VPP that is still running and still able to DMA
         // through it.
-        Some((pid, ticks, boot)) => {
-            VppProcess::adopt(pid, ticks, boot.as_deref()).map_err(|e| {
-                format!(
-                    "{}: could not adopt the recorded VPP (pid {pid}): {e}. That process is \
+        Some((pid, ticks, boot)) => VppProcess::adopt(pid, ticks, Some(&boot)).map_err(|e| {
+            format!(
+                "{}: could not adopt the recorded VPP (pid {pid}): {e}. That process is \
                      probably still running and still holds its VF and hugepages.",
-                    crate::service::MAY_HOLD_RESOURCES
-                )
-            })?
-        }
+                crate::service::MAY_HOLD_RESOURCES
+            )
+        })?,
         None => None,
     };
     // Whether that VPP is diverting traffic right now. From the recorded
