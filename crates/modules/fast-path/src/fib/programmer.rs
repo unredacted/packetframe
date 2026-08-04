@@ -1054,6 +1054,33 @@ impl FibProgrammer {
         self.seq_by_id.remove(&id);
         self.free_ids.push(id);
 
+        // The second tier's LAST chance to hear about this address.
+        //
+        // `on_neigh_event` ignores events for IPs absent from `by_ip`, so
+        // the line above makes every future `Gone`/`Failed` for `ip`
+        // unreachable — without this the other tier would hold the
+        // adjacency until its process restarted.
+        //
+        // The case that needs it is a route REWRITE, not a withdrawal. On
+        // withdrawal every referencing route was announced withdrawn
+        // first, so nothing there points at this adjacency anyway. But a
+        // prefix re-advertised from NH-A to NH-B releases NH-A through
+        // the grace queue while the prefix itself stays up: the sink is
+        // correctly told `route_resolved(P, [NH-B])` and, without this,
+        // is never told NH-A is gone. Those accumulate for every nexthop
+        // the box has ever used, and a consumer programming static
+        // neighbours re-installs the whole stale set on every resync —
+        // adjacency slots spent, and resync time spent, inside a budget
+        // that has one.
+        //
+        // Refcount zero means no route in THIS tier references it, and
+        // the two tiers cannot disagree in the direction that matters
+        // (a prefix refused here is never announced), so nothing on the
+        // other side is still forwarding through it.
+        if let Some(sink) = self.route_sink.as_deref() {
+            sink.neighbour_lost(ip);
+        }
+
         // Leave the NEXTHOPS slot marked Failed so any stale FIB
         // pointer still producing lookups gets CustomFibNoNeigh
         // rather than forwarding to a recycled MAC.

@@ -1827,3 +1827,56 @@ fn neighbour_resolution_and_loss_reach_the_sink() {
         "a neighbour we hold no nexthop for must not be announced"
     );
 }
+
+/// Unregistering a nexthop tells the second tier it is gone.
+///
+/// This is the seam's only exit for an address, and the reason is a
+/// filter rather than a policy: `on_neigh_event` ignores events for IPs
+/// absent from `by_ip`, so once `unregister` removes the record no
+/// future `Gone` can reach the sink. Without a notification here the
+/// other tier keeps the adjacency for the life of the process.
+///
+/// Driven through `unregister_nexthop` rather than through the
+/// motivating scenario — a prefix re-advertised from NH-A to NH-B, which
+/// releases NH-A through the 100 ms grace queue — because both reach the
+/// same notification site and only one of them is deterministic.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn unregistering_a_nexthop_tells_the_sink_it_is_gone() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+    let mac = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x09];
+
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    h.feed_neigh(NeighEvent::Learned {
+        ip: nh,
+        mac,
+        ifindex: 4242,
+        src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+    });
+    assert_eq!(
+        sink.calls(),
+        vec![SinkCall::NeighResolved(nh, mac, 4242)],
+        "resolution reaches the sink first"
+    );
+
+    h.run(async { h.handle.unregister_nexthop(nh).await })
+        .expect("unregister_nexthop");
+    assert_eq!(
+        sink.calls().last(),
+        Some(&SinkCall::NeighLost(nh)),
+        "and its removal must too — nothing else can report it afterwards"
+    );
+
+    // The filter really is closed behind it: a kernel event arriving
+    // after the unregister is dropped, which is what makes the
+    // notification above the only one there will ever be.
+    let before = sink.calls().len();
+    h.feed_neigh(NeighEvent::Gone { ip: nh });
+    assert_eq!(
+        sink.calls().len(),
+        before,
+        "a post-unregister event is filtered, so it cannot substitute"
+    );
+}
