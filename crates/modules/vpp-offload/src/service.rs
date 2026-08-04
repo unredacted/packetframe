@@ -147,6 +147,49 @@ struct Shared {
     latest: Mutex<Option<Published>>,
 }
 
+/// A teardown that outlived the detach budget, and the way to watch it.
+///
+/// `stop()` returns one of these instead of simply dropping the thread
+/// handle. It has to: the timeout message tells the operator to check
+/// `packetframe status`, and without this the background thread became the
+/// only owner of the shared status window — so its eventual final publish,
+/// including whether `ReleaseResources` finally succeeded or exactly which
+/// VF refused to unbind, went somewhere nobody could read and was destroyed
+/// when the thread exited. A promise of information with no channel behind
+/// it is the defect this file has produced repeatedly; this one promised it
+/// to an operator rather than to a caller.
+pub struct PendingTeardown {
+    shared: Arc<Shared>,
+    thread: JoinHandle<()>,
+}
+
+impl PendingTeardown {
+    /// The most recent snapshot the loop published, including the final one
+    /// once it settles. Poll while [`Self::is_finished`] is false.
+    pub fn status(&self) -> Option<Published> {
+        self.shared.latest.lock().expect("status lock").clone()
+    }
+
+    /// Whether the loop has finished. Once true, [`Self::status`] is the
+    /// FINAL word on the teardown — what was released and what was not.
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+}
+
+/// What `stop()` observed.
+///
+/// A struct rather than an enum because most callers only want
+/// `published`; `pending` is `Some` exactly when the loop was still working
+/// when the detach budget expired, and making it a field is what turns
+/// dropping it into a deliberate act rather than an accident.
+pub struct StopReport {
+    /// What to report now.
+    pub published: Option<Published>,
+    /// `Some` when the teardown is still running in the background.
+    pub pending: Option<PendingTeardown>,
+}
+
 /// Handle to a running supervision loop.
 pub struct SupervisionService {
     shared: Arc<Shared>,
@@ -233,10 +276,13 @@ impl SupervisionService {
     /// Consumes the handle: there is nothing meaningful to do with a
     /// service after stopping it except read the final status, which
     /// is returned.
-    pub fn stop(mut self) -> Option<Published> {
+    pub fn stop(mut self) -> StopReport {
         self.shared.stop.store(true, Ordering::SeqCst);
         let Some(t) = self.thread.take() else {
-            return self.status();
+            return StopReport {
+                published: self.status(),
+                pending: None,
+            };
         };
         // Bounded and interruptible, NOT `join()`, and bounded by the
         // CONTRACT rather than by this module's convenience.
@@ -275,13 +321,23 @@ impl SupervisionService {
             // in flight is exactly the lie `teardown_failures` exists to
             // prevent.
             //
-            return Some(self.incomplete_teardown(format!(
+            let published = Some(self.incomplete_teardown(format!(
                 "the supervision loop was still working after {} ms and was not waited on \
                  further; VPP and its resources may still be held — it continues tearing \
                  down in the background, but check `packetframe status` and the state file \
                  before re-attaching",
                 DETACH_BUDGET.as_millis()
             )));
+            // The thread keeps its own `Arc<Shared>`, so handing the caller
+            // one keeps the eventual final publish reachable — which is
+            // exactly what the message above sends the operator to read.
+            return StopReport {
+                published,
+                pending: Some(PendingTeardown {
+                    shared: Arc::clone(&self.shared),
+                    thread: t,
+                }),
+            };
         }
         // A panic is NOT a clean stop, and discarding the join error made
         // it look like one. `is_finished()` is true for a panicked thread,
@@ -294,7 +350,7 @@ impl SupervisionService {
         // The panic payload itself is not propagated as a second panic
         // here: the thread already printed it, and the caller needs a
         // status, not an unwind.
-        match t.join() {
+        let published = match t.join() {
             Ok(()) => self.status(),
             Err(_) => Some(
                 self.incomplete_teardown(
@@ -305,6 +361,11 @@ impl SupervisionService {
                         .to_string(),
                 ),
             ),
+        };
+        // Settled — the loop is gone, so there is nothing left to watch.
+        StopReport {
+            published,
+            pending: None,
         }
     }
 

@@ -132,7 +132,7 @@ fn the_service_converges_publishes_health_and_stops_clean() {
     // The runtime's release_resources refuses by design until the
     // attach wiring exists, and that refusal must reach the caller
     // rather than vanish with a discarded Tick.
-    let last = svc.stop().expect("final status");
+    let last = svc.stop().published.expect("final status");
     assert_eq!(last.state, State::Stopped, "{:?}", last.report);
     assert!(
         last.metrics.contains("state=\"stopped\"} 1"),
@@ -729,7 +729,7 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
     }
     assert!(!svc.is_alive(), "the loop was expected to panic");
 
-    let last = svc.stop().expect("a status, even after a panic");
+    let last = svc.stop().published.expect("a status, even after a panic");
     assert!(
         last.resources_leaked,
         "nothing confirmed a release, so resources must be reported as possibly held: {:?}",
@@ -848,4 +848,106 @@ fn an_episode_keeps_its_root_cause_alongside_the_latest_symptom() {
     }
 
     let _ = svc.stop();
+}
+
+/// A teardown that outlives the detach budget stays OBSERVABLE.
+///
+/// `stop()`'s timeout message tells the operator to check `packetframe
+/// status`. That promise was unkeepable: `stop()` consumes the service and
+/// dropped the thread handle, leaving the background loop as the only owner
+/// of the shared status window — so its eventual final publish, including
+/// whether the release finally succeeded, went somewhere nobody could read.
+///
+/// The loop is held up by a fake that stops answering `control_ping` while
+/// keeping the connection open, so a tick sits in its synchronous socket
+/// read past the 900 ms budget.
+#[test]
+fn a_teardown_that_outlives_the_budget_is_still_observable() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-pending",
+        fake_vpp::Behaviour {
+            hangup_after: None,
+            reject_deletes: 0,
+            garbage_crcs: false,
+            stall_pings_after: Some(1),
+            verify_mismatch: false,
+        },
+    );
+    let sock = fake.path.clone();
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let report = svc.stop();
+    assert!(
+        report.published.is_some(),
+        "a snapshot must come back either way"
+    );
+
+    // Whether the budget expires is a race against the stalled ping, so
+    // BOTH outcomes assert something — a conditional assertion that can
+    // silently do nothing is the shape this PR has produced five times.
+    // Locally this takes the pending branch; the settled branch is asserted
+    // in case a slower runner beats the stall.
+    let Some(pending) = report.pending else {
+        assert_eq!(
+            report.published.as_ref().map(|p| p.state),
+            Some(State::Stopped),
+            "no pending handle, so the teardown must have actually completed"
+        );
+        return;
+    };
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pending.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pending.is_finished(),
+            "the background teardown never settled"
+        );
+        let final_status = pending
+            .status()
+            .expect("the final publish must be reachable through the handle");
+        assert_eq!(
+            final_status.state,
+            State::Stopped,
+            "the FINAL word on the teardown, which used to be destroyed with the thread: \
+             {:?}",
+            final_status.teardown_failures
+        );
+    }
 }
