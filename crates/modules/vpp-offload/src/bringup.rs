@@ -380,6 +380,51 @@ fn finish(
         );
         let initial = match adopted {
             Some(p) => {
+                // The API handshake MUST happen before the adoption is
+                // injected, and this is the only place it can.
+                //
+                // `Event::Adopted` runs `AttachDevices` and `StartResync`
+                // synchronously. Against an engine whose transport has never
+                // connected, both return `NotConnected` → `ConvergenceFailed`
+                // → `fail()` → **Kill** — so the adopted VPP, the one thing
+                // preserve-on-restart exists to keep, was killed and replaced
+                // by a full restart and reconvergence. That is drill (d)
+                // inverted, and every adoption test in `vpp_service.rs` does
+                // this handshake in its factory with a comment saying the
+                // attach wiring does the same. The comment was aspirational.
+                {
+                    use crate::driver::Observe as _;
+                    let (mut obs, _) = runtime.views();
+                    if !obs.api_ready() {
+                        // Do NOT kill it and do NOT release anything. VPP is
+                        // running and may be forwarding steered traffic; the
+                        // one thing we now know is that we cannot talk to it.
+                        // Deciding to restart it is the supervisor's job on
+                        // evidence, and we have none beyond a refused
+                        // handshake — so this reports and leaves the box
+                        // alone. `MAY_HOLD_RESOURCES` suppresses the caller's
+                        // rollback, because the VF is still under a live
+                        // process.
+                        let detail = runtime
+                            .status()
+                            .api_error
+                            .unwrap_or_else(|| "(no detail recorded)".into());
+                        let permanent = if runtime.api_incompatible() {
+                            " This is a permanent incompatibility (CRC/version skew); \
+                             retrying cannot fix it."
+                        } else {
+                            ""
+                        };
+                        return Err(format!(
+                            "{}: adopted VPP (pid {}) does not answer its binary API: \
+                             {detail}.{permanent} It is still running and still holds its \
+                             VF and hugepages — nothing was killed or released. Investigate, \
+                             or `packetframe detach --all` to clear it and start fresh.",
+                            crate::service::MAY_HOLD_RESOURCES,
+                            p.pid()
+                        ));
+                    }
+                }
                 // Order matters and is contractual: `adopt_process`
                 // first, with the same `steered`, so the engine's socket
                 // deadline is already the steered one when `inject`
@@ -387,6 +432,9 @@ fn finish(
                 runtime.adopt_process(p, steered);
                 vec![Event::Adopted { steered }]
             }
+            // Nothing to hand over: VPP does not exist yet, so there is no
+            // API to handshake with. The loop's `Start` spawns it and the
+            // driver polls `api_ready` while `Starting`.
             None => vec![Event::StartRequested],
         };
         Ok((Driver::new(), runtime, initial))
