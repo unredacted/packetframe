@@ -54,10 +54,18 @@ use crate::supervisor::Event;
 /// How long a SIGTERM gets before escalation, on top of the bounded
 /// SIGKILL wait inside [`VppProcess::terminate`].
 ///
-/// Short: by the time `Kill` is issued, steering is already down (rule
-/// 2), so nothing is lost by being brisk — and the recovery clock is
-/// running against the published ≤90 s number.
-pub const TERM_GRACE: Duration = Duration::from_secs(3);
+/// SIGTERM here is a courtesy, not a correctness need: by the time
+/// `Kill` is issued steering is already down (rule 2), and VPP holds no
+/// durable state — its FIB is reconstructed from the mirror on every
+/// start. So the grace is sized against the `Module::detach` contract
+/// (< 1 s, SPEC.md §3.2), which this kill path sits inside: 500 ms of
+/// courtesy keeps the cooperative case within the contract. The
+/// uninterruptible-sleep case (VFIO/DMA, SIGKILL cannot bite) exceeds
+/// any budget by nature; `terminate` bounds that wait at 2 s and
+/// reports `MustLeak` rather than hanging, which is the documented
+/// best-effort relaxation from slice 2 — detach fails loudly instead of
+/// blocking forever on a process the kernel will not release.
+pub const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// The `(pid, start_ticks, boot_id)` triple that makes a recorded
 /// process identity safe to act on across restarts and PID reuse.
@@ -276,6 +284,38 @@ pub struct RuntimeStatus {
 }
 
 impl Core {
+    /// A freshly spawned child whose identity cannot be made durable —
+    /// the store refused it, or its boot_id could not be read — must
+    /// not survive unrecorded, and must not be *forgotten* either.
+    ///
+    /// Termination is attempted; the disposition decides everything.
+    /// `SafeToRelease`: the child is gone and the spawn simply failed.
+    /// `MustLeak`: the child survived SIGKILL (VFIO/DMA), and the first
+    /// version of this path dropped the handle anyway — discarding the
+    /// one observer (the pidfd) that will ever report the late exit,
+    /// and leaving `SpawnFailed`'s retry free to start a second VPP
+    /// over a VF the survivor may still be DMAing through. Now the
+    /// handle is retained (so `spawn` refuses while it exists) and
+    /// `TerminationFailed` is queued so the supervisor's `undead` flag
+    /// blocks the restart through the designed mechanism rather than by
+    /// accident of backoff timing.
+    fn abandon_spawn(&mut self, mut p: VppProcess, why: String) -> String {
+        let pid = p.pid();
+        match terminate_or_leak(&mut p, TERM_GRACE) {
+            Disposition::SafeToRelease => {
+                format!("spawned pid {pid} but {why}; the child was terminated")
+            }
+            Disposition::MustLeak => {
+                self.process = Some(p);
+                self.pending.push(Event::TerminationFailed);
+                format!(
+                    "spawned pid {pid} but {why}; the child SURVIVED termination — \
+                     handle retained, restart blocked until its exit is observed"
+                )
+            }
+        }
+    }
+
     /// The process is confirmed gone: invalidate everything learned
     /// from it. Indices are per-instance, the ledger describes a FIB
     /// that no longer exists, and the socket belongs to the dead
@@ -347,24 +387,33 @@ impl Effects for EffectsView {
             return Err("refusing to spawn: a supervised process already exists".into());
         }
         let (binary, conf) = (c.vpp_binary.clone(), c.startup_conf.clone());
-        let mut p = VppProcess::spawn(&binary, &conf).map_err(|e| format!("spawning VPP: {e}"))?;
+        let p = VppProcess::spawn(&binary, &conf).map_err(|e| format!("spawning VPP: {e}"))?;
 
+        // The boot_id is not optional in spirit: `VppProcess::adopt`
+        // refuses an identity without one (a `(pid, ticks)` pair is
+        // forgeable across a reboot), so recording `None` here would
+        // manufacture a live VPP no future daemon can ever adopt — an
+        // orphan holding the VF. An unreadable boot_id therefore gets
+        // the same treatment as a store failure: the child does not
+        // survive unrecorded.
+        let boot_id = match crate::process::boot_id() {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(c.abandon_spawn(
+                    p,
+                    format!("its boot_id could not be read ({e}), making it unadoptable"),
+                ))
+            }
+        };
         let identity = ProcessIdentity {
             pid: p.pid(),
             start_ticks: p.start_ticks(),
-            boot_id: crate::process::boot_id().ok(),
+            boot_id: Some(boot_id),
         };
         if let Err(e) = c.store.process_changed(Some(identity)) {
-            // Persist-or-kill. A VPP whose identity is not on disk
-            // cannot be adopted after a daemon restart: it survives as
-            // an orphan holding the VF, unkillable by anything that
-            // respects the identity check. Better one failed spawn now
-            // than that later.
-            let _ = terminate_or_leak(&mut p, Duration::from_secs(1));
-            return Err(format!(
-                "spawned pid {} but could not record it: {e}",
-                p.pid()
-            ));
+            // Persist-or-kill: a VPP whose identity is not on disk
+            // cannot be adopted after a daemon restart.
+            return Err(c.abandon_spawn(p, format!("could not record it: {e}")));
         }
         c.process = Some(p);
         Ok(())
