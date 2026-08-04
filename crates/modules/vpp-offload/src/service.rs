@@ -54,6 +54,17 @@ const STOP_POLL_CAP: Duration = Duration::from_millis(50);
 /// the final published status says which.
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
+/// How long `stop()` waits for the loop before returning with an
+/// unfinished teardown on the record.
+///
+/// Sized to the `Module::detach` contract (under 1 s, SPEC.md §3.2) with
+/// room for the poll granularity, NOT to the loop's internal teardown
+/// budget. The distinction is the point: the loop may legitimately need
+/// `STOP_PATIENCE` to outlast an undead VPP, and the caller must not be
+/// blocked for it. What the caller gets instead is a snapshot that says
+/// the teardown is unfinished.
+const DETACH_BUDGET: Duration = Duration::from_millis(900);
+
 /// Builds the loop's non-`Send` pieces on the loop thread, and returns
 /// the events to inject before the first tick.
 ///
@@ -188,44 +199,91 @@ impl SupervisionService {
         let Some(t) = self.thread.take() else {
             return self.status();
         };
-        // Bounded and interruptible, NOT `join()`.
+        // Bounded and interruptible, NOT `join()`, and bounded by the
+        // CONTRACT rather than by this module's convenience.
         //
-        // An unconditional join cannot observe `STOP_PATIENCE` or the
-        // stop flag until the tick in progress returns — and a tick can
-        // legitimately sit in a synchronous API call for a full
-        // `SYNC_PING_BUDGET` (10 s unsteered), with verification issuing
-        // several such calls in a row. The teardown deadline only starts
-        // counting after that, so the honest worst case was ~20 s with no
-        // ceiling anywhere, against a `Module::detach` contract of under
-        // one second (SPEC.md §3.2).
+        // An unconditional join cannot observe any deadline until the tick
+        // in progress returns — and a tick can legitimately sit in a
+        // synchronous API call for a full `SYNC_PING_BUDGET` (10 s
+        // unsteered), with verification issuing several in a row. So the
+        // honest worst case was ~20 s with no ceiling.
         //
-        // Under one second is not achievable on this platform and the plan
-        // says so: VPP sits on VFIO/DMA, SIGKILL cannot interrupt an
-        // uninterruptible sleep, and the kill path alone budgets 500 ms of
-        // SIGTERM grace plus a bounded SIGKILL wait. So the contract is
-        // relaxed to a documented best-effort bound, and this is where
-        // that bound is enforced: `STOP_PATIENCE`, the same budget the
-        // loop gives its own teardown, so a teardown that completes
-        // normally always completes inside it.
-        let deadline = Instant::now() + STOP_PATIENCE;
+        // The first fix bounded it at `STOP_PATIENCE` (10 s), which was
+        // still wrong for a reason worth naming: `Module::detach` is
+        // documented to complete in under a second, and 10 s is an order of
+        // magnitude past it. Choosing the loop's internal budget as the
+        // caller's bound was picking whichever of two contradicting
+        // documents suited the code.
+        //
+        // Waiting for the whole teardown inside a second is genuinely
+        // impossible here — the kill path alone budgets 500 ms of SIGTERM
+        // grace plus a bounded SIGKILL wait, and VFIO/DMA can defeat
+        // SIGKILL entirely. But *returning* inside a second is not: the
+        // loop keeps its own `STOP_PATIENCE` and finishes the teardown in
+        // the background, and the state file is what lets a later
+        // `detach --all` complete anything left. So this waits only for the
+        // fast path — the overwhelmingly common case, where nothing is
+        // wedged and the loop settles in milliseconds — and past that
+        // reports an unfinished teardown rather than blocking the loader.
+        let deadline = Instant::now() + DETACH_BUDGET;
         while !t.is_finished() && Instant::now() < deadline {
             std::thread::sleep(STOP_POLL_CAP);
         }
         if !t.is_finished() {
-            // Deliberately NOT joined: blocking past the stated bound is
-            // the thing being fixed. The thread is left to finish its own
-            // teardown — it has the same deadline and will release what it
-            // can — but the caller is told, because a detach that reports
-            // success over a teardown still in flight is exactly the lie
-            // `teardown_failures` exists to prevent.
-            let mut last = self.status()?;
+            // Deliberately NOT joined. The thread is left to finish its own
+            // teardown under `STOP_PATIENCE`, but the caller is told,
+            // because a detach that reports success over a teardown still
+            // in flight is exactly the lie `teardown_failures` exists to
+            // prevent.
+            //
+            // `status()` is `Some` for any started service —
+            // `SupervisionService::start` blocks on the first publish — so
+            // the fallback below is unreachable in practice and is written
+            // as a real snapshot rather than a `?` that would silently
+            // discard the timeout.
+            let mut last = self.status().unwrap_or_else(|| Published {
+                report: HealthReport::healthy(),
+                metrics: String::new(),
+                state: State::Stopped,
+                api_error: None,
+                terminal: None,
+                teardown_failures: Vec::new(),
+                resources_leaked: false,
+                last_failures: Vec::new(),
+                store_error: None,
+            });
             last.teardown_failures.push(format!(
-                "the supervision loop was still working after {}s and was not waited on \
-                 further; VPP and its resources may still be held — check `packetframe \
-                 status` and the state file before re-attaching",
-                STOP_PATIENCE.as_secs()
+                "the supervision loop was still working after {} ms and was not waited on \
+                 further; VPP and its resources may still be held — it continues tearing \
+                 down in the background, but check `packetframe status` and the state file \
+                 before re-attaching",
+                DETACH_BUDGET.as_millis()
             ));
             last.resources_leaked = true;
+            // The rest of the snapshot is from the last ORDINARY publish,
+            // which may well say `Ready`/Healthy — it was true when the
+            // loop published it and is not true now. Returning it unchanged
+            // advertised healthy-and-ready alongside "teardown unfinished,
+            // resources may be held", in one object.
+            last.report.overall = packetframe_common::module::HealthState::Unhealthy;
+            last.report
+                .subsystems
+                .push(packetframe_common::module::SubsystemHealth {
+                    name: "supervision".into(),
+                    state: packetframe_common::module::HealthState::Unhealthy,
+                    message: Some(
+                        "shutdown did not complete within the detach budget; the loop is \
+                         still running"
+                            .into(),
+                    ),
+                    last_success_age_seconds: None,
+                });
+            // Metrics are emptied rather than adjusted. They were rendered
+            // from a snapshot that no longer describes anything, and
+            // rewriting individual gauge lines by string surgery would be a
+            // second, divergent renderer. No data beats stale data that
+            // reads as healthy.
+            last.metrics.clear();
             return Some(last);
         }
         // A panicked loop already published nothing further; the join
@@ -258,6 +316,15 @@ impl Drop for SupervisionService {
 /// One action failure per line, `Action: reason`, for the published
 /// diagnostics. Shared so an ordinary tick, an injected event and the
 /// teardown all render identically.
+/// Whether a supervised process exists right now.
+///
+/// `Backoff` and `Stopped` are deliberately "no process": the previous one
+/// is already gone. Anything learned FROM that process — notably a verify
+/// verdict — stops describing reality here.
+fn has_process_now(driver: &Driver) -> bool {
+    driver.state().has_process()
+}
+
 fn fmt_failures(outcome: &crate::executor::Outcome) -> Vec<String> {
     outcome
         .failures
@@ -465,25 +532,38 @@ fn run_loop(
             last_failures = failures;
         }
 
-        // The retained verdict describes ONE process instance, so process
-        // loss has to invalidate it — but asymmetrically, and the
-        // asymmetry is the whole point:
+        // The retained verdict describes ONE process instance, and it dies
+        // with it — in BOTH polarities.
         //
-        // - a **passing** verdict must go. Keeping it reported a verified
-        //   FIB, and `packetframe_vpp_fib_verified 1`, for a process that
-        //   no longer exists — through the entire backoff interval and in
-        //   the final stopped snapshot.
-        // - a **failing** verdict must stay. It is the reason we are in
-        //   backoff at all, and dropping it puts "not yet verified" where
-        //   the explanation should be.
+        // Three attempts got this wrong before the reason became clear, so
+        // the reasoning is worth keeping. Keying on `Starting` never fired
+        // (a lost process lands in `Backoff`, never passing through
+        // `Starting`). Keying on `!has_process()` fired on loss but not on
+        // replacement. Trying to detect the replacement as a false→true
+        // edge failed too, and instructively: `BackoffElapsed` enters
+        // `Starting` and a failed spawn returns to `Backoff` inside ONE
+        // tick, so a once-per-pass sample never observes it — a transient
+        // state cannot be detected by polling.
         //
-        // Keyed on `has_process()`, not on a state guess. The first
-        // version keyed on `Starting`, which a lost process does not pass
-        // through: a crash, a wedge or a stop lands in `Backoff` or
-        // `Stopped`, so the invalidation never fired for any of the cases
-        // it existed to cover.
-        if !driver.state().has_process() && last_verify.as_ref().is_some_and(|v| v.passed()) {
-            last_verify = None;
+        // The asymmetry was the real mistake. It existed to keep a failed
+        // verdict visible as the explanation for backoff, which conflated
+        // two jobs: the FIB subsystem reports on the CURRENT instance,
+        // while "why are we in backoff" belongs to `last_failures`, the
+        // field that already retains reasons across the empty ticks. Split
+        // them and the transient-state problem disappears — the condition
+        // becomes `!has_process()`, which is stable for as long as it
+        // matters.
+        if !has_process_now(&driver) {
+            if let Some(v) = last_verify.take() {
+                if !v.passed() {
+                    // Retain the WHY where reasons live, before dropping
+                    // the verdict that can no longer describe anything.
+                    let summary = format!("Verify: {}", v.summary());
+                    if !last_failures.contains(&summary) {
+                        last_failures.push(summary);
+                    }
+                }
+            }
             last_verify_at = None;
         }
 

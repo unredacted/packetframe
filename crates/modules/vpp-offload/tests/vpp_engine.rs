@@ -329,6 +329,7 @@ fn a_refused_derived_delete_is_retried() {
             hangup_after: None,
             reject_deletes: 1,
             garbage_crcs: false,
+            stall_pings_after: None,
             verify_mismatch: false,
         },
     );
@@ -475,6 +476,7 @@ fn a_crc_mismatch_is_recorded_as_permanent() {
             hangup_after: None,
             reject_deletes: 0,
             garbage_crcs: true,
+            stall_pings_after: None,
             verify_mismatch: false,
         },
     );

@@ -151,6 +151,15 @@ pub struct Behaviour {
     /// Advertise garbage CRCs in the handshake's message table — the
     /// version-skew shape the transport must refuse loudly.
     pub garbage_crcs: bool,
+    /// Stop answering `control_ping` after this many of them, WITHOUT
+    /// closing the connection.
+    ///
+    /// Models a VPP whose main thread is busy: the client blocks in its
+    /// synchronous socket read until the timeout in force. That is the
+    /// shape that made `stop()` unbounded — a tick sitting inside an API
+    /// call cannot observe the stop flag — and a hangup cannot model it,
+    /// because a closed socket returns immediately.
+    pub stall_pings_after: Option<usize>,
     /// Answer `ip_route_lookup` with a path on an interface the module
     /// does not own, so readback verification FAILS.
     ///
@@ -363,7 +372,15 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
                 write_frame(sock, &d);
                 continue;
             }
+            "control_ping" if behaviour.stall_pings_after == Some(0) => {
+                // Silence, connection held open: the client blocks until
+                // its read timeout.
+                continue;
+            }
             "control_ping" => {
+                if let Some(n) = behaviour.stall_pings_after.as_mut() {
+                    *n -= 1;
+                }
                 out = reply_head("control_ping_reply");
                 ControlPingReply {
                     context: ctx,

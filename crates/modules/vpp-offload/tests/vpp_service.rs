@@ -169,6 +169,7 @@ fn an_incompatible_api_fails_attach_with_the_reason() {
             hangup_after: None,
             reject_deletes: 0,
             garbage_crcs: true,
+            stall_pings_after: None,
             verify_mismatch: false,
         },
     );
@@ -349,6 +350,7 @@ fn a_failing_verifys_teardown_failures_are_published_and_retained() {
             reject_deletes: 0,
             garbage_crcs: false,
             // Routes install and ack; only the readback disagrees.
+            stall_pings_after: None,
             verify_mismatch: true,
         },
     );
@@ -516,6 +518,110 @@ fn the_initial_injections_failures_reach_the_first_snapshot() {
         "a VPP that never started must not read as healthy: {:?}",
         first.report
     );
+
+    let _ = svc.stop();
+}
+
+/// A verdict must not outlive the process it describes — in either
+/// polarity — and the REASON must survive the verdict.
+///
+/// A passing verdict kept after the process died reported a verified FIB,
+/// and `packetframe_vpp_fib_verified 1`, for something that no longer
+/// existed. A failing one kept for the same reason then survived into the
+/// *replacement*, describing a process it had never seen for the whole
+/// startup budget. Both are fixed by tying the verdict's lifetime to
+/// `has_process()`; what keeps that from losing information is that the
+/// failed verify's summary moves into `last_failures`, the field that
+/// exists to retain reasons.
+#[test]
+fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-inherit",
+        fake_vpp::Behaviour {
+            hangup_after: None,
+            reject_deletes: 0,
+            garbage_crcs: false,
+            stall_pings_after: None,
+            verify_mismatch: true,
+        },
+    );
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                "/nonexistent/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let fib_msg = |p: &packetframe_vpp_offload::service::Published| {
+        p.report
+            .subsystems
+            .iter()
+            .find(|s| s.name == "fib-synced")
+            .and_then(|s| s.message.clone())
+            .unwrap_or_default()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let p = svc.status().expect("published");
+        if p.state == State::Backoff {
+            // The verdict is gone: it described a process that no longer
+            // exists, and the FIB subsystem speaks for the current one.
+            assert!(
+                !fib_msg(&p).contains("verify FAIL"),
+                "the verdict outlived its process: {:?}",
+                fib_msg(&p)
+            );
+            // But the reason is not gone.
+            assert!(
+                p.last_failures
+                    .iter()
+                    .any(|f| f.starts_with("Verify:") && f.contains("verify FAIL")),
+                "the failed verify's summary was dropped with the verdict; nothing now \
+                 explains the backoff: {:?}",
+                p.last_failures
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never reached Backoff; state {:?}",
+            p.state
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let _ = svc.stop();
 }
