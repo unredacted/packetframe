@@ -173,6 +173,12 @@ impl Driver {
         let before = self.sup.state();
         let mut events = Vec::new();
         let mut more_to_drain = false;
+        // Whether the API was already up **at entry**. Captured here
+        // because the block below may arm the detector during this very
+        // tick, and every observation in this loop reads the state as it
+        // was on entry — draining on the tick that first saw the API
+        // would act on a transition the supervisor has not applied yet.
+        let api_up_at_entry = self.detector.is_some();
 
         // Death first, and **before the deadline events**. A pidfd is
         // level-triggered, so an exit can still be readable on the very
@@ -206,20 +212,60 @@ impl Driver {
                 }
             }
 
-            // Only while the RESYNC is in flight — not merely while
-            // `is_converging()`, which also covers `Verifying`. Draining
-            // an already-empty map during verify would report
-            // `SyncComplete` on every pass; the supervisor ignores it,
-            // but "an event was applied" is what asks for an immediate
-            // re-tick, so it would spin a core through the whole verify.
-            if matches!(before, State::Syncing | State::AdoptedResyncing) {
+            // Drained in EVERY state with a live API, not only during a
+            // resync — because `drain_batch` also pulls the source's live
+            // changes, and after first convergence the module spends its
+            // life in `Ready`/`Steered`. Gated on the resync states (as
+            // this was) every route learned after attach would reach the
+            // eBPF tier and stop there: VPP would forward a frozen table,
+            // report healthy, and pass readback verification, since
+            // verify samples the mirror it was synced against.
+            //
+            // What stays gated is the *event*. `Ok(true)` outside a
+            // resync means "nothing pending", an unremarkable steady
+            // state; emitting `SyncComplete` for it would ask for an
+            // immediate re-tick on every pass and spin a core through
+            // the whole of `Verifying`.
+            //
+            // `Verifying` itself stays excluded, and for a second reason
+            // that outlives the spin: verify probes VPP for prefixes **the
+            // ledger believes are installed**, so a withdrawal applied
+            // between the sample and the probe makes VPP correctly answer
+            // "no route" and verify read it as a mismatch. That failure
+            // unsteers and restarts a VPP that was working. Deltas wait
+            // out the verify instead — bounded, and the source's map
+            // collapses per prefix, so waiting costs staleness rather
+            // than depth.
+            let resyncing = matches!(before, State::Syncing | State::AdoptedResyncing);
+            // `resyncing ||` and not `api_up_at_entry` alone: an ADOPTED
+            // process is already in a resync state on the very first
+            // tick, before the detector has been armed, and the old guard
+            // drained it there. Gating that behind `api_up_at_entry`
+            // withholds the first batch for one tick — long enough for
+            // the settled tick's sleep to run the resync phase deadline
+            // out and fail a convergence that was fine.
+            if (resyncing || api_up_at_entry) && before != State::Verifying {
                 match obs.drain_batch() {
                     // Empty means the resync is done — and only the
                     // drain can say so, which is why this is observed
                     // rather than assumed after issuing StartResync.
-                    Ok(true) => events.push(Event::SyncComplete),
+                    Ok(true) if resyncing => events.push(Event::SyncComplete),
+                    Ok(true) => {}
                     Ok(false) => more_to_drain = true,
-                    Err(_) => events.push(Event::ConvergenceFailed),
+                    // Failing mid-resync is a convergence failure: the
+                    // table is known-incomplete and nothing is forwarding
+                    // through it yet.
+                    Err(_) if resyncing => events.push(Event::ConvergenceFailed),
+                    // Failing in steady state is NOT. The batch stays in
+                    // the pending map, which is last-write-wins, so the
+                    // retry is free and idempotent — and treating one bad
+                    // round trip as a convergence failure would unsteer
+                    // and restart a VPP that is carrying traffic, at ~40 s
+                    // of resync, to fix a route that the next tick would
+                    // have installed. A VPP that has genuinely stopped
+                    // answering is the wedge detector's job, and it has a
+                    // measured budget for exactly that.
+                    Err(_) => more_to_drain = true,
                 }
             }
 

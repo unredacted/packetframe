@@ -52,11 +52,15 @@ use std::sync::Mutex;
 
 use packetframe_common::fib::{IpPrefix, ResolvedRouteSink};
 
-use crate::engine::RouteSource;
+use crate::engine::{RouteSource, SourceChanges};
 use crate::sink::PrefixKey;
 
 /// Index into [`Inner::sets`].
 type SetId = u32;
+
+/// A neighbour change as the feed stores it, before device names are
+/// resolved: the nexthop, and its (MAC, kernel ifindex) or `None`.
+type RawNeighChange = (IpAddr, Option<([u8; 6], u32)>);
 
 /// How many prefixes one lock acquisition copies out during a full-table
 /// walk.
@@ -83,6 +87,8 @@ pub struct FeedStats {
     /// route source, which is a different fault from VPP being slow.
     pub pending: u64,
     pub neighbours: u64,
+    /// Neighbour changes the engine has not drained yet.
+    pub pending_neighbours: u64,
     /// Distinct nexthop sets interned. Expected to sit near the
     /// topology's shape (129 nexthops / 2 devices as measured); an
     /// order-of-magnitude departure means the assumption behind
@@ -106,6 +112,17 @@ struct Inner {
     /// read path, not here: `if_indextoname` is a socket-and-ioctl on
     /// glibc, and this runs on the other tier's task.
     neighbours: HashMap<IpAddr, ([u8; 6], u32)>,
+    /// Neighbour → new state, or `None` for lost. Same shape and the same
+    /// reason as `pending`.
+    ///
+    /// Carried as deltas rather than re-walked, because the alternative
+    /// is a full neighbour refresh on every tick that has route changes —
+    /// ~129 entries and an `if_indextoname` each, repeatedly, to discover
+    /// that nothing moved. And it cannot simply be skipped: a route delta
+    /// naming a nexthop the engine's map has never seen classifies
+    /// **unresolvable**, so without this a genuinely new nexthop would
+    /// black-hole its routes until the next full resync.
+    neigh_pending: HashMap<IpAddr, Option<([u8; 6], u32)>>,
 }
 
 impl Inner {
@@ -138,30 +155,9 @@ impl RouteFeed {
             routes: g.routes.len() as u64,
             pending: g.pending.len() as u64,
             neighbours: g.neighbours.len() as u64,
+            pending_neighbours: g.neigh_pending.len() as u64,
             nexthop_sets: g.sets.len() as u64,
         }
-    }
-
-    /// Take up to `max` deltas in key order, removing them from the
-    /// pending map.
-    ///
-    /// `None` in the second position is a withdrawal. Returning owned
-    /// `Vec`s rather than borrowing the intern table is deliberate: the
-    /// caller applies them to the engine's own pending map, and holding
-    /// this lock while doing so would put the other tier's route updates
-    /// behind VPP's convergence.
-    pub fn drain(&self, max: usize) -> Vec<(IpPrefix, Option<Vec<IpAddr>>)> {
-        let mut g = self.lock();
-        let keys: Vec<PrefixKey> = g.pending.keys().take(max).copied().collect();
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            let Some(state) = g.pending.remove(&k) else {
-                continue;
-            };
-            let nhs = state.map(|id| g.sets[id as usize].clone());
-            out.push((k.into(), nhs));
-        }
-        out
     }
 
     /// `PoisonError` cannot mean what it usually means here.
@@ -200,15 +196,56 @@ impl ResolvedRouteSink for RouteFeed {
     }
 
     fn neighbour_resolved(&self, nh: IpAddr, mac: [u8; 6], ifindex: u32) {
-        self.lock().neighbours.insert(nh, (mac, ifindex));
+        let mut g = self.lock();
+        g.neighbours.insert(nh, (mac, ifindex));
+        g.neigh_pending.insert(nh, Some((mac, ifindex)));
     }
 
     fn neighbour_lost(&self, nh: IpAddr) {
-        self.lock().neighbours.remove(&nh);
+        let mut g = self.lock();
+        g.neighbours.remove(&nh);
+        // Queued even if the map held nothing, for the same reason a
+        // withdrawal is: the engine's nexthop map is filled by resync too,
+        // so it can know a mapping this feed has already dropped.
+        g.neigh_pending.insert(nh, None);
     }
 }
 
 impl RouteSource for RouteFeed {
+    fn drain_changes(&self, max: usize) -> SourceChanges {
+        // Neighbours are taken whole rather than bounded: there are ~129
+        // of them against ~1.05M routes, so a cap would add a resumption
+        // path for a set that cannot produce a batch worth resuming.
+        let (neigh_raw, routes) = {
+            let mut g = self.lock();
+            let neigh: Vec<RawNeighChange> = g.neigh_pending.drain().collect();
+            let keys: Vec<PrefixKey> = g.pending.keys().take(max).copied().collect();
+            let mut routes = Vec::with_capacity(keys.len());
+            for k in keys {
+                let Some(state) = g.pending.remove(&k) else {
+                    continue;
+                };
+                let nhs = state.map(|id| g.sets[id as usize].clone());
+                routes.push((IpPrefix::from(k), nhs));
+            }
+            (neigh, routes)
+        };
+        // Names resolved after the lock is dropped: `if_indextoname` is a
+        // syscall, and the writer is the other tier's task.
+        let neighbours = neigh_raw
+            .into_iter()
+            .map(|(ip, state)| {
+                let resolved = state.and_then(|(mac, idx)| {
+                    // A link that vanished between the notification and
+                    // here reads as a loss, not as a name we invented.
+                    if_indextoname(idx).map(|dev| (dev, mac))
+                });
+                (ip, resolved)
+            })
+            .collect();
+        SourceChanges { routes, neighbours }
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         // Chunked so the writer never waits for more than `WALK_CHUNK`
         // copies. `after` is the resume cursor; a prefix inserted below it
@@ -269,6 +306,9 @@ impl RouteSource for RouteFeed {
 /// to be a separate object, and two objects is two mirrors — the engine
 /// would resync from a table nothing was writing to.
 impl RouteSource for std::sync::Arc<RouteFeed> {
+    fn drain_changes(&self, max: usize) -> SourceChanges {
+        (**self).drain_changes(max)
+    }
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         (**self).for_each_route(visit)
     }
@@ -317,7 +357,7 @@ mod tests {
             f.route_resolved(v4(192, 0), &[nh(i)]);
         }
         assert_eq!(f.stats().pending, 1, "100 updates, one pending delta");
-        let drained = f.drain(64);
+        let drained = f.drain_changes(64).routes;
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0], (v4(192, 0), Some(vec![nh(99)])), "newest wins");
         assert_eq!(f.stats().pending, 0, "drain removes what it returned");
@@ -332,13 +372,17 @@ mod tests {
 
         f.route_resolved(v4(198, 18), &[nh(1)]);
         f.route_withdrawn(v4(198, 18));
-        assert_eq!(f.drain(64), vec![(v4(198, 18), None)], "withdraw wins");
+        assert_eq!(
+            f.drain_changes(64).routes,
+            vec![(v4(198, 18), None)],
+            "withdraw wins"
+        );
         assert_eq!(f.stats().routes, 0, "and leaves the mirror");
 
         f.route_withdrawn(v4(198, 19));
         f.route_resolved(v4(198, 19), &[nh(2)]);
         assert_eq!(
-            f.drain(64),
+            f.drain_changes(64).routes,
             vec![(v4(198, 19), Some(vec![nh(2)]))],
             "a fresh install must displace a queued withdrawal"
         );
@@ -355,7 +399,7 @@ mod tests {
     fn a_withdrawal_for_an_unknown_prefix_still_reaches_the_engine() {
         let f = RouteFeed::new();
         f.route_withdrawn(v4(203, 0));
-        assert_eq!(f.drain(64), vec![(v4(203, 0), None)]);
+        assert_eq!(f.drain_changes(64).routes, vec![(v4(203, 0), None)]);
     }
 
     /// `drain` is bounded and resumes in key order.
@@ -365,12 +409,12 @@ mod tests {
         for i in 0..10u8 {
             f.route_resolved(v4(10, i), &[nh(1)]);
         }
-        let first = f.drain(4);
+        let first = f.drain_changes(4).routes;
         assert_eq!(first.len(), 4);
         assert_eq!(first[0].0, v4(10, 0), "key order, lowest first");
         assert_eq!(f.stats().pending, 6, "the rest stay queued");
-        assert_eq!(f.drain(100).len(), 6);
-        assert!(f.drain(100).is_empty());
+        assert_eq!(f.drain_changes(100).routes.len(), 6);
+        assert!(f.drain_changes(100).routes.is_empty());
     }
 
     /// Equal nexthop sets share one intern entry; distinct ones do not.

@@ -67,6 +67,15 @@ use crate::supervisor::Event;
 /// blocking forever on a process the kernel will not release.
 pub const TERM_GRACE: Duration = Duration::from_millis(500);
 
+/// How many live route changes one tick pulls from the source.
+///
+/// Bounded for the same reason `drain_batch` is: this runs on the
+/// supervision thread, and an unbounded pull during a peering flap would
+/// hold the tick for as long as the flap lasted, sending no ping and
+/// noticing no exit. Whatever is left stays in the source's map — which
+/// collapses per prefix, so waiting costs staleness, never depth.
+const DELTA_BATCH: usize = 4096;
+
 /// The `(pid, start_ticks, boot_id)` triple that makes a recorded
 /// process identity safe to act on across restarts and PID reuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,9 +465,15 @@ impl Observe for ObserveView {
     }
 
     fn drain_batch(&mut self) -> Result<bool, String> {
-        self.core
-            .borrow_mut()
-            .engine
+        let mut c = self.core.borrow_mut();
+        // Live changes are pulled in FIRST, so a route learned while VPP
+        // was already converged goes out in this same batch rather than
+        // waiting for a resync that may never come. The engine's pending
+        // map is the single queue either way, so `done` below already
+        // accounts for whatever was just added.
+        let Core { engine, source, .. } = &mut *c;
+        engine.apply_changes(source.as_ref(), DELTA_BATCH);
+        engine
             .drain_batch()
             .map(|(done, _stats)| done)
             .map_err(|e| e.to_string())

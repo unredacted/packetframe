@@ -137,6 +137,54 @@ pub trait RouteSource {
     /// resolves), and traffic is dropped on the floor by an incomplete
     /// adjacency. Nothing in the module would report a fault.
     fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6]));
+
+    /// Changes since the last call, bounded by `max` routes.
+    ///
+    /// The default is "none", which is correct for a static snapshot: a
+    /// fixture mirror does not change under the engine, and every
+    /// in-tree implementation but the live feed is one of those. A source
+    /// that *does* change must override this, or its updates reach the
+    /// engine only at the next full resync.
+    ///
+    /// Both kinds come back from one call because they must be applied
+    /// together and in order — see [`SourceChanges`].
+    fn drain_changes(&self, _max: usize) -> SourceChanges {
+        SourceChanges::default()
+    }
+}
+
+/// One route change: the prefix, and its new nexthop set — or `None`
+/// if it was withdrawn.
+pub type RouteChange = (IpPrefix, Option<Vec<IpAddr>>);
+
+/// One neighbour change: the nexthop, and its (egress device, MAC) —
+/// or `None` if it is no longer resolved.
+pub type NeighbourChange = (IpAddr, Option<(String, [u8; 6])>);
+
+/// What changed at the source since it was last asked.
+///
+/// One struct rather than two calls so a tick cannot take the routes and
+/// leave the neighbours behind. The order they are applied in is not
+/// cosmetic: a route whose nexthop the engine's map has never seen is
+/// classified **unresolvable**, so neighbours must land first or a
+/// genuinely new nexthop black-holes its own routes until the next full
+/// resync.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SourceChanges {
+    /// Prefix → new nexthop set, or `None` for withdrawn.
+    pub routes: Vec<RouteChange>,
+    /// Nexthop → (egress device, MAC), or `None` for lost.
+    pub neighbours: Vec<NeighbourChange>,
+}
+
+impl SourceChanges {
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty() && self.neighbours.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.routes.len() + self.neighbours.len()
+    }
 }
 
 /// What a full-table resync queued.
@@ -677,6 +725,43 @@ impl ConvergenceEngine {
     /// resolvability depends on it, and resolving against a stale map
     /// would classify routes unresolvable for a neighbour that has since
     /// been learned.
+    /// Pull live changes from the source into the pending map.
+    ///
+    /// Returns how many were taken. This only *queues* — sending is
+    /// `drain_batch`'s job, exactly as it is for a resync, so there is one
+    /// path to VPP rather than a steady-state one and a convergence one
+    /// that can disagree.
+    ///
+    /// **Neighbours before routes**, and the order is load-bearing: a
+    /// route whose nexthop the map has never seen is classified
+    /// unresolvable, so a new nexthop arriving in the same batch as the
+    /// routes that use it would black-hole them for a full resync cycle
+    /// if applied the other way round.
+    pub fn apply_changes(&mut self, src: &dyn RouteSource, max: usize) -> u64 {
+        let changes = src.drain_changes(max);
+        if changes.is_empty() {
+            return 0;
+        }
+        let n = changes.len() as u64;
+        for (nh, state) in changes.neighbours {
+            match state {
+                Some((dev, _mac)) => self.nexthops.set_device(nh, dev),
+                // Forgotten rather than left at its last known device —
+                // see `NexthopMap::forget_device`. The routes through it
+                // become unresolvable, which is the honest answer and the
+                // one health reports.
+                None => self.nexthops.forget_device(&nh),
+            }
+        }
+        for (prefix, nhs) in changes.routes {
+            match nhs {
+                Some(v) => self.pending.upsert(prefix, v),
+                None => self.pending.withdraw(prefix),
+            }
+        }
+        n
+    }
+
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
         self.phase = Some(Phase::Resync);
 

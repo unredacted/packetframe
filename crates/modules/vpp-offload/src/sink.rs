@@ -278,6 +278,18 @@ impl NexthopMap {
         self.device_of.clear();
     }
 
+    /// Forget one nexthop's device, for a live loss between resyncs.
+    ///
+    /// The incremental half of [`Self::forget_devices`], and it exists
+    /// for exactly the failure that one describes: without it the delta
+    /// path is insert-only, so a nexthop the source reports as lost keeps
+    /// its last known device until the next full resync, and routes
+    /// naming it resolve as reachable through a stale interface rather
+    /// than being classified unresolvable.
+    pub fn forget_device(&mut self, nexthop: &IpAddr) {
+        self.device_of.remove(nexthop);
+    }
+
     /// Resolve one nexthop, or `None` if its device is excluded.
     pub fn resolve(&self, nexthop: &IpAddr) -> Option<NexthopTarget> {
         let dev = self.device_of.get(nexthop)?;
