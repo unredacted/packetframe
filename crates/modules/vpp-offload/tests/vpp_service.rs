@@ -754,3 +754,98 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
         last.metrics
     );
 }
+
+/// An unhealthy episode keeps its ROOT CAUSE, not just its latest symptom.
+///
+/// A failed verify puts VPP into backoff; the respawn then fails too. An
+/// operator needs both — "the FIB did not verify" is why the restart is
+/// happening, "cannot spawn" is why it is not finishing. Three writers of
+/// `last_failures` used to disagree about this: the verify path appended
+/// while the tick paths assigned, so which survived came down to ordering.
+#[test]
+fn an_episode_keeps_its_root_cause_alongside_the_latest_symptom() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-episode",
+        fake_vpp::Behaviour {
+            hangup_after: None,
+            reject_deletes: 0,
+            garbage_crcs: false,
+            stall_pings_after: None,
+            // Verification fails, which is the root cause.
+            verify_mismatch: true,
+        },
+    );
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..3).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                // And the respawn cannot succeed, which is the symptom.
+                "/nonexistent/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let p = svc.status().expect("published");
+        let has_verify = p
+            .last_failures
+            .iter()
+            .any(|f| f.starts_with("Verify:") && f.contains("verify FAIL"));
+        let has_spawn = p.last_failures.iter().any(|f| f.starts_with("Spawn:"));
+        if has_spawn {
+            assert!(
+                has_verify,
+                "the spawn failure replaced the verify failure that caused the restart; \
+                 the root cause is gone: {:?}",
+                p.last_failures
+            );
+            // Bounded: a backoff loop must not grow this without limit.
+            assert!(
+                p.last_failures.len() <= 8,
+                "episode reasons grew unbounded: {:?}",
+                p.last_failures
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the respawn never failed; state {:?} failures {:?}",
+            p.state,
+            p.last_failures
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = svc.stop();
+}

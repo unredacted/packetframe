@@ -54,6 +54,12 @@ const STOP_POLL_CAP: Duration = Duration::from_millis(50);
 /// the final published status says which.
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
+/// Cap on distinct reasons retained for one unhealthy episode.
+///
+/// Enough for a cause plus a few symptoms, small enough that a backoff loop
+/// cannot grow a `Vec` that is cloned into every published snapshot.
+const MAX_EPISODE_REASONS: usize = 8;
+
 /// How long `stop()` waits for the loop before returning with an
 /// unfinished teardown on the record.
 ///
@@ -410,13 +416,40 @@ fn expire_verdict(
     }
     if let Some(v) = last_verify.take() {
         if !v.passed() {
-            let summary = format!("Verify: {}", v.summary());
-            if !last_failures.contains(&summary) {
-                last_failures.push(summary);
-            }
+            // Through `remember_failures` like every other writer. This
+            // one used to append directly while the tick paths assigned,
+            // so whether the verify reason survived depended on ordering.
+            remember_failures(last_failures, vec![format!("Verify: {}", v.summary())]);
         }
     }
     *last_verify_at = None;
+}
+
+/// Add reasons for the CURRENT unhealthy episode, keeping the earliest as
+/// well as the latest.
+///
+/// One operation, because there were three writers with two different
+/// semantics: `expire_verdict` appended a failed verify's summary while the
+/// tick paths assigned, so whether the root cause survived depended on
+/// which happened last. A failed verify followed by a failed respawn would
+/// report only "cannot spawn" — losing the reason the restart was happening
+/// at all.
+///
+/// Accumulating rather than replacing is the right default here because an
+/// episode has a cause and a symptom and an operator needs both, but it is
+/// bounded: `MAX_EPISODE_REASONS` distinct entries, deduplicated, because a
+/// long backoff loop would otherwise append the same spawn failure forever
+/// into a `Vec` published on every tick. The episode ends — and the list is
+/// cleared — when health returns to `Healthy`.
+fn remember_failures(into: &mut Vec<String>, new: Vec<String>) {
+    for reason in new {
+        if into.len() >= MAX_EPISODE_REASONS {
+            return;
+        }
+        if !into.contains(&reason) {
+            into.push(reason);
+        }
+    }
 }
 
 fn fmt_failures(outcome: &crate::executor::Outcome) -> Vec<String> {
@@ -475,10 +508,7 @@ fn run_loop(
     for e in initial {
         let now = Instant::now();
         let injected = driver.inject(now, e, &mut fx);
-        let f = fmt_failures(&injected.outcome);
-        if !f.is_empty() {
-            last_failures = f;
-        }
+        remember_failures(&mut last_failures, fmt_failures(&injected.outcome));
     }
 
     // Returns the overall health it published, which is what decides
@@ -622,9 +652,7 @@ fn run_loop(
         // reason on the very next tick. `Healthy` is the condition that
         // actually covers every way this module can be unwell, because it
         // is the same whitelist `nominal()` applies.
-        if !failures.is_empty() {
-            last_failures = failures;
-        }
+        remember_failures(&mut last_failures, failures);
 
         // One call, one rule. See `expire_verdict`.
         expire_verdict(
