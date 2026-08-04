@@ -174,10 +174,31 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 Box::new(FastPathModule::new()) as Box<dyn Module>,
             )),
             #[cfg(feature = "vpp-offload")]
-            "vpp-offload" => modules.push((
-                section.name.clone(),
-                Box::new(packetframe_vpp_offload::VppOffloadModule::new()) as Box<dyn Module>,
-            )),
+            "vpp-offload" => {
+                // Refused HERE, before fast-path attaches, rather than
+                // discovered as a mid-attach unwind.
+                //
+                // The module is complete except for its route feed: nothing
+                // calls `set_route_source`, because reaching across to the
+                // fast-path RouteController's mirror touches the live
+                // control plane and carries an unresolved access decision
+                // (the mirror lives inside the programmer task and is
+                // reachable only by command; a full-table reply, a shared
+                // lock, and a second mirror all trade differently). Until
+                // that lands, `attach` correctly refuses — a VPP with an
+                // empty FIB passes every health check and blackholes every
+                // steered packet — and letting startup discover that after
+                // fast-path has already attached just makes the operator
+                // read an unwind log to learn it.
+                return Err(RunError::Startup(
+                    "module vpp-offload cannot run yet: its route feed is not wired, so \
+                     VPP would come up with an empty FIB. Remove the `module vpp-offload` \
+                     section to start. (Everything else — resources, supervision, \
+                     convergence, health — is in place; `packetframe feasibility` still \
+                     reports its probes.)"
+                        .into(),
+                ));
+            }
             other => {
                 return Err(RunError::Startup(format!(
                     "unknown module `{other}` in {}",
@@ -1037,7 +1058,24 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
         }
     }
 
-    let paths = SysPaths::live(state_dir, packetframe_vpp_offload::default_hugepage_bytes());
+    // Point release at the pool the state file RECORDS, not the pool that
+    // happens to be the default now.
+    //
+    // `release` deliberately refuses a pool mismatch — freeing the wrong
+    // pool while leaking the real reservation is worse than failing — so
+    // using the current default meant that if the kernel's default page size
+    // changed between attach and detach (a reboot between the fleet's 512 MiB
+    // and 2 MiB defaults does it), release would free the VFs, refuse the
+    // pool, keep the reservation in state, and then recompute the same wrong
+    // default on every retry. The advertised recovery command could never
+    // restore that pool. A recorded `0` means attach owned no reservation, so
+    // there is nothing to match and the current default is fine.
+    let pool_bytes = if state.hugepage_pool_bytes != 0 {
+        state.hugepage_pool_bytes
+    } else {
+        packetframe_vpp_offload::default_hugepage_bytes()
+    };
+    let paths = SysPaths::live(state_dir, pool_bytes);
     release(&paths, state).map_err(|e| format!("vpp-offload: {e}"))?;
     tracing::info!("vpp-offload: VFs rebound and hugepages restored");
     Ok(())
