@@ -54,6 +54,15 @@ const STOP_POLL_CAP: Duration = Duration::from_millis(50);
 /// the final published status says which.
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
+/// Builds the loop's non-`Send` pieces on the loop thread, and returns
+/// the events to inject before the first tick.
+///
+/// `Err` is an **attach failure** — a dead API socket, a version-skewed
+/// VPP, a refused adoption — surfaced synchronously by
+/// [`SupervisionService::start`] rather than becoming a dead thread the
+/// first health check discovers.
+pub type LoopFactory = Box<dyn FnOnce() -> Result<(Driver, Runtime, Vec<Event>), String> + Send>;
+
 /// What the loop publishes after every pass.
 #[derive(Debug, Clone)]
 pub struct Published {
@@ -63,6 +72,22 @@ pub struct Published {
     pub metrics: String,
     /// The supervision state at publish time, for `packetframe status`.
     pub state: State,
+    /// The engine's last API error, verbatim. Carried so a CRC
+    /// mismatch reads as "our definitions say X, this VPP says Y"
+    /// instead of a generic startup failure.
+    pub api_error: Option<String>,
+    /// Set when the loop ended itself: the reason supervision is over
+    /// and will not resume (today: a permanently incompatible API).
+    pub terminal: Option<String>,
+    /// Failures collected while executing the stop transition —
+    /// including a refused resource release, which produces NO event
+    /// (the supervisor is already `Stopped`) and would otherwise
+    /// vanish with the discarded Tick, leaving detach reporting a
+    /// clean stop over still-held VFs.
+    pub teardown_failures: Vec<String>,
+    /// The teardown declined to release resources (unsteer failed or
+    /// the process survived); they are deliberately still held.
+    pub resources_leaked: bool,
 }
 
 /// Shared between the loop and the module.
@@ -90,35 +115,39 @@ impl SupervisionService {
     /// factory that dies (bad socket, failed adoption) surfaces here,
     /// synchronously, as the attach failure it is, rather than as a
     /// mysteriously dead thread discovered on the first health check.
-    pub fn start(
-        module: &'static str,
-        factory: Box<dyn FnOnce() -> (Driver, Runtime, Vec<Event>) + Send>,
-    ) -> Result<Self, String> {
+    pub fn start(module: &'static str, factory: LoopFactory) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             latest: Mutex::new(None),
         });
         let looped = Arc::clone(&shared);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("vpp-supervision".into())
             .spawn(move || run_loop(module, factory, &looped, ready_tx))
             .map_err(|e| format!("spawning the supervision thread: {e}"))?;
-        // A dropped sender (the factory panicked before the first
-        // publish) turns this into RecvError — the failure is reaped
-        // and reported here instead of leaking a dead thread.
-        if ready_rx.recv().is_err() {
-            let _ = thread.join();
-            return Err(
-                "the supervision loop died before publishing its first status — the \
-                 factory failed (see the panic in the log)"
-                    .into(),
-            );
+        // Three outcomes, all reported synchronously as the attach
+        // failures they are: the factory returned an error (a dead API
+        // socket, a version-skewed VPP), the factory panicked (dropped
+        // sender → RecvError), or it succeeded and published.
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                shared,
+                thread: Some(thread),
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(
+                    "the supervision loop died before publishing its first status — the \
+                     factory panicked (see the log)"
+                        .into(),
+                )
+            }
         }
-        Ok(Self {
-            shared,
-            thread: Some(thread),
-        })
     }
 
     /// The most recent snapshot, if the loop has completed a pass.
@@ -165,12 +194,23 @@ impl Drop for SupervisionService {
 
 fn run_loop(
     module: &'static str,
-    factory: Box<dyn FnOnce() -> (Driver, Runtime, Vec<Event>) + Send>,
+    factory: LoopFactory,
     shared: &Shared,
-    ready: std::sync::mpsc::Sender<()>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    let (mut driver, runtime, initial) = factory();
+    let (mut driver, runtime, initial) = match factory() {
+        Ok(parts) => parts,
+        Err(e) => {
+            // Nothing was built, so there is nothing to publish or tear
+            // down; `start()` turns this into its return value.
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
     let (mut obs, mut fx) = runtime.views();
+    let mut terminal: Option<String> = None;
+    let mut teardown_failures: Vec<String> = Vec::new();
+    let mut resources_leaked = false;
     // When the last passing verify was observed, for the freshness the
     // health surface reports. Tracked here because `VerifyOutcome`
     // deliberately carries no clock.
@@ -181,7 +221,12 @@ fn run_loop(
         let _ = driver.inject(now, e, &mut fx);
     }
 
-    let publish = |driver: &Driver, runtime: &Runtime, last_verify_at: &Option<Instant>| {
+    let publish = |driver: &Driver,
+                   runtime: &Runtime,
+                   last_verify_at: &Option<Instant>,
+                   terminal: &Option<String>,
+                   teardown_failures: &[String],
+                   resources_leaked: bool| {
         let now = Instant::now();
         let rs = runtime.status();
         let fib = match (&rs.last_verify, last_verify_at) {
@@ -201,6 +246,10 @@ fn run_loop(
             report: snap.report(),
             metrics: crate::status::render_metrics(&snap, module),
             state: driver.state(),
+            api_error: rs.api_error,
+            terminal: terminal.clone(),
+            teardown_failures: teardown_failures.to_vec(),
+            resources_leaked,
         };
         *shared.latest.lock().expect("status lock") = Some(published);
     };
@@ -208,20 +257,48 @@ fn run_loop(
     // First snapshot before the first tick; the handshake below is
     // what makes `start()`'s "status() is Some on return" guarantee
     // actually true rather than a race the test suite happens to win.
-    publish(&driver, &runtime, &last_verify_at);
-    let _ = ready.send(());
+    publish(&driver, &runtime, &last_verify_at, &None, &[], false);
+    let _ = ready.send(Ok(()));
 
     while !shared.stop.load(Ordering::SeqCst) {
         let now = Instant::now();
         let tick = driver.tick(now, &mut obs, &mut fx);
         for e in runtime.take_pending() {
-            if matches!(e, Event::VerifyPassed) {
+            // Every COMPLETED verify gets the timestamp, not only a
+            // pass. Stamping only `VerifyPassed` converted a first
+            // failed verify into `NeverVerified` — hiding a concrete
+            // failure summary behind "not yet verified" — and gave a
+            // later failure the stale timestamp of the last pass.
+            if matches!(
+                e,
+                Event::VerifyPassed | Event::VerifyFailed | Event::VerifyIncomplete
+            ) {
                 last_verify_at = Some(Instant::now());
             }
             let _ = driver.inject(Instant::now(), e, &mut fx);
         }
         runtime.set_steered(driver.supervisor().is_steered());
-        publish(&driver, &runtime, &last_verify_at);
+
+        // The check `api_incompatible` exists FOR, in the loop it was
+        // built for. A CRC mismatch or handshake refusal fails
+        // identically on every attempt: without this, the loop polls
+        // out the 60 s startup budget, kills a VPP that answered its
+        // socket perfectly well, restarts it, and repeats forever —
+        // while the version skew that explains everything sits
+        // unread in the engine. Terminal means terminal: tear down and
+        // end supervision with the reason on the record.
+        if runtime.api_incompatible() {
+            terminal = Some(format!(
+                "VPP's API is permanently incompatible: {}",
+                runtime
+                    .status()
+                    .api_error
+                    .as_deref()
+                    .unwrap_or("(no detail recorded)")
+            ));
+            break;
+        }
+        publish(&driver, &runtime, &last_verify_at, &terminal, &[], false);
 
         match tick.sleep {
             Some(d) if d.is_zero() => {} // more work queued; go again
@@ -237,33 +314,70 @@ fn run_loop(
     // settles or the bounded patience expires. `StopRequested` on an
     // already-Stopped machine is a no-op, so the redundant case is
     // harmless.
+    //
+    // Outcomes are ACCUMULATED here, not dropped. The stop transition's
+    // `ReleaseResources` can fail after the supervisor is already
+    // `Stopped`, so no event will ever carry that failure — the
+    // discarded Tick was the only witness, and discarding it made
+    // `stop()` return a clean-looking snapshot over still-held VFs.
+    let mut absorb = |outcome: crate::executor::Outcome| {
+        for (action, why) in outcome.failures {
+            teardown_failures.push(format!("{action:?}: {why}"));
+        }
+        resources_leaked |= outcome.resources_leaked;
+    };
     let deadline = Instant::now() + STOP_PATIENCE;
-    let _ = driver.inject(Instant::now(), Event::StopRequested, &mut fx);
+    absorb(
+        driver
+            .inject(Instant::now(), Event::StopRequested, &mut fx)
+            .outcome,
+    );
     while driver.state() != State::Stopped && Instant::now() < deadline {
         let now = Instant::now();
         let tick = driver.tick(now, &mut obs, &mut fx);
+        absorb(tick.outcome.clone());
         for e in runtime.take_pending() {
-            let _ = driver.inject(Instant::now(), e, &mut fx);
+            absorb(driver.inject(Instant::now(), e, &mut fx).outcome);
         }
         match tick.sleep {
             Some(d) if d.is_zero() => {}
             _ => std::thread::sleep(Duration::from_millis(10)),
         }
     }
-    // The final word: whatever the teardown left behind — including an
-    // undead VPP that refused to die — is on the record for the caller.
-    publish(&driver, &runtime, &last_verify_at);
+    // The final word: whatever the teardown left behind — an undead VPP
+    // that refused to die, a release that failed after `Stopped`, the
+    // incompatibility that ended supervision — is on the record.
+    publish(
+        &driver,
+        &runtime,
+        &last_verify_at,
+        &terminal,
+        &teardown_failures,
+        resources_leaked,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A factory that dies is an ATTACH failure, reported synchronously
-    /// from `start()` — not a mysteriously dead thread discovered later
-    /// by a health check reading frozen status.
+    /// A factory that FAILS is an attach failure carrying its own
+    /// reason — this is the path a version-skewed VPP takes, since the
+    /// attach wiring verifies the API before it commits to adopting.
     #[test]
-    fn a_failed_factory_fails_start_synchronously() {
+    fn a_factory_error_fails_start_with_its_own_reason() {
+        let result = SupervisionService::start(
+            "vpp-offload",
+            Box::new(|| Err("API mismatch for `ip_route_add_del`".into())),
+        );
+        let err = result.err().expect("start must fail");
+        assert!(err.contains("API mismatch"), "{err}");
+    }
+
+    /// A factory that PANICS must not leave a dead thread behind a
+    /// health check that would go on reading frozen status as current.
+    #[test]
+    fn a_panicking_factory_fails_start_synchronously() {
         let result = SupervisionService::start(
             "vpp-offload",
             Box::new(|| panic!("factory failed on purpose")),
@@ -271,6 +385,6 @@ mod tests {
         let err = result
             .err()
             .expect("start must fail, not hand back a dead loop");
-        assert!(err.contains("died before publishing"), "{err}");
+        assert!(err.contains("panicked"), "{err}");
     }
 }

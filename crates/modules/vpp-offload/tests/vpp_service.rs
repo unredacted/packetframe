@@ -70,11 +70,11 @@ fn the_service_converges_publishes_health_and_stops_clean() {
                 let (mut obs, _) = runtime.views();
                 assert!(obs.api_ready(), "fake must answer the handshake");
             }
-            (
+            Ok((
                 Driver::new(),
                 runtime,
                 vec![Event::Adopted { steered: false }],
-            )
+            ))
         }),
     )
     .expect("service starts");
@@ -125,12 +125,87 @@ fn the_service_converges_publishes_health_and_stops_clean() {
     assert!(svc.is_alive());
 
     // Stop: the machine is handed StopRequested, settles in Stopped,
-    // and the final snapshot says so.
+    // and the final snapshot says so — INCLUDING the failures the stop
+    // transition produced after the supervisor was already Stopped.
+    // The runtime's release_resources refuses by design until the
+    // attach wiring exists, and that refusal must reach the caller
+    // rather than vanish with a discarded Tick.
     let last = svc.stop().expect("final status");
     assert_eq!(last.state, State::Stopped, "{:?}", last.report);
     assert!(
         last.metrics.contains("state=\"stopped\"} 1"),
         "{}",
         last.metrics
+    );
+    assert!(
+        last.teardown_failures
+            .iter()
+            .any(|f| f.contains("attach wiring")),
+        "the refused resource release must be on the record: {:?}",
+        last.teardown_failures
+    );
+}
+
+/// A VPP speaking a different API version must fail ATTACH, with the
+/// skew on the record — not be adopted into a supervision loop that
+/// restarts it every 60 s while the explanation sits unread.
+///
+/// The check lives in the factory because that is where the real attach
+/// wiring verifies the API before adopting: adoption injected against a
+/// dead transport runs `attach_devices` synchronously, fails
+/// `NotConnected`, and lands in backoff without ever polling
+/// `api_ready` — so discovering the skew there would be too late to
+/// name it. (The loop ALSO checks `api_incompatible` for a VPP that
+/// becomes incompatible mid-life, e.g. a respawn into an upgraded
+/// binary. That path needs a real spawn and stays hardware territory
+/// with the failover drills.)
+#[test]
+fn an_incompatible_api_fails_attach_with_the_reason() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-crc",
+        fake_vpp::Behaviour {
+            hangup_after: None,
+            reject_deletes: 0,
+            garbage_crcs: true,
+        },
+    );
+    let sock = fake.path.clone();
+
+    let err = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let mut engine = ConvergenceEngine::new(
+                &sock,
+                Vec::new(),
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            // Exactly what the attach wiring does: confirm the API
+            // answers BEFORE committing to adopt it.
+            if !engine.api_ready() {
+                return Err(format!(
+                    "VPP's binary API did not answer usably: {}{}",
+                    engine.last_api_error().unwrap_or("(no detail)"),
+                    if engine.api_incompatible() {
+                        " (permanently incompatible — retrying cannot fix this)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            unreachable!("the fake advertises garbage CRCs; the handshake must refuse");
+        }),
+    )
+    .err()
+    .expect("attach must fail on a version-skewed VPP");
+
+    assert!(
+        err.contains("API mismatch"),
+        "the CRC detail must survive: {err}"
+    );
+    assert!(
+        err.contains("permanently incompatible"),
+        "and it must be marked terminal, not retryable: {err}"
     );
 }

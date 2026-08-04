@@ -148,6 +148,9 @@ pub struct Behaviour {
     /// Reject this many *deletes* with a non-zero retval before
     /// accepting them.
     pub reject_deletes: usize,
+    /// Advertise garbage CRCs in the handshake's message table — the
+    /// version-skew shape the transport must refuse loudly.
+    pub garbage_crcs: bool,
 }
 
 impl Fake {
@@ -215,9 +218,14 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
         message_table: Vec::new(),
     };
     for (i, m) in MESSAGE_META.iter().enumerate() {
+        let crc = if behaviour.garbage_crcs {
+            "deadbeef".to_string()
+        } else {
+            m.crc.trim_start_matches("0x").to_string()
+        };
         reply.message_table.push(MessageTableEntry {
             index: 100 + i as u16,
-            name: format!("{}_{}", m.name, m.crc.trim_start_matches("0x")),
+            name: format!("{}_{crc}", m.name),
         });
     }
     let mut payload = Vec::new();
