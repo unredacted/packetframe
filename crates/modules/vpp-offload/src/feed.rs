@@ -246,6 +246,11 @@ impl RouteSource for RouteFeed {
         SourceChanges { routes, neighbours }
     }
 
+    fn backlog(&self) -> u64 {
+        let g = self.lock();
+        (g.pending.len() + g.neigh_pending.len()) as u64
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         // Chunked so the writer never waits for more than `WALK_CHUNK`
         // copies. `after` is the resume cursor; a prefix inserted below it
@@ -308,6 +313,9 @@ impl RouteSource for RouteFeed {
 impl RouteSource for std::sync::Arc<RouteFeed> {
     fn drain_changes(&self, max: usize) -> SourceChanges {
         (**self).drain_changes(max)
+    }
+    fn backlog(&self) -> u64 {
+        (**self).backlog()
     }
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         (**self).for_each_route(visit)

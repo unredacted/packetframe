@@ -213,6 +213,16 @@ struct Core {
     /// (an observed exit is a fact whether or not it can be recorded).
     /// Surfaced for status; never blocks the loop.
     last_store_error: Option<String>,
+    /// Why the last drain failed, or `None` if the last one succeeded.
+    ///
+    /// Recorded here rather than left to the caller because the caller
+    /// deliberately throws it away: outside a resync a failed batch is
+    /// retried, not escalated, so the driver's steady-state arm has no
+    /// event to carry a reason on. Without this the module would degrade
+    /// silently — the one shape this phase keeps producing — and the
+    /// operator would see a stalled `pending_ops` with nothing saying
+    /// why.
+    last_drain_error: Option<String>,
 }
 
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
@@ -253,6 +263,7 @@ impl Runtime {
                 attach_mode: crate::attach::AttachMode::Fresh,
                 pending: Vec::new(),
                 last_store_error: None,
+                last_drain_error: None,
             })),
         }
     }
@@ -327,6 +338,8 @@ impl Runtime {
             port_links: c.engine.port_links(),
             api_error: c.engine.last_api_error().map(str::to_string),
             store_error: c.last_store_error.clone(),
+            drain_error: c.last_drain_error.clone(),
+            source_backlog: c.source.backlog(),
         }
     }
 }
@@ -342,6 +355,15 @@ pub struct RuntimeStatus {
     pub port_links: Vec<crate::status::PortLink>,
     pub api_error: Option<String>,
     pub store_error: Option<String>,
+    /// Why the last drain failed. See `Core::last_drain_error`.
+    pub drain_error: Option<String>,
+    /// Changes the source is holding that the engine has not pulled yet.
+    ///
+    /// Distinct from `pending_ops`, which is what the engine has pulled
+    /// and not yet sent. Both can be non-zero at once and they fail
+    /// differently: a backlog here means the engine is not draining, a
+    /// backlog there means VPP is not accepting.
+    pub source_backlog: u64,
 }
 
 impl Core {
@@ -471,12 +493,23 @@ impl Observe for ObserveView {
         // waiting for a resync that may never come. The engine's pending
         // map is the single queue either way, so `done` below already
         // accounts for whatever was just added.
-        let Core { engine, source, .. } = &mut *c;
+        let Core {
+            engine,
+            source,
+            last_drain_error,
+            ..
+        } = &mut *c;
         engine.apply_changes(source.as_ref(), DELTA_BATCH);
-        engine
+        let r = engine
             .drain_batch()
             .map(|(done, _stats)| done)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        // Set on failure and cleared on success, in one place, for the
+        // same reason `note_persist` is: a field that only ever gets set
+        // reports a fault that recovered as though it were still
+        // happening.
+        *last_drain_error = r.as_ref().err().cloned();
+        r
     }
 }
 

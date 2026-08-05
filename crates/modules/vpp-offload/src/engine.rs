@@ -151,6 +151,16 @@ pub trait RouteSource {
     fn drain_changes(&self, _max: usize) -> SourceChanges {
         SourceChanges::default()
     }
+
+    /// How many changes are queued but not yet handed over.
+    ///
+    /// Reported so a source that is filling faster than the engine drains
+    /// is visible as its own fault, rather than as an unexplained gap
+    /// between what bird advertises and what VPP holds. Default `0` for
+    /// the static sources, which never queue anything.
+    fn backlog(&self) -> u64 {
+        0
+    }
 }
 
 /// One route change: the prefix, and its new nexthop set — or `None`

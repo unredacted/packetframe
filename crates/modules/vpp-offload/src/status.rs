@@ -60,6 +60,8 @@ pub const SUBSYS_PORTS: &str = "ports";
 /// Reported only when a persist failed; see
 /// [`StatusSnapshot::store_error`].
 pub const SUBSYS_STATE_FILE: &str = "state-file";
+/// Subsystem name for the cross-tier route feed.
+pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
 
 /// Liveness of the binary API, as observed from ping/pong timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +252,20 @@ pub struct StatusSnapshot {
     /// patch existed to surface. Two surfaces, one condition, one place
     /// to encode it.
     pub store_error: Option<String>,
+    /// Why the last drain failed, or `None` if the last one succeeded.
+    ///
+    /// Its own field rather than folded into `api_error`, because the
+    /// two fail differently and only one of them is silent. An API error
+    /// already shows up as a ping failure and eventually a wedge; a drain
+    /// failure in steady state is deliberately *not* escalated — the
+    /// batch is retried — so without this the module would degrade with
+    /// nothing saying why.
+    pub drain_error: Option<String>,
+    /// Changes the route source is holding that the engine has not
+    /// pulled. Separate from `pending_ops`: a backlog here means the
+    /// engine is not draining, a backlog there means VPP is not
+    /// accepting.
+    pub source_backlog: u64,
 }
 
 impl StatusSnapshot {
@@ -275,6 +291,8 @@ impl StatusSnapshot {
             fib,
             ports,
             None,
+            None,
+            0,
         )
     }
 
@@ -293,6 +311,8 @@ impl StatusSnapshot {
         fib: FibSync,
         ports: Vec<PortLink>,
         store_error: Option<String>,
+        drain_error: Option<String>,
+        source_backlog: u64,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -307,6 +327,8 @@ impl StatusSnapshot {
             fib,
             ports,
             store_error,
+            drain_error,
+            source_backlog,
         }
     }
 
@@ -343,6 +365,22 @@ impl StatusSnapshot {
         // Only present when the runtime actually failed to persist
         // something, so the subsystem list does not carry a permanent
         // "state-file: fine" row nobody reads.
+        // Same shape and the same reason as the state-file row below:
+        // present only when it actually failed, so there is no permanent
+        // "route-feed: fine" line for an operator to learn to ignore.
+        if let Some(e) = &self.drain_error {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_ROUTE_FEED.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "could not apply route updates to VPP ({e}); {} change(s) waiting at the \
+                     source and {} queued for VPP. Retried every tick — the offload is forwarding \
+                     a table that is behind bird, not a wrong one.",
+                    self.source_backlog, self.pending_ops
+                )),
+                last_success_age_seconds: None,
+            });
+        }
         if let Some(e) = &self.store_error {
             subsystems.push(SubsystemHealth {
                 name: SUBSYS_STATE_FILE.into(),
@@ -431,6 +469,11 @@ impl StatusSnapshot {
             // restart", or the whitelist quietly stops covering the one
             // failure whose consequence is deferred.
             && self.store_error.is_none()
+            // A drain that is failing means VPP's FIB is drifting away
+            // from bird's with every update it misses. Nothing restarts
+            // over it by design, which is exactly why it must not read as
+            // nominal.
+            && self.drain_error.is_none()
     }
 
     fn process_health(&self) -> SubsystemHealth {
@@ -756,6 +799,28 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         out,
         "packetframe_vpp_pending_ops{{module=\"{module}\"}} {}",
         snap.pending_ops
+    );
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_source_backlog",
+        "route and neighbour changes the feed holds that the engine has not pulled",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_source_backlog{{module=\"{module}\"}} {}",
+        snap.source_backlog
+    );
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_drain_failing",
+        "1 when the last attempt to push route updates to VPP failed",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_drain_failing{{module=\"{module}\"}} {}",
+        u8::from(snap.drain_error.is_some())
     );
 
     gauge(
@@ -1302,6 +1367,83 @@ mod tests {
             assert_eq!(ones, 1, "state {label} must be exactly one-hot:\n{m}");
             assert!(m.contains(&format!("state=\"{label}\"}} 1")), "{m}");
         }
+    }
+
+    /// A drain that keeps failing degrades health, names itself, and
+    /// says so on both surfaces.
+    ///
+    /// The policy is that a steady-state drain failure is retried rather
+    /// than escalated — nothing restarts, nothing unsteers. That is the
+    /// right call for a VPP carrying traffic, and it is exactly why this
+    /// has to be loud: the only thing distinguishing "retrying, will be
+    /// fine" from "VPP's FIB has been drifting from bird's for an hour"
+    /// is that somebody is told.
+    #[test]
+    fn a_failing_drain_degrades_and_is_named_on_both_surfaces() {
+        let clean = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            ports_up(),
+        );
+        assert_eq!(
+            clean.report().overall,
+            HealthState::Healthy,
+            "the control must be healthy or this proves nothing"
+        );
+
+        let mut degraded = clean.clone();
+        degraded.drain_error = Some("socket closed".into());
+        degraded.source_backlog = 12;
+        degraded.pending_ops = 34;
+
+        assert_eq!(degraded.report().overall, HealthState::Degraded);
+        assert!(
+            !degraded.nominal(),
+            "a drifting FIB must not read as nominal just because nothing restarted"
+        );
+
+        // Named, with both backlogs, because they point at different
+        // faults and the operator needs to know which one is stuck.
+        let sub = degraded
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|s| s.name == SUBSYS_ROUTE_FEED)
+            .expect("the route feed must appear as its own subsystem");
+        assert_eq!(sub.state, HealthState::Degraded);
+        let msg = sub.message.unwrap_or_default();
+        assert!(msg.contains("socket closed"), "{msg}");
+        assert!(msg.contains("12"), "the source backlog is named: {msg}");
+        assert!(msg.contains("34"), "the queued count is named: {msg}");
+
+        // And Prometheus agrees. This is the pairing that `store_error`
+        // got wrong once: the report said Degraded while the gauge, built
+        // from a different input, went on saying healthy.
+        let m = render_metrics(&degraded, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_health{module=\"vpp-offload\",state=\"degraded\"} 1"),
+            "the gauge disagrees with the report: {m}"
+        );
+        assert!(
+            m.contains("packetframe_vpp_drain_failing{module=\"vpp-offload\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("packetframe_vpp_source_backlog{module=\"vpp-offload\"} 12"),
+            "{m}"
+        );
+
+        // A recovered drain stops degrading — the clearing observation,
+        // without which a fault that healed reports forever.
+        let mut recovered = degraded.clone();
+        recovered.drain_error = None;
+        assert_eq!(recovered.report().overall, HealthState::Healthy);
+        assert!(!render_metrics(&recovered, "vpp-offload")
+            .contains("packetframe_vpp_drain_failing{module=\"vpp-offload\"} 1"));
     }
 
     #[test]

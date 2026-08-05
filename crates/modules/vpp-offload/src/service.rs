@@ -711,6 +711,8 @@ fn run_loop(
             fib,
             rs.port_links,
             rs.store_error.clone(),
+            rs.drain_error.clone(),
+            rs.source_backlog,
         );
         let report = snap.report();
         let overall = report.overall;
