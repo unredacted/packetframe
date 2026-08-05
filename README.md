@@ -1,6 +1,6 @@
 # PacketFrame
 
-**Forwarding data plane for Linux edge routers.** PacketFrame takes the traffic you allowlist off the kernel's conntrack and netfilter path and forwards it straight between NICs, leaving everything else to normal kernel forwarding. It can build its own routing table from a BGP feed, so it neither depends on netlink nor competes with the routing daemon for it. Written in Rust, attached one interface at a time, and removable the same way.
+**Forwarding data plane for Linux edge routers.** PacketFrame takes the traffic you allowlist off the kernel's conntrack and netfilter path and forwards it straight between NICs, leaving everything else to normal kernel forwarding. It can build its own routing table from a BGP feed instead of reading the kernel's, so it doesn't compete with the routing daemon over it. Written in Rust, and opt-in per interface: it only touches the ones you name.
 
 Running in production on edge routers with full-table BGP feeds. About 98% of allowlisted flows take the fast path there; conntrack entries and customer-facing latency both dropped substantially, with numbers below.
 
@@ -35,7 +35,7 @@ Other things the fast path can do:
 | Per-packet conntrack lookup | yes, every packet | bypassed for allowlisted flows |
 | iptables FORWARD chain walk | yes, every packet, every rule | bypassed |
 | skb allocation cost (native XDP) | yes | bypassed |
-| BGP route source | netlink from a routing daemon | direct iBGP/BMP, no netlink coupling |
+| BGP route source | netlink from a routing daemon | direct iBGP/BMP; netlink is used only for next-hop MACs |
 | Kernel features still work | yes | yes (slow path is unchanged) |
 | Fallback path | n/a | always: non-matching traffic uses kernel |
 
