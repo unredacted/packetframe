@@ -215,11 +215,23 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // What this does NOT guarantee, and cannot: that the table is
     // *complete* when vpp-offload attaches. bird's initial dump takes
     // time, so the first convergence may cover a fraction of it and the
-    // rest arrives as deltas. That is safe only because a first attach
-    // never steers — `bring_up` refuses any `steer on` port until MCAM
-    // steering ships — so nothing is diverted into a partial table. When
-    // slice 5 lands, "the table is complete" becomes a precondition of
-    // the first steer, and this is where to start looking.
+    // rest arrives as deltas.
+    //
+    // Slice 5 has landed, so `bring_up` no longer refuses `steer on` —
+    // and the guards that replaced it do NOT close this. Steering is
+    // reachable only from `Ready`, i.e. after a verified resync, and
+    // `blocks_first_steer` withholds it while anything is unresolvable;
+    // but verification samples what the LEDGER holds, so a table that is
+    // merely incomplete verifies clean. A config that steers on the
+    // first attach can therefore divert traffic into a partial FIB.
+    //
+    // The mitigation is procedural, not enforced here: the rollout's
+    // staging state is every port `steer off` until the table has
+    // converged, then one port at a time. That is what the runbook's
+    // canary ladder is for. Closing it in code needs a completeness
+    // signal the module does not have — bird's own route count, which
+    // the fast-path integrity checker already fetches for a different
+    // purpose.
     #[cfg(feature = "vpp-offload")]
     let feed = {
         let names: Vec<&str> = config.modules.iter().map(|m| m.name.as_str()).collect();
@@ -251,6 +263,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 m.set_route_source(Box::new(
                     feed.clone().expect("a vpp-offload section implies a feed"),
                 ));
+                // Steering diverts the fast-path allowlist, so it comes
+                // from that section. The loader is the only place that
+                // sees both.
+                m.set_allowlist(crate::feasibility::allowlist_from_config(&config));
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {

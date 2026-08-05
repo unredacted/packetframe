@@ -37,6 +37,14 @@ use packetframe_vpp_offload::engine::RouteSource;
 use packetframe_vpp_offload::resources::ResourceState;
 use packetframe_vpp_offload::VppOffloadConfig;
 
+/// The allowlist steering would divert. Non-empty so the `steer on`
+/// path has something to plan; these tests keep every port `steer off`
+/// except the one that exercises it.
+const ALLOW: [IpPrefix; 1] = [IpPrefix::V4 {
+    addr: [23, 191, 200, 0],
+    prefix_len: 24,
+}];
+
 /// A mirror with one route and one resolved neighbour. Enough to be a
 /// route source; convergence itself is `vpp_service.rs`'s job.
 struct Mirror;
@@ -154,7 +162,7 @@ fn a_fresh_attach_acquires_renders_and_supervises() {
     );
     let cfg = host.cfg(&[("eth4", 1, false), ("eth5", 1, false)]);
 
-    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror)).expect("bring-up");
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW).expect("bring-up");
 
     // --- The core map: workers off the top, main below them, cpu0 and
     // the isolated cpu12 untouched.
@@ -265,7 +273,7 @@ fn a_config_that_cannot_work_touches_nothing() {
     // More workers than there are usable CPUs (18 online, cpu0 and cpu12
     // excluded ⇒ 16 usable, so 16 workers plus a main thread cannot fit).
     let mut cfg = host.cfg(&[("eth4", 16, false)]);
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW)
         .err()
         .expect("must fail");
     assert!(e.contains("usable CPU"), "{e}");
@@ -273,7 +281,7 @@ fn a_config_that_cannot_work_touches_nothing() {
     // A VPP binary that is not there.
     cfg = host.cfg(&[("eth4", 1, false)]);
     cfg.vpp_binary = Some(host.base.join("no-such-vpp").to_string_lossy().into_owned());
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW)
         .err()
         .expect("must fail");
     assert!(e.contains("does not exist"), "{e}");
@@ -286,7 +294,7 @@ fn a_config_that_cannot_work_touches_nothing() {
     fs::write(&unexecutable, "not really vpp").unwrap();
     fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644)).unwrap();
     cfg.vpp_binary = Some(unexecutable.to_string_lossy().into_owned());
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW)
         .err()
         .expect("must fail");
     assert!(e.contains("is not executable"), "{e}");
@@ -333,7 +341,7 @@ fn a_failure_after_acquisition_releases_what_it_took() {
     fs::create_dir_all(&host.paths.startup_conf).unwrap();
 
     let cfg = host.cfg(&[("eth4", 1, false)]);
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW)
         .err()
         .expect("must fail");
     assert!(e.contains("conf-is-a-dir"), "{e}");
@@ -409,31 +417,36 @@ fn attaching_without_a_route_source_is_refused() {
     );
     assert!(msg.contains("before load()"), "{msg}");
 }
-
-/// `steer on` must be REFUSED, not silently ignored.
+/// A `steer on` port whose allowlist yields no rules is refused, in the
+/// pure phase.
 ///
-/// The steering flag is dropped when ports are mapped for the attach step,
-/// a fresh supervisor starts with `steer_wanted = false`, and a first attach
-/// deliberately never steers itself — so `SteeringUnavailable` is never
-/// called, convergence settles in `Ready`, and `nominal()` returns true
-/// because `steer_intended()` is false. An operator who asked for traffic
-/// diversion would get a Healthy module that never attempted it.
+/// Steering exists now, so `steer on` is honoured rather than rejected —
+/// but an allowlist that produces nothing steerable must not be accepted
+/// quietly. The supervisor would settle in `Ready` with `steer_intended`
+/// true and nothing diverted, which is the "requested, not observed"
+/// shape this phase keeps producing: an operator who asked for traffic
+/// diversion gets a Healthy module that never moved a packet.
 ///
-/// Refused in the pure phase, so nothing is touched.
+/// v6-only is the realistic way to get there — `ip6` ntuple is rejected
+/// by this NIC's AF, so a v6 allowlist is unsteerable at any size.
 #[test]
-fn a_steer_on_port_is_refused_until_mcam_exists() {
+fn a_steer_on_port_with_nothing_steerable_is_refused() {
     let fake = fake_vpp::Fake::start("bringup-steer");
     let host = Host::new(
         "steer",
         &[("eth4", "0002:07:00.0"), ("eth5", "0002:07:00.1")],
         fake.path.clone(),
     );
-
     let cfg = host.cfg(&[("eth4", 1, false), ("eth5", 1, true)]);
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+
+    let v6_only = [IpPrefix::V6 {
+        addr: [0x26, 0x02, 0xf7, 0xd8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        prefix_len: 48,
+    }];
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &v6_only)
         .err()
-        .expect("a steer-on port must be refused");
-    assert!(e.contains("eth5"), "the offending port must be named: {e}");
+        .expect("steer on with nothing steerable must be refused");
+    assert!(e.contains("no steerable"), "{e}");
     assert!(e.contains("steer off"), "and the remedy stated: {e}");
 
     // Refused BEFORE any mutation: no VF, no reservation, no state file.
@@ -446,11 +459,15 @@ fn a_steer_on_port_is_refused_until_mcam_exists() {
         "a refused config reserved hugepages"
     );
 
-    // All-off is the designed staging state and must still work.
-    let cfg_ok = host.cfg(&[("eth4", 1, false), ("eth5", 1, false)]);
-    let attached = bring_up(&cfg_ok, &host.paths, Box::new(Mirror))
-        .expect("every port steer off is the staging state and must attach");
-    let _ = attached.service.stop();
+    // And the SAME config with a steerable allowlist is accepted, so the
+    // refusal is about having nothing to steer rather than about `steer
+    // on` still being unimplemented.
+    let ok = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW);
+    assert!(
+        ok.is_ok(),
+        "a steerable allowlist must now be accepted: {:?}",
+        ok.err()
+    );
 }
 
 /// An incomplete recorded identity must REFUSE, not fall through to a fresh
@@ -474,7 +491,7 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
     // releases and removes the state file, and dropping deliberately does not
     // tear down (that is preserve-on-exit, §8.5), so the record survives —
     // which is exactly the situation a daemon restart finds.
-    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror)).expect("first attach");
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW).expect("first attach");
     drop(attached);
 
     // Play the kernel's part: a real bind creates the `driver` symlink that
@@ -496,7 +513,7 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
     state.vpp_boot_id = None; // the third leg is missing
     state.save(&host.paths.sys.state_dir).unwrap();
 
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror))
+    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW)
         .err()
         .expect("an unverifiable identity must refuse");
     assert!(e.contains("4242"), "the pid must be named: {e}");
