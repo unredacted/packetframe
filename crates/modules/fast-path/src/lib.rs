@@ -74,11 +74,31 @@ pub const FAST_PATH_BPF_AVAILABLE: bool = !FAST_PATH_BPF.is_empty();
 pub struct FastPathModule {
     #[cfg(target_os = "linux")]
     state: Option<linux_impl::ActiveState>,
+    /// A second forwarding tier's sink, if one is configured.
+    ///
+    /// Set before `attach` and consumed there: the programmer can only
+    /// accept a sink before it starts, because one registered later would
+    /// have missed every route resolved in the meantime.
+    #[cfg(target_os = "linux")]
+    route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
 }
 
 impl FastPathModule {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Announce the resolved FIB to a second tier.
+    ///
+    /// Must be called before [`Module::attach`]; after that the
+    /// programmer is running and cannot take one. The loader is the only
+    /// caller, because it is the only place that knows both tiers exist.
+    #[cfg(target_os = "linux")]
+    pub fn set_route_sink(
+        &mut self,
+        sink: std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>,
+    ) {
+        self.route_sink = Some(sink);
     }
 
     /// Snapshot of the current attach set for status reporting.
@@ -147,7 +167,7 @@ impl Module for FastPathModule {
             .state
             .as_mut()
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach called before load"))?;
-        linux_impl::attach(state, cfg)
+        linux_impl::attach(state, cfg, self.route_sink.clone())
     }
 
     #[cfg(not(target_os = "linux"))]

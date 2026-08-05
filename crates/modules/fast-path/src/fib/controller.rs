@@ -132,6 +132,7 @@ impl RouteController {
         local_prefixes: Vec<LocalPrefixSpec>,
         fallback_default: Option<FallbackDefaultSpec>,
         fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
+        route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
     ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
@@ -157,7 +158,7 @@ impl RouteController {
         // every newly-allocated nexthop. Pre-fix this was wired but
         // never called, leaving nexthops dependent on multicast events
         // that don't fire for stable REACHABLE kernel entries.
-        let (programmer, prog_handle) = FibProgrammer::new_with_resolver(
+        let (mut programmer, prog_handle) = FibProgrammer::new_with_resolver(
             nexthops,
             fib_v4,
             fib_v6,
@@ -167,6 +168,15 @@ impl RouteController {
             shutdown_token.clone(),
             Some(neigh_handle.clone()),
         );
+        // Registered before the programmer is spawned, which is the only
+        // window `set_route_sink` accepts: a sink attached afterwards
+        // would have missed every route resolved in the meantime, and a
+        // second tier silently short those prefixes is the shape of bug
+        // that reports healthy and black-holes.
+        if let Some(sink) = route_sink {
+            programmer.set_route_sink(sink);
+            info!("second-tier route sink registered with the FibProgrammer");
+        }
 
         // v0.2.1: enable the connected fast-path when the operator
         // declared at least one `local-prefix`. The resolver gets the

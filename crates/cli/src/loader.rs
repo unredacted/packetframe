@@ -164,40 +164,94 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
     }
 }
 
+/// Whether a route feed is needed, and whether the config can support one.
+///
+/// Pure, so the two refusals are testable off a router — `run_linux`
+/// itself needs a live bpffs and real interfaces.
+///
+/// `Ok(true)` = build the feed and hand it to both tiers. `Ok(false)` =
+/// no vpp-offload section, nothing to wire. `Err` = a config that would
+/// bring VPP up against a table nobody is filling.
+#[cfg(all(target_os = "linux", feature = "fast-path", feature = "vpp-offload"))]
+fn feed_wiring(names: &[&str]) -> Result<bool, String> {
+    let vpp = names.iter().position(|n| *n == "vpp-offload");
+    let fp = names.iter().position(|n| *n == "fast-path");
+    match (vpp, fp) {
+        (None, _) => Ok(false),
+        (Some(_), None) => Err(
+            "module vpp-offload needs a `module fast-path` section: its FIB comes from the \
+             fast-path route controller, and without one VPP would come up with an empty table"
+                .into(),
+        ),
+        // Attach order is config order, and vpp-offload's first resync
+        // reads whatever the feed holds at that instant. Refused rather
+        // than reordered: an operator who wrote it this way should learn
+        // it from the error, not from a VPP that came up short.
+        (Some(v), Some(f)) if f > v => Err(
+            "module fast-path must be declared before module vpp-offload: modules attach in \
+             config order, and vpp-offload's first FIB resync reads what the fast-path route \
+             controller has already resolved"
+                .into(),
+        ),
+        (Some(_), Some(_)) => Ok(true),
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
+    // The route feed, built before either module so both can be handed
+    // the SAME one.
+    //
+    // Two objects here would be two mirrors, and the vpp-offload engine
+    // would resync from a table nothing was writing to — which converges
+    // cleanly, verifies cleanly, and forwards nothing.
+    //
+    // Order is enforced rather than assumed. vpp-offload's first resync
+    // reads whatever the feed holds at that instant, so the fast-path
+    // programmer has to be running first. Config order is attach order,
+    // so a config listing them the other way round is refused with the
+    // reason rather than quietly reordered.
+    //
+    // What this does NOT guarantee, and cannot: that the table is
+    // *complete* when vpp-offload attaches. bird's initial dump takes
+    // time, so the first convergence may cover a fraction of it and the
+    // rest arrives as deltas. That is safe only because a first attach
+    // never steers — `bring_up` refuses any `steer on` port until MCAM
+    // steering ships — so nothing is diverted into a partial table. When
+    // slice 5 lands, "the table is complete" becomes a precondition of
+    // the first steer, and this is where to start looking.
+    #[cfg(feature = "vpp-offload")]
+    let feed = {
+        let names: Vec<&str> = config.modules.iter().map(|m| m.name.as_str()).collect();
+        match feed_wiring(&names).map_err(RunError::Startup)? {
+            true => Some(std::sync::Arc::new(
+                packetframe_vpp_offload::feed::RouteFeed::new(),
+            )),
+            false => None,
+        }
+    };
+
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
-            "fast-path" => modules.push((
-                section.name.clone(),
-                Box::new(FastPathModule::new()) as Box<dyn Module>,
-            )),
+            "fast-path" => {
+                #[allow(unused_mut)]
+                let mut m = FastPathModule::new();
+                #[cfg(feature = "vpp-offload")]
+                if let Some(f) = &feed {
+                    m.set_route_sink(f.clone());
+                }
+                modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
+            }
             #[cfg(feature = "vpp-offload")]
             "vpp-offload" => {
-                // Refused HERE, before fast-path attaches, rather than
-                // discovered as a mid-attach unwind.
-                //
-                // The module is complete except for its route feed: nothing
-                // calls `set_route_source`, because reaching across to the
-                // fast-path RouteController's mirror touches the live
-                // control plane and carries an unresolved access decision
-                // (the mirror lives inside the programmer task and is
-                // reachable only by command; a full-table reply, a shared
-                // lock, and a second mirror all trade differently). Until
-                // that lands, `attach` correctly refuses — a VPP with an
-                // empty FIB passes every health check and blackholes every
-                // steered packet — and letting startup discover that after
-                // fast-path has already attached just makes the operator
-                // read an unwind log to learn it.
-                return Err(RunError::Startup(
-                    "module vpp-offload cannot run yet: its route feed is not wired, so \
-                     VPP would come up with an empty FIB. Remove the `module vpp-offload` \
-                     section to start. (Everything else — resources, supervision, \
-                     convergence, health — is in place; `packetframe feasibility` still \
-                     reports its probes.)"
-                        .into(),
+                let mut m = packetframe_vpp_offload::VppOffloadModule::new();
+                // `feed` is `Some` whenever a vpp-offload section exists —
+                // the match above returns before here otherwise.
+                m.set_route_source(Box::new(
+                    feed.clone().expect("a vpp-offload section implies a feed"),
                 ));
+                modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {
                 return Err(RunError::Startup(format!(
@@ -1289,6 +1343,45 @@ fn trial_attach_probes(_ifaces: &[String]) -> Vec<(String, String)> {
 #[cfg(all(test, feature = "vpp-offload"))]
 mod vpp_detach_tests {
     use super::*;
+
+    /// No vpp-offload section means no feed and no opinion about ordering.
+    ///
+    /// These three are gated exactly like `feed_wiring` itself. It is
+    /// pure, but its only non-test caller is `run_linux`, so ungating it
+    /// would make it dead code on a macOS build under `-D warnings`. They
+    /// run in CI's Linux test job.
+    #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
+    #[test]
+    fn without_vpp_offload_there_is_nothing_to_wire() {
+        assert_eq!(feed_wiring(&["fast-path"]), Ok(false));
+        assert_eq!(feed_wiring(&[]), Ok(false));
+    }
+
+    /// vpp-offload alone is refused: there is no route controller to
+    /// resolve a FIB, so VPP would come up against an empty table — which
+    /// converges, verifies, and forwards nothing.
+    #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
+    #[test]
+    fn vpp_offload_without_fast_path_is_refused() {
+        let e = feed_wiring(&["vpp-offload"]).expect_err("must refuse");
+        assert!(e.contains("needs a `module fast-path` section"), "{e}");
+    }
+
+    /// Declared the wrong way round is refused rather than reordered.
+    ///
+    /// Modules attach in config order, and vpp-offload's first resync
+    /// reads whatever the feed holds at that instant. Silently reordering
+    /// would work, and would also mean the file no longer describes what
+    /// the daemon did.
+    #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
+    #[test]
+    fn vpp_offload_before_fast_path_is_refused() {
+        let e = feed_wiring(&["vpp-offload", "fast-path"]).expect_err("must refuse");
+        assert!(e.contains("must be declared before"), "{e}");
+        // The right order is accepted, so the test above is about order
+        // and not about the pair being rejected outright.
+        assert_eq!(feed_wiring(&["fast-path", "vpp-offload"]), Ok(true));
+    }
 
     /// A recorded pid with no start-time cookie must not be signalled, and
     /// its resources must not be released either.

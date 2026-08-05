@@ -394,3 +394,243 @@ fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
         rt.status().store_error
     );
 }
+
+/// A route learned **after** convergence reaches VPP.
+///
+/// The regression this exists for is a silent one. `drain_batch` used to
+/// be called only while a resync was in flight, so once the module
+/// settled into `Ready` — where it spends its life — nothing pulled the
+/// source again. VPP would forward a frozen table, report healthy, and
+/// pass readback verification, because verification samples the very
+/// mirror it was synced against. Nothing would have said a word.
+///
+/// So the assertion is deliberately about the wire, not about counters:
+/// the fake must actually receive the prefix.
+///
+/// The port is named after a real local interface, because the feed
+/// resolves a neighbour's egress device through `if_indextoname` and the
+/// engine matches that name against the configured ports. Inventing
+/// "eth4" here would make every route unresolvable for a reason that has
+/// nothing to do with what is under test.
+#[test]
+fn a_route_learned_after_convergence_still_reaches_vpp() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::Arc;
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start("late-route");
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 1), &[fake_vpp::nh()]);
+
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: dev.clone(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+        }],
+        vec![dev],
+        1_000_000,
+        FamilyPolicy::V4Only,
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(feed.clone()),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (mut now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    assert_eq!(
+        rt.status().counts.installed,
+        1,
+        "the seeded route converged before the part under test"
+    );
+    let _ = fake.drain_events();
+
+    // THE POINT: a new route arrives with the module already settled.
+    let late_addr = [10u8, 0, 200, 0];
+    feed.route_resolved(fake_vpp::v4(0, 200), &[fake_vpp::nh()]);
+
+    // Hand-rolled rather than `run_until`, because the stop condition has
+    // to accumulate the fake's events: `drain_events` empties the channel,
+    // so a closure that polled it would throw away the very sighting it
+    // was waiting for.
+    let mut saw_late = false;
+    let mut events = Vec::new();
+    for _ in 0..64 {
+        let t = {
+            let (mut obs, mut fx) = rt.views();
+            d.tick(now, &mut obs, &mut fx)
+        };
+        events.extend(t.events.clone());
+        // Same seam the real loop uses; without it a completed verify
+        // never lands and the module eventually reports a wedge, which
+        // would bury this test's actual finding under restart noise.
+        for e in rt.take_pending() {
+            let (_, mut fx) = rt.views();
+            events.extend(d.inject(now, e, &mut fx).events);
+        }
+        for e in fake.drain_events() {
+            if let fake_vpp::Event::Route(r) = e {
+                if r.addr == late_addr && r.is_add {
+                    saw_late = true;
+                }
+            }
+        }
+        if saw_late {
+            break;
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+
+    assert!(
+        saw_late,
+        "a route learned after convergence never reached VPP; events: {events:?}"
+    );
+    assert_eq!(
+        d.state(),
+        State::Ready,
+        "and the module stayed Ready — a live delta is ordinary work, \
+         not a reason to resync, unsteer, or re-verify"
+    );
+}
+
+/// A real (ifindex, name) pair from this host.
+///
+/// Scanned rather than hard-coded: `lo` on Linux is `lo0` on macOS, and
+/// this test runs on both.
+fn local_interface() -> (u32, String) {
+    for idx in 1..=16u32 {
+        let mut buf = [0u8; 16];
+        // SAFETY: `buf` is IF_NAMESIZE bytes, as the call requires.
+        let rc = unsafe { libc::if_indextoname(idx, buf.as_mut_ptr() as *mut libc::c_char) };
+        if rc.is_null() {
+            continue;
+        }
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+            return (idx, name.to_string());
+        }
+    }
+    panic!("no usable interface at index 1..16");
+}
+
+/// A nexthop first seen **after** convergence gets its static neighbour
+/// programmed, not just its device mapping.
+///
+/// This is #115's worst finding arriving through a different door. Giving
+/// the nexthop a device is enough for `NexthopMap::resolve` to return
+/// `Some`, so routes through it classify as resolvable and install — and
+/// VPP, which runs without linux-cp and can never ARP for the adjacency,
+/// has nothing to send them to. Readback verification does not catch it
+/// either: it checks a route exists on an interface we own, deliberately
+/// not that its adjacency resolves. Route acks, verify passes, every
+/// packet drops.
+#[test]
+fn a_nexthop_first_seen_after_convergence_gets_its_adjacency() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::Arc;
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start("late-nexthop");
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 1), &[fake_vpp::nh()]);
+
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: dev.clone(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+        }],
+        vec![dev],
+        1_000_000,
+        FamilyPolicy::V4Only,
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(feed.clone()),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (mut now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    let _ = fake.drain_events();
+
+    // A nexthop the engine has never seen, arriving with a route through
+    // it — the order the feed delivers them in is what the fix depends on.
+    let late_nh = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let late_mac = [0x02, 0x00, 0x5e, 0x00, 0x00, 0x09];
+    feed.neighbour_resolved(late_nh, late_mac, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 201), &[late_nh]);
+
+    let mut saw_neigh = false;
+    for _ in 0..64 {
+        let t = {
+            let (mut obs, mut fx) = rt.views();
+            d.tick(now, &mut obs, &mut fx)
+        };
+        for e in rt.take_pending() {
+            let (_, mut fx) = rt.views();
+            d.inject(now, e, &mut fx);
+        }
+        for e in fake.drain_events() {
+            if let fake_vpp::Event::Neighbour { mac, .. } = e {
+                if mac == late_mac {
+                    saw_neigh = true;
+                }
+            }
+        }
+        if saw_neigh {
+            break;
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+
+    assert!(
+        saw_neigh,
+        "the new nexthop's static neighbour was never programmed — its routes \
+         would install, verify clean, and blackhole"
+    );
+}

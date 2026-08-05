@@ -1176,7 +1176,11 @@ fn populate_mss_clamp(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<
     Ok(())
 }
 
-pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
+pub fn attach(
+    state: &mut ActiveState,
+    cfg: &ModuleConfig<'_>,
+    route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
+) -> ModuleResult<Vec<Attachment>> {
     // v0.2.5: load `finalize` first so its FD is available for the
     // MUTATION_PROGS[0] population below. Order matters: fast_path's
     // tail_call into MUTATION_PROGS[0] must succeed on every packet
@@ -1630,6 +1634,7 @@ pub fn attach(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<V
             local_prefixes,
             fallback_default,
             fdb_pin_chains,
+            route_sink,
         )
         .map_err(|e| {
             ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))

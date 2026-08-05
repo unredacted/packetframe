@@ -137,6 +137,64 @@ pub trait RouteSource {
     /// resolves), and traffic is dropped on the floor by an incomplete
     /// adjacency. Nothing in the module would report a fault.
     fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6]));
+
+    /// Changes since the last call, bounded by `max` routes.
+    ///
+    /// The default is "none", which is correct for a static snapshot: a
+    /// fixture mirror does not change under the engine, and every
+    /// in-tree implementation but the live feed is one of those. A source
+    /// that *does* change must override this, or its updates reach the
+    /// engine only at the next full resync.
+    ///
+    /// Both kinds come back from one call because they must be applied
+    /// together and in order — see [`SourceChanges`].
+    fn drain_changes(&self, _max: usize) -> SourceChanges {
+        SourceChanges::default()
+    }
+
+    /// How many changes are queued but not yet handed over.
+    ///
+    /// Reported so a source that is filling faster than the engine drains
+    /// is visible as its own fault, rather than as an unexplained gap
+    /// between what bird advertises and what VPP holds. Default `0` for
+    /// the static sources, which never queue anything.
+    fn backlog(&self) -> u64 {
+        0
+    }
+}
+
+/// One route change: the prefix, and its new nexthop set — or `None`
+/// if it was withdrawn.
+pub type RouteChange = (IpPrefix, Option<Vec<IpAddr>>);
+
+/// One neighbour change: the nexthop, and its (egress device, MAC) —
+/// or `None` if it is no longer resolved.
+pub type NeighbourChange = (IpAddr, Option<(String, [u8; 6])>);
+
+/// What changed at the source since it was last asked.
+///
+/// One struct rather than two calls so a tick cannot take the routes and
+/// leave the neighbours behind. The order they are applied in is not
+/// cosmetic: a route whose nexthop the engine's map has never seen is
+/// classified **unresolvable**, so neighbours must land first or a
+/// genuinely new nexthop black-holes its own routes until the next full
+/// resync.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SourceChanges {
+    /// Prefix → new nexthop set, or `None` for withdrawn.
+    pub routes: Vec<RouteChange>,
+    /// Nexthop → (egress device, MAC), or `None` for lost.
+    pub neighbours: Vec<NeighbourChange>,
+}
+
+impl SourceChanges {
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty() && self.neighbours.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.routes.len() + self.neighbours.len()
+    }
 }
 
 /// What a full-table resync queued.
@@ -614,41 +672,59 @@ impl ConvergenceEngine {
             });
         }
 
-        let t = self.transport.as_mut().expect("checked just above");
         let mut programmed = 0u64;
         for (ip, sw_if_index, mac_address) in wanted {
-            let reply =
-                match t.request::<IpNeighborAddDel, IpNeighborAddDelReply>(IpNeighborAddDel {
-                    context: 0,
-                    is_add: true,
-                    neighbor: IpNeighbor {
-                        sw_if_index,
-                        // Static: VPP must never age this out and never
-                        // ARP to refresh it, because it cannot receive
-                        // the reply.
-                        flags: IP_NEIGHBOR_STATIC,
-                        mac_address,
-                        ip_address: to_address(ip),
-                    },
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.disconnect();
-                        return Err(EngineError::Transport(e));
-                    }
-                };
-            if reply.retval != 0 {
-                // Refused, not a broken socket. Loud rather than skipped:
-                // every route through this nexthop would install cleanly
-                // and then blackhole.
-                return Err(EngineError::NeighbourRefused {
-                    nexthop: ip,
-                    retval: reply.retval,
-                });
-            }
+            self.send_neighbour(ip, sw_if_index, mac_address, true)?;
             programmed += 1;
         }
         Ok(programmed)
+    }
+
+    /// One `ip_neighbor_add_del`, the single place this message is built.
+    ///
+    /// Extracted because there are now two callers — the resync walk and
+    /// the steady-state delta path — and a second hand-written copy of
+    /// this is how the tiers end up disagreeing about a flag. The static
+    /// bit especially: VPP must never age these out and never ARP to
+    /// refresh them, because it cannot receive the reply.
+    fn send_neighbour(
+        &mut self,
+        ip: IpAddr,
+        sw_if_index: u32,
+        mac_address: [u8; 6],
+        is_add: bool,
+    ) -> Result<(), EngineError> {
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        let reply = match t.request::<IpNeighborAddDel, IpNeighborAddDelReply>(IpNeighborAddDel {
+            context: 0,
+            is_add,
+            neighbor: IpNeighbor {
+                sw_if_index,
+                flags: IP_NEIGHBOR_STATIC,
+                mac_address,
+                ip_address: to_address(ip),
+            },
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                self.disconnect();
+                return Err(EngineError::Transport(e));
+            }
+        };
+        if reply.retval != 0 {
+            // A removal VPP does not recognise is not a fault: the
+            // adjacency we wanted gone is gone. An *add* it refuses is,
+            // because every route through that nexthop would install
+            // cleanly and then blackhole.
+            if !is_add {
+                return Ok(());
+            }
+            return Err(EngineError::NeighbourRefused {
+                nexthop: ip,
+                retval: reply.retval,
+            });
+        }
+        Ok(())
     }
 
     /// Queue a full-table resync as a **diff** against the route source.
@@ -677,6 +753,77 @@ impl ConvergenceEngine {
     /// resolvability depends on it, and resolving against a stale map
     /// would classify routes unresolvable for a neighbour that has since
     /// been learned.
+    /// Pull live changes from the source into the pending map.
+    ///
+    /// Returns how many were taken. This only *queues* — sending is
+    /// `drain_batch`'s job, exactly as it is for a resync, so there is one
+    /// path to VPP rather than a steady-state one and a convergence one
+    /// that can disagree.
+    ///
+    /// **Neighbours before routes**, and the order is load-bearing: a
+    /// route whose nexthop the map has never seen is classified
+    /// unresolvable, so a new nexthop arriving in the same batch as the
+    /// routes that use it would black-hole them for a full resync cycle
+    /// if applied the other way round.
+    pub fn apply_changes(&mut self, src: &dyn RouteSource, max: usize) -> Result<u64, EngineError> {
+        let changes = src.drain_changes(max);
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let n = changes.len() as u64;
+        for (nh, state) in changes.neighbours {
+            match state {
+                Some((dev, mac)) => {
+                    self.nexthops.set_device(nh, dev);
+                    // And PROGRAM it, which is the whole point.
+                    //
+                    // `set_device` alone makes `resolve` return `Some`, so
+                    // routes through this nexthop classify as resolvable
+                    // and install — while VPP, which runs without
+                    // linux-cp and can never ARP for the adjacency, has
+                    // nothing to send them to. Verification would not
+                    // catch it either: it checks a route exists on an
+                    // interface we own, deliberately not that its
+                    // adjacency resolves. That is #115's worst finding
+                    // exactly, arriving through the delta door instead of
+                    // the resync one.
+                    if let Some(idx) = self
+                        .nexthops
+                        .resolve(&nh)
+                        .and_then(|t| self.port_index.get(&t))
+                    {
+                        self.send_neighbour(nh, idx, mac, true)?;
+                    }
+                }
+                // Forgotten rather than left at its last known device —
+                // see `NexthopMap::forget_device`. The routes through it
+                // become unresolvable, which is the honest answer and the
+                // one health reports.
+                //
+                // The adjacency is withdrawn from VPP first, while the
+                // mapping that names its interface is still there to
+                // withdraw it *with*.
+                None => {
+                    if let Some(idx) = self
+                        .nexthops
+                        .resolve(&nh)
+                        .and_then(|t| self.port_index.get(&t))
+                    {
+                        self.send_neighbour(nh, idx, [0; 6], false)?;
+                    }
+                    self.nexthops.forget_device(&nh);
+                }
+            }
+        }
+        for (prefix, nhs) in changes.routes {
+            match nhs {
+                Some(v) => self.pending.upsert(prefix, v),
+                None => self.pending.withdraw(prefix),
+            }
+        }
+        Ok(n)
+    }
+
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
         self.phase = Some(Phase::Resync);
 
