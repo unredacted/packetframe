@@ -117,6 +117,9 @@ impl Default for McamBudget {
     }
 }
 
+/// Source and destination — see [`RuleSet::plan`] for why both.
+const RULES_PER_PREFIX: usize = 2;
+
 impl RuleSet {
     /// Decide the rules for one port.
     ///
@@ -132,38 +135,42 @@ impl RuleSet {
     /// through VPP and the rest through the kernel, which is a policy
     /// nobody chose.
     pub fn plan(allowlist: &[IpPrefix], budget: McamBudget) -> Result<Self, String> {
-        let mut out = RuleSet::default();
-        let mut next = budget.base;
-        for p in allowlist {
-            let (addr, prefix_len) = match p {
-                IpPrefix::V4 { addr, prefix_len } => (Ipv4Addr::from(*addr), *prefix_len),
-                IpPrefix::V6 { .. } => {
-                    out.skipped_v6 += 1;
-                    continue;
-                }
-            };
-            for side in [Side::Src, Side::Dst] {
-                if next >= budget.base + budget.count {
-                    return Err(format!(
-                        "allowlist needs more MCAM slots than the budget allows ({} rules for \
-                         {} prefixes, budget {} from {}); steering part of the allowlist would \
-                         split it across both forwarding tiers, so none is installed",
-                        out.rules.len() + 1,
-                        allowlist.len(),
-                        budget.count,
-                        budget.base
-                    ));
-                }
-                out.rules.push(SteerRule {
+        // Partition first, then check capacity, then build. The order is
+        // what makes the refusal's numbers true: counting as we go can
+        // only ever report how far we got, which is the budget size — the
+        // one number the operator already knows.
+        let steerable: Vec<(Ipv4Addr, u8)> = allowlist
+            .iter()
+            .filter_map(|p| match p {
+                IpPrefix::V4 { addr, prefix_len } => Some((Ipv4Addr::from(*addr), *prefix_len)),
+                IpPrefix::V6 { .. } => None,
+            })
+            .collect();
+        let skipped_v6 = (allowlist.len() - steerable.len()) as u32;
+        let needed = steerable.len() * RULES_PER_PREFIX;
+
+        if needed > budget.count as usize {
+            return Err(format!(
+                "the allowlist needs {needed} MCAM rule(s) ({} steerable prefix(es) × {}                  directions) but the budget allows {} from slot {}; steering part of the                  allowlist would split it across both forwarding tiers, so none is installed",
+                steerable.len(),
+                RULES_PER_PREFIX,
+                budget.count,
+                budget.base
+            ));
+        }
+
+        let mut rules = Vec::with_capacity(needed);
+        for (i, (addr, prefix_len)) in steerable.into_iter().enumerate() {
+            for (j, side) in [Side::Src, Side::Dst].into_iter().enumerate() {
+                rules.push(SteerRule {
                     prefix: addr,
                     prefix_len,
                     side,
-                    location: next,
+                    location: budget.base + (i * RULES_PER_PREFIX + j) as u32,
                 });
-                next += 1;
             }
         }
-        Ok(out)
+        Ok(RuleSet { rules, skipped_v6 })
     }
 
     /// The slots this set occupies, for the state file — teardown must
@@ -212,18 +219,33 @@ mod tests {
         );
     }
 
-    /// An allowlist that does not fit installs NOTHING.
+    /// An allowlist that does not fit installs NOTHING, and says how
+    /// many rules it actually needed.
     ///
-    /// The failure mode this prevents is worse than no steering: a
+    /// The failure mode the refusal prevents is worse than no steering: a
     /// partially steered port forwards some allowlisted traffic through
-    /// VPP and the rest through the kernel, which is a forwarding policy
-    /// neither tier was configured for and which no counter names.
+    /// VPP and the rest through the kernel, a policy neither tier was
+    /// configured for and which no counter names.
+    ///
+    /// The *number* is asserted because it is the number an operator
+    /// sizes the budget from. Counting rules as they are built can only
+    /// report how far the loop got — which is the budget size, the one
+    /// figure they already have — so this asserts the true requirement
+    /// and, explicitly, that the old understated figure is gone.
     #[test]
     fn an_allowlist_that_exceeds_the_budget_is_refused_whole() {
         let allow: Vec<IpPrefix> = (0..4).map(|i| v4(10, i, 0, 0, 16)).collect();
         let budget = McamBudget { base: 0, count: 5 };
         let e = RuleSet::plan(&allow, budget).expect_err("must refuse");
-        assert!(e.contains("MCAM slots"), "{e}");
+
+        assert!(
+            e.contains("needs 8 MCAM rule(s)"),
+            "must name the TRUE requirement, not how far it got: {e}"
+        );
+        assert!(
+            !e.contains("6 MCAM"),
+            "reporting budget+1 tells the operator to try a size that also fails: {e}"
+        );
         assert!(
             e.contains("none is installed"),
             "the message must say the port is left unsteered: {e}"
@@ -233,6 +255,30 @@ mod tests {
         // about the budget and not about the allowlist's shape.
         let ok = RuleSet::plan(&allow, McamBudget { base: 0, count: 8 }).expect("fits exactly");
         assert_eq!(ok.rules.len(), 8);
+    }
+
+    /// The refusal counts STEERABLE prefixes, not every line in the
+    /// allowlist.
+    ///
+    /// A v6 prefix consumes no slot, so including it in the count would
+    /// overstate the shortfall and send an operator looking for a budget
+    /// increase they do not need — the inverse of the understatement
+    /// above, and equally a number they would act on.
+    #[test]
+    fn the_refusal_does_not_count_prefixes_that_consume_no_slots() {
+        let allow = vec![
+            v4(10, 0, 0, 0, 16),
+            v4(10, 1, 0, 0, 16),
+            IpPrefix::V6 {
+                addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                prefix_len: 32,
+            },
+        ];
+        let e = RuleSet::plan(&allow, McamBudget { base: 0, count: 3 }).expect_err("must refuse");
+        assert!(
+            e.contains("needs 4 MCAM rule(s)") && e.contains("2 steerable prefix(es)"),
+            "the v6 prefix is not steerable and must not inflate either number: {e}"
+        );
     }
 
     /// An allowlist with no v4 in it produces no rules and says why.

@@ -52,14 +52,26 @@ fn probe_steering_budget(allowlist: &[packetframe_common::fib::IpPrefix]) -> Cap
 
     let budget = McamBudget::default();
     match RuleSet::plan(allowlist, budget) {
-        Ok(set) if set.rules.is_empty() && set.skipped_v6 > 0 => Capability::fail(
+        // Nothing to steer is a FAIL however it arose. The two ways there
+        // read very differently to an operator, so they are named
+        // separately — but neither may pass: a port that steers nothing
+        // diverts no traffic while every other line in this report, and
+        // the module's own health, says the offload is fine.
+        Ok(set) if set.rules.is_empty() => Capability::fail(
             "vpp.steering.budget",
-            format!(
-                "none of the allowlist can be steered: all {} prefix(es) are IPv6, and `ip6` \
-                 ntuple is rejected by this NIC's AF (gate 0b round 4). The offload would \
-                 forward nothing while reporting healthy",
-                set.skipped_v6
-            ),
+            if set.skipped_v6 > 0 {
+                format!(
+                    "none of the allowlist can be steered: all {} prefix(es) are IPv6, and \
+                     `ip6` ntuple is rejected by this NIC's AF (gate 0b round 4). The offload \
+                     would forward nothing while reporting healthy",
+                    set.skipped_v6
+                )
+            } else {
+                "the fast-path allowlist is empty, so there is nothing to steer. Steered \
+                 prefixes are inherited from fast-path's `allow-prefix`/`allow-prefix6`; \
+                 without any, the offload would forward nothing while reporting healthy"
+                    .to_string()
+            },
             false,
         ),
         Ok(set) => {
@@ -217,4 +229,54 @@ pub(crate) fn default_hugepage_bytes() -> u64 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod steering_probe_tests {
+    use super::*;
+    use packetframe_common::fib::IpPrefix;
+    use packetframe_common::probe::CapabilityStatus;
+
+    fn v4(a: u8, len: u8) -> IpPrefix {
+        IpPrefix::V4 {
+            addr: [10, a, 0, 0],
+            prefix_len: len,
+        }
+    }
+
+    /// Nothing to steer is a FAIL however it arose.
+    ///
+    /// Two ways to get there and they read very differently to an
+    /// operator, so both are named — but neither may pass. A port that
+    /// steers nothing diverts no traffic while every other line in the
+    /// report, and the module's own health, says the offload is fine.
+    /// The empty case is the one that slipped through: it is also what
+    /// `validate_vpp_offload` permits, since nothing requires fast-path
+    /// to declare an allowlist when a port asks to steer.
+    #[test]
+    fn an_allowlist_that_steers_nothing_never_passes() {
+        let empty = probe_steering_budget(&[]);
+        assert_eq!(empty.status, CapabilityStatus::Fail, "{empty:?}");
+        assert!(
+            empty.detail.contains("allowlist is empty"),
+            "names which of the two ways it got here: {}",
+            empty.detail
+        );
+
+        let v6_only = probe_steering_budget(&[IpPrefix::V6 {
+            addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 32,
+        }]);
+        assert_eq!(v6_only.status, CapabilityStatus::Fail, "{v6_only:?}");
+        assert!(
+            v6_only.detail.contains("IPv6"),
+            "and names the other: {}",
+            v6_only.detail
+        );
+
+        // A steerable prefix passes, so the failures above are about
+        // having nothing to steer rather than the probe always failing.
+        let ok = probe_steering_budget(&[v4(0, 24)]);
+        assert_eq!(ok.status, CapabilityStatus::Pass, "{ok:?}");
+    }
 }
