@@ -407,11 +407,6 @@ impl NtupleSteering {
         }
     }
 
-    /// What is installed right now, for the state file.
-    pub fn installed(&self) -> &[(String, u32)] {
-        &self.installed
-    }
-
     /// Remove `victims`, **keeping whatever would not come out**.
     ///
     /// One routine because there are two callers — `steer`'s rollback and
@@ -724,6 +719,7 @@ mod tests {
     /// knew about them, still steering into a VF nobody owns.
     #[test]
     fn adopted_locations_are_what_unsteer_removes() {
+        use crate::runtime::Steering as _;
         let allow = vec![IpPrefix::V4 {
             addr: [23, 191, 200, 0],
             prefix_len: 24,
@@ -738,7 +734,7 @@ mod tests {
         s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
         assert_eq!(
             s.installed(),
-            &[("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
+            vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
             "the previous process's rules are now this one's to remove"
         );
     }
