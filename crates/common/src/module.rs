@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{GlobalConfig, ModuleSection};
@@ -105,7 +106,13 @@ impl HealthCtx {
 }
 
 /// Overall health of a subsystem.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because the loader publishes a health
+/// snapshot to disk for `packetframe status` to read — module health
+/// needs a live daemon, and `status` runs without one. Derived here
+/// rather than mirrored in the CLI: a hand-copied enum is how the
+/// counter-name list drifted (see `metrics::COUNTER_NAMES`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HealthState {
     /// Subsystem is operating normally; all checks pass.
     #[default]
@@ -147,7 +154,7 @@ impl HealthState {
 /// Per-subsystem health entry within a [`HealthReport`]. `name` is
 /// stable for dashboards; changing it breaks operator tooling that
 /// keys on the string.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubsystemHealth {
     /// Stable identifier, e.g. `"bmp-station"`, `"netlink-neigh"`,
     /// `"fib-programmer"`. Append-safe (new subsystems can land);
@@ -175,7 +182,7 @@ pub struct SubsystemHealth {
 /// Added during the Option F custom-FIB rollout because the prior
 /// `ModuleResult<()>` surface couldn't express partial-degraded
 /// states across multiple control-plane subsystems.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthReport {
     pub overall: HealthState,
     pub subsystems: Vec<SubsystemHealth>,

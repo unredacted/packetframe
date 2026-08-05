@@ -10,6 +10,8 @@
 //!   alone.
 
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+use std::time::{Duration, Instant};
 
 use packetframe_common::{config::Config, probe::run_probes};
 
@@ -364,8 +366,18 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
     // Start the metrics exporter once STATS is pinned (which happens
     // in the attach loop above).
+    // Shared with the exporter so the modules' gauges reach the same
+    // textfile as the BPF counters, without a second writer. Created even
+    // when no textfile is configured, because the health poll publishes
+    // into it unconditionally and a slot nobody reads costs one
+    // allocation.
+    let module_gauges: crate::metrics::ModuleGauges = Default::default();
     let metrics_exporter = config.global.metrics_textfile.as_ref().map(|path| {
-        crate::metrics::MetricsExporter::start(path.clone(), config.global.bpffs_root.clone())
+        crate::metrics::MetricsExporter::start(
+            path.clone(),
+            config.global.bpffs_root.clone(),
+            module_gauges.clone(),
+        )
     });
 
     // Start circuit-breaker sampler(s) for each module that declared
@@ -402,6 +414,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         config_path,
         &config.global.state_dir,
         &mut modules,
+        &module_gauges,
         #[cfg(feature = "vpp-offload")]
         &allowlist,
     )
@@ -438,6 +451,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             drop(modules);
         }
     }
+    // The health snapshot describes a *daemon*, and this one is
+    // leaving. Unlike the pins — which deliberately outlive the process
+    // (§8.5) — a report kept past its writer is only misleading:
+    // `packetframe status` would render the last `Healthy` from a
+    // process that no longer exists. Removed here on the clean paths;
+    // for a crash, `status` falls back to the recorded pid, which is the
+    // check that cannot be forgotten.
+    crate::health::remove(&config.global.state_dir);
+
     // Best-effort PID file cleanup. Non-fatal, the file is harmless
     // if left behind (PID will be unrecognized on re-validate).
     if let Err(e) = std::fs::remove_file(&pid_file_path) {
@@ -545,19 +567,54 @@ enum Termination {
     BreakerTrip,
 }
 
-/// Drive the signal loop. Returns the termination reason the caller
-/// uses to decide whether to detach or preserve pins on exit.
+/// How often the loop samples `health_check` and `sample_metrics`.
+///
+/// Deliberately shorter than the exporter's 15 s write interval. The
+/// exporter appends whatever fragment it finds, and the two run on
+/// independent phases — at equal cadences a fragment could be a whole
+/// write period old, so the file would routinely pair fresh BPF counters
+/// with module gauges from the previous cycle. At 5 s the pairing is off
+/// by at most a third of a write.
+///
+/// It is also the health snapshot's cadence, which sets how stale
+/// `packetframe status` can be while the daemon is healthy.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+const MODULE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long the loop sleeps between checks for a pending signal.
+///
+/// The cost of not blocking on the signal fd: one wakeup per interval,
+/// each a non-blocking drain plus two `Instant` comparisons. The same
+/// 250 ms the metrics exporter already uses for its shutdown check, and
+/// it bounds SIGTERM latency the same way.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+const SIGNAL_POLL: Duration = Duration::from_millis(250);
+
+/// Drive the daemon's main loop: signals, plus the module health and
+/// metrics cadence. Returns the termination reason the caller uses to
+/// decide whether to detach or preserve pins on exit.
 ///
 /// - SIGHUP → re-parse config + reconfigure each loaded module.
 /// - SIGTERM/SIGINT → `Termination::ExitPreserveAttach` (keep pins).
 /// - SIGUSR1 → `Termination::BreakerTrip` (breaker fired; caller
 ///   detaches). SIGUSR1 is raised by the breaker sampler thread on
 ///   trip.
+/// - every [`MODULE_POLL_INTERVAL`] → sample the modules.
+///
+/// **This loop is where the module polling has to live**, and that is
+/// what turned a blocking `signals.forever()` into a poll. `health_check`
+/// and `sample_metrics` need the modules, the modules are owned here
+/// alongside the `&mut` uses (reconfigure, detach), and sharing them with
+/// the exporter thread would mean an `Arc<Mutex<_>>` that serialises a
+/// metrics read against a reconfigure. Polling here keeps single
+/// ownership and keeps the textfile single-writer; the cost is one
+/// wakeup per [`SIGNAL_POLL`].
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn drive_signal_loop(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    module_gauges: &crate::metrics::ModuleGauges,
     #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) -> Result<Termination, String> {
     use signal_hook::{
@@ -568,27 +625,42 @@ fn drive_signal_loop(
     let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP, SIGUSR1])
         .map_err(|e| format!("signal registration: {e}"))?;
 
-    for sig in signals.forever() {
-        match sig {
-            SIGHUP => reconfigure_from_signal(
-                config_path,
-                state_dir,
-                modules,
-                #[cfg(feature = "vpp-offload")]
-                allowlist,
-            ),
-            SIGTERM | SIGINT => {
-                tracing::info!(signal = sig, "termination requested");
-                return Ok(Termination::ExitPreserveAttach);
+    // Sample once immediately. Waiting a full interval would leave
+    // `packetframe status` reporting "no snapshot" for the first 5 s of
+    // every daemon's life — which is exactly when an operator who just
+    // started it is looking.
+    let mut next_poll = Instant::now();
+
+    loop {
+        for sig in signals.pending() {
+            match sig {
+                SIGHUP => reconfigure_from_signal(
+                    config_path,
+                    state_dir,
+                    modules,
+                    #[cfg(feature = "vpp-offload")]
+                    allowlist,
+                ),
+                SIGTERM | SIGINT => {
+                    tracing::info!(signal = sig, "termination requested");
+                    return Ok(Termination::ExitPreserveAttach);
+                }
+                SIGUSR1 => {
+                    tracing::warn!("SIGUSR1 received, breaker-triggered shutdown");
+                    return Ok(Termination::BreakerTrip);
+                }
+                _ => {}
             }
-            SIGUSR1 => {
-                tracing::warn!("SIGUSR1 received, breaker-triggered shutdown");
-                return Ok(Termination::BreakerTrip);
-            }
-            _ => {}
         }
+
+        let now = Instant::now();
+        if now >= next_poll {
+            crate::health::poll(state_dir, modules, module_gauges);
+            next_poll = now + MODULE_POLL_INTERVAL;
+        }
+
+        std::thread::sleep(SIGNAL_POLL);
     }
-    Ok(Termination::ExitPreserveAttach)
 }
 
 /// SIGHUP handler. Re-parses the config from `config_path` and calls
@@ -1282,9 +1354,109 @@ pub fn status(config_path: &Path) -> Result<(), String> {
         // process exit (§8.5).
         #[cfg(target_os = "linux")]
         print_stats(&config.global.bpffs_root);
+
+        print_module_health(&config.global.state_dir);
     }
 
     Ok(())
+}
+
+/// Render the daemon's last published module health.
+///
+/// Everything else `status` prints is read from the kernel or from a pin
+/// and is therefore *current by construction*. This is not: it is a file
+/// a daemon wrote, and the daemon may be gone. So the liveness question
+/// is answered first and separately — from the recorded pid, the same
+/// cross-check `reconfigure` uses — and the age second. A report is only
+/// presented as current when the process that wrote it still exists.
+#[cfg(feature = "fast-path")]
+fn print_module_health(state_dir: &Path) {
+    use packetframe_common::module::HealthState;
+
+    let snapshot = match crate::health::load(state_dir) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!();
+            println!(
+                "module health: no snapshot at {} — no daemon has published one (module \
+                 health needs a running `packetframe run`; the counters above do not)",
+                crate::health::Snapshot::path_in(state_dir).display()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("note: module health unavailable ({e})");
+            return;
+        }
+    };
+
+    println!();
+    // Liveness BEFORE the contents. An operator who reads "Healthy" and
+    // only then learns the daemon is dead has already drawn the
+    // conclusion, and it was the wrong one.
+    #[cfg(target_os = "linux")]
+    let live = proc_exe_matches_current(snapshot.pid);
+    // No /proc to cross-check against, so liveness is unknown rather
+    // than assumed either way.
+    #[cfg(not(target_os = "linux"))]
+    let live = false;
+
+    let age = match crate::health::age_seconds(&snapshot) {
+        Some(a) => format!("{a}s old"),
+        // The clock moved backwards since the write; saying so beats
+        // printing a flattering number derived from it.
+        None => "written in the future (clock skew)".to_string(),
+    };
+
+    if live {
+        println!("module health (pid {}, {age}):", snapshot.pid);
+    } else {
+        println!(
+            "module health: STALE — the daemon that wrote this (pid {}) is gone. The report \
+             below is history, {age}; the dataplane may still be forwarding via its pins \
+             (§8.5).",
+            snapshot.pid
+        );
+    }
+
+    for m in &snapshot.modules {
+        match (&m.report, &m.error) {
+            // A check that could not run is not a verdict about the
+            // module, and must not be rendered as one.
+            (_, Some(e)) => println!("  {}: health check FAILED — {e}", m.module),
+            (Some(r), None) => {
+                println!("  {}: {}", m.module, health_word(r.overall));
+                for sub in &r.subsystems {
+                    let age = match sub.last_success_age_seconds {
+                        Some(a) => format!(" (last ok {a}s ago)"),
+                        None => String::new(),
+                    };
+                    let msg = sub.message.as_deref().unwrap_or("");
+                    let sep = if msg.is_empty() { "" } else { " — " };
+                    println!(
+                        "    {:<14} {}{sep}{msg}{age}",
+                        sub.name,
+                        health_word(sub.state)
+                    );
+                }
+            }
+            // Neither a report nor a reason. Unreachable from
+            // `health::poll`, which always sets exactly one, so it means
+            // the file was written by something else or hand-edited.
+            (None, None) => println!(
+                "  {}: no report and no error recorded (malformed snapshot)",
+                m.module
+            ),
+        }
+    }
+
+    fn health_word(s: HealthState) -> &'static str {
+        match s {
+            HealthState::Healthy => "healthy",
+            HealthState::Degraded => "DEGRADED",
+            HealthState::Unhealthy => "UNHEALTHY",
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
