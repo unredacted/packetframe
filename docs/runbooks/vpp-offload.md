@@ -250,8 +250,8 @@ Traffic returns to the eBPF fast-path. Membership stays, the FIB stays
 synced, VPP keeps running — you land on rung 0, which is a state you
 have already soaked.
 
-This path is deliberately robust in one specific way: an allowlist that
-has outgrown the MCAM budget **does not block it**. The budget check
+One thing about this path is deliberate: an allowlist that has outgrown
+the MCAM budget does not block it. The budget check
 only applies when rules are about to be installed, because `unsteer`
 removes what the ledger names and never consults the plan. An allowlist
 growing past the budget is a plausible route to wanting exactly this

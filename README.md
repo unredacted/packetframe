@@ -1,6 +1,6 @@
 # PacketFrame
 
-**eBPF/XDP fast-path for Linux packet forwarding.** Pure Rust, pluggable, attaches per-interface. Forwards allowlisted traffic directly between NICs at the driver level (bypassing iptables, conntrack, and the kernel routing stack), and falls back to normal kernel forwarding for everything else.
+**Forwarding data plane for Linux edge routers.** PacketFrame takes the traffic you allowlist off the kernel's conntrack and netfilter path and forwards it straight between NICs, leaving everything else to normal kernel forwarding. It can build its own routing table from a BGP feed, so it neither depends on netlink nor competes with the routing daemon for it. Written in Rust, attached one interface at a time, and removable the same way.
 
 Running in production on edge routers with full-table BGP feeds. About 98% of allowlisted flows take the fast path there; conntrack entries and customer-facing latency both dropped substantially, with numbers below.
 
@@ -8,21 +8,27 @@ GPL-3.0-or-later. Linux ≥ 5.15. Single static binary; no separate libbpf, bpft
 
 ## What it does
 
-For each interface you attach it to, PacketFrame runs an eBPF program at XDP ingress that:
+One daemon, one config file, and a set of modules. There are three parts.
+
+**The fast path.** For each interface you attach it to, PacketFrame runs an eBPF program at XDP ingress that:
 
 1. **Filters** by your declared `allow-prefix` / `allow-prefix6` lists. Non-matching packets fall through to the kernel unchanged.
 2. **Forwards** matched packets directly to the egress NIC via `bpf_redirect_map`: no `nf_hook_slow`, no conntrack, no iptables walk, no kernel skb allocation in native XDP mode.
-3. **Resolves the egress** via either the kernel FIB (`bpf_fib_lookup`) or PacketFrame's own LPM trie populated from a BGP feed (your choice via `forwarding-mode`).
+3. **Resolves the egress** via either the kernel FIB (`bpf_fib_lookup`) or PacketFrame's own routing table (your choice via `forwarding-mode`).
 
-Optional layered features:
+**The route side.** In custom-FIB mode PacketFrame reads BGP itself — iBGP from `bird` today, or BMP (RFC 7854/9069) — and builds an LPM trie from it, resolving next-hop MACs over netlink. The kernel route table is not involved, so daemons that read it are unaffected and there is no race over BGP attribute updates.
+
+**A second way to forward.** The `vpp-offload` module can hand allowlisted traffic to a VPP process on an SR-IOV virtual function instead, using the same routes. It is written but has not run on real hardware yet; see [below](#second-forwarding-path-vpp-offload).
+
+Other things the fast path can do:
 
 - **VLAN push/pop/rewrite** for tagged forwarding
-- **Custom-FIB mode**: ingest BGP routes directly via iBGP (production today, with `bird`) or BMP (RFC 7854/9069). No netlink dependency, no race with other daemons subscribed to kernel routes.
 - **Per-host fast-path for connected destinations** via `local-prefix` directives + ARP scavenging
 - **XDP-time bogon block** (`block-prefix`) for dropping traffic to unrouteable destinations before kernel processing
 - **Default-route synthesis** in custom-FIB mode (`fallback-default`) for catching destinations the BGP feed doesn't cover
+- **MSS clamping** for fast-pathed TCP, which iptables no longer sees
 
-## Benefits
+## What changes
 
 | Concern | Stock kernel forwarding | PacketFrame fast-path |
 |---|---|---|
@@ -57,7 +63,9 @@ Actual results depend on workload mix, NIC, kernel version, and deployment topol
 | Memory model | kernel-managed BPF maps | hugepages | kernel | kernel |
 | Deploy disruption | per-iface attach, opt-in | replaces network stack | runs alongside | default |
 
-PacketFrame complements existing routing daemons rather than replacing them. The intended pairing is `bird` (BGP) + `pathvector` (config generator) + PacketFrame (fast-path). FRR works similarly via its BMP support.
+The PacketFrame column describes the fast path, which is what runs in production. `vpp-offload` sits between the first two columns: it puts VPP on a virtual function under PacketFrame's supervision, so for steered traffic it does bypass the kernel fully and does need dedicated cores. The fast path stays underneath as the fallback.
+
+PacketFrame does not replace a routing daemon. The intended pairing is `bird` (BGP) + `pathvector` (config generator) + PacketFrame. FRR works too, via its BMP support.
 
 ## Status
 
@@ -300,12 +308,18 @@ Quick directive index:
 **Module fast-path: driver opt-ins**
 - `driver-workaround rvu-nicpf-head-shift {auto|on|off}`
 
-`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, and forwarding-mode bits. Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, or editing `local-prefix`/`local-prefix6` requires a restart.
+**Module vpp-offload** (see [the runbook](docs/runbooks/vpp-offload.md) before using)
+- `port <iface> cores <n> steer {on|off}`: one line per interface VPP takes part in; `steer` is the per-interface switch
+- `expected-routes <n>`: sizes VPP's memory, fixed when it starts
+- `hugepages <n>`, `vpp-binary <path>`
+- `require-table-complete {on|off}`: wait for the routing table to finish loading before steering (default on)
+
+`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, forwarding-mode bits, and vpp-offload's `steer` switches. Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, editing `local-prefix`/`local-prefix6`, or changing any vpp-offload directive other than `steer` requires a restart.
 
 ## Operator tools
 
 ```sh
-sudo packetframe status                # live counters from pinned STATS map
+sudo packetframe status                # live counters, plus each module's health
 sudo packetframe fib stats             # custom-FIB occupancy / hash mode
 sudo packetframe fib lookup <ip>       # "what would XDP do for this dst?"
 sudo packetframe fib dump-v4           # walk FIB_V4 LPM trie
