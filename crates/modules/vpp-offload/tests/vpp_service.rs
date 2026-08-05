@@ -248,6 +248,9 @@ impl IdentityStore for RefusingStore {
     fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
         Err("state dir is read-only".into())
     }
+    fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// An unpersisted interface identity must DEGRADE health, not pass
@@ -682,6 +685,10 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
         fn unsteer(&mut self) -> Result<(), String> {
             Ok(())
         }
+        fn installed(&self) -> Vec<(String, u32)> {
+            Vec::new()
+        }
+        fn retarget(&mut self, _: Vec<(String, u32)>, _: packetframe_vpp_offload::steer::RuleSet) {}
     }
 
     let fake = Fake::start("svc-panic");
@@ -1074,4 +1081,203 @@ fn the_timeout_correction_survives_the_in_flight_tick() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(pending.is_finished(), "the teardown never settled");
+}
+
+/// Steering that records what it was asked to do, so the request path
+/// can be observed without a NIC. The ioctl half has its own tests
+/// against an in-memory NIC inside the crate.
+#[derive(Default)]
+struct SpySteering(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl packetframe_vpp_offload::runtime::Steering for SpySteering {
+    fn steer(&mut self) -> Result<(), String> {
+        self.0.lock().unwrap().push("steer".into());
+        Ok(())
+    }
+    fn unsteer(&mut self) -> Result<(), String> {
+        self.0.lock().unwrap().push("unsteer".into());
+        Ok(())
+    }
+    fn installed(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+    fn retarget(
+        &mut self,
+        ports: Vec<(String, u32)>,
+        plan: packetframe_vpp_offload::steer::RuleSet,
+    ) {
+        self.0.lock().unwrap().push(format!(
+            "retarget {} ports, {} rules",
+            ports.len(),
+            plan.rules.len()
+        ));
+    }
+}
+
+fn plan_for(count: u8) -> packetframe_vpp_offload::steer::RuleSet {
+    let allow: Vec<IpPrefix> = (0..count).map(|i| fake_vpp::v4(0, i)).collect();
+    packetframe_vpp_offload::steer::RuleSet::plan(
+        &allow,
+        packetframe_vpp_offload::steer::McamBudget::default(),
+    )
+    .expect("fits")
+}
+
+/// The canary lever, turned through the running service.
+///
+/// This is `Module::reconfigure`'s whole path: post a target, the loop
+/// retargets and injects the event, the supervisor emits `Steer`, and
+/// the answer comes back to the caller SYNCHRONOUSLY — because
+/// `packetframe reconfigure` writes an OK/ERR marker an operator reads,
+/// and "the rollout step succeeded" must not look like "the rollout step
+/// was queued".
+#[test]
+fn an_operator_can_steer_and_unsteer_a_converged_service() {
+    let fake = Fake::start("svc-steer");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SpySteering(spy)),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not reach Ready: {:?}",
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true)
+        .expect("the canary lever must turn without a restart");
+    assert_eq!(
+        svc.status().expect("published").state,
+        State::Steered,
+        "and the change is visible before the call returns, not eventually"
+    );
+
+    // Rollback: membership stays, the FIB stays synced, traffic returns
+    // to the fallback tier.
+    svc.apply_steering(Vec::new(), plan_for(2), false)
+        .expect("rollback");
+    assert_eq!(svc.status().expect("published").state, State::Ready);
+
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            "retarget 1 ports, 4 rules".to_string(),
+            "steer".into(),
+            "retarget 0 ports, 4 rules".into(),
+            "unsteer".into(),
+        ],
+        "the target is recorded BEFORE the reconcile, or Steer installs the old rules"
+    );
+
+    svc.stop();
+}
+
+/// A steering change before convergence is refused, not queued.
+///
+/// A request that outlives a crash and fires against the replacement is
+/// not what the operator asked for — and it is unnecessary, since a
+/// replacement re-steers on its own when steering was wanted. The
+/// refusal has to reach the caller, because their rollout step did not
+/// happen.
+#[test]
+fn a_steering_change_before_convergence_is_refused() {
+    let fake = Fake::start("svc-steer-early");
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                // Large enough that the drain spans ticks, so the
+                // request lands while the machine is still converging.
+                Box::new(Mirror(
+                    (0..=255u8)
+                        .flat_map(|a| (0..=255u8).map(move |b| fake_vpp::v4(a, b)))
+                        .collect(),
+                )),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            Ok((Driver::new(), runtime, vec![Event::StartRequested]))
+        }),
+    )
+    .expect("service starts");
+
+    let e = svc
+        .apply_steering(vec![("eth4".into(), 0)], plan_for(2), true)
+        .expect_err("must refuse before convergence");
+    assert!(
+        e.contains("not converged"),
+        "must be the refusal, not the wait timing out — a timeout here would make this \
+         test pass without the refusal ever running: {e}"
+    );
+    assert!(
+        e.contains("takes effect at the next successful convergence"),
+        "and it must say what happens to the config the operator just wrote: {e}"
+    );
+
+    svc.stop();
 }

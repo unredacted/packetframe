@@ -13,8 +13,9 @@
 //!   (different VF address than recorded, foreign driver bound) is an
 //!   error, and it names the manual escape hatch.
 //! - **Teardown ordering is load-bearing.** Steering rules die first
-//!   (slice 5 owns them; the state file records them so release can
-//!   clear them even when the in-memory module never saw them), then
+//!   ([`crate::ntuple`] owns them; `steer_rules` here records them so
+//!   release can clear them even when the in-memory module never saw
+//!   them — MCAM outlives both the VPP process and the daemon), then
 //!   the VPP process (slice 4), then vfio unbind → rebind to the
 //!   kernel VF driver → `sriov_numvfs = 0` → hugepage release. The
 //!   inverse of acquisition, always.
@@ -90,10 +91,10 @@ pub struct PortState {
 }
 
 /// Everything attach acquired, in acquisition order. Release walks it
-/// in reverse. Steering rules are recorded here from slice 5 onward so
-/// a crash between "rules installed" and "state updated" stays
-/// recoverable (rules are re-derived idempotently from config, but
-/// release must be able to clear rules the config no longer names).
+/// in reverse. Steering rules are recorded here so a crash between
+/// "rules installed" and "state updated" stays recoverable: the plan is
+/// re-derived idempotently from config, but release must be able to
+/// clear rules the config no longer names.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceState {
     pub version: u32,
@@ -136,9 +137,20 @@ pub struct ResourceState {
     #[serde(default)]
     pub hugepage_prior_pages: u32,
     pub ports: Vec<PortState>,
-    /// ntuple rule locations installed per PF iface (slice 5).
-    /// Present in the schema from day one so adopting a newer state
-    /// file layout never needs a version bump for this field.
+    /// ntuple rule locations installed per PF iface.
+    ///
+    /// The **only durable record that MCAM rules exist**. They are NIC
+    /// state, not process state, so they outlive both VPP and the
+    /// daemon; without this a restart cannot know it is steering, and
+    /// `unsteer` — which removes what its own ledger names — would
+    /// answer `Ok` over rules that are still in the NIC.
+    ///
+    /// Written through [`crate::runtime::IdentityStore::steering_changed`]
+    /// after every steer and unsteer, in both polarities. Use
+    /// [`group_steer_rules`] / [`flatten_steer_rules`] to convert, never
+    /// by hand: the shape here is grouped for the file, the shape
+    /// everything else uses is flat, and three open-coded conversions is
+    /// how the two stop agreeing.
     pub steer_rules: Vec<(String, Vec<u32>)>,
     /// VPP pid at last state write. `None` = no process was running.
     ///
@@ -303,6 +315,33 @@ fn write_str(path: &Path, value: &str) -> Result<(), String> {
 /// actually granted them — on long-uptime hosts a contiguous 512 MiB
 /// reservation can silently fall short, which must be an error here,
 /// not an EAL mystery later. Returns the verified count.
+/// Flat `(iface, loc)` pairs → the grouped shape the state file holds.
+///
+/// Order-preserving in both directions, so a round trip is the identity
+/// and a test can assert on the list it handed in. Paired with
+/// [`flatten_steer_rules`] and kept here, next to the field, because
+/// three open-coded conversions — the store's write, `bring_up`'s
+/// restore, and `bring_up`'s stale-rule rewrite — is exactly how a
+/// grouped record and a flat ledger stop describing the same rules.
+pub fn group_steer_rules(rules: &[(String, u32)]) -> Vec<(String, Vec<u32>)> {
+    let mut grouped: Vec<(String, Vec<u32>)> = Vec::new();
+    for (iface, loc) in rules {
+        match grouped.iter_mut().find(|(name, _)| name == iface) {
+            Some((_, locs)) => locs.push(*loc),
+            None => grouped.push((iface.clone(), vec![*loc])),
+        }
+    }
+    grouped
+}
+
+/// The state file's grouped shape → the flat ledger everything else uses.
+pub fn flatten_steer_rules(grouped: &[(String, Vec<u32>)]) -> Vec<(String, u32)> {
+    grouped
+        .iter()
+        .flat_map(|(iface, locs)| locs.iter().map(|l| (iface.clone(), *l)))
+        .collect()
+}
+
 pub fn reserve_hugepages_in(pool_dir: &Path, pages: u32) -> Result<u32, String> {
     let nr = pool_dir.join("nr_hugepages");
     let current: u32 = read_trim(&nr)?.parse().unwrap_or(0);

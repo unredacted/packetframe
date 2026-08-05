@@ -31,12 +31,12 @@ use crate::supervisor::{Action, Event};
 /// Everything the executor does to the world outside itself.
 ///
 /// A trait so the ordering and failure-handling rules can be tested
-/// against a recorder. The real implementation lands with the tick loop;
-/// `Steer`/`Unsteer` stay unimplemented until slice 5 builds MCAM, and
-/// deliberately **fail loudly** there rather than returning `Ok(())` —
-/// a no-op steer that reports success would let the supervisor believe
-/// traffic is diverted when nothing is, which is worse than not having
-/// the feature.
+/// against a recorder. `Steer`/`Unsteer` are real
+/// ([`crate::ntuple::NtupleSteering`]) and must **fail loudly** rather
+/// than returning `Ok(())` on any doubt — a no-op steer that reports
+/// success lets the supervisor believe traffic is diverted when nothing
+/// is, and a no-op unsteer releases a VF that MCAM is still pointing
+/// traffic at.
 pub trait Effects {
     fn spawn(&mut self) -> Result<(), String>;
 

@@ -529,3 +529,123 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
         "the rollback must be suppressed: {e}"
     );
 }
+
+/// MCAM rules recorded by a VPP that is no longer running must be
+/// cleared before a fresh one is spawned.
+///
+/// They are NIC state, so they survive both the process and the daemon —
+/// and with nothing behind the VF they have been blackholing the steered
+/// prefixes since that VPP died. A fresh spawn does not fix it: reaching
+/// `Ready` takes a full convergence, and the supervisor never steers a
+/// first attach on its own. So the rules would keep diverting traffic
+/// into a hole under a daemon that reports Healthy.
+///
+/// Clearing them hands those prefixes back to the eBPF fast-path, which
+/// is the entire premise of it being the permanent failover tier.
+///
+/// The assertion is on the RECORD rather than on the NIC, because these
+/// tests have no NIC: on this host the removal fails and the rules stay
+/// in the ledger, which is itself the invariant that matters — a rule
+/// that would not come out must remain findable by `detach --all`.
+#[test]
+fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
+    let fake = fake_vpp::Fake::start("bringup-stale-steer");
+    let host = Host::new(
+        "stale-steer",
+        &[("eth4", "0002:07:00.0")],
+        fake.path.clone(),
+    );
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW).expect("first attach");
+    drop(attached);
+
+    // Play the kernel's part: a real bind creates the `driver` symlink
+    // adoption verifies against.
+    let link = host
+        .paths
+        .sys
+        .pci_devices
+        .join("0002:07:00.0")
+        .join("driver");
+    if !link.exists() {
+        std::os::unix::fs::symlink(host.paths.sys.pci_drivers.join("vfio-pci"), &link).unwrap();
+    }
+
+    // What a steered VPP leaves behind when it dies: rules on the
+    // record, no live process.
+    let mut state = host.state().expect("state file");
+    state.steer_rules = vec![("eth4".into(), vec![1024, 1025])];
+    state.vpp_pid = None;
+    state.vpp_start_ticks = None;
+    state.vpp_boot_id = None;
+    state.save(&host.paths.sys.state_dir).unwrap();
+
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW).expect("second attach");
+    drop(attached);
+
+    let after = host.state().expect("state file");
+    let residual = packetframe_vpp_offload::resources::flatten_steer_rules(&after.steer_rules);
+    assert_eq!(
+        residual,
+        vec![("eth4".to_string(), 1024), ("eth4".to_string(), 1025)],
+        "a rule the removal could not clear must stay on the record — dropping it is how \
+         a live MCAM rule becomes invisible to every later teardown"
+    );
+}
+
+/// A recorded ledger is what `unsteer` acts on after a restart.
+///
+/// Both halves of this shipped in #127 and nothing connected them:
+/// `steer_rules` was read by `bring_up` and written by nobody, and
+/// `NtupleSteering::adopt_installed` had no production caller. So a
+/// daemon restart over a steered VPP believed nothing was diverted,
+/// emitted no `Unsteer` on teardown, and released the VF with MCAM
+/// still pointing traffic into it.
+///
+/// Asserted through the teardown that the ledger governs: with rules on
+/// the record, the release must be REFUSED, because on this host they
+/// cannot be confirmed gone.
+#[test]
+fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
+    let fake = fake_vpp::Fake::start("bringup-ledger");
+    let host = Host::new("ledger", &[("eth4", "0002:07:00.0")], fake.path.clone());
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW).expect("first attach");
+    drop(attached);
+
+    // Play the kernel's part: a real bind creates the `driver` symlink
+    // adoption verifies against.
+    let link = host
+        .paths
+        .sys
+        .pci_devices
+        .join("0002:07:00.0")
+        .join("driver");
+    if !link.exists() {
+        std::os::unix::fs::symlink(host.paths.sys.pci_drivers.join("vfio-pci"), &link).unwrap();
+    }
+
+    let mut state = host.state().expect("state file");
+    state.steer_rules = vec![("eth4".into(), vec![1024])];
+    state.save(&host.paths.sys.state_dir).unwrap();
+
+    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW).expect("attach");
+    let report = attached.service.stop();
+    let published = report
+        .published
+        .or_else(|| report.pending.map(|p| p.settle()))
+        .expect("a final snapshot");
+
+    assert!(
+        published.resources_leaked,
+        "an unconfirmed steering removal must withhold the VF; releasing it while MCAM \
+         may still target it is the blackhole this ledger exists to prevent. Report: {:?}",
+        published.report
+    );
+    assert!(
+        host.state().is_some(),
+        "and the state file must survive, or nothing can find the rules later"
+    );
+}

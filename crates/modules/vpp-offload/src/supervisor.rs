@@ -227,6 +227,36 @@ pub enum Event {
     ConvergenceStopped,
     /// Backoff elapsed.
     BackoffElapsed,
+    /// This attach inherited MCAM rules with no process behind them.
+    ///
+    /// Steering is NIC state, so a VPP that died steered leaves its
+    /// rules diverting allowlisted traffic into a VF nothing is
+    /// servicing — a blackhole that started when it died and that a
+    /// fresh spawn does not end, since reaching `Ready` takes a full
+    /// convergence and the machine never steers a first attach on its
+    /// own.
+    ///
+    /// Reported rather than cleaned up by the caller so the ordinary
+    /// teardown ordering handles it: `Unsteer` first, and if the NIC
+    /// refuses, `steered` stays true and the VF stays withheld. The
+    /// *want* is recorded too — steering was established and never
+    /// deliberately stopped — so the replacement re-steers once it
+    /// verifies, which is what closes the blackhole.
+    InheritedSteering,
+    /// The operator turned the canary lever ON: a `steer on` appeared,
+    /// or the allowlist changed under a port that is already steering.
+    ///
+    /// Distinct from `VerifyPassed`'s automatic re-steer because the
+    /// machine deliberately never steers a first attach on its own —
+    /// that decision is the operator's, and this is how they make it
+    /// without a restart. The caller must have called
+    /// [`crate::runtime::Steering::retarget`] first; `Action::Steer`
+    /// reconciles the NIC to whatever the target now is.
+    SteerRequested,
+    /// The operator turned the canary lever OFF — the rollback landing
+    /// zone. Membership stays, the FIB stays synced, traffic goes back
+    /// to the fallback tier.
+    UnsteerRequested,
     /// Operator asked for a clean stop.
     StopRequested,
 }
@@ -499,6 +529,52 @@ impl Supervisor {
                 self.steered = true;
                 self.steer_wanted = true;
                 vec![]
+            }
+
+            // Rules without a process. Believed steered on the strength
+            // of the record, because that is the only evidence there is
+            // — and believing it is what makes the teardown emit
+            // `Unsteer` and withhold the VF if the removal is refused.
+            //
+            // Only from `Stopped`: this is an attach-time fact, injected
+            // before the first `StartRequested`. Anywhere else it would
+            // be describing a process that exists.
+            (Stopped, InheritedSteering) => {
+                self.steered = true;
+                self.steer_wanted = true;
+                vec![Action::Unsteer]
+            }
+
+            // --- the canary lever, turned without a restart ---
+            //
+            // Legal only from the two converged states. Everywhere else
+            // there is either no verified FIB to divert traffic into or
+            // a teardown in progress, and both make an operator's steer
+            // request something to decline rather than to queue: a
+            // request that survives a crash and fires against the
+            // replacement is not what was asked for.
+            //
+            // From `Ready` this is the first steer. From `Steered` it is
+            // a reconcile — the target changed underneath live rules —
+            // and the state deliberately does not move, because traffic
+            // never stopped being diverted.
+            (Ready | State::Steered, SteerRequested) => {
+                self.steer_wanted = true;
+                vec![Action::Steer]
+            }
+            // Believed down only on `Unsteered`, exactly as everywhere
+            // else. The state returns to `Ready` because that is what
+            // membership-without-steering is — the designed staging
+            // state — but `steered` is left for the acknowledgement, so
+            // a refused removal keeps the VF withheld.
+            (Ready | State::Steered, UnsteerRequested) => {
+                self.steer_wanted = false;
+                self.state = Ready;
+                if self.steered {
+                    vec![Action::Unsteer]
+                } else {
+                    vec![]
+                }
             }
 
             // --- death and wedging ---
@@ -1251,5 +1327,157 @@ mod tests {
         assert!(s.on(Event::Wedged).is_empty());
         assert_eq!(s.state(), State::Stopped);
         assert_eq!(s.failures(), 0);
+    }
+
+    /// Turning the canary lever on from the staging state.
+    ///
+    /// The whole point of `reconfigure`: the rollout's first steer, and
+    /// every step after it, must not cost a VPP restart — that is ~40 s
+    /// of resync with the offload down, per step.
+    fn ready_unsteered() -> Supervisor {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        s.on(Event::VerifyPassed);
+        assert_eq!(s.state(), State::Ready);
+        assert!(!s.is_steered());
+        s
+    }
+
+    #[test]
+    fn an_operator_can_steer_a_ready_vpp_without_a_restart() {
+        let mut s = ready_unsteered();
+        assert_eq!(s.on(Event::SteerRequested), vec![Action::Steer]);
+        // The state does NOT move on the request. `Steered` is the
+        // acknowledgement, exactly as on the automatic path: claiming it
+        // here would report a steered dataplane whose MCAM inserts had
+        // not yet been attempted.
+        assert_eq!(s.state(), State::Ready);
+        assert!(!s.is_steered());
+
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::Steered);
+        assert!(s.is_steered());
+    }
+
+    /// A refused canary step leaves the *want* recorded, so the next
+    /// verify retries it — the same rule the automatic path follows.
+    #[test]
+    fn a_refused_operator_steer_is_not_mistaken_for_steer_off() {
+        let mut s = ready_unsteered();
+        s.on(Event::SteerRequested);
+        s.on(Event::SteerFailed);
+        assert!(!s.is_steered(), "nothing was diverted");
+        assert!(
+            s.steer_intended(),
+            "a rollout that broke must be distinguishable from the designed staging state"
+        );
+    }
+
+    /// Turning it off is the rollback landing zone: membership stays,
+    /// the FIB stays synced, traffic returns to the fallback tier.
+    #[test]
+    fn unsteering_on_request_returns_to_the_staging_state() {
+        let mut s = running_and_steered();
+        assert_eq!(s.on(Event::UnsteerRequested), vec![Action::Unsteer]);
+        assert_eq!(s.state(), State::Ready);
+        assert!(
+            s.is_steered(),
+            "still believed steered until the removal is acknowledged — releasing a VF on \
+             an optimistic clear is the failure this rule exists for"
+        );
+
+        s.on(Event::Unsteered);
+        assert!(!s.is_steered());
+        assert!(
+            !s.steer_intended(),
+            "a deliberate `steer off` must not be re-steered by the next verify"
+        );
+    }
+
+    /// A removal the NIC refused keeps the VF withheld.
+    #[test]
+    fn a_refused_operator_unsteer_keeps_the_vf_withheld() {
+        let mut s = running_and_steered();
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        assert!(s.is_steered(), "traffic is still diverted");
+        assert!(
+            s.on(Event::StopRequested).contains(&Action::Unsteer),
+            "every later teardown must keep trying, and keep withholding the VF"
+        );
+    }
+
+    /// Rules inherited from a dead VPP are taken down first, and
+    /// withhold the VF if they will not come down.
+    ///
+    /// MCAM outlives the process. Without this the record's rules were
+    /// adopted into the ledger and then ignored: the supervisor believed
+    /// nothing was diverted, so teardown emitted no `Unsteer` and
+    /// released the VF while the NIC was still steering into it.
+    #[test]
+    fn inherited_steering_is_taken_down_before_anything_else() {
+        let mut s = Supervisor::new();
+        assert_eq!(s.on(Event::InheritedSteering), vec![Action::Unsteer]);
+        assert!(
+            s.is_steered(),
+            "the record is the only evidence there is, and believing it is what makes \
+             the teardown emit Unsteer"
+        );
+
+        // Removal refused: the VF must stay withheld, on this and every
+        // later teardown.
+        s.on(Event::UnsteerFailed);
+        assert!(s.is_steered());
+        assert!(s.on(Event::StopRequested).contains(&Action::Unsteer));
+    }
+
+    /// Inheriting steering also inherits the *want*, so the replacement
+    /// re-steers once it verifies.
+    ///
+    /// Steering was established and never deliberately stopped — and
+    /// until the replacement steers, those prefixes are diverted into a
+    /// VF with nothing behind them. Waiting for an operator would leave
+    /// the blackhole open across a restart nobody watched.
+    #[test]
+    fn a_replacement_re_steers_what_the_dead_vpp_was_steering() {
+        let mut s = Supervisor::new();
+        s.on(Event::InheritedSteering);
+        s.on(Event::Unsteered);
+        assert!(!s.is_steered(), "the stale rules are gone");
+        assert!(s.steer_intended(), "but the want survives them");
+
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(
+            s.on(Event::VerifyPassed).contains(&Action::Steer),
+            "a verified replacement must restore the offload without being asked"
+        );
+    }
+
+    /// Steering requests are refused outside the converged states rather
+    /// than queued.
+    ///
+    /// A request that survives a crash and fires against the replacement
+    /// is not what the operator asked for — and it is unnecessary: the
+    /// replacement re-steers on its own if steering was wanted.
+    #[test]
+    fn a_steer_request_while_converging_does_nothing() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        assert_eq!(s.state(), State::Syncing);
+
+        assert!(s.on(Event::SteerRequested).is_empty());
+        assert_eq!(s.state(), State::Syncing);
+        assert!(
+            !s.steer_intended(),
+            "a refused request must leave no want behind, or the next VerifyPassed acts on it"
+        );
     }
 }

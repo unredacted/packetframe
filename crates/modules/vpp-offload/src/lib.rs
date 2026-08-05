@@ -32,12 +32,16 @@
 //! convergence budget was measured separately (gate 0b, 40.32 s of 60 s)
 //! by a bench driving the same engine, not by this module.
 //!
-//! Two things are deliberately absent rather than stubbed:
-//! **MCAM steering** ([`runtime::SteeringUnavailable`] refuses both
-//! directions until slice 5) and **stats-segment gauges** (they need a
-//! shared-memory parser that does not exist). A config with every port
-//! `steer off` — the designed staging state — never reaches the steering
-//! seam.
+//! **Stats-segment gauges** are deliberately absent rather than stubbed:
+//! they need a shared-memory parser that does not exist, and a field
+//! reporting "unavailable" forever would be a shim for a hypothetical
+//! state.
+//!
+//! MCAM steering is real ([`steer`] plans, [`ntuple`] installs and reads
+//! back), and [`Module::reconfigure`] turns it on and off under a
+//! running VPP — that is the canary lever, and making it cost a restart
+//! would put ~40 s of resync between an operator and every rollout step,
+//! including the rollback.
 //!
 //! Design record: `.claude/plans/` phase-4 plan v7. Key invariants
 //! enforced from day one:
@@ -126,6 +130,61 @@ impl VppOffloadConfig {
         out
     }
 
+    /// What in `new` cannot be applied without a restart.
+    ///
+    /// `Ok(())` means the only differences are ones `reconfigure` can
+    /// act on: the per-port `steer` flag. Everything else is fixed at
+    /// VPP's start or at VF acquisition, so the honest answer is to
+    /// refuse and say so — the alternative is a daemon whose running
+    /// configuration silently differs from the file an operator just
+    /// edited, which is how the wrong thing gets debugged for an hour.
+    ///
+    /// A pure function over two configs so the rule is testable without
+    /// a VPP, a NIC, or an attachment.
+    pub fn restart_only_delta(&self, new: &Self) -> Result<(), String> {
+        // Ports are compared as (iface, cores) IN ORDER. Order matters
+        // as much as membership: it decides which VF is created on which
+        // PF, and `acquire` refuses to adopt across a change to either.
+        let old_ports: Vec<(&str, u16)> = self
+            .ports
+            .iter()
+            .map(|(i, c, _)| (i.as_str(), *c))
+            .collect();
+        let new_ports: Vec<(&str, u16)> =
+            new.ports.iter().map(|(i, c, _)| (i.as_str(), *c)).collect();
+        if old_ports != new_ports {
+            return Err(format!(
+                "the `port` lines changed ({old_ports:?} → {new_ports:?}); VF and worker \
+                 topology is fixed when VPP starts, so this needs a restart \
+                 (`packetframe detach --all`, then start). Only `steer on|off` can change \
+                 under a running VPP"
+            ));
+        }
+        if self.expected_routes != new.expected_routes {
+            return Err(format!(
+                "`expected-routes` changed ({} → {}); it sizes VPP's main heap and stats \
+                 segment, both fixed at start. Applying the new ceiling to a VPP running on \
+                 the old segments is what aborts it mid-resync — restart to apply",
+                self.expected_routes, new.expected_routes
+            ));
+        }
+        if self.hugepages != new.hugepages {
+            return Err(format!(
+                "`hugepages` changed ({:?} → {:?}); the reservation is made at attach and \
+                 VPP maps it at start — restart to apply",
+                self.hugepages, new.hugepages
+            ));
+        }
+        if self.vpp_binary != new.vpp_binary {
+            return Err(format!(
+                "`vpp-binary` changed ({:?} → {:?}); the running VPP is the one that was \
+                 spawned — restart to apply",
+                self.vpp_binary, new.vpp_binary
+            ));
+        }
+        Ok(())
+    }
+
     /// Total VPP worker threads the config promises, across all ports.
     ///
     /// VPP's thread count is global, not per-interface, and its counter
@@ -140,6 +199,38 @@ impl VppOffloadConfig {
     }
 }
 
+/// The fast-path allowlist, as a live handle rather than a copy.
+///
+/// A handle because a copy is wrong at exactly one moment, and it is the
+/// moment that matters. `attach` reads the allowlist once at startup;
+/// `reconfigure` runs on SIGHUP, when the operator has *just changed
+/// it*. But the allowlist lives in the fast-path section, and
+/// `Module::reconfigure` is handed only its own module's `ModuleConfig`
+/// — so a module holding a `Vec` would compare the new steering target
+/// against a snapshot of the old allowlist, find no change, and silently
+/// do nothing. The one thing SIGHUP exists to do.
+///
+/// So the loader owns one of these, publishes into it from a single
+/// derivation, and hands the same object to the module. There is nothing
+/// to keep in sync because there is only one copy.
+#[derive(Debug, Default)]
+pub struct SharedAllowlist(std::sync::RwLock<Vec<packetframe_common::fib::IpPrefix>>);
+
+impl SharedAllowlist {
+    pub fn new(prefixes: Vec<packetframe_common::fib::IpPrefix>) -> Self {
+        Self(std::sync::RwLock::new(prefixes))
+    }
+
+    /// Replace the whole list. The loader is the only writer.
+    pub fn publish(&self, prefixes: Vec<packetframe_common::fib::IpPrefix>) {
+        *self.0.write().expect("allowlist lock") = prefixes;
+    }
+
+    pub fn get(&self) -> Vec<packetframe_common::fib::IpPrefix> {
+        self.0.read().expect("allowlist lock").clone()
+    }
+}
+
 pub struct VppOffloadModule {
     cfg: VppOffloadConfig,
     /// From [`LoaderCtx`] at load; `attach` has no ctx of its own.
@@ -149,7 +240,7 @@ pub struct VppOffloadModule {
     source: Option<Box<dyn engine::RouteSource + Send + Sync>>,
     /// Prefixes steering diverts, inherited from fast-path's allowlist.
     /// Empty until the loader sets it; see [`Self::set_allowlist`].
-    allowlist: Vec<packetframe_common::fib::IpPrefix>,
+    allowlist: std::sync::Arc<SharedAllowlist>,
     /// `Some` once supervision is running.
     attached: Option<bringup::Attached>,
     /// A teardown still running in the background after `detach` returned.
@@ -175,7 +266,7 @@ impl VppOffloadModule {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            allowlist: Vec::new(),
+            allowlist: std::sync::Arc::new(SharedAllowlist::default()),
             cfg: VppOffloadConfig::default(),
             state_dir: std::path::PathBuf::new(),
             source: None,
@@ -211,7 +302,10 @@ impl VppOffloadModule {
     /// same traffic" true by construction instead of by two lists
     /// agreeing. The loader is the only caller — it is the only place
     /// that sees both sections.
-    pub fn set_allowlist(&mut self, allowlist: Vec<packetframe_common::fib::IpPrefix>) {
+    ///
+    /// Takes the shared handle, not a snapshot: see [`SharedAllowlist`]
+    /// for why a snapshot is wrong on exactly the SIGHUP path.
+    pub fn set_allowlist(&mut self, allowlist: std::sync::Arc<SharedAllowlist>) {
         self.allowlist = allowlist;
     }
 
@@ -474,7 +568,7 @@ impl Module for VppOffloadModule {
             ));
         }
         let paths = bringup::AttachPaths::live(&self.state_dir, default_hugepage_bytes());
-        let attached = match bringup::bring_up(&self.cfg, &paths, source, &self.allowlist) {
+        let attached = match bringup::bring_up(&self.cfg, &paths, source, &self.allowlist.get()) {
             Ok(a) => a,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
         };
@@ -494,13 +588,71 @@ impl Module for VppOffloadModule {
         Ok(Vec::new())
     }
 
-    fn reconfigure(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
-        // Allowlist deltas become steering deltas, which needs the MCAM
-        // implementation (slice 5). Port and cores changes are
-        // restart-only by design — `acquire` refuses to adopt across
-        // them, and so does a changed `expected-routes`, because VPP
-        // fixes its heap and stats segment at start.
-        Err(ModuleError::not_implemented(MODULE_NAME))
+    /// Allowlist and `steer on|off` deltas become MCAM deltas.
+    ///
+    /// This is the canary lever. The rollout turns it port by port, and
+    /// its rollback turns it back — so it must not cost a VPP restart:
+    /// that would be ~40 s of resync with the offload down, per step,
+    /// including the step whose whole purpose is to get traffic OFF a
+    /// misbehaving VPP quickly.
+    ///
+    /// Everything else in the section is restart-only, and refused with
+    /// the reason rather than silently ignored. `port` and `cores` are
+    /// VF and thread topology that VPP fixes at start (and `acquire`
+    /// refuses to adopt across); `expected-routes` sizes the main heap
+    /// and the stats segment, which VPP also fixes at start — applying a
+    /// raised ceiling to a VPP running on the old segments is the
+    /// mid-resync OOM abort gate 0b found; `vpp-binary` and `hugepages`
+    /// likewise only mean anything at spawn.
+    fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+        let new = VppOffloadConfig::from_directives(&cfg.section.directives);
+        if let Err(why) = self.cfg.restart_only_delta(&new) {
+            return Err(ModuleError::other(MODULE_NAME, why));
+        }
+
+        // Nothing to steer into. Not an error: a config with every port
+        // `steer off` and no attachment is a legitimate state, and so is
+        // a SIGHUP arriving between `load` and `attach`.
+        let Some(attached) = &self.attached else {
+            self.cfg = new;
+            return Ok(());
+        };
+
+        let allowlist = self.allowlist.get();
+        let plan = steer::RuleSet::plan(&allowlist, steer::McamBudget::default())
+            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        let ports: Vec<(String, u32)> = new
+            .ports
+            .iter()
+            .filter(|(_, _, steer)| *steer)
+            .map(|(iface, _, _)| (iface.clone(), 0u32))
+            .collect();
+        // `steer on` with nothing steerable is refused here for the same
+        // reason `bring_up` refuses it: steering would divert nothing
+        // while every surface reported it on.
+        if !ports.is_empty() && plan.rules.is_empty() {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!(
+                    "port(s) are configured `steer on`, but the allowlist produces no \
+                     steerable rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected \
+                     by this NIC). Steering would divert nothing while reporting Healthy",
+                    plan.skipped_v6
+                ),
+            ));
+        }
+
+        let want_steer = !ports.is_empty();
+        attached
+            .service
+            .apply_steering(ports, plan, want_steer)
+            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        // Recorded only after the change landed. A `cfg` updated ahead of
+        // the apply would make the NEXT reconfigure diff against a target
+        // that was never installed, so a failed canary step would look
+        // like a no-op change and never be retried.
+        self.cfg = new;
+        Ok(())
     }
 
     fn detach(&mut self) -> ModuleResult<()> {
@@ -961,5 +1113,121 @@ mod tests {
         ] {
             assert_eq!(a.worse_of(b), want, "{a:?}.worse_of({b:?})");
         }
+    }
+
+    fn cfg(ports: &[(&str, u16, bool)], routes: u64) -> VppOffloadConfig {
+        VppOffloadConfig {
+            ports: ports
+                .iter()
+                .map(|(i, c, s)| (i.to_string(), *c, *s))
+                .collect(),
+            vpp_binary: None,
+            expected_routes: routes,
+            hugepages: None,
+        }
+    }
+
+    /// The `steer` flag is the ONLY thing a SIGHUP may change.
+    ///
+    /// It has to be: it is the canary lever, and the rollout turns it
+    /// port by port. Making it restart-only would cost ~40 s of resync
+    /// with the offload down per rollout step — including the rollback
+    /// step, whose whole purpose is to get traffic off a misbehaving VPP
+    /// quickly.
+    #[test]
+    fn flipping_the_canary_lever_is_not_a_restart() {
+        let before = cfg(&[("eth4", 1, false), ("eth5", 1, false)], 1_600_000);
+        let after = cfg(&[("eth4", 1, false), ("eth5", 1, true)], 1_600_000);
+        before
+            .restart_only_delta(&after)
+            .expect("steer on|off must be applicable under a running VPP");
+    }
+
+    /// Everything VPP fixes at start is refused, and says which knob and
+    /// what to do.
+    ///
+    /// Silently ignoring any of these is the failure mode that matters:
+    /// the daemon's running configuration would differ from the file the
+    /// operator just edited, with nothing anywhere saying so.
+    #[test]
+    fn everything_fixed_at_start_is_refused_by_name() {
+        let base = cfg(&[("eth4", 1, false)], 1_600_000);
+
+        for (new, needle) in [
+            (
+                cfg(&[("eth4", 1, false), ("eth5", 1, false)], 1_600_000),
+                "`port` lines changed",
+            ),
+            (
+                cfg(&[("eth4", 2, false)], 1_600_000),
+                "`port` lines changed",
+            ),
+            (
+                cfg(&[("eth4", 1, false)], 2_000_000),
+                "`expected-routes` changed",
+            ),
+        ] {
+            let e = base.restart_only_delta(&new).expect_err("must refuse");
+            assert!(e.contains(needle), "{e}");
+            assert!(
+                e.contains("restart"),
+                "the operator needs to be told what to DO about it: {e}"
+            );
+        }
+
+        let mut pages = base.clone();
+        pages.hugepages = Some(12);
+        assert!(base
+            .restart_only_delta(&pages)
+            .expect_err("hugepages")
+            .contains("`hugepages` changed"));
+
+        let mut binary = base.clone();
+        binary.vpp_binary = Some("/opt/vpp/bin/vpp".into());
+        assert!(base
+            .restart_only_delta(&binary)
+            .expect_err("vpp-binary")
+            .contains("`vpp-binary` changed"));
+    }
+
+    /// A reordered port list is a change, not a permutation.
+    ///
+    /// Order decides which VF is created on which PF, and `acquire`
+    /// refuses to adopt across it — so accepting it here would produce a
+    /// reconfigure that reports OK and a next start that refuses.
+    #[test]
+    fn reordering_the_ports_is_a_restart() {
+        let before = cfg(&[("eth4", 1, false), ("eth5", 1, false)], 1_600_000);
+        let after = cfg(&[("eth5", 1, false), ("eth4", 1, false)], 1_600_000);
+        assert!(before.restart_only_delta(&after).is_err());
+    }
+
+    /// The shared allowlist is a window, not a copy.
+    ///
+    /// The defect it exists to prevent: `reconfigure` is handed only its
+    /// own module's section, so a module holding a `Vec` would compare
+    /// the new steering target against the allowlist as it was at
+    /// startup, find no change, and report OK for the one thing SIGHUP
+    /// was raised to do.
+    #[test]
+    fn a_republished_allowlist_is_visible_through_the_handle() {
+        use packetframe_common::fib::IpPrefix;
+        let v4 = |a: u8| IpPrefix::V4 {
+            addr: [10, a, 0, 0],
+            prefix_len: 16,
+        };
+        let shared = std::sync::Arc::new(SharedAllowlist::new(vec![v4(0)]));
+
+        let mut m = VppOffloadModule::new();
+        m.set_allowlist(shared.clone());
+        assert_eq!(m.allowlist.get(), vec![v4(0)]);
+
+        // What the loader does on SIGHUP, from the whole new config.
+        shared.publish(vec![v4(0), v4(1)]);
+        assert_eq!(
+            m.allowlist.get(),
+            vec![v4(0), v4(1)],
+            "the module must see the republished list without being handed anything"
+        );
     }
 }

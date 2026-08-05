@@ -243,6 +243,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         }
     };
 
+    // One allowlist object, not a copy per consumer. The SIGHUP path
+    // republishes into it from the SAME derivation the startup path
+    // uses, which is what makes "vpp-offload steers exactly what
+    // fast-path allows" survive a reconfigure — see `SharedAllowlist`.
+    #[cfg(feature = "vpp-offload")]
+    let allowlist = std::sync::Arc::new(packetframe_vpp_offload::SharedAllowlist::new(
+        crate::feasibility::allowlist_from_config(&config),
+    ));
+
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
@@ -266,7 +275,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 // Steering diverts the fast-path allowlist, so it comes
                 // from that section. The loader is the only place that
                 // sees both.
-                m.set_allowlist(crate::feasibility::allowlist_from_config(&config));
+                m.set_allowlist(allowlist.clone());
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {
@@ -389,8 +398,14 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
     tracing::info!("fast-path running, SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
-    let termination = drive_signal_loop(config_path, &config.global.state_dir, &mut modules)
-        .map_err(RunError::Runtime)?;
+    let termination = drive_signal_loop(
+        config_path,
+        &config.global.state_dir,
+        &mut modules,
+        #[cfg(feature = "vpp-offload")]
+        &allowlist,
+    )
+    .map_err(RunError::Runtime)?;
 
     // Stop the exporter + breaker sampler(s) first so their final
     // writes complete before we touch module state.
@@ -543,6 +558,7 @@ fn drive_signal_loop(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) -> Result<Termination, String> {
     use signal_hook::{
         consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1},
@@ -554,7 +570,13 @@ fn drive_signal_loop(
 
     for sig in signals.forever() {
         match sig {
-            SIGHUP => reconfigure_from_signal(config_path, state_dir, modules),
+            SIGHUP => reconfigure_from_signal(
+                config_path,
+                state_dir,
+                modules,
+                #[cfg(feature = "vpp-offload")]
+                allowlist,
+            ),
             SIGTERM | SIGINT => {
                 tracing::info!(signal = sig, "termination requested");
                 return Ok(Termination::ExitPreserveAttach);
@@ -580,6 +602,7 @@ fn reconfigure_from_signal(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) {
     use packetframe_common::module::ModuleConfig;
 
@@ -595,6 +618,15 @@ fn reconfigure_from_signal(
             return;
         }
     };
+
+    // Before the module loop, and for the WHOLE config rather than per
+    // module. vpp-offload's steering target is derived from fast-path's
+    // `allow-prefix` lines, which its own `ModuleConfig` does not
+    // contain — so without this its `reconfigure` would re-derive the
+    // steering plan from the allowlist as it was at startup, find it
+    // unchanged, and report OK for a SIGHUP that changed nothing.
+    #[cfg(feature = "vpp-offload")]
+    allowlist.publish(crate::feasibility::allowlist_from_config(&new_config));
 
     let mut failures: Vec<String> = Vec::new();
     for (name, module) in modules.iter_mut() {
