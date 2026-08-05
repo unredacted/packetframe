@@ -140,6 +140,195 @@ impl PeerId {
     }
 }
 
+// --- Table completeness ----------------------------------------------
+
+/// Drift at or below which the mirror counts as converged, for the
+/// purpose of **letting traffic be steered into it**.
+///
+/// A separate constant from the integrity checker's own warn threshold
+/// even though both start at 1%, because they answer different
+/// questions and will drift apart the moment either is tuned. The
+/// checker asks "should an operator look at this?"; this asks "may we
+/// divert packets into it?".
+///
+/// What it is actually separating is **"bird's initial dump is still
+/// arriving"** — where the mirror holds a fraction of the table — from
+/// an ordinary converged state with BGP churn on top. That is a gap of
+/// tens of percent, so a modest threshold does the job while tolerating
+/// the churn a tighter one would trip over. A gate that refuses during
+/// normal operation is a gate operators turn off.
+///
+/// The residual is deliberate and bounded: both tiers mirror the same
+/// table, so a prefix missing here is missing from the eBPF tier too.
+/// Steering makes it worse rather than new — an unsteered miss falls to
+/// the kernel path, a steered one is dropped by VPP — which is why the
+/// gate exists at all, and why it is sized to catch the large case.
+pub const STEER_MAX_DRIFT: f64 = 0.01;
+
+/// How old a completeness report may be and still be acted on.
+///
+/// The publisher's cadence is ~5 minutes, so this tolerates two missed
+/// runs rather than blocking a rollout step on one slow `birdc`. It is
+/// generous because of what the report says: "the table had converged".
+/// A table does not un-converge while nobody is looking — and the case
+/// that would matter, a daemon restart mid-dump, cannot produce a stale
+/// report at all, since the handle lives in memory and a fresh process
+/// starts with none.
+pub const STEER_MAX_REPORT_AGE: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// One comparison of the mirror against its authority.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompletenessReport {
+    /// What the authority (bird) says it has.
+    pub authority_routes: u64,
+    /// What our mirror holds.
+    pub mirror_routes: u64,
+    /// When the comparison was made.
+    pub at: std::time::Instant,
+}
+
+impl CompletenessReport {
+    /// How far the mirror is from the authority, as a fraction of the
+    /// authority's count. `None` when the authority reports zero, which
+    /// is not a 100%-complete mirror — it is no basis for a judgement.
+    pub fn drift(&self) -> Option<f64> {
+        if self.authority_routes == 0 {
+            return None;
+        }
+        let a = self.authority_routes as f64;
+        Some((a - self.mirror_routes as f64).abs() / a)
+    }
+}
+
+/// The verdict a steering decision acts on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Completeness {
+    /// Safe to divert traffic into.
+    Converged { drift: f64 },
+    /// The mirror is measurably short of the authority.
+    Incomplete {
+        drift: f64,
+        authority: u64,
+        mirror: u64,
+    },
+    /// There is a report, but it is too old to act on.
+    Stale { age: std::time::Duration },
+    /// No report at all, or none that supports a judgement.
+    Unknown { why: &'static str },
+}
+
+impl Completeness {
+    /// Whether traffic may be steered on the strength of this.
+    ///
+    /// Only `Converged` says yes. `Unknown` deliberately does **not** —
+    /// "I could not establish this" is not the same as "there is no
+    /// constraint", and reading it as permission is the exact shape that
+    /// has produced the worst bugs in this subsystem. Deployments with
+    /// no authority to compare against say so in config rather than
+    /// arriving here.
+    pub fn permits_steering(&self) -> bool {
+        matches!(self, Completeness::Converged { .. })
+    }
+
+    /// Operator-facing reason, for the refusal message.
+    pub fn describe(&self) -> String {
+        match self {
+            Completeness::Converged { drift } => {
+                format!("converged ({:.3}% drift)", drift * 100.0)
+            }
+            Completeness::Incomplete {
+                drift,
+                authority,
+                mirror,
+            } => format!(
+                "the route mirror holds {mirror} of the authority's {authority} routes \
+                 ({:.2}% short) — it is probably still loading",
+                drift * 100.0
+            ),
+            Completeness::Stale { age } => format!(
+                "the last completeness check was {}s ago, too old to act on",
+                age.as_secs()
+            ),
+            Completeness::Unknown { why } => format!("completeness is unknown: {why}"),
+        }
+    }
+}
+
+/// Turn a report into a verdict. Pure, so the rule is testable without
+/// a bird, a VPP or a NIC.
+pub fn assess(
+    report: Option<CompletenessReport>,
+    now: std::time::Instant,
+    max_drift: f64,
+    max_age: std::time::Duration,
+) -> Completeness {
+    let Some(r) = report else {
+        return Completeness::Unknown {
+            why: "no check has run yet",
+        };
+    };
+    // Age first. A report whose drift looks fine but which predates
+    // anything we care about is not evidence, and reporting its drift
+    // would invite acting on it.
+    let age = now.saturating_duration_since(r.at);
+    if age > max_age {
+        return Completeness::Stale { age };
+    }
+    let Some(drift) = r.drift() else {
+        return Completeness::Unknown {
+            why: "the authority reports zero routes",
+        };
+    };
+    if drift <= max_drift {
+        Completeness::Converged { drift }
+    } else {
+        Completeness::Incomplete {
+            drift,
+            authority: r.authority_routes,
+            mirror: r.mirror_routes,
+        }
+    }
+}
+
+/// Where the route mirror publishes how complete it is, for the second
+/// forwarding tier to read before diverting traffic.
+///
+/// A shared handle rather than a copy, and a `std` lock rather than
+/// tokio's, because the two ends live in different worlds: the publisher
+/// is the fast-path's async integrity checker, the reader is
+/// vpp-offload's synchronous supervision loop. Neither should have to
+/// adopt the other's runtime to answer one question.
+///
+/// The loader owns it and hands the same object to both, exactly as it
+/// does for the route feed and the allowlist.
+#[derive(Debug, Default)]
+pub struct TableCompleteness(std::sync::RwLock<Option<CompletenessReport>>);
+
+impl TableCompleteness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a comparison. The integrity checker is the only writer.
+    pub fn publish(&self, report: CompletenessReport) {
+        *self.0.write().expect("completeness lock") = Some(report);
+    }
+
+    pub fn latest(&self) -> Option<CompletenessReport> {
+        *self.0.read().expect("completeness lock")
+    }
+
+    /// The verdict now, under the steering policy.
+    pub fn verdict(&self) -> Completeness {
+        assess(
+            self.latest(),
+            std::time::Instant::now(),
+            STEER_MAX_DRIFT,
+            STEER_MAX_REPORT_AGE,
+        )
+    }
+}
+
 #[cfg(test)]
 mod peer_id_tests {
     use super::*;
@@ -386,5 +575,112 @@ mod tests {
         let f = RouteSourceError::fatal("listener bind");
         assert!(!f.recoverable);
         assert!(format!("{f}").contains("fatal"));
+    }
+
+    mod completeness {
+        use super::super::*;
+        use std::time::{Duration, Instant};
+
+        fn report(authority: u64, mirror: u64, age: Duration) -> CompletenessReport {
+            CompletenessReport {
+                authority_routes: authority,
+                mirror_routes: mirror,
+                at: Instant::now() - age,
+            }
+        }
+
+        fn verdict(r: Option<CompletenessReport>) -> Completeness {
+            assess(r, Instant::now(), STEER_MAX_DRIFT, STEER_MAX_REPORT_AGE)
+        }
+
+        /// The case the gate exists for: bird's initial dump is still
+        /// arriving, so the mirror holds a fraction of the table.
+        /// Steering into it blackholes everything not yet loaded, and —
+        /// unlike an unsteered miss, which falls to the kernel path —
+        /// a steered one is dropped.
+        #[test]
+        fn a_mirror_still_loading_does_not_permit_steering() {
+            let v = verdict(Some(report(1_053_360, 400_000, Duration::ZERO)));
+            assert!(!v.permits_steering());
+            assert!(matches!(v, Completeness::Incomplete { .. }), "{v:?}");
+            let msg = v.describe();
+            assert!(
+                msg.contains("1053360") && msg.contains("400000"),
+                "the operator needs both numbers to judge it: {msg}"
+            );
+        }
+
+        /// Ordinary churn must not refuse a rollout step. A gate that
+        /// fires during normal operation is a gate operators disable.
+        #[test]
+        fn ordinary_churn_still_permits_steering() {
+            // 0.5% short — well inside the noise BGP produces.
+            let v = verdict(Some(report(1_000_000, 995_000, Duration::ZERO)));
+            assert!(v.permits_steering(), "{v:?}");
+        }
+
+        /// No report is NOT permission.
+        ///
+        /// "I could not establish this" read as "there is no
+        /// constraint" is the shape that has produced the worst bugs in
+        /// this subsystem. A deployment with no authority to compare
+        /// against says so in config rather than arriving here.
+        #[test]
+        fn an_absent_report_is_not_permission() {
+            let v = verdict(None);
+            assert!(!v.permits_steering());
+            assert!(matches!(v, Completeness::Unknown { .. }), "{v:?}");
+        }
+
+        /// An authority reporting zero routes is not a complete mirror.
+        ///
+        /// The arithmetic would divide by zero; the honest reading is
+        /// that bird has nothing to compare against, which is no basis
+        /// for diverting traffic.
+        #[test]
+        fn a_zero_route_authority_is_unknown_not_converged() {
+            let v = verdict(Some(report(0, 0, Duration::ZERO)));
+            assert!(!v.permits_steering(), "{v:?}");
+            assert!(matches!(v, Completeness::Unknown { .. }), "{v:?}");
+        }
+
+        /// Age is judged BEFORE drift.
+        ///
+        /// A report that looks converged but predates anything we care
+        /// about is not evidence, and reporting its drift would invite
+        /// acting on it.
+        #[test]
+        fn a_stale_report_is_refused_even_when_it_looks_converged() {
+            let old = report(
+                1_000_000,
+                1_000_000,
+                STEER_MAX_REPORT_AGE + Duration::from_secs(1),
+            );
+            let v = verdict(Some(old));
+            assert!(!v.permits_steering());
+            assert!(matches!(v, Completeness::Stale { .. }), "{v:?}");
+        }
+
+        /// The handle is a window, not a copy: a publish is visible to
+        /// the reader without anything being handed over.
+        #[test]
+        fn a_published_report_is_visible_through_the_handle() {
+            let h = TableCompleteness::new();
+            assert!(
+                !h.verdict().permits_steering(),
+                "empty handle permits nothing"
+            );
+
+            h.publish(report(1_000_000, 999_000, Duration::ZERO));
+            assert!(h.verdict().permits_steering());
+
+            // And a later, worse report replaces it rather than being
+            // merged with the good one.
+            h.publish(report(1_000_000, 100_000, Duration::ZERO));
+            assert!(
+                !h.verdict().permits_steering(),
+                "the newest report is the verdict"
+            );
+        }
     }
 }

@@ -95,6 +95,10 @@ pub struct VppOffloadConfig {
     pub vpp_binary: Option<String>,
     pub expected_routes: u64,
     pub hugepages: Option<u32>,
+    /// Whether a first steer waits for the route mirror to be confirmed
+    /// converged against bird. See
+    /// [`packetframe_common::fib::TableCompleteness`].
+    pub require_table_complete: bool,
 }
 
 /// Default sizing input when `expected-routes` is absent.
@@ -111,6 +115,9 @@ impl VppOffloadConfig {
     pub fn from_directives(directives: &[ModuleDirective]) -> Self {
         let mut out = Self {
             expected_routes: DEFAULT_EXPECTED_ROUTES,
+            // Safe by default: absent config must not mean "divert
+            // traffic into whatever the mirror happens to hold".
+            require_table_complete: true,
             ..Self::default()
         };
         for d in directives {
@@ -124,6 +131,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
+                ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
                 _ => {}
             }
         }
@@ -133,7 +141,8 @@ impl VppOffloadConfig {
     /// What in `new` cannot be applied without a restart.
     ///
     /// `Ok(())` means the only differences are ones `reconfigure` can
-    /// act on: the per-port `steer` flag. Everything else is fixed at
+    /// act on: the per-port `steer` flag and `require-table-complete`,
+    /// neither of which VPP knows about. Everything else is fixed at
     /// VPP's start or at VF acquisition, so the honest answer is to
     /// refuse and say so — the alternative is a daemon whose running
     /// configuration silently differs from the file an operator just
@@ -306,6 +315,10 @@ pub struct VppOffloadModule {
     /// Prefixes steering diverts, inherited from fast-path's allowlist.
     /// Empty until the loader sets it; see [`Self::set_allowlist`].
     allowlist: std::sync::Arc<SharedAllowlist>,
+    /// Where the route mirror says how complete it is. `None` until the
+    /// loader wires it, which it does only when a route authority
+    /// exists; see [`Self::set_completeness`].
+    completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     /// `Some` once supervision is running.
     attached: Option<bringup::Attached>,
     /// A teardown still running in the background after `detach` returned.
@@ -332,6 +345,7 @@ impl VppOffloadModule {
     pub fn new() -> Self {
         Self {
             allowlist: std::sync::Arc::new(SharedAllowlist::default()),
+            completeness: None,
             cfg: VppOffloadConfig::default(),
             state_dir: std::path::PathBuf::new(),
             source: None,
@@ -372,6 +386,20 @@ impl VppOffloadModule {
     /// for why a snapshot is wrong on exactly the SIGHUP path.
     pub fn set_allowlist(&mut self, allowlist: std::sync::Arc<SharedAllowlist>) {
         self.allowlist = allowlist;
+    }
+
+    /// Hand the module the route mirror's completeness handle.
+    ///
+    /// The loader sets this when the fast-path has a route authority to
+    /// compare against; without it, `require-table-complete on` refuses
+    /// at attach rather than refusing every steer forever. Same wiring
+    /// as the route feed and the allowlist — the loader is the only
+    /// place that sees both modules.
+    pub fn set_completeness(
+        &mut self,
+        handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
+    ) {
+        self.completeness = Some(handle);
     }
 
     /// Settle a finished background teardown and replace the provisional
@@ -633,7 +661,13 @@ impl Module for VppOffloadModule {
             ));
         }
         let paths = bringup::AttachPaths::live(&self.state_dir, default_hugepage_bytes());
-        let attached = match bringup::bring_up(&self.cfg, &paths, source, &self.allowlist.get()) {
+        let attached = match bringup::bring_up(
+            &self.cfg,
+            &paths,
+            source,
+            &self.allowlist.get(),
+            self.completeness.clone(),
+        ) {
             Ok(a) => a,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
         };
@@ -1183,6 +1217,7 @@ mod tests {
             vpp_binary: None,
             expected_routes: routes,
             hugepages: None,
+            require_table_complete: true,
         }
     }
 

@@ -254,6 +254,17 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         crate::feasibility::allowlist_from_config(&config),
     ));
 
+    // How complete the route mirror is, published by the fast-path's
+    // integrity checker and read by vpp-offload before it diverts
+    // traffic. One object, both tiers, same wiring as the feed and the
+    // allowlist — and only built when BOTH modules are present, because
+    // an unpublished handle is what `require-table-complete on` refuses
+    // at attach rather than silently treating as permission.
+    #[cfg(feature = "vpp-offload")]
+    let completeness = feed
+        .as_ref()
+        .map(|_| std::sync::Arc::new(packetframe_common::fib::TableCompleteness::new()));
+
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
@@ -263,6 +274,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 #[cfg(feature = "vpp-offload")]
                 if let Some(f) = &feed {
                     m.set_route_sink(f.clone());
+                }
+                #[cfg(feature = "vpp-offload")]
+                if let Some(c) = &completeness {
+                    m.set_completeness(c.clone());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
@@ -278,6 +293,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 // from that section. The loader is the only place that
                 // sees both.
                 m.set_allowlist(allowlist.clone());
+                if let Some(c) = &completeness {
+                    m.set_completeness(c.clone());
+                }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {

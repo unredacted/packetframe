@@ -133,6 +133,7 @@ impl RouteController {
         fallback_default: Option<FallbackDefaultSpec>,
         fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
         route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
+        completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     ) -> Result<Self, ControllerError> {
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
@@ -225,12 +226,17 @@ impl RouteController {
                 peer_acl,
             }) => {
                 let snapshot = shared_snapshot();
-                let checker = IntegrityChecker::new(
+                let mut checker = IntegrityChecker::new(
                     IntegrityConfig::default(),
                     snapshot.clone(),
                     prog_handle.clone(),
                     shutdown_token.clone(),
                 );
+                // The second tier's steering gate reads what this
+                // publishes; see `TableCompleteness`.
+                if let Some(h) = completeness.clone() {
+                    checker = checker.with_completeness(h);
+                }
                 tasks.push(runtime.spawn(async move { checker.run().await }));
 
                 // v0.2.2: spawn under a retry-with-backoff loop. Pre-fix,
@@ -291,12 +297,17 @@ impl RouteController {
                 expected_peer_ip,
             }) => {
                 let snapshot = shared_snapshot();
-                let checker = IntegrityChecker::new(
+                let mut checker = IntegrityChecker::new(
                     IntegrityConfig::default(),
                     snapshot.clone(),
                     prog_handle.clone(),
                     shutdown_token.clone(),
                 );
+                // The second tier's steering gate reads what this
+                // publishes; see `TableCompleteness`.
+                if let Some(h) = completeness.clone() {
+                    checker = checker.with_completeness(h);
+                }
                 tasks.push(runtime.spawn(async move { checker.run().await }));
 
                 // v0.2.2: same retry-with-backoff pattern as BmpStation

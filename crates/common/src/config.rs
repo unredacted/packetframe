@@ -166,6 +166,13 @@ pub enum ModuleDirective {
     /// Must be ≥ the minimum derived from `expected-routes`; the
     /// renderer errors at load otherwise.
     VppHugepages(u32),
+    /// `require-table-complete on|off` — whether a first steer waits
+    /// for the route mirror to be confirmed converged against bird.
+    ///
+    /// Default `on`. `off` is for deployments with no authority to
+    /// compare against — the shadow has no bird of its own — and it
+    /// means the operator owns the completeness judgement instead.
+    VppRequireTableComplete(bool),
     AllowPrefix4(Ipv4Prefix),
     AllowPrefix6(Ipv6Prefix),
     /// Connected/local prefix the operator wants packetframe to
@@ -1811,6 +1818,13 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             }
             Ok(ModuleDirective::ExpectedRoutes(n))
         }),
+        "require-table-complete" => {
+            parse_single_arg(line, rest, "require-table-complete", |t| match t {
+                "on" => Ok(ModuleDirective::VppRequireTableComplete(true)),
+                "off" => Ok(ModuleDirective::VppRequireTableComplete(false)),
+                _ => Err("require-table-complete expects on|off".to_string()),
+            })
+        }
         "hugepages" => parse_single_arg(line, rest, "hugepages", |t| {
             let n: u32 = t
                 .parse()

@@ -197,6 +197,13 @@ including the step whose purpose is to get traffic *off* a bad VPP.
 **Rung 0 — membership, everything off.** Every fast-path attach port
 gets a `port` line; every one is `steer off`.
 
+Before anything else, know which side of `require-table-complete` you are
+on. On a box with its own bird, leave it `on` (the default) and the first
+steer waits until the mirror is confirmed converged. On a box without one
+— the shadow — attach will **refuse to start** with `on`, because the gate
+could never pass; set `off` there and the completeness judgement is yours,
+which in practice means reading the route counts before you turn a lever.
+
 ```bash
 packetframe reconfigure /etc/packetframe/packetframe.conf
 ```
@@ -286,6 +293,30 @@ If the NIC *has* the rules and traffic still is not arriving, suspect
 keyword mis-encodes it on the rvu driver, so a rule installed by hand
 with that keyword lands somewhere else. Gate 0a established this by
 inserting both forms and reading back what the NIC stored.
+
+### A steer is refused with "the route mirror holds N of M routes"
+
+The completeness gate. bird's initial dump has not finished, so the
+mirror is short of the table and steering into it would blackhole
+whatever has not arrived — and a steered miss is dropped, where an
+unsteered one falls through to the kernel path.
+
+Nothing to do: it retries on its own. The refusal leaves the *want* set,
+so the next verify attempts the steer again, and by then the dump has
+usually finished. Watch the two counts converge:
+
+```bash
+birdc show route count
+packetframe status /etc/packetframe/packetframe.conf | grep -A6 'module health'
+```
+
+If it persists, the mirror is genuinely not keeping up and that is a
+fast-path problem, not a steering one — check the integrity checker's
+drift warnings in the log.
+
+Refusals reading **"completeness is unknown"** or **"too old to act on"**
+mean something different: no check has run, or the last one is over 15
+minutes old. That is `birdc` failing, not the table being incomplete.
 
 ### `packetframe_vpp_routes{state="unresolvable"} > 0`
 
@@ -428,11 +459,13 @@ refused rather than adopted.
 - **MCAM slots must be pre-allocated.** The driver rejects an
   out-of-range `loc` rather than assigning one, which is why this module
   tracks the locations it owns (base 1024) and hands back exactly those.
-- **The first steer is not guarded against an *incomplete* table.**
-  Verification samples what the ledger holds, so a table that is merely
-  missing prefixes verifies clean. the `unresolvable`, `withheld` and
-  `installing` route counts must all read zero before you turn the first lever —
-  which is what rung 0's soak is for. Closing this in code needs a
-  completeness signal the module does not have; bird's own route count,
-  which the fast-path integrity checker already fetches, is the
-  candidate.
+- **The first steer is guarded against an incomplete table — but only
+  where there is a bird.** Verification samples what the *ledger* holds,
+  so a table that is merely missing prefixes verifies clean. That is why
+  the guard is a separate comparison against bird's own route count,
+  published by the fast-path integrity checker and consulted by every
+  steer, not by the verify. Where no publisher exists,
+  `require-table-complete off` hands the judgement back to you, and rung
+  0's soak is what discharges it: the `unresolvable`, `withheld` and
+  `installing` counts must all read zero before you turn the first
+  lever.
