@@ -1183,7 +1183,9 @@ mod tests {
     fn a_failed_steer_is_distinguishable_from_deliberate_steer_off() {
         // First attach: the operator asked, the MCAM insert failed.
         let mut first = ready_supervisor();
-        first.on(Event::SteerFailed);
+        first.on(Event::SteerFailed {
+            rules_remain: false,
+        });
         assert!(!first.is_steered());
         assert!(
             first.steer_intended(),
@@ -1199,7 +1201,9 @@ mod tests {
         sup.on(Event::SyncComplete);
         sup.on(Event::VerifyPassed);
         sup.on(Event::Unsteered); // rules torn down on the way through
-        sup.on(Event::SteerFailed);
+        sup.on(Event::SteerFailed {
+            rules_remain: false,
+        });
         assert!(!sup.is_steered());
         assert!(sup.steer_intended());
 

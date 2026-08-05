@@ -195,9 +195,25 @@ pub enum Event {
     /// it fires.
     PhaseTimedOut,
     /// Installing the MCAM rules failed. The dataplane is verified but
-    /// traffic is NOT diverted — the safe staging state, reported
-    /// rather than papered over.
-    SteerFailed,
+    /// traffic is not going where it was asked to go.
+    ///
+    /// `rules_remain` is **observed from the steering ledger**, not
+    /// inferred: [`crate::ntuple::NtupleSteering::steer`] rolls back
+    /// all-or-nothing, so a failure may leave the NIC empty (clean
+    /// rollback) or holding rules the NIC refused to delete — and on a
+    /// *reconcile* of an already-steering port the rollback removes the
+    /// rules that were working a moment ago. Nothing in the lifecycle
+    /// state distinguishes those, so the executor reads the ledger and
+    /// says which.
+    ///
+    /// Guessing either way is wrong in a way that matters. Assuming
+    /// rules remain reports a steered, healthy offload over an empty NIC
+    /// — traffic is on the eBPF tier and every surface says otherwise.
+    /// Assuming they are gone suppresses the `Unsteer` teardown owes and
+    /// releases a VF that MCAM may still target.
+    SteerFailed {
+        rules_remain: bool,
+    },
     /// MCAM rules are confirmed removed.
     ///
     /// Steering is only believed *down* on this acknowledgement, for
@@ -619,8 +635,20 @@ impl Supervisor {
             // on the next `VerifyPassed`, and every health surface reads
             // it as the designed staging state. Same defect shape as the
             // rest of this file: an attempt that failed left no trace.
-            (Ready, SteerFailed) => {
+            //
+            // Reachable from `State::Steered` too, since a reconfigure
+            // re-steers a live port — and that is the case where leaving
+            // `steered` alone was actively wrong: the rollback empties
+            // the NIC, so the machine would sit in `Steered`, report the
+            // steering subsystem Healthy with no message, and publish
+            // `packetframe_vpp_state{state="steered"}` while every
+            // steered packet was in fact on the eBPF tier. `state`
+            // returns to `Ready` because that is where "verified, not
+            // diverting what we asked" belongs.
+            (Ready | State::Steered, SteerFailed { rules_remain }) => {
                 self.steer_wanted = true;
+                self.steered = rules_remain;
+                self.state = Ready;
                 vec![]
             }
 
@@ -1067,7 +1095,7 @@ mod tests {
         assert_eq!(s.state(), State::Ready);
 
         // Rules could not be installed.
-        assert_eq!(s.on(Event::SteerFailed), vec![]);
+        assert_eq!(s.on(Event::SteerFailed { rules_remain: true }), vec![]);
         assert_eq!(
             s.state(),
             State::Ready,
@@ -1100,7 +1128,9 @@ mod tests {
         assert!(!s.steer_intended(), "nothing has asked for steering yet");
 
         // The operator's canary fires and the MCAM insert fails.
-        s.on(Event::SteerFailed);
+        s.on(Event::SteerFailed {
+            rules_remain: false,
+        });
         assert!(!s.is_steered());
         assert!(
             s.steer_intended(),
@@ -1368,7 +1398,9 @@ mod tests {
     fn a_refused_operator_steer_is_not_mistaken_for_steer_off() {
         let mut s = ready_unsteered();
         s.on(Event::SteerRequested);
-        s.on(Event::SteerFailed);
+        s.on(Event::SteerFailed {
+            rules_remain: false,
+        });
         assert!(!s.is_steered(), "nothing was diverted");
         assert!(
             s.steer_intended(),
@@ -1478,6 +1510,63 @@ mod tests {
         assert!(
             !s.steer_intended(),
             "a refused request must leave no want behind, or the next VerifyPassed acts on it"
+        );
+    }
+
+    /// A failed reconcile of a LIVE steered port must not leave the
+    /// machine claiming it is steering.
+    ///
+    /// `steer` rolls back all-or-nothing, and on a reconcile that
+    /// rollback removes the rules that were working a moment ago — so a
+    /// clean rollback empties the NIC. With `SteerFailed` falling through
+    /// to the catch-all from `State::Steered`, the machine stayed
+    /// `Steered` with `steered == true`: `steering_health()` reports
+    /// Healthy with no message and the state gauge publishes
+    /// `state="steered"`, while every steered packet is in fact on the
+    /// eBPF tier.
+    ///
+    /// So the observed ledger decides, and the assertion is on
+    /// `is_steered()` rather than on the state name — that is the field
+    /// health and teardown both read.
+    #[test]
+    fn a_failed_reconcile_of_a_live_port_stops_claiming_to_steer() {
+        let mut s = running_and_steered();
+        s.on(Event::SteerRequested);
+        s.on(Event::SteerFailed {
+            rules_remain: false,
+        });
+
+        assert!(
+            !s.is_steered(),
+            "the rollback emptied the NIC, so nothing is diverted and nothing may say it is"
+        );
+        assert_eq!(s.state(), State::Ready, "verified, but not diverting");
+        assert!(
+            s.steer_intended(),
+            "the want survives, so the next verify restores the offload"
+        );
+        assert!(
+            !s.on(Event::StopRequested).contains(&Action::Unsteer),
+            "and no Unsteer is owed for rules that are confirmed gone"
+        );
+    }
+
+    /// The same failure with rules left behind keeps the VF withheld.
+    ///
+    /// The other polarity, and the reason this is observed rather than
+    /// assumed: a rollback that could not delete leaves rules diverting
+    /// traffic, so `steered` must stay true or `ReleaseResources` unbinds
+    /// a VF that MCAM still targets.
+    #[test]
+    fn a_failed_reconcile_that_left_rules_keeps_the_vf_withheld() {
+        let mut s = running_and_steered();
+        s.on(Event::SteerRequested);
+        s.on(Event::SteerFailed { rules_remain: true });
+
+        assert!(s.is_steered(), "rules are still in the NIC");
+        assert!(
+            s.on(Event::StopRequested).contains(&Action::Unsteer),
+            "so every teardown must try again and keep withholding the VF"
         );
     }
 }

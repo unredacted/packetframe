@@ -658,6 +658,10 @@ impl Effects for EffectsView {
         outcome
     }
 
+    fn steering_in_place(&self) -> bool {
+        !self.core.borrow().steering.installed().is_empty()
+    }
+
     fn kill(&mut self) -> Disposition {
         let mut c = self.core.borrow_mut();
         let Some(p) = c.process.as_mut() else {

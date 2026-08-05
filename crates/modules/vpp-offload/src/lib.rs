@@ -231,6 +231,71 @@ impl SharedAllowlist {
     }
 }
 
+/// What steering should look like for a config + allowlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteeringTarget {
+    /// `(PF iface, VF index)` for every port configured `steer on`.
+    pub ports: Vec<(String, u32)>,
+    /// The rules those ports should hold. Empty when nothing steers.
+    pub plan: steer::RuleSet,
+    /// Whether traffic should be diverted once the target is in place.
+    pub want_steer: bool,
+}
+
+/// Derive the steering target.
+///
+/// A free function so the one rule that is easy to get backwards is
+/// testable without an attachment, a VPP or a NIC: **the plan is built
+/// only when something is going to be installed.**
+///
+/// `RuleSet::plan` refuses an allowlist that overruns the MCAM budget,
+/// which is right on the way in and wrong on the way out.
+/// [`crate::runtime::Steering::unsteer`] removes what the ledger names
+/// and never reads the plan, so validating it unconditionally lets an
+/// over-budget allowlist block `steer off` — the one reconfigure an
+/// operator must always be able to make, since it is how traffic comes
+/// off a misbehaving VPP. An allowlist growing past the budget is a
+/// plausible way to arrive at wanting exactly that.
+fn steering_target(
+    cfg: &VppOffloadConfig,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+) -> Result<SteeringTarget, String> {
+    // VF 0 because `acquire` creates exactly one per PF.
+    let ports: Vec<(String, u32)> = cfg
+        .ports
+        .iter()
+        .filter(|(_, _, steer)| *steer)
+        .map(|(iface, _, _)| (iface.clone(), 0u32))
+        .collect();
+    let want_steer = !ports.is_empty();
+    if !want_steer {
+        // Nothing to install and nothing that reads a plan. An empty
+        // target is also the truthful one: no port steers.
+        return Ok(SteeringTarget {
+            ports,
+            plan: steer::RuleSet::default(),
+            want_steer: false,
+        });
+    }
+    let plan = steer::RuleSet::plan(allowlist, steer::McamBudget::default())?;
+    // `steer on` with nothing steerable is refused for the same reason
+    // `bring_up` refuses it: steering would divert nothing while every
+    // surface reported it on.
+    if plan.rules.is_empty() {
+        return Err(format!(
+            "port(s) are configured `steer on`, but the allowlist produces no steerable \
+             rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this NIC). \
+             Steering would divert nothing while reporting Healthy",
+            plan.skipped_v6
+        ));
+    }
+    Ok(SteeringTarget {
+        ports,
+        plan,
+        want_steer: true,
+    })
+}
+
 pub struct VppOffloadModule {
     cfg: VppOffloadConfig,
     /// From [`LoaderCtx`] at load; `attach` has no ctx of its own.
@@ -618,31 +683,8 @@ impl Module for VppOffloadModule {
             return Ok(());
         };
 
-        let allowlist = self.allowlist.get();
-        let plan = steer::RuleSet::plan(&allowlist, steer::McamBudget::default())
+        let target = steering_target(&new, &self.allowlist.get())
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
-        let ports: Vec<(String, u32)> = new
-            .ports
-            .iter()
-            .filter(|(_, _, steer)| *steer)
-            .map(|(iface, _, _)| (iface.clone(), 0u32))
-            .collect();
-        // `steer on` with nothing steerable is refused here for the same
-        // reason `bring_up` refuses it: steering would divert nothing
-        // while every surface reported it on.
-        if !ports.is_empty() && plan.rules.is_empty() {
-            return Err(ModuleError::other(
-                MODULE_NAME,
-                format!(
-                    "port(s) are configured `steer on`, but the allowlist produces no \
-                     steerable rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected \
-                     by this NIC). Steering would divert nothing while reporting Healthy",
-                    plan.skipped_v6
-                ),
-            ));
-        }
-
-        let want_steer = !ports.is_empty();
         // Did the operator actually turn the lever, or does the config
         // merely still say `steer on`?
         //
@@ -662,7 +704,7 @@ impl Module for VppOffloadModule {
             .ne(new.ports.iter().map(|(_, _, steer)| *steer));
         attached
             .service
-            .apply_steering(ports, plan, want_steer, lever_moved)
+            .apply_steering(target.ports, target.plan, target.want_steer, lever_moved)
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Recorded only after the change landed. A `cfg` updated ahead of
         // the apply would make the NEXT reconfigure diff against a target
@@ -1245,6 +1287,62 @@ mod tests {
             m.allowlist.get(),
             vec![v4(0), v4(1)],
             "the module must see the republished list without being handed anything"
+        );
+    }
+
+    /// An over-budget allowlist must never block `steer off`.
+    ///
+    /// `RuleSet::plan` refuses an allowlist bigger than the MCAM budget,
+    /// which is correct when rules are about to be installed. Validating
+    /// it on the way OUT blocks the one reconfigure an operator must
+    /// always be able to make — turning traffic off a misbehaving VPP —
+    /// and `unsteer` never reads the plan anyway. An allowlist growing
+    /// past the budget is a plausible route to wanting exactly that
+    /// rollback.
+    #[test]
+    fn an_over_budget_allowlist_does_not_block_the_rollback() {
+        use packetframe_common::fib::IpPrefix;
+        // The default budget is 512 slots at two rules per prefix, so
+        // 300 v4 prefixes cannot fit.
+        let allow: Vec<IpPrefix> = (0..300u32)
+            .map(|i| IpPrefix::V4 {
+                addr: [10, (i >> 8) as u8, (i & 0xff) as u8, 0],
+                prefix_len: 24,
+            })
+            .collect();
+
+        // Steering ON is refused, and names the true requirement.
+        let on = cfg(&[("eth4", 1, true)], 1_600_000);
+        let e = steering_target(&on, &allow).expect_err("cannot fit");
+        assert!(e.contains("600 MCAM rule(s)"), "{e}");
+
+        // Steering OFF succeeds with the same allowlist. This is the
+        // assertion that matters: the rollback path must not consult a
+        // budget it does not spend.
+        let off = cfg(&[("eth4", 1, false)], 1_600_000);
+        let t = steering_target(&off, &allow).expect("rollback must be possible");
+        assert!(t.ports.is_empty() && !t.want_steer);
+        assert!(
+            t.plan.rules.is_empty(),
+            "and it carries an empty target, which is what no port steering means"
+        );
+    }
+
+    /// A `steer on` port with a v6-only allowlist is refused, not
+    /// silently accepted as steering nothing.
+    #[test]
+    fn steer_on_with_nothing_steerable_is_refused() {
+        use packetframe_common::fib::IpPrefix;
+        let allow = vec![IpPrefix::V6 {
+            addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 32,
+        }];
+        let on = cfg(&[("eth4", 1, true)], 1_600_000);
+        let e = steering_target(&on, &allow).expect_err("must refuse");
+        assert!(e.contains("no steerable rules"), "{e}");
+        assert!(
+            e.contains("reporting Healthy"),
+            "the consequence has to be stated: {e}"
         );
     }
 }

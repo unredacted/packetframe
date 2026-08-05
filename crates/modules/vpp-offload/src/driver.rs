@@ -516,6 +516,11 @@ mod tests {
     }
 
     impl Effects for Fx {
+        fn steering_in_place(&self) -> bool {
+            // No ledger in this fake; the driver tests never assert on
+            // `steered` after a failed steer.
+            false
+        }
         fn spawn(&mut self) -> Result<(), String> {
             self.calls.push("spawn");
             Ok(())
@@ -1298,6 +1303,9 @@ mod tests {
     fn failures_name_the_action_that_failed() {
         struct Bad;
         impl Effects for Bad {
+            fn steering_in_place(&self) -> bool {
+                false
+            }
             fn spawn(&mut self) -> Result<(), String> {
                 Err("no binary".into())
             }

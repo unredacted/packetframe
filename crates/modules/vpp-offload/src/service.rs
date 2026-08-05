@@ -111,11 +111,21 @@ const DETACH_BUDGET: Duration = Duration::from_millis(900);
 /// A refused MCAM insert has to come back as a failure at the moment
 /// the operator is watching for one.
 ///
-/// Generous against the loop's own cadence (it re-checks at least every
-/// [`STOP_POLL_CAP`]) and still well inside the CLI's 5 s ack timeout,
-/// so a timeout here reaches the operator as a timeout rather than as a
-/// dropped connection.
-const STEERING_BUDGET: Duration = Duration::from_secs(2);
+/// Sized against **one tick**, not against the poll cadence. The request
+/// is picked up before the next tick, so the wait is however long the
+/// tick already in progress takes — and in `Ready`/`Steered`, the only
+/// states a steering change is accepted from, that is a liveness ping
+/// (1.5 s budget while steered) plus a delta drain. Two seconds would
+/// therefore time out on an ordinary busy tick and report a failure over
+/// a change that was about to happen.
+///
+/// Bounded above by the CLI's own 5 s ack timeout
+/// (`RECONFIGURE_TIMEOUT_MS`), which covers every module's reconfigure,
+/// so this cannot simply be made generous. 3 s leaves room for
+/// fast-path's reconcile alongside it. A timeout is not a lost change
+/// either way: the wait withdraws the request if the loop has not taken
+/// it, and says plainly which of the two happened.
+const STEERING_BUDGET: Duration = Duration::from_secs(3);
 
 /// Poll granularity while waiting for the loop to answer.
 const STEERING_POLL: Duration = Duration::from_millis(5);
@@ -641,11 +651,52 @@ impl SupervisionService {
                 }
             }
             if Instant::now() >= deadline {
+                // WITHDRAW it, if the loop has not taken it yet.
+                //
+                // Leaving it in the slot is how "the change was NOT
+                // applied" becomes a lie: the loop takes whatever is
+                // there on its next free iteration, so a rollback
+                // reported as failed would quietly take effect afterwards
+                // — and publish its verdict where this caller is no
+                // longer listening. An operator who has just been told
+                // their `steer off` failed will do something else about
+                // it; the change must not also happen.
+                let withdrawn = {
+                    let mut slot = self.shared.steering_request.lock().expect("steering lock");
+                    let ours = slot.as_ref().is_some_and(|r| r.seq == seq);
+                    if ours {
+                        *slot = None;
+                    }
+                    ours
+                };
+                if !withdrawn {
+                    // The loop has it, so it is genuinely in flight and
+                    // cannot be recalled. One last look for the verdict —
+                    // it may have landed between the poll and now, and
+                    // reporting a timeout over a published answer would
+                    // be the same lie in the other direction.
+                    if let Some((answered, outcome)) = self
+                        .shared
+                        .steering_result
+                        .lock()
+                        .expect("steering lock")
+                        .clone()
+                    {
+                        if answered == seq {
+                            return outcome;
+                        }
+                    }
+                    return Err(format!(
+                        "the supervision loop took the steering change but had not finished it \
+                         within {STEERING_BUDGET:?}, so it MAY still take effect. \
+                         `packetframe status` reports what the module is doing; re-run once it \
+                         settles."
+                    ));
+                }
                 return Err(format!(
-                    "the supervision loop did not apply the steering change within {:?}. It is \
-                     busy or wedged — the change was NOT applied, and `packetframe status` \
-                     reports what the module is doing",
-                    STEERING_BUDGET
+                    "the supervision loop did not pick up the steering change within \
+                     {STEERING_BUDGET:?} — it is busy or wedged. The change was withdrawn and \
+                     NOT applied; `packetframe status` reports what the module is doing."
                 ));
             }
             std::thread::sleep(STEERING_POLL);
