@@ -709,6 +709,28 @@ fn reconfigure_from_signal(
         }
     };
 
+    // The membership invariant, on THIS path as well as at startup.
+    //
+    // `run` validates before attaching, and that used to be the only
+    // check — which left the guard enforced on the path nobody uses to
+    // turn steering on, and absent from the one the rollout actually
+    // follows. The canary ladder is `steer off` everywhere, then flip
+    // one port and SIGHUP. Without this, that flip diverts traffic while
+    // other egress ports have no `port` line, and every destination
+    // whose best path leaves through one of them is blackholed: exactly
+    // the failure the rule was written for, reached through the
+    // documented procedure.
+    //
+    // A refusal here changes nothing. The daemon keeps running the
+    // configuration it already had, and the operator gets the reason
+    // from `packetframe reconfigure` — which is the right outcome for a
+    // config that would have diverted traffic into a hole.
+    if let Err(e) = new_config.validate_vpp_offload() {
+        tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
+        write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        return;
+    }
+
     // Before the module loop, and for the WHOLE config rather than per
     // module. vpp-offload's steering target is derived from fast-path's
     // `allow-prefix` lines, which its own `ModuleConfig` does not
