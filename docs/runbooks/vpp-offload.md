@@ -184,34 +184,36 @@ vppctl -s /run/packetframe/vpp/api.sock show threads
 
 ## The canary ladder
 
-Traffic moves when *you* say so. The module never steers a first attach
-on its own, and — since #128 — a `reconfigure` that did not move the
-`steer` flag will not either, so editing an unrelated line cannot divert
-traffic as a side effect.
+Traffic moves only when you say so. The module never steers on a first
+attach, and a reconfigure that did not change a `steer` flag will not
+either, so editing an unrelated line cannot divert traffic by accident.
 
-Each rung is a `steer` edit plus a SIGHUP. **No restart, no resync**:
-that is the whole point of `reconfigure` handling this, because a
-restart would cost ~40 s of resync with the offload down at every step —
-including the step whose purpose is to get traffic *off* a bad VPP.
+Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
+resync: a restart would cost about 40 seconds with the offload down at
+every step, including the step meant to get traffic off a bad VPP
+quickly.
 
 **Rung 0 — membership, everything off.** Every fast-path attach port
 gets a `port` line; every one is `steer off`.
 
-Before anything else, know which side of `require-table-complete` you are
-on. On a box with its own bird, leave it `on` (the default) and the first
-steer waits until the mirror is confirmed converged. On a box without one
-— the shadow — attach will **refuse to start** with `on`, because the gate
-could never pass; set `off` there and the completeness judgement is yours,
-which in practice means reading the route counts before you turn a lever.
+Decide `require-table-complete` first. On a box running its own bird,
+leave it `on` (the default); the first steer then waits until the route
+mirror matches bird's route count. On a box without a local bird, attach
+refuses to start with `on`, because the check could never pass. Set it
+`off` there and compare the counts yourself before turning a lever:
+`packetframe status` reports how many routes are installed, and
+`birdc show route count` on the box running bird says how many there
+should be.
 
 ```bash
 packetframe reconfigure /etc/packetframe/packetframe.conf
 ```
 
-Wait for `fib-synced healthy` and `routes_unresolvable 0`. Soak here —
+Wait for `fib-synced healthy` and for
+`packetframe_vpp_routes{state="unresolvable"}` to read 0. Soak here for
 at least an hour, and through a udapi provision cycle if one is due.
-This state is safe by construction: VPP is up, its FIB is synced and
-verified, and not one packet is diverted.
+Nothing is diverted in this state: VPP is up, its FIB is synced and
+verified, and every packet is still on the XDP path.
 
 **Rung 1 — one port.** Flip the least important port to `steer on`,
 SIGHUP, and confirm:
@@ -445,8 +447,8 @@ refused rather than adopted.
 
 - **`packetframe feasibility` does not attach anything.** It used to,
   via `--config`, on every configured port — including the native-XDP
-  attach that panics this fleet. Fixed in #124; if you are on an older
-  build, do not run it against a live config.
+  attach that panics this fleet. Fixed in v0.2.7; on an older build, do
+  not run it against a live config.
 - **`reconfigure` accepts only the `steer` flag.** `port`, `cores`,
   `expected-routes`, `hugepages` and `vpp-binary` are all fixed at VPP's
   start or at VF acquisition, and each is refused **by name** with what

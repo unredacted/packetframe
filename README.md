@@ -2,7 +2,7 @@
 
 **eBPF/XDP fast-path for Linux packet forwarding.** Pure Rust, pluggable, attaches per-interface. Forwards allowlisted traffic directly between NICs at the driver level (bypassing iptables, conntrack, and the kernel routing stack), and falls back to normal kernel forwarding for everything else.
 
-Production-tested on edge routers with full-table BGP feeds. **~98% of allowlisted flows fast-path** in measured deployments, with conntrack table size and customer-facing latency both reduced significantly versus stock kernel forwarding.
+Running in production on edge routers with full-table BGP feeds. About 98% of allowlisted flows take the fast path there; conntrack entries and customer-facing latency both dropped substantially, with numbers below.
 
 GPL-3.0-or-later. Linux ≥ 5.15. Single static binary; no separate libbpf, bpftool, or runtime nightly toolchain.
 
@@ -75,8 +75,8 @@ PacketFrame complements existing routing daemons rather than replacing them. The
 | `packetframe reconfigure` / `systemctl reload packetframe` | Production (v0.2.4+) |
 | Two-stage BPF datapath (`fast_path` + `finalize` via `bpf_tail_call`) | Production (v0.2.5+); see [docs/runbooks/tail-call-architecture.md](docs/runbooks/tail-call-architecture.md) |
 | `probe` module (diagnostic XDP) | Production |
-| tc-ingress datapath (`attach <iface> tc`, custom-fib only) | Experimental (Phase T); see [docs/runbooks/tc-datapath.md](docs/runbooks/tc-datapath.md) |
-| Module health + metrics surface (`packetframe status`, `packetframe_vpp_*`) | Production |
+| tc-ingress datapath (`attach <iface> tc`, custom-fib only) | Built and measured slower: +70% CPU per packet on the reference hardware. Kept for reference, not recommended; see [docs/runbooks/tc-datapath.md](docs/runbooks/tc-datapath.md) |
+| Per-module health + metrics, read by `packetframe status` and the Prometheus textfile | Production (v0.2.7+) |
 | `vpp-offload` module (VPP-on-VF forwarding vector) | **Code-complete, hardware-unproven** — never run against a real VPP; see [docs/runbooks/vpp-offload.md](docs/runbooks/vpp-offload.md) |
 | `ddos` module (XDP-time SYN-flood + amplification filter) | Future; sketched in SPEC §5.2 (priority 0–999, security/admission) |
 | `sampler` module (per-flow ringbuf observability) | Future; sketched in SPEC §5.3 (priority 2000–2999, observation) |
@@ -90,7 +90,7 @@ Releases are published on the [GitHub releases page](https://github.com/unredact
 ### Debian / Ubuntu (.deb)
 
 ```sh
-VERSION=v0.2.6
+VERSION=v0.2.7
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe_${VERSION#v}_${ARCH}.deb"
@@ -107,7 +107,7 @@ Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packet
 For musl-static deployments, non-Debian distros, or anything else:
 
 ```sh
-VERSION=v0.2.6
+VERSION=v0.2.7
 TARGET=aarch64-unknown-linux-gnu     # or: x86_64-unknown-linux-{gnu,musl}, aarch64-unknown-linux-musl
 
 curl -LO "https://github.com/unredacted/packetframe/releases/download/${VERSION}/packetframe-${VERSION}-${TARGET}.tar.gz"
@@ -214,32 +214,27 @@ route-source bmp 127.0.0.1:6543 require-loc-rib
 
 See [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) for the full operational guide: cutover sequence, rollback, integrity checking, troubleshooting.
 
-## Forwarding vectors
+## Second forwarding path (vpp-offload)
 
-`forwarding-mode` chooses how a route is *resolved*. A **vector** is what
-actually moves the packet, and PacketFrame is built to carry more than
-one at a time.
+The XDP fast-path is how PacketFrame forwards packets today. The
+`vpp-offload` module adds a second option for the same traffic: the NIC's
+hardware classifier sends allowlisted packets straight to an SR-IOV
+virtual function, where a VPP process that PacketFrame starts and
+supervises forwards them. VPP gets its routes from the same BGP feed the
+fast-path uses, so both paths make the same forwarding decisions.
 
-- **eBPF fast-path** (XDP on the PFs) is the vector today, and stays the
-  permanent failover tier. It is at its structural floor under generic
-  XDP — native XDP panics the reference vendor kernel, so there is no
-  cheap headroom left here.
-- **`vpp-offload`** (phase 4) adds a second: MCAM hardware bifurcation
-  steers allowlisted traffic to an SR-IOV VF owned by a
-  packetframe-supervised VPP, which forwards it from a full-table FIB fed
-  by the same resolved best-paths the eBPF tier uses. Anything not
-  steered — and everything, if VPP dies — stays on the tier above.
+Traffic that isn't steered stays on the XDP path, and so does all of it
+if VPP stops running.
 
-The split is what makes the second vector safe to adopt incrementally:
-membership is provisioned everywhere first, then steering is turned on
-one port at a time, and turning it off is a config edit rather than a
-restart. **No dataplane code for the second vector lives in this repo** —
-VPP is unmodified upstream, built and shipped on its own release tag.
+Steering is per-interface and off by default. You turn it on one
+interface at a time and turn it back off with a config reload, without
+restarting VPP. No VPP source lives in this repo: PacketFrame builds
+unmodified upstream VPP and publishes it under its own release tag.
 
-`vpp-offload` is code-complete and **hardware-unproven**: it has never
-run against a real VPP process, and its MCAM ioctl path has never met a
-NIC. Read [`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md)
-before enabling it anywhere that carries traffic.
+The code is finished but has never run against a real VPP process or a
+real NIC. Read
+[`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md) before
+turning it on anywhere carrying traffic.
 
 ## Attach modes
 
@@ -317,14 +312,24 @@ sudo packetframe fib dump-v4           # walk FIB_V4 LPM trie
 sudo packetframe detach --all          # remove all pins, detach XDP
 ```
 
-Counters export as Prometheus textfile every 15 s when `metrics-textfile` is set. Metrics include per-counter gauges, custom-FIB occupancy by nexthop state, and the active forwarding mode.
+Counters export as a Prometheus textfile every 15 s when `metrics-textfile` is set: per-counter gauges, custom-FIB occupancy by nexthop state, the active forwarding mode, and whatever each loaded module publishes.
 
 ## Documentation
 
 - [`conf/example.conf`](conf/example.conf): annotated reference config
-- [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md): operational runbook for custom-FIB mode (cutover, rollback, integrity checks, triage by symptom)
-- [`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md): operational runbook for the VPP-on-VF vector (canary ladder, rollback, triage, and which published numbers are measured)
-- [`docs/runbooks/vpp-offload-spike.md`](docs/runbooks/vpp-offload-spike.md): the gate-0b bring-up procedure and its results, including what failed
+
+Runbooks, in `docs/runbooks/`:
+
+| File | Covers |
+|---|---|
+| [`custom-fib.md`](docs/runbooks/custom-fib.md) | Custom-FIB mode: cutover, rollback, integrity checks, triage by symptom |
+| [`reconfigure.md`](docs/runbooks/reconfigure.md) | What SIGHUP applies and what needs a restart |
+| [`mss-clamp.md`](docs/runbooks/mss-clamp.md) | MSS clamping and the iptables-bypass gap it closes |
+| [`tail-call-architecture.md`](docs/runbooks/tail-call-architecture.md) | The two-stage BPF datapath and why it is split |
+| [`generic-mode-performance.md`](docs/runbooks/generic-mode-performance.md) | Measured cost of generic vs native XDP, and host tuning |
+| [`tc-datapath.md`](docs/runbooks/tc-datapath.md) | The tc-ingress variant, and why it measured slower |
+| [`vpp-offload.md`](docs/runbooks/vpp-offload.md) | Running vpp-offload: rollout, rollback, triage, which numbers are measured |
+| [`vpp-offload-spike.md`](docs/runbooks/vpp-offload-spike.md) | How vpp-offload was brought up on test hardware, and what failed |
 
 ## Build from source
 
@@ -348,13 +353,16 @@ packetframe/
 ├── crates/
 │   ├── common/                       # config parser, Module trait, capability probes
 │   ├── cli/                          # the `packetframe` binary
-│   └── modules/
-│       ├── fast-path/                # main forwarding module
-│       │   └── bpf/                  # XDP program (nightly toolchain)
-│       └── probe/                    # diagnostic XDP probe
-│           └── bpf/                  # probe BPF program
+│   ├── modules/
+│   │   ├── fast-path/                # main forwarding module
+│   │   │   └── bpf/                  # XDP program (nightly toolchain)
+│   │   ├── probe/                    # diagnostic XDP probe
+│   │   │   └── bpf/                  # probe BPF program
+│   │   └── vpp-offload/              # second forwarding path (supervises VPP)
+│   └── tools/vpp-api-codegen/        # generates VPP binary-API structs from its .api.json
 ├── conf/example.conf                 # annotated reference config
 ├── docs/runbooks/                    # operational runbooks
+├── vpp/pin.toml                      # which upstream VPP we build and ship
 └── .github/workflows/                # CI (fmt/clippy/test, cross-build, qemu-verifier, release)
 ```
 
