@@ -585,20 +585,50 @@ impl SupervisionService {
         // Sequence first, so the request that lands in the slot is
         // always the one whose number we then wait for.
         let seq = self.shared.steering_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.shared.steering_request.lock().expect("steering lock") = Some(SteeringRequest {
-            seq,
-            ports,
-            plan,
-            want_steer,
-            lever_moved,
-        });
+        let displaced = self
+            .shared
+            .steering_request
+            .lock()
+            .expect("steering lock")
+            .replace(SteeringRequest {
+                seq,
+                ports,
+                plan,
+                want_steer,
+                lever_moved,
+            });
+        // A request still sitting in the slot never ran, and now never
+        // will — the slot holds one, and this call just took it. Answer
+        // it here or its caller waits out the whole budget for a verdict
+        // nobody will ever publish.
+        //
+        // Answered at the displacement rather than inferred by the
+        // waiter, which is what the first version did: it peeked at the
+        // slot and treated a higher sequence as proof of being
+        // superseded. That is wrong in the case that matters — the loop
+        // may have taken request A and be applying it right now, so a
+        // newly-arrived B makes A's waiter report "replaced before it
+        // was applied" about a change that DID happen. State recorded
+        // from a request rather than from an observation, in the
+        // machinery built to avoid exactly that.
+        //
+        // Unreachable from the loader today (SIGHUP handling is serial,
+        // and each `reconfigure` blocks for its answer), so this is
+        // about the seam being honest rather than about a live race.
+        if let Some(older) = displaced {
+            *self.shared.steering_result.lock().expect("steering lock") = Some((
+                older.seq,
+                Err(
+                    "a newer configuration change replaced this one before the supervision \
+                     loop saw it; re-run `packetframe reconfigure` to see where the newer \
+                     one landed"
+                        .into(),
+                ),
+            ));
+        }
 
         let deadline = Instant::now() + STEERING_BUDGET;
         loop {
-            // Two ways to be done, and the second is not an error worth
-            // waiting out: if the slot now holds a HIGHER sequence, this
-            // request was replaced before the loop ever saw it, and no
-            // answer for it will ever be published.
             if let Some((answered, outcome)) = self
                 .shared
                 .steering_result
@@ -608,21 +638,6 @@ impl SupervisionService {
             {
                 if answered == seq {
                     return outcome;
-                }
-            }
-            if let Some(pending) = self
-                .shared
-                .steering_request
-                .lock()
-                .expect("steering lock")
-                .as_ref()
-            {
-                if pending.seq > seq {
-                    return Err(
-                        "a newer configuration change replaced this one before it was applied; \
-                         re-run `packetframe reconfigure` to see where the newer one landed"
-                            .into(),
-                    );
                 }
             }
             if Instant::now() >= deadline {
