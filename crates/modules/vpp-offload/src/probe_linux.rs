@@ -11,7 +11,11 @@ use std::path::Path;
 
 use packetframe_common::probe::Capability;
 
-pub(crate) fn run(ports: &[String], vpp_binary: Option<&str>) -> Vec<Capability> {
+pub(crate) fn run(
+    ports: &[String],
+    vpp_binary: Option<&str>,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+) -> Vec<Capability> {
     let mut caps = Vec::with_capacity(4 + ports.len());
     caps.push(probe_iommu());
     caps.push(probe_vfio());
@@ -25,7 +29,60 @@ pub(crate) fn run(ports: &[String], vpp_binary: Option<&str>) -> Vec<Capability>
     for iface in ports {
         caps.push(probe_sriov(iface));
     }
+    caps.push(probe_steering_budget(allowlist));
     caps
+}
+
+/// Can the configured allowlist actually be steered?
+///
+/// Two answers an operator wants before the canary and not during it.
+/// **Does it fit MCAM** — the rules are two per v4 prefix and the table
+/// is shared with UniFi's own, so an allowlist that overruns the budget
+/// cannot be steered at all (partially steering it would split the
+/// allowlist across both forwarding tiers, which is a policy nobody
+/// chose, so it is refused whole). And **how much of it is v6**, which
+/// cannot be steered on this NIC at any size: `ip6` ntuple is rejected
+/// by the AF, so a v6-heavy allowlist means the offload covers far less
+/// traffic than the config reads like it does.
+///
+/// Read-only and non-required, like every probe here: it computes the
+/// plan the module would install, and installs nothing.
+fn probe_steering_budget(allowlist: &[packetframe_common::fib::IpPrefix]) -> Capability {
+    use crate::steer::{McamBudget, RuleSet};
+
+    let budget = McamBudget::default();
+    match RuleSet::plan(allowlist, budget) {
+        Ok(set) if set.rules.is_empty() && set.skipped_v6 > 0 => Capability::fail(
+            "vpp.steering.budget",
+            format!(
+                "none of the allowlist can be steered: all {} prefix(es) are IPv6, and `ip6` \
+                 ntuple is rejected by this NIC's AF (gate 0b round 4). The offload would \
+                 forward nothing while reporting healthy",
+                set.skipped_v6
+            ),
+            false,
+        ),
+        Ok(set) => {
+            let detail = format!(
+                "{} rule(s) for {} steerable prefix(es), budget {} from slot {}{}",
+                set.rules.len(),
+                set.rules.len() / 2,
+                budget.count,
+                budget.base,
+                if set.skipped_v6 > 0 {
+                    format!(
+                        "; {} IPv6 prefix(es) NOT steerable on this NIC and left on the \
+                         kernel path",
+                        set.skipped_v6
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            Capability::pass("vpp.steering.budget", detail, false)
+        }
+        Err(e) => Capability::fail("vpp.steering.budget", e, false),
+    }
 }
 
 /// An SMMU registered in /sys/class/iommu is the difference between

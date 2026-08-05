@@ -65,6 +65,7 @@ pub mod service;
 pub mod sink;
 pub mod startup_conf;
 pub mod status;
+pub mod steer;
 pub mod supervisor;
 pub mod verify;
 pub mod vpp_api;
@@ -619,14 +620,18 @@ impl Module for VppOffloadModule {
 /// Feasibility probes for `packetframe feasibility`, mirroring how the
 /// fast-path's per-interface probes graft into the report. All
 /// non-required: feasibility output informs, attach enforces.
-pub fn run_feasibility_probes(ports: &[String], vpp_binary: Option<&str>) -> Vec<Capability> {
+pub fn run_feasibility_probes(
+    ports: &[String],
+    vpp_binary: Option<&str>,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        probe_linux::run(ports, vpp_binary)
+        probe_linux::run(ports, vpp_binary, allowlist)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ports, vpp_binary);
+        let _ = (ports, vpp_binary, allowlist);
         Vec::new()
     }
 }

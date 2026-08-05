@@ -8,6 +8,7 @@ use std::path::Path;
 
 use packetframe_common::{
     config::{Config, ModuleDirective},
+    fib::IpPrefix,
     probe::{run_iface_probes, run_probes, Capability, CapabilityStatus, FeasibilityReport},
 };
 
@@ -50,6 +51,35 @@ pub fn vpp_ports_from_config(config: &Config) -> Vec<String> {
     ports
 }
 
+/// The fast-path allowlist, as the steering probe needs it.
+///
+/// It comes from the **fast-path** section, not vpp-offload's: steered
+/// prefixes inherit the allowlist rather than declaring their own, which
+/// is what makes "the offload carries a slice of the same traffic"
+/// true by construction instead of by two lists agreeing.
+pub fn allowlist_from_config(config: &Config) -> Vec<IpPrefix> {
+    let mut out = Vec::new();
+    for m in &config.modules {
+        if m.name != "fast-path" {
+            continue;
+        }
+        for d in &m.directives {
+            match d {
+                ModuleDirective::AllowPrefix4(p) => out.push(IpPrefix::V4 {
+                    addr: p.addr.octets(),
+                    prefix_len: p.prefix_len,
+                }),
+                ModuleDirective::AllowPrefix6(p) => out.push(IpPrefix::V6 {
+                    addr: p.addr.octets(),
+                    prefix_len: p.prefix_len,
+                }),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// The `vpp-binary` override from a `vpp-offload` section, if set, so
 /// feasibility probes the executable the module will actually run.
 pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
@@ -69,6 +99,7 @@ pub fn probe_and_render(
     attach_ifaces: &[String],
     vpp_ports: &[String],
     vpp_binary: Option<&str>,
+    allowlist: &[IpPrefix],
     human: bool,
 ) -> Rendered {
     let mut report = run_probes(bpffs_root);
@@ -94,12 +125,13 @@ pub fn probe_and_render(
     // the module's attach enforces.
     #[cfg(feature = "vpp-offload")]
     if !vpp_ports.is_empty() {
-        for cap in packetframe_vpp_offload::run_feasibility_probes(vpp_ports, vpp_binary) {
+        for cap in packetframe_vpp_offload::run_feasibility_probes(vpp_ports, vpp_binary, allowlist)
+        {
             report.capabilities.push(cap);
         }
     }
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = (vpp_ports, vpp_binary);
+    let _ = (vpp_ports, vpp_binary, allowlist);
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.
