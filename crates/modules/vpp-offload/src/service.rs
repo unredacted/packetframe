@@ -138,6 +138,21 @@ pub struct SteeringRequest {
     /// Whether traffic should be diverted once the target is in place.
     /// False is the rollback landing zone, not an error.
     pub want_steer: bool,
+    /// Whether the `steer` flag itself moved in this reconfigure.
+    ///
+    /// The difference between "the operator just turned the lever" and
+    /// "the config still says `steer on`, and this port was deliberately
+    /// left unsteered". Without it, a SIGHUP for an unrelated reason —
+    /// an added `allow-prefix`, a changed global — would divert traffic
+    /// on every `steer on` port that had not yet been steered, because
+    /// the flag is *present*. The machine never steers a first attach on
+    /// its own precisely because that decision is the operator's, and a
+    /// side effect of editing something else is not that decision.
+    ///
+    /// A port that is already steering is reconciled either way: its
+    /// traffic is diverted now, so the rules must match the new
+    /// allowlist whether or not the lever moved.
+    pub lever_moved: bool,
 }
 
 /// Builds the loop's non-`Send` pieces on the loop thread, and returns
@@ -552,10 +567,6 @@ impl SupervisionService {
         }
     }
 
-    /// Whether the loop thread is still running. `false` after `stop`,
-    /// and — importantly — after a panic: a dead loop means nothing is
-    /// supervising VPP, which the caller must surface rather than keep
-    /// reporting the last published (now frozen) status as current.
     /// Hand the loop a new steering target and wait for its verdict.
     ///
     /// Synchronous on purpose — see [`STEERING_BUDGET`]. Returns `Err`
@@ -569,6 +580,7 @@ impl SupervisionService {
         ports: Vec<(String, u32)>,
         plan: crate::steer::RuleSet,
         want_steer: bool,
+        lever_moved: bool,
     ) -> Result<(), String> {
         // Sequence first, so the request that lands in the slot is
         // always the one whose number we then wait for.
@@ -578,6 +590,7 @@ impl SupervisionService {
             ports,
             plan,
             want_steer,
+            lever_moved,
         });
 
         let deadline = Instant::now() + STEERING_BUDGET;
@@ -624,6 +637,10 @@ impl SupervisionService {
         }
     }
 
+    /// Whether the loop thread is still running. `false` after `stop`,
+    /// and — importantly — after a panic: a dead loop means nothing is
+    /// supervising VPP, which the caller must surface rather than keep
+    /// reporting the last published (now frozen) status as current.
     pub fn is_alive(&self) -> bool {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
@@ -774,7 +791,22 @@ fn apply_steering(
     }
     runtime.retarget(req.ports.clone(), req.plan.clone());
 
+    let steered = driver.supervisor().is_steered();
     let event = if req.want_steer {
+        // The config says steer, but that is not the same as the
+        // operator asking for it NOW.
+        //
+        // A `steer on` port that has never steered is in the designed
+        // staging state: the machine never steers a first attach on its
+        // own, because when traffic moves is the operator's decision and
+        // the canary ladder is paced by hand. So a SIGHUP that did not
+        // move the lever — an added `allow-prefix`, a changed global —
+        // updates the target and stops there. Diverting traffic as a side
+        // effect of editing something else is precisely the decision this
+        // module is not allowed to make.
+        if !steered && !req.lever_moved {
+            return Ok(());
+        }
         // The same gate the automatic path uses, and applied on the same
         // terms: **first steer only**. An operator turning the lever on
         // an unsteered port is no more entitled to divert traffic into a
@@ -790,7 +822,7 @@ fn apply_steering(
         // fail at random. And the failure would be the wrong way round:
         // refusing leaves the PREVIOUS rules installed, so a prefix the
         // operator just removed from the allowlist keeps being diverted.
-        if !driver.supervisor().is_steered() {
+        if !steered {
             let counts = runtime.status().counts;
             if counts.blocks_first_steer() {
                 return Err(format!(

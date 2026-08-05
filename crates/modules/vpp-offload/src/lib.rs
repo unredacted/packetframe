@@ -643,9 +643,26 @@ impl Module for VppOffloadModule {
         }
 
         let want_steer = !ports.is_empty();
+        // Did the operator actually turn the lever, or does the config
+        // merely still say `steer on`?
+        //
+        // The two must not look the same. A `steer on` port that has
+        // never steered is in the designed staging state, and a SIGHUP
+        // for an unrelated reason — an added `allow-prefix`, a changed
+        // global — must not divert its traffic as a side effect. Only the
+        // flag moving is the operator asking.
+        //
+        // Positional comparison is sound because `restart_only_delta`
+        // has already established the port list is identical, in order.
+        let lever_moved = self
+            .cfg
+            .ports
+            .iter()
+            .map(|(_, _, steer)| *steer)
+            .ne(new.ports.iter().map(|(_, _, steer)| *steer));
         attached
             .service
-            .apply_steering(ports, plan, want_steer)
+            .apply_steering(ports, plan, want_steer, lever_moved)
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Recorded only after the change landed. A `cfg` updated ahead of
         // the apply would make the NEXT reconfigure diff against a target

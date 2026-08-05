@@ -1190,7 +1190,7 @@ fn an_operator_can_steer_and_unsteer_a_converged_service() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true)
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
         .expect("the canary lever must turn without a restart");
     assert_eq!(
         svc.status().expect("published").state,
@@ -1200,7 +1200,7 @@ fn an_operator_can_steer_and_unsteer_a_converged_service() {
 
     // Rollback: membership stays, the FIB stays synced, traffic returns
     // to the fallback tier.
-    svc.apply_steering(Vec::new(), plan_for(2), false)
+    svc.apply_steering(Vec::new(), plan_for(2), false, true)
         .expect("rollback");
     assert_eq!(svc.status().expect("published").state, State::Ready);
 
@@ -1267,7 +1267,7 @@ fn a_steering_change_before_convergence_is_refused() {
     .expect("service starts");
 
     let e = svc
-        .apply_steering(vec![("eth4".into(), 0)], plan_for(2), true)
+        .apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
         .expect_err("must refuse before convergence");
     assert!(
         e.contains("not converged"),
@@ -1277,6 +1277,188 @@ fn a_steering_change_before_convergence_is_refused() {
     assert!(
         e.contains("takes effect at the next successful convergence"),
         "and it must say what happens to the config the operator just wrote: {e}"
+    );
+
+    svc.stop();
+}
+
+/// A SIGHUP that did not move the lever must not divert traffic.
+///
+/// `steer on` in the config is not the same as the operator asking to
+/// steer NOW. A port configured `steer on` that has never steered is in
+/// the designed staging state — the machine never steers a first attach
+/// on its own, because the canary ladder is paced by hand — so a
+/// reconfigure for an unrelated reason (an added `allow-prefix`, a
+/// changed global) must update the target and stop.
+///
+/// The assertion is that the SPY saw no steer, not merely that the call
+/// returned Ok: returning Ok while quietly diverting traffic is exactly
+/// the outcome under test.
+#[test]
+fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
+    let fake = Fake::start("svc-no-lever");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SpySteering(spy)),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not reach Ready: {:?}",
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // `steer on` is in the config (ports is non-empty, want_steer true)
+    // but the flag did not move in this reconfigure.
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, false)
+        .expect("a target update is not an error");
+
+    assert_eq!(
+        svc.status().expect("published").state,
+        State::Ready,
+        "traffic must still be on the fallback tier"
+    );
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec!["retarget 1 ports, 4 rules".to_string()],
+        "the target is updated and nothing else — a steer here would divert traffic as a \
+         side effect of editing something unrelated"
+    );
+
+    // And the operator turning the lever on the very next reconfigure
+    // still works, so this withholds rather than latches.
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
+        .expect("the lever still turns");
+    assert_eq!(svc.status().expect("published").state, State::Steered);
+
+    svc.stop();
+}
+
+/// An allowlist change under a port that IS steering is reconciled,
+/// lever or no lever.
+///
+/// Its traffic is diverted right now, so the rules must match the new
+/// allowlist — withholding here would leave a prefix the operator just
+/// removed from the allowlist still being diverted, which is the failure
+/// inverted.
+#[test]
+fn an_allowlist_change_under_live_steering_is_always_reconciled() {
+    let fake = Fake::start("svc-live-reconcile");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SpySteering(spy)),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            // Adopted ALREADY steered: rules are in the NIC and traffic
+            // is diverted while it converges, which is the case whose
+            // reconcile must not be withheld.
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: true }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Steered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not reach Steered: {:?}",
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The lever did NOT move — only the allowlist did.
+    log.lock().unwrap().clear();
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(1), true, false)
+        .expect("a live port must be reconciled");
+
+    let seen = log.lock().unwrap().clone();
+    assert!(
+        seen.contains(&"steer".to_string()),
+        "a steering port must be reconciled to the new allowlist even when the lever did \
+         not move, or a withdrawn prefix keeps being diverted: {seen:?}"
     );
 
     svc.stop();
