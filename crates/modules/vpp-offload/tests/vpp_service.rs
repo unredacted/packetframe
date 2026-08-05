@@ -195,6 +195,7 @@ fn an_incompatible_api_fails_attach_with_the_reason() {
             garbage_crcs: true,
             stall_pings_after: None,
             verify_mismatch: false,
+            ..Default::default()
         },
     );
     let sock = fake.path.clone();
@@ -377,6 +378,7 @@ fn a_failing_verifys_teardown_failures_are_published_and_retained() {
             // Routes install and ack; only the readback disagrees.
             stall_pings_after: None,
             verify_mismatch: true,
+            ..Default::default()
         },
     );
     let sock = fake.path.clone();
@@ -570,6 +572,7 @@ fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
             garbage_crcs: false,
             stall_pings_after: None,
             verify_mismatch: true,
+            ..Default::default()
         },
     );
     let sock = fake.path.clone();
@@ -783,6 +786,7 @@ fn an_episode_keeps_its_root_cause_alongside_the_latest_symptom() {
             stall_pings_after: None,
             // Verification fails, which is the root cause.
             verify_mismatch: true,
+            ..Default::default()
         },
     );
     let sock = fake.path.clone();
@@ -882,6 +886,7 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
             garbage_crcs: false,
             stall_pings_after: Some(1),
             verify_mismatch: false,
+            ..Default::default()
         },
     );
     let sock = fake.path.clone();
@@ -1007,6 +1012,7 @@ fn the_timeout_correction_survives_the_in_flight_tick() {
             garbage_crcs: false,
             stall_pings_after: Some(1),
             verify_mismatch: false,
+            ..Default::default()
         },
     );
     let sock = fake.path.clone();

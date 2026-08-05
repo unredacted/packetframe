@@ -331,6 +331,7 @@ fn a_refused_derived_delete_is_retried() {
             garbage_crcs: false,
             stall_pings_after: None,
             verify_mismatch: false,
+            ..Default::default()
         },
     );
     let mut e = engine_for(&fake);
@@ -478,6 +479,7 @@ fn a_crc_mismatch_is_recorded_as_permanent() {
             garbage_crcs: true,
             stall_pings_after: None,
             verify_mismatch: false,
+            ..Default::default()
         },
     );
     let mut e = engine_for(&fake);
@@ -487,5 +489,77 @@ fn a_crc_mismatch_is_recorded_as_permanent() {
     assert!(
         e.api_incompatible(),
         "retrying cannot fix a version skew: {err}"
+    );
+}
+
+/// Adopting a surviving VPP withdraws what the source stopped
+/// advertising — and leaves VPP's own routes alone.
+///
+/// The gap this closes: the resync diff derives withdrawals from the
+/// ledger, and on adoption the ledger is empty while the surviving VPP's
+/// FIB is not. A prefix withdrawn while packetframe was down therefore
+/// stayed installed, where a stale more-specific keeps overriding the
+/// live table — and verification could not see it, because it samples
+/// only what the ledger knows about.
+///
+/// The second half is the dangerous one. VPP's FIB also holds routes VPP
+/// created: drop routes, connected routes, local `/32`s. Adopting those
+/// would hand them to the same diff, and the next convergence would
+/// delete the infrastructure VPP needs to resolve any adjacency. So the
+/// fake serves three routes and the test asserts on all three.
+#[test]
+fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
+    // 10.0.1.0/24 — ours, and the source still advertises it.
+    // 10.0.9.0/24 — ours, withdrawn while we were down. Must go.
+    // 10.9.9.0/24 — no nexthop: a connected route's shape. Must stay.
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 9, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 9, 9, 0], 24, ASSIGNED_INDEX, false),
+    ];
+    let fake = Fake::start_behaving(
+        "adopt-fib",
+        Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+
+    // The source advertises only 10.0.1.0/24 now.
+    let mirror = Mirror {
+        routes: vec![v4(0, 1)],
+    };
+    let adopted = engine.adopt_vpp_fib().expect("readback");
+    assert_eq!(
+        adopted, 2,
+        "both nexthop-bearing routes adopted; the connected-shaped one is not"
+    );
+
+    let plan = engine.begin_resync(&mirror);
+    assert_eq!(
+        plan.withdrawals, 1,
+        "exactly the prefix the source stopped advertising: {plan:?}"
+    );
+
+    while !engine.drain_batch().expect("drain").0 {}
+    let deleted: Vec<[u8; 4]> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Route(WireRoute {
+                is_add: false,
+                addr,
+                ..
+            }) => Some(addr),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deleted,
+        vec![[10, 0, 9, 0]],
+        "the stale route is withdrawn and nothing else is: {deleted:?}"
     );
 }

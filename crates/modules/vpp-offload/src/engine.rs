@@ -41,12 +41,15 @@ use std::time::Duration;
 use packetframe_common::fib::IpPrefix;
 
 use crate::attach::{attach_ports, AttachError, AttachMode, AttachedPort, PortAttach};
-use crate::fib_sync::to_address;
+use crate::fib_sync::{from_prefix, to_address};
 use crate::fib_sync::{DrainStats, Drainer, FamilyPolicy, PortIndex, ResolvedPath, DEFAULT_WINDOW};
 use crate::sink::{Capacity, NexthopMap, PendingMap, RouteLedger, SinkCounts};
 use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
-use crate::vpp_api::generated::{IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply};
+use crate::vpp_api::generated::{
+    IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute, IpRouteDetails, IpRouteDump,
+    IpTable, FIB_API_PATH_TYPE_NORMAL,
+};
 use crate::vpp_api::{Transport, TransportError};
 
 /// `IP_API_NEIGHBOR_FLAG_STATIC` from ip_neighbor.api.
@@ -727,27 +730,106 @@ impl ConvergenceEngine {
         Ok(())
     }
 
+    /// Seed the ledger from VPP's own FIB, so an adoption can compute
+    /// withdrawals.
+    ///
+    /// Only acts when the ledger is **empty**, which is the condition
+    /// rather than an adoption flag: an empty ledger means this process
+    /// has no record of what VPP holds, whether because it just adopted
+    /// a survivor or because it is starting fresh. A freshly spawned VPP
+    /// answers with its own infrastructure routes and none of them pass
+    /// the filter below, so the fresh case seeds nothing and costs one
+    /// round trip.
+    ///
+    /// ## What it deliberately does NOT adopt, and why that matters
+    ///
+    /// VPP's FIB is not only ours. A fresh instance already holds drop
+    /// routes, connected routes for interface subnets, and local `/32`s
+    /// for interface addresses — all created by VPP itself. Seeding
+    /// those would hand them to the resync diff, which withdraws
+    /// everything the route source does not advertise, and the next
+    /// convergence would delete the infrastructure VPP needs to resolve
+    /// any adjacency at all.
+    ///
+    /// So a dumped route is adopted only if it looks like something this
+    /// module installed: at least one path that is
+    /// `FIB_API_PATH_TYPE_NORMAL`, egresses an interface **we** own, and
+    /// carries a **non-zero nexthop address**. That last clause is what
+    /// excludes connected routes, which are attached and therefore have
+    /// no nexthop; type excludes local and drop. Anything else is left
+    /// alone — an unadopted route is one we will not withdraw, which is
+    /// the safe direction.
+    pub fn adopt_vpp_fib(&mut self) -> Result<u64, EngineError> {
+        if !self.ledger.known_prefixes().is_empty() {
+            return Ok(0);
+        }
+        self.arm_timeout();
+        if self.transport.is_none() {
+            return Err(EngineError::NotConnected);
+        }
+
+        let mut adopted = 0u64;
+        for &is_ip6 in self.drainer.families().dump_families() {
+            let t = self.transport.as_mut().expect("checked just above");
+            let details: Vec<IpRouteDetails> = match t.dump(IpRouteDump {
+                context: 0,
+                table: IpTable {
+                    table_id: 0,
+                    is_ip6,
+                    name: String::new(),
+                },
+            }) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.disconnect();
+                    return Err(EngineError::Transport(e));
+                }
+            };
+            for d in details {
+                let Some(prefix) = from_prefix(&d.route.prefix) else {
+                    continue;
+                };
+                if !self.drainer.families().carries(prefix) {
+                    continue;
+                }
+                if !self.looks_self_installed(&d.route) {
+                    continue;
+                }
+                self.ledger.adopt_installed(prefix);
+                adopted += 1;
+            }
+        }
+        Ok(adopted)
+    }
+
+    /// Whether a route read back from VPP is one this module installed.
+    /// See [`Self::adopt_vpp_fib`] for why the answer must be
+    /// conservative.
+    fn looks_self_installed(&self, route: &IpRoute) -> bool {
+        route.paths.iter().any(|p| {
+            p.r#type == FIB_API_PATH_TYPE_NORMAL
+                && self.port_index.owns(p.sw_if_index)
+                && p.nh.address.0.iter().any(|b| *b != 0)
+        })
+    }
+
     /// Queue a full-table resync as a **diff** against the route source.
     ///
-    /// ## Known gap: adoption cannot compute withdrawals
+    /// ## Adoption withdrawals: closed by the FIB readback
     ///
     /// The diff derives deletions from `ledger.known_prefixes()`, and on
-    /// **adoption** the ledger starts empty while VPP's FIB does not. A
-    /// prefix withdrawn while packetframe was down therefore stays
-    /// installed in the surviving VPP, where a stale more-specific can
-    /// keep overriding the live table — and verification cannot see it,
-    /// because it samples only what the ledger knows.
+    /// **adoption** the ledger starts empty while VPP's FIB does not — so
+    /// a prefix withdrawn while packetframe was down used to stay
+    /// installed in the surviving VPP, where a stale more-specific keeps
+    /// overriding the live table, invisible to verification because it
+    /// samples only what the ledger knows.
     ///
-    /// Closing it needs VPP's own FIB read back, and `ip_route_dump` is
-    /// **not in the generated API whitelist** — so it needs a codegen
-    /// addition plus the regenerate-and-diff CI, not a change here.
-    /// Persisting the installed prefix set to the state file is not the
-    /// alternative: that is 1.05M prefixes rewritten continuously.
-    ///
-    /// Until then an adopted VPP's FIB is only reconciled for prefixes
-    /// the source still advertises. Recorded rather than papered over,
-    /// because the adoption path is precisely the one that keeps
-    /// forwarding while it converges.
+    /// [`Self::adopt_vpp_fib`] now seeds the ledger from `ip_route_dump`
+    /// before this runs, so the diff below sees what VPP actually holds
+    /// and withdraws accordingly. Callers must invoke it first;
+    /// `Runtime::start_resync` does. Persisting the installed prefix set
+    /// to the state file was the alternative and is not one: that is
+    /// 1.05M prefixes rewritten continuously.
     ///
     /// Refreshes the nexthop→device mapping first: a route's
     /// resolvability depends on it, and resolving against a stale map
