@@ -108,6 +108,15 @@ pub struct Tick {
 pub struct Driver {
     sup: Supervisor,
     sched: Schedule,
+    /// A drain lost the socket; the next tick must reconnect before it
+    /// can make progress.
+    ///
+    /// `api_ready` is the only thing that reconnects, and it is otherwise
+    /// called just once — while `detector` is `None`. Once armed, the
+    /// detector stays armed for the whole of steady state, so without
+    /// this flag a transport dropped by a failed drain could never come
+    /// back and every later drain would fail instantly on `NotConnected`.
+    reconnect_wanted: bool,
     /// Liveness tracking, from the first pong onward.
     ///
     /// `Option` because it must NOT exist before the API has answered
@@ -127,6 +136,7 @@ impl Driver {
         Self {
             sup: Supervisor::new(),
             sched: Schedule::new(),
+            reconnect_wanted: false,
             detector: None,
         }
     }
@@ -236,6 +246,13 @@ impl Driver {
             // out the verify instead — bounded, and the source's map
             // collapses per prefix, so waiting costs staleness rather
             // than depth.
+            // Reconnect first, if the last drain lost the socket. The
+            // engine drops its transport on any drain error, and nothing
+            // else on this path would ever call `api_ready` again.
+            if api_up_at_entry && self.reconnect_wanted {
+                self.reconnect_wanted = !obs.api_ready();
+            }
+
             let resyncing = matches!(before, State::Syncing | State::AdoptedResyncing);
             // `resyncing ||` and not `api_up_at_entry` alone: an ADOPTED
             // process is already in a resync state on the very first
@@ -255,7 +272,10 @@ impl Driver {
                     // Failing mid-resync is a convergence failure: the
                     // table is known-incomplete and nothing is forwarding
                     // through it yet.
-                    Err(_) if resyncing => events.push(Event::ConvergenceFailed),
+                    Err(_) if resyncing => {
+                        self.reconnect_wanted = true;
+                        events.push(Event::ConvergenceFailed);
+                    }
                     // Failing in steady state is NOT. The batch stays in
                     // the pending map, which is last-write-wins, so the
                     // retry is free and idempotent — and treating one bad
@@ -265,7 +285,17 @@ impl Driver {
                     // have installed. A VPP that has genuinely stopped
                     // answering is the wedge detector's job, and it has a
                     // measured budget for exactly that.
-                    Err(_) => more_to_drain = true,
+                    //
+                    // **Not** `more_to_drain`, which asks for an immediate
+                    // re-tick. The engine drops its transport on a drain
+                    // error, so the next call fails on `NotConnected`
+                    // without touching the socket — a zero-cost failure
+                    // requesting a zero-length sleep is a pegged core, and
+                    // one that never reconnects, ending in the very
+                    // restart this arm exists to avoid. The retry rides
+                    // the ordinary schedule instead, one attempt per ping
+                    // interval, after the reconnect above has had a turn.
+                    Err(_) => self.reconnect_wanted = true,
                 }
             }
 
@@ -450,6 +480,7 @@ mod tests {
         ping_fails: bool,
         pings: usize,
         drains: usize,
+        api_readies: usize,
     }
 
     impl Observe for World {
@@ -457,6 +488,7 @@ mod tests {
             self.exited
         }
         fn api_ready(&mut self) -> bool {
+            self.api_readies += 1;
             self.api
         }
         fn ping(&mut self) -> Result<(), String> {
@@ -580,6 +612,57 @@ mod tests {
     /// The supervisor ignores the event — but "an event was applied" is
     /// what asks for an immediate re-tick, so the loop would spin a core
     /// for the whole verify.
+    /// A steady-state drain failure must not peg a core, and must be
+    /// able to recover.
+    ///
+    /// Two halves of one bug. The engine drops its transport on any drain
+    /// error, so the next drain fails on `NotConnected` without touching
+    /// the socket — asking for an immediate re-tick after that is a
+    /// zero-cost failure requesting a zero-length sleep, i.e. a spin. And
+    /// `api_ready` is the only thing that reconnects, but it is otherwise
+    /// called just once, while `detector` is `None`; once armed it never
+    /// runs again, so the spin could never end in anything but the wedge
+    /// restart this arm exists to avoid.
+    #[test]
+    fn a_steady_state_drain_failure_neither_spins_nor_strands_the_socket() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        // Drive to a settled steady state.
+        d.inject(t0, Event::VerifyPassed, &mut fx);
+        assert_eq!(d.state(), State::Ready);
+
+        let readies_before = w.api_readies;
+        w.drain_fails = true;
+        let t = d.tick(at(t0, 100), &mut w, &mut fx);
+
+        assert!(
+            !t.events.contains(&Event::ConvergenceFailed),
+            "a steady-state drain failure must not escalate: {:?}",
+            t.events
+        );
+        assert_ne!(
+            t.sleep,
+            Some(Duration::ZERO),
+            "a failed drain must not ask to be called again immediately — the              next attempt fails on a dropped socket without doing any I/O, so              that is a pegged core"
+        );
+
+        // And the next tick tries to reconnect, which is the only way the
+        // retry can ever succeed.
+        let _ = d.tick(at(t0, 200), &mut w, &mut fx);
+        assert!(
+            w.api_readies > readies_before,
+            "nothing attempted to reconnect, so the transport is stranded and              every later drain fails instantly on NotConnected"
+        );
+    }
+
     #[test]
     fn verification_does_not_drain_and_does_not_spin() {
         let t0 = Instant::now();

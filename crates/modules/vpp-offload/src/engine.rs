@@ -672,41 +672,59 @@ impl ConvergenceEngine {
             });
         }
 
-        let t = self.transport.as_mut().expect("checked just above");
         let mut programmed = 0u64;
         for (ip, sw_if_index, mac_address) in wanted {
-            let reply =
-                match t.request::<IpNeighborAddDel, IpNeighborAddDelReply>(IpNeighborAddDel {
-                    context: 0,
-                    is_add: true,
-                    neighbor: IpNeighbor {
-                        sw_if_index,
-                        // Static: VPP must never age this out and never
-                        // ARP to refresh it, because it cannot receive
-                        // the reply.
-                        flags: IP_NEIGHBOR_STATIC,
-                        mac_address,
-                        ip_address: to_address(ip),
-                    },
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.disconnect();
-                        return Err(EngineError::Transport(e));
-                    }
-                };
-            if reply.retval != 0 {
-                // Refused, not a broken socket. Loud rather than skipped:
-                // every route through this nexthop would install cleanly
-                // and then blackhole.
-                return Err(EngineError::NeighbourRefused {
-                    nexthop: ip,
-                    retval: reply.retval,
-                });
-            }
+            self.send_neighbour(ip, sw_if_index, mac_address, true)?;
             programmed += 1;
         }
         Ok(programmed)
+    }
+
+    /// One `ip_neighbor_add_del`, the single place this message is built.
+    ///
+    /// Extracted because there are now two callers — the resync walk and
+    /// the steady-state delta path — and a second hand-written copy of
+    /// this is how the tiers end up disagreeing about a flag. The static
+    /// bit especially: VPP must never age these out and never ARP to
+    /// refresh them, because it cannot receive the reply.
+    fn send_neighbour(
+        &mut self,
+        ip: IpAddr,
+        sw_if_index: u32,
+        mac_address: [u8; 6],
+        is_add: bool,
+    ) -> Result<(), EngineError> {
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        let reply = match t.request::<IpNeighborAddDel, IpNeighborAddDelReply>(IpNeighborAddDel {
+            context: 0,
+            is_add,
+            neighbor: IpNeighbor {
+                sw_if_index,
+                flags: IP_NEIGHBOR_STATIC,
+                mac_address,
+                ip_address: to_address(ip),
+            },
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                self.disconnect();
+                return Err(EngineError::Transport(e));
+            }
+        };
+        if reply.retval != 0 {
+            // A removal VPP does not recognise is not a fault: the
+            // adjacency we wanted gone is gone. An *add* it refuses is,
+            // because every route through that nexthop would install
+            // cleanly and then blackhole.
+            if !is_add {
+                return Ok(());
+            }
+            return Err(EngineError::NeighbourRefused {
+                nexthop: ip,
+                retval: reply.retval,
+            });
+        }
+        Ok(())
     }
 
     /// Queue a full-table resync as a **diff** against the route source.
@@ -747,20 +765,54 @@ impl ConvergenceEngine {
     /// unresolvable, so a new nexthop arriving in the same batch as the
     /// routes that use it would black-hole them for a full resync cycle
     /// if applied the other way round.
-    pub fn apply_changes(&mut self, src: &dyn RouteSource, max: usize) -> u64 {
+    pub fn apply_changes(&mut self, src: &dyn RouteSource, max: usize) -> Result<u64, EngineError> {
         let changes = src.drain_changes(max);
         if changes.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let n = changes.len() as u64;
         for (nh, state) in changes.neighbours {
             match state {
-                Some((dev, _mac)) => self.nexthops.set_device(nh, dev),
+                Some((dev, mac)) => {
+                    self.nexthops.set_device(nh, dev);
+                    // And PROGRAM it, which is the whole point.
+                    //
+                    // `set_device` alone makes `resolve` return `Some`, so
+                    // routes through this nexthop classify as resolvable
+                    // and install — while VPP, which runs without
+                    // linux-cp and can never ARP for the adjacency, has
+                    // nothing to send them to. Verification would not
+                    // catch it either: it checks a route exists on an
+                    // interface we own, deliberately not that its
+                    // adjacency resolves. That is #115's worst finding
+                    // exactly, arriving through the delta door instead of
+                    // the resync one.
+                    if let Some(idx) = self
+                        .nexthops
+                        .resolve(&nh)
+                        .and_then(|t| self.port_index.get(&t))
+                    {
+                        self.send_neighbour(nh, idx, mac, true)?;
+                    }
+                }
                 // Forgotten rather than left at its last known device —
                 // see `NexthopMap::forget_device`. The routes through it
                 // become unresolvable, which is the honest answer and the
                 // one health reports.
-                None => self.nexthops.forget_device(&nh),
+                //
+                // The adjacency is withdrawn from VPP first, while the
+                // mapping that names its interface is still there to
+                // withdraw it *with*.
+                None => {
+                    if let Some(idx) = self
+                        .nexthops
+                        .resolve(&nh)
+                        .and_then(|t| self.port_index.get(&t))
+                    {
+                        self.send_neighbour(nh, idx, [0; 6], false)?;
+                    }
+                    self.nexthops.forget_device(&nh);
+                }
             }
         }
         for (prefix, nhs) in changes.routes {
@@ -769,7 +821,7 @@ impl ConvergenceEngine {
                 None => self.pending.withdraw(prefix),
             }
         }
-        n
+        Ok(n)
     }
 
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {

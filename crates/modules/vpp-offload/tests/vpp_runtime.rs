@@ -535,3 +535,102 @@ fn local_interface() -> (u32, String) {
     }
     panic!("no usable interface at index 1..16");
 }
+
+/// A nexthop first seen **after** convergence gets its static neighbour
+/// programmed, not just its device mapping.
+///
+/// This is #115's worst finding arriving through a different door. Giving
+/// the nexthop a device is enough for `NexthopMap::resolve` to return
+/// `Some`, so routes through it classify as resolvable and install — and
+/// VPP, which runs without linux-cp and can never ARP for the adjacency,
+/// has nothing to send them to. Readback verification does not catch it
+/// either: it checks a route exists on an interface we own, deliberately
+/// not that its adjacency resolves. Route acks, verify passes, every
+/// packet drops.
+#[test]
+fn a_nexthop_first_seen_after_convergence_gets_its_adjacency() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::Arc;
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start("late-nexthop");
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 1), &[fake_vpp::nh()]);
+
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: dev.clone(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+        }],
+        vec![dev],
+        1_000_000,
+        FamilyPolicy::V4Only,
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(feed.clone()),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (mut now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    let _ = fake.drain_events();
+
+    // A nexthop the engine has never seen, arriving with a route through
+    // it — the order the feed delivers them in is what the fix depends on.
+    let late_nh = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let late_mac = [0x02, 0x00, 0x5e, 0x00, 0x00, 0x09];
+    feed.neighbour_resolved(late_nh, late_mac, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 201), &[late_nh]);
+
+    let mut saw_neigh = false;
+    for _ in 0..64 {
+        let t = {
+            let (mut obs, mut fx) = rt.views();
+            d.tick(now, &mut obs, &mut fx)
+        };
+        for e in rt.take_pending() {
+            let (_, mut fx) = rt.views();
+            d.inject(now, e, &mut fx);
+        }
+        for e in fake.drain_events() {
+            if let fake_vpp::Event::Neighbour { mac, .. } = e {
+                if mac == late_mac {
+                    saw_neigh = true;
+                }
+            }
+        }
+        if saw_neigh {
+            break;
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+
+    assert!(
+        saw_neigh,
+        "the new nexthop's static neighbour was never programmed — its routes \
+         would install, verify clean, and blackhole"
+    );
+}

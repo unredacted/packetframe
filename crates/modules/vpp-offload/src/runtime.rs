@@ -499,11 +499,16 @@ impl Observe for ObserveView {
             last_drain_error,
             ..
         } = &mut *c;
-        engine.apply_changes(source.as_ref(), DELTA_BATCH);
-        let r = engine
-            .drain_batch()
-            .map(|(done, _stats)| done)
-            .map_err(|e| e.to_string());
+        // `?`-equivalent: a failed neighbour programming must not be
+        // followed by a route drain that installs paths through the
+        // adjacency that just failed to land.
+        let r = match engine.apply_changes(source.as_ref(), DELTA_BATCH) {
+            Err(e) => Err(e.to_string()),
+            Ok(_) => engine
+                .drain_batch()
+                .map(|(done, _stats)| done)
+                .map_err(|e| e.to_string()),
+        };
         // Set on failure and cleared on success, in one place, for the
         // same reason `note_persist` is: a field that only ever gets set
         // reports a fault that recovered as though it were still
