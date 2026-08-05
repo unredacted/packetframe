@@ -85,7 +85,7 @@ physically cannot receive an ARP request.
 Two ports of call. `packetframe status` for the structured view:
 
 ```bash
-packetframe status /etc/packetframe/packetframe.conf
+packetframe status
 ```
 
 Under a healthy, fully steered offload the module-health section reads:
@@ -206,7 +206,7 @@ refuses to start with `on`, because the check could never pass. Set it
 should be.
 
 ```bash
-packetframe reconfigure /etc/packetframe/packetframe.conf
+packetframe reconfigure
 ```
 
 Wait for `fib-synced healthy` and for
@@ -220,7 +220,7 @@ SIGHUP, and confirm:
 
 ```bash
 ethtool -n eth5 | head          # rules exist, at loc >= 1024
-packetframe status /etc/packetframe/packetframe.conf | grep -A6 'module health'
+packetframe status | grep -A6 'module health'
 ```
 
 `packetframe reconfigure` reports the outcome synchronously. If it says
@@ -243,7 +243,7 @@ Any rung, at any time:
 
 ```bash
 # Edit the port back to `steer off`, then:
-packetframe reconfigure /etc/packetframe/packetframe.conf
+packetframe reconfigure
 ```
 
 Traffic returns to the eBPF fast-path. Membership stays, the FIB stays
@@ -261,7 +261,7 @@ If you need the whole vector gone:
 
 ```bash
 systemctl stop packetframe
-packetframe detach --all /etc/packetframe/packetframe.conf
+packetframe detach --all
 ```
 
 `detach --all` takes steering down **first**, then kills VPP, then
@@ -309,7 +309,7 @@ usually finished. Watch the two counts converge:
 
 ```bash
 birdc show route count
-packetframe status /etc/packetframe/packetframe.conf | grep -A6 'module health'
+packetframe status | grep -A6 'module health'
 ```
 
 If it persists, the mirror is genuinely not keeping up and that is a
