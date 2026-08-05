@@ -586,6 +586,31 @@ impl RouteLedger {
     }
 
     /// VPP acknowledged the route.
+    /// Record a prefix VPP is **observed** to already hold.
+    ///
+    /// For adoption, and only for adoption: the ledger starts empty
+    /// while a surviving VPP's FIB does not, so without this the resync
+    /// diff — which derives withdrawals from what the ledger knows —
+    /// cannot see a prefix that was withdrawn while packetframe was
+    /// down, and it stays installed where a stale more-specific keeps
+    /// overriding the live table.
+    ///
+    /// `Installed` is honest here rather than optimistic: the caller
+    /// read it out of VPP with `ip_route_dump`. That is a stronger
+    /// observation than the one `commit_installed` acts on, which is an
+    /// acknowledgement of our own write.
+    ///
+    /// Refuses to overwrite a prefix the ledger already tracks — a
+    /// readback must not stomp an in-flight `Installing`, and a
+    /// non-empty ledger means this is not an adoption.
+    pub fn adopt_installed(&mut self, prefix: IpPrefix) {
+        let key = PrefixKey::from(prefix);
+        if self.state.contains_key(&key) {
+            return;
+        }
+        self.set_state(key, RouteState::Installed);
+    }
+
     pub fn commit_installed(&mut self, prefix: IpPrefix) {
         let key = PrefixKey::from(prefix);
         if matches!(self.state.get(&key), Some(RouteState::Installing { .. })) {

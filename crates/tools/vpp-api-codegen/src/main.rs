@@ -38,6 +38,17 @@ const MESSAGES: &[&str] = &[
     "ip_route_add_del_reply",
     "ip_route_lookup",
     "ip_route_lookup_reply",
+    // Reading VPP's FIB back. Also a DUMP (streamed `ip_route_details`
+    // terminated by a trailing `control_ping`, same shape as
+    // `sw_interface_dump`). Adoption needs it and cannot be trusted
+    // without it: the resync diff derives withdrawals from the ledger,
+    // and on adoption the ledger starts empty while a surviving VPP's
+    // FIB does not — so a prefix withdrawn while packetframe was down
+    // stays installed, where a stale more-specific keeps overriding the
+    // live table. Verification cannot see it either, because it samples
+    // only what the ledger knows about.
+    "ip_route_dump",
+    "ip_route_details",
     "ip_neighbor_add_del",
     "ip_neighbor_add_del_reply",
     // Interface state.

@@ -29,6 +29,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "ip_route_add_del_reply", crc: "0x1992deab", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "ip_route_lookup", crc: "0x710d6471", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "ip_route_lookup_reply", crc: "0x5d8febcb", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "ip_route_dump", crc: "0xb9d2e09e", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "ip_route_details", crc: "0xbda8f315", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "ip_neighbor_add_del", crc: "0x0607c257", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "ip_neighbor_add_del_reply", crc: "0x1992deab", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_flags", crc: "0xf5aec1b8", context_offset: 6, client_index_prefix: true },
@@ -365,6 +367,41 @@ impl Decode for IpRoute {
             prefix,
             n_paths,
             paths,
+        })
+    }
+}
+
+/// `ip_table` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpTable {
+    pub table_id: u32,
+    pub is_ip6: bool,
+    pub name: String,
+}
+
+impl Encode for IpTable {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.table_id).to_be_bytes());
+        buf.push(if self.is_ip6 { 1u8 } else { 0u8 });
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.name.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+    }
+}
+
+impl Decode for IpTable {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let table_id = d.u32()?;
+        let is_ip6 = d.bool()?;
+        let name = d.string_fixed(64)?;
+        Ok(Self {
+            table_id,
+            is_ip6,
+            name,
         })
     }
 }
@@ -817,6 +854,75 @@ impl Decode for IpRouteLookupReply {
 impl Message for IpRouteLookupReply {
     const NAME: &'static str = "ip_route_lookup_reply";
     const CRC: &'static str = "0x5d8febcb";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `ip_route_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpRouteDump {
+    pub context: u32,
+    pub table: IpTable,
+}
+
+impl Encode for IpRouteDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        self.table.encode(buf);
+    }
+}
+
+impl Decode for IpRouteDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let table = IpTable::decode(d)?;
+        Ok(Self {
+            context,
+            table,
+        })
+    }
+}
+
+impl Message for IpRouteDump {
+    const NAME: &'static str = "ip_route_dump";
+    const CRC: &'static str = "0xb9d2e09e";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `ip_route_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpRouteDetails {
+    pub context: u32,
+    pub route: IpRoute,
+}
+
+impl Encode for IpRouteDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        self.route.encode(buf);
+    }
+}
+
+impl Decode for IpRouteDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let route = IpRoute::decode(d)?;
+        Ok(Self {
+            context,
+            route,
+        })
+    }
+}
+
+impl Message for IpRouteDetails {
+    const NAME: &'static str = "ip_route_details";
+    const CRC: &'static str = "0xbda8f315";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

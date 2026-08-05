@@ -616,6 +616,19 @@ impl Effects for EffectsView {
         // Split borrow: the engine walks the source while both live in
         // the same core.
         let Core { engine, source, .. } = &mut *c;
+        // BEFORE the diff, because the diff is what consumes it: the
+        // ledger's contents are where withdrawals come from, and on an
+        // adoption it is empty while the surviving VPP's FIB is not.
+        // A no-op unless the ledger is empty, so a fresh spawn pays one
+        // round trip and adopts nothing.
+        let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+        if adopted > 0 {
+            tracing::info!(
+                routes = adopted,
+                "adopted VPP's existing FIB; the resync diff can now withdraw what the \
+                 route source no longer advertises"
+            );
+        }
         let _plan = engine.begin_resync(source.as_ref());
         // Neighbours between attach and the first drain, and fatal on
         // refusal: a route through an unprogrammed adjacency installs

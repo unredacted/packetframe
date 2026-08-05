@@ -23,10 +23,11 @@ use packetframe_vpp_offload::vpp_api::codec::{
     SOCKCLNT_CREATE_MSG_ID,
 };
 use packetframe_vpp_offload::vpp_api::generated::{
-    ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpNeighborAddDel,
-    IpNeighborAddDelReply, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteLookupReply,
-    MessageTableEntry, SockclntCreateReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
-    MESSAGE_META,
+    Address, AddressUnion, ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath,
+    FibPathNh, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute, IpRouteAddDel, IpRouteAddDelReply,
+    IpRouteDetails, IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
+    SwInterfaceDetails, SwInterfaceSetFlagsReply, ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4,
+    FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -169,6 +170,17 @@ pub struct Behaviour {
     /// `VerifyFailed` teardown from a test, because the verdict arrives
     /// as an INJECTED event rather than from an ordinary tick.
     pub verify_mismatch: bool,
+    /// Prefixes this VPP already holds when the client connects, as
+    /// `(addr, len, sw_if_index, nexthop_is_set)`.
+    ///
+    /// Models a **surviving** VPP for the adoption path: its FIB is
+    /// populated and the freshly started packetframe's ledger is not.
+    /// `nexthop_is_set` false / an index we do not own reproduces VPP's
+    /// own infrastructure routes, which the readback must leave alone —
+    /// adopting those would hand them to the resync diff, and the next
+    /// convergence would delete the connected and local routes VPP needs
+    /// to resolve any adjacency at all.
+    pub existing_routes: &'static [([u8; 4], u8, u32, bool)],
 }
 
 impl Fake {
@@ -366,6 +378,18 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
             }
             // DUMP: one details frame per interface, no terminator — the
             // trailing control_ping's reply ends the stream, as VPP does.
+            "ip_route_dump" => {
+                for &(addr, len, sw_if_index, has_nh) in behaviour.existing_routes {
+                    let mut d = reply_head("ip_route_details");
+                    IpRouteDetails {
+                        context: ctx,
+                        route: existing_route(addr, len, sw_if_index, has_nh),
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
             "sw_interface_dump" => {
                 let mut d = reply_head("sw_interface_details");
                 details(ASSIGNED_INDEX, "octeon0/0", 3, ctx).encode(&mut d);
@@ -392,6 +416,53 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
             other => panic!("fake got unexpected message {other}"),
         }
         write_frame(sock, &out);
+    }
+}
+
+/// One route as a surviving VPP would report it.
+///
+/// `has_nh` is the whole point: a real nexthop address plus a path type
+/// of NORMAL on an interface we own is what our own drainer emits, and
+/// is what the readback filter looks for. Leaving it zero produces the
+/// shape of a connected route — attached, no nexthop — which must NOT be
+/// adopted.
+fn existing_route(addr: [u8; 4], len: u8, sw_if_index: u32, has_nh: bool) -> IpRoute {
+    let mut un = [0u8; 16];
+    un[..4].copy_from_slice(&addr);
+    let mut nh_un = [0u8; 16];
+    if has_nh {
+        // 192.0.2.1, the same nexthop the tests' mirror advertises.
+        nh_un[..4].copy_from_slice(&[192, 0, 2, 1]);
+    }
+    IpRoute {
+        table_id: 0,
+        stats_index: 0,
+        prefix: Prefix {
+            address: Address {
+                af: ADDRESS_IP4,
+                un: AddressUnion(un),
+            },
+            len,
+        },
+        n_paths: 1,
+        paths: vec![FibPath {
+            sw_if_index,
+            table_id: 0,
+            rpf_id: 0,
+            weight: 1,
+            preference: 0,
+            r#type: FIB_API_PATH_TYPE_NORMAL,
+            flags: 0,
+            proto: FIB_API_PATH_NH_PROTO_IP4,
+            nh: FibPathNh {
+                address: AddressUnion(nh_un),
+                via_label: 0,
+                obj_id: 0,
+                classify_table_index: 0,
+            },
+            n_labels: 0,
+            label_stack: Default::default(),
+        }],
     }
 }
 

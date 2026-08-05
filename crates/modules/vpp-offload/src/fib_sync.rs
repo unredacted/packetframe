@@ -94,6 +94,12 @@ impl PortIndex {
     pub fn indices(&self) -> std::collections::HashSet<u32> {
         self.idx.values().copied().collect()
     }
+
+    /// Whether `sw_if_index` is one of ours. Same source of truth as
+    /// [`Self::indices`], without materialising the set for one lookup.
+    pub fn owns(&self, sw_if_index: u32) -> bool {
+        self.idx.values().any(|v| *v == sw_if_index)
+    }
 }
 
 /// Wire form of an address, family tag and all.
@@ -136,6 +142,29 @@ fn withdraw_msg(prefix: IpPrefix) -> IpRouteAddDel {
 }
 
 /// Wire form of a prefix.
+/// `Prefix` back into an `IpPrefix`, for routes read out of VPP.
+///
+/// `None` for an address family we do not carry, rather than a guess:
+/// the caller uses this to decide what to withdraw, and inventing a
+/// prefix there deletes a route.
+pub fn from_prefix(p: &Prefix) -> Option<IpPrefix> {
+    match p.address.af {
+        ADDRESS_IP4 => {
+            let mut addr = [0u8; 4];
+            addr.copy_from_slice(&p.address.un.0[..4]);
+            Some(IpPrefix::V4 {
+                addr,
+                prefix_len: p.len,
+            })
+        }
+        ADDRESS_IP6 => Some(IpPrefix::V6 {
+            addr: p.address.un.0,
+            prefix_len: p.len,
+        }),
+        _ => None,
+    }
+}
+
 pub fn to_prefix(p: IpPrefix) -> Prefix {
     match p {
         IpPrefix::V4 { addr, prefix_len } => {
@@ -275,6 +304,19 @@ pub enum FamilyPolicy {
 }
 
 impl FamilyPolicy {
+    /// The `is_ip6` flags to issue an `ip_route_dump` for.
+    ///
+    /// Derived from the same policy that decides what gets installed, so
+    /// a readback can never cover a family the sink does not carry —
+    /// adopting v6 routes under `V4Only` would hand the resync diff a set
+    /// it will never re-install and therefore withdraw wholesale.
+    pub fn dump_families(self) -> &'static [bool] {
+        match self {
+            FamilyPolicy::Both => &[false, true],
+            FamilyPolicy::V4Only => &[false],
+        }
+    }
+
     pub fn carries(self, prefix: IpPrefix) -> bool {
         match self {
             FamilyPolicy::Both => true,
@@ -365,6 +407,12 @@ impl Drainer {
             window: window.max(1),
             families: FamilyPolicy::default(),
         }
+    }
+
+    /// Which families reach VPP, for callers that must apply the same
+    /// policy outside the drain path — the FIB readback especially.
+    pub fn families(&self) -> FamilyPolicy {
+        self.families
     }
 
     /// Override which families reach VPP. See [`FamilyPolicy`].
