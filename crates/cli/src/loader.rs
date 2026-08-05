@@ -1405,7 +1405,13 @@ fn print_module_health(state_dir: &Path) {
             return;
         }
         Err(e) => {
-            eprintln!("note: module health unavailable ({e})");
+            // Scrubbed too: this carries a serde parse error, which can
+            // quote bytes from the snapshot file. Ours to write, but a
+            // corrupt or hand-edited one is exactly when this branch runs.
+            eprintln!(
+                "note: module health unavailable ({})",
+                scrub_for_terminal(&e)
+            );
             return;
         }
     };
