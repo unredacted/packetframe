@@ -167,19 +167,23 @@ cat /var/lib/packetframe/state/vpp-offload.json | jq '{vpp_pid, vpp_start_ticks,
 ethtool -n eth5
 ```
 
+`vppctl` speaks the **CLI** socket, which the renderer places at
+`<api-socket>.cli`. Pointing it at the binary API socket connects and
+then hangs forever waiting for a protocol the other end does not speak.
+
 ```bash
 # What does VPP think its FIB looks like? Legitimate non-bulk vppctl.
-vppctl -s /run/packetframe/vpp/api.sock show ip fib summary
+vppctl -s /run/packetframe/vpp/api.sock.cli show ip fib summary
 ```
 
 ```bash
 # The interfaces VPP created, and their link state.
-vppctl -s /run/packetframe/vpp/api.sock show interface
+vppctl -s /run/packetframe/vpp/api.sock.cli show interface
 ```
 
 ```bash
 # Worker placement — one hot core per worker, permanently. See the heat note.
-vppctl -s /run/packetframe/vpp/api.sock show threads
+vppctl -s /run/packetframe/vpp/api.sock.cli show threads
 ```
 
 ## The canary ladder
