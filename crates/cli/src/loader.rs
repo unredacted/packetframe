@@ -739,7 +739,11 @@ fn reconfigure_from_signal(
 /// (config text, BGP/BMP error text propagated up); a stray ANSI
 /// escape sequence in the marker would corrupt the operator's TTY
 /// when they run `packetframe reconfigure`. Audit Slice 5 hardening.
-#[cfg(all(target_os = "linux", feature = "fast-path"))]
+///
+/// Gated on the feature rather than on Linux because the health surface
+/// prints the same class of text on every platform — see
+/// [`scrub_for_terminal`].
+#[cfg(feature = "fast-path")]
 fn scrub_control_chars(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -750,6 +754,22 @@ fn scrub_control_chars(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The same scrub, for text going **straight to a terminal** rather than
+/// into a line-oriented file.
+///
+/// Built on [`scrub_control_chars`] rather than beside it, so what counts
+/// as a control character is decided in exactly one place. What differs
+/// is tab and newline: the marker file keeps them because lines are its
+/// record separator, and a terminal must not, because a `\n` inside a
+/// subsystem message can **forge a row** — a message ending
+/// `"\n  vpp-offload: healthy"` would print an extra module line that no
+/// module reported. The strings involved carry VPP, ethtool and ntuple
+/// error text from outside this process, so that is not hypothetical.
+#[cfg(feature = "fast-path")]
+fn scrub_for_terminal(s: &str) -> String {
+    scrub_control_chars(s).replace(['\n', '\t'], " ")
 }
 
 /// Append a timestamp + status line to the reconfigure marker file.
@@ -1423,19 +1443,31 @@ fn print_module_health(state_dir: &Path) {
         match (&m.report, &m.error) {
             // A check that could not run is not a verdict about the
             // module, and must not be rendered as one.
-            (_, Some(e)) => println!("  {}: health check FAILED — {e}", m.module),
+            (_, Some(e)) => println!(
+                "  {}: health check FAILED — {}",
+                scrub_for_terminal(&m.module),
+                scrub_for_terminal(e)
+            ),
             (Some(r), None) => {
-                println!("  {}: {}", m.module, health_word(r.overall));
+                println!(
+                    "  {}: {}",
+                    scrub_for_terminal(&m.module),
+                    health_word(r.overall)
+                );
                 for sub in &r.subsystems {
                     let age = match sub.last_success_age_seconds {
                         Some(a) => format!(" (last ok {a}s ago)"),
                         None => String::new(),
                     };
-                    let msg = sub.message.as_deref().unwrap_or("");
+                    let msg = sub
+                        .message
+                        .as_deref()
+                        .map(scrub_for_terminal)
+                        .unwrap_or_default();
                     let sep = if msg.is_empty() { "" } else { " — " };
                     println!(
                         "    {:<14} {}{sep}{msg}{age}",
-                        sub.name,
+                        scrub_for_terminal(&sub.name),
                         health_word(sub.state)
                     );
                 }
@@ -1445,7 +1477,7 @@ fn print_module_health(state_dir: &Path) {
             // the file was written by something else or hand-edited.
             (None, None) => println!(
                 "  {}: no report and no error recorded (malformed snapshot)",
-                m.module
+                scrub_for_terminal(&m.module)
             ),
         }
     }
@@ -1737,5 +1769,53 @@ mod vpp_detach_tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(detach_vpp_offload(&dir).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The terminal scrub. Host-runnable on purpose: this is the rule that
+/// existed on one path to an operator's TTY and not on the other, which
+/// is exactly the shape that gets missed.
+#[cfg(all(test, feature = "fast-path"))]
+mod terminal_scrub_tests {
+    use super::*;
+
+    /// An ANSI escape in module-supplied text must not reach the
+    /// terminal. `scrub_control_chars` has said so since the May 2026
+    /// audit; the health surface is a second path to the same TTY and
+    /// was not using it.
+    #[test]
+    fn an_escape_sequence_cannot_reach_the_terminal() {
+        let hostile = "ntuple insert failed: \x1b[2J\x1b[1;1Hgotcha";
+        let clean = scrub_for_terminal(hostile);
+        assert!(!clean.contains('\x1b'), "{clean:?}");
+        assert!(
+            clean.contains("gotcha") && clean.contains("ntuple insert failed"),
+            "the actual message must survive, or the scrub costs the operator the diagnosis: \
+             {clean:?}"
+        );
+    }
+
+    /// A newline must not survive either — on a terminal it FORGES A ROW.
+    ///
+    /// This is what makes the display scrub stricter than the marker
+    /// scrub rather than the same function reused: the marker file keeps
+    /// newlines because lines are its record separator. Here a subsystem
+    /// message ending in a fake health line would print a module verdict
+    /// no module reported, and the strings carry VPP/ethtool text from
+    /// outside this process.
+    #[test]
+    fn a_newline_cannot_forge_a_health_row() {
+        let forged = "cannot reach VPP\n  vpp-offload: healthy";
+        let clean = scrub_for_terminal(forged);
+        assert!(!clean.contains('\n'), "{clean:?}");
+        assert_eq!(clean, "cannot reach VPP   vpp-offload: healthy");
+    }
+
+    /// And the marker path keeps its newlines, so this did not quietly
+    /// change the file format underneath `packetframe reconfigure`.
+    #[test]
+    fn the_marker_scrub_still_keeps_its_record_separator() {
+        assert_eq!(scrub_control_chars("a\nb\tc"), "a\nb\tc");
+        assert_eq!(scrub_control_chars("a\x1bb"), "a?b");
     }
 }
