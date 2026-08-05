@@ -212,7 +212,51 @@ fn parse_mode(s: &str) -> Result<packetframe_probe::AttachMode, String> {
     }
 }
 
+/// Put SIGPIPE back to the kernel default before anything prints.
+///
+/// Rust ignores SIGPIPE at startup, so a write to a closed pipe returns
+/// EPIPE and `println!` panics on it. That turns `packetframe status |
+/// head` — an entirely ordinary thing for an operator to type — into:
+///
+/// ```text
+/// thread 'main' panicked at library/std/src/io/stdio.rs:
+/// failed printing to stdout: Broken pipe (os error 32)
+/// ```
+///
+/// which reads like packetframe broke rather than like `head` having
+/// seen enough. Observed on the shadow during the first bring-up, on a
+/// command whose output an operator was trying to trim.
+///
+/// The default disposition kills the process silently, which is what
+/// every other Unix tool does and what the shell expects. `run` inherits
+/// the same behaviour: a daemon whose stdout reader goes away now exits
+/// on the signal instead of panicking, which is the better of the two —
+/// and it cannot fire spuriously, since SIGPIPE needs the read end
+/// actually closed. Under systemd stdout is the journal socket and the
+/// case does not arise at all.
+///
+/// Not unit-tested: the behaviour is a process-level signal disposition,
+/// and any test that could observe it would be re-testing libc. It is
+/// verified the way it was found — by piping the output into `head`.
+///
+/// Gated on Linux rather than on `unix` because that is where `libc` is
+/// a dependency of this crate, and where the daemon runs. A macOS dev
+/// build keeps the panic; nobody operates a router from one.
+#[cfg(target_os = "linux")]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal` with SIG_DFL on SIGPIPE is async-signal-safe and
+    // runs before any thread is spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restore_default_sigpipe() {}
+
 fn main() -> ExitCode {
+    restore_default_sigpipe();
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // Default: info from our crates, plus suppress one upstream
         // noise source. `bgpkit_parser::parser::bgp::messages`

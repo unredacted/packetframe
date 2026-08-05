@@ -709,6 +709,28 @@ fn reconfigure_from_signal(
         }
     };
 
+    // The membership invariant, on THIS path as well as at startup.
+    //
+    // `run` validates before attaching, and that used to be the only
+    // check — which left the guard enforced on the path nobody uses to
+    // turn steering on, and absent from the one the rollout actually
+    // follows. The canary ladder is `steer off` everywhere, then flip
+    // one port and SIGHUP. Without this, that flip diverts traffic while
+    // other egress ports have no `port` line, and every destination
+    // whose best path leaves through one of them is blackholed: exactly
+    // the failure the rule was written for, reached through the
+    // documented procedure.
+    //
+    // A refusal here changes nothing. The daemon keeps running the
+    // configuration it already had, and the operator gets the reason
+    // from `packetframe reconfigure` — which is the right outcome for a
+    // config that would have diverted traffic into a hole.
+    if let Err(e) = new_config.validate_vpp_offload() {
+        tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
+        write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        return;
+    }
+
     // Before the module loop, and for the WHOLE config rather than per
     // module. vpp-offload's steering target is derived from fast-path's
     // `allow-prefix` lines, which its own `ModuleConfig` does not
@@ -965,7 +987,19 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
         let _ = rest;
         Ok(())
     } else if let Some(rest) = trimmed.strip_prefix("ERR ") {
-        Err(ReconfigureError::DaemonRejected(rest.to_string()))
+        // Drop the trailing nanosecond stamp the writer appends. Without
+        // this every rejection an operator reads ends in a 19-digit
+        // number glued to the last word of the sentence, which reads as
+        // part of the diagnostic — observed on the first real reconfigure
+        // refusal. Only stripped when the tail actually is a number, so a
+        // truncated or hand-edited marker still shows what it holds.
+        let message = match rest.rsplit_once(' ') {
+            Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+                head
+            }
+            _ => rest,
+        };
+        Err(ReconfigureError::DaemonRejected(message.to_string()))
     } else {
         // Marker exists but doesn't match the expected format.
         Err(ReconfigureError::Io(format!(

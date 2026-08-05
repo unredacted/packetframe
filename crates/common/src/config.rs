@@ -4287,4 +4287,47 @@ module fast-path
         let v = extract_mss_clamps(&m);
         assert_eq!(v[0].2, 65495);
     }
+
+    /// The membership rule must hold for a config arriving by SIGHUP,
+    /// not only one arriving at startup.
+    ///
+    /// This is the shape the rollout actually takes: start with every
+    /// port `steer off` (always valid, membership-only), then flip one
+    /// port on and reload. If only startup validates, that flip is
+    /// unchecked — and it is the exact moment traffic starts being
+    /// diverted, with other egress ports possibly having no `port` line
+    /// at all.
+    ///
+    /// Asserted on the *config* rather than through the signal handler
+    /// because the handler needs a live daemon; what has to be true is
+    /// that the same predicate rejects the same file, whichever door it
+    /// comes through.
+    #[test]
+    fn the_membership_rule_rejects_a_steer_on_reload_too() {
+        // The staging state the ladder starts from: two attached ports,
+        // both members, neither steering.
+        let staged = "module fast-path\n  attach eth4 generic\n  attach eth5 generic\n  \
+                      forwarding-mode custom-fib\n\n\
+                      module vpp-offload\n  port eth4 cores 1 steer off\n  \
+                      port eth5 cores 1 steer off\n  expected-routes 100\n";
+        Config::parse(staged)
+            .unwrap()
+            .validate_vpp_offload()
+            .expect("all-steer-off is the designed staging state");
+
+        // The rollout's first rung, with one member quietly missing.
+        // Startup would refuse this; so must a reload.
+        let rung_one = "module fast-path\n  attach eth4 generic\n  attach eth5 generic\n  \
+                        forwarding-mode custom-fib\n\n\
+                        module vpp-offload\n  port eth5 cores 1 steer on\n  \
+                        expected-routes 100\n";
+        let e = Config::parse(rung_one)
+            .unwrap()
+            .validate_vpp_offload()
+            .expect_err("eth4 has no port line while eth5 steers");
+        assert!(
+            format!("{e}").contains("eth4"),
+            "the refusal must name the uncovered port: {e}"
+        );
+    }
 }
