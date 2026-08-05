@@ -207,17 +207,20 @@ pub trait Steering {
     fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet);
 }
 
-/// A steering seam that refuses both directions.
+/// A steering seam that refuses both directions. **Tests only.**
 ///
-/// Used where no port asks to steer, and by tests. `steer` refusing is
-/// obvious. `unsteer` refusing is the half that matters: `Ok` from
-/// unsteer becomes `Event::Unsteered`, which clears `steered` and
-/// unblocks `ReleaseResources` — so a stand-in that faked success would
-/// let the supervisor release a VF that MCAM rules from a previous run
-/// might still be pointing traffic at. Refusing keeps `steered` true
-/// and the VF withheld, which is the designed behaviour for "rules
-/// exist that we cannot manage". A config with every port `steer off`
-/// never reaches either path.
+/// `bring_up` constructs a [`crate::ntuple::NtupleSteering`]
+/// unconditionally — a config with every port `steer off` gets one with
+/// an empty port list, not this — so nothing in production reaches it.
+/// It is kept because it encodes the rule every stand-in must follow,
+/// and a test double that got this wrong would prove the opposite of
+/// what it claims: `steer` refusing is obvious, but `unsteer` refusing
+/// is the half that matters. `Ok` from unsteer becomes
+/// `Event::Unsteered`, which clears `steered` and unblocks
+/// `ReleaseResources` — so faking success releases a VF that MCAM rules
+/// from a previous run might still be pointing traffic at. Refusing
+/// keeps `steered` true and the VF withheld, which is the designed
+/// behaviour for "rules exist that we cannot manage".
 #[derive(Debug, Default)]
 pub struct SteeringUnavailable;
 
