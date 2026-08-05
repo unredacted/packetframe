@@ -1819,6 +1819,35 @@ fn kernel_at_least(min: (u32, u32)) -> bool {
 /// toggle opts into the known-unsafe path. Runs *before* any
 /// hardware-level XDP attach so the driver's attach-time bugs don't
 /// even get one chance to trip.
+/// Whether a **native** XDP attach on `iface` is unsafe on this host.
+///
+/// The one expression of SPEC §11.1(c): the rvu-nicpf driver before
+/// Linux v6.8 has two bugs that together make native XDP unsafe, and on
+/// this fleet the attach is not merely degraded — it panics the kernel
+/// and takes the router down. Note that the driver *accepts* the attach
+/// first, so a probe reporting "native OK" has learned nothing about
+/// what happens next.
+///
+/// A function rather than an inline check in the gate because there are
+/// two callers and only one of them used to have it: `feasibility
+/// --config` attached native directly, bypassing the gate entirely, so
+/// a command that reads as diagnostic-only would do the forbidden thing
+/// to every configured interface — on a production box, all of them
+/// carrying traffic. Found on hardware 2026-08-05.
+fn native_xdp_unsafe(iface: &str) -> bool {
+    native_xdp_unsafe_for(kernel_version(), read_iface_driver(iface).as_deref())
+}
+
+/// The decision, separated from the two reads that feed it so it is
+/// testable on a laptop. An unreadable kernel version counts as unsafe:
+/// the whole point is that being wrong here panics a router, so "I could
+/// not tell" has to mean "do not".
+fn native_xdp_unsafe_for(kernel: Option<(u32, u32)>, driver: Option<&str>) -> bool {
+    let is_rvu = driver.is_some_and(|d| RVU_NICPF_DRIVERS.contains(&d));
+    let fixed = kernel.is_some_and(|v| v >= RVU_NICPF_FIXED_IN_KERNEL);
+    is_rvu && !fixed
+}
+
 fn rvu_nicpf_version_gate(
     attach_dirs: Vec<(String, AttachMode, u32)>,
     mcfg: &ModuleConfig<'_>,
@@ -1851,11 +1880,8 @@ fn rvu_nicpf_version_gate(
 
     let mut out = Vec::with_capacity(attach_dirs.len());
     for (iface, mode, ifindex) in attach_dirs {
-        let is_rvu = read_iface_driver(&iface)
-            .as_deref()
-            .is_some_and(|d| RVU_NICPF_DRIVERS.contains(&d));
         let wants_native = matches!(mode, AttachMode::Native | AttachMode::Auto);
-        if !is_rvu || !wants_native {
+        if !native_xdp_unsafe(&iface) || !wants_native {
             out.push((iface, mode, ifindex));
             continue;
         }
@@ -2761,6 +2787,39 @@ pub fn trial_attach_native(iface: &str) -> TrialResult {
     if let Err(e) = prog.load() {
         return TrialResult::LoadFailed(e.to_string());
     }
+    // Refused, not attempted. A capability probe must not be the thing
+    // that performs the one operation the loader refuses to perform —
+    // and `feasibility --config` probes *every* configured interface, so
+    // on a production box that is every port carrying traffic.
+    //
+    // No `driver-workaround` escape hatch here, deliberately: the toggle
+    // exists so an operator who has backported the fix can run the real
+    // data plane natively, and honouring it in a diagnostic would mean
+    // this function needed the config for the sole purpose of being able
+    // to panic the box. Generic is still probed, so the report keeps its
+    // useful half.
+    if native_xdp_unsafe(iface) {
+        let native_error = format!(
+            "refused without attempting: rvu-nicpf on kernel {} lacks commit 04f647c8e456 \
+             (Linux v6.8+), which makes a native attach unsafe on this driver — SPEC \
+             §11.1(c). The loader refuses it too; this probe will not do it just to \
+             report the result.",
+            kernel_version()
+                .map(|(a, b)| format!("{a}.{b}"))
+                .unwrap_or_else(|| "<unknown>".into())
+        );
+        return match prog.attach_to_if_index(ifindex, XdpFlags::SKB_MODE) {
+            Ok(link_id) => {
+                let _ = prog.detach(link_id);
+                TrialResult::GenericOnly { native_error }
+            }
+            Err(generic_err) => TrialResult::Neither {
+                native_error,
+                generic_error: generic_err.to_string(),
+            },
+        };
+    }
+
     match prog.attach_to_if_index(ifindex, XdpFlags::DRV_MODE) {
         Ok(link_id) => {
             // Detach immediately, this was a probe.
@@ -3090,6 +3149,45 @@ pub fn bpffs_pin_root(state: &ActiveState) -> PathBuf {
 #[allow(dead_code)]
 pub fn state_dir(state: &ActiveState) -> &Path {
     &state.state_dir
+}
+
+#[cfg(test)]
+mod native_gate_tests {
+    use super::*;
+
+    /// The one rule, in the one place both callers read it from.
+    ///
+    /// It exists because `feasibility --config` used to attach native
+    /// XDP directly — the exact operation `rvu_nicpf_version_gate`
+    /// refuses — to every configured interface. A diagnostic that
+    /// panics a production router is a worse bug than the missing
+    /// capability it was reporting on.
+    #[test]
+    fn native_is_unsafe_only_on_rvu_nicpf_before_v6_8() {
+        // The fleet: pre-6.8 rvu-nicpf, both spellings.
+        assert!(native_xdp_unsafe_for(Some((5, 15)), Some("rvu_nicpf")));
+        assert!(native_xdp_unsafe_for(Some((5, 15)), Some("rvu-nicpf")));
+
+        // Fixed kernel: the upstream commit is in, native is allowed.
+        assert!(!native_xdp_unsafe_for(Some((6, 8)), Some("rvu_nicpf")));
+        assert!(!native_xdp_unsafe_for(Some((6, 9)), Some("rvu_nicpf")));
+
+        // Another driver on the same old kernel is not our problem.
+        assert!(!native_xdp_unsafe_for(Some((5, 15)), Some("mlx5_core")));
+        assert!(!native_xdp_unsafe_for(Some((5, 15)), None));
+    }
+
+    /// Unknown kernel on the affected driver is treated as unsafe.
+    ///
+    /// Asserted separately because it is the direction that is easy to
+    /// get backwards: `kernel_at_least` returning false for an
+    /// unreadable version happens to give the safe answer here, and a
+    /// later refactor that flipped it to a permissive default would be
+    /// silent. Being wrong in this direction panics a router.
+    #[test]
+    fn an_unreadable_kernel_version_counts_as_unsafe() {
+        assert!(native_xdp_unsafe_for(None, Some("rvu_nicpf")));
+    }
 }
 
 #[cfg(test)]
