@@ -206,6 +206,11 @@ mod sys {
                 std::io::Error::last_os_error()
             ));
         }
+        // `ioctl`'s request argument is `c_ulong` on glibc and `c_int`
+        // on musl, so this cast is a no-op on one published target and
+        // load-bearing on another — the same reason `probe/mod.rs` and
+        // `probe/bpf.rs` carry this allow. Without it clippy fails the
+        // glibc build; without the cast, the musl build does not compile.
         #[allow(clippy::unnecessary_cast)]
         let rc = unsafe { libc::ioctl(sock, SIOCETHTOOL as _, &mut ifr) };
         let err = std::io::Error::last_os_error();
@@ -308,6 +313,28 @@ impl NtupleSteering {
         &self.installed
     }
 
+    /// Remove `victims`, **keeping whatever would not come out**.
+    ///
+    /// One routine because there are two callers — `steer`'s rollback and
+    /// `unsteer` — and they must agree on the half that matters: a rule
+    /// the NIC would not delete is still steering traffic, so it has to
+    /// stay in `installed`. `Ok` from `unsteer` is what releases the VF,
+    /// and a rollback that dropped its failures would empty the list, let
+    /// a later `unsteer` find nothing, and hand back a VF with a live
+    /// rule pointing into it.
+    ///
+    /// Returns the failures, formatted for the caller's message.
+    fn remove_all(&mut self, victims: Vec<(String, u32)>) -> Vec<String> {
+        let mut failed = Vec::new();
+        for (iface, loc) in victims {
+            if let Err(e) = delete(&iface, loc) {
+                failed.push(format!("{iface} loc {loc}: {e}"));
+                self.installed.push((iface, loc));
+            }
+        }
+        failed
+    }
+
     /// Adopt locations a previous process installed.
     ///
     /// Without this a restart cannot remove them: the plan would be
@@ -335,12 +362,8 @@ impl crate::runtime::Steering for NtupleSteering {
                     // All-or-nothing. A partially steered port divides
                     // traffic between the tiers along a line nobody chose,
                     // so back out what landed before reporting the failure.
-                    let mut rollback = Vec::new();
-                    for (i, loc) in std::mem::take(&mut self.installed) {
-                        if let Err(re) = delete(&i, loc) {
-                            rollback.push(format!("{i} loc {loc}: {re}"));
-                        }
-                    }
+                    let victims = std::mem::take(&mut self.installed);
+                    let rollback = self.remove_all(victims);
                     return Err(if rollback.is_empty() {
                         format!("{e}; every rule installed before it was removed")
                     } else {
@@ -362,21 +385,10 @@ impl crate::runtime::Steering for NtupleSteering {
     }
 
     fn unsteer(&mut self) -> Result<(), String> {
-        let mut failed = Vec::new();
-        // Drained as we go: a location removed successfully must not be
-        // retried by a later call, and one that failed must stay
-        // recorded — `Ok` from here is what releases the VF.
-        let mut remaining = Vec::new();
-        for (iface, loc) in std::mem::take(&mut self.installed) {
-            match delete(&iface, loc) {
-                Ok(()) => {}
-                Err(e) => {
-                    failed.push(format!("{iface} loc {loc}: {e}"));
-                    remaining.push((iface, loc));
-                }
-            }
-        }
-        self.installed = remaining;
+        // Same routine the rollback uses, so the two cannot disagree
+        // about what happens to a rule that would not come out.
+        let victims = std::mem::take(&mut self.installed);
+        let failed = self.remove_all(victims);
         if failed.is_empty() {
             Ok(())
         } else {
@@ -497,6 +509,41 @@ mod tests {
         let e = s.steer().expect_err("must refuse");
         assert!(e.contains("nothing to steer"), "{e}");
         assert!(s.installed().is_empty());
+    }
+
+    /// A rule that would not delete STAYS recorded.
+    ///
+    /// This is the invariant `steer`'s rollback used to break while
+    /// `unsteer`, thirty lines away, got it right: the rollback took the
+    /// list, recorded delete failures in a message, and left `installed`
+    /// empty. A later `unsteer` then found nothing, returned `Ok` — and
+    /// `Ok` from unsteer is precisely what releases the VF — handing back
+    /// a VF with a live rule still steering traffic into it.
+    ///
+    /// Both paths now share `remove_all`, so they cannot disagree. Driven
+    /// through it directly because every `delete` fails on a non-Linux
+    /// host, which is exactly the condition under test.
+    #[test]
+    fn a_rule_that_will_not_delete_stays_recorded() {
+        use crate::runtime::Steering as _;
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
+        s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
+
+        let victims = std::mem::take(&mut s.installed);
+        let failed = s.remove_all(victims);
+        assert_eq!(failed.len(), 2, "both deletions failed on this host");
+        assert_eq!(
+            s.installed().len(),
+            2,
+            "a rule that would not come out must stay recorded, or the next \
+             unsteer reports success over live steering"
+        );
+
+        // And that is what makes the refusal reachable: unsteer must not
+        // report Ok while anything is still installed.
+        let e = s.unsteer().expect_err("must refuse while rules remain");
+        assert!(e.contains("must not be released"), "{e}");
+        assert_eq!(s.installed().len(), 2, "still recorded after the refusal");
     }
 
     /// Adopted locations survive into `unsteer`.
