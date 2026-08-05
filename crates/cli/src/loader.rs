@@ -987,7 +987,19 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
         let _ = rest;
         Ok(())
     } else if let Some(rest) = trimmed.strip_prefix("ERR ") {
-        Err(ReconfigureError::DaemonRejected(rest.to_string()))
+        // Drop the trailing nanosecond stamp the writer appends. Without
+        // this every rejection an operator reads ends in a 19-digit
+        // number glued to the last word of the sentence, which reads as
+        // part of the diagnostic — observed on the first real reconfigure
+        // refusal. Only stripped when the tail actually is a number, so a
+        // truncated or hand-edited marker still shows what it holds.
+        let message = match rest.rsplit_once(' ') {
+            Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+                head
+            }
+            _ => rest,
+        };
+        Err(ReconfigureError::DaemonRejected(message.to_string()))
     } else {
         // Marker exists but doesn't match the expected format.
         Err(ReconfigureError::Io(format!(

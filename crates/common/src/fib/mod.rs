@@ -211,6 +211,16 @@ pub enum Completeness {
         authority: u64,
         mirror: u64,
     },
+    /// The mirror holds substantially MORE than the authority claims.
+    ///
+    /// Not a loading state, and not a drift figure worth printing — it
+    /// means the thing being asked is not the thing feeding us. Seen on
+    /// first contact: the box had a local `birdc` answering for its own
+    /// near-empty bird while the table arrived from a different router,
+    /// and the "% short" arithmetic reported 6852510%. Steering is still
+    /// refused — an authority we cannot trust is no basis for diverting
+    /// traffic — but the reason has to say which problem it is.
+    AuthorityMismatch { authority: u64, mirror: u64 },
     /// There is a report, but it is too old to act on.
     Stale { age: std::time::Duration },
     /// No report at all, or none that supports a judgement.
@@ -244,6 +254,12 @@ impl Completeness {
                 "the route mirror holds {mirror} of the authority's {authority} routes \
                  ({:.2}% short) — it is probably still loading",
                 drift * 100.0
+            ),
+            Completeness::AuthorityMismatch { authority, mirror } => format!(
+                "the route mirror holds {mirror} routes but the authority reports only \
+                 {authority} — that is not the authority feeding this mirror. Check which \
+                 bird `birdc` is talking to; on a box whose routes come from elsewhere, \
+                 `require-table-complete off` is the right answer"
             ),
             Completeness::Stale { age } => format!(
                 "the last completeness check was {}s ago, too old to act on",
@@ -280,13 +296,23 @@ pub fn assess(
         };
     };
     if drift <= max_drift {
-        Completeness::Converged { drift }
-    } else {
-        Completeness::Incomplete {
-            drift,
+        return Completeness::Converged { drift };
+    }
+    // Which side is short decides which problem this is, and they lead
+    // somewhere different. Short of the authority is a mirror still
+    // loading — wait. Larger than the authority cannot be a loading
+    // state at all; it means the authority is not the one feeding this
+    // mirror, and no amount of waiting fixes it.
+    if r.mirror_routes > r.authority_routes {
+        return Completeness::AuthorityMismatch {
             authority: r.authority_routes,
             mirror: r.mirror_routes,
-        }
+        };
+    }
+    Completeness::Incomplete {
+        drift,
+        authority: r.authority_routes,
+        mirror: r.mirror_routes,
     }
 }
 
@@ -681,6 +707,41 @@ mod tests {
                 !h.verdict().permits_steering(),
                 "the newest report is the verdict"
             );
+        }
+
+        /// A mirror LARGER than the authority is not a loading state.
+        ///
+        /// This is what the shadow produced on first contact: a local
+        /// `birdc` answering for a near-empty bird while the table
+        /// arrived from a different router. The old arithmetic called it
+        /// "6852510% short — probably still loading", which is the exact
+        /// opposite of what was wrong and sends an operator to wait for
+        /// something that will never happen.
+        #[test]
+        fn a_mirror_larger_than_the_authority_names_the_right_problem() {
+            let v = verdict(Some(report(19, 1_301_996, Duration::ZERO)));
+            assert!(!v.permits_steering());
+            assert!(matches!(v, Completeness::AuthorityMismatch { .. }), "{v:?}");
+            let msg = v.describe();
+            assert!(
+                msg.contains("not the authority feeding this mirror"),
+                "the operator must be told it is the wrong authority, not a slow one: {msg}"
+            );
+            assert!(
+                !msg.contains("short") && !msg.contains("loading"),
+                "and must NOT be told to wait: {msg}"
+            );
+        }
+
+        /// A mirror trivially ahead of the authority is still converged.
+        ///
+        /// Routes arrive between the two counts, so the mirror leading by
+        /// a hair is ordinary churn. Only a gap past the drift threshold
+        /// means the authority is wrong.
+        #[test]
+        fn a_mirror_a_hair_ahead_is_still_converged() {
+            let v = verdict(Some(report(1_000_000, 1_000_500, Duration::ZERO)));
+            assert!(v.permits_steering(), "{v:?}");
         }
     }
 }

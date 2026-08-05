@@ -102,6 +102,23 @@ pub struct Attached {
     pub adopted_process: bool,
 }
 
+/// Which completeness handle the runtime should actually gate on.
+///
+/// A named function rather than an inline `if` because the bug it fixes
+/// was an inline nothing: the directive was parsed, refused against, and
+/// never consulted where it decided anything. One place, one rule,
+/// testable without a NIC.
+fn completeness_gate(
+    cfg: &VppOffloadConfig,
+    handle: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+) -> Option<Arc<packetframe_common::fib::TableCompleteness>> {
+    if cfg.require_table_complete {
+        handle
+    } else {
+        None
+    }
+}
+
 /// Acquire, render, adopt-or-arm, and start supervising.
 ///
 /// On any failure after acquisition, everything acquired is released
@@ -129,6 +146,17 @@ pub fn bring_up(
                 .into(),
         );
     }
+    // `off` means off.
+    //
+    // The loader builds a completeness handle whenever both modules are
+    // configured and hands it over unconditionally — it has no view of
+    // this directive. So dropping it HERE is the only thing that makes
+    // `require-table-complete off` mean anything. Without this the
+    // directive was read, validated against above, and then ignored: the
+    // gate ran on every deployment, including the ones that set it off
+    // precisely because they have no authority worth comparing to.
+    let completeness = completeness_gate(cfg, completeness);
+
     // --- Everything pure first. A config that cannot work must cost no
     // sysfs writes; the alternative is a rollback path exercised by
     // ordinary operator typos.
@@ -593,4 +621,44 @@ fn finish(
         acquired,
         adopted_process,
     })
+}
+
+/// `require-table-complete off` must actually turn the gate off.
+///
+/// The loader hands over a completeness handle whenever both modules are
+/// configured — it has no view of this directive — so the module is the
+/// only thing that can honour it. Before this, the directive was parsed,
+/// refused against when no publisher existed, and then ignored: the gate
+/// ran on every deployment, including the ones that set it off precisely
+/// because their `birdc` answers for the wrong bird. Found on the shadow,
+/// where `off` was set and the steer was refused anyway.
+#[cfg(test)]
+mod completeness_gate_tests {
+    use super::*;
+
+    fn cfg(require: bool) -> VppOffloadConfig {
+        VppOffloadConfig {
+            ports: vec![("eth1".into(), 1, false)],
+            vpp_binary: None,
+            expected_routes: 1_600_000,
+            hugepages: None,
+            require_table_complete: require,
+        }
+    }
+
+    #[test]
+    fn off_drops_the_handle_and_on_keeps_it() {
+        let handle = Arc::new(packetframe_common::fib::TableCompleteness::new());
+
+        assert!(
+            completeness_gate(&cfg(false), Some(handle.clone())).is_none(),
+            "`off` must drop the handle, or the directive decides nothing"
+        );
+        assert!(
+            completeness_gate(&cfg(true), Some(handle)).is_some(),
+            "`on` must keep it"
+        );
+        // And nothing invents a gate that was never handed over.
+        assert!(completeness_gate(&cfg(true), None).is_none());
+    }
 }
