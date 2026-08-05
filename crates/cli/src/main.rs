@@ -8,11 +8,14 @@
 //! detaching. `fib` (Option F, Phase 3.8, see SPEC.md §4.11) opens
 //! the pinned custom-FIB maps directly for inspection.
 
+mod atomic;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod breaker;
 mod feasibility;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod fib_cli;
+#[cfg(feature = "fast-path")]
+mod health;
 mod loader;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod metrics;

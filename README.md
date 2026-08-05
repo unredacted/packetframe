@@ -76,6 +76,8 @@ PacketFrame complements existing routing daemons rather than replacing them. The
 | Two-stage BPF datapath (`fast_path` + `finalize` via `bpf_tail_call`) | Production (v0.2.5+); see [docs/runbooks/tail-call-architecture.md](docs/runbooks/tail-call-architecture.md) |
 | `probe` module (diagnostic XDP) | Production |
 | tc-ingress datapath (`attach <iface> tc`, custom-fib only) | Experimental (Phase T); see [docs/runbooks/tc-datapath.md](docs/runbooks/tc-datapath.md) |
+| Module health + metrics surface (`packetframe status`, `packetframe_vpp_*`) | Production |
+| `vpp-offload` module (VPP-on-VF forwarding vector) | **Code-complete, hardware-unproven** — never run against a real VPP; see [docs/runbooks/vpp-offload.md](docs/runbooks/vpp-offload.md) |
 | `ddos` module (XDP-time SYN-flood + amplification filter) | Future; sketched in SPEC §5.2 (priority 0–999, security/admission) |
 | `sampler` module (per-flow ringbuf observability) | Future; sketched in SPEC §5.3 (priority 2000–2999, observation) |
 | `randomizer` module (TC egress jitter for NoiseNet anti-correlation) | Future; sketched in SPEC §5.1 (priority ~3000, egress) |
@@ -212,6 +214,33 @@ route-source bmp 127.0.0.1:6543 require-loc-rib
 
 See [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) for the full operational guide: cutover sequence, rollback, integrity checking, troubleshooting.
 
+## Forwarding vectors
+
+`forwarding-mode` chooses how a route is *resolved*. A **vector** is what
+actually moves the packet, and PacketFrame is built to carry more than
+one at a time.
+
+- **eBPF fast-path** (XDP on the PFs) is the vector today, and stays the
+  permanent failover tier. It is at its structural floor under generic
+  XDP — native XDP panics the reference vendor kernel, so there is no
+  cheap headroom left here.
+- **`vpp-offload`** (phase 4) adds a second: MCAM hardware bifurcation
+  steers allowlisted traffic to an SR-IOV VF owned by a
+  packetframe-supervised VPP, which forwards it from a full-table FIB fed
+  by the same resolved best-paths the eBPF tier uses. Anything not
+  steered — and everything, if VPP dies — stays on the tier above.
+
+The split is what makes the second vector safe to adopt incrementally:
+membership is provisioned everywhere first, then steering is turned on
+one port at a time, and turning it off is a config edit rather than a
+restart. **No dataplane code for the second vector lives in this repo** —
+VPP is unmodified upstream, built and shipped on its own release tag.
+
+`vpp-offload` is code-complete and **hardware-unproven**: it has never
+run against a real VPP process, and its MCAM ioctl path has never met a
+NIC. Read [`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md)
+before enabling it anywhere that carries traffic.
+
 ## Attach modes
 
 Each `attach <iface> <mode>` directive picks how XDP binds to the interface:
@@ -294,6 +323,8 @@ Counters export as Prometheus textfile every 15 s when `metrics-textfile` is set
 
 - [`conf/example.conf`](conf/example.conf): annotated reference config
 - [`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md): operational runbook for custom-FIB mode (cutover, rollback, integrity checks, triage by symptom)
+- [`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md): operational runbook for the VPP-on-VF vector (canary ladder, rollback, triage, and which published numbers are measured)
+- [`docs/runbooks/vpp-offload-spike.md`](docs/runbooks/vpp-offload-spike.md): the gate-0b bring-up procedure and its results, including what failed
 
 ## Build from source
 
