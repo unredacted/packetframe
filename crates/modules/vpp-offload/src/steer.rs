@@ -41,14 +41,11 @@
 //! family attempted that cannot work, a budget overrun leaving a port
 //! half-steered) is decided here and tested without hardware.
 //!
-//! The ioctl half is deliberately absent rather than sketched.
-//! `ethtool_rx_flow_spec` is not in `libc`, so its layout would be
-//! hand-written from a header this machine cannot read, and a field in
-//! the wrong place produces rules that install cleanly and match the
-//! wrong traffic. When it lands it must **read every rule back** with
-//! `ETHTOOL_GRXCLSRULE` and compare against what was asked for, so the
-//! layout is self-validating on the first real NIC instead of trusted —
-//! the same reasoning the FIB readback verify rests on.
+//! The ioctl half is [`crate::ntuple`], which installs what this plans
+//! and reads every rule back with `ETHTOOL_GRXCLSRULE` before believing
+//! it — `ethtool_rx_flow_spec` is not in `libc`, so its layout is
+//! hand-written, and a field in the wrong place produces rules that
+//! install cleanly and match the wrong traffic.
 
 use std::net::Ipv4Addr;
 

@@ -267,6 +267,9 @@ fn a_persist_that_recovers_clears_the_recorded_failure() {
                 Ok(())
             }
         }
+        fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     let fake = Fake::start("store-recover");
@@ -350,6 +353,9 @@ fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
             }
         }
         fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
+        fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
             Ok(())
         }
     }

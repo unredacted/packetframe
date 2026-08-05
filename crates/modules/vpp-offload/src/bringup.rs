@@ -423,6 +423,23 @@ fn finish(
     let steered = !state.steer_rules.is_empty();
     let adopted_process = adopted.is_some();
 
+    // Take ownership of the rules the record names, so `unsteer` can
+    // remove them.
+    //
+    // `steered` above is derived from the same field, and the two must
+    // not diverge: believing traffic is diverted while holding no way to
+    // undivert it is worse than either mistake alone — every teardown
+    // would emit an `Unsteer` that found an empty ledger, answered `Ok`,
+    // and released the VF with the rules still in the NIC.
+    //
+    // Rules recorded for an interface that is no longer a member port
+    // are adopted TOO, deliberately. They are in the NIC either way, and
+    // this object is the only thing that will ever remove them; dropping
+    // them here because the config changed is how a `steer on` port
+    // removed from the config keeps diverting traffic forever.
+    let mut steering = steering;
+    steering.adopt_installed(crate::resources::flatten_steer_rules(&state.steer_rules));
+
     let capacity = startup_conf::route_capacity(sizing);
     let api_socket_path = paths.api_socket.clone();
     let startup_conf_path = paths.startup_conf.clone();
@@ -509,6 +526,17 @@ fn finish(
             // Nothing to hand over: VPP does not exist yet, so there is no
             // API to handshake with. The loop's `Start` spawns it and the
             // driver polls `api_ready` while `Starting`.
+            //
+            // But the RULES may still be there. MCAM outlives the
+            // process, so a VPP that died steered leaves its rules
+            // diverting allowlisted traffic into a VF with nothing
+            // behind it — blackholing since the moment it died. Telling
+            // the supervisor makes its own teardown ordering handle it:
+            // `Unsteer` first, and if the NIC refuses, `steered` stays
+            // true and the VF stays withheld. Doing the removal here
+            // instead would be a second, unsupervised path to the same
+            // effect, whose failures nothing would ever retry.
+            None if steered => vec![Event::InheritedSteering, Event::StartRequested],
             None => vec![Event::StartRequested],
         };
         Ok((Driver::new(), runtime, initial))

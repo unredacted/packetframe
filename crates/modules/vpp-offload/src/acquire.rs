@@ -575,6 +575,22 @@ impl IdentityStore for FileStore {
         }
         self.state.save(&self.state_dir)
     }
+
+    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+        // Grouped by interface for the file's shape, and REPLACED rather
+        // than merged: the argument is the complete ledger, so an
+        // interface that no longer appears has no rules left. Merging
+        // would make `steer off` on one port unrecordable.
+        //
+        // Deliberately NOT validated against `self.ports` the way
+        // `interfaces_attached` validates its interface. That check
+        // exists to stop attach inventing a resource nothing holds; here
+        // the rule is already in the NIC, and refusing to write it down
+        // because the port record looks wrong would leave the one thing
+        // a later `detach --all` needs unrecorded.
+        self.state.steer_rules = crate::resources::group_steer_rules(rules);
+        self.state.save(&self.state_dir)
+    }
 }
 
 /// The single owner of everything attach acquired: the state file and
@@ -639,6 +655,23 @@ impl IdentityStore for ResourceOwner {
         }
         self.store.interfaces_attached(indices)
     }
+
+    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+        if self.released {
+            // Release only happens after a teardown reported clean,
+            // which requires an `Unsteer` that confirmed the rules gone
+            // — so the only steering change that can arrive here is one
+            // recording an empty set, and the file it would re-create
+            // describes VFs nothing holds. Refusing is right; a
+            // NON-empty set arriving here would mean the release rules
+            // were violated upstream, and that is worth the loud store
+            // error rather than a silent write.
+            return Err(
+                "resources were already released; refusing to re-create the state file".into(),
+            );
+        }
+        self.store.steering_changed(rules)
+    }
 }
 
 impl ResourceRelease for ResourceOwner {
@@ -691,6 +724,9 @@ impl IdentityStore for SharedOwner {
     }
     fn interfaces_attached(&mut self, indices: &[(String, u32)]) -> Result<(), String> {
         self.0.borrow_mut().interfaces_attached(indices)
+    }
+    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+        self.0.borrow_mut().steering_changed(rules)
     }
 }
 
@@ -1347,5 +1383,71 @@ mod tests {
         owner.process_changed(None).unwrap();
         let after = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
         assert_eq!(after.ports.len(), 1, "eth3 was resurrected by a later save");
+    }
+
+    /// The steering ledger reaches the file, and reaches it in a shape
+    /// `bring_up` can read back.
+    ///
+    /// This is the seam that shipped missing: `ResourceState::steer_rules`
+    /// was read by `bring_up` — to decide whether an adopted VPP is
+    /// diverting traffic — and written by nothing. So a daemon restart
+    /// over a steered VPP believed nothing was steered, emitted no
+    /// `Unsteer` on teardown, and released the VF with MCAM still
+    /// pointing traffic into it.
+    ///
+    /// Asserted through a full round trip rather than on the field,
+    /// because the field alone proves nothing: what has to hold is that
+    /// the pairs written here are the pairs `NtupleSteering` gets back.
+    #[test]
+    fn the_steering_ledger_round_trips_through_the_state_file() {
+        let f = Fixture::new(
+            "owner-steer",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let mut owner = ResourceOwner::new(state, f.paths.clone());
+
+        let rules = vec![
+            ("eth2".to_string(), 1024u32),
+            ("eth2".to_string(), 1025),
+            ("eth3".to_string(), 1024),
+        ];
+        owner.steering_changed(&rules).unwrap();
+
+        // The flattening `bring_up` performs, against what it was given.
+        let on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        let restored = crate::resources::flatten_steer_rules(&on_disk.steer_rules);
+        assert_eq!(restored, rules, "what goes in is what comes back");
+        assert!(
+            !on_disk.steer_rules.is_empty(),
+            "and it is non-empty, which is what makes `Adopted {{ steered: true }}` reachable"
+        );
+    }
+
+    /// An empty ledger REPLACES the recorded one rather than merging.
+    ///
+    /// `steer off` on the last steered port produces exactly this call.
+    /// Merging would leave the removed rules on the record forever, and
+    /// the next daemon start would adopt them — believing itself steered,
+    /// and holding locations the NIC no longer has.
+    #[test]
+    fn clearing_the_steering_ledger_clears_the_record() {
+        let f = Fixture::new(
+            "owner-unsteer",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let mut owner = ResourceOwner::new(state, f.paths.clone());
+
+        owner
+            .steering_changed(&[("eth2".to_string(), 1024)])
+            .unwrap();
+        owner.steering_changed(&[]).unwrap();
+
+        let on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        assert!(
+            on_disk.steer_rules.is_empty(),
+            "an unsteer that confirmed removal must leave nothing for the next start to adopt"
+        );
     }
 }

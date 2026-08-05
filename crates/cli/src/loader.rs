@@ -243,6 +243,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         }
     };
 
+    // One allowlist object, not a copy per consumer. The SIGHUP path
+    // republishes into it from the SAME derivation the startup path
+    // uses, which is what makes "vpp-offload steers exactly what
+    // fast-path allows" survive a reconfigure — see `SharedAllowlist`.
+    #[cfg(feature = "vpp-offload")]
+    let allowlist = std::sync::Arc::new(packetframe_vpp_offload::SharedAllowlist::new(
+        crate::feasibility::allowlist_from_config(&config),
+    ));
+
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
@@ -266,7 +275,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 // Steering diverts the fast-path allowlist, so it comes
                 // from that section. The loader is the only place that
                 // sees both.
-                m.set_allowlist(crate::feasibility::allowlist_from_config(&config));
+                m.set_allowlist(allowlist.clone());
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {
@@ -389,8 +398,14 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
     tracing::info!("fast-path running, SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
-    let termination = drive_signal_loop(config_path, &config.global.state_dir, &mut modules)
-        .map_err(RunError::Runtime)?;
+    let termination = drive_signal_loop(
+        config_path,
+        &config.global.state_dir,
+        &mut modules,
+        #[cfg(feature = "vpp-offload")]
+        &allowlist,
+    )
+    .map_err(RunError::Runtime)?;
 
     // Stop the exporter + breaker sampler(s) first so their final
     // writes complete before we touch module state.
@@ -543,6 +558,7 @@ fn drive_signal_loop(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) -> Result<Termination, String> {
     use signal_hook::{
         consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1},
@@ -554,7 +570,13 @@ fn drive_signal_loop(
 
     for sig in signals.forever() {
         match sig {
-            SIGHUP => reconfigure_from_signal(config_path, state_dir, modules),
+            SIGHUP => reconfigure_from_signal(
+                config_path,
+                state_dir,
+                modules,
+                #[cfg(feature = "vpp-offload")]
+                allowlist,
+            ),
             SIGTERM | SIGINT => {
                 tracing::info!(signal = sig, "termination requested");
                 return Ok(Termination::ExitPreserveAttach);
@@ -580,6 +602,7 @@ fn reconfigure_from_signal(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) {
     use packetframe_common::module::ModuleConfig;
 
@@ -595,6 +618,15 @@ fn reconfigure_from_signal(
             return;
         }
     };
+
+    // Before the module loop, and for the WHOLE config rather than per
+    // module. vpp-offload's steering target is derived from fast-path's
+    // `allow-prefix` lines, which its own `ModuleConfig` does not
+    // contain — so without this its `reconfigure` would re-derive the
+    // steering plan from the allowlist as it was at startup, find it
+    // unchanged, and report OK for a SIGHUP that changed nothing.
+    #[cfg(feature = "vpp-offload")]
+    allowlist.publish(crate::feasibility::allowlist_from_config(&new_config));
 
     let mut failures: Vec<String> = Vec::new();
     for (name, module) in modules.iter_mut() {
@@ -1058,48 +1090,64 @@ fn detach_fast_path(
 /// confirmed gone: unbinding a VF or handing back hugepages while a process
 /// can still DMA through them is memory corruption, whereas leaking a VF is a
 /// line in `packetframe status` and a reboot's worth of inconvenience.
-/// Steering is not unwound here because MCAM is not implemented yet; when it
-/// is, it must come first (before the kill), or traffic is left pointed at a
-/// VF nothing services.
+/// **Steering comes down first**, before the kill, or traffic is left pointed
+/// at a VF nothing services.
 #[cfg(feature = "vpp-offload")]
 fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     use packetframe_vpp_offload::acquire::{release, SysPaths};
+    use packetframe_vpp_offload::ntuple::NtupleSteering;
     use packetframe_vpp_offload::process::{terminate_or_leak, Disposition, VppProcess};
-    use packetframe_vpp_offload::resources::ResourceState;
-    use packetframe_vpp_offload::runtime::TERM_GRACE;
+    use packetframe_vpp_offload::resources::{
+        flatten_steer_rules, group_steer_rules, ResourceState,
+    };
+    use packetframe_vpp_offload::runtime::{Steering as _, TERM_GRACE};
+    use packetframe_vpp_offload::steer::RuleSet;
 
     let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
         return Ok(()); // nothing was ever acquired
     };
 
     // Recorded MCAM rules mean traffic is DIVERTED to a VF this function is
-    // about to unbind. Refuse.
+    // about to unbind, so they come down FIRST.
     //
     // The module's teardown ordering is unsteer → abort → kill → release, and
     // the first step is not decoration: releasing a VF that MCAM still points
     // at leaves steered traffic arriving at a function nothing services — a
     // blackhole, which is the failure the whole `Disposition::MustLeak`
-    // discipline exists to avoid, reached from the other direction. This path
-    // cannot unsteer, because MCAM is not implemented until slice 5.
+    // discipline exists to avoid, reached from the other direction.
     //
-    // `steer_rules` is always empty today for exactly that reason, so this is
-    // a guard against a future state rather than a live bug. It is a guard
-    // and not a comment deliberately: "when steering ships, unsteer here
-    // first" is the kind of note this session has watched expire more than
-    // once, and a refusal cannot be forgotten.
+    // This used to be a REFUSAL, guarding a state that could not yet occur:
+    // nothing wrote `steer_rules`, so it was always empty. It is live now,
+    // and a refusal would be the wrong answer — `packetframe detach --all` is
+    // the remedy every error in this subsystem points an operator at, and
+    // refusing it whenever a steered VPP had been running would strand the
+    // box with no way forward. It can do the removal, so it does.
+    //
+    // Through `NtupleSteering` rather than a delete loop here, so this shares
+    // the module's removal routine — including the half that matters, that a
+    // rule the NIC will not delete stays on the record. A second
+    // implementation of "take steering down" is exactly the asymmetry that
+    // produced the release-a-steered-VF bug twice already.
     if !state.steer_rules.is_empty() {
-        let ifaces: Vec<&str> = state
-            .steer_rules
-            .iter()
-            .map(|(iface, _)| iface.as_str())
-            .collect();
-        return Err(format!(
-            "vpp-offload: the state file records MCAM steering rules on {}, so traffic is \
-             being diverted to VF(s) this teardown would unbind — that would blackhole it. \
-             This command cannot remove those rules (MCAM steering is not implemented yet); \
-             clear them first, then re-run.",
-            ifaces.join(", ")
-        ));
+        let recorded = flatten_steer_rules(&state.steer_rules);
+        let mut steering = NtupleSteering::new(Vec::new(), RuleSet::default());
+        steering.adopt_installed(recorded);
+        if let Err(e) = steering.unsteer() {
+            // Write back what is STILL in the NIC before refusing. The rules
+            // that came out must not be retried by the operator's next
+            // attempt, and the ones that did not have to stay findable —
+            // this file is the only record of them.
+            let mut state = state;
+            state.steer_rules = group_steer_rules(&steering.installed());
+            let _ = state.save(state_dir);
+            return Err(format!(
+                "vpp-offload: {e}. The VF(s) were NOT unbound, because MCAM is still \
+                 diverting traffic to them — unbinding now would blackhole it. The state \
+                 file records exactly which rules remain; remove them by hand \
+                 (`ethtool -N <iface> delete <loc>`) and re-run."
+            ));
+        }
+        tracing::info!("vpp-offload: MCAM steering rules removed");
     }
 
     // Kill the recorded VPP first, if it is still the process we recorded.
@@ -1466,16 +1514,25 @@ mod vpp_detach_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Recorded steering rules must block the teardown.
+    /// Steering that cannot be removed blocks the teardown, and the
+    /// record keeps naming exactly what is left.
     ///
-    /// The module unsteers before it releases, because releasing a VF that
-    /// MCAM still points at blackholes the traffic it diverts. This path
-    /// cannot unsteer (no MCAM yet), so it must refuse rather than release.
-    /// Latent today — `steer_rules` is always empty — which is precisely why
-    /// it is a guard with a test rather than a note for later.
+    /// Releasing a VF that MCAM still points at blackholes the traffic it
+    /// diverts, so the removal comes first and a refused removal stops the
+    /// release. What changed when `steer_rules` acquired a writer is the
+    /// *shape* of the guard: this path used to refuse unconditionally,
+    /// which was correct while the field was always empty and became wrong
+    /// the moment it was not — `detach --all` is the remedy every error in
+    /// this subsystem points at, and one that refuses whenever a steered
+    /// VPP had been running would strand the box.
+    ///
+    /// On this host no ethtool call can succeed, so what is exercised is
+    /// the refusal path. The assertion is on the RECORD rather than on the
+    /// message, because that is the invariant: rules that would not come
+    /// out must stay findable, or nothing can ever remove them.
     #[test]
-    fn recorded_steering_rules_block_the_teardown() {
-        use packetframe_vpp_offload::resources::ResourceState;
+    fn steering_that_will_not_come_down_blocks_the_teardown() {
+        use packetframe_vpp_offload::resources::{flatten_steer_rules, ResourceState};
 
         let dir = std::env::temp_dir().join(format!("pf-detach-steer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1483,12 +1540,21 @@ mod vpp_detach_tests {
         state.steer_rules = vec![("eth5".to_string(), vec![0, 1])];
         state.save(&dir).unwrap();
 
-        let e = detach_vpp_offload(&dir).expect_err("must refuse");
+        let e = detach_vpp_offload(&dir).expect_err("must refuse while rules remain");
         assert!(e.contains("eth5"), "the steered port must be named: {e}");
         assert!(e.contains("blackhole"), "and the consequence stated: {e}");
         assert!(
-            ResourceState::load(&dir).unwrap().is_some(),
-            "the record must survive"
+            e.contains("ethtool -N"),
+            "and the manual escape hatch, since nothing else can clear them: {e}"
+        );
+
+        let after = ResourceState::load(&dir)
+            .unwrap()
+            .expect("the record must survive");
+        assert_eq!(
+            flatten_steer_rules(&after.steer_rules),
+            vec![("eth5".to_string(), 0), ("eth5".to_string(), 1)],
+            "every rule still in the NIC must still be on the record"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

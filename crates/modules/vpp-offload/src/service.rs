@@ -29,7 +29,7 @@
 //! reports it). The final status is published either way, so the
 //! caller can see exactly what the shutdown left behind.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -101,6 +101,70 @@ const MAX_EPISODE_REASONS: usize = 8;
 /// the teardown is unfinished.
 const DETACH_BUDGET: Duration = Duration::from_millis(900);
 
+/// How long [`SupervisionService::apply_steering`] waits for the loop to
+/// pick up a steering change and report what happened.
+///
+/// The alternative — post and return `Ok` — is what makes this worth a
+/// wait at all. `packetframe reconfigure` writes an OK/ERR marker the
+/// operator reads, and this is the canary lever: "the rollout step
+/// succeeded" and "the rollout step was queued" must not look the same.
+/// A refused MCAM insert has to come back as a failure at the moment
+/// the operator is watching for one.
+///
+/// Sized against **one tick**, not against the poll cadence. The request
+/// is picked up before the next tick, so the wait is however long the
+/// tick already in progress takes — and in `Ready`/`Steered`, the only
+/// states a steering change is accepted from, that is a liveness ping
+/// (1.5 s budget while steered) plus a delta drain. Two seconds would
+/// therefore time out on an ordinary busy tick and report a failure over
+/// a change that was about to happen.
+///
+/// Bounded above by the CLI's own 5 s ack timeout
+/// (`RECONFIGURE_TIMEOUT_MS`), which covers every module's reconfigure,
+/// so this cannot simply be made generous. 3 s leaves room for
+/// fast-path's reconcile alongside it. A timeout is not a lost change
+/// either way: the wait withdraws the request if the loop has not taken
+/// it, and says plainly which of the two happened.
+const STEERING_BUDGET: Duration = Duration::from_secs(3);
+
+/// Poll granularity while waiting for the loop to answer.
+const STEERING_POLL: Duration = Duration::from_millis(5);
+
+/// A steering change on its way from `Module::reconfigure` to the loop.
+///
+/// Carries the whole target rather than a delta. The loop applies it
+/// with [`crate::runtime::Runtime::retarget`] and one supervisor event,
+/// and `Action::Steer` reconciles the NIC — so there is exactly one
+/// routine that decides which rules exist, and a reconfigure cannot
+/// grow a second, subtly different one.
+#[derive(Debug, Clone)]
+pub struct SteeringRequest {
+    /// Matched against the answer so a caller cannot collect the result
+    /// of somebody else's request — or of its own previous one.
+    seq: u64,
+    /// `(PF iface, VF index)` for every port now configured `steer on`.
+    pub ports: Vec<(String, u32)>,
+    pub plan: crate::steer::RuleSet,
+    /// Whether traffic should be diverted once the target is in place.
+    /// False is the rollback landing zone, not an error.
+    pub want_steer: bool,
+    /// Whether the `steer` flag itself moved in this reconfigure.
+    ///
+    /// The difference between "the operator just turned the lever" and
+    /// "the config still says `steer on`, and this port was deliberately
+    /// left unsteered". Without it, a SIGHUP for an unrelated reason —
+    /// an added `allow-prefix`, a changed global — would divert traffic
+    /// on every `steer on` port that had not yet been steered, because
+    /// the flag is *present*. The machine never steers a first attach on
+    /// its own precisely because that decision is the operator's, and a
+    /// side effect of editing something else is not that decision.
+    ///
+    /// A port that is already steering is reconciled either way: its
+    /// traffic is diverted now, so the rules must match the new
+    /// allowlist whether or not the lever moved.
+    pub lever_moved: bool,
+}
+
 /// Builds the loop's non-`Send` pieces on the loop thread, and returns
 /// the events to inject before the first tick.
 ///
@@ -164,6 +228,16 @@ pub struct Published {
 struct Shared {
     stop: AtomicBool,
     latest: Mutex<Option<Published>>,
+    /// A steering change waiting to be applied. At most one: a second
+    /// request supersedes the first, which is right — both describe the
+    /// complete target, and the newer one is the config that is now on
+    /// disk. The superseded caller learns it was superseded rather than
+    /// waiting out its budget for an answer that will never come.
+    steering_request: Mutex<Option<SteeringRequest>>,
+    /// What the loop made of request `seq`.
+    steering_result: Mutex<Option<(u64, Result<(), String>)>>,
+    /// Hands out request sequence numbers.
+    steering_seq: AtomicU64,
 }
 
 /// The one place a shutdown that did not complete is turned into a snapshot.
@@ -336,6 +410,9 @@ impl SupervisionService {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             latest: Mutex::new(None),
+            steering_request: Mutex::new(None),
+            steering_result: Mutex::new(None),
+            steering_seq: AtomicU64::new(0),
         });
         let looped = Arc::clone(&shared);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -500,6 +577,132 @@ impl SupervisionService {
         }
     }
 
+    /// Hand the loop a new steering target and wait for its verdict.
+    ///
+    /// Synchronous on purpose — see [`STEERING_BUDGET`]. Returns `Err`
+    /// when the loop refused the change (not converged, the FIB is
+    /// incomplete, an MCAM insert failed), when a newer request
+    /// superseded this one, or when the loop did not answer in time. In
+    /// every one of those cases the operator's rollout step did NOT
+    /// happen, which is what they need to know.
+    pub fn apply_steering(
+        &self,
+        ports: Vec<(String, u32)>,
+        plan: crate::steer::RuleSet,
+        want_steer: bool,
+        lever_moved: bool,
+    ) -> Result<(), String> {
+        // Sequence first, so the request that lands in the slot is
+        // always the one whose number we then wait for.
+        let seq = self.shared.steering_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let displaced = self
+            .shared
+            .steering_request
+            .lock()
+            .expect("steering lock")
+            .replace(SteeringRequest {
+                seq,
+                ports,
+                plan,
+                want_steer,
+                lever_moved,
+            });
+        // A request still sitting in the slot never ran, and now never
+        // will — the slot holds one, and this call just took it. Answer
+        // it here or its caller waits out the whole budget for a verdict
+        // nobody will ever publish.
+        //
+        // Answered at the displacement rather than inferred by the
+        // waiter, which is what the first version did: it peeked at the
+        // slot and treated a higher sequence as proof of being
+        // superseded. That is wrong in the case that matters — the loop
+        // may have taken request A and be applying it right now, so a
+        // newly-arrived B makes A's waiter report "replaced before it
+        // was applied" about a change that DID happen. State recorded
+        // from a request rather than from an observation, in the
+        // machinery built to avoid exactly that.
+        //
+        // Unreachable from the loader today (SIGHUP handling is serial,
+        // and each `reconfigure` blocks for its answer), so this is
+        // about the seam being honest rather than about a live race.
+        if let Some(older) = displaced {
+            *self.shared.steering_result.lock().expect("steering lock") = Some((
+                older.seq,
+                Err(
+                    "a newer configuration change replaced this one before the supervision \
+                     loop saw it; re-run `packetframe reconfigure` to see where the newer \
+                     one landed"
+                        .into(),
+                ),
+            ));
+        }
+
+        let deadline = Instant::now() + STEERING_BUDGET;
+        loop {
+            if let Some((answered, outcome)) = self
+                .shared
+                .steering_result
+                .lock()
+                .expect("steering lock")
+                .clone()
+            {
+                if answered == seq {
+                    return outcome;
+                }
+            }
+            if Instant::now() >= deadline {
+                // WITHDRAW it, if the loop has not taken it yet.
+                //
+                // Leaving it in the slot is how "the change was NOT
+                // applied" becomes a lie: the loop takes whatever is
+                // there on its next free iteration, so a rollback
+                // reported as failed would quietly take effect afterwards
+                // — and publish its verdict where this caller is no
+                // longer listening. An operator who has just been told
+                // their `steer off` failed will do something else about
+                // it; the change must not also happen.
+                let withdrawn = {
+                    let mut slot = self.shared.steering_request.lock().expect("steering lock");
+                    let ours = slot.as_ref().is_some_and(|r| r.seq == seq);
+                    if ours {
+                        *slot = None;
+                    }
+                    ours
+                };
+                if !withdrawn {
+                    // The loop has it, so it is genuinely in flight and
+                    // cannot be recalled. One last look for the verdict —
+                    // it may have landed between the poll and now, and
+                    // reporting a timeout over a published answer would
+                    // be the same lie in the other direction.
+                    if let Some((answered, outcome)) = self
+                        .shared
+                        .steering_result
+                        .lock()
+                        .expect("steering lock")
+                        .clone()
+                    {
+                        if answered == seq {
+                            return outcome;
+                        }
+                    }
+                    return Err(format!(
+                        "the supervision loop took the steering change but had not finished it \
+                         within {STEERING_BUDGET:?}, so it MAY still take effect. \
+                         `packetframe status` reports what the module is doing; re-run once it \
+                         settles."
+                    ));
+                }
+                return Err(format!(
+                    "the supervision loop did not pick up the steering change within \
+                     {STEERING_BUDGET:?} — it is busy or wedged. The change was withdrawn and \
+                     NOT applied; `packetframe status` reports what the module is doing."
+                ));
+            }
+            std::thread::sleep(STEERING_POLL);
+        }
+    }
+
     /// Whether the loop thread is still running. `false` after `stop`,
     /// and — importantly — after a panic: a dead loop means nothing is
     /// supervising VPP, which the caller must surface rather than keep
@@ -625,6 +828,95 @@ fn fmt_failures(outcome: &crate::executor::Outcome) -> Vec<String> {
         .collect()
 }
 
+/// Apply one steering change, from inside the loop.
+///
+/// Split out so the two halves of a steering change — the target and
+/// the reconcile — happen in one place and in one order. The target is
+/// recorded first, unconditionally, because `Action::Steer` reconciles
+/// against whatever the target is: swapping it after the event would
+/// install the OLD rules and leave the new ones for whenever the next
+/// verify happened to fire.
+fn apply_steering(
+    driver: &mut Driver,
+    runtime: &Runtime,
+    fx: &mut dyn crate::executor::Effects,
+    req: &SteeringRequest,
+) -> Result<(), String> {
+    let state = driver.state();
+    if !matches!(state, State::Ready | State::Steered) {
+        // Deliberately refused rather than queued. A steer request that
+        // outlives a crash and fires against the replacement is not what
+        // the operator asked for, and the replacement re-steers on its
+        // own if steering was wanted. The new config is on disk either
+        // way, so the next attach picks it up.
+        return Err(format!(
+            "vpp-offload is {state:?}, not converged — steering changes apply only from \
+             Ready or Steered. The new configuration is on disk and takes effect at the \
+             next successful convergence"
+        ));
+    }
+    runtime.retarget(req.ports.clone(), req.plan.clone());
+
+    let steered = driver.supervisor().is_steered();
+    let event = if req.want_steer {
+        // The config says steer, but that is not the same as the
+        // operator asking for it NOW.
+        //
+        // A `steer on` port that has never steered is in the designed
+        // staging state: the machine never steers a first attach on its
+        // own, because when traffic moves is the operator's decision and
+        // the canary ladder is paced by hand. So a SIGHUP that did not
+        // move the lever — an added `allow-prefix`, a changed global —
+        // updates the target and stops there. Diverting traffic as a side
+        // effect of editing something else is precisely the decision this
+        // module is not allowed to make.
+        if !steered && !req.lever_moved {
+            return Ok(());
+        }
+        // The same gate the automatic path uses, and applied on the same
+        // terms: **first steer only**. An operator turning the lever on
+        // an unsteered port is no more entitled to divert traffic into a
+        // FIB with known holes than a `VerifyPassed` is, and this is the
+        // likelier door — the canary ladder's shape is "steer once the
+        // table has converged", which is exactly when someone is
+        // impatient.
+        //
+        // A port that is ALREADY steered is deliberately not gated.
+        // `blocks_first_steer` counts `installing`, which is nonzero
+        // whenever routes are in flight — routine under a live BGP feed
+        // — so gating the reconcile would make `packetframe reconfigure`
+        // fail at random. And the failure would be the wrong way round:
+        // refusing leaves the PREVIOUS rules installed, so a prefix the
+        // operator just removed from the allowlist keeps being diverted.
+        if !steered {
+            let counts = runtime.status().counts;
+            if counts.blocks_first_steer() {
+                return Err(format!(
+                    "refusing the first steer: the FIB is incomplete ({} unresolvable, {} \
+                     withheld, {} still installing). Diverting traffic into it would \
+                     blackhole exactly the prefixes that are missing. `packetframe status` \
+                     reports all three; they must be zero",
+                    counts.unresolvable, counts.withheld, counts.installing
+                ));
+            }
+        }
+        Event::SteerRequested
+    } else {
+        Event::UnsteerRequested
+    };
+
+    let tick = driver.inject(Instant::now(), event, fx);
+    // The actions ran synchronously inside `inject`, and their failures
+    // exist only in this Tick — the same reason the main loop keeps its
+    // injected outcomes. Here they are also the operator's answer.
+    let failures = fmt_failures(&tick.outcome);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 fn run_loop(
     module: &'static str,
     factory: LoopFactory,
@@ -747,6 +1039,35 @@ fn run_loop(
     let _ = ready.send(Ok(()));
 
     while !shared.stop.load(Ordering::SeqCst) {
+        // Steering changes first, before the tick. They are the
+        // operator's, they are synchronous on the far side, and a tick
+        // can take a while — a resync batch, a verify sample — so
+        // applying them after would spend the caller's budget waiting
+        // for work that has nothing to do with the request.
+        let request = shared
+            .steering_request
+            .lock()
+            .expect("steering lock")
+            .take();
+        if let Some(req) = request {
+            let outcome = apply_steering(&mut driver, &runtime, &mut fx, &req);
+            if let Err(e) = &outcome {
+                // Also onto the health surface. `apply_steering` answers
+                // the caller, but `packetframe reconfigure` is not the
+                // only way this is read: a refused canary step has to be
+                // visible in `packetframe status` afterwards, the same
+                // as a refused automatic steer.
+                remember_failures(&mut last_failures, vec![format!("Reconfigure: {e}")]);
+            }
+            *shared.steering_result.lock().expect("steering lock") = Some((req.seq, outcome));
+            // The engine's socket deadline keys on whether packets are
+            // on VPP, and that may have just changed. Synced here rather
+            // than left to the post-tick call for the same reason
+            // `adopt_process` takes `steered` as a parameter: the work
+            // in between runs under the wrong budget otherwise.
+            runtime.set_steered(driver.supervisor().is_steered());
+        }
+
         let now = Instant::now();
         let tick = driver.tick(now, &mut obs, &mut fx);
         let mut failures: Vec<String> = fmt_failures(&tick.outcome);

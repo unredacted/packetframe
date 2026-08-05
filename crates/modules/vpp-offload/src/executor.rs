@@ -31,12 +31,12 @@ use crate::supervisor::{Action, Event};
 /// Everything the executor does to the world outside itself.
 ///
 /// A trait so the ordering and failure-handling rules can be tested
-/// against a recorder. The real implementation lands with the tick loop;
-/// `Steer`/`Unsteer` stay unimplemented until slice 5 builds MCAM, and
-/// deliberately **fail loudly** there rather than returning `Ok(())` —
-/// a no-op steer that reports success would let the supervisor believe
-/// traffic is diverted when nothing is, which is worse than not having
-/// the feature.
+/// against a recorder. `Steer`/`Unsteer` are real
+/// ([`crate::ntuple::NtupleSteering`]) and must **fail loudly** rather
+/// than returning `Ok(())` on any doubt — a no-op steer that reports
+/// success lets the supervisor believe traffic is diverted when nothing
+/// is, and a no-op unsteer releases a VF that MCAM is still pointing
+/// traffic at.
 pub trait Effects {
     fn spawn(&mut self) -> Result<(), String>;
 
@@ -45,6 +45,15 @@ pub trait Effects {
 
     /// Install MCAM steering rules.
     fn steer(&mut self) -> Result<(), String>;
+
+    /// Whether the steering ledger currently names any rule in the NIC.
+    ///
+    /// Read after a failed [`Self::steer`] so the supervisor is *told*
+    /// whether traffic is still diverted rather than assuming. A steer
+    /// that fails may leave the NIC empty or holding rules that would
+    /// not delete, and the two demand opposite handling — see
+    /// [`Event::SteerFailed`].
+    fn steering_in_place(&self) -> bool;
 
     /// Stop the process. Returns whether its resources may be released
     /// — see [`Disposition`].
@@ -173,10 +182,17 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                 Ok(()) => Event::Steered,
                 Err(e) => {
                     out.failures.push((*action, e));
-                    // Verified but not steered: reported, not papered
-                    // over, and NOT a process restart — the dataplane
-                    // is fine.
-                    Event::SteerFailed
+                    // Verified but not steered as asked: reported, not
+                    // papered over, and NOT a process restart — the
+                    // dataplane is fine.
+                    //
+                    // `rules_remain` is read from the ledger AFTER the
+                    // failure, because only the ledger knows whether the
+                    // rollback emptied the NIC or left rules it could
+                    // not delete. See `Event::SteerFailed`.
+                    Event::SteerFailed {
+                        rules_remain: fx.steering_in_place(),
+                    }
                 }
             }),
             Action::AbortConvergence => fx.abort_convergence(),
@@ -211,9 +227,15 @@ mod tests {
         fail_verify: bool,
         fail_release: bool,
         kill_disposition: Option<Disposition>,
+        /// What the steering ledger reports after a failed steer.
+        rules_remain: bool,
     }
 
     impl Effects for Recorder {
+        /// Whatever the test says the ledger holds after a steer.
+        fn steering_in_place(&self) -> bool {
+            self.rules_remain
+        }
         fn spawn(&mut self) -> Result<(), String> {
             self.calls.push("spawn");
             err_if(self.fail_spawn, "no such binary")
@@ -410,7 +432,12 @@ mod tests {
             ..Default::default()
         };
         let out = execute(&[Action::Steer], &mut r);
-        assert_eq!(out.events, vec![Event::SteerFailed]);
+        assert_eq!(
+            out.events,
+            vec![Event::SteerFailed {
+                rules_remain: false
+            }]
+        );
         assert!(!out.events.contains(&Event::Steered));
     }
 

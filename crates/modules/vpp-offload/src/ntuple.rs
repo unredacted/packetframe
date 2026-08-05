@@ -172,7 +172,7 @@ fn matches(asked: &RxFlowSpec, got: &RxFlowSpec) -> bool {
         && asked.m_u.hdata[..8] == got.m_u.hdata[..8]
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(test)))]
 mod sys {
     use super::Rxnfc;
 
@@ -222,11 +222,110 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(test)))]
 mod sys {
     use super::Rxnfc;
     pub(super) fn ethtool(_iface: &str, _req: &mut Rxnfc) -> Result<(), String> {
         Err("ntuple steering is Linux-only".into())
+    }
+}
+
+/// An in-memory NIC standing in for `SIOCETHTOOL`, tests only.
+///
+/// Exists because without it **nothing in [`NtupleSteering::steer`] or
+/// [`NtupleSteering::unsteer`] had ever executed** — every `ethtool`
+/// call fails on a dev host and fails for a different reason on a CI
+/// runner with no such interface, so both routines could only ever be
+/// tested along their failure paths. The sequencing they encode
+/// (reconcile stale rules before installing, all-or-nothing rollback,
+/// a ledger that is a set) is exactly what a failure-only test cannot
+/// see.
+///
+/// **What this does NOT prove**: the wire format. The fake stores
+/// whatever `flow_spec` produced and hands the same bytes back, so a
+/// field at the wrong offset round-trips perfectly here. That check has
+/// one real venue — the `ETHTOOL_GRXCLSRULE` readback against a real
+/// NIC — and it is still unrun. This substitutes for a NIC's
+/// *behaviour*, not for its *layout*.
+#[cfg(test)]
+pub(super) mod sys {
+    use super::{Rxnfc, ETHTOOL_GRXCLSRULE, ETHTOOL_SRXCLSRLDEL, ETHTOOL_SRXCLSRLINS};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    pub(crate) struct FakeNic {
+        rules: HashMap<(String, u32), super::RxFlowSpec>,
+        /// Locations whose delete must fail, modelling the rule that
+        /// will not come out — the case the release rules turn on.
+        undeletable: Vec<u32>,
+        /// Locations whose insert must fail, modelling a full or
+        /// otherwise refusing MCAM.
+        uninsertable: Vec<u32>,
+    }
+
+    thread_local! {
+        static NIC: RefCell<FakeNic> = RefCell::new(FakeNic::default());
+    }
+
+    /// Start from an empty NIC. Call at the top of any test that
+    /// installs rules; the state is per-thread, and Rust runs each test
+    /// on its own.
+    pub(crate) fn reset() {
+        NIC.with(|n| *n.borrow_mut() = FakeNic::default());
+    }
+
+    pub(crate) fn wedge_delete(locations: &[u32]) {
+        NIC.with(|n| n.borrow_mut().undeletable = locations.to_vec());
+    }
+
+    pub(crate) fn wedge_insert(locations: &[u32]) {
+        NIC.with(|n| n.borrow_mut().uninsertable = locations.to_vec());
+    }
+
+    /// Every `(iface, loc)` the NIC currently holds, sorted — the
+    /// ground truth a test compares the ledger against.
+    pub(crate) fn rules() -> Vec<(String, u32)> {
+        NIC.with(|n| {
+            let mut v: Vec<(String, u32)> = n.borrow().rules.keys().cloned().collect();
+            v.sort();
+            v
+        })
+    }
+
+    pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), String> {
+        NIC.with(|n| {
+            let mut nic = n.borrow_mut();
+            let key = (iface.to_string(), req.fs.location);
+            match req.cmd {
+                ETHTOOL_SRXCLSRLINS => {
+                    if nic.uninsertable.contains(&req.fs.location) {
+                        return Err("ENOSPC: no free MCAM entry".into());
+                    }
+                    // A real insert at an occupied slot replaces it,
+                    // which is what makes re-asserting cheap.
+                    nic.rules.insert(key, req.fs);
+                    Ok(())
+                }
+                ETHTOOL_GRXCLSRULE => match nic.rules.get(&key) {
+                    Some(stored) => {
+                        req.fs = *stored;
+                        Ok(())
+                    }
+                    None => Err("ENOENT: no rule at that location".into()),
+                },
+                ETHTOOL_SRXCLSRLDEL => {
+                    if nic.undeletable.contains(&req.fs.location) {
+                        return Err("EBUSY: rule is pinned".into());
+                    }
+                    match nic.rules.remove(&key) {
+                        Some(_) => Ok(()),
+                        None => Err("ENOENT: no rule at that location".into()),
+                    }
+                }
+                other => Err(format!("fake NIC got an unexpected command {other:#x}")),
+            }
+        })
     }
 }
 
@@ -308,11 +407,6 @@ impl NtupleSteering {
         }
     }
 
-    /// What is installed right now, for the state file.
-    pub fn installed(&self) -> &[(String, u32)] {
-        &self.installed
-    }
-
     /// Remove `victims`, **keeping whatever would not come out**.
     ///
     /// One routine because there are two callers — `steer`'s rollback and
@@ -342,8 +436,24 @@ impl NtupleSteering {
     /// installed, and a fresh object has installed nothing. The rules
     /// would outlive every process that knew about them and keep
     /// diverting traffic to a VF nobody owns.
+    ///
+    /// The record comes from
+    /// [`crate::resources::ResourceState::steer_rules`], written by
+    /// [`crate::runtime::IdentityStore::steering_changed`] after every
+    /// change. Both halves shipped in #127 with nothing between them.
     pub fn adopt_installed(&mut self, installed: Vec<(String, u32)>) {
         self.installed = installed;
+    }
+
+    /// What the NIC should hold, from the current ports and plan.
+    fn desired(&self) -> Vec<(String, u32)> {
+        let mut out = Vec::with_capacity(self.ports.len() * self.plan.rules.len());
+        for (iface, _) in &self.ports {
+            for rule in &self.plan.rules {
+                out.push((iface.clone(), rule.location));
+            }
+        }
+        out
     }
 }
 
@@ -356,6 +466,40 @@ impl crate::runtime::Steering for NtupleSteering {
                     .into(),
             );
         }
+        // Clear anything the ledger holds that the current target does
+        // not — rules from a previous allowlist, or from a port that has
+        // since gone `steer off`. Without this, a reconfigure would
+        // install the new set ALONGSIDE the old one and leave prefixes
+        // diverted that the operator had just removed from the
+        // allowlist, with nothing naming them.
+        //
+        // Before the inserts, not after: the two sets can overlap in
+        // slot numbers, and removing afterwards would delete rules the
+        // insert loop had just written.
+        let desired = self.desired();
+        let stale: Vec<(String, u32)> = self
+            .installed
+            .iter()
+            .filter(|e| !desired.contains(e))
+            .cloned()
+            .collect();
+        self.installed.retain(|e| !stale.contains(e));
+        let failed = self.remove_all(stale);
+        if !failed.is_empty() {
+            // Refusing here rather than installing over them. A rule
+            // that would not come out is still matching its old prefix,
+            // and the new set may reuse its slot — so proceeding would
+            // leave the NIC in a state neither the ledger nor the
+            // operator could describe.
+            return Err(format!(
+                "{} stale ntuple rule(s) from the previous steering target could not be \
+                 removed ({}); the new rules were NOT installed, because they may reuse \
+                 those slots",
+                failed.len(),
+                failed.join(", ")
+            ));
+        }
+
         for (iface, vf_index) in &self.ports {
             for rule in &self.plan.rules {
                 if let Err(e) = insert(iface, rule, *vf_index) {
@@ -378,7 +522,19 @@ impl crate::runtime::Steering for NtupleSteering {
                         )
                     });
                 }
-                self.installed.push((iface.clone(), rule.location));
+                // A SET, not a log. The supervisor re-emits `Action::Steer`
+                // for a VPP it already believes steered — the UniFi
+                // controller wipes classifier state on provisioning, so
+                // re-asserting is the reconcile step — and appending
+                // unconditionally recorded every slot twice. `unsteer`
+                // then deleted each twice, the second delete failed
+                // because the rule was already gone, and a perfectly
+                // clean teardown reported rules it could not remove and
+                // withheld the VF.
+                let entry = (iface.clone(), rule.location);
+                if !self.installed.contains(&entry) {
+                    self.installed.push(entry);
+                }
             }
         }
         Ok(())
@@ -399,6 +555,15 @@ impl crate::runtime::Steering for NtupleSteering {
                 failed.join(", ")
             ))
         }
+    }
+
+    fn installed(&self) -> Vec<(String, u32)> {
+        self.installed.clone()
+    }
+
+    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: RuleSet) {
+        self.ports = ports;
+        self.plan = plan;
     }
 }
 
@@ -520,12 +685,12 @@ mod tests {
     /// `Ok` from unsteer is precisely what releases the VF — handing back
     /// a VF with a live rule still steering traffic into it.
     ///
-    /// Both paths now share `remove_all`, so they cannot disagree. Driven
-    /// through it directly because every `delete` fails on a non-Linux
-    /// host, which is exactly the condition under test.
+    /// Both paths now share `remove_all`, so they cannot disagree.
     #[test]
     fn a_rule_that_will_not_delete_stays_recorded() {
         use crate::runtime::Steering as _;
+        sys::reset();
+        sys::wedge_delete(&[1024, 1025]);
         let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
         s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
 
@@ -554,6 +719,7 @@ mod tests {
     /// knew about them, still steering into a VF nobody owns.
     #[test]
     fn adopted_locations_are_what_unsteer_removes() {
+        use crate::runtime::Steering as _;
         let allow = vec![IpPrefix::V4 {
             addr: [23, 191, 200, 0],
             prefix_len: 24,
@@ -568,8 +734,172 @@ mod tests {
         s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
         assert_eq!(
             s.installed(),
-            &[("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
+            vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
             "the previous process's rules are now this one's to remove"
         );
+    }
+
+    fn plan_for(prefixes: &[[u8; 4]]) -> RuleSet {
+        let allow: Vec<IpPrefix> = prefixes
+            .iter()
+            .map(|a| IpPrefix::V4 {
+                addr: *a,
+                prefix_len: 24,
+            })
+            .collect();
+        RuleSet::plan(&allow, McamBudget::default()).expect("fits")
+    }
+
+    /// The happy path, which had never executed anywhere.
+    ///
+    /// Asserts the ledger against the NIC rather than against itself:
+    /// `installed()` is the list teardown acts on, and the only thing
+    /// that makes it meaningful is that it names exactly the rules the
+    /// hardware holds.
+    #[test]
+    fn a_steer_installs_the_plan_and_an_unsteer_removes_all_of_it() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+
+        s.steer().expect("installs");
+        assert_eq!(
+            sys::rules(),
+            vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
+            "both directions, in the planned slots"
+        );
+        assert_eq!(
+            s.installed(),
+            sys::rules(),
+            "the ledger names what the NIC holds"
+        );
+
+        s.unsteer().expect("removes");
+        assert!(sys::rules().is_empty(), "nothing left in the NIC");
+        assert!(s.installed().is_empty(), "and nothing left in the ledger");
+    }
+
+    /// Re-asserting steering must not record the same slot twice.
+    ///
+    /// The supervisor deliberately re-emits `Action::Steer` for a VPP it
+    /// already believes steered, because the UniFi controller wipes
+    /// classifier state on provisioning. With the ledger appending, the
+    /// second pass recorded every slot a second time; `unsteer` then
+    /// deleted each twice, the second delete returned ENOENT, and a
+    /// teardown that had in fact removed every rule reported failures
+    /// and **withheld the VF**.
+    ///
+    /// So the assertion is on the ledger's cardinality, not on the
+    /// removal succeeding — the removal succeeding is the symptom, the
+    /// set property is the invariant.
+    #[test]
+    fn re_asserting_steering_records_each_slot_once() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+
+        s.steer().expect("first");
+        s.steer()
+            .expect("re-assert, as the supervisor does on every Ready");
+        assert_eq!(
+            s.installed().len(),
+            2,
+            "two rules exist, so two must be recorded — however many times they were asserted"
+        );
+        s.unsteer()
+            .expect("a clean teardown must stay clean across a re-assert");
+    }
+
+    /// A retarget removes what the old target had and installs the new,
+    /// leaving nothing behind.
+    ///
+    /// This is the reconfigure path: an operator drops a prefix from the
+    /// allowlist and SIGHUPs. Without the stale-removal the old rules
+    /// stay in the NIC — traffic for a prefix the operator explicitly
+    /// removed keeps being diverted, and nothing anywhere names it,
+    /// because the ledger only ever describes the current plan.
+    #[test]
+    fn a_retarget_leaves_only_the_new_rules() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
+        );
+        s.steer().expect("installs four");
+        assert_eq!(sys::rules().len(), 4);
+
+        // Down to one prefix: slots 1026/1027 are no longer wanted.
+        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.steer().expect("reconciles");
+
+        assert_eq!(
+            sys::rules(),
+            vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
+            "the withdrawn prefix's rules are gone from the NIC, not merely unrecorded"
+        );
+        assert_eq!(s.installed(), sys::rules());
+    }
+
+    /// A retarget that cannot clear a stale rule installs NOTHING.
+    ///
+    /// The new plan may reuse the slot the old rule is sitting in, so
+    /// proceeding would leave the NIC holding a mix of two targets that
+    /// neither the ledger nor the operator could describe. And the
+    /// undeletable rule stays recorded — it is still steering traffic,
+    /// and it is what a later `detach --all` has to find.
+    #[test]
+    fn a_retarget_that_cannot_clear_the_old_rules_installs_nothing() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
+        );
+        s.steer().expect("installs four");
+
+        sys::wedge_delete(&[1026]);
+        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        let e = s.steer().expect_err("must refuse");
+
+        assert!(
+            e.contains("could not be removed") && e.contains("NOT installed"),
+            "the operator has to learn both halves: what stayed, and that nothing new landed: {e}"
+        );
+        assert!(
+            s.installed().contains(&("eth0".to_string(), 1026)),
+            "the rule that would not come out must stay in the ledger, or detach cannot find it"
+        );
+    }
+
+    /// A failed insert backs out everything, including rules that were
+    /// already installed before this attempt.
+    ///
+    /// All-or-nothing is the point: a port holding half its rules
+    /// forwards some allowlisted traffic through VPP and the rest
+    /// through the kernel. Slot 1027 — the last of four — is made to
+    /// refuse, so three rules are already in the NIC when the failure
+    /// lands.
+    #[test]
+    fn a_failed_insert_leaves_the_port_unsteered() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        sys::wedge_insert(&[1027]);
+        let mut s = NtupleSteering::new(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
+        );
+
+        let e = s.steer().expect_err("the last rule cannot be installed");
+        assert!(
+            e.contains("every rule installed before it was removed"),
+            "{e}"
+        );
+        assert!(
+            sys::rules().is_empty(),
+            "the three that landed must not survive the failure — a half-steered port is \
+             a forwarding policy nobody chose"
+        );
+        assert!(s.installed().is_empty());
     }
 }

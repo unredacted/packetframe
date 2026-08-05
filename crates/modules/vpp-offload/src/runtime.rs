@@ -1,7 +1,7 @@
 //! The runtime: [`Observe`] and [`Effects`] implemented by delegation
 //! to the real machinery — [`VppProcess`] for the process,
 //! [`ConvergenceEngine`] for everything reachable over the API socket,
-//! and a [`Steering`] seam for the MCAM rules that land in slice 5.
+//! and a [`Steering`] seam over the MCAM rules ([`crate::ntuple`]).
 //!
 //! This is the last layer of pure wiring before `Module::attach()`. It
 //! deliberately contains **no policy**: every decision lives in the
@@ -36,9 +36,9 @@
 //!   [`ResourceState`](crate::resources::ResourceState) — the same
 //!   attach wiring. A [`NullStore`] exists for tests only.
 //! - **MCAM steering.** [`Steering`] is a seam; the ETHTOOL
-//!   implementation is slice 5. The placeholder here refuses in both
-//!   directions — see [`SteeringUnavailable`] for why refusing to
-//!   *unsteer* is the load-bearing half.
+//!   implementation is [`crate::ntuple`]. [`SteeringUnavailable`] stands
+//!   in where no port steers, and refuses in both directions — see it
+//!   for why refusing to *unsteer* is the load-bearing half.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -101,6 +101,23 @@ pub trait IdentityStore {
     /// Persisting them is what lets the next daemon adopt instead of
     /// blind-attaching.
     fn interfaces_attached(&mut self, indices: &[(String, u32)]) -> Result<(), String>;
+
+    /// The MCAM rules believed installed right now, as `(iface, loc)`.
+    ///
+    /// Written after every steer and unsteer, in both polarities.
+    /// MCAM rules outlive the process that installed them — they are
+    /// NIC state, not process state — so this file is the only thing
+    /// that can tell the next daemon they exist.
+    ///
+    /// Without it a restart with a steered VPP alive was doubly unsafe.
+    /// `bring_up` derives `Adopted { steered }` from the recorded rules,
+    /// so an empty record meant the supervisor believed nothing was
+    /// diverted: teardown emitted no `Unsteer` and released the VF with
+    /// MCAM still pointing traffic into it. And
+    /// [`Steering::unsteer`] removes what its own ledger names, so a
+    /// fresh ledger would have answered `Ok` — reporting rules removed
+    /// that were still in the NIC.
+    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String>;
 }
 
 /// Hands back the VF/vfio/hugepage resources attach acquired.
@@ -137,6 +154,9 @@ impl IdentityStore for NullStore {
     fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
         Ok(())
     }
+    fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Releases nothing, and says so. Tests only, and it must keep
@@ -152,36 +172,66 @@ impl ResourceRelease for NoResources {
     }
 }
 
-/// The MCAM steering seam. Real implementation lands in slice 5
-/// (ETHTOOL_SRXCLSRLINS, ring_cookie `(vf+1)<<32`, loc budgeting).
+/// The MCAM steering seam ([`crate::ntuple::NtupleSteering`] is the
+/// real one: ETHTOOL_SRXCLSRLINS, ring_cookie `(vf+1)<<32`, loc
+/// budgeting).
+///
+/// [`Self::steer`] is a **reconcile**, not an append: it makes the NIC
+/// match the current target, whatever was there before. That is what
+/// the supervisor already assumes when it re-emits `Action::Steer` for
+/// a VPP it believes is steered (the UniFi controller wipes classifier
+/// state on provisioning, so rules may simply be gone), and it is what
+/// lets [`Self::retarget`] change the target under a live port without
+/// a second code path.
 pub trait Steering {
     /// Install the rules. `Ok` means they are confirmed in the NIC.
     fn steer(&mut self) -> Result<(), String>;
     /// Remove the rules. `Ok` means they are confirmed gone — and only
     /// then, because the supervisor releases VFs on the strength of it.
     fn unsteer(&mut self) -> Result<(), String>;
+    /// `(iface, loc)` for every rule believed to be in the NIC right
+    /// now, including any that a removal could not clear.
+    ///
+    /// Read after **every** steer and unsteer, successful or not, and
+    /// persisted — see [`IdentityStore::steering_changed`]. A rule that
+    /// would not come out is still diverting traffic, so the failure
+    /// path is the one that most needs this recorded.
+    fn installed(&self) -> Vec<(String, u32)>;
+    /// Change what steering *should* be, without touching the NIC.
+    ///
+    /// Deliberately infallible and side-effect-free: it records intent,
+    /// and the next `steer`/`unsteer` is what makes the hardware agree.
+    /// Splitting it that way keeps one routine — `steer` — responsible
+    /// for every rule that ever reaches the NIC, so a reconfigure cannot
+    /// grow its own, subtly different, installation path.
+    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet);
 }
 
-/// The placeholder until slice 5: refuses both directions.
+/// A steering seam that refuses both directions.
 ///
-/// `steer` refusing is obvious. `unsteer` refusing is the half that
-/// matters: `Ok` from unsteer becomes `Event::Unsteered`, which clears
-/// `steered` and unblocks `ReleaseResources` — so a placeholder that
-/// faked success would let the supervisor release a VF that MCAM rules
-/// from a previous run might still be pointing traffic at. Refusing
-/// keeps `steered` true and the VF withheld, which is the designed
-/// behaviour for "rules exist that we cannot manage". A config with
-/// every port `steer off` never reaches either path.
+/// Used where no port asks to steer, and by tests. `steer` refusing is
+/// obvious. `unsteer` refusing is the half that matters: `Ok` from
+/// unsteer becomes `Event::Unsteered`, which clears `steered` and
+/// unblocks `ReleaseResources` — so a stand-in that faked success would
+/// let the supervisor release a VF that MCAM rules from a previous run
+/// might still be pointing traffic at. Refusing keeps `steered` true
+/// and the VF withheld, which is the designed behaviour for "rules
+/// exist that we cannot manage". A config with every port `steer off`
+/// never reaches either path.
 #[derive(Debug, Default)]
 pub struct SteeringUnavailable;
 
 impl Steering for SteeringUnavailable {
     fn steer(&mut self) -> Result<(), String> {
-        Err("MCAM steering is not implemented until slice 5; port stays unsteered".into())
+        Err("MCAM steering is unavailable in this runtime; port stays unsteered".into())
     }
     fn unsteer(&mut self) -> Result<(), String> {
-        Err("MCAM steering is not implemented until slice 5; cannot confirm rules removed".into())
+        Err("MCAM steering is unavailable in this runtime; cannot confirm rules removed".into())
     }
+    fn installed(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+    fn retarget(&mut self, _ports: Vec<(String, u32)>, _plan: crate::steer::RuleSet) {}
 }
 
 /// Everything both trait views share.
@@ -291,6 +341,16 @@ impl Runtime {
         c.process = Some(p);
         c.attach_mode = crate::attach::AttachMode::Adopted;
         c.engine.set_steered(steered);
+    }
+
+    /// Point steering at a new set of ports and rules.
+    ///
+    /// Records intent only — see [`Steering::retarget`]. The caller must
+    /// follow it with the supervisor event that reconciles the NIC, and
+    /// the supervision loop is the only caller precisely so that the two
+    /// cannot be separated.
+    pub fn retarget(&self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
+        self.core.borrow_mut().steering.retarget(ports, plan);
     }
 
     /// The two trait views the driver's tick takes.
@@ -452,6 +512,26 @@ impl Core {
         }
         r
     }
+
+    /// Write the steering ledger through, after any change to it.
+    ///
+    /// Called on **both** outcomes of steer and unsteer, which is the
+    /// whole point. The failure paths are the ones that matter: a
+    /// rollback that could not clear a rule, or an unsteer the NIC
+    /// refused, leaves rules diverting traffic — and those are exactly
+    /// the rules a later `detach --all` has to be able to find.
+    /// Recording only successes would persist an empty list at the
+    /// moment the record most needs to be non-empty.
+    ///
+    /// The result goes through [`Self::note_persist`], so a failure
+    /// degrades health rather than failing the steer: the rules are in
+    /// the NIC either way, and reporting the steer as failed would make
+    /// the supervisor believe traffic is not diverted when it is.
+    fn record_steering(&mut self) {
+        let rules = self.steering.installed();
+        let r = self.store.steering_changed(&rules);
+        let _ = self.note_persist(r);
+    }
 }
 
 impl Observe for ObserveView {
@@ -565,11 +645,21 @@ impl Effects for EffectsView {
     }
 
     fn unsteer(&mut self) -> Result<(), String> {
-        self.core.borrow_mut().steering.unsteer()
+        let mut c = self.core.borrow_mut();
+        let outcome = c.steering.unsteer();
+        c.record_steering();
+        outcome
     }
 
     fn steer(&mut self) -> Result<(), String> {
-        self.core.borrow_mut().steering.steer()
+        let mut c = self.core.borrow_mut();
+        let outcome = c.steering.steer();
+        c.record_steering();
+        outcome
+    }
+
+    fn steering_in_place(&self) -> bool {
+        !self.core.borrow().steering.installed().is_empty()
     }
 
     fn kill(&mut self) -> Disposition {
@@ -720,6 +810,154 @@ mod tests {
         )
     }
 
+    /// Steering that reports a ledger and can be made to fail, so the
+    /// persistence wiring can be observed on both polarities.
+    #[derive(Default)]
+    struct LedgerSteering {
+        rules: Vec<(String, u32)>,
+        /// What the next call leaves behind, and whether it succeeds.
+        next: Option<(Vec<(String, u32)>, bool)>,
+    }
+
+    impl Steering for LedgerSteering {
+        fn steer(&mut self) -> Result<(), String> {
+            let (rules, ok) = self.next.take().unwrap_or_default();
+            self.rules = rules;
+            if ok {
+                Ok(())
+            } else {
+                Err("MCAM refused".into())
+            }
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            let (rules, ok) = self.next.take().unwrap_or_default();
+            self.rules = rules;
+            if ok {
+                Ok(())
+            } else {
+                Err("a rule would not come out".into())
+            }
+        }
+        fn installed(&self) -> Vec<(String, u32)> {
+            self.rules.clone()
+        }
+        fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+    }
+
+    /// Every ledger the store was handed, in order.
+    type LedgerLog = std::rc::Rc<std::cell::RefCell<Vec<Vec<(String, u32)>>>>;
+
+    /// Records every steering ledger it is handed.
+    #[derive(Default)]
+    struct RecordingStore(LedgerLog);
+
+    impl IdentityStore for RecordingStore {
+        fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+            Ok(())
+        }
+        fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
+        fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+            self.0.borrow_mut().push(rules.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Every steer and unsteer writes the ledger through — **including
+    /// the ones that fail**.
+    ///
+    /// The failure polarity is the whole reason this is asserted. A
+    /// rollback that could not clear a rule, or an unsteer the NIC
+    /// refused, leaves rules diverting traffic; recording only successes
+    /// would persist an empty list at exactly the moment the record has
+    /// to be non-empty, and `detach --all` would have nothing to find.
+    #[test]
+    fn every_steering_change_is_persisted_including_the_failures() {
+        let seen: LedgerLog = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // A steer that lands two rules, then an unsteer that gets one
+        // out and leaves the other stuck.
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024), ("eth4".into(), 1025)], true)),
+            ..Default::default()
+        };
+
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(RecordingStore(std::rc::Rc::clone(&seen))),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let (_, mut fx) = rt.views();
+        fx.steer().expect("installs");
+
+        rt.core.borrow_mut().steering = Box::new(LedgerSteering {
+            rules: vec![("eth4".into(), 1024), ("eth4".into(), 1025)],
+            next: Some((vec![("eth4".into(), 1025)], false)),
+        });
+        fx.unsteer().expect_err("one rule would not come out");
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2, "both changes reached the store");
+        assert_eq!(
+            seen[0],
+            vec![("eth4".to_string(), 1024), ("eth4".to_string(), 1025)],
+            "the successful steer recorded what it installed"
+        );
+        assert_eq!(
+            seen[1],
+            vec![("eth4".to_string(), 1025)],
+            "the FAILED unsteer recorded the rule still in the NIC — a record of nothing \
+             here is a VF released under live steering"
+        );
+    }
+
+    /// A store that cannot record the ledger degrades health; it does
+    /// not fail the steer.
+    ///
+    /// The rules are in the NIC either way. Reporting the steer as
+    /// failed would tell the supervisor traffic is not diverted while it
+    /// is, which is the more dangerous of the two wrong answers.
+    #[test]
+    fn an_unrecordable_steering_ledger_degrades_rather_than_failing() {
+        struct Refusing;
+        impl IdentityStore for Refusing {
+            fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+                Ok(())
+            }
+            fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+                Ok(())
+            }
+            fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+                Err("state dir is read-only".into())
+            }
+        }
+
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024)], true)),
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(Refusing),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let (_, mut fx) = rt.views();
+        fx.steer()
+            .expect("the steer itself succeeded and must say so");
+        assert!(
+            rt.status().store_error.is_some(),
+            "but the operator has to learn the record is stale — the next start cannot adopt"
+        );
+    }
+
     /// The placeholder must refuse BOTH directions. `unsteer` faking
     /// success would emit `Unsteered`, clear `steered`, and unblock the
     /// release of a VF that rules from a previous run might still be
@@ -821,6 +1059,9 @@ mod tests {
             fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
                 Ok(())
             }
+            fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+                Ok(())
+            }
         }
         let rt = Runtime::new(
             engine(),
@@ -853,6 +1094,9 @@ mod tests {
                 Ok(())
             }
             fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+                Ok(())
+            }
+            fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
                 Ok(())
             }
         }
