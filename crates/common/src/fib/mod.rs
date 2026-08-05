@@ -262,6 +262,73 @@ pub enum NeighEvent {
     Gone { ip: IpAddr },
 }
 
+// --- ResolvedRouteSink ------------------------------------------------
+
+/// A second consumer of the FIB, fed with what the programmer
+/// **resolved** rather than with what a peer advertised.
+///
+/// This exists so `vpp-offload` can mirror the forwarding table without
+/// re-deriving it. The obvious alternative — tee [`RouteEvent`]s where
+/// they enter the controller — looks cheaper and is a trap: a
+/// `RouteEvent::Add` carries one *advertisement* (`peer_id`, `path_id`,
+/// `local_pref`), and turning a prefix's advertisements into the nexthop
+/// set that actually forwards is the programmer's local-pref tiering and
+/// ADD-PATH aggregation. A second consumer of the raw events would have
+/// to reimplement that, which is two copies of the rule that decides
+/// where packets go — and the failure mode is the two tiers forwarding
+/// differently, discovered during a failover.
+///
+/// So the notification sites are the programmer's mirror commits, and
+/// what crosses this trait is the resolved best-path union. The
+/// consequence is deliberate and worth stating: the second tier inherits
+/// the first tier's resolution, **including its refusals**. A prefix the
+/// programmer declined on capacity is not announced here either. The two
+/// tiers agreeing is worth more than the second one being independently
+/// complete, because it means a failover cannot change forwarding.
+///
+/// ## Why nothing here can fail
+///
+/// No `Result`, no `async`, `&self`. The fallback tier must never be
+/// stalled by a sick consumer — that is the standing requirement for the
+/// eBPF path, which carries production traffic whenever the offload is
+/// down. A signature that cannot report failure cannot tempt a caller
+/// into waiting for one, so an implementation must absorb its own
+/// backpressure (a prefix-keyed map with last-write-wins collapses churn
+/// and is bounded by table size, not event rate) and must not block:
+/// anything held across these calls is held against the programmer's
+/// task, which is the fallback tier's control plane.
+pub trait ResolvedRouteSink: Send + Sync {
+    /// `prefix` now forwards over `nexthops` — the resolved, sorted,
+    /// deduplicated best-path union, exactly what the data plane reads.
+    /// Replaces any previous set for this prefix.
+    fn route_resolved(&self, prefix: IpPrefix, nexthops: &[IpAddr]);
+
+    /// `prefix` no longer forwards and must be withdrawn downstream.
+    ///
+    /// Distinct from `route_resolved(prefix, &[])`, which would read as
+    /// "still present, currently unresolvable" — a state that black-holes
+    /// rather than falls back, so conflating them would leave a withdrawn
+    /// route installed in the second tier.
+    fn route_withdrawn(&self, prefix: IpPrefix);
+
+    /// `nh` resolved to `mac` out of `ifindex`.
+    ///
+    /// Forwarded because a consumer running VPP has no way to learn it:
+    /// VPP runs without `linux-cp` and MCAM rules match IP fields, so an
+    /// ARP frame can never reach it. Every adjacency it has must be
+    /// programmed from what the kernel already resolved here.
+    fn neighbour_resolved(&self, nh: IpAddr, mac: [u8; 6], ifindex: u32);
+
+    /// `nh` is no longer resolved — the kernel dropped it, or resolution
+    /// failed after retries.
+    ///
+    /// Both cases collapse into one call on purpose: the consumer's
+    /// question is only "may I still forward through this adjacency",
+    /// and the answer is no either way. Why it failed is the fast-path
+    /// tier's diagnostic, and it already reports it.
+    fn neighbour_lost(&self, nh: IpAddr);
+}
+
 /// Errors a NeighborResolver can surface.
 #[derive(Debug)]
 pub struct NeighError {

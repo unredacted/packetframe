@@ -24,13 +24,13 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
-use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent};
+use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::programmer::FibProgrammer;
 use packetframe_fast_path::fib::types::{
@@ -170,6 +170,59 @@ fn open_lpm_v6(path: &Path) -> LpmTrie<MapData, [u8; 16], FibValue> {
     LpmTrie::try_from(Map::LpmTrie(map_data)).expect("LpmTrie try_from")
 }
 
+/// What the second tier was told, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SinkCall {
+    Resolved(IpPrefix, Vec<IpAddr>),
+    Withdrawn(IpPrefix),
+    NeighResolved(IpAddr, [u8; 6], u32),
+    NeighLost(IpAddr),
+}
+
+/// A [`ResolvedRouteSink`] that records rather than forwards.
+///
+/// Ordering matters as much as content here — a withdrawal announced
+/// before the mirror commit that produced it, or a resolve announced for
+/// a set the programmer then failed to install, are the two bugs this
+/// seam can have — so the recording is a `Vec`, not a map.
+#[derive(Default)]
+struct RecordingSink {
+    calls: std::sync::Mutex<Vec<SinkCall>>,
+}
+
+impl RecordingSink {
+    fn calls(&self) -> Vec<SinkCall> {
+        self.calls.lock().expect("sink mutex").clone()
+    }
+}
+
+impl ResolvedRouteSink for RecordingSink {
+    fn route_resolved(&self, prefix: IpPrefix, nexthops: &[IpAddr]) {
+        self.calls
+            .lock()
+            .expect("sink mutex")
+            .push(SinkCall::Resolved(prefix, nexthops.to_vec()));
+    }
+    fn route_withdrawn(&self, prefix: IpPrefix) {
+        self.calls
+            .lock()
+            .expect("sink mutex")
+            .push(SinkCall::Withdrawn(prefix));
+    }
+    fn neighbour_resolved(&self, nh: IpAddr, mac: [u8; 6], ifindex: u32) {
+        self.calls
+            .lock()
+            .expect("sink mutex")
+            .push(SinkCall::NeighResolved(nh, mac, ifindex));
+    }
+    fn neighbour_lost(&self, nh: IpAddr) {
+        self.calls
+            .lock()
+            .expect("sink mutex")
+            .push(SinkCall::NeighLost(nh));
+    }
+}
+
 /// Construct a FibProgrammer with handles to the pinned maps, spawn
 /// it on a fresh current-thread tokio runtime, return the handle +
 /// a shutdown token + a task join handle.
@@ -180,6 +233,10 @@ struct ProgrammerHarness {
     shutdown: CancellationToken,
     handle: packetframe_fast_path::fib::programmer::FibProgrammerHandle,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Retained only by the sink variant, which needs to inject
+    /// `NeighEvent`s. `new()`/`new_with_cache()` drop their sender, which
+    /// closes the channel — fine for route-only tests, fatal here.
+    events_tx: Option<tokio::sync::mpsc::Sender<NeighEvent>>,
 }
 
 impl ProgrammerHarness {
@@ -221,6 +278,7 @@ impl ProgrammerHarness {
             shutdown,
             handle,
             task: Some(task),
+            events_tx: None,
         }
     }
 
@@ -260,7 +318,62 @@ impl ProgrammerHarness {
             shutdown,
             handle,
             task: Some(task),
+            events_tx: None,
         }
+    }
+
+    /// Variant with a second-tier sink registered and the neigh-event
+    /// sender retained.
+    fn with_sink() -> (Self, Arc<RecordingSink>) {
+        let pins = PinDirs::setup();
+        let ebpf = load_and_pin(&pins);
+        let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
+        let fib_v4 = open_lpm_v4(&pins.path("FIB_V4"));
+        let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
+        let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
+        let shutdown = CancellationToken::new();
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (mut programmer, handle) = FibProgrammer::new(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            events_rx,
+            shutdown.clone(),
+        );
+        let sink = Arc::new(RecordingSink::default());
+        programmer.set_route_sink(sink.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let task = rt.spawn(programmer.run());
+        (
+            Self {
+                pins,
+                _ebpf: ebpf,
+                rt,
+                shutdown,
+                handle,
+                task: Some(task),
+                events_tx: Some(events_tx),
+            },
+            sink,
+        )
+    }
+
+    /// Push a `NeighEvent` into the programmer and let it drain.
+    ///
+    /// The settle is a yield-and-wait rather than an ack: neigh events
+    /// are a fire-and-forget channel with no reply, so there is nothing
+    /// to await. 200 ms against a current-thread runtime whose only other
+    /// work is this event is generous by three orders of magnitude.
+    fn feed_neigh(&self, evt: NeighEvent) {
+        let tx = self.events_tx.as_ref().expect("sink harness only").clone();
+        self.run(async move {
+            tx.send(evt).await.expect("neigh channel open");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
     }
 
     /// Read FIB_CACHE_CFG via a fresh handle.
@@ -1488,5 +1601,282 @@ fn fib_cache_generation_semantics() {
         h.read_cache_cfg().generation,
         5,
         "same-value toggle is a no-op"
+    );
+}
+
+// ========== Second-tier sink (Phase 4) ==========
+
+/// The announcement carries the **resolved** union, not the union of
+/// what peers advertised.
+///
+/// This is the test that pins the seam to the right layer. Two peers
+/// advertise the same prefix at different LOCAL_PREF; the programmer's
+/// tiering keeps only the winning tier, and the second tier must be told
+/// that — not both nexthops. Teeing `RouteEvent`s where they enter the
+/// controller would pass this prefix along with `10.0.0.2` included, and
+/// the two forwarding tiers would then disagree about where the traffic
+/// goes, discovered during a failover.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn the_sink_is_told_the_resolved_union_not_the_advertisements() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let prefix = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let winner = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let loser = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+    h.run(async {
+        // Low tier first, so the second Add must *displace* it rather
+        // than merely fail to add to it.
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId(0x1111),
+                prefix,
+                nexthops: vec![loser],
+                path_id: None,
+                local_pref: Some(100),
+            })
+            .await
+            .expect("apply low-pref Add");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId(0x2222),
+                prefix,
+                nexthops: vec![winner],
+                path_id: None,
+                local_pref: Some(150),
+            })
+            .await
+            .expect("apply high-pref Add");
+    });
+
+    let calls = sink.calls();
+    assert_eq!(
+        calls.last(),
+        Some(&SinkCall::Resolved(prefix, vec![winner])),
+        "the latest announcement must be the winning tier alone; got {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, SinkCall::Resolved(_, nhs) if nhs.contains(&loser) && nhs.contains(&winner))),
+        "no announcement may ever have merged the two local-pref tiers: {calls:?}"
+    );
+}
+
+/// A withdrawal reaches the sink, and by the same path for every way a
+/// prefix can stop forwarding.
+///
+/// `Del` and `PeerDown` are asserted together because the claim in the
+/// programmer is that they *share* the removal site — that is what makes
+/// "one notification site covers every withdrawal" true rather than
+/// hopeful. If they ever stop sharing it, one of these two halves fails.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn every_way_a_prefix_stops_forwarding_reaches_the_sink() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let by_del = IpPrefix::V4 {
+        addr: [198, 18, 0, 0],
+        prefix_len: 24,
+    };
+    let by_peer_down = IpPrefix::V4 {
+        addr: [198, 18, 1, 0],
+        prefix_len: 24,
+    };
+    let peer = PeerId(0x3333);
+
+    h.run(async {
+        for prefix in [by_del, by_peer_down] {
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: peer,
+                    prefix,
+                    nexthops: vec![nh],
+                    path_id: None,
+                    local_pref: None,
+                })
+                .await
+                .expect("apply Add");
+        }
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix: by_del,
+                path_id: None,
+            })
+            .await
+            .expect("apply Del");
+        h.handle
+            .apply_route_event(RouteEvent::PeerDown { peer_id: peer })
+            .await
+            .expect("apply PeerDown");
+    });
+
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&SinkCall::Withdrawn(by_del)),
+        "an explicit Del must be announced: {calls:?}"
+    );
+    assert!(
+        calls.contains(&SinkCall::Withdrawn(by_peer_down)),
+        "a PeerDown's routes must be announced as withdrawn too — if this \
+         fails, PeerDown no longer shares the mirror-removal site: {calls:?}"
+    );
+    // Ordering, not just presence: a withdrawal announced before its
+    // install would leave the second tier forwarding a dead prefix.
+    let install = calls
+        .iter()
+        .position(|c| matches!(c, SinkCall::Resolved(p, _) if *p == by_del))
+        .expect("install announced");
+    let withdraw = calls
+        .iter()
+        .position(|c| *c == SinkCall::Withdrawn(by_del))
+        .expect("withdrawal announced");
+    assert!(install < withdraw, "install must precede withdrawal");
+}
+
+/// Re-advertising an identical nexthop set announces nothing.
+///
+/// Not an optimisation: under a peering flap the same prefix is
+/// re-advertised repeatedly with an unchanged union, and a sink that
+/// re-queued each one would turn churn into work for the second tier
+/// with nothing to show for it. The programmer already short-circuits
+/// this for its own maps; the sink must inherit that, not sit upstream
+/// of it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn an_unchanged_nexthop_set_is_announced_once() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let prefix = IpPrefix::V4 {
+        addr: [198, 18, 2, 0],
+        prefix_len: 24,
+    };
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+    h.run(async {
+        for _ in 0..3 {
+            h.handle
+                .apply_route_event(RouteEvent::Add {
+                    peer_id: PeerId(0x4444),
+                    prefix,
+                    nexthops: vec![nh],
+                    path_id: None,
+                    local_pref: None,
+                })
+                .await
+                .expect("apply Add");
+        }
+    });
+
+    let announcements = sink
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, SinkCall::Resolved(p, _) if *p == prefix))
+        .count();
+    assert_eq!(
+        announcements, 1,
+        "three identical Adds must announce once, not three times"
+    );
+}
+
+/// Neighbour resolution and loss both reach the sink, with the egress
+/// ifindex the kernel reported.
+///
+/// The nexthop has to be registered first: the programmer ignores neigh
+/// events for IPs it holds no nexthop for, and that filter is upstream of
+/// the announcement — a sink told about every neighbour on the box would
+/// be told about ones it has no route through.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn neighbour_resolution_and_loss_reach_the_sink() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+    let mac = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x07];
+    let ifindex = 4242;
+
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    h.feed_neigh(NeighEvent::Learned {
+        ip: nh,
+        mac,
+        ifindex,
+        src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+    });
+    h.feed_neigh(NeighEvent::Gone { ip: nh });
+
+    let calls = sink.calls();
+    assert_eq!(
+        calls,
+        vec![
+            SinkCall::NeighResolved(nh, mac, ifindex),
+            SinkCall::NeighLost(nh),
+        ],
+        "resolution then loss, in that order and nothing else"
+    );
+
+    // An unregistered neighbour is not announced — the programmer's own
+    // filter, inherited rather than duplicated.
+    let stranger = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
+    h.feed_neigh(NeighEvent::Gone { ip: stranger });
+    assert_eq!(
+        sink.calls().len(),
+        2,
+        "a neighbour we hold no nexthop for must not be announced"
+    );
+}
+
+/// Unregistering a nexthop tells the second tier it is gone.
+///
+/// This is the seam's only exit for an address, and the reason is a
+/// filter rather than a policy: `on_neigh_event` ignores events for IPs
+/// absent from `by_ip`, so once `unregister` removes the record no
+/// future `Gone` can reach the sink. Without a notification here the
+/// other tier keeps the adjacency for the life of the process.
+///
+/// Driven through `unregister_nexthop` rather than through the
+/// motivating scenario — a prefix re-advertised from NH-A to NH-B, which
+/// releases NH-A through the 100 ms grace queue — because both reach the
+/// same notification site and only one of them is deterministic.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn unregistering_a_nexthop_tells_the_sink_it_is_gone() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+    let mac = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x09];
+
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    h.feed_neigh(NeighEvent::Learned {
+        ip: nh,
+        mac,
+        ifindex: 4242,
+        src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+    });
+    assert_eq!(
+        sink.calls(),
+        vec![SinkCall::NeighResolved(nh, mac, 4242)],
+        "resolution reaches the sink first"
+    );
+
+    h.run(async { h.handle.unregister_nexthop(nh).await })
+        .expect("unregister_nexthop");
+    assert_eq!(
+        sink.calls().last(),
+        Some(&SinkCall::NeighLost(nh)),
+        "and its removal must too — nothing else can report it afterwards"
+    );
+
+    // The filter really is closed behind it: a kernel event arriving
+    // after the unregister is dropped, which is what makes the
+    // notification above the only one there will ever be.
+    let before = sink.calls().len();
+    h.feed_neigh(NeighEvent::Gone { ip: nh });
+    assert_eq!(
+        sink.calls().len(),
+        before,
+        "a post-unregister event is filtered, so it cannot substitute"
     );
 }
