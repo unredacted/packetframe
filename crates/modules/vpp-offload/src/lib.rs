@@ -57,6 +57,7 @@ pub mod executor;
 pub mod feed;
 pub mod fib_sync;
 pub mod liveness;
+pub mod ntuple;
 pub mod process;
 pub mod resources;
 pub mod runtime;
@@ -146,6 +147,9 @@ pub struct VppOffloadModule {
     /// Where routes and neighbours come from. Set before `attach` by
     /// whoever owns the RouteController; see [`Self::set_route_source`].
     source: Option<Box<dyn engine::RouteSource + Send + Sync>>,
+    /// Prefixes steering diverts, inherited from fast-path's allowlist.
+    /// Empty until the loader sets it; see [`Self::set_allowlist`].
+    allowlist: Vec<packetframe_common::fib::IpPrefix>,
     /// `Some` once supervision is running.
     attached: Option<bringup::Attached>,
     /// A teardown still running in the background after `detach` returned.
@@ -171,6 +175,7 @@ impl VppOffloadModule {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
+            allowlist: Vec::new(),
             cfg: VppOffloadConfig::default(),
             state_dir: std::path::PathBuf::new(),
             source: None,
@@ -196,6 +201,18 @@ impl VppOffloadModule {
     /// is the seam it plugs into.
     pub fn set_route_source(&mut self, source: Box<dyn engine::RouteSource + Send + Sync>) {
         self.source = Some(source);
+    }
+
+    /// The prefixes steering diverts, inherited from fast-path.
+    ///
+    /// A setter rather than config, because the allowlist belongs to the
+    /// fast-path section: steered prefixes inherit it rather than
+    /// declaring their own, which is what makes "both tiers carry the
+    /// same traffic" true by construction instead of by two lists
+    /// agreeing. The loader is the only caller — it is the only place
+    /// that sees both sections.
+    pub fn set_allowlist(&mut self, allowlist: Vec<packetframe_common::fib::IpPrefix>) {
+        self.allowlist = allowlist;
     }
 
     /// Settle a finished background teardown and replace the provisional
@@ -457,7 +474,7 @@ impl Module for VppOffloadModule {
             ));
         }
         let paths = bringup::AttachPaths::live(&self.state_dir, default_hugepage_bytes());
-        let attached = match bringup::bring_up(&self.cfg, &paths, source) {
+        let attached = match bringup::bring_up(&self.cfg, &paths, source, &self.allowlist) {
             Ok(a) => a,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
         };

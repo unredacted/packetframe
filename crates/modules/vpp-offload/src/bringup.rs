@@ -42,11 +42,13 @@ use crate::cores;
 use crate::driver::Driver;
 use crate::engine::{ConvergenceEngine, RouteSource};
 use crate::fib_sync::FamilyPolicy;
+use crate::ntuple::NtupleSteering;
 use crate::process::VppProcess;
 use crate::resources::ResourceState;
-use crate::runtime::{Runtime, SteeringUnavailable};
+use crate::runtime::Runtime;
 use crate::service::{LoopFactory, SupervisionService};
 use crate::startup_conf;
+use crate::steer::{McamBudget, RuleSet};
 use crate::supervisor::Event;
 use crate::{VppOffloadConfig, MODULE_NAME};
 
@@ -108,6 +110,7 @@ pub fn bring_up(
     cfg: &VppOffloadConfig,
     paths: &AttachPaths,
     source: Box<dyn RouteSource + Send + Sync>,
+    allowlist: &[packetframe_common::fib::IpPrefix],
 ) -> Result<Attached, String> {
     // --- Everything pure first. A config that cannot work must cost no
     // sysfs writes; the alternative is a rollback path exercised by
@@ -122,37 +125,38 @@ pub fn bring_up(
     if cfg.ports.is_empty() {
         return Err("no `port` lines; there is no forwarding domain to bring up".into());
     }
-    // `steer on` is REFUSED until slice 5 builds MCAM, in the pure phase
-    // before anything is touched.
-    //
-    // Accepting it was a silent no-op with a healthy face on it. The steering
-    // flag is dropped here (the attach step needs only iface and cores), a
-    // fresh supervisor starts with `steer_wanted = false`, and a first attach
-    // deliberately never steers itself — so `SteeringUnavailable` is never
-    // called, convergence settles in `Ready`, and `nominal()` returns true
-    // because `steer_intended()` is false. An operator who asked for traffic
-    // diversion would get a Healthy module that never attempted it, which is
-    // precisely the "requested, not observed" shape this phase keeps
-    // producing.
-    //
-    // Refusing is safe: the plan's staging state is every port `steer off`
-    // (members up, FIB synced and verified, zero traffic diverted), and that
-    // is exactly what this module can honestly deliver today.
-    let asked_to_steer: Vec<&str> = cfg
+    // Steering is real now, so `steer on` is planned rather than
+    // refused — but the plan is built HERE, in the pure phase, because
+    // an allowlist that cannot be steered is a config error and must
+    // cost nothing to discover. `RuleSet::plan` refuses an allowlist
+    // that overruns the MCAM budget rather than truncating it: a
+    // partially steered port divides traffic between the two forwarding
+    // tiers along a line nobody chose.
+    let steer_plan = RuleSet::plan(allowlist, McamBudget::default())?;
+    let wants_steer = cfg.ports.iter().any(|(_, _, steer)| *steer);
+    if wants_steer && steer_plan.rules.is_empty() {
+        return Err(format!(
+            "port(s) are configured `steer on`, but the allowlist produces no steerable \
+             rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this NIC). \
+             Steering would divert nothing while reporting Healthy; set the ports \
+             `steer off` or give fast-path a v4 `allow-prefix`",
+            steer_plan.skipped_v6
+        ));
+    }
+
+    // Only the ports the operator asked to steer. `steer off` is the
+    // designed staging state and the rollback landing zone, so a port
+    // left off must get no rules at all — not rules that happen to be
+    // unused. VF 0 because `acquire` creates exactly one per PF and
+    // reads it back through `virtfn0`.
+    let steer_ports: Vec<(String, u32)> = cfg
         .ports
         .iter()
         .filter(|(_, _, steer)| *steer)
-        .map(|(iface, _, _)| iface.as_str())
+        .map(|(iface, _, _)| (iface.clone(), 0u32))
         .collect();
-    if !asked_to_steer.is_empty() {
-        return Err(format!(
-            "port(s) {} are configured `steer on`, but MCAM steering is not implemented \
-             until slice 5 — attaching would report Healthy while diverting nothing. Set \
-             every port to `steer off` (the designed staging state: members up, FIB synced \
-             and verified, no traffic diverted) until steering ships.",
-            asked_to_steer.join(", ")
-        ));
-    }
+    let steering = NtupleSteering::new(steer_ports, steer_plan);
+
     let workers = cfg.total_workers();
     let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;
     let core_map = cores::derive_from_sysfs(&paths.sysfs_cpu, workers)?;
@@ -236,6 +240,7 @@ pub fn bring_up(
         state.clone(),
         acquired,
         &vpp_binary,
+        steering,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -303,6 +308,7 @@ fn finish(
     state: ResourceState,
     acquired: Acquired,
     vpp_binary: &Path,
+    steering: NtupleSteering,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -440,7 +446,7 @@ fn finish(
         let runtime = Runtime::new(
             engine,
             source,
-            Box::new(SteeringUnavailable),
+            Box::new(steering),
             Box::new(owner.clone()),
             Box::new(owner),
             vpp_binary,

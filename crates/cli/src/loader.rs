@@ -251,6 +251,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 m.set_route_source(Box::new(
                     feed.clone().expect("a vpp-offload section implies a feed"),
                 ));
+                // Steering diverts the fast-path allowlist, so it comes
+                // from that section. The loader is the only place that
+                // sees both.
+                m.set_allowlist(crate::feasibility::allowlist_from_config(&config));
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {
