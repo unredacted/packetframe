@@ -81,6 +81,8 @@ pub struct FastPathModule {
     /// have missed every route resolved in the meantime.
     #[cfg(target_os = "linux")]
     route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
+    #[cfg(target_os = "linux")]
+    completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
 }
 
 impl FastPathModule {
@@ -99,6 +101,20 @@ impl FastPathModule {
         sink: std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>,
     ) {
         self.route_sink = Some(sink);
+    }
+
+    /// Publish how complete the route mirror is, for a second tier to
+    /// consult before it diverts traffic.
+    ///
+    /// Same constraint and same reason as [`Self::set_route_sink`]: the
+    /// loader is the only caller, and it must land before
+    /// [`Module::attach`] spawns the integrity checker.
+    #[cfg(target_os = "linux")]
+    pub fn set_completeness(
+        &mut self,
+        handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
+    ) {
+        self.completeness = Some(handle);
     }
 
     /// Snapshot of the current attach set for status reporting.
@@ -167,7 +183,12 @@ impl Module for FastPathModule {
             .state
             .as_mut()
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach called before load"))?;
-        linux_impl::attach(state, cfg, self.route_sink.clone())
+        linux_impl::attach(
+            state,
+            cfg,
+            self.route_sink.clone(),
+            self.completeness.clone(),
+        )
     }
 
     #[cfg(not(target_os = "linux"))]

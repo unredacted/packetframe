@@ -184,27 +184,36 @@ vppctl -s /run/packetframe/vpp/api.sock show threads
 
 ## The canary ladder
 
-Traffic moves when *you* say so. The module never steers a first attach
-on its own, and — since #128 — a `reconfigure` that did not move the
-`steer` flag will not either, so editing an unrelated line cannot divert
-traffic as a side effect.
+Traffic moves only when you say so. The module never steers on a first
+attach, and a reconfigure that did not change a `steer` flag will not
+either, so editing an unrelated line cannot divert traffic by accident.
 
-Each rung is a `steer` edit plus a SIGHUP. **No restart, no resync**:
-that is the whole point of `reconfigure` handling this, because a
-restart would cost ~40 s of resync with the offload down at every step —
-including the step whose purpose is to get traffic *off* a bad VPP.
+Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
+resync: a restart would cost about 40 seconds with the offload down at
+every step, including the step meant to get traffic off a bad VPP
+quickly.
 
 **Rung 0 — membership, everything off.** Every fast-path attach port
 gets a `port` line; every one is `steer off`.
+
+Decide `require-table-complete` first. On a box running its own bird,
+leave it `on` (the default); the first steer then waits until the route
+mirror matches bird's route count. On a box without a local bird, attach
+refuses to start with `on`, because the check could never pass. Set it
+`off` there and compare the counts yourself before turning a lever:
+`packetframe status` reports how many routes are installed, and
+`birdc show route count` on the box running bird says how many there
+should be.
 
 ```bash
 packetframe reconfigure /etc/packetframe/packetframe.conf
 ```
 
-Wait for `fib-synced healthy` and `routes_unresolvable 0`. Soak here —
+Wait for `fib-synced healthy` and for
+`packetframe_vpp_routes{state="unresolvable"}` to read 0. Soak here for
 at least an hour, and through a udapi provision cycle if one is due.
-This state is safe by construction: VPP is up, its FIB is synced and
-verified, and not one packet is diverted.
+Nothing is diverted in this state: VPP is up, its FIB is synced and
+verified, and every packet is still on the XDP path.
 
 **Rung 1 — one port.** Flip the least important port to `steer on`,
 SIGHUP, and confirm:
@@ -241,8 +250,8 @@ Traffic returns to the eBPF fast-path. Membership stays, the FIB stays
 synced, VPP keeps running — you land on rung 0, which is a state you
 have already soaked.
 
-This path is deliberately robust in one specific way: an allowlist that
-has outgrown the MCAM budget **does not block it**. The budget check
+One thing about this path is deliberate: an allowlist that has outgrown
+the MCAM budget does not block it. The budget check
 only applies when rules are about to be installed, because `unsteer`
 removes what the ledger names and never consults the plan. An allowlist
 growing past the budget is a plausible route to wanting exactly this
@@ -286,6 +295,30 @@ If the NIC *has* the rules and traffic still is not arriving, suspect
 keyword mis-encodes it on the rvu driver, so a rule installed by hand
 with that keyword lands somewhere else. Gate 0a established this by
 inserting both forms and reading back what the NIC stored.
+
+### A steer is refused with "the route mirror holds N of M routes"
+
+The completeness gate. bird's initial dump has not finished, so the
+mirror is short of the table and steering into it would blackhole
+whatever has not arrived — and a steered miss is dropped, where an
+unsteered one falls through to the kernel path.
+
+Nothing to do: it retries on its own. The refusal leaves the *want* set,
+so the next verify attempts the steer again, and by then the dump has
+usually finished. Watch the two counts converge:
+
+```bash
+birdc show route count
+packetframe status /etc/packetframe/packetframe.conf | grep -A6 'module health'
+```
+
+If it persists, the mirror is genuinely not keeping up and that is a
+fast-path problem, not a steering one — check the integrity checker's
+drift warnings in the log.
+
+Refusals reading **"completeness is unknown"** or **"too old to act on"**
+mean something different: no check has run, or the last one is over 15
+minutes old. That is `birdc` failing, not the table being incomplete.
 
 ### `packetframe_vpp_routes{state="unresolvable"} > 0`
 
@@ -414,8 +447,8 @@ refused rather than adopted.
 
 - **`packetframe feasibility` does not attach anything.** It used to,
   via `--config`, on every configured port — including the native-XDP
-  attach that panics this fleet. Fixed in #124; if you are on an older
-  build, do not run it against a live config.
+  attach that panics this fleet. Fixed in v0.2.7; on an older build, do
+  not run it against a live config.
 - **`reconfigure` accepts only the `steer` flag.** `port`, `cores`,
   `expected-routes`, `hugepages` and `vpp-binary` are all fixed at VPP's
   start or at VF acquisition, and each is refused **by name** with what
@@ -428,11 +461,13 @@ refused rather than adopted.
 - **MCAM slots must be pre-allocated.** The driver rejects an
   out-of-range `loc` rather than assigning one, which is why this module
   tracks the locations it owns (base 1024) and hands back exactly those.
-- **The first steer is not guarded against an *incomplete* table.**
-  Verification samples what the ledger holds, so a table that is merely
-  missing prefixes verifies clean. the `unresolvable`, `withheld` and
-  `installing` route counts must all read zero before you turn the first lever —
-  which is what rung 0's soak is for. Closing this in code needs a
-  completeness signal the module does not have; bird's own route count,
-  which the fast-path integrity checker already fetches, is the
-  candidate.
+- **The first steer is guarded against an incomplete table — but only
+  where there is a bird.** Verification samples what the *ledger* holds,
+  so a table that is merely missing prefixes verifies clean. That is why
+  the guard is a separate comparison against bird's own route count,
+  published by the fast-path integrity checker and consulted by every
+  steer, not by the verify. Where no publisher exists,
+  `require-table-complete off` hands the judgement back to you, and rung
+  0's soak is what discharges it: the `unresolvable`, `withheld` and
+  `installing` counts must all read zero before you turn the first
+  lever.

@@ -35,6 +35,7 @@
 //! tear its steering down first.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::acquire::{self, Acquired, ResourceOwner, SharedOwner, SysPaths};
 use crate::attach::PortAttach;
@@ -111,7 +112,23 @@ pub fn bring_up(
     paths: &AttachPaths,
     source: Box<dyn RouteSource + Send + Sync>,
     allowlist: &[packetframe_common::fib::IpPrefix],
+    completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
 ) -> Result<Attached, String> {
+    // `require-table-complete on` with nothing publishing completeness
+    // is refused at attach rather than discovered at the first canary
+    // step. The gate would never pass — every steer would be declined
+    // with "no check has run yet" — and the operator would be debugging
+    // a rollout that cannot proceed instead of reading this once.
+    if cfg.require_table_complete && completeness.is_none() {
+        return Err(
+            "`require-table-complete on` (the default), but nothing is publishing route \
+             completeness — the fast-path integrity checker needs `birdc` and a bird to \
+             ask. Steering would be refused forever. Either give this box a bird, or set \
+             `require-table-complete off` and own the judgement yourself (see the canary \
+             ladder in docs/runbooks/vpp-offload.md)"
+                .into(),
+        );
+    }
     // --- Everything pure first. A config that cannot work must cost no
     // sysfs writes; the alternative is a rollback path exercised by
     // ordinary operator typos.
@@ -241,6 +258,7 @@ pub fn bring_up(
         acquired,
         &vpp_binary,
         steering,
+        completeness,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -309,6 +327,7 @@ fn finish(
     acquired: Acquired,
     vpp_binary: &Path,
     steering: NtupleSteering,
+    completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -469,6 +488,9 @@ fn finish(
             vpp_binary,
             startup_conf_path,
         );
+        if let Some(handle) = completeness {
+            runtime.require_table_complete(handle);
+        }
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is

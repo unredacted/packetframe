@@ -207,17 +207,20 @@ pub trait Steering {
     fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet);
 }
 
-/// A steering seam that refuses both directions.
+/// A steering seam that refuses both directions. **Tests only.**
 ///
-/// Used where no port asks to steer, and by tests. `steer` refusing is
-/// obvious. `unsteer` refusing is the half that matters: `Ok` from
-/// unsteer becomes `Event::Unsteered`, which clears `steered` and
-/// unblocks `ReleaseResources` — so a stand-in that faked success would
-/// let the supervisor release a VF that MCAM rules from a previous run
-/// might still be pointing traffic at. Refusing keeps `steered` true
-/// and the VF withheld, which is the designed behaviour for "rules
-/// exist that we cannot manage". A config with every port `steer off`
-/// never reaches either path.
+/// `bring_up` constructs a [`crate::ntuple::NtupleSteering`]
+/// unconditionally — a config with every port `steer off` gets one with
+/// an empty port list, not this — so nothing in production reaches it.
+/// It is kept because it encodes the rule every stand-in must follow,
+/// and a test double that got this wrong would prove the opposite of
+/// what it claims: `steer` refusing is obvious, but `unsteer` refusing
+/// is the half that matters. `Ok` from unsteer becomes
+/// `Event::Unsteered`, which clears `steered` and unblocks
+/// `ReleaseResources` — so faking success releases a VF that MCAM rules
+/// from a previous run might still be pointing traffic at. Refusing
+/// keeps `steered` true and the VF withheld, which is the designed
+/// behaviour for "rules exist that we cannot manage".
 #[derive(Debug, Default)]
 pub struct SteeringUnavailable;
 
@@ -263,6 +266,13 @@ struct Core {
     /// (an observed exit is a fact whether or not it can be recorded).
     /// Surfaced for status; never blocks the loop.
     last_store_error: Option<String>,
+    /// The completeness gate: may traffic be diverted into the mirror
+    /// yet?
+    ///
+    /// `None` when `require-table-complete off` — the deployment has no
+    /// authority to compare against (the shadow has no bird of its own)
+    /// and the operator owns the judgement instead.
+    completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     /// Why the last drain failed, or `None` if the last one succeeded.
     ///
     /// Recorded here rather than left to the caller because the caller
@@ -302,6 +312,7 @@ impl Runtime {
     ) -> Self {
         Self {
             core: Rc::new(RefCell::new(Core {
+                completeness: None,
                 engine,
                 process: None,
                 source,
@@ -341,6 +352,21 @@ impl Runtime {
         c.process = Some(p);
         c.attach_mode = crate::attach::AttachMode::Adopted;
         c.engine.set_steered(steered);
+    }
+
+    /// Require the route mirror to be confirmed converged before any
+    /// steer installs rules.
+    ///
+    /// Set by the attach wiring when `require-table-complete on` (the
+    /// default). Left unset, [`Effects::steer`] does not consult
+    /// completeness at all — which is the honest shape for a deployment
+    /// with no authority to compare against, and is a config decision
+    /// rather than an inference.
+    pub fn require_table_complete(
+        &self,
+        handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
+    ) {
+        self.core.borrow_mut().completeness = Some(handle);
     }
 
     /// Point steering at a new set of ports and rules.
@@ -653,6 +679,34 @@ impl Effects for EffectsView {
 
     fn steer(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
+        // The completeness gate, HERE rather than at either caller.
+        //
+        // Two paths reach a steer: the operator's `reconfigure`, and the
+        // supervisor's automatic re-steer once a replacement verifies.
+        // The second is the one that would have been missed — the
+        // fast-path's mirror rebuilds from bird after a daemon restart,
+        // so a VPP that comes back up while the dump is still arriving
+        // re-steers into a table missing most of its prefixes. Gating
+        // the operator path alone would leave exactly that door open, so
+        // the check sits at the single point both go through.
+        //
+        // Refusing is cheap and self-correcting: it becomes
+        // `SteerFailed`, which leaves `steer_wanted` set, so the next
+        // verify retries — and by then the dump has usually finished. No
+        // rules are installed, so `rules_remain` is unaffected.
+        if let Some(handle) = &c.completeness {
+            let verdict = handle.verdict();
+            if !verdict.permits_steering() {
+                return Err(format!(
+                    "refusing to steer: {}. Traffic would be diverted into a table that \
+                     cannot forward it, and a steered miss is dropped rather than falling \
+                     back to the kernel path. This retries on its own once the mirror \
+                     converges; `require-table-complete off` opts out where there is no \
+                     bird to compare against",
+                    verdict.describe()
+                ));
+            }
+        }
         let outcome = c.steering.steer();
         c.record_steering();
         outcome
@@ -1138,5 +1192,94 @@ mod tests {
         );
         // And only once.
         assert_eq!(obs.poll_exit(), None);
+    }
+
+    /// A steer into a mirror that is still loading is refused.
+    ///
+    /// The gate sits in `steer()` rather than at either caller, and this
+    /// is why: the operator's `reconfigure` is the obvious path, but the
+    /// supervisor also re-steers automatically once a replacement
+    /// verifies — and after a daemon restart the fast-path's mirror is
+    /// rebuilding from bird, so that automatic path can divert traffic
+    /// into a table missing most of its prefixes. One check, both paths.
+    #[test]
+    fn a_steer_into_a_loading_mirror_is_refused() {
+        use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024)], true)),
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        rt.require_table_complete(handle.clone());
+
+        let (_, mut fx) = rt.views();
+        // Nothing published yet: unknown is not permission.
+        let e = fx.steer().expect_err("must refuse without a verdict");
+        assert!(e.contains("refusing to steer"), "{e}");
+        assert!(
+            e.contains("require-table-complete off"),
+            "the message must name the way out, or an operator with no bird is stuck: {e}"
+        );
+
+        // Still loading.
+        handle.publish(CompletenessReport {
+            authority_routes: 1_000_000,
+            mirror_routes: 300_000,
+            at: std::time::Instant::now(),
+        });
+        let e = fx.steer().expect_err("must refuse a partial mirror");
+        assert!(e.contains("300000") && e.contains("1000000"), "{e}");
+
+        // And NOTHING was installed on either refusal — the refusal is
+        // before the NIC, so a later retry starts clean.
+        assert!(
+            rt.core.borrow().steering.installed().is_empty(),
+            "a refused steer must not have touched the NIC"
+        );
+
+        // Converged: the same call now goes through.
+        handle.publish(CompletenessReport {
+            authority_routes: 1_000_000,
+            mirror_routes: 999_000,
+            at: std::time::Instant::now(),
+        });
+        fx.steer().expect("a converged mirror permits steering");
+        assert_eq!(rt.core.borrow().steering.installed().len(), 1);
+    }
+
+    /// Without the handle the gate does not exist at all.
+    ///
+    /// `require-table-complete off` is a deployment with no authority to
+    /// compare against — the shadow has no bird of its own. That is a
+    /// config decision, not an inference: `bring_up` refuses `on` with
+    /// nothing publishing, so this state is only ever reached
+    /// deliberately.
+    #[test]
+    fn an_unset_gate_does_not_block_steering() {
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024)], true)),
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let (_, mut fx) = rt.views();
+        fx.steer().expect("no gate configured, no gate applied");
     }
 }

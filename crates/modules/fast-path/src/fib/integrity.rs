@@ -93,6 +93,20 @@ pub struct IntegrityChecker {
     snapshot: SharedSnapshot,
     prog: FibProgrammerHandle,
     shutdown: CancellationToken,
+    /// Where the same comparison is republished for the **second
+    /// forwarding tier** to read before it diverts traffic.
+    ///
+    /// Same numbers, different consumer and a different question. This
+    /// checker asks "should an operator look at this?" on a 5-minute
+    /// drift-catch cadence; vpp-offload asks "may I steer packets into
+    /// this mirror yet?", where the case that matters is bird's initial
+    /// dump still arriving. Publishing rather than having vpp-offload
+    /// run its own `birdc` keeps one process shelling out to bird and
+    /// one place parsing its output.
+    ///
+    /// `None` when nothing is consuming it, which is every
+    /// single-module deployment.
+    completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
 }
 
 impl IntegrityChecker {
@@ -107,7 +121,20 @@ impl IntegrityChecker {
             snapshot,
             prog,
             shutdown,
+            completeness: None,
         }
+    }
+
+    /// Publish each comparison to the second forwarding tier as well.
+    ///
+    /// Set by the loader, which is the only place that sees both
+    /// modules — the same wiring the route feed and the allowlist use.
+    pub fn with_completeness(
+        mut self,
+        handle: Arc<packetframe_common::fib::TableCompleteness>,
+    ) -> Self {
+        self.completeness = Some(handle);
+        self
     }
 
     /// Main loop. Sleeps `config.interval`, runs one check, repeats.
@@ -136,6 +163,18 @@ impl IntegrityChecker {
         let bird_route = run_birdc_count(&self.config.birdc_path).await;
         let bird_peers = run_birdc_protocols(&self.config.birdc_path).await;
         let pf_route = self.prog.mirror_counts().await;
+
+        // Captured from THIS run's results, before they are folded into
+        // the snapshot.
+        //
+        // The snapshot's count fields are sticky — a failed `birdc` or a
+        // failed `mirror_counts` leaves the previous run's number in
+        // place, which is right for a drift-catch display and wrong as
+        // the basis of a steering decision. Reading them back below
+        // would publish a report built from one fresh number and one
+        // five minutes old, and the reader acts on it.
+        let fresh_bird = bird_route.as_ref().ok().copied();
+        let fresh_mirror = pf_route.as_ref().ok().map(|(v4, v6)| v4 + v6);
 
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(Instant::now());
@@ -166,6 +205,24 @@ impl IntegrityChecker {
                 snap.last_error = Some(format!("programmer mirror_counts: {e}"));
                 warn!(error = %e, "integrity check: mirror_counts failed");
             }
+        }
+
+        // Republished for the steering gate, and only when BOTH counts
+        // came from THIS run.
+        //
+        // A partial run publishes nothing rather than a mixed report:
+        // the reader treats an absent report as "refuse to steer", which
+        // is the safe reading, while a fabricated one would be acted on.
+        // Leaving the previous report in place is correct — it ages out
+        // on its own, and its own timestamp says how far behind it is.
+        if let (Some(handle), Some(bird), Some(pf)) =
+            (self.completeness.as_ref(), fresh_bird, fresh_mirror)
+        {
+            handle.publish(packetframe_common::fib::CompletenessReport {
+                authority_routes: bird as u64,
+                mirror_routes: pf as u64,
+                at: Instant::now(),
+            });
         }
 
         if let (Some(bird), Some(pf)) = (snap.bird_route_count, snap.packetframe_route_count) {
