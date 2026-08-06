@@ -236,13 +236,18 @@ mod sys {
     /// variable-length, and `RxnfcAll` below is why.
     const ETHTOOL_GRXCLSRLALL: u32 = 0x0000_0030;
 
+    /// `ETHTOOL_GRXCLSRLCNT` — how many rules are installed.
+    ///
+    /// Not redundant with `GRXCLSRLALL`, and skipping it is a bug this
+    /// module already shipped once: see [`rule_table`].
+    const ETHTOOL_GRXCLSRLCNT: u32 = 0x0000_002e;
+
     /// The most locations one query will enumerate.
     ///
-    /// Four times the measured table, so a NIC with a larger one still
-    /// answers rather than failing with `EMSGSIZE`; if a driver ever
-    /// holds more rules than this the query fails loudly rather than
-    /// returning a short list, which would make occupied slots look
-    /// free.
+    /// Four times the measured table, so a NIC with a larger one is
+    /// still describable; a driver reporting more rules than this fails
+    /// loudly rather than returning a short list, which would make
+    /// occupied slots look free.
     const MAX_ENUMERATED_RULES: usize = 64;
 
     /// `struct ethtool_rxnfc` **with its trailing `rule_locs[]`**.
@@ -265,31 +270,74 @@ mod sys {
 
     const _: () = assert!(core::mem::offset_of!(RxnfcAll, rule_locs) == 188);
 
+    /// Two ioctls, and the first one is not optional.
+    ///
+    /// `rule_cnt` on the way IN is not "the size of my buffer" to this
+    /// driver — it is *how many rules to go and find*. `otx2_get_all_flows`
+    /// walks locations upward until it has collected that many, and
+    /// `otx2_get_flow` returns `EINVAL` once `location >= max_flows`. So
+    /// asking for a generous 64 on a table holding four rules walks off
+    /// the end and returns that `EINVAL` as the result of the whole call.
+    /// That is what this function did when it shipped, and it failed on
+    /// the first box it ran against.
+    ///
+    /// `GRXCLSRLCNT` first, then ask for exactly that many — which is what
+    /// `ethtool -n` does, and why `ethtool -n` worked throughout the
+    /// session where this did not. With zero rules installed the second
+    /// call requests zero, the driver's loop does not run, and `data`
+    /// still comes back carrying the table size.
     pub(in crate::ntuple) fn rule_table(iface: &str) -> Result<RuleTable, String> {
+        let mut cnt = Rxnfc {
+            cmd: ETHTOOL_GRXCLSRLCNT,
+            ..Rxnfc::default()
+        };
+        ethtool(iface, &mut cnt).map_err(|e| describe(iface, "counting ntuple rules", &e))?;
+        let installed = cnt.rule_cnt as usize;
+        if installed > MAX_ENUMERATED_RULES {
+            return Err(format!(
+                "{iface} holds {installed} ntuple rules, more than the {MAX_ENUMERATED_RULES} \
+                 this can enumerate; refusing rather than reading a short list, which would \
+                 make occupied slots look free and overwrite somebody else's rule"
+            ));
+        }
+
         let mut all = RxnfcAll {
             cmd: ETHTOOL_GRXCLSRLALL,
             flow_type: 0,
             data: 0,
             fs: RxFlowSpec::default(),
-            // The capacity of `rule_locs`, which the kernel uses to size
-            // its own buffer and to bound what it copies back.
-            rule_cnt: MAX_ENUMERATED_RULES as u32,
+            // Exactly what exists. See the doc comment: to this driver
+            // this is a target, not a capacity.
+            rule_cnt: installed as u32,
             rule_locs: [0; MAX_ENUMERATED_RULES],
         };
         // SAFETY: the pointer covers the whole `RxnfcAll`, which is what
         // the kernel writes through for `GRXCLSRLALL`.
-        unsafe { ethtool_raw(iface, (&mut all as *mut RxnfcAll).cast()) }.map_err(|e| {
-            format!(
-                "reading the ntuple rule table of {iface}: {e}. A port that is administratively \
-                 down answers EOPNOTSUPP here — `otx2_get_rxnfc` gates on `netif_running` — which \
-                 reads like the NIC lacks the feature rather than like the link being down"
-            )
-        })?;
-        let count = (all.rule_cnt as usize).min(MAX_ENUMERATED_RULES);
+        unsafe { ethtool_raw(iface, (&mut all as *mut RxnfcAll).cast()) }
+            .map_err(|e| describe(iface, "reading the ntuple rule table", &e))?;
+
+        let count = (all.rule_cnt as usize).min(installed);
         Ok(RuleTable {
             size: all.data as u32,
             occupied: all.rule_locs[..count].to_vec(),
         })
+    }
+
+    /// Name the cause when the errno has a specific meaning here.
+    ///
+    /// The down-port hint is attached only to `EOPNOTSUPP`, because that
+    /// is the only errno it explains — printed against the `EINVAL` above
+    /// it sent a reader looking at link state for a malformed request.
+    fn describe(iface: &str, what: &str, e: &std::io::Error) -> String {
+        let hint = if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            ". A port that is administratively DOWN answers this — `otx2_get_rxnfc` gates on \
+             `netif_running` — which reads like the NIC lacks ntuple rather than like the link \
+             being down. `ethtool -k` reports `ntuple-filters: on` either way and will not \
+             disambiguate it; check `ip -br link`"
+        } else {
+            ""
+        };
+        format!("{what} of {iface}: {e}{hint}")
     }
 
     /// `SIOCETHTOOL`, the ioctl every ethtool command rides. Lives here
@@ -304,7 +352,7 @@ mod sys {
     /// `req` must be a fully initialised `Rxnfc` whose `cmd` names the
     /// operation; the kernel reads and writes through the pointer for
     /// the lifetime of the call only.
-    pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), String> {
+    pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), std::io::Error> {
         // SAFETY: the pointer covers a fully initialised `Rxnfc`, which
         // is the whole buffer for every command except `GRXCLSRLALL`.
         unsafe { ethtool_raw(iface, (req as *mut Rxnfc).cast()) }
@@ -314,11 +362,13 @@ mod sys {
     /// `req` must point at a fully initialised `ethtool_rxnfc`-shaped
     /// buffer large enough for whatever its `cmd` makes the kernel write
     /// — for `GRXCLSRLALL` that includes the trailing `rule_locs[]`.
-    unsafe fn ethtool_raw(iface: &str, req: *mut core::ffi::c_void) -> Result<(), String> {
+    unsafe fn ethtool_raw(iface: &str, req: *mut core::ffi::c_void) -> Result<(), std::io::Error> {
         let name = iface.as_bytes();
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
         if name.len() >= ifr.ifr_name.len() {
-            return Err(format!("interface name `{iface}` exceeds IFNAMSIZ"));
+            return Err(std::io::Error::other(format!(
+                "interface name `{iface}` exceeds IFNAMSIZ"
+            )));
         }
         for (dst, src) in ifr.ifr_name.iter_mut().zip(name) {
             *dst = *src as libc::c_char;
@@ -327,10 +377,7 @@ mod sys {
 
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock < 0 {
-            return Err(format!(
-                "socket(AF_INET, SOCK_DGRAM): {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(std::io::Error::last_os_error());
         }
         // `ioctl`'s request argument is `c_ulong` on glibc and `c_int`
         // on musl, so this cast is a no-op on one published target and
@@ -342,7 +389,7 @@ mod sys {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock) };
         if rc != 0 {
-            return Err(err.to_string());
+            return Err(err);
         }
         Ok(())
     }
@@ -351,8 +398,8 @@ mod sys {
 #[cfg(all(not(target_os = "linux"), not(test)))]
 mod sys {
     use super::{RuleTable, Rxnfc};
-    pub(super) fn ethtool(_iface: &str, _req: &mut Rxnfc) -> Result<(), String> {
-        Err("ntuple steering is Linux-only".into())
+    pub(super) fn ethtool(_iface: &str, _req: &mut Rxnfc) -> Result<(), std::io::Error> {
+        Err(std::io::Error::other("ntuple steering is Linux-only"))
     }
     pub(in crate::ntuple) fn rule_table(_iface: &str) -> Result<RuleTable, String> {
         Err("ntuple steering is Linux-only".into())
@@ -463,14 +510,14 @@ pub(super) mod sys {
         })
     }
 
-    pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), String> {
+    pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), std::io::Error> {
         NIC.with(|n| {
             let mut nic = n.borrow_mut();
             let key = (iface.to_string(), req.fs.location);
             match req.cmd {
                 ETHTOOL_SRXCLSRLINS => {
                     if nic.uninsertable.contains(&req.fs.location) {
-                        return Err("ENOSPC: no free MCAM entry".into());
+                        return Err(std::io::Error::other("ENOSPC: no free MCAM entry"));
                     }
                     // A real insert at an occupied slot replaces it,
                     // which is what makes re-asserting cheap.
@@ -482,18 +529,20 @@ pub(super) mod sys {
                         req.fs = *stored;
                         Ok(())
                     }
-                    None => Err("ENOENT: no rule at that location".into()),
+                    None => Err(std::io::Error::other("ENOENT: no rule at that location")),
                 },
                 ETHTOOL_SRXCLSRLDEL => {
                     if nic.undeletable.contains(&req.fs.location) {
-                        return Err("EBUSY: rule is pinned".into());
+                        return Err(std::io::Error::other("EBUSY: rule is pinned"));
                     }
                     match nic.rules.remove(&key) {
                         Some(_) => Ok(()),
-                        None => Err("ENOENT: no rule at that location".into()),
+                        None => Err(std::io::Error::other("ENOENT: no rule at that location")),
                     }
                 }
-                other => Err(format!("fake NIC got an unexpected command {other:#x}")),
+                other => Err(std::io::Error::other(format!(
+                    "fake NIC got an unexpected command {other:#x}"
+                ))),
             }
         })
     }
