@@ -240,6 +240,36 @@ impl SharedAllowlist {
     }
 }
 
+/// Which interfaces `attach` should ask for their ntuple table.
+///
+/// Every steering port — unless the allowlist holds nothing this NIC can
+/// steer, in which case: none.
+///
+/// The exception is the whole point. `bring_up` refuses an unsteerable
+/// allowlist on the config alone, deliberately *before* any ioctl, so an
+/// operator who wrote `steer on` against a v6-only allowlist reads about
+/// their allowlist. Querying every steering port here regardless moved
+/// the NIC read one layer out and back in front of that refusal, so on
+/// an administratively-down port the answer became `EOPNOTSUPP` — a true
+/// statement about the wrong problem. Found in review on #132; the
+/// ordering `bring_up`'s own comment promises is only real if this
+/// function honours it.
+///
+/// A named function, so the rule is testable without a NIC.
+fn ifaces_to_query<'a>(
+    cfg: &'a VppOffloadConfig,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+) -> Vec<&'a str> {
+    if steer::steerable_count(allowlist) == 0 {
+        return Vec::new();
+    }
+    cfg.ports
+        .iter()
+        .filter(|(_, _, steer)| *steer)
+        .map(|(iface, _, _)| iface.as_str())
+        .collect()
+}
+
 /// What steering should look like for a config + allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteeringTarget {
@@ -666,13 +696,8 @@ impl Module for VppOffloadModule {
         // keeps its pure phase pure: planning slots is arithmetic, and
         // which slots exist is an environment read like every other one
         // this function performs before delegating.
-        let budget = match steer::McamBudget::for_ifaces(
-            self.cfg
-                .ports
-                .iter()
-                .filter(|(_, _, steer)| *steer)
-                .map(|(iface, _, _)| iface.as_str()),
-        ) {
+        let allowlist = self.allowlist.get();
+        let budget = match steer::McamBudget::for_ifaces(ifaces_to_query(&self.cfg, &allowlist)) {
             Ok(b) => b,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
         };
@@ -680,7 +705,7 @@ impl Module for VppOffloadModule {
             &self.cfg,
             &paths,
             source,
-            &self.allowlist.get(),
+            &allowlist,
             self.completeness.clone(),
             &budget,
         ) {
@@ -959,6 +984,44 @@ mod tests {
             last_failures: Vec::new(),
             store_error: None,
         }
+    }
+
+    /// `attach` asks no NIC when the allowlist has nothing steerable.
+    ///
+    /// The ordering is the assertion. `bring_up` refuses an unsteerable
+    /// allowlist on the config alone, deliberately ahead of any ioctl, so
+    /// that an operator who wrote `steer on` against a v6-only allowlist
+    /// reads about their allowlist rather than about `EOPNOTSUPP` from a
+    /// port that happens to be down. Querying unconditionally here put
+    /// the NIC read back in front of that refusal — found in review, and
+    /// invisible to every other test because both paths still refuse.
+    #[test]
+    fn nothing_steerable_means_no_nic_is_asked() {
+        let cfg = VppOffloadConfig {
+            ports: vec![("eth4".into(), 1, true), ("eth5".into(), 1, false)],
+            ..VppOffloadConfig::default()
+        };
+        let v6_only = [packetframe_common::fib::IpPrefix::V6 {
+            addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 32,
+        }];
+        assert!(
+            ifaces_to_query(&cfg, &v6_only).is_empty(),
+            "a v6-only allowlist is a config error; asking a NIC first answers the wrong question"
+        );
+        assert!(
+            ifaces_to_query(&cfg, &[]).is_empty(),
+            "and so is an empty one"
+        );
+
+        // With something steerable, only the steering ports are asked —
+        // `steer off` is the staging state and installs nothing, so its
+        // table is not a constraint on the plan.
+        let v4 = [packetframe_common::fib::IpPrefix::V4 {
+            addr: [10, 88, 1, 0],
+            prefix_len: 24,
+        }];
+        assert_eq!(ifaces_to_query(&cfg, &v4), vec!["eth4"]);
     }
 
     /// An unattached module orchestrates nothing, and says so honestly

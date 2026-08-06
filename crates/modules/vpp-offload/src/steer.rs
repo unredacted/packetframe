@@ -177,6 +177,22 @@ impl Default for McamBudget {
 /// Source and destination — see [`RuleSet::plan`] for why both.
 const RULES_PER_PREFIX: usize = 2;
 
+/// How many prefixes in `allowlist` this NIC could steer at all.
+///
+/// v4 only: `ip6` ntuple is rejected by this NIC's AF, so a v6 prefix
+/// consumes no slot and cannot be diverted.
+///
+/// A named function because two callers need the answer and one of them
+/// needs it *before* touching a NIC: whether there is anything to steer
+/// is a property of the config, and settling it first is what keeps an
+/// unsteerable allowlist from being reported as an ioctl failure.
+pub fn steerable_count(allowlist: &[IpPrefix]) -> usize {
+    allowlist
+        .iter()
+        .filter(|p| matches!(p, IpPrefix::V4 { .. }))
+        .count()
+}
+
 impl RuleSet {
     /// Decide the rules for one port.
     ///

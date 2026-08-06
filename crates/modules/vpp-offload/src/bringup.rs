@@ -193,10 +193,7 @@ pub fn bring_up(
         // table query. Otherwise the operator's answer is whatever the
         // ioctl said (on a down port, `EOPNOTSUPP`), which names the
         // wrong problem entirely.
-        let steerable = allowlist
-            .iter()
-            .filter(|p| matches!(p, packetframe_common::fib::IpPrefix::V4 { .. }))
-            .count();
+        let steerable = crate::steer::steerable_count(allowlist);
         if steerable == 0 {
             return Err(format!(
                 "port(s) are configured `steer on`, but the allowlist produces no steerable \
