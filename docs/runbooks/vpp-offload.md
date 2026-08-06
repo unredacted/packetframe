@@ -18,11 +18,14 @@ running badly.
 > composition has never executed on hardware. Neither has any of the
 > three published failover numbers.
 >
-> **The MCAM ioctl path has now met a NIC, and it took two rounds.**
-> First contact on 2026-08-05 found the `loc` space sized from the wrong
-> figure and `m_u` written with inverted polarity; both are fixed and
-> both failed loudly, as designed — nothing was installed, and the
-> all-or-nothing unwind left the port with zero rules. What is *still*
+> **The MCAM ioctl path has now met a NIC, and it took several rounds.**
+> First contact on 2026-08-05 found one real defect — the `loc` space
+> sized from `npc/mcam_info` rather than from the driver — plus two
+> self-inflicted ones chasing it: a `GRXCLSRLALL` that asked for more
+> rules than existed, and a mask "correction" that inverted a field
+> which had been right all along. Every one of them failed loudly, as
+> designed: nothing was installed, and the all-or-nothing unwind left the
+> port with zero rules each time. What is *still*
 > unproven is everything past installation: no steered packet has ever
 > reached VPP, because the only port available to test on carries
 > nothing the allowlist matches. Every rule
@@ -484,6 +487,14 @@ refused rather than adopted.
   like the NIC lacks ntuple rather than like the link being down.
   `ethtool -k <if> | grep ntuple` says `on` either way and will not
   disambiguate it.
+- **`ethtool -n` prints the COMPLEMENT of the mask it stores.** Its CLI
+  `m` argument means "bits to ignore" and it inverts on the way in and
+  on the way out, so a /24 you typed as `m 0.0.0.255` displays as
+  `0.0.0.255` and sits in `ethtool_rx_flow_spec.m_u` as `ff ff ff 00`.
+  In the struct a set bit **matches**; zero ignores. Do not infer the
+  wire format from the display — read it with `ETHTOOL_GRXCLSRULE`
+  (`/root/dumpspec.py` on the shadow does exactly this). Believing the
+  display cost one merged PR and one failed steer.
 - **`ethtool -N` exits 0 when the insert fails.** It prints
   `rmgr: Cannot insert RX class rule: ...` to stderr and returns success,
   so any check shaped like `if ethtool -N ... >/dev/null 2>&1` reports

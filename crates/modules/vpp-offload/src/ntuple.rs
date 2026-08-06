@@ -45,6 +45,12 @@ const ETHTOOL_GRXCLSRULE: u32 = 0x0000_002f;
 /// not mention protocols at all.
 const IP_USER_FLOW: u32 = 0x0d;
 
+/// `ip_ver` within `ethtool_usrip4_spec` — after ip4src, ip4dst,
+/// l4_4_bytes and tos.
+const IP_VER_OFFSET: usize = 13;
+/// `ETH_RX_NFC_IP4`, the value `ethtool` puts in `ip_ver`.
+const ETH_RX_NFC_IP4: u8 = 1;
+
 /// The table size assumed where there is no interface to ask.
 ///
 /// Measured on the EFG's `rvu-nicpf` on 2026-08-05: locations 0..=15 are
@@ -170,44 +176,57 @@ pub fn mask_for(prefix_len: u8) -> u32 {
 /// testable without a NIC — every field the NIC matches on is decided
 /// here.
 ///
-/// **A set bit in `m_u` means IGNORE**, which is the opposite of the
-/// reading this function was first written to. Two consequences, and the
-/// first is the one that made every insert fail:
+/// **A set bit in `m_u` means MATCH, and a zero means ignore** — so the
+/// mask is the netmask itself and every field this rule does not name is
+/// left at zero.
 ///
-/// - `m_u` must start all-ones. Left zeroed — the obvious "I only set
-///   what I match" default — it asks the NIC to match every field in the
-///   union exactly against `h_u`, which is all zeros: source address
-///   `0.0.0.0`, protocol 0, TOS 0, `l4_4_bytes` 0. The driver rejects
-///   that outright, which is how this surfaced.
-/// - The address mask is the **complement** of the netmask. A /24 is
-///   `0.0.0.255` — ignore the host bits — not `255.255.255.0`, which
-///   ignores the network and matches the host.
+/// `ethtool -n` prints the OPPOSITE of what it stores. Its CLI `m`
+/// argument means "bits to ignore", and it inverts on the way in and on
+/// the way out, so a /24 the user typed as `m 0.0.0.255` displays as
+/// `0.0.0.255` and sits in the struct as `ff ff ff 00`. Reading that
+/// printed value as the stored one is how this function briefly grew an
+/// all-ones default and a complemented mask, which asked the NIC to
+/// match `proto == 0`, `tos == 0`, `ip_ver == 0`, the other address
+/// against `0.0.0.0`, and 37 bytes of padding — rejected with
+/// `EOPNOTSUPP`, on hardware, having been "fixed" from something that
+/// was already right.
 ///
-/// Both were confirmed against the NIC on 2026-08-05 by inserting via
-/// `ethtool -N` and reading the rule back: a rule naming only a
-/// destination reports `Src IP addr: 0.0.0.0 mask: 255.255.255.255`,
-/// `Protocol: 0 mask: 0xff`, and its own `Dest IP addr: 10.88.1.0 mask:
-/// 0.0.0.255`.
+/// The bytes below are the ground truth, read back with `GRXCLSRULE`
+/// from a rule `ethtool` inserted for source `23.191.200.0/24` to VF 0
+/// on 2026-08-06:
+///
+/// ```text
+/// flow_type  : 0d 00 00 00
+/// h_u[0:16]  : 17 bf c8 00 00 00 00 00 00 00 00 00 00 01 00 00
+/// m_u[0:16]  : ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00
+/// ring_cookie: 00 00 00 00 01 00 00 00
+/// ```
+///
+/// A decoded display is not the wire format. `GRXCLSRULE` was available
+/// the whole time and would have settled it in one command.
 fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
     let mut fs = RxFlowSpec {
         flow_type: IP_USER_FLOW,
         ring_cookie: ring_cookie(vf_index),
         location: rule.location,
-        // Ignore everything, then un-ignore the bits this rule matches.
-        m_u: FlowUnion { hdata: [0xff; 52] },
         ..RxFlowSpec::default()
     };
     // `ethtool_usrip4_spec` lays out as ip4src, ip4dst, l4_4_bytes, tos,
     // ip_ver, proto — so the two addresses are the first eight bytes of
     // the union, in network order.
     let addr = rule.prefix.octets();
-    let mask = (!mask_for(rule.prefix_len)).to_be_bytes();
+    let mask = mask_for(rule.prefix_len).to_be_bytes();
     let (addr_off, mask_off) = match rule.side {
         Side::Src => (0, 0),
         Side::Dst => (4, 4),
     };
     fs.h_u.hdata[addr_off..addr_off + 4].copy_from_slice(&addr);
     fs.m_u.hdata[mask_off..mask_off + 4].copy_from_slice(&mask);
+    // `ip_ver`, at offset 13. Its mask is zero, so the driver ignores the
+    // value — this is here only because the one rule known to be accepted
+    // by this NIC carries it, and matching a proven-good sample byte for
+    // byte costs nothing.
+    fs.h_u.hdata[IP_VER_OFFSET] = ETH_RX_NFC_IP4;
     fs
 }
 
@@ -845,35 +864,39 @@ mod tests {
             "dst rule leaves ip4src unset"
         );
 
-        // And the mask follows the address, or the rule matches a
-        // different width than intended. A SET bit means ignore, so a
-        // /24 is the complement of the netmask — asserted as the literal
-        // the NIC reports rather than as `!mask_for(24)`, which would
-        // pass against either polarity.
-        assert_eq!(&src.m_u.hdata[0..4], &[0, 0, 0, 255], "ip4src /24");
-        assert_eq!(&dst.m_u.hdata[4..8], &[0, 0, 0, 255], "ip4dst /24");
+        // The mask is the NETMASK — a set bit matches. These are the
+        // literal bytes `GRXCLSRULE` returned from a rule this NIC
+        // accepted, not a rendering of them: `ethtool -n` prints the
+        // complement of what it stores, and believing its display is how
+        // this file briefly shipped the inverse.
+        assert_eq!(&src.m_u.hdata[0..4], &[255, 255, 255, 0], "ip4src /24");
+        assert_eq!(&dst.m_u.hdata[4..8], &[255, 255, 255, 0], "ip4dst /24");
 
-        // Everything this rule does NOT match must be ignored, which is
-        // all-ones. Left at the struct default of zero it reads as
-        // "match exactly", and the driver refuses the whole rule — the
-        // defect that made every insert fail with EINVAL. Checked across
-        // the rest of the union, not just the sibling address, because
-        // `usr_ip4_spec` also carries tos, proto and l4_4_bytes.
+        // Every field this rule does not name stays ZERO, which is what
+        // ignores it. All-ones there asks the NIC to match tos, proto,
+        // ip_ver, l4_4_bytes and the sibling address against zero, and
+        // the AF answers EOPNOTSUPP for the whole rule. Asserted across
+        // the rest of the union rather than just the sibling address,
+        // because the failure came from the fields nobody was looking at.
         assert_eq!(
             &src.m_u.hdata[4..],
-            &[0xff; 48][..],
-            "a src rule ignores ip4dst and every other field"
+            &[0u8; 48][..],
+            "a src rule leaves ip4dst and every other mask at zero"
         );
         assert_eq!(
             &dst.m_u.hdata[0..4],
-            &[0xff, 0xff, 0xff, 0xff],
-            "a dst rule ignores ip4src"
+            &[0, 0, 0, 0],
+            "a dst rule masks no src"
         );
         assert_eq!(
             &dst.m_u.hdata[8..],
-            &[0xff; 44][..],
-            "a dst rule ignores tos, proto and l4_4_bytes"
+            &[0u8; 44][..],
+            "a dst rule masks no tos, proto or l4_4_bytes"
         );
+
+        // `ip_ver`, carried because the accepted sample carries it.
+        assert_eq!(src.h_u.hdata[IP_VER_OFFSET], ETH_RX_NFC_IP4);
+        assert_eq!(src.m_u.hdata[IP_VER_OFFSET], 0, "and masked off");
     }
 
     /// The readback comparison must reject the differences that change
@@ -894,7 +917,7 @@ mod tests {
             |f: &mut RxFlowSpec| f.location = 99,
             |f: &mut RxFlowSpec| f.flow_type = 0x01,
             |f: &mut RxFlowSpec| f.h_u.hdata[0] = 24,
-            |f: &mut RxFlowSpec| f.m_u.hdata[3] = 0x00,
+            |f: &mut RxFlowSpec| f.m_u.hdata[3] = 0xff,
         ] {
             let mut got = asked;
             mutate(&mut got);
