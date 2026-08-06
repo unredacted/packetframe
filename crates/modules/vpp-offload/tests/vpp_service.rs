@@ -679,6 +679,10 @@ fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
 fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
     struct PanicOnSteer;
     impl packetframe_vpp_offload::runtime::Steering for PanicOnSteer {
+        fn configured_ports(&self) -> usize {
+            1
+        }
+
         fn steer(&mut self) -> Result<(), String> {
             panic!("supervision loop panic, on purpose");
         }
@@ -1090,6 +1094,10 @@ fn the_timeout_correction_survives_the_in_flight_tick() {
 struct SpySteering(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
 impl packetframe_vpp_offload::runtime::Steering for SpySteering {
+    fn configured_ports(&self) -> usize {
+        1
+    }
+
     fn steer(&mut self) -> Result<(), String> {
         self.0.lock().unwrap().push("steer".into());
         Ok(())

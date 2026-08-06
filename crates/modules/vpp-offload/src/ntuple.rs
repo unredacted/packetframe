@@ -696,6 +696,10 @@ impl NtupleSteering {
 }
 
 impl crate::runtime::Steering for NtupleSteering {
+    fn configured_ports(&self) -> usize {
+        self.ports.len()
+    }
+
     fn steer(&mut self) -> Result<(), String> {
         if self.plan.rules.is_empty() {
             return Err(
