@@ -4,6 +4,7 @@
 //! config; it graduates the per-iface attach feasibility from Deferred
 //! to a real pass/fail check.
 
+use crate::scrub::scrub_for_terminal;
 use std::path::Path;
 
 use packetframe_common::{
@@ -280,11 +281,22 @@ fn print_human(report: &FeasibilityReport) {
             if failing.len() == 1 { "y" } else { "ies" },
         );
         for f in failing {
-            println!("  - {} ({})", f.name, f.detail);
+            println!(
+                "  - {} ({})",
+                scrub_for_terminal(&f.name),
+                scrub_for_terminal(&f.detail)
+            );
         }
     }
 }
 
+/// Both `name` and `detail` are scrubbed, and `detail` is the reason.
+///
+/// A capability's detail is assembled from whatever the probe found:
+/// `strerror` text from an ioctl, a VPP version string, a path out of
+/// the config, an ethtool refusal. `vpp.steering.budget` alone now
+/// carries the raw `io::Error` from `ETHTOOL_GRXCLSRLALL`. None of that
+/// originated here, and this prints straight to a TTY.
 fn print_row(cap: &Capability, name_w: usize) {
     let status = match cap.status {
         CapabilityStatus::Pass => "PASS",
@@ -295,6 +307,9 @@ fn print_row(cap: &Capability, name_w: usize) {
     let req = if cap.required { "yes" } else { "no" };
     println!(
         "{:<8} {:<4} {:<name_w$} {}",
-        status, req, cap.name, cap.detail
+        status,
+        req,
+        scrub_for_terminal(&cap.name),
+        scrub_for_terminal(&cap.detail)
     );
 }

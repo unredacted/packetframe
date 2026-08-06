@@ -108,7 +108,13 @@ where
     let cfg = match Config::from_file(&path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config parse {}: {e}", path.display());
+            // The parse error quotes the config file it failed on, so
+            // it carries bytes this process did not author.
+            eprintln!(
+                "config parse {}: {}",
+                path.display(),
+                crate::scrub::scrub_for_terminal(&e.to_string())
+            );
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     };

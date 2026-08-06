@@ -10,9 +10,8 @@
 //! too. What it deliberately does NOT model is VPP's forwarding
 //! behaviour — that is gate 0b's job on hardware.
 
-use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -22,9 +21,11 @@ use std::time::Duration;
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::fib_sync::{Drainer, FamilyPolicy, PortIndex, ResolvedPath};
 use packetframe_vpp_offload::sink::{Capacity, NexthopMap, PendingMap, RouteLedger};
-use packetframe_vpp_offload::vpp_api::codec::{
-    parse_frame_header, write_frame_header, Encode, MSG_HEADER_LEN, SOCKCLNT_CREATE_MSG_ID,
-};
+use packetframe_vpp_offload::vpp_api::codec::{Encode, SOCKCLNT_CREATE_MSG_ID};
+#[path = "common/wire.rs"]
+mod wire;
+use wire::{id_for, read_frame, request_context, write_frame};
+
 use packetframe_vpp_offload::vpp_api::generated::{
     IpRouteAddDelReply, MessageTableEntry, SockclntCreateReply, MESSAGE_META,
 };
@@ -33,33 +34,6 @@ use packetframe_vpp_offload::vpp_api::Transport;
 /// Message id we hand out for `ip_route_add_del_reply`.
 fn reply_id() -> u16 {
     id_for("ip_route_add_del_reply")
-}
-
-fn id_for(name: &str) -> u16 {
-    100 + MESSAGE_META.iter().position(|m| m.name == name).unwrap() as u16
-}
-
-fn read_frame(s: &mut UnixStream) -> Option<Vec<u8>> {
-    let mut hdr = [0u8; MSG_HEADER_LEN];
-    s.read_exact(&mut hdr).ok()?;
-    let len = parse_frame_header(&hdr) as usize;
-    let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload).ok()?;
-    Some(payload)
-}
-
-fn write_frame(s: &mut UnixStream, payload: &[u8]) {
-    let mut framed = Vec::new();
-    write_frame_header(&mut framed, payload.len());
-    framed.extend_from_slice(payload);
-    let _ = s.write_all(&framed);
-    let _ = s.flush();
-}
-
-/// `context` from a request payload that carries a client_index
-/// prefix (every request the drainer sends does).
-fn request_context(payload: &[u8]) -> u32 {
-    u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]])
 }
 
 /// How the fake answers each route request, in order.

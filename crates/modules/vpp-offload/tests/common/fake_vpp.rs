@@ -2,14 +2,18 @@
 //! format, built from the same generated types the client encodes with.
 //!
 //! Extracted from `vpp_engine.rs` so new integration tests do not grow a
-//! fourth divergent copy (loopback and attach_verify predate it and
-//! still carry their own — migrating them is recorded follow-up work).
+//! divergent copy. `vpp_api_loopback.rs` and `vpp_attach_verify.rs` keep
+//! their own **servers** deliberately — they script handshake failures,
+//! CRC mismatches and device attach, and folding that into a fake built
+//! to model success would complicate the shared one in service of tests
+//! whose job is to break the protocol. What all three now share is
+//! `wire.rs`: frame geometry, reply headers, context extraction.
+//!
 //! Reply headers come from `MESSAGE_META` because header geometry is
 //! per-message; a hand-assumed prefix here would quietly match a
 //! hand-assumed prefix in the client and prove nothing.
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -19,9 +23,12 @@ use packetframe_common::fib::IpPrefix;
 use std::net::{IpAddr, Ipv4Addr};
 
 use packetframe_vpp_offload::vpp_api::codec::{
-    parse_frame_header, peek_msg_id, write_frame_header, Decode, Decoder, Encode, MSG_HEADER_LEN,
-    SOCKCLNT_CREATE_MSG_ID,
+    peek_msg_id, Decode, Decoder, Encode, SOCKCLNT_CREATE_MSG_ID,
 };
+#[path = "wire.rs"]
+mod wire;
+use wire::{name_for, read_frame, reply_head, request_context, write_frame};
+
 use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath,
     FibPathNh, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute, IpRouteAddDel, IpRouteAddDelReply,
@@ -36,48 +43,6 @@ pub const ASSIGNED_INDEX: u32 = 3;
 
 /// Link-layer address the fake mirror hands out for its one neighbour.
 pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-
-fn id_for(name: &str) -> u16 {
-    100 + MESSAGE_META.iter().position(|m| m.name == name).unwrap() as u16
-}
-
-fn name_for(id: u16) -> &'static str {
-    MESSAGE_META[(id - 100) as usize].name
-}
-
-fn reply_head(name: &str) -> Vec<u8> {
-    let meta = MESSAGE_META
-        .iter()
-        .find(|m| m.name == name)
-        .expect("known reply");
-    let mut out = Vec::new();
-    out.extend_from_slice(&id_for(name).to_be_bytes());
-    if meta.client_index_prefix {
-        out.extend_from_slice(&7u32.to_be_bytes());
-    }
-    out
-}
-
-fn read_frame(s: &mut UnixStream) -> Option<Vec<u8>> {
-    let mut hdr = [0u8; MSG_HEADER_LEN];
-    s.read_exact(&mut hdr).ok()?;
-    let len = parse_frame_header(&hdr) as usize;
-    let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload).ok()?;
-    Some(payload)
-}
-
-fn write_frame(s: &mut UnixStream, payload: &[u8]) {
-    let mut framed = Vec::new();
-    write_frame_header(&mut framed, payload.len());
-    framed.extend_from_slice(payload);
-    let _ = s.write_all(&framed);
-    let _ = s.flush();
-}
-
-fn request_context(payload: &[u8]) -> u32 {
-    u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]])
-}
 
 mod tempdir {
     use std::path::{Path, PathBuf};
