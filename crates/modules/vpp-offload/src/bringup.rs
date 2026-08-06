@@ -130,6 +130,7 @@ pub fn bring_up(
     source: Box<dyn RouteSource + Send + Sync>,
     allowlist: &[packetframe_common::fib::IpPrefix],
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+    budget: &McamBudget,
 ) -> Result<Attached, String> {
     // `require-table-complete on` with nothing publishing completeness
     // is refused at attach rather than discovered at the first canary
@@ -177,17 +178,38 @@ pub fn bring_up(
     // that overruns the MCAM budget rather than truncating it: a
     // partially steered port divides traffic between the two forwarding
     // tiers along a line nobody chose.
-    let steer_plan = RuleSet::plan(allowlist, McamBudget::default())?;
+    //
+    // Built only when something steers, for the same reason
+    // `steering_target` does it that way: `plan` refuses an allowlist
+    // that overruns the budget, and the budget is now the NIC's real 16
+    // slots rather than an imagined 512. Planning unconditionally would
+    // make an allowlist of more than eight v4 prefixes refuse to *attach*
+    // — on a config whose ports are all `steer off`, where no rule would
+    // ever be installed and the refusal decides nothing.
     let wants_steer = cfg.ports.iter().any(|(_, _, steer)| *steer);
-    if wants_steer && steer_plan.rules.is_empty() {
-        return Err(format!(
-            "port(s) are configured `steer on`, but the allowlist produces no steerable \
-             rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this NIC). \
-             Steering would divert nothing while reporting Healthy; set the ports \
-             `steer off` or give fast-path a v4 `allow-prefix`",
-            steer_plan.skipped_v6
-        ));
-    }
+    let steer_plan = if wants_steer {
+        // An allowlist with nothing steerable in it is a config error,
+        // and settling that needs no NIC — so it is settled BEFORE the
+        // table query. Otherwise the operator's answer is whatever the
+        // ioctl said (on a down port, `EOPNOTSUPP`), which names the
+        // wrong problem entirely.
+        let steerable = allowlist
+            .iter()
+            .filter(|p| matches!(p, packetframe_common::fib::IpPrefix::V4 { .. }))
+            .count();
+        if steerable == 0 {
+            return Err(format!(
+                "port(s) are configured `steer on`, but the allowlist produces no steerable \
+                 rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this NIC). \
+                 Steering would divert nothing while reporting Healthy; set the ports \
+                 `steer off` or give fast-path a v4 `allow-prefix`",
+                allowlist.len() - steerable
+            ));
+        }
+        RuleSet::plan(allowlist, budget.clone())?
+    } else {
+        RuleSet::default()
+    };
 
     // Only the ports the operator asked to steer. `steer off` is the
     // designed staging state and the rollback landing zone, so a port

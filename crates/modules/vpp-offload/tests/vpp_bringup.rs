@@ -35,6 +35,7 @@ use packetframe_vpp_offload::acquire::SysPaths;
 use packetframe_vpp_offload::bringup::{bring_up, AttachPaths};
 use packetframe_vpp_offload::engine::RouteSource;
 use packetframe_vpp_offload::resources::ResourceState;
+use packetframe_vpp_offload::steer::McamBudget;
 use packetframe_vpp_offload::VppOffloadConfig;
 
 /// The allowlist steering would divert. Non-empty so the `steer on`
@@ -166,7 +167,15 @@ fn a_fresh_attach_acquires_renders_and_supervises() {
     );
     let cfg = host.cfg(&[("eth4", 1, false), ("eth5", 1, false)]);
 
-    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None).expect("bring-up");
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .expect("bring-up");
 
     // --- The core map: workers off the top, main below them, cpu0 and
     // the isolated cpu12 untouched.
@@ -277,17 +286,31 @@ fn a_config_that_cannot_work_touches_nothing() {
     // More workers than there are usable CPUs (18 online, cpu0 and cpu12
     // excluded ⇒ 16 usable, so 16 workers plus a main thread cannot fit).
     let mut cfg = host.cfg(&[("eth4", 16, false)]);
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None)
-        .err()
-        .expect("must fail");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("must fail");
     assert!(e.contains("usable CPU"), "{e}");
 
     // A VPP binary that is not there.
     cfg = host.cfg(&[("eth4", 1, false)]);
     cfg.vpp_binary = Some(host.base.join("no-such-vpp").to_string_lossy().into_owned());
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None)
-        .err()
-        .expect("must fail");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("must fail");
     assert!(e.contains("does not exist"), "{e}");
 
     // A VPP binary that is there but cannot be executed. Distinct from
@@ -298,9 +321,16 @@ fn a_config_that_cannot_work_touches_nothing() {
     fs::write(&unexecutable, "not really vpp").unwrap();
     fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644)).unwrap();
     cfg.vpp_binary = Some(unexecutable.to_string_lossy().into_owned());
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None)
-        .err()
-        .expect("must fail");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("must fail");
     assert!(e.contains("is not executable"), "{e}");
 
     // No attempt may have created a VF, a reservation, or a record.
@@ -345,9 +375,16 @@ fn a_failure_after_acquisition_releases_what_it_took() {
     fs::create_dir_all(&host.paths.startup_conf).unwrap();
 
     let cfg = host.cfg(&[("eth4", 1, false)]);
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None)
-        .err()
-        .expect("must fail");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("must fail");
     assert!(e.contains("conf-is-a-dir"), "{e}");
     assert!(
         e.contains("was released"),
@@ -447,9 +484,16 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
         addr: [0x26, 0x02, 0xf7, 0xd8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         prefix_len: 48,
     }];
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &v6_only, None)
-        .err()
-        .expect("steer on with nothing steerable must be refused");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &v6_only,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("steer on with nothing steerable must be refused");
     assert!(e.contains("no steerable"), "{e}");
     assert!(e.contains("steer off"), "and the remedy stated: {e}");
 
@@ -466,7 +510,14 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
     // And the SAME config with a steerable allowlist is accepted, so the
     // refusal is about having nothing to steer rather than about `steer
     // on` still being unimplemented.
-    let ok = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None);
+    let ok = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    );
     assert!(
         ok.is_ok(),
         "a steerable allowlist must now be accepted: {:?}",
@@ -495,8 +546,15 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
     // releases and removes the state file, and dropping deliberately does not
     // tear down (that is preserve-on-exit, §8.5), so the record survives —
     // which is exactly the situation a daemon restart finds.
-    let attached =
-        bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None).expect("first attach");
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .expect("first attach");
     drop(attached);
 
     // Play the kernel's part: a real bind creates the `driver` symlink that
@@ -518,9 +576,16 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
     state.vpp_boot_id = None; // the third leg is missing
     state.save(&host.paths.sys.state_dir).unwrap();
 
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None)
-        .err()
-        .expect("an unverifiable identity must refuse");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("an unverifiable identity must refuse");
     assert!(e.contains("4242"), "the pid must be named: {e}");
     assert!(e.contains("boot id"), "and the missing leg: {e}");
     assert!(
@@ -562,8 +627,15 @@ fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
     );
     let cfg = host.cfg(&[("eth4", 1, false)]);
 
-    let attached =
-        bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None).expect("first attach");
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .expect("first attach");
     drop(attached);
 
     // Play the kernel's part: a real bind creates the `driver` symlink
@@ -587,8 +659,15 @@ fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
     state.vpp_boot_id = None;
     state.save(&host.paths.sys.state_dir).unwrap();
 
-    let attached =
-        bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None).expect("second attach");
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .expect("second attach");
     drop(attached);
 
     let after = host.state().expect("state file");
@@ -619,8 +698,15 @@ fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
     let host = Host::new("ledger", &[("eth4", "0002:07:00.0")], fake.path.clone());
     let cfg = host.cfg(&[("eth4", 1, false)]);
 
-    let attached =
-        bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None).expect("first attach");
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .expect("first attach");
     drop(attached);
 
     // Play the kernel's part: a real bind creates the `driver` symlink
@@ -639,7 +725,15 @@ fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
     state.steer_rules = vec![("eth4".into(), vec![1024])];
     state.save(&host.paths.sys.state_dir).unwrap();
 
-    let attached = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None).expect("attach");
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .expect("attach");
     let report = attached.service.stop();
     let published = report
         .published
@@ -672,9 +766,16 @@ fn requiring_completeness_with_no_publisher_is_refused_at_attach() {
     let mut cfg = host.cfg(&[("eth4", 1, false)]);
     cfg.require_table_complete = true;
 
-    let e = bring_up(&cfg, &host.paths, Box::new(Mirror), &ALLOW, None)
-        .err()
-        .expect("must refuse");
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("must refuse");
     assert!(e.contains("require-table-complete"), "{e}");
     assert!(
         e.contains("refused forever"),

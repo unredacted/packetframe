@@ -286,7 +286,8 @@ fn steering_target(
             want_steer: false,
         });
     }
-    let plan = steer::RuleSet::plan(allowlist, steer::McamBudget::default())?;
+    let budget = steer::McamBudget::for_ifaces(ports.iter().map(|(iface, _)| iface.as_str()))?;
+    let plan = steer::RuleSet::plan(allowlist, budget)?;
     // `steer on` with nothing steerable is refused for the same reason
     // `bring_up` refuses it: steering would divert nothing while every
     // surface reported it on.
@@ -661,12 +662,27 @@ impl Module for VppOffloadModule {
             ));
         }
         let paths = bringup::AttachPaths::live(&self.state_dir, default_hugepage_bytes());
+        // The NIC is asked here rather than inside `bring_up`, which
+        // keeps its pure phase pure: planning slots is arithmetic, and
+        // which slots exist is an environment read like every other one
+        // this function performs before delegating.
+        let budget = match steer::McamBudget::for_ifaces(
+            self.cfg
+                .ports
+                .iter()
+                .filter(|(_, _, steer)| *steer)
+                .map(|(iface, _, _)| iface.as_str()),
+        ) {
+            Ok(b) => b,
+            Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
+        };
         let attached = match bringup::bring_up(
             &self.cfg,
             &paths,
             source,
             &self.allowlist.get(),
             self.completeness.clone(),
+            &budget,
         ) {
             Ok(a) => a,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),

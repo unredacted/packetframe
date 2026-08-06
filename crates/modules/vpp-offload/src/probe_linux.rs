@@ -29,7 +29,7 @@ pub(crate) fn run(
     for iface in ports {
         caps.push(probe_sriov(iface));
     }
-    caps.push(probe_steering_budget(allowlist));
+    caps.push(probe_steering_budget(ports, allowlist));
     caps
 }
 
@@ -47,10 +47,24 @@ pub(crate) fn run(
 ///
 /// Read-only and non-required, like every probe here: it computes the
 /// plan the module would install, and installs nothing.
-fn probe_steering_budget(allowlist: &[packetframe_common::fib::IpPrefix]) -> Capability {
+///
+/// **The budget comes from the NIC.** This used to plan against
+/// `McamBudget::default()` and report whether the arithmetic held — a
+/// constant checked against itself, which passed while every insert the
+/// module would issue was rejected, because the constant named a slot
+/// 1008 past the end of the table. A probe whose answer cannot disagree
+/// with the code it is probing is not a probe.
+fn probe_steering_budget(
+    ports: &[String],
+    allowlist: &[packetframe_common::fib::IpPrefix],
+) -> Capability {
     use crate::steer::{McamBudget, RuleSet};
 
-    let budget = McamBudget::default();
+    let budget = match McamBudget::for_ifaces(ports.iter().map(String::as_str)) {
+        Ok(b) => b,
+        Err(e) => return Capability::fail("vpp.steering.budget", e, false),
+    };
+    let free = budget.free.len();
     match RuleSet::plan(allowlist, budget) {
         // Nothing to steer is a FAIL however it arose. The two ways there
         // read very differently to an operator, so they are named
@@ -76,11 +90,10 @@ fn probe_steering_budget(allowlist: &[packetframe_common::fib::IpPrefix]) -> Cap
         ),
         Ok(set) => {
             let detail = format!(
-                "{} rule(s) for {} steerable prefix(es), budget {} from slot {}{}",
+                "{} rule(s) for {} steerable prefix(es); the NIC reports {} free slot(s){}",
                 set.rules.len(),
                 set.rules.len() / 2,
-                budget.count,
-                budget.base,
+                free,
                 if set.skipped_v6 > 0 {
                     format!(
                         "; {} IPv6 prefix(es) NOT steerable on this NIC and left on the \
@@ -255,7 +268,10 @@ mod steering_probe_tests {
     /// to declare an allowlist when a port asks to steer.
     #[test]
     fn an_allowlist_that_steers_nothing_never_passes() {
-        let empty = probe_steering_budget(&[]);
+        // No ports: `for_ifaces` asks no NIC and yields the fallback
+        // budget, so these stay tests of the ALLOWLIST logic — which is
+        // what they were always about — on a host that has no rvu NIC.
+        let empty = probe_steering_budget(&[], &[]);
         assert_eq!(empty.status, CapabilityStatus::Fail, "{empty:?}");
         assert!(
             empty.detail.contains("allowlist is empty"),
@@ -263,10 +279,13 @@ mod steering_probe_tests {
             empty.detail
         );
 
-        let v6_only = probe_steering_budget(&[IpPrefix::V6 {
-            addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            prefix_len: 32,
-        }]);
+        let v6_only = probe_steering_budget(
+            &[],
+            &[IpPrefix::V6 {
+                addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                prefix_len: 32,
+            }],
+        );
         assert_eq!(v6_only.status, CapabilityStatus::Fail, "{v6_only:?}");
         assert!(
             v6_only.detail.contains("IPv6"),
@@ -276,7 +295,7 @@ mod steering_probe_tests {
 
         // A steerable prefix passes, so the failures above are about
         // having nothing to steer rather than the probe always failing.
-        let ok = probe_steering_budget(&[v4(0, 24)]);
+        let ok = probe_steering_budget(&[], &[v4(0, 24)]);
         assert_eq!(ok.status, CapabilityStatus::Pass, "{ok:?}");
     }
 }
