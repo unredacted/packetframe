@@ -79,9 +79,72 @@ A quiet single-interface canary cannot see either effect (0.5% share
 measured 99.4% forward parity and looked clean). On this fleet the tc
 datapath is reserved for **temporary, single-interface tcpdump
 visibility**; it is not a CPU optimization and must not be fleet-wide.
-Also observed and unresolved: `err_parse` runs ~0.18% of tc-path
-traffic (fail-safe — those packets take the kernel slow path) vs
-~zero under XDP; diagnose before any future tc use beyond debugging.
+Also observed: `err_parse` runs ~0.18% of tc-path traffic (fail-safe —
+those packets take the kernel slow path) vs ~zero under XDP. See
+[The tc-only `err_parse`](#the-tc-only-err_parse) for the analysis, the
+leading hypothesis, and what would confirm it. Diagnose before any
+future tc use beyond debugging.
+
+## The tc-only `err_parse`
+
+**Status: analysed, not confirmed. Nothing here has been measured — the
+confirming change is unwritten on purpose (see the end).**
+
+`err_parse_tc` has exactly four producers, all in `tc.rs`, and they are
+all the same shape — a bounds check against `ctx.data_end()`:
+
+| site | condition |
+|---|---|
+| `tc_try_fast_path` | shorter than `EthHdr` |
+| `tc_try_fast_path` | 802.1Q/ad frame shorter than `EthHdr + VLAN_HDR_LEN` |
+| `tc_handle_ipv4` | shorter than `EthHdr + Ipv4Hdr` (plus the VLAN offset) |
+| `tc_handle_ipv6` | shorter than `EthHdr + Ipv6Hdr` (plus the VLAN offset) |
+
+There is no fifth path, and none of them is a malformed-packet check.
+Every one of them says *the bytes I need are not in front of me*.
+
+### Why that is a different statement under tc than under XDP
+
+Under XDP the program sees a linear buffer: `data`..`data_end` is the
+whole frame, so a bounds failure really does mean a runt. Under
+`cls_bpf` it does not. `data`..`data_end` spans only the **linear** part
+of the `sk_buff`, and a non-linear skb — GRO-coalesced, or one whose
+driver placed payload in page fragments — can carry its L3 header
+outside that window while being a perfectly well-formed packet.
+
+That fits every observation:
+
+- **It is tc-only.** The XDP path cannot produce it, and measures ~zero.
+  A cause rooted in malformed traffic would show on both.
+- **The rate is small and non-zero** (~0.18%), which is the shape of a
+  minority of skbs arriving paged rather than of a traffic class.
+- **It is fail-safe today.** Those packets fall to the kernel path and
+  forward correctly, which is why this has never been urgent.
+
+The remedy, if confirmed, is `bpf_skb_pull_data(skb, needed)` before the
+parse, with `data`/`data_end` re-read afterwards — the pointers are
+invalidated by the call. It is not free: a pull can copy.
+
+### What would confirm it
+
+Two appended `StatIdx` entries splitting the four sites — at minimum
+"too short for L2" versus "too short for L3" — and a `bpf_skb_pull_data`
+retry on the L3 arm counting how often the pull succeeds. If the pull
+turns the failures into forwards, the hypothesis is proven and the fix
+is already in hand.
+
+**Deliberately not written yet, and the reason is worth recording.** It
+is a BPF datapath change, and BPF changes cannot be compiled on the
+macOS dev host at all — the build falls back to a stub, so the code
+would appear to build and its tests would pass having executed nothing.
+The only gates that see BPF are CI and the qemu verifier. Writing
+verifier-sensitive code for a 5.15 vendor kernel with no compiler and no
+verifier in the loop is how a day gets lost; this waits for both.
+
+It is also worth being honest about priority: the tc datapath is a
+**measured dead end** on this fleet (+70% ns/pkt, see above) and is
+reserved for temporary tcpdump visibility. This matters if tc is ever
+reconsidered, and not before.
 
 ## Prerequisites
 
