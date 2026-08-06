@@ -205,6 +205,18 @@ pub trait Steering {
     /// for every rule that ever reaches the NIC, so a reconfigure cannot
     /// grow its own, subtly different, installation path.
     fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet);
+    /// How many ports the CONFIG asks to steer, whether or not any rule
+    /// is installed.
+    ///
+    /// Distinct from everything else here, which reports what the NIC
+    /// holds. The supervisor deliberately never steers a first attach on
+    /// its own — `steer on` in the file is the designed staging state
+    /// until an operator moves the lever — so without this the health
+    /// surface cannot tell "configured off" from "configured on and
+    /// waiting", and reports the identical line for both. An operator
+    /// who wrote `steer on`, restarted, and read `steer off (staging
+    /// state)` has no way to know the config was seen.
+    fn configured_ports(&self) -> usize;
 }
 
 /// A steering seam that refuses both directions. **Tests only.**
@@ -225,6 +237,10 @@ pub trait Steering {
 pub struct SteeringUnavailable;
 
 impl Steering for SteeringUnavailable {
+    fn configured_ports(&self) -> usize {
+        0
+    }
+
     fn steer(&mut self) -> Result<(), String> {
         Err("MCAM steering is unavailable in this runtime; port stays unsteered".into())
     }
@@ -426,6 +442,7 @@ impl Runtime {
             store_error: c.last_store_error.clone(),
             drain_error: c.last_drain_error.clone(),
             source_backlog: c.source.backlog(),
+            steer_configured_ports: c.steering.configured_ports(),
         }
     }
 }
@@ -443,6 +460,9 @@ pub struct RuntimeStatus {
     pub store_error: Option<String>,
     /// Why the last drain failed. See `Core::last_drain_error`.
     pub drain_error: Option<String>,
+    /// How many ports the config asks to steer. See
+    /// [`Steering::configured_ports`].
+    pub steer_configured_ports: usize,
     /// Changes the source is holding that the engine has not pulled yet.
     ///
     /// Distinct from `pending_ops`, which is what the engine has pulled
@@ -871,9 +891,18 @@ mod tests {
         rules: Vec<(String, u32)>,
         /// What the next call leaves behind, and whether it succeeds.
         next: Option<(Vec<(String, u32)>, bool)>,
+        /// Ports the config asks to steer. Its own field rather than
+        /// derived from `rules`, because the whole point of
+        /// `configured_ports` is being answerable when nothing is
+        /// installed.
+        configured: usize,
     }
 
     impl Steering for LedgerSteering {
+        fn configured_ports(&self) -> usize {
+            self.configured
+        }
+
         fn steer(&mut self) -> Result<(), String> {
             let (rules, ok) = self.next.take().unwrap_or_default();
             self.rules = rules;
@@ -951,6 +980,7 @@ mod tests {
         rt.core.borrow_mut().steering = Box::new(LedgerSteering {
             rules: vec![("eth4".into(), 1024), ("eth4".into(), 1025)],
             next: Some((vec![("eth4".into(), 1025)], false)),
+            configured: 1,
         });
         fx.unsteer().expect_err("one rule would not come out");
 

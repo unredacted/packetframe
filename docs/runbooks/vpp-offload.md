@@ -207,6 +207,17 @@ resync: a restart would cost about 40 seconds with the offload down at
 every step, including the step meant to get traffic off a bad VPP
 quickly.
 
+**The lever has to travel.** What triggers a steer is the `steer` flag
+*changing*, not its value — so a daemon that started with `steer on`
+already in the file is sitting in the staging state and a reconfigure
+against that same file does nothing. `packetframe status` names this
+case: `configured "steer on", awaiting an operator lever move`. To move
+it, set the port `steer off`, `packetframe reconfigure`, set it back to
+`steer on`, and reconfigure again. This costs one round trip after any
+restart of an already-steered deployment, and it is deliberate: a SIGHUP
+raised for an unrelated edit must never divert traffic as a side
+effect.
+
 **Rung 0 — membership, everything off.** Every fast-path attach port
 gets a `port` line; every one is `steer off`.
 
@@ -394,6 +405,10 @@ Be precise about this when reasoning about an incident.
 | Nexthop spread | eth3 1,248,508 / eth2 52,492 | the full-table decision rests on this |
 | ntuple `loc` space | **16 per port** (0..=15) | measured on the shadow's eth1 2026-08-05, by insert-and-read-back. At 2 rules per prefix → **8 steerable IPv4 prefixes per port**. Production's allowlist is 2. |
 | NPC MCAM block | 2048 entries, ~1689 free, 31 allocated per PF | from `npc/mcam_info`. **This is not the `loc` space** and must never be used to size one — doing so is what produced `base: 1024`, an out-of-range slot that failed the first steer this module ever attempted. |
+| First steer | **4 rules installed and readback-verified** | 2026-08-06, shadow eth1, locs 15/14/13/12, src+dst × 2 prefixes → VF 0. Installation only: eth1 carries the interconnect, so zero packets match. |
+| Steered-idle soak | **5 h 17 m**, rules intact, no restarts | 2026-08-06 overnight. Proves nothing wiped them; does **not** prove they survive a UniFi provisioning push — the re-assert path is still untested. |
+| Drill (d) adopt-while-steered | **PASS** | restart under a steered VPP; MCAM rule count sampled at 5 Hz never left 4, VPP never restarted, adoption took `Adopted {{ steered: true }}`. Loss unmeasured (no traffic peer). |
+| Restart Unhealthy window | **~10 s** | between adoption and the first verify. See the warning below — it is correct behaviour. |
 
 **Published but never measured:**
 
@@ -403,6 +418,51 @@ Be precise about this when reasoning about an incident.
 | Wedge detection ≤ 2 s | UNMEASURED |
 | Recovery ≤ 90 s | UNMEASURED |
 | `detach` < 1 s across N VFs | UNMEASURED — needs real VFs; relaxes to a documented best-effort bound if hardware says so |
+| Steered packets actually reaching VPP | UNMEASURED — gate 0b item 1's second half; needs a traffic peer |
+| PMTUD through a steered path | UNMEASURED — gate 0b item 7, unskippable |
+
+### A planned restart looks Unhealthy for ~10 seconds. Do not page on it.
+
+Restarting packetframe over a **steered** VPP reports:
+
+```
+vpp-offload: UNHEALTHY
+  fib-synced   UNHEALTHY — traffic steered into an unverified FIB
+```
+
+for roughly ten seconds, then clears to `fib-synced healthy` on its own.
+
+This is correct and deliberate. An adopted VPP is presumed
+good-until-proven-stale: the module resyncs and verifies but does **not**
+unsteer first, because unsteering a correctly-forwarding VPP would create
+the blackhole the design exists to avoid. So between adoption and the
+first completed verify, traffic genuinely is diverted into a FIB this
+process has not yet checked — and the health surface refuses to call that
+healthy rather than papering over it.
+
+Consequence for alerting: anything paging on `packetframe_vpp_health`
+will fire on every planned restart. Either alert on a sustained
+Unhealthy (30 s or more) or exclude the window explicitly. Measured
+2026-08-06 on the shadow during drill (d).
+
+### Verification does not re-run in steady state
+
+`fib-synced` reports the **last completed** readback verify, and the
+`last ok Ns ago` beside it is not decoration — on a long-lived steered
+daemon it legitimately reads hours. Measured: `last ok 18966s ago` after
+a 5 h uptime.
+
+Verify runs on first attach and after every resync, then not again. A
+periodic verify would have to sample the ledger and probe VPP while
+deltas are in flight, and a withdrawal landing between sample and probe
+reads as a mismatch — which is why delta draining is excluded during
+`Verifying` in the first place. Steady-state divergence is meant to
+surface as drain errors and a rising outstanding count instead.
+
+What this means when you are reading a dashboard: a green `fib-synced`
+says the FIB was verified *at some point*, not that it is being watched.
+Nothing here would notice VPP's FIB drifting for a reason other than this
+module's own deltas.
 
 **Failed, and shaping the design:**
 

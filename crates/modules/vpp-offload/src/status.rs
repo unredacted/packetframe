@@ -154,6 +154,22 @@ impl ApiHealth {
 /// verification**, never the fact that a resync finished — a drained
 /// pending map means we sent everything, which is exactly the kind of
 /// requested-not-observed claim that has bitten this module repeatedly.
+///
+/// **Verification is a convergence-time gate, not a heartbeat**, and the
+/// `age` here is how an operator sees that. It runs on first attach and
+/// after every resync, and then not again: a periodic verify would have
+/// to sample the ledger and probe VPP while deltas are in flight, and a
+/// withdrawal landing between sample and probe reads as a mismatch —
+/// which is why `drain_batch` is excluded during `Verifying` in the
+/// first place. Steady-state divergence is meant to surface as drain
+/// errors and a rising outstanding count instead.
+///
+/// The consequence is real and worth knowing before reading a
+/// dashboard: on a long-lived steered daemon this can legitimately say
+/// `last ok 18966s ago` (measured, 2026-08-06), and nothing would notice
+/// VPP's FIB drifting for a reason other than our own deltas. Making it
+/// a heartbeat is a design change, not a tweak — it needs an answer for
+/// the in-flight-delta race first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FibSync {
     /// No verify has completed for the current process.
@@ -229,6 +245,18 @@ pub struct StatusSnapshot {
     /// state, which is the designed rollback landing zone rather than a
     /// fault.
     pub steer_intended: bool,
+    /// The config asks at least one port to steer.
+    ///
+    /// Separate from `steer_intended`, which is the supervisor's belief
+    /// about whether traffic is or should be diverted *right now*. The
+    /// machine never steers a first attach on its own — when traffic
+    /// moves is an operator decision, paced by hand up the canary ladder
+    /// — so a port configured `steer on` that has never steered sits in
+    /// the designed staging state. Without this the surface reported the
+    /// identical line for that and for `steer off`, and an operator who
+    /// had just written `steer on` could not tell the config had been
+    /// read at all.
+    pub steer_configured: bool,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -281,6 +309,7 @@ impl StatusSnapshot {
         api: ApiHealth,
         fib: FibSync,
         ports: Vec<PortLink>,
+        steer_configured: bool,
     ) -> Self {
         Self::observe_parts(
             sup,
@@ -293,6 +322,7 @@ impl StatusSnapshot {
             None,
             None,
             0,
+            steer_configured,
         )
     }
 
@@ -313,11 +343,13 @@ impl StatusSnapshot {
         store_error: Option<String>,
         drain_error: Option<String>,
         source_backlog: u64,
+        steer_configured: bool,
     ) -> Self {
         Self {
             state: sup.state(),
             steered: sup.is_steered(),
             steer_intended: sup.steer_intended(),
+            steer_configured,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -553,10 +585,13 @@ impl StatusSnapshot {
                         )),
                     )
                 } else {
+                    // "verified AT" rather than "verified", because
+                    // nothing re-runs verification in steady state and
+                    // this line is read hours later. See `FibSync`.
                     (
                         HealthState::Healthy,
                         Some(format!(
-                            "{} routes installed, verified on {sampled} probes",
+                            "{} routes installed; last verified on {sampled} probes",
                             c.installed
                         )),
                     )
@@ -583,6 +618,19 @@ impl StatusSnapshot {
             // The deliberate staging state: all members up, FIB synced
             // and verified, nothing diverted. Every canary's waypoint
             // and every rollback's landing zone, so it is not a fault.
+            //
+            // Split by what the CONFIG says, because the two ways to be
+            // here read very differently to whoever is holding the
+            // rollout. Both are Healthy — waiting for a lever is not a
+            // fault — but "I asked for this" and "the machine is waiting
+            // for me" must not print the same line.
+            (false, false) if self.steer_configured => (
+                HealthState::Healthy,
+                Some(
+                    "configured `steer on`, awaiting an operator lever move; traffic is on                      the eBPF tier. A first attach never steers by itself — set the port                      `steer off`, `packetframe reconfigure`, then back to `steer on` and                      reconfigure again (canary ladder, docs/runbooks/vpp-offload.md)"
+                        .into(),
+                ),
+            ),
             (false, false) => (
                 HealthState::Healthy,
                 Some("steer off (staging state); traffic is on the eBPF tier".into()),
@@ -994,7 +1042,15 @@ mod tests {
         fib: FibSync,
         ports: Vec<PortLink>,
     ) -> StatusSnapshot {
-        StatusSnapshot::observe(sup, led.counts(), &PendingMap::new(), api, fib, ports)
+        StatusSnapshot::observe(
+            sup,
+            led.counts(),
+            &PendingMap::new(),
+            api,
+            fib,
+            ports,
+            false,
+        )
     }
 
     #[test]
@@ -1224,6 +1280,64 @@ mod tests {
             .find(|x| x.name == SUBSYS_STEERING)
             .unwrap();
         assert_eq!(steer.state, HealthState::Degraded);
+    }
+
+    /// The two ways to be unsteered must not print the same line.
+    ///
+    /// Both are Healthy — a first attach never steers by itself, so
+    /// `steer on` waiting for a lever is the designed staging state, not
+    /// a fault. But an operator who has just written `steer on` and
+    /// restarted needs to see that the config was read. Reporting
+    /// `steer off (staging state)` at them says the opposite, and this
+    /// bit us directly on the shadow: the first steer needed a lever
+    /// round-trip that nothing in the output suggested.
+    ///
+    /// Asserts the DISTINCTION rather than either message's wording — a
+    /// test pinning one string passes just as well when both arms print
+    /// it.
+    #[test]
+    fn configured_steer_on_reads_differently_from_steer_off() {
+        let led = ledger_with(10, 0, 0);
+        let sup = ready_supervisor();
+        assert!(!sup.is_steered() && !sup.steer_intended());
+
+        let msg = |configured: bool| {
+            StatusSnapshot::observe(
+                &sup,
+                led.counts(),
+                &PendingMap::new(),
+                ApiHealth::Answering {
+                    silent_for: Duration::ZERO,
+                },
+                verified(1),
+                ports_up(),
+                configured,
+            )
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|x| x.name == SUBSYS_STEERING)
+            .map(|x| (x.state, x.message.unwrap_or_default()))
+            .unwrap()
+        };
+
+        let (off_state, off_msg) = msg(false);
+        let (on_state, on_msg) = msg(true);
+
+        assert_eq!(off_state, HealthState::Healthy, "steer off is not a fault");
+        assert_eq!(
+            on_state,
+            HealthState::Healthy,
+            "and neither is waiting for the lever"
+        );
+        assert_ne!(
+            off_msg, on_msg,
+            "a config asking to steer must not report as one that is not"
+        );
+        assert!(
+            on_msg.contains("lever"),
+            "the waiting case must say what unblocks it: {on_msg}"
+        );
     }
 
     /// Undead outranks everything: the VF cannot be released and no
