@@ -45,6 +45,35 @@ const ETHTOOL_GRXCLSRULE: u32 = 0x0000_002f;
 /// not mention protocols at all.
 const IP_USER_FLOW: u32 = 0x0d;
 
+/// The table size assumed where there is no interface to ask.
+///
+/// Measured on the EFG's `rvu-nicpf` on 2026-08-05: locations 0..=15 are
+/// accepted and 16 upward are rejected. Reached only by
+/// [`crate::steer::McamBudget::default`] — tests and the non-Linux stub.
+/// Production goes through [`rule_table`], because a constant is exactly
+/// what put `base: 1024` in this file.
+pub const FALLBACK_TABLE_SIZE: u32 = 16;
+
+/// The `loc` space one interface actually offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleTable {
+    /// Locations run `0..size`. From the driver, not from us.
+    pub size: u32,
+    /// Locations already holding a rule — anyone's, not just ours.
+    pub occupied: Vec<u32>,
+}
+
+/// Ask `iface` how big its ntuple table is and what already sits in it.
+///
+/// The one number that governs a `loc`, read from the thing that
+/// enforces it. Note the failure mode this replaces is not a wrong
+/// answer but a plausible one: `npc/mcam_info` reports a real, correct,
+/// entirely different quantity, and nothing about reading it feels like
+/// a guess.
+pub fn rule_table(iface: &str) -> Result<RuleTable, String> {
+    sys::rule_table(iface)
+}
+
 /// `union ethtool_flow_union` — sized by its `hdata[52]` member.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -88,10 +117,14 @@ const _: () = assert!(core::mem::size_of::<RxFlowSpec>() == 168);
 
 /// `struct ethtool_rxnfc`, up to and including `rule_cnt`.
 ///
-/// The trailing `rule_locs[0]` is only read by `GRXCLSRLALL`, which this
-/// module does not use — it tracks the locations it installed rather
-/// than asking the NIC to enumerate them, because a location we did not
-/// choose is one teardown cannot account for.
+/// Enough for every command that names a single rule. `GRXCLSRLALL`
+/// needs the trailing `rule_locs[]` as well and uses its own struct in
+/// `sys`, because appending an array to this one lands it four bytes
+/// past where the kernel writes.
+///
+/// Teardown still removes only the locations the ledger records — a slot
+/// this module did not choose is one it cannot account for — so the
+/// enumeration feeds slot *selection*, never removal.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Rxnfc {
@@ -136,18 +169,39 @@ pub fn mask_for(prefix_len: u8) -> u32 {
 /// Build the flow spec for one rule. Split out so the encoding is
 /// testable without a NIC — every field the NIC matches on is decided
 /// here.
+///
+/// **A set bit in `m_u` means IGNORE**, which is the opposite of the
+/// reading this function was first written to. Two consequences, and the
+/// first is the one that made every insert fail:
+///
+/// - `m_u` must start all-ones. Left zeroed — the obvious "I only set
+///   what I match" default — it asks the NIC to match every field in the
+///   union exactly against `h_u`, which is all zeros: source address
+///   `0.0.0.0`, protocol 0, TOS 0, `l4_4_bytes` 0. The driver rejects
+///   that outright, which is how this surfaced.
+/// - The address mask is the **complement** of the netmask. A /24 is
+///   `0.0.0.255` — ignore the host bits — not `255.255.255.0`, which
+///   ignores the network and matches the host.
+///
+/// Both were confirmed against the NIC on 2026-08-05 by inserting via
+/// `ethtool -N` and reading the rule back: a rule naming only a
+/// destination reports `Src IP addr: 0.0.0.0 mask: 255.255.255.255`,
+/// `Protocol: 0 mask: 0xff`, and its own `Dest IP addr: 10.88.1.0 mask:
+/// 0.0.0.255`.
 fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
     let mut fs = RxFlowSpec {
         flow_type: IP_USER_FLOW,
         ring_cookie: ring_cookie(vf_index),
         location: rule.location,
+        // Ignore everything, then un-ignore the bits this rule matches.
+        m_u: FlowUnion { hdata: [0xff; 52] },
         ..RxFlowSpec::default()
     };
     // `ethtool_usrip4_spec` lays out as ip4src, ip4dst, l4_4_bytes, tos,
     // ip_ver, proto — so the two addresses are the first eight bytes of
     // the union, in network order.
     let addr = rule.prefix.octets();
-    let mask = mask_for(rule.prefix_len).to_be_bytes();
+    let mask = (!mask_for(rule.prefix_len)).to_be_bytes();
     let (addr_off, mask_off) = match rule.side {
         Side::Src => (0, 0),
         Side::Dst => (4, 4),
@@ -174,7 +228,69 @@ fn matches(asked: &RxFlowSpec, got: &RxFlowSpec) -> bool {
 
 #[cfg(all(target_os = "linux", not(test)))]
 mod sys {
-    use super::Rxnfc;
+    use super::{RuleTable, RxFlowSpec, Rxnfc};
+
+    /// `ETHTOOL_GRXCLSRLALL` — enumerate installed locations, and report
+    /// how many the table holds. Lives here rather than beside the other
+    /// command codes because it is the only one whose buffer is
+    /// variable-length, and `RxnfcAll` below is why.
+    const ETHTOOL_GRXCLSRLALL: u32 = 0x0000_0030;
+
+    /// The most locations one query will enumerate.
+    ///
+    /// Four times the measured table, so a NIC with a larger one still
+    /// answers rather than failing with `EMSGSIZE`; if a driver ever
+    /// holds more rules than this the query fails loudly rather than
+    /// returning a short list, which would make occupied slots look
+    /// free.
+    const MAX_ENUMERATED_RULES: usize = 64;
+
+    /// `struct ethtool_rxnfc` **with its trailing `rule_locs[]`**.
+    ///
+    /// Written flat rather than as `{ Rxnfc, [u32; N] }` because that
+    /// nesting is wrong in a way that compiles: `Rxnfc` ends on a `u32`
+    /// at offset 184 but carries 8-byte alignment from its `data` field,
+    /// so `size_of` rounds it to 192 and the array would start four
+    /// bytes past where the kernel writes. The offset assertion below is
+    /// the check, not the layout comment.
+    #[repr(C)]
+    struct RxnfcAll {
+        cmd: u32,
+        flow_type: u32,
+        data: u64,
+        fs: RxFlowSpec,
+        rule_cnt: u32,
+        rule_locs: [u32; MAX_ENUMERATED_RULES],
+    }
+
+    const _: () = assert!(core::mem::offset_of!(RxnfcAll, rule_locs) == 188);
+
+    pub(in crate::ntuple) fn rule_table(iface: &str) -> Result<RuleTable, String> {
+        let mut all = RxnfcAll {
+            cmd: ETHTOOL_GRXCLSRLALL,
+            flow_type: 0,
+            data: 0,
+            fs: RxFlowSpec::default(),
+            // The capacity of `rule_locs`, which the kernel uses to size
+            // its own buffer and to bound what it copies back.
+            rule_cnt: MAX_ENUMERATED_RULES as u32,
+            rule_locs: [0; MAX_ENUMERATED_RULES],
+        };
+        // SAFETY: the pointer covers the whole `RxnfcAll`, which is what
+        // the kernel writes through for `GRXCLSRLALL`.
+        unsafe { ethtool_raw(iface, (&mut all as *mut RxnfcAll).cast()) }.map_err(|e| {
+            format!(
+                "reading the ntuple rule table of {iface}: {e}. A port that is administratively \
+                 down answers EOPNOTSUPP here — `otx2_get_rxnfc` gates on `netif_running` — which \
+                 reads like the NIC lacks the feature rather than like the link being down"
+            )
+        })?;
+        let count = (all.rule_cnt as usize).min(MAX_ENUMERATED_RULES);
+        Ok(RuleTable {
+            size: all.data as u32,
+            occupied: all.rule_locs[..count].to_vec(),
+        })
+    }
 
     /// `SIOCETHTOOL`, the ioctl every ethtool command rides. Lives here
     /// rather than beside the `ETHTOOL_*` command codes because it is the
@@ -189,6 +305,16 @@ mod sys {
     /// operation; the kernel reads and writes through the pointer for
     /// the lifetime of the call only.
     pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), String> {
+        // SAFETY: the pointer covers a fully initialised `Rxnfc`, which
+        // is the whole buffer for every command except `GRXCLSRLALL`.
+        unsafe { ethtool_raw(iface, (req as *mut Rxnfc).cast()) }
+    }
+
+    /// # Safety
+    /// `req` must point at a fully initialised `ethtool_rxnfc`-shaped
+    /// buffer large enough for whatever its `cmd` makes the kernel write
+    /// — for `GRXCLSRLALL` that includes the trailing `rule_locs[]`.
+    unsafe fn ethtool_raw(iface: &str, req: *mut core::ffi::c_void) -> Result<(), String> {
         let name = iface.as_bytes();
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
         if name.len() >= ifr.ifr_name.len() {
@@ -197,7 +323,7 @@ mod sys {
         for (dst, src) in ifr.ifr_name.iter_mut().zip(name) {
             *dst = *src as libc::c_char;
         }
-        ifr.ifr_ifru.ifru_data = req as *mut Rxnfc as *mut libc::c_char;
+        ifr.ifr_ifru.ifru_data = req as *mut libc::c_char;
 
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock < 0 {
@@ -224,8 +350,11 @@ mod sys {
 
 #[cfg(all(not(target_os = "linux"), not(test)))]
 mod sys {
-    use super::Rxnfc;
+    use super::{RuleTable, Rxnfc};
     pub(super) fn ethtool(_iface: &str, _req: &mut Rxnfc) -> Result<(), String> {
+        Err("ntuple steering is Linux-only".into())
+    }
+    pub(in crate::ntuple) fn rule_table(_iface: &str) -> Result<RuleTable, String> {
         Err("ntuple steering is Linux-only".into())
     }
 }
@@ -253,7 +382,6 @@ pub(super) mod sys {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    #[derive(Default)]
     pub(crate) struct FakeNic {
         rules: HashMap<(String, u32), super::RxFlowSpec>,
         /// Locations whose delete must fail, modelling the rule that
@@ -262,6 +390,21 @@ pub(super) mod sys {
         /// Locations whose insert must fail, modelling a full or
         /// otherwise refusing MCAM.
         uninsertable: Vec<u32>,
+        /// How many locations this fake offers. Defaults to the measured
+        /// hardware size rather than to zero, so a test that forgets to
+        /// set it gets a plausible NIC instead of one with no table.
+        table_size: u32,
+    }
+
+    impl Default for FakeNic {
+        fn default() -> Self {
+            Self {
+                rules: HashMap::new(),
+                undeletable: Vec::new(),
+                uninsertable: Vec::new(),
+                table_size: super::FALLBACK_TABLE_SIZE,
+            }
+        }
     }
 
     thread_local! {
@@ -281,6 +424,33 @@ pub(super) mod sys {
 
     pub(crate) fn wedge_insert(locations: &[u32]) {
         NIC.with(|n| n.borrow_mut().uninsertable = locations.to_vec());
+    }
+
+    pub(crate) fn set_table_size(size: u32) {
+        NIC.with(|n| n.borrow_mut().table_size = size);
+    }
+
+    /// The fake's answer to `GRXCLSRLALL`.
+    ///
+    /// Note what this cannot stand in for: the real one reads a size the
+    /// *driver* chose, and the whole defect it exists to prevent was a
+    /// number this codebase chose for itself. A test using this proves
+    /// the budget arithmetic, never the size.
+    pub(in crate::ntuple) fn rule_table(iface: &str) -> Result<super::RuleTable, String> {
+        NIC.with(|n| {
+            let nic = n.borrow();
+            let mut occupied: Vec<u32> = nic
+                .rules
+                .keys()
+                .filter(|(i, _)| i == iface)
+                .map(|(_, loc)| *loc)
+                .collect();
+            occupied.sort_unstable();
+            Ok(super::RuleTable {
+                size: nic.table_size,
+                occupied,
+            })
+        })
     }
 
     /// Every `(iface, loc)` the NIC currently holds, sorted — the
@@ -627,9 +797,34 @@ mod tests {
         );
 
         // And the mask follows the address, or the rule matches a
-        // different width than intended.
-        assert_eq!(&src.m_u.hdata[0..4], &[255, 255, 255, 0]);
-        assert_eq!(&dst.m_u.hdata[4..8], &[255, 255, 255, 0]);
+        // different width than intended. A SET bit means ignore, so a
+        // /24 is the complement of the netmask — asserted as the literal
+        // the NIC reports rather than as `!mask_for(24)`, which would
+        // pass against either polarity.
+        assert_eq!(&src.m_u.hdata[0..4], &[0, 0, 0, 255], "ip4src /24");
+        assert_eq!(&dst.m_u.hdata[4..8], &[0, 0, 0, 255], "ip4dst /24");
+
+        // Everything this rule does NOT match must be ignored, which is
+        // all-ones. Left at the struct default of zero it reads as
+        // "match exactly", and the driver refuses the whole rule — the
+        // defect that made every insert fail with EINVAL. Checked across
+        // the rest of the union, not just the sibling address, because
+        // `usr_ip4_spec` also carries tos, proto and l4_4_bytes.
+        assert_eq!(
+            &src.m_u.hdata[4..],
+            &[0xff; 48][..],
+            "a src rule ignores ip4dst and every other field"
+        );
+        assert_eq!(
+            &dst.m_u.hdata[0..4],
+            &[0xff, 0xff, 0xff, 0xff],
+            "a dst rule ignores ip4src"
+        );
+        assert_eq!(
+            &dst.m_u.hdata[8..],
+            &[0xff; 44][..],
+            "a dst rule ignores tos, proto and l4_4_bytes"
+        );
     }
 
     /// The readback comparison must reject the differences that change
@@ -650,7 +845,7 @@ mod tests {
             |f: &mut RxFlowSpec| f.location = 99,
             |f: &mut RxFlowSpec| f.flow_type = 0x01,
             |f: &mut RxFlowSpec| f.h_u.hdata[0] = 24,
-            |f: &mut RxFlowSpec| f.m_u.hdata[3] = 0xff,
+            |f: &mut RxFlowSpec| f.m_u.hdata[3] = 0x00,
         ] {
             let mut got = asked;
             mutate(&mut got);
@@ -659,6 +854,71 @@ mod tests {
                 "a difference that changes forwarding must be caught"
             );
         }
+    }
+
+    /// Slots come from the NIC's table, and occupied ones are not slots.
+    ///
+    /// The defect this replaces was a budget that named locations the
+    /// driver would never accept, so the assertions are about the budget
+    /// *tracking the table* rather than about any particular number: a
+    /// test pinning 16 would pass just as well against a second
+    /// hardcoded constant.
+    #[test]
+    fn the_budget_follows_the_nic_rather_than_a_constant() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+
+        let empty = McamBudget::for_ifaces(["eth0"]).expect("fake NIC answers");
+        assert_eq!(
+            empty.free.len(),
+            FALLBACK_TABLE_SIZE as usize,
+            "an untouched table offers every location"
+        );
+        assert_eq!(
+            empty.free.first(),
+            Some(&(FALLBACK_TABLE_SIZE - 1)),
+            "highest first, to stay clear of whatever the vendor installs low"
+        );
+
+        // A smaller table yields a smaller budget, with no code change.
+        sys::set_table_size(4);
+        let small = McamBudget::for_ifaces(["eth0"]).expect("fake NIC answers");
+        assert_eq!(small.free, vec![3, 2, 1, 0]);
+
+        // And an allowlist that no longer fits is refused whole rather
+        // than truncated into a half-steered port.
+        let e = RuleSet::plan(
+            &[
+                IpPrefix::V4 {
+                    addr: [10, 0, 0, 0],
+                    prefix_len: 24,
+                },
+                IpPrefix::V4 {
+                    addr: [10, 1, 0, 0],
+                    prefix_len: 24,
+                },
+                IpPrefix::V4 {
+                    addr: [10, 2, 0, 0],
+                    prefix_len: 24,
+                },
+            ],
+            small,
+        )
+        .expect_err("six rules cannot fit four slots");
+        assert!(e.contains("only 4 slot(s) are free"), "{e}");
+
+        // Rules already in the table are excluded, not overwritten —
+        // including ones this module did not install.
+        sys::set_table_size(FALLBACK_TABLE_SIZE);
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.steer().expect("installs at 15 and 14");
+        let after = McamBudget::for_ifaces(["eth0"]).expect("fake NIC answers");
+        assert!(
+            !after.free.contains(&15) && !after.free.contains(&14),
+            "occupied slots must not be offered again: {:?}",
+            after.free
+        );
+        assert_eq!(after.free.first(), Some(&13), "the next free one is next");
     }
 
     /// A plan with no rules refuses rather than reporting success.
@@ -765,14 +1025,17 @@ mod tests {
         s.steer().expect("installs");
         assert_eq!(
             sys::rules(),
-            vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
+            vec![("eth0".to_string(), 14), ("eth0".to_string(), 15)],
             "both directions, in the planned slots"
         );
-        assert_eq!(
-            s.installed(),
-            sys::rules(),
-            "the ledger names what the NIC holds"
-        );
+        // Sorted on both sides: the ledger is a SET (that is #127's
+        // fix), so it holds no order worth asserting, and slots are now
+        // taken highest-first — comparing raw would test the direction
+        // the budget hands out locations rather than the property that
+        // matters, which is that the two name the same rules.
+        let mut ledger = s.installed();
+        ledger.sort();
+        assert_eq!(ledger, sys::rules(), "the ledger names what the NIC holds");
 
         s.unsteer().expect("removes");
         assert!(sys::rules().is_empty(), "nothing left in the NIC");
@@ -829,16 +1092,18 @@ mod tests {
         s.steer().expect("installs four");
         assert_eq!(sys::rules().len(), 4);
 
-        // Down to one prefix: slots 1026/1027 are no longer wanted.
+        // Down to one prefix: slots 13/12 are no longer wanted.
         s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
         s.steer().expect("reconciles");
 
         assert_eq!(
             sys::rules(),
-            vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
+            vec![("eth0".to_string(), 14), ("eth0".to_string(), 15)],
             "the withdrawn prefix's rules are gone from the NIC, not merely unrecorded"
         );
-        assert_eq!(s.installed(), sys::rules());
+        let mut ledger = s.installed();
+        ledger.sort();
+        assert_eq!(ledger, sys::rules());
     }
 
     /// A retarget that cannot clear a stale rule installs NOTHING.
@@ -858,7 +1123,7 @@ mod tests {
         );
         s.steer().expect("installs four");
 
-        sys::wedge_delete(&[1026]);
+        sys::wedge_delete(&[13]);
         s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
         let e = s.steer().expect_err("must refuse");
 
@@ -867,7 +1132,7 @@ mod tests {
             "the operator has to learn both halves: what stayed, and that nothing new landed: {e}"
         );
         assert!(
-            s.installed().contains(&("eth0".to_string(), 1026)),
+            s.installed().contains(&("eth0".to_string(), 13)),
             "the rule that would not come out must stay in the ledger, or detach cannot find it"
         );
     }
@@ -877,14 +1142,14 @@ mod tests {
     ///
     /// All-or-nothing is the point: a port holding half its rules
     /// forwards some allowlisted traffic through VPP and the rest
-    /// through the kernel. Slot 1027 — the last of four — is made to
+    /// through the kernel. Slot 12 — the last of four — is made to
     /// refuse, so three rules are already in the NIC when the failure
     /// lands.
     #[test]
     fn a_failed_insert_leaves_the_port_unsteered() {
         use crate::runtime::Steering as _;
         sys::reset();
-        sys::wedge_insert(&[1027]);
+        sys::wedge_insert(&[12]);
         let mut s = NtupleSteering::new(
             vec![("eth0".into(), 0)],
             plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),

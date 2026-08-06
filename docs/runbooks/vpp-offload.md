@@ -18,7 +18,14 @@ running badly.
 > composition has never executed on hardware. Neither has any of the
 > three published failover numbers.
 >
-> **No part of the MCAM ioctl path has ever met a NIC.** Every rule
+> **The MCAM ioctl path has now met a NIC, and it took two rounds.**
+> First contact on 2026-08-05 found the `loc` space sized from the wrong
+> figure and `m_u` written with inverted polarity; both are fixed and
+> both failed loudly, as designed — nothing was installed, and the
+> all-or-nothing unwind left the port with zero rules. What is *still*
+> unproven is everything past installation: no steered packet has ever
+> reached VPP, because the only port available to test on carries
+> nothing the allowlist matches. Every rule
 > insert is followed by an `ETHTOOL_GRXCLSRULE` readback and compared
 > field by field, precisely so a wrong `ethtool_rx_flow_spec` offset
 > fails loudly on first contact instead of installing a rule that
@@ -382,7 +389,8 @@ Be precise about this when reasoning about an incident.
 | Stats segment | 97 B/route | **at two threads** — counter vectors are per-thread, so every per-route figure is a two-thread figure |
 | Live table | 1,053,360 v4 (1,301,000 v4+v6) | 2026-08-02 |
 | Nexthop spread | eth3 1,248,508 / eth2 52,492 | the full-table decision rests on this |
-| MCAM capacity | 2048 entries, ~1689 free | budget is base 1024, count 512 → **256 v4 prefixes** at 2 rules each |
+| ntuple `loc` space | **16 per port** (0..=15) | measured on the shadow's eth1 2026-08-05, by insert-and-read-back. At 2 rules per prefix → **8 steerable IPv4 prefixes per port**. Production's allowlist is 2. |
+| NPC MCAM block | 2048 entries, ~1689 free, 31 allocated per PF | from `npc/mcam_info`. **This is not the `loc` space** and must never be used to size one — doing so is what produced `base: 1024`, an out-of-range slot that failed the first steer this module ever attempted. |
 
 **Published but never measured:**
 
@@ -462,9 +470,25 @@ refused rather than adopted.
 - **Restart ordering is stop → detach --all → start.** This bit
   production twice. A plain `systemctl restart` leaves the previous
   attachment's pins in place and the next start refuses them.
-- **MCAM slots must be pre-allocated.** The driver rejects an
-  out-of-range `loc` rather than assigning one, which is why this module
-  tracks the locations it owns (base 1024) and hands back exactly those.
+- **The ntuple table holds 16 rules per port, and `npc/mcam_info` will
+  not tell you that.** The driver rejects an out-of-range `loc` with
+  `EINVAL` rather than assigning one. The module asks the NIC via
+  `ETHTOOL_GRXCLSRLALL` and takes the highest free slots; the debugfs
+  figures (2048 entries, 1689 available) describe the NPC block across
+  all six PFs and govern nothing here. Ceiling: **8 IPv4 prefixes per
+  steered port**, and `packetframe feasibility` reports the real free
+  count under `vpp.steering.budget`.
+- **A port must be administratively UP before it can be steered.**
+  `otx2_get_rxnfc` gates on `netif_running`, so a down port answers
+  `EOPNOTSUPP` to both the insert and the rule-count query — which reads
+  like the NIC lacks ntuple rather than like the link being down.
+  `ethtool -k <if> | grep ntuple` says `on` either way and will not
+  disambiguate it.
+- **`ethtool -N` exits 0 when the insert fails.** It prints
+  `rmgr: Cannot insert RX class rule: ...` to stderr and returns success,
+  so any check shaped like `if ethtool -N ... >/dev/null 2>&1` reports
+  every location as working. Confirm with `ethtool -n <if>` and look for
+  the `Filter: <loc>` block.
 - **The first steer is guarded against an incomplete table — but only
   where there is a bird.** Verification samples what the *ledger* holds,
   so a table that is merely missing prefixes verifies clean. That is why
