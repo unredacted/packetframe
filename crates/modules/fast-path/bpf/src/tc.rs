@@ -113,6 +113,7 @@ fn tc_try_fast_path(
     let start = ctx.data();
     let end = ctx.data_end();
     if start + EthHdr::LEN > end {
+        bump(stats, StatIdx::ErrParseTcL2);
         return Err(());
     }
     let eth = start as *mut EthHdr;
@@ -135,6 +136,7 @@ fn tc_try_fast_path(
         // Inline-tag fallback; mirrors main.rs's parse (one tag, QinQ
         // out of scope, VID 0 treated as absent).
         if start + EthHdr::LEN + VLAN_HDR_LEN > end {
+            bump(stats, StatIdx::ErrParseTcVlan);
             return Err(());
         }
         let tci_hi = unsafe { *((start + EthHdr::LEN) as *const u8) };
@@ -189,6 +191,7 @@ fn tc_handle_ipv4(
     let start = ctx.data();
     let end = ctx.data_end();
     if start + ip_offset + Ipv4Hdr::LEN > end {
+        bump(stats, StatIdx::ErrParseTcL3V4);
         return Err(());
     }
     let ip = (start + ip_offset) as *mut Ipv4Hdr;
@@ -273,6 +276,7 @@ fn tc_handle_ipv6(
     let start = ctx.data();
     let end = ctx.data_end();
     if start + ip_offset + Ipv6Hdr::LEN > end {
+        bump(stats, StatIdx::ErrParseTcL3V6);
         return Err(());
     }
     let ip = (start + ip_offset) as *mut Ipv6Hdr;

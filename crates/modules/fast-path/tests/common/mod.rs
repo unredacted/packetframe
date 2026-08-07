@@ -121,6 +121,10 @@ pub enum StatIdx {
     FibCacheMiss = 43,
     FibCacheStale = 44,
     ErrParseTc = 45,
+    ErrParseTcL2 = 46,
+    ErrParseTcVlan = 47,
+    ErrParseTcL3V4 = 48,
+    ErrParseTcL3V6 = 49,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a

@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 /// operators (19 hid `err_head_shift`; 33 hid the mss-clamp and
 /// tail-call diagnostics from the Prometheus export; a separate
 /// hardcoded 37 hid `pass_ndp` from `packetframe status`).
-pub const COUNTER_NAMES: [&str; 46] = [
+pub const COUNTER_NAMES: [&str; 50] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -87,6 +87,14 @@ pub const COUNTER_NAMES: [&str; 46] = [
     "fib_cache_stale",
     // --- v0.2.9: per-hook parse-error attribution ---
     "err_parse_tc",
+    // --- v0.2.10: which bounds check produced `err_parse_tc`.
+    // These four must sum to `err_parse_tc`; all of them mean "the bytes
+    // I need are not in front of me", which under cls_bpf is a statement
+    // about the skb's LINEAR window rather than about the packet.
+    "err_parse_tc_l2",
+    "err_parse_tc_vlan",
+    "err_parse_tc_l3_v4",
+    "err_parse_tc_l3_v6",
 ];
 
 /// `COUNTER_NAMES.len()` as a named const. Sizes the `[u64; N]` value
@@ -238,7 +246,7 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 46);
+        assert_eq!(COUNTER_NAMES.len(), 50);
         assert_eq!(COUNTER_NAMES.len(), COUNTER_COUNT);
         // The newest counters, as a canary that the tail of the list
         // stayed aligned with the `StatIdx` discriminants.
@@ -248,6 +256,10 @@ mod tests {
         assert_eq!(COUNTER_NAMES[43], "fib_cache_miss");
         assert_eq!(COUNTER_NAMES[44], "fib_cache_stale");
         assert_eq!(COUNTER_NAMES[45], "err_parse_tc");
+        assert_eq!(COUNTER_NAMES[46], "err_parse_tc_l2");
+        assert_eq!(COUNTER_NAMES[47], "err_parse_tc_vlan");
+        assert_eq!(COUNTER_NAMES[48], "err_parse_tc_l3_v4");
+        assert_eq!(COUNTER_NAMES[49], "err_parse_tc_l3_v6");
     }
 
     #[test]

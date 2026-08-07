@@ -87,8 +87,9 @@ future tc use beyond debugging.
 
 ## The tc-only `err_parse`
 
-**Status: analysed, not confirmed. Nothing here has been measured — the
-confirming change is unwritten on purpose (see the end).**
+**Status: analysed, instrumented, not yet measured.** The counters that
+would confirm it now exist; no tc canary has been run since they were
+added, so the hypothesis below is still a hypothesis.
 
 `err_parse_tc` has exactly four producers, all in `tc.rs`, and they are
 all the same shape — a bounds check against `ctx.data_end()`:
@@ -125,26 +126,55 @@ The remedy, if confirmed, is `bpf_skb_pull_data(skb, needed)` before the
 parse, with `data`/`data_end` re-read afterwards — the pointers are
 invalidated by the call. It is not free: a pull can copy.
 
-### What would confirm it
+### The breakdown, and how to read it
 
-Two appended `StatIdx` entries splitting the four sites — at minimum
-"too short for L2" versus "too short for L3" — and a `bpf_skb_pull_data`
-retry on the L3 arm counting how often the pull succeeds. If the pull
-turns the failures into forwards, the hypothesis is proven and the fix
-is already in hand.
+Four appended counters now split the sites, bumped **in addition to**
+`err_parse` and `err_parse_tc` so both keep their meaning:
 
-**Deliberately not written yet, and the reason is worth recording.** It
-is a BPF datapath change, and BPF changes cannot be compiled on the
-macOS dev host at all — the build falls back to a stub, so the code
-would appear to build and its tests would pass having executed nothing.
-The only gates that see BPF are CI and the qemu verifier. Writing
-verifier-sensitive code for a 5.15 vendor kernel with no compiler and no
-verifier in the loop is how a day gets lost; this waits for both.
+| counter | site |
+|---|---|
+| `err_parse_tc_l2` | shorter than `EthHdr` |
+| `err_parse_tc_vlan` | inline-tagged frame shorter than `EthHdr + VLAN_HDR_LEN` |
+| `err_parse_tc_l3_v4` | shorter than the IPv4 header at its offset |
+| `err_parse_tc_l3_v6` | shorter than the IPv6 header at its offset |
 
-It is also worth being honest about priority: the tc datapath is a
-**measured dead end** on this fleet (+70% ns/pkt, see above) and is
-reserved for temporary tcpdump visibility. This matters if tc is ever
-reconsidered, and not before.
+They partition `err_parse_tc` — the four must sum to it, and a test
+asserts that so a site added later cannot quietly shrink the total.
+
+What each outcome would mean, decided now rather than after seeing the
+numbers:
+
+- **Concentrated in the L3 arms** → the non-linear-skb hypothesis holds.
+  L3 sits furthest into the frame, so it is what a short linear window
+  truncates first. Proceed to `bpf_skb_pull_data`.
+- **Concentrated in `l2`** → genuine runts, and the hypothesis is wrong.
+  A frame too short for 14 bytes is malformed however it is stored.
+- **Split by FAMILY rather than by depth** (v4 and v6 arms differing by
+  much more than their traffic ratio) → also wrong, or at least
+  incomplete: the two headers differ in size, so a depth explanation
+  predicts they track traffic share while a family explanation does not.
+- **`vlan` non-zero at all** → notable on its own. That arm is reachable
+  only when the tag is still in-band, which on this fleet should be
+  rare, since the driver lifts it into `vlan_tci`.
+
+### The remedy is deliberately NOT applied yet
+
+If the L3 arms dominate, the fix is `bpf_skb_pull_data(skb, needed)`
+before the parse, with `data`/`data_end` re-read afterwards — the call
+invalidates them — and it is not free, since a pull can copy.
+
+It is not in this change on purpose. Applying a remedy before the
+diagnosis confirms the disease is how a correct piece of code gets
+"fixed" into a broken one; that happened twice in this repo in one week
+(see `docs/runbooks/vpp-offload.md` on the ntuple mask). The counters
+cost nothing on the fast path — they are bumps on an already-failing
+branch — and they answer the question. Wire them up, run a tc canary on
+one interface, read the split, then write the fix the numbers ask for.
+
+Priority, honestly: the tc datapath is a **measured dead end** on this
+fleet (+70% ns/pkt, see above) and is reserved for temporary tcpdump
+visibility. This matters if tc is ever reconsidered, and not before —
+which is why the diagnosis ships and the datapath change waits.
 
 ## Prerequisites
 
