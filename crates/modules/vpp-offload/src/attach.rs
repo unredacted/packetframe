@@ -288,13 +288,37 @@ pub fn attach_ports(
                 });
                 continue;
             }
-            // Recorded but gone: the state file outlived the interface.
-            // Refuse rather than attach a second one, because we cannot
-            // tell whether the live FIB still references the old index.
-            return Err(AttachError::StaleIndex {
-                port: p.port.clone(),
-                sw_if_index: idx,
-            });
+            // Recorded but gone. What that means depends entirely on
+            // which VPP we are talking to.
+            //
+            // Adopted: refuse. A running VPP's FIB may still reference
+            // the old index, and attaching a second interface would
+            // leave two, with routes pointing at the one we are not
+            // managing.
+            //
+            // Fresh: the index is stale by construction. We spawned this
+            // process; it has no FIB and no interfaces, so nothing can
+            // reference the recorded index and re-attaching is the only
+            // correct move. Refusing here stranded the module on the
+            // shadow (2026-08-07) after VPP was killed while packetframe
+            // was not running — nothing had observed the exit, so
+            // `on_process_gone` never cleared the record, and every
+            // restart spawned a VPP it then refused to attach to. It
+            // could not self-heal; only killing VPP again *with the
+            // daemon watching* recovered it.
+            if mode == AttachMode::Adopted {
+                return Err(AttachError::StaleIndex {
+                    port: p.port.clone(),
+                    sw_if_index: idx,
+                });
+            }
+            tracing::warn!(
+                port = %p.port,
+                stale_sw_if_index = idx,
+                "state file records an interface this freshly spawned VPP does not have; \
+                 discarding the record and attaching — a new process has no FIB that could \
+                 reference it"
+            );
         }
 
         let dev_index = attach_device(t, p)?;
