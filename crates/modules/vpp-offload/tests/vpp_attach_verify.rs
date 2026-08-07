@@ -10,8 +10,7 @@
 //! The fake dispatches on message id, so a request sent out of order
 //! shows up as a wrong-message failure rather than passing by accident.
 
-use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -22,69 +21,17 @@ use packetframe_vpp_offload::attach::{attach_ports, AttachError, AttachMode, Por
 use packetframe_vpp_offload::fib_sync::{to_prefix, PortIndex};
 use packetframe_vpp_offload::sink::{Capacity, RouteLedger};
 use packetframe_vpp_offload::verify::{verify, Mismatch};
-use packetframe_vpp_offload::vpp_api::codec::{
-    parse_frame_header, peek_msg_id, write_frame_header, Encode, MSG_HEADER_LEN,
-    SOCKCLNT_CREATE_MSG_ID,
-};
+use packetframe_vpp_offload::vpp_api::codec::{peek_msg_id, Encode, SOCKCLNT_CREATE_MSG_ID};
+#[path = "common/wire.rs"]
+mod wire;
+use wire::{name_for, read_frame, reply_head, request_context, write_frame};
+
 use packetframe_vpp_offload::vpp_api::generated::{
     ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply,
     MessageTableEntry, SockclntCreateReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
     MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
-
-fn id_for(name: &str) -> u16 {
-    100 + MESSAGE_META.iter().position(|m| m.name == name).unwrap() as u16
-}
-
-fn name_for(id: u16) -> &'static str {
-    MESSAGE_META[(id - 100) as usize].name
-}
-
-/// Start a reply payload for `name`.
-///
-/// **The header geometry is per-message, not uniform**, and this fake
-/// has to honour that or it tests nothing. `dev_create_port_if_reply`
-/// carries a `client_index` between the id and the context; its own
-/// sibling `dev_attach_reply` does not. Reading the layout out of
-/// `MESSAGE_META` rather than hardcoding `[id][context]` is what makes
-/// the fake speak the same wire the real VPP does — a hand-assumed
-/// prefix here would have quietly matched a hand-assumed prefix in the
-/// client and proved nothing.
-fn reply_head(name: &str) -> Vec<u8> {
-    let meta = MESSAGE_META
-        .iter()
-        .find(|m| m.name == name)
-        .expect("known reply");
-    let mut out = Vec::new();
-    out.extend_from_slice(&id_for(name).to_be_bytes());
-    if meta.client_index_prefix {
-        out.extend_from_slice(&7u32.to_be_bytes());
-    }
-    out
-}
-
-fn read_frame(s: &mut UnixStream) -> Option<Vec<u8>> {
-    let mut hdr = [0u8; MSG_HEADER_LEN];
-    s.read_exact(&mut hdr).ok()?;
-    let len = parse_frame_header(&hdr) as usize;
-    let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload).ok()?;
-    Some(payload)
-}
-
-fn write_frame(s: &mut UnixStream, payload: &[u8]) {
-    let mut framed = Vec::new();
-    write_frame_header(&mut framed, payload.len());
-    framed.extend_from_slice(payload);
-    let _ = s.write_all(&framed);
-    let _ = s.flush();
-}
-
-/// Requests carry `[msg_id][client_index][context]`.
-fn request_context(payload: &[u8]) -> u32 {
-    u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]])
-}
 
 mod tempdir {
     use std::path::{Path, PathBuf};

@@ -10,6 +10,8 @@
 //!   alone.
 
 use std::path::{Path, PathBuf};
+
+use crate::scrub::scrub_for_terminal;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 use std::time::{Duration, Instant};
 
@@ -770,48 +772,6 @@ fn reconfigure_from_signal(
     }
 }
 
-/// Scrub ASCII control bytes (< 0x20) other than tab/newline from a
-/// string that's about to be written to the reconfigure marker file
-/// (and from there read back by `packetframe reconfigure` and
-/// echoed via `tracing::error!` to an operator's terminal). The
-/// failure-side `status` ultimately includes per-module error
-/// messages that can carry parser bytes from external sources
-/// (config text, BGP/BMP error text propagated up); a stray ANSI
-/// escape sequence in the marker would corrupt the operator's TTY
-/// when they run `packetframe reconfigure`. Audit Slice 5 hardening.
-///
-/// Gated on the feature rather than on Linux because the health surface
-/// prints the same class of text on every platform — see
-/// [`scrub_for_terminal`].
-#[cfg(feature = "fast-path")]
-fn scrub_control_chars(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c == '\t' || c == '\n' || !c.is_control() {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
-
-/// The same scrub, for text going **straight to a terminal** rather than
-/// into a line-oriented file.
-///
-/// Built on [`scrub_control_chars`] rather than beside it, so what counts
-/// as a control character is decided in exactly one place. What differs
-/// is tab and newline: the marker file keeps them because lines are its
-/// record separator, and a terminal must not, because a `\n` inside a
-/// subsystem message can **forge a row** — a message ending
-/// `"\n  vpp-offload: healthy"` would print an extra module line that no
-/// module reported. The strings involved carry VPP, ethtool and ntuple
-/// error text from outside this process, so that is not hypothetical.
-#[cfg(feature = "fast-path")]
-fn scrub_for_terminal(s: &str) -> String {
-    scrub_control_chars(s).replace(['\n', '\t'], " ")
-}
-
 /// Append a timestamp + status line to the reconfigure marker file.
 /// Non-fatal on I/O error, the SIGHUP handler still completed its
 /// real work; the marker is just a hint to the CLI ack-poller.
@@ -828,7 +788,7 @@ fn write_reconfigure_marker(path: &Path, status: &str) {
         return;
     }
     let tmp = path.with_extension("timestamp.tmp");
-    let body = format!("{} {}\n", scrub_control_chars(status), now_ns);
+    let body = format!("{} {}\n", crate::scrub::scrub_control_chars(status), now_ns);
     let r = (|| -> std::io::Result<()> {
         let mut f = create_excl_no_follow_with_retry(&tmp)?;
         f.write_all(body.as_bytes())?;
@@ -1389,7 +1349,7 @@ pub fn status(config_path: &Path) -> Result<(), String> {
         use packetframe_fast_path::registry::load as registry_load;
         match registry_load(&config.global.state_dir) {
             Ok(Some(file)) => {
-                println!("module: {}", file.module);
+                println!("module: {}", scrub_for_terminal(&file.module));
                 println!("attachments ({}):", file.attachments.len());
                 for a in &file.attachments {
                     let hook_name = match a.hook {
@@ -1873,7 +1833,7 @@ mod terminal_scrub_tests {
     /// change the file format underneath `packetframe reconfigure`.
     #[test]
     fn the_marker_scrub_still_keeps_its_record_separator() {
-        assert_eq!(scrub_control_chars("a\nb\tc"), "a\nb\tc");
-        assert_eq!(scrub_control_chars("a\x1bb"), "a?b");
+        assert_eq!(crate::scrub::scrub_control_chars("a\nb\tc"), "a\nb\tc");
+        assert_eq!(crate::scrub::scrub_control_chars("a\x1bb"), "a?b");
     }
 }

@@ -21,6 +21,7 @@ mod loader;
 mod metrics;
 #[cfg(feature = "probe")]
 mod probe;
+mod scrub;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
