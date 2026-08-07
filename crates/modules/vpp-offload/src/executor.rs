@@ -128,11 +128,19 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                 // is down. Reporting this rather than letting `fail()`
                 // assume it is what stops a later teardown from
                 // releasing a VF that MCAM is still pointing at.
-                Ok(()) => Event::Unsteered,
+                Ok(()) => {
+                    tracing::info!("steering DOWN: traffic returned to the eBPF fast-path tier");
+                    Event::Unsteered
+                }
                 Err(e) => {
                     // Traffic is still being diverted to a dataplane we
                     // are about to stop supervising. Loud, and it
                     // forfeits the right to release the VF.
+                    tracing::error!(
+                        error = %e,
+                        "steering could NOT be removed; traffic is still diverted into a VPP \
+                         that is being stopped, and the VF will be withheld"
+                    );
                     out.failures.push((*action, e));
                     teardown_clean = false;
                     Event::UnsteerFailed
@@ -179,8 +187,25 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                 }
             }
             Action::Steer => out.events.push(match fx.steer() {
-                Ok(()) => Event::Steered,
+                Ok(()) => {
+                    // The one action that moves customer traffic between
+                    // forwarding tiers. It had no log line at all until
+                    // a shadow run came up steered with nothing in the
+                    // log to say when, or by which path — the state
+                    // field was the only record, and an incident
+                    // reconstruction needs a timestamp.
+                    tracing::info!(
+                        "steering UP: allowlisted traffic is now diverted to VPP (the eBPF \
+                         tier remains the failover)"
+                    );
+                    Event::Steered
+                }
                 Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        rules_remain = fx.steering_in_place(),
+                        "steer failed; traffic stays on the eBPF tier"
+                    );
                     out.failures.push((*action, e));
                     // Verified but not steered as asked: reported, not
                     // papered over, and NOT a process restart — the

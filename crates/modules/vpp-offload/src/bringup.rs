@@ -571,6 +571,11 @@ fn finish(
             loopback,
         )
         .with_recorded_indices(recorded);
+        // Counted before the record moves into the owner: the log line
+        // below needs it, and reaching for it afterwards is what the
+        // borrow checker just refused.
+        let inherited_rule_count: usize =
+            state.steer_rules.iter().map(|(_, locs)| locs.len()).sum();
         let owner = SharedOwner::new(ResourceOwner::new(state, sys));
         let runtime = Runtime::new(
             engine,
@@ -651,7 +656,22 @@ fn finish(
             // true and the VF stays withheld. Doing the removal here
             // instead would be a second, unsupervised path to the same
             // effect, whose failures nothing would ever retry.
-            None if steered => vec![Event::InheritedSteering, Event::StartRequested],
+            None if steered => {
+                // Visible, because everything that follows from it is
+                // consequential and none of it is obvious: this process
+                // will unsteer rules it did not install, spawn a new
+                // VPP, and — once the resync verifies — steer again,
+                // restoring a state the operator set on a previous run.
+                // Observed on the shadow 2026-08-07 happening in
+                // complete silence.
+                tracing::warn!(
+                    rules = inherited_rule_count,
+                    "MCAM rules from a previous run are still installed and the process that \
+                     owned them is gone; they will be removed now and re-applied only after \
+                     this VPP's table verifies"
+                );
+                vec![Event::InheritedSteering, Event::StartRequested]
+            }
             None => vec![Event::StartRequested],
         };
         Ok((Driver::new(), runtime, initial))
