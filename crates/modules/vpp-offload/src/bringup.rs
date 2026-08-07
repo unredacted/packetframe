@@ -532,6 +532,13 @@ fn finish(
     // the relaxed 10 s socket budget while packets are on VPP, defeating
     // the published ≤2 s wedge bound.
     let steered = !state.steer_rules.is_empty();
+    // The CONFIG's answer, captured before `steering` moves into the
+    // runtime. Inherited rules say what the NIC holds; only this says
+    // what the operator asked for.
+    let config_wants_steer = {
+        use crate::runtime::Steering as _;
+        steering.configured_ports() > 0
+    };
     let adopted_process = adopted.is_some();
 
     // Take ownership of the rules the record names, so `unsteer` can
@@ -660,17 +667,26 @@ fn finish(
                 // Visible, because everything that follows from it is
                 // consequential and none of it is obvious: this process
                 // will unsteer rules it did not install, spawn a new
-                // VPP, and — once the resync verifies — steer again,
-                // restoring a state the operator set on a previous run.
-                // Observed on the shadow 2026-08-07 happening in
-                // complete silence.
+                // VPP, and — if the config still asks for steering —
+                // steer again once the resync verifies. Observed on the
+                // shadow 2026-08-07 happening in complete silence.
                 tracing::warn!(
                     rules = inherited_rule_count,
+                    still_configured = config_wants_steer,
                     "MCAM rules from a previous run are still installed and the process that \
-                     owned them is gone; they will be removed now and re-applied only after \
-                     this VPP's table verifies"
+                     owned them is gone; removing them now, and restoring steering after this \
+                     VPP's table verifies ONLY if the config still asks for it"
                 );
-                vec![Event::InheritedSteering, Event::StartRequested]
+                vec![
+                    Event::InheritedSteering {
+                        // The config's answer, not the NIC's. A
+                        // deployment sitting at `steer off` must come
+                        // back at `steer off`, however its last run
+                        // ended.
+                        still_configured: config_wants_steer,
+                    },
+                    Event::StartRequested,
+                ]
             }
             None => vec![Event::StartRequested],
         };

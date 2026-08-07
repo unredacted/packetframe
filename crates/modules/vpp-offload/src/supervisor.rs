@@ -258,7 +258,18 @@ pub enum Event {
     /// *want* is recorded too — steering was established and never
     /// deliberately stopped — so the replacement re-steers once it
     /// verifies, which is what closes the blackhole.
-    InheritedSteering,
+    InheritedSteering {
+        /// Does the CONFIG still ask this deployment to steer?
+        ///
+        /// Carried rather than assumed. Inheriting rules means the NIC
+        /// holds them; it does not mean the operator still wants them.
+        /// With `steer off` in the file, forcing the want on left the
+        /// module permanently `steering intended but not in place` —
+        /// the unsteer cleared `steered`, the target had no ports, and
+        /// every retry failed with "nothing to steer" (shadow,
+        /// 2026-08-07).
+        still_configured: bool,
+    },
     /// The operator turned the canary lever ON: a `steer on` appeared,
     /// or the allowlist changed under a port that is already steering.
     ///
@@ -555,9 +566,22 @@ impl Supervisor {
             // Only from `Stopped`: this is an attach-time fact, injected
             // before the first `StartRequested`. Anywhere else it would
             // be describing a process that exists.
-            (Stopped, InheritedSteering) => {
+            (Stopped, InheritedSteering { still_configured }) => {
                 self.steered = true;
-                self.steer_wanted = true;
+                // The *want* survives a crash — a restart nobody watched
+                // should not silently leave the offload off and make an
+                // operator re-walk the canary ladder — but only while
+                // the config still asks for it.
+                //
+                // Setting it unconditionally left the module unable to
+                // reach a healthy state: with `steer off` in the file
+                // the unsteer cleared `steered`, the target had no ports
+                // because the config says off, and every retry failed
+                // "nothing to steer". Permanently Degraded, which also
+                // held the failure episode open so `last-tick` showed
+                // stale text beside a freshly verified FIB. Observed on
+                // the shadow 2026-08-07.
+                self.steer_wanted = still_configured;
                 vec![Action::Unsteer]
             }
 
@@ -1452,7 +1476,12 @@ mod tests {
     #[test]
     fn inherited_steering_is_taken_down_before_anything_else() {
         let mut s = Supervisor::new();
-        assert_eq!(s.on(Event::InheritedSteering), vec![Action::Unsteer]);
+        assert_eq!(
+            s.on(Event::InheritedSteering {
+                still_configured: true,
+            }),
+            vec![Action::Unsteer]
+        );
         assert!(
             s.is_steered(),
             "the record is the only evidence there is, and believing it is what makes \
@@ -1476,7 +1505,9 @@ mod tests {
     #[test]
     fn a_replacement_re_steers_what_the_dead_vpp_was_steering() {
         let mut s = Supervisor::new();
-        s.on(Event::InheritedSteering);
+        s.on(Event::InheritedSteering {
+            still_configured: true,
+        });
         s.on(Event::Unsteered);
         assert!(!s.is_steered(), "the stale rules are gone");
         assert!(s.steer_intended(), "but the want survives them");
@@ -1488,6 +1519,48 @@ mod tests {
         assert!(
             s.on(Event::VerifyPassed).contains(&Action::Steer),
             "a verified replacement must restore the offload without being asked"
+        );
+    }
+
+    /// Inherited rules do NOT resurrect steering the config turned off.
+    ///
+    /// The mirror of the test above, and the one that was missing. A
+    /// deployment sitting at `steer off` must come back at `steer off`
+    /// however its last run ended — otherwise the rules on the NIC, not
+    /// the operator, decide where traffic goes.
+    ///
+    /// Getting this wrong was not a subtle degradation: with the want
+    /// forced on and no ports configured to steer, the module reported
+    /// `steering intended but not in place` forever and every retry
+    /// failed "nothing to steer". Health never returned to Healthy, so
+    /// the failure episode never closed either, and `last-tick` showed
+    /// stale attach errors beside a freshly verified FIB. Observed on
+    /// the shadow, 2026-08-07.
+    #[test]
+    fn inherited_rules_do_not_override_a_config_that_says_steer_off() {
+        let mut s = Supervisor::new();
+        assert_eq!(
+            s.on(Event::InheritedSteering {
+                still_configured: false,
+            }),
+            vec![Action::Unsteer],
+            "the stale rules still come down — they point at a dead VF"
+        );
+        s.on(Event::Unsteered);
+
+        assert!(!s.is_steered());
+        assert!(
+            !s.steer_intended(),
+            "and nothing is left wanting: the config said off"
+        );
+
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(
+            !s.on(Event::VerifyPassed).contains(&Action::Steer),
+            "a verified replacement must NOT steer a deployment the operator turned off"
         );
     }
 
