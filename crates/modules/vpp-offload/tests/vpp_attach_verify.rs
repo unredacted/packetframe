@@ -127,6 +127,22 @@ impl Fake {
         ifaces: Ifaces,
         deaf_to_mac: bool,
     ) -> Self {
+        Self::start_seeded(tag, attach, lookup, ifaces, deaf_to_mac, Vec::new())
+    }
+
+    /// `addrs` seeds interface addresses the fake starts with, as
+    /// `(sw_if_index, wire-format prefix)` — see [`addr_key`]. This is
+    /// what lets a test express "VPP already has state", which every
+    /// adoption defect so far had in common and no empty-starting fake
+    /// could represent.
+    fn start_seeded(
+        tag: &str,
+        attach: AttachBehaviour,
+        lookup: LookupBehaviour,
+        ifaces: Ifaces,
+        deaf_to_mac: bool,
+        addrs: Vec<(u32, Vec<u8>)>,
+    ) -> Self {
         let dir = tempdir::TempDir::new(tag).unwrap();
         let path = dir.path().join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -136,6 +152,13 @@ impl Fake {
             let mut ifaces = ifaces;
             let mut macs: std::collections::HashMap<u32, [u8; 6]> =
                 std::collections::HashMap::new();
+            let mut addrs: std::collections::HashMap<u32, Vec<Vec<u8>>> = {
+                let mut m = std::collections::HashMap::<u32, Vec<Vec<u8>>>::new();
+                for (idx, key) in addrs {
+                    m.entry(idx).or_default().push(key);
+                }
+                m
+            };
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
@@ -241,11 +264,40 @@ impl Fake {
                         }
                         .encode(&mut out);
                     }
+                    // Modelled with VPP's real refusal semantics, not
+                    // merely acknowledged. A fake that answered 0
+                    // unconditionally is why the loopback-recreate bug
+                    // (-105 on the shadow, 2026-08-07) passed CI: it
+                    // structurally could not say no. Semantics from
+                    // stable/2506 `ip4_add_del_interface_address_internal`,
+                    // disambiguated by the hardware observation — an
+                    // exact re-add on the SAME interface is -127
+                    // DUPLICATE_IF_ADDRESS (its error string blames
+                    // another interface and is wrong); the address held
+                    // by a DIFFERENT interface is -105 ADDRESS_IN_USE.
                     "sw_interface_add_del_address" => {
+                        // id(2) client_index(4) context(4) sw_if_index(4)
+                        // is_add(1) del_all(1) af(1)+un(16)+len(1).
+                        let idx = u32::from_be_bytes([req[10], req[11], req[12], req[13]]);
+                        let is_add = req[14] != 0;
+                        let key = req[16..34].to_vec();
+                        let retval = if !is_add {
+                            if let Some(v) = addrs.get_mut(&idx) {
+                                v.retain(|k| k != &key);
+                            }
+                            0
+                        } else if addrs.get(&idx).is_some_and(|v| v.contains(&key)) {
+                            -127 // VNET_API_ERROR_DUPLICATE_IF_ADDRESS
+                        } else if addrs.iter().any(|(i, v)| *i != idx && v.contains(&key)) {
+                            -105 // VNET_API_ERROR_ADDRESS_IN_USE
+                        } else {
+                            addrs.entry(idx).or_default().push(key);
+                            0
+                        };
                         out = reply_head("sw_interface_add_del_address_reply");
                         SwInterfaceAddDelAddressReply {
                             context: ctx,
-                            retval: 0,
+                            retval,
                         }
                         .encode(&mut out);
                     }
@@ -410,6 +462,172 @@ fn ports() -> Vec<PortAttach> {
         num_rx_queues: 1,
         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
     }]
+}
+
+/// A surviving VPP's loopback is adopted, not duplicated.
+///
+/// The first daemon restart over a live VPP failed on this: the module
+/// created a second loopback and then could not give it an address the
+/// first one already held —
+/// `sw_interface_add_del_address for loop0 failed (retval -105)`.
+/// Adoption has to discover VPP's state rather than recreate it, which
+/// is the same rule that governs port interfaces.
+///
+/// Asserts that `create_loopback` is NOT sent when one already exists —
+/// the presence of a message, not its absence from a happy path, since a
+/// test that only checked the returned index would pass while VPP
+/// accumulated a loopback per restart.
+#[test]
+fn an_existing_loopback_is_adopted_rather_than_recreated() {
+    let fake = Fake::start_with(
+        "loopadopt",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![
+            (7, "octeon0/0".into(), 3),
+            (LOOP_IF_INDEX, "loop0".into(), 3),
+        ],
+    );
+    let mut t = fake.connect();
+
+    let found = packetframe_vpp_offload::attach::find_loopback(&mut t).expect("dump");
+    assert_eq!(
+        found,
+        Some(LOOP_IF_INDEX),
+        "the loopback this VPP already has must be discoverable"
+    );
+    assert!(
+        !fake.observed().contains(&"create_loopback".to_string()),
+        "discovery must not create anything: {:?}",
+        fake.observed()
+    );
+}
+
+/// The address the loopback holds in these tests, and its wire form.
+///
+/// The wire form matters because the fake stores and compares the exact
+/// bytes `prefix_of` encodes: af(1) + un(16) + len(1).
+fn loop_addr() -> packetframe_common::config::Ipv4Prefix {
+    packetframe_common::config::Ipv4Prefix {
+        addr: std::net::Ipv4Addr::new(169, 254, 254, 3),
+        prefix_len: 32,
+    }
+}
+
+fn addr_key(p: packetframe_common::config::Ipv4Prefix) -> Vec<u8> {
+    let mut k = vec![0u8]; // ADDRESS_IP4
+    k.extend_from_slice(&p.addr.octets());
+    k.extend_from_slice(&[0u8; 12]);
+    k.push(p.prefix_len);
+    k
+}
+
+/// The common case of every healthy adoption: the loopback already holds
+/// the address, and VPP answers the re-assert with -127
+/// DUPLICATE_IF_ADDRESS — its spelling of "already exactly where you
+/// want it". Adoption must read that as success.
+///
+/// Remove the -127 acceptance from `adopt_loopback` and this fails,
+/// which is the point: the fake now refuses duplicates the way VPP does,
+/// so an address-shaped adoption bug fails on host CI instead of on the
+/// shadow.
+#[test]
+fn an_adopted_loopback_holding_its_address_reconciles_clean() {
+    let fake = Fake::start_seeded(
+        "loopdup",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![
+            (7, "octeon0/0".into(), 3),
+            (LOOP_IF_INDEX, "loop0".into(), 3),
+        ],
+        false,
+        vec![(LOOP_IF_INDEX, addr_key(loop_addr()))],
+    );
+    let mut t = fake.connect();
+
+    let found = packetframe_vpp_offload::attach::find_loopback(&mut t)
+        .expect("dump")
+        .expect("loop0 seeded");
+    packetframe_vpp_offload::attach::adopt_loopback(&mut t, found, loop_addr())
+        .expect("a duplicate address on the adopted loopback is the healthy case");
+
+    let seen = fake.observed();
+    assert!(
+        seen.contains(&"sw_interface_add_del_address".to_string()),
+        "the address must be re-asserted, not assumed: {seen:?}"
+    );
+    assert!(
+        seen.contains(&"sw_interface_set_flags".to_string()),
+        "admin-up must be re-asserted, as the member reuse path does: {seen:?}"
+    );
+}
+
+/// A crash between `create_loopback`'s create and its address-add leaves
+/// a named, addressless loopback. Blind adoption then puts every member
+/// behind `ip4-not-enabled` with the FIB verified green. Reconcile adds
+/// the missing address — proven by the second adopt answering
+/// "duplicate", which it can only do if the first one's add took.
+#[test]
+fn an_adopted_loopback_that_lost_its_address_gets_it_back() {
+    let fake = Fake::start_seeded(
+        "loopbare",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![(LOOP_IF_INDEX, "loop0".into(), 3)],
+        false,
+        Vec::new(), // the crash window: loop0 exists, no address
+    );
+    let mut t = fake.connect();
+
+    packetframe_vpp_offload::attach::adopt_loopback(&mut t, LOOP_IF_INDEX, loop_addr())
+        .expect("an addressless adopted loopback must be repaired, not trusted");
+    packetframe_vpp_offload::attach::adopt_loopback(&mut t, LOOP_IF_INDEX, loop_addr())
+        .expect("the repair must have taken: the second pass sees the duplicate");
+}
+
+/// -105 stays fatal. The duplicate acceptance is for the address being
+/// exactly where we want it; an address held by a *different* interface
+/// is a conflict, and whitelisting broadly would adopt an addressless
+/// loopback while something else answers for the router address.
+#[test]
+fn a_cross_interface_address_conflict_still_refuses() {
+    let fake = Fake::start_seeded(
+        "loopconflict",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![
+            (7, "octeon0/0".into(), 3),
+            (LOOP_IF_INDEX, "loop0".into(), 3),
+        ],
+        false,
+        // The router address lives on the member port, not the loopback.
+        vec![(7, addr_key(loop_addr()))],
+    );
+    let mut t = fake.connect();
+
+    let err = packetframe_vpp_offload::attach::adopt_loopback(&mut t, LOOP_IF_INDEX, loop_addr())
+        .expect_err("an address held elsewhere is a conflict, not a reconcile");
+    match err {
+        AttachError::Refused { retval, .. } => assert_eq!(retval, -105),
+        other => panic!("expected Refused with ADDRESS_IN_USE, got {other:?}"),
+    }
 }
 
 /// The MAC readback catches a driver that says yes and does nothing.
