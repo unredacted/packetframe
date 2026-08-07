@@ -102,6 +102,33 @@ pub struct Attached {
     pub adopted_process: bool,
 }
 
+/// The PF's MAC, from `/sys/class/net/<iface>/address`.
+///
+/// Read here rather than asked of VPP, because VPP cannot know it: the
+/// interface it owns is the **VF**, which has its own address. MCAM
+/// redirects frames addressed to the PF, so the PF's MAC is what the VPP
+/// interface must answer to — and what it must source on tx, so the
+/// frame leaves the same LMAC and the upstream switch sees no move.
+fn pf_mac(sysfs_net: &Path, iface: &str) -> Result<[u8; 6], String> {
+    let path = sysfs_net.join(iface).join("address");
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.len() != 6 {
+        return Err(format!(
+            "{} holds {:?}, which is not a MAC address",
+            path.display(),
+            text.trim()
+        ));
+    }
+    let mut out = [0u8; 6];
+    for (slot, byte) in out.iter_mut().zip(&parts) {
+        *slot = u8::from_str_radix(byte, 16)
+            .map_err(|_| format!("{}: {byte:?} is not a hex octet", path.display()))?;
+    }
+    Ok(out)
+}
+
 /// Which completeness handle the runtime should actually gate on.
 ///
 /// A named function rather than an inline `if` because the bug it fixes
@@ -290,6 +317,19 @@ pub fn bring_up(
         .iter()
         .map(|(iface, cores, _)| (iface.clone(), *cores))
         .collect();
+    // Mandatory, and checked in the pure phase so a config that cannot
+    // forward costs no VF and no hugepage reservation.
+    // `Config::validate_vpp_offload` refuses it at load; this is the
+    // guard for callers that reach `bring_up` directly.
+    let Some(loopback) = cfg.loopback_address else {
+        return Err(
+            "no `loopback-address`; member ports are unnumbered to a loopback and forward \
+             nothing without one — while reporting healthy, because the FIB stays correct \
+             and every packet dies at `ip4-not-enabled`"
+                .into(),
+        );
+    };
+
     let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
 
     // From here, every failure releases. `?` would return holding VFs
@@ -306,6 +346,7 @@ pub fn bring_up(
         &vpp_binary,
         steering,
         completeness,
+        loopback,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -375,6 +416,7 @@ fn finish(
     vpp_binary: &Path,
     steering: NtupleSteering,
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+    loopback: packetframe_common::config::Ipv4Prefix,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -406,13 +448,16 @@ fn finish(
     let port_attach: Vec<PortAttach> = state
         .ports
         .iter()
-        .map(|p| PortAttach {
-            port: p.iface.clone(),
-            pci_addr: p.vf_pci.clone(),
-            port_id: 0,
-            num_rx_queues: p.cores,
+        .map(|p| {
+            Ok(PortAttach {
+                port: p.iface.clone(),
+                pci_addr: p.vf_pci.clone(),
+                port_id: 0,
+                num_rx_queues: p.cores,
+                pf_mac: pf_mac(&paths.sys.sysfs_net, &p.iface)?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     // Every member port, whether or not it steers: a steered packet's
     // best path may egress any of them, so the nexthop mapping must
     // resolve all of them (plan v5, membership vs steering).
@@ -523,6 +568,7 @@ fn finish(
             members,
             capacity,
             FamilyPolicy::V4Only,
+            loopback,
         )
         .with_recorded_indices(recorded);
         let owner = SharedOwner::new(ResourceOwner::new(state, sys));
@@ -662,6 +708,10 @@ mod completeness_gate_tests {
             expected_routes: 1_600_000,
             hugepages: None,
             require_table_complete: require,
+            loopback_address: Some(packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            }),
         }
     }
 

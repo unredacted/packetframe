@@ -54,6 +54,30 @@ const MESSAGES: &[&str] = &[
     // Interface state.
     "sw_interface_set_flags",
     "sw_interface_set_flags_reply",
+    // Making a member port able to FORWARD, which admin-up does not.
+    //
+    // Both were found by tracing a live VPP on 2026-08-07, in this
+    // order, each hiding behind the previous one:
+    //
+    // - Without the PF's MAC on the interface, every steered frame is
+    //   punted `ethernet-input: l3 mac mismatch`. MCAM redirects frames
+    //   addressed to the PF into the VF, and the VF carries its own MAC,
+    //   so VPP decides they are not for it. Setting it is also what makes
+    //   VPP *source* MAC-PF on tx, which the design requires so the frame
+    //   leaves the same LMAC and the upstream switch sees no MAC move.
+    // - With the MAC right, frames reach IP and die at `ip4-not-enabled`.
+    //   A VPP interface forwards only once IPv4 is enabled on it, and the
+    //   scheme that works here is a loopback holding the router address
+    //   with each member unnumbered to it (no overlapping-subnet
+    //   rejection at /32).
+    "sw_interface_set_mac_address",
+    "sw_interface_set_mac_address_reply",
+    "create_loopback",
+    "create_loopback_reply",
+    "sw_interface_add_del_address",
+    "sw_interface_add_del_address_reply",
+    "sw_interface_set_unnumbered",
+    "sw_interface_set_unnumbered_reply",
     // Interface discovery + link state. `sw_interface_dump` is a DUMP:
     // it streams `sw_interface_details` and is terminated by trailing a
     // `control_ping`. Two jobs neither of which is optional — adoption

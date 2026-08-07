@@ -166,6 +166,19 @@ pub enum ModuleDirective {
     /// Must be ≥ the minimum derived from `expected-routes`; the
     /// renderer errors at load otherwise.
     VppHugepages(u32),
+    /// `loopback-address <ip>/<len>` — the address VPP's loopback holds,
+    /// which every member port is unnumbered to.
+    ///
+    /// Not derivable, which is why it is configuration. A member port
+    /// forwards nothing until IPv4 is enabled on it (traced on hardware
+    /// 2026-08-07: frames reach `ip4-not-enabled` and are dropped), and
+    /// the scheme that works is one loopback carrying the router address
+    /// with the members unnumbered to it. Which address that should be
+    /// is a per-box decision — the reference primary has a different
+    /// address on each of four member ports and only one loopback — and
+    /// it is also what sources ICMP, so PMTUD's frag-needed is only
+    /// correct if an operator chose it deliberately.
+    VppLoopbackAddress(Ipv4Prefix),
     /// `require-table-complete on|off` — whether a first steer waits
     /// for the route mirror to be confirmed converged against bird.
     ///
@@ -987,6 +1000,28 @@ impl Config {
                 0,
                 "module vpp-offload declares no `port` lines; remove the section or give it \
                  at least one port (membership must cover every possible egress port)",
+            ));
+        }
+
+        // A member port that is not IP-enabled forwards NOTHING, and
+        // says nothing about it: the FIB is correct, readback
+        // verification passes on it, health reports `fib-synced
+        // healthy`, and every packet dies at `ip4-not-enabled`. Observed
+        // on hardware 2026-08-07 with 1,053,960 routes installed and
+        // verified on 64 probes, forwarding zero. So the address that
+        // makes forwarding possible is mandatory the moment a port
+        // exists, refused here rather than discovered by a canary.
+        if !vpp
+            .directives
+            .iter()
+            .any(|d| matches!(d, ModuleDirective::VppLoopbackAddress(_)))
+        {
+            return Err(ConfigError::parse(
+                0,
+                "module vpp-offload has `port` lines but no `loopback-address`; member ports \
+                 are unnumbered to a loopback and forward nothing without it — and do so \
+                 while reporting healthy. Add e.g. `loopback-address 198.51.100.1/32` \
+                 (an address this router owns; it also sources ICMP, so PMTUD depends on it)",
             ));
         }
 
@@ -1817,6 +1852,12 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 return Err("expected-routes must be >= 1".to_string());
             }
             Ok(ModuleDirective::ExpectedRoutes(n))
+        }),
+        "loopback-address" => parse_single_arg(line, rest, "loopback-address", |t| {
+            let p: Ipv4Prefix = t
+                .parse()
+                .map_err(|e: String| format!("loopback-address: {e}"))?;
+            Ok(ModuleDirective::VppLoopbackAddress(p))
         }),
         "require-table-complete" => {
             parse_single_arg(line, rest, "require-table-complete", |t| match t {
@@ -2753,44 +2794,44 @@ module fast-path
     #[test]
     fn vpp_offload_cross_validation() {
         // Membership-only (no steer) with a fast-path section: valid.
-        let staging = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n";
+        let staging = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n";
         Config::parse(staging)
             .unwrap()
             .validate_vpp_offload()
             .unwrap();
 
         // vpp-offload without fast-path: rejected.
-        let orphan = "module vpp-offload\n  port eth4 cores 1 steer off\n";
+        let orphan = "module vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n";
         assert!(Config::parse(orphan)
             .unwrap()
             .validate_vpp_offload()
             .is_err());
 
         // Steering without custom-fib: rejected.
-        let no_cfib = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer on\n";
+        let no_cfib = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer on\n";
         assert!(Config::parse(no_cfib)
             .unwrap()
             .validate_vpp_offload()
             .is_err());
 
         // Steering with a fast-path attach port missing membership: rejected.
-        let missing_member = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  port eth5 cores 1 steer on\n";
+        let missing_member = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth5 cores 1 steer on\n";
         assert!(Config::parse(missing_member)
             .unwrap()
             .validate_vpp_offload()
             .is_err());
 
         // Full membership + steering + custom-fib: valid.
-        let good = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n  port eth5 cores 1 steer on\n";
+        let good = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  port eth5 cores 1 steer on\n";
         Config::parse(good).unwrap().validate_vpp_offload().unwrap();
 
         // Duplicate port line: rejected.
-        let dup = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  port eth4 cores 1 steer off\n  port eth4 cores 2 steer off\n";
+        let dup = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  port eth4 cores 2 steer off\n";
         assert!(Config::parse(dup).unwrap().validate_vpp_offload().is_err());
 
         // Empty section: rejected here, so `feasibility` and `run`
         // reach the same verdict on the same file.
-        let empty = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  expected-routes 100\n";
+        let empty = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  expected-routes 100\n";
         let err = Config::parse(empty)
             .unwrap()
             .validate_vpp_offload()
@@ -4308,7 +4349,7 @@ module fast-path
         // both members, neither steering.
         let staged = "module fast-path\n  attach eth4 generic\n  attach eth5 generic\n  \
                       forwarding-mode custom-fib\n\n\
-                      module vpp-offload\n  port eth4 cores 1 steer off\n  \
+                      module vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  \
                       port eth5 cores 1 steer off\n  expected-routes 100\n";
         Config::parse(staged)
             .unwrap()
@@ -4319,7 +4360,7 @@ module fast-path
         // Startup would refuse this; so must a reload.
         let rung_one = "module fast-path\n  attach eth4 generic\n  attach eth5 generic\n  \
                         forwarding-mode custom-fib\n\n\
-                        module vpp-offload\n  port eth5 cores 1 steer on\n  \
+                        module vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth5 cores 1 steer on\n  \
                         expected-routes 100\n";
         let e = Config::parse(rung_one)
             .unwrap()

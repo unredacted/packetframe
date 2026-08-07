@@ -30,16 +30,21 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
-    Address, AddressUnion, ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath,
-    FibPathNh, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute, IpRouteAddDel, IpRouteAddDelReply,
-    IpRouteDetails, IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
-    SwInterfaceDetails, SwInterfaceSetFlagsReply, ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4,
-    FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    Address, AddressUnion, ControlPingReply, CreateLoopbackReply, DevAttachReply,
+    DevCreatePortIfReply, FibPath, FibPathNh, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute,
+    IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
+    Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceDetails,
+    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetUnnumberedReply,
+    ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
 /// install onto *this*, learned from VPP, never onto a guess.
 pub const ASSIGNED_INDEX: u32 = 3;
+
+/// The index the fake's `create_loopback` hands out. Distinct from
+/// `ASSIGNED_INDEX` so a test crossing the two would show it.
+pub const LOOPBACK_INDEX: u32 = 11;
 
 /// Link-layer address the fake mirror hands out for its one neighbour.
 pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -204,6 +209,10 @@ impl Fake {
 }
 
 fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) -> Option<()> {
+    // What `sw_interface_set_mac_address` last set, per interface. The
+    // dump reports it, so `attach::set_mac`'s readback has a real answer
+    // to compare against rather than a constant that always matches.
+    let mut macs: std::collections::HashMap<u32, [u8; 6]> = std::collections::HashMap::new();
     read_frame(sock)?;
     let mut reply = SockclntCreateReply {
         context: 1,
@@ -357,8 +366,60 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
             }
             "sw_interface_dump" => {
                 let mut d = reply_head("sw_interface_details");
-                details(ASSIGNED_INDEX, "octeon0/0", 3, ctx).encode(&mut d);
+                let mut det = details(ASSIGNED_INDEX, "octeon0/0", 3, ctx);
+                if let Some(m) = macs.get(&ASSIGNED_INDEX) {
+                    det.l2_address = *m;
+                }
+                det.encode(&mut d);
                 write_frame(sock, &d);
+                continue;
+            }
+            "sw_interface_set_mac_address" => {
+                // Payload: id(2) client_index(4) context(4) sw_if_index(4)
+                // mac(6). Read by offset because the generated request
+                // types are encode-only.
+                let idx = u32::from_be_bytes([req[10], req[11], req[12], req[13]]);
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(&req[14..20]);
+                macs.insert(idx, mac);
+                let mut out = reply_head("sw_interface_set_mac_address_reply");
+                SwInterfaceSetMacAddressReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+                write_frame(sock, &out);
+                continue;
+            }
+            "create_loopback" => {
+                let mut out = reply_head("create_loopback_reply");
+                CreateLoopbackReply {
+                    context: ctx,
+                    sw_if_index: LOOPBACK_INDEX,
+                    retval: 0,
+                }
+                .encode(&mut out);
+                write_frame(sock, &out);
+                continue;
+            }
+            "sw_interface_add_del_address" => {
+                let mut out = reply_head("sw_interface_add_del_address_reply");
+                SwInterfaceAddDelAddressReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+                write_frame(sock, &out);
+                continue;
+            }
+            "sw_interface_set_unnumbered" => {
+                let mut out = reply_head("sw_interface_set_unnumbered_reply");
+                SwInterfaceSetUnnumberedReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+                write_frame(sock, &out);
                 continue;
             }
             "control_ping" if behaviour.stall_pings_after == Some(0) => {

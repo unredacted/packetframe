@@ -368,11 +368,16 @@ fn measured_convergence_against_a_real_vpp() {
                 pci_addr: pci.clone(),
                 port_id: 0,
                 num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             })
             .collect(),
         ports.clone(),
         HIGH_WATER,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     )
     .with_recorded_indices(recorded);
 

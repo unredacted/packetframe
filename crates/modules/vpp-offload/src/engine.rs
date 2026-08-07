@@ -303,6 +303,12 @@ pub struct ConvergenceEngine {
     transport: Option<Transport>,
 
     ports: Vec<PortAttach>,
+    /// The address the loopback holds; every member is unnumbered to it.
+    loopback: packetframe_common::config::Ipv4Prefix,
+    /// The loopback's index once created. `None` until the first attach
+    /// pass — and reset with the transport, because an index from a VPP
+    /// that has since died names nothing.
+    loop_index: Option<u32>,
     /// `(port, sw_if_index)` recorded from a previous run, for adoption.
     recorded_indices: Vec<(String, u32)>,
     attached: Vec<AttachedPort>,
@@ -351,11 +357,14 @@ impl ConvergenceEngine {
         members: Vec<String>,
         high_water_routes: u64,
         families: FamilyPolicy,
+        loopback: packetframe_common::config::Ipv4Prefix,
     ) -> Self {
         Self {
             api_socket: api_socket.into(),
             transport: None,
             ports,
+            loopback,
+            loop_index: None,
             recorded_indices: Vec::new(),
             attached: Vec::new(),
             port_index: PortIndex::default(),
@@ -598,7 +607,21 @@ impl ConvergenceEngine {
                 return Err(EngineError::NotConnected);
             }
         };
-        let result = attach_ports(t, &ports, &known, mode);
+        // The loopback comes first and exists once per VPP: members are
+        // unnumbered to it, so there is nothing to borrow an address
+        // from until it does. Re-created after a restart because the
+        // index died with the process.
+        let loop_index = match self.loop_index {
+            Some(idx) => Ok(idx),
+            None => crate::attach::create_loopback(t, self.loopback),
+        };
+        let result = match loop_index {
+            Ok(idx) => {
+                self.loop_index = Some(idx);
+                attach_ports(t, &ports, &known, mode, idx)
+            }
+            Err(e) => Err(e),
+        };
         self.ports = ports;
         self.recorded_indices = known;
         let attached = match result {
@@ -1075,6 +1098,11 @@ impl ConvergenceEngine {
         // live FIB still references them — and every recovery after an
         // adopted-process failure was driven straight back into teardown.
         self.recorded_indices.clear();
+        // Same reasoning, one interface further: the loopback belonged
+        // to the dead process. Keeping its index would have the next
+        // attach unnumber every member to an interface that no longer
+        // exists — which VPP would refuse, or worse accept.
+        self.loop_index = None;
         self.pending = PendingMap::new();
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;
@@ -1141,10 +1169,15 @@ mod tests {
                 pci_addr: "0002:07:00.1".into(),
                 port_id: 0,
                 num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             }],
             vec!["eth4".into()],
             1_000_000,
             FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
         )
     }
 
@@ -1260,6 +1293,10 @@ mod tests {
             vec!["eth4".into()],
             2,
             FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
         );
         e.nexthops.set_device(nh(1), "eth4");
         for i in 0..4u8 {
@@ -1304,6 +1341,10 @@ mod tests {
             vec!["eth4".into()],
             1_000,
             FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
         );
         e.last_verify = Some(crate::verify::VerifyOutcome {
             sampled: 4,

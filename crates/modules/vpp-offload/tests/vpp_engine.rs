@@ -58,10 +58,15 @@ fn engine_for(fake: &Fake) -> ConvergenceEngine {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }],
         vec!["eth4".into()],
         1_000_000,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     )
 }
 
