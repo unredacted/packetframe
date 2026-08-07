@@ -20,9 +20,14 @@
 //! installed and silently drops. The supervisor orders
 //! `AttachDevices` ahead of `StartResync` for exactly this reason.
 
+use packetframe_common::config::Ipv4Prefix;
+
 use crate::vpp_api::generated::{
-    DevAttach, DevAttachReply, DevCreatePortIf, DevCreatePortIfReply, SwInterfaceDetails,
-    SwInterfaceDump, SwInterfaceSetFlags, SwInterfaceSetFlagsReply,
+    Address, AddressUnion, CreateLoopback, CreateLoopbackReply, DevAttach, DevAttachReply,
+    DevCreatePortIf, DevCreatePortIfReply, Prefix, SwInterfaceAddDelAddress,
+    SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
+    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
+    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -66,6 +71,12 @@ pub struct PortAttach {
     pub port_id: u16,
     /// Receive queues, from the operator's `cores` promise.
     pub num_rx_queues: u16,
+    /// The **PF's** MAC, read from `/sys/class/net/<port>/address`.
+    ///
+    /// The VF's own MAC is not usable: MCAM redirects frames addressed
+    /// to the PF, so the interface must answer to that address or punt
+    /// every one of them.
+    pub pf_mac: [u8; 6],
 }
 
 /// A port VPP has accepted, with the index FIB paths must reference.
@@ -106,6 +117,17 @@ pub enum AttachError {
     /// here whether a live FIB still references the old index, and
     /// creating a second interface would leave routes pointing at
     /// something nothing services. A clean restart is the safe answer.
+    /// The MAC we set is not the MAC VPP reports.
+    ///
+    /// Its own variant because the consequence is specific and silent:
+    /// steered frames are addressed to the PF, so an interface holding
+    /// any other MAC punts every one of them at `ethernet-input` while
+    /// the FIB stays perfectly correct and health stays green.
+    MacMismatch {
+        port: String,
+        asked: [u8; 6],
+        got: [u8; 6],
+    },
     StaleIndex {
         port: String,
         sw_if_index: u32,
@@ -126,6 +148,14 @@ pub enum AttachError {
 impl std::fmt::Display for AttachError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MacMismatch { port, asked, got } => write!(
+                f,
+                "{port}: asked VPP for MAC {} but it reports {}; steered frames are \
+                 addressed to the PF, so this interface would punt every one of them at \
+                 ethernet-input while the FIB and every health check stayed green",
+                hex_mac(asked),
+                hex_mac(got)
+            ),
             AttachError::Transport(e) => write!(f, "{e}"),
             AttachError::Refused {
                 step,
@@ -209,6 +239,7 @@ pub fn attach_ports(
     ports: &[PortAttach],
     known: &[(String, u32)],
     mode: AttachMode,
+    loop_idx: u32,
 ) -> Result<Vec<AttachedPort>, AttachError> {
     // One dump for the whole pass: it both confirms recorded indices
     // still exist and is the only way to see link state.
@@ -242,6 +273,14 @@ pub fn attach_ports(
                 // udapi provisioning can flap interface state under us,
                 // and this is the reconcile point.
                 set_admin_up(t, p, idx)?;
+                // Re-asserted on the reuse path too, for the same
+                // reason admin-up is: a controller deploy or a udapi
+                // provisioning cycle can reset interface state under a
+                // running VPP, and this is the reconcile point. A MAC
+                // that silently reverted would punt every steered frame
+                // while every counter stayed healthy.
+                set_mac(t, p, idx, p.pf_mac)?;
+                set_unnumbered(t, p, idx, loop_idx)?;
                 out.push(AttachedPort {
                     port: p.port.clone(),
                     dev_index: None,
@@ -261,6 +300,13 @@ pub fn attach_ports(
         let dev_index = attach_device(t, p)?;
         let sw_if_index = create_port_if(t, p, dev_index)?;
         set_admin_up(t, p, sw_if_index)?;
+        // Order matters and is not arbitrary: MAC before unnumbered,
+        // both before the port is announced as attached. A port handed
+        // to the sink before it can forward is a port the FIB will
+        // resolve routes onto while every packet dies at
+        // `ip4-not-enabled`.
+        set_mac(t, p, sw_if_index, p.pf_mac)?;
+        set_unnumbered(t, p, sw_if_index, loop_idx)?;
         out.push(AttachedPort {
             port: p.port.clone(),
             dev_index: Some(dev_index),
@@ -290,6 +336,7 @@ pub fn interfaces(t: &mut Transport) -> Result<Vec<Interface>, TransportError> {
             sw_if_index: d.sw_if_index,
             name: d.interface_name,
             flags: d.flags,
+            l2_address: d.l2_address,
         })
         .collect())
 }
@@ -300,6 +347,9 @@ pub struct Interface {
     pub sw_if_index: u32,
     pub name: String,
     pub flags: u32,
+    /// What VPP believes this interface's MAC is. The only way to check
+    /// that `sw_interface_set_mac_address` did anything.
+    pub l2_address: [u8; 6],
 }
 
 impl Interface {
@@ -374,6 +424,182 @@ fn create_port_if(t: &mut Transport, p: &PortAttach, dev_index: u32) -> Result<u
     Ok(reply.sw_if_index)
 }
 
+/// A config prefix as VPP's wire `Prefix`.
+fn prefix_of(p: Ipv4Prefix) -> Prefix {
+    let mut u = [0u8; 16];
+    u[..4].copy_from_slice(&p.addr.octets());
+    Prefix {
+        address: Address {
+            af: ADDRESS_IP4,
+            un: AddressUnion(u),
+        },
+        len: p.prefix_len,
+    }
+}
+
+/// `58:d6:1f:4f:cd:56`, for error messages an operator compares against
+/// `ip link` output.
+fn hex_mac(m: &[u8; 6]) -> String {
+    m.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Give the interface the PF's MAC, then read the dump back and check.
+///
+/// Steered frames arrive addressed to the **PF**, because that is what
+/// MCAM redirects; the VF carries its own MAC, so without this every one
+/// of them is punted `ethernet-input: l3 mac mismatch`. Traced on
+/// hardware 2026-08-07 — 100 frames in, 100 punted, FIB correct
+/// throughout.
+///
+/// It is also what makes VPP *source* MAC-PF on transmit, which the
+/// design requires: the frame then leaves the same LMAC the kernel uses,
+/// so the upstream switch never sees the address move ports.
+///
+/// The readback is not ceremony. `sw_interface_set_mac_address` can
+/// return 0 and leave the interface unchanged on a driver that does not
+/// implement it, and the failure mode is invisible — every packet
+/// punted, every counter healthy. `sw_interface_dump` reports
+/// `l2_address`, so the check costs one dump we already know how to do.
+fn set_mac(
+    t: &mut Transport,
+    p: &PortAttach,
+    sw_if_index: u32,
+    mac: [u8; 6],
+) -> Result<(), AttachError> {
+    let reply = t.request::<SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply>(
+        SwInterfaceSetMacAddress {
+            context: 0,
+            sw_if_index,
+            mac_address: mac,
+        },
+    )?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_mac_address",
+            port: p.port.clone(),
+            retval: reply.retval,
+            detail: format!("mac {}", hex_mac(&mac)),
+        });
+    }
+    let got = interfaces(t)?
+        .into_iter()
+        .find(|i| i.sw_if_index == sw_if_index)
+        .map(|i| i.l2_address)
+        .ok_or_else(|| AttachError::StaleIndex {
+            port: p.port.clone(),
+            sw_if_index,
+        })?;
+    if got != mac {
+        return Err(AttachError::MacMismatch {
+            port: p.port.clone(),
+            asked: mac,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Create the loopback that member ports borrow an address from.
+///
+/// One per VPP, holding the router address. Returns its `sw_if_index`
+/// so teardown can delete it and so members can be unnumbered to it.
+pub fn create_loopback(t: &mut Transport, addr: Ipv4Prefix) -> Result<u32, AttachError> {
+    let reply = t.request::<CreateLoopback, CreateLoopbackReply>(CreateLoopback {
+        context: 0,
+        // Zero asks VPP to pick one. A loopback never puts a frame on a
+        // wire, so its address is not load-bearing the way a member
+        // port's is.
+        mac_address: [0; 6],
+    })?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "create_loopback",
+            port: "loop0".into(),
+            retval: reply.retval,
+            detail: String::new(),
+        });
+    }
+    let loop_idx = reply.sw_if_index;
+
+    let reply = t.request::<SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply>(
+        SwInterfaceAddDelAddress {
+            context: 0,
+            sw_if_index: loop_idx,
+            is_add: true,
+            del_all: false,
+            prefix: prefix_of(addr),
+        },
+    )?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_add_del_address",
+            port: "loop0".into(),
+            retval: reply.retval,
+            detail: format!("{}/{}", addr.addr, addr.prefix_len),
+        });
+    }
+
+    let reply =
+        t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
+            context: 0,
+            sw_if_index: loop_idx,
+            flags: IF_STATUS_ADMIN_UP,
+        })?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_flags(loop0)",
+            port: "loop0".into(),
+            retval: reply.retval,
+            detail: String::new(),
+        });
+    }
+    Ok(loop_idx)
+}
+
+/// Enable IPv4 on a member by borrowing the loopback's address.
+///
+/// Admin-up is not enough: an interface with no IPv4 drops every packet
+/// at `ip4-not-enabled`, *after* a correct FIB lookup would have
+/// succeeded. Observed on hardware with 1,053,960 routes installed and
+/// verified, forwarding zero.
+///
+/// Unnumbered rather than a per-port address because VPP rejects
+/// overlapping subnets across interfaces, and because one router address
+/// is what should source ICMP — PMTUD's frag-needed has to come from an
+/// address the sender can route back to.
+///
+/// **Not readback-verified**, unlike the MAC: `sw_interface_dump` does
+/// not report IP-enabled state, and no dump in the whitelist does. This
+/// rests on the API's acknowledgement, which is weaker, and the
+/// difference is deliberate rather than overlooked.
+fn set_unnumbered(
+    t: &mut Transport,
+    p: &PortAttach,
+    sw_if_index: u32,
+    loop_idx: u32,
+) -> Result<(), AttachError> {
+    let reply = t.request::<SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply>(
+        SwInterfaceSetUnnumbered {
+            context: 0,
+            sw_if_index: loop_idx,
+            unnumbered_sw_if_index: sw_if_index,
+            is_add: true,
+        },
+    )?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_unnumbered",
+            port: p.port.clone(),
+            retval: reply.retval,
+            detail: String::new(),
+        });
+    }
+    Ok(())
+}
+
 fn set_admin_up(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
     let reply =
         t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
@@ -405,6 +631,7 @@ mod tests {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         };
         assert_eq!(format!("pci/{}", p.pci_addr), "pci/0002:07:00.1");
     }

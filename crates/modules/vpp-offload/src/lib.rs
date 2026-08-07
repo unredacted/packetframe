@@ -99,6 +99,15 @@ pub struct VppOffloadConfig {
     /// converged against bird. See
     /// [`packetframe_common::fib::TableCompleteness`].
     pub require_table_complete: bool,
+    /// The address VPP's loopback holds; every member port is
+    /// unnumbered to it.
+    ///
+    /// `None` is a config error whenever there are ports, refused at
+    /// load — see [`packetframe_common::config::Config::validate_vpp_offload`].
+    /// Attaching without it produces a VPP that passes every health
+    /// check and forwards nothing, which is the failure this whole
+    /// module is built to make impossible.
+    pub loopback_address: Option<packetframe_common::config::Ipv4Prefix>,
 }
 
 /// Default sizing input when `expected-routes` is absent.
@@ -132,6 +141,7 @@ impl VppOffloadConfig {
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
+                ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
                 _ => {}
             }
         }
@@ -182,6 +192,14 @@ impl VppOffloadConfig {
                 "`hugepages` changed ({:?} → {:?}); the reservation is made at attach and \
                  VPP maps it at start — restart to apply",
                 self.hugepages, new.hugepages
+            ));
+        }
+        if self.loopback_address != new.loopback_address {
+            return Err(format!(
+                "`loopback-address` changed ({:?} → {:?}); the loopback is created and the \
+                 member ports unnumbered to it at attach, and VPP's adjacencies are built \
+                 from it — restart to apply",
+                self.loopback_address, new.loopback_address
             ));
         }
         if self.vpp_binary != new.vpp_binary {
@@ -1297,6 +1315,10 @@ mod tests {
             expected_routes: routes,
             hugepages: None,
             require_table_complete: true,
+            loopback_address: Some(packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            }),
         }
     }
 

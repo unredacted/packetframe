@@ -445,6 +445,33 @@ will fire on every planned restart. Either alert on a sustained
 Unhealthy (30 s or more) or exclude the window explicitly. Measured
 2026-08-06 on the shadow during drill (d).
 
+### A member port needs two things admin-up does not give it
+
+Both were found by tracing a live VPP on 2026-08-07, each hidden behind
+the other, and the module now does both at attach:
+
+1. **The port must carry the PF's MAC.** MCAM redirects frames addressed
+   to the *PF*; the VF has its own address, so without this every steered
+   frame is punted `ethernet-input: l3 mac mismatch`. It is also what
+   makes VPP source MAC-PF on transmit, so the frame leaves the same LMAC
+   and the upstream switch never sees the address move ports. The module
+   sets it and then **reads it back** — `sw_interface_set_mac_address` can
+   return 0 and change nothing, and that failure is invisible in every
+   other surface.
+2. **IPv4 must be enabled on the port.** A member with a correct FIB and
+   no IPv4 drops everything at `ip4-not-enabled`. `loopback-address` in
+   the config is the address VPP's loopback holds; members are unnumbered
+   to it.
+
+**What this looked like before the fix, and why it matters for the
+canary:** with 1,053,960 routes installed and verified on 64 probes,
+`packetframe status` reported `fib-synced healthy` while VPP forwarded
+**zero** packets. Readback verification samples the FIB, and the FIB was
+genuinely right. A verified FIB is not a forwarding dataplane — on a
+steered production port that distinction is the difference between a
+canary that reveals a problem and one that blackholes traffic with every
+gauge green.
+
 ### Verification does not re-run in steady state
 
 `fib-synced` reports the **last completed** readback verify, and the

@@ -869,6 +869,10 @@ mod tests {
             vec!["eth4".into()],
             1_000,
             FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
         )
     }
 

@@ -84,6 +84,16 @@ impl Host {
             let dev = net.join(iface).join("device");
             fs::create_dir_all(&dev).unwrap();
             fs::write(dev.join("sriov_numvfs"), "0").unwrap();
+            // The PF's MAC, which attach gives to the VPP interface so
+            // steered frames — addressed to the PF — are accepted rather
+            // than punted. Distinct per port, so a test that crossed
+            // them would show it.
+            let last = iface.as_bytes()[iface.len() - 1];
+            fs::write(
+                net.join(iface).join("address"),
+                format!("58:d6:1f:4f:cd:{last:02x}\n"),
+            )
+            .unwrap();
             let pci_dev = devices.join(pci);
             fs::create_dir_all(&pci_dev).unwrap();
             std::os::unix::fs::symlink(&pci_dev, dev.join("virtfn0")).unwrap();
@@ -141,6 +151,10 @@ impl Host {
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.
             require_table_complete: false,
+            loopback_address: Some(packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            }),
         }
     }
 

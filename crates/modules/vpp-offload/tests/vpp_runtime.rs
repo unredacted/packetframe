@@ -51,10 +51,15 @@ fn runtime_for(fake: &Fake, n_routes: u8) -> Runtime {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }],
         vec!["eth4".into()],
         1_000_000,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     );
     let mirror = Mirror {
         routes: (0..n_routes).map(|i| fake_vpp::v4(0, i)).collect(),
@@ -281,10 +286,15 @@ fn a_persist_that_recovers_clears_the_recorded_failure() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }],
         vec!["eth4".into()],
         1_000_000,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     );
     let rt = Runtime::new(
         engine,
@@ -368,6 +378,10 @@ fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
         vec!["eth4".into()],
         1_000,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     );
     let rt = Runtime::new(
         engine,
@@ -438,10 +452,15 @@ fn a_route_learned_after_convergence_still_reaches_vpp() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }],
         vec![dev],
         1_000_000,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     );
     let rt = Runtime::new(
         engine,
@@ -573,10 +592,15 @@ fn a_nexthop_first_seen_after_convergence_gets_its_adjacency() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }],
         vec![dev],
         1_000_000,
         FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
     );
     let rt = Runtime::new(
         engine,

@@ -22,14 +22,22 @@ use packetframe_vpp_offload::fib_sync::{to_prefix, PortIndex};
 use packetframe_vpp_offload::sink::{Capacity, RouteLedger};
 use packetframe_vpp_offload::verify::{verify, Mismatch};
 use packetframe_vpp_offload::vpp_api::codec::{peek_msg_id, Encode, SOCKCLNT_CREATE_MSG_ID};
+/// The loopback index the fake hands out. Attach unnumbers every member
+/// to it; these tests care that the call is made, not what the index is.
+const TEST_LOOP_IDX: u32 = 9;
+
+/// What the fake's `create_loopback` hands back.
+const LOOP_IF_INDEX: u32 = 9;
+
 #[path = "common/wire.rs"]
 mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
-    ControlPingReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply,
-    MessageTableEntry, SockclntCreateReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
-    MESSAGE_META,
+    ControlPingReply, CreateLoopbackReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute,
+    IpRouteLookupReply, MessageTableEntry, SockclntCreateReply, SwInterfaceAddDelAddressReply,
+    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
+    SwInterfaceSetUnnumberedReply, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
 
@@ -106,12 +114,28 @@ impl Fake {
         lookup: LookupBehaviour,
         ifaces: Ifaces,
     ) -> Self {
+        Self::start_full(tag, attach, lookup, ifaces, false)
+    }
+
+    /// `deaf_to_mac` models the failure the readback exists for: a
+    /// driver that answers `sw_interface_set_mac_address` with retval 0
+    /// and leaves the interface unchanged.
+    fn start_full(
+        tag: &str,
+        attach: AttachBehaviour,
+        lookup: LookupBehaviour,
+        ifaces: Ifaces,
+        deaf_to_mac: bool,
+    ) -> Self {
         let dir = tempdir::TempDir::new(tag).unwrap();
         let path = dir.path().join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx): (Sender<String>, Receiver<String>) = channel();
 
         thread::spawn(move || {
+            let mut ifaces = ifaces;
+            let mut macs: std::collections::HashMap<u32, [u8; 6]> =
+                std::collections::HashMap::new();
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
@@ -164,12 +188,72 @@ impl Fake {
                         .encode(&mut out);
                     }
                     "dev_create_port_if" => {
+                        // A created interface shows up in later dumps,
+                        // as it does in VPP. Without this the MAC
+                        // readback cannot find the port it just made,
+                        // and the fake would be failing attach for a
+                        // reason no real VPP has.
+                        if attach.create_retval == 0
+                            && !ifaces.iter().any(|(i, _, _)| *i == attach.sw_if_index)
+                        {
+                            ifaces.push((attach.sw_if_index, "octeon0/0".into(), 3));
+                        }
                         out = reply_head("dev_create_port_if_reply");
                         DevCreatePortIfReply {
                             context: ctx,
                             sw_if_index: attach.sw_if_index,
                             retval: attach.create_retval,
                             error_string: String::new(),
+                        }
+                        .encode(&mut out);
+                    }
+                    // Modelled, not merely acknowledged: the dump below
+                    // reports whatever was set here, so `set_mac`'s
+                    // readback has something real to disagree with. A
+                    // fake that returned 0 and forgot would make the
+                    // readback untestable — and the readback exists
+                    // precisely because a driver can do that.
+                    "sw_interface_set_mac_address" => {
+                        // Read off the wire by offset rather than
+                        // decoded: requests are encode-only in the
+                        // generated types. Payload is
+                        // id(2) client_index(4) context(4) sw_if_index(4)
+                        // mac(6).
+                        let idx = u32::from_be_bytes([req[10], req[11], req[12], req[13]]);
+                        let mut mac = [0u8; 6];
+                        mac.copy_from_slice(&req[14..20]);
+                        if !deaf_to_mac {
+                            macs.insert(idx, mac);
+                        }
+                        out = reply_head("sw_interface_set_mac_address_reply");
+                        SwInterfaceSetMacAddressReply {
+                            context: ctx,
+                            retval: 0,
+                        }
+                        .encode(&mut out);
+                    }
+                    "create_loopback" => {
+                        out = reply_head("create_loopback_reply");
+                        CreateLoopbackReply {
+                            context: ctx,
+                            sw_if_index: LOOP_IF_INDEX,
+                            retval: 0,
+                        }
+                        .encode(&mut out);
+                    }
+                    "sw_interface_add_del_address" => {
+                        out = reply_head("sw_interface_add_del_address_reply");
+                        SwInterfaceAddDelAddressReply {
+                            context: ctx,
+                            retval: 0,
+                        }
+                        .encode(&mut out);
+                    }
+                    "sw_interface_set_unnumbered" => {
+                        out = reply_head("sw_interface_set_unnumbered_reply");
+                        SwInterfaceSetUnnumberedReply {
+                            context: ctx,
+                            retval: 0,
                         }
                         .encode(&mut out);
                     }
@@ -209,7 +293,11 @@ impl Fake {
                     "sw_interface_dump" => {
                         for (idx, name, flags) in &ifaces {
                             let mut d = reply_head("sw_interface_details");
-                            details(*idx, name, *flags, ctx).encode(&mut d);
+                            let mut det = details(*idx, name, *flags, ctx);
+                            if let Some(m) = macs.get(idx) {
+                                det.l2_address = *m;
+                            }
+                            det.encode(&mut d);
                             write_frame(&mut sock, &d);
                         }
                         continue;
@@ -320,11 +408,49 @@ fn ports() -> Vec<PortAttach> {
         pci_addr: "0002:07:00.1".into(),
         port_id: 0,
         num_rx_queues: 1,
+        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
     }]
 }
 
+/// The MAC readback catches a driver that says yes and does nothing.
+///
+/// This is the whole reason `set_mac` costs an extra dump. A retval of 0
+/// is not evidence: `sw_interface_set_mac_address` can be accepted and
+/// ignored, and the result is invisible everywhere else — the FIB
+/// installs correctly, verification passes, health reports healthy, and
+/// every steered frame is punted at `ethernet-input` because the
+/// interface does not answer to the address MCAM sends traffic to.
+/// Traced on hardware 2026-08-07 before the MAC was set: 100 frames in,
+/// 100 punted, `fib-synced healthy` throughout.
 #[test]
-fn attach_sends_the_three_messages_in_order() {
+fn a_mac_set_that_did_not_take_is_caught_not_trusted() {
+    let fake = Fake::start_full(
+        "deafmac",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![(7, "octeon0/0".into(), 3)],
+        // Acknowledges, changes nothing — the failure mode.
+        true,
+    );
+    let mut t = fake.connect();
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX)
+        .expect_err("a MAC that did not take must not be reported as attached");
+
+    match err {
+        AttachError::MacMismatch { port, asked, got } => {
+            assert_eq!(port, "eth3");
+            assert_ne!(asked, got, "the point is that they differ");
+        }
+        other => panic!("expected MacMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn attach_sends_every_message_a_forwarding_port_needs_in_order() {
     let fake = Fake::start(
         "ok",
         AttachBehaviour {
@@ -335,7 +461,8 @@ fn attach_sends_the_three_messages_in_order() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let got = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect("attach");
+    let got =
+        attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
 
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].port, "eth3");
@@ -343,9 +470,17 @@ fn attach_sends_the_three_messages_in_order() {
     assert_eq!(got[0].sw_if_index, 7);
 
     // A discovery dump comes first (so an adopted VPP is not
-    // re-attached), then the attach proper. Order within the attach is
-    // not cosmetic: create_port_if consumes dev_attach's index, and
-    // set_flags consumes create_port_if's.
+    // re-attached), then the attach proper. None of this order is
+    // cosmetic: create_port_if consumes dev_attach's index, set_flags
+    // consumes create_port_if's, and the MAC and unnumbered calls must
+    // land before the port is reported attached — a port handed to the
+    // sink before it can forward is one the FIB resolves routes onto
+    // while every packet dies at `ip4-not-enabled`.
+    //
+    // The second dump is the MAC readback. It is in this list on
+    // purpose: `sw_interface_set_mac_address` can return 0 and change
+    // nothing, and the only thing that catches it is asking VPP what
+    // the interface actually holds.
     assert_eq!(
         fake.observed(),
         vec![
@@ -354,6 +489,10 @@ fn attach_sends_the_three_messages_in_order() {
             "dev_attach".to_string(),
             "dev_create_port_if".to_string(),
             "sw_interface_set_flags".to_string(),
+            "sw_interface_set_mac_address".to_string(),
+            "sw_interface_dump".to_string(),
+            "control_ping".to_string(),
+            "sw_interface_set_unnumbered".to_string(),
         ]
     );
 }
@@ -373,8 +512,8 @@ fn an_sw_if_index_of_zero_is_refused_as_local0() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err =
-        attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect_err("must refuse index 0");
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX)
+        .expect_err("must refuse index 0");
     assert!(matches!(err, AttachError::LocalZero { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("local0"), "{msg}");
@@ -402,7 +541,8 @@ fn a_refused_dev_attach_reports_vpps_own_text() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect_err("must fail");
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX)
+        .expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("dev_attach"), "{msg}");
     assert!(msg.contains("eth3"), "names the port: {msg}");
@@ -433,7 +573,8 @@ fn a_refused_create_port_if_names_the_step_that_failed() {
         LookupBehaviour::Missing,
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect_err("must fail");
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX)
+        .expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("dev_create_port_if"), "{msg}");
     assert!(msg.contains("-11"), "reports the retval: {msg}");
@@ -464,7 +605,8 @@ fn a_recorded_interface_is_reused_not_re_attached() {
     );
     let mut t = fake.connect();
     let known = vec![("eth3".to_string(), 7u32)];
-    let got = attach_ports(&mut t, &ports(), &known, AttachMode::Adopted).expect("adopt");
+    let got =
+        attach_ports(&mut t, &ports(), &known, AttachMode::Adopted, TEST_LOOP_IDX).expect("adopt");
 
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].sw_if_index, 7);
@@ -501,7 +643,8 @@ fn a_stale_recorded_index_is_refused() {
     );
     let mut t = fake.connect();
     let known = vec![("eth3".to_string(), 7u32)];
-    let err = attach_ports(&mut t, &ports(), &known, AttachMode::Adopted).expect_err("must refuse");
+    let err = attach_ports(&mut t, &ports(), &known, AttachMode::Adopted, TEST_LOOP_IDX)
+        .expect_err("must refuse");
     assert!(matches!(err, AttachError::StaleIndex { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("no longer has it"), "{msg}");
@@ -524,7 +667,8 @@ fn adopting_without_a_recorded_index_refuses_rather_than_duplicating() {
         vec![(7, "octeon0/0".into(), 3)],
     );
     let mut t = fake.connect();
-    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Adopted).expect_err("must refuse");
+    let err = attach_ports(&mut t, &ports(), &[], AttachMode::Adopted, TEST_LOOP_IDX)
+        .expect_err("must refuse");
     assert!(
         matches!(err, AttachError::UnknownIndexOnAdopt { .. }),
         "{err:?}"
@@ -551,7 +695,8 @@ fn a_fresh_process_with_no_recorded_index_attaches_normally() {
         vec![],
     );
     let mut t = fake.connect();
-    let got = attach_ports(&mut t, &ports(), &[], AttachMode::Fresh).expect("attach");
+    let got =
+        attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
     assert_eq!(got[0].sw_if_index, 7);
     assert_eq!(got[0].dev_index, Some(1));
 }
