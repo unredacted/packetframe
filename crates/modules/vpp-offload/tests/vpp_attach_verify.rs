@@ -412,6 +412,49 @@ fn ports() -> Vec<PortAttach> {
     }]
 }
 
+/// A surviving VPP's loopback is adopted, not duplicated.
+///
+/// The first daemon restart over a live VPP failed on this: the module
+/// created a second loopback and then could not give it an address the
+/// first one already held —
+/// `sw_interface_add_del_address for loop0 failed (retval -105)`.
+/// Adoption has to discover VPP's state rather than recreate it, which
+/// is the same rule that governs port interfaces.
+///
+/// Asserts that `create_loopback` is NOT sent when one already exists —
+/// the presence of a message, not its absence from a happy path, since a
+/// test that only checked the returned index would pass while VPP
+/// accumulated a loopback per restart.
+#[test]
+fn an_existing_loopback_is_adopted_rather_than_recreated() {
+    let fake = Fake::start_with(
+        "loopadopt",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![
+            (7, "octeon0/0".into(), 3),
+            (LOOP_IF_INDEX, "loop0".into(), 3),
+        ],
+    );
+    let mut t = fake.connect();
+
+    let found = packetframe_vpp_offload::attach::find_loopback(&mut t).expect("dump");
+    assert_eq!(
+        found,
+        Some(LOOP_IF_INDEX),
+        "the loopback this VPP already has must be discoverable"
+    );
+    assert!(
+        !fake.observed().contains(&"create_loopback".to_string()),
+        "discovery must not create anything: {:?}",
+        fake.observed()
+    );
+}
+
 /// The MAC readback catches a driver that says yes and does nothing.
 ///
 /// This is the whole reason `set_mac` costs an extra dump. A retval of 0

@@ -613,7 +613,21 @@ impl ConvergenceEngine {
         // index died with the process.
         let loop_index = match self.loop_index {
             Some(idx) => Ok(idx),
-            None => crate::attach::create_loopback(t, self.loopback),
+            // Adopt before creating. A surviving VPP already has the
+            // loopback and its address; creating a second one and
+            // assigning the same address fails ADDRESS_IN_USE, and the
+            // attach step never completes.
+            None => match crate::attach::find_loopback(t) {
+                Ok(Some(idx)) => {
+                    tracing::info!(
+                        sw_if_index = idx,
+                        "reusing the loopback this VPP already has rather than creating another"
+                    );
+                    Ok(idx)
+                }
+                Ok(None) => crate::attach::create_loopback(t, self.loopback),
+                Err(e) => Err(e.into()),
+            },
         };
         let result = match loop_index {
             Ok(idx) => {

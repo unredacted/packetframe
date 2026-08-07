@@ -526,6 +526,32 @@ fn set_mac(
     Ok(())
 }
 
+/// The loopback a surviving VPP already has, if any.
+///
+/// Adoption must discover VPP's state, not recreate it — the same rule
+/// that governs port interfaces, learned again the hard way. Creating a
+/// second loopback and assigning it an address the first one already
+/// holds fails with `VNET_API_ERROR_ADDRESS_IN_USE`, which is what a
+/// daemon restart over a live VPP did on the shadow (2026-08-07) the
+/// first time that path ran.
+///
+/// Matched by name because VPP names loopbacks `loop0`, `loop1`, … and
+/// nothing else talks to this VPP: the module spawns it on a private
+/// socket under its own runtime directory. That is the whole assumption,
+/// and it is worth stating rather than leaving implicit — a loopback
+/// created by anything else would be adopted as ours.
+pub fn find_loopback(t: &mut Transport) -> Result<Option<u32>, TransportError> {
+    let mut found: Vec<u32> = interfaces(t)?
+        .into_iter()
+        .filter(|i| i.name.starts_with("loop"))
+        .map(|i| i.sw_if_index)
+        .collect();
+    // Lowest index: the first one created, which is ours if a previous
+    // run left more than one behind.
+    found.sort_unstable();
+    Ok(found.first().copied())
+}
+
 /// Create the loopback that member ports borrow an address from.
 ///
 /// One per VPP, holding the router address. Returns its `sw_if_index`
