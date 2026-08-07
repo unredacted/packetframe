@@ -456,13 +456,35 @@ fn emit_encode(out: &mut String, api: &Api, name: &str, fields: &[Field], is_msg
                 .map(|c| (c.clone(), field_ident(&f.name)))
         })
         .collect();
+    // Whether this message's client_index sits at the prefix position
+    // (before context). Only there is it the transport's to write —
+    // `send` and the fakes' `reply_head` stamp id + prefix client_index
+    // and nothing else. A MID-BODY client_index (control_ping_reply
+    // puts it after retval) is written by nobody on that path, and the
+    // decoder consumes it positionally, so an encoder that skips it
+    // produces a frame 4 bytes short of what its own decoder demands.
+    // Nothing in production ever encodes a reply, which is exactly why
+    // this asymmetry survived: the only encoders of replies are the
+    // test fakes, and a fake whose ping replies cannot be decoded made
+    // every fake-backed liveness test run on a silently failing ping.
+    let ci_prefix = is_msg && header_geometry(fields).1;
     writeln!(out, "impl Encode for {rname} {{").unwrap();
     writeln!(out, "    fn encode(&self, buf: &mut Vec<u8>) {{").unwrap();
     if fields.is_empty() {
         writeln!(out, "        let _ = buf;").unwrap();
     }
     for f in fields {
-        if is_msg && (f.name == "_vl_msg_id" || f.name == "client_index") {
+        if is_msg && (f.name == "_vl_msg_id" || (f.name == "client_index" && ci_prefix)) {
+            continue;
+        }
+        if is_msg && f.name == "client_index" {
+            // Transport-owned but mid-body: emit the placeholder so
+            // encode and decode agree on the frame's length.
+            writeln!(
+                out,
+                "        buf.extend_from_slice(&0u32.to_be_bytes()); // client_index"
+            )
+            .unwrap();
             continue;
         }
         // A count field is DERIVED, never taken from the struct. VPP

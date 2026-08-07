@@ -251,6 +251,12 @@ impl RouteSource for RouteFeed {
         (g.pending.len() + g.neigh_pending.len()) as u64
     }
 
+    fn route_count(&self) -> u64 {
+        // The mirror's own length — O(1), safe to poll every tick while
+        // an adopted resync waits for the feed to finish loading.
+        self.lock().routes.len() as u64
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         // Chunked so the writer never waits for more than `WALK_CHUNK`
         // copies. `after` is the resume cursor; a prefix inserted below it

@@ -299,7 +299,32 @@ struct Core {
     /// operator would see a stalled `pending_ops` with nothing saying
     /// why.
     last_drain_error: Option<String>,
+    /// `Some(floor)` while an adopted resync is deferred: the diff will
+    /// not run until the route source holds at least `floor` routes.
+    ///
+    /// Set by `start_resync` when it adopts a populated FIB and finds
+    /// the source still loading; cleared by `drain_batch` when the
+    /// source crosses the floor and the diff actually begins. While
+    /// set, the adopted VPP is left exactly as found — steered, routes
+    /// intact — because a diff against a loading source is ~all
+    /// withdrawals, and draining those into a live dataplane is the
+    /// drill-(d) blackhole (2026-08-07).
+    deferred_resync_floor: Option<u64>,
 }
+
+/// An adopted resync is deferred while the route source holds fewer
+/// routes than `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
+///
+/// Half, not "equal": the source and the adopted FIB legitimately
+/// differ by whatever churned while packetframe was down, and demanding
+/// near-parity would deadlock against a genuinely shrunken table (an
+/// upstream loss can remove a real fraction). Half is far above any
+/// plausible legitimate shrink and far below any partially-loaded feed
+/// — the two distributions this constant separates. If the source
+/// never crosses the floor (feed down), the deferral holds forever and
+/// health stays degraded: stale-but-verified forwarding plus an alarm
+/// beats withdrawing a live table.
+pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
 
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
@@ -341,6 +366,7 @@ impl Runtime {
                 pending: Vec::new(),
                 last_store_error: None,
                 last_drain_error: None,
+                deferred_resync_floor: None,
             })),
         }
     }
@@ -443,6 +469,9 @@ impl Runtime {
             drain_error: c.last_drain_error.clone(),
             source_backlog: c.source.backlog(),
             steer_configured_ports: c.steering.configured_ports(),
+            resync_deferred: c
+                .deferred_resync_floor
+                .map(|want| (c.source.route_count(), want)),
         }
     }
 }
@@ -470,6 +499,9 @@ pub struct RuntimeStatus {
     /// differently: a backlog here means the engine is not draining, a
     /// backlog there means VPP is not accepting.
     pub source_backlog: u64,
+    /// `Some((have, want))` while an adopted resync is deferred for a
+    /// still-loading route source. See `Core::deferred_resync_floor`.
+    pub resync_deferred: Option<(u64, u64)>,
 }
 
 impl Core {
@@ -612,8 +644,35 @@ impl Observe for ObserveView {
             .map_err(|e| e.to_string())
     }
 
-    fn drain_batch(&mut self) -> Result<bool, String> {
+    fn drain_batch(&mut self) -> Result<crate::driver::Drain, String> {
         let mut c = self.core.borrow_mut();
+        // A deferred adopted resync is re-checked here, on the driver's
+        // paced cadence, because this is the only Observe call that runs
+        // every tick of a resync state. While the source is below the
+        // floor NOTHING touches the engine — no deltas either, since the
+        // coming diff reads the full mirror and covers them, and
+        // applying a partial feed's withdrawals early is the exact
+        // hazard being deferred.
+        if let Some(floor) = c.deferred_resync_floor {
+            let have = c.source.route_count();
+            if have < floor {
+                return Ok(crate::driver::Drain::AwaitingSource { have, want: floor });
+            }
+            tracing::info!(
+                have,
+                floor,
+                "route source crossed the deferral floor; running the adopted resync diff"
+            );
+            {
+                let Core { engine, source, .. } = &mut *c;
+                let _plan = engine.begin_resync(source.as_ref());
+                engine
+                    .program_neighbours(source.as_ref())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())?;
+            }
+            c.deferred_resync_floor = None;
+        }
         // Live changes are pulled in FIRST, so a route learned while VPP
         // was already converged goes out in this same batch rather than
         // waiting for a resync that may never come. The engine's pending
@@ -632,7 +691,13 @@ impl Observe for ObserveView {
             Err(e) => Err(e.to_string()),
             Ok(_) => engine
                 .drain_batch()
-                .map(|(done, _stats)| done)
+                .map(|(done, _stats)| {
+                    if done {
+                        crate::driver::Drain::Idle
+                    } else {
+                        crate::driver::Drain::More
+                    }
+                })
                 .map_err(|e| e.to_string()),
         };
         // Set on failure and cleared on success, in one place, for the
@@ -779,28 +844,58 @@ impl Effects for EffectsView {
         let mut c = self.core.borrow_mut();
         // Split borrow: the engine walks the source while both live in
         // the same core.
-        let Core { engine, source, .. } = &mut *c;
-        // BEFORE the diff, because the diff is what consumes it: the
-        // ledger's contents are where withdrawals come from, and on an
-        // adoption it is empty while the surviving VPP's FIB is not.
-        // A no-op unless the ledger is empty, so a fresh spawn pays one
-        // round trip and adopts nothing.
-        let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
-        if adopted > 0 {
-            tracing::info!(
-                routes = adopted,
-                "adopted VPP's existing FIB; the resync diff can now withdraw what the \
-                 route source no longer advertises"
-            );
-        }
-        let _plan = engine.begin_resync(source.as_ref());
-        // Neighbours between attach and the first drain, and fatal on
-        // refusal: a route through an unprogrammed adjacency installs
-        // cleanly, verifies cleanly, and drops every packet.
-        engine
-            .program_neighbours(source.as_ref())
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let deferral = {
+            let Core { engine, source, .. } = &mut *c;
+            // BEFORE the diff, because the diff is what consumes it: the
+            // ledger's contents are where withdrawals come from, and on an
+            // adoption it is empty while the surviving VPP's FIB is not.
+            // A no-op unless the ledger is empty, so a fresh spawn pays one
+            // round trip and adopts nothing.
+            let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+            if adopted > 0 {
+                tracing::info!(
+                    routes = adopted,
+                    "adopted VPP's existing FIB; the resync diff can now withdraw what the \
+                     route source no longer advertises"
+                );
+            }
+            // The diff is only meaningful against a source that has
+            // finished loading, and a daemon restart is exactly when it
+            // has not: the feed reconnects at startup and takes tens of
+            // seconds to reload. Diffing an adopted ledger against that
+            // window queues ~everything as a withdrawal — against a
+            // live, possibly steered VPP. Drill (d) on the shadow
+            // (2026-08-07): the drain began emptying a verified
+            // forwarding table, convergence failed, and the teardown
+            // killed the adopted VPP. So the diff waits below the floor;
+            // `drain_batch` runs it once the source crosses.
+            let floor = adopted / ADOPTED_SOURCE_FLOOR_DIVISOR;
+            let have = source.route_count();
+            if have < floor {
+                tracing::warn!(
+                    have,
+                    adopted,
+                    floor,
+                    "adopted resync deferred: the route source is still loading, and a diff \
+                     now would withdraw most of a table VPP is forwarding with; keeping the \
+                     adopted FIB untouched until the source catches up"
+                );
+                Some(floor)
+            } else {
+                let _plan = engine.begin_resync(source.as_ref());
+                // Neighbours between attach and the first drain, and
+                // fatal on refusal: a route through an unprogrammed
+                // adjacency installs cleanly, verifies cleanly, and
+                // drops every packet.
+                engine
+                    .program_neighbours(source.as_ref())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())?;
+                None
+            }
+        };
+        c.deferred_resync_floor = deferral;
+        Ok(())
     }
 
     fn start_verify(&mut self) -> Result<(), String> {

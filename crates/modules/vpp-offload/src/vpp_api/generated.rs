@@ -678,6 +678,7 @@ impl Encode for ControlPingReply {
     fn encode(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&(self.context).to_be_bytes());
         buf.extend_from_slice(&(self.retval).to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // client_index
         buf.extend_from_slice(&(self.vpe_pid).to_be_bytes());
     }
 }

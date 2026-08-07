@@ -268,6 +268,11 @@ pub struct StatusSnapshot {
     pub parked_ops: u64,
     pub api: ApiHealth,
     pub fib: FibSync,
+    /// `Some((have, want))` while an adopted resync waits for the route
+    /// source to finish loading. See `Runtime`'s deferral: the adopted
+    /// FIB is deliberately left forwarding, so this reads as Degraded
+    /// with the reason, never as steered-but-broken.
+    pub resync_deferred: Option<(u64, u64)>,
     pub ports: Vec<PortLink>,
     /// The runtime could not persist something it observed.
     ///
@@ -318,6 +323,7 @@ impl StatusSnapshot {
             pending.withheld_len() as u64,
             api,
             fib,
+            None,
             ports,
             None,
             None,
@@ -339,6 +345,7 @@ impl StatusSnapshot {
         parked_ops: u64,
         api: ApiHealth,
         fib: FibSync,
+        resync_deferred: Option<(u64, u64)>,
         ports: Vec<PortLink>,
         store_error: Option<String>,
         drain_error: Option<String>,
@@ -357,6 +364,7 @@ impl StatusSnapshot {
             parked_ops,
             api,
             fib,
+            resync_deferred,
             ports,
             store_error,
             drain_error,
@@ -377,10 +385,17 @@ impl StatusSnapshot {
     /// a wedged one, a FIB never verified or known wrong, or a port
     /// whose link is down under paths that resolve through it.
     fn steered_but_broken(&self) -> bool {
+        // A deferred adopted resync is steered with `fib` unverified BY
+        // THIS DAEMON — deliberately: the table it forwards with was
+        // verified by the previous daemon, and preserving it untouched is
+        // the protection. Counting that as "steered but broken" would
+        // report the safeguard as the module's worst fault for as long
+        // as bird takes to reload.
+        let fib_unverified = !self.fib.verified() && self.resync_deferred.is_none();
         self.steered
             && (!self.state.has_process()
                 || matches!(self.api, ApiHealth::Silent { .. })
-                || !self.fib.verified()
+                || fib_unverified
                 || !self.dead_ports().is_empty())
     }
 
@@ -563,6 +578,26 @@ impl StatusSnapshot {
 
     fn fib_health(&self) -> SubsystemHealth {
         let (state, message) = match &self.fib {
+            // Checked before the steered arm below, deliberately: a
+            // deferred adopted resync IS steered — the whole point of the
+            // deferral is leaving a forwarding VPP alone — and the
+            // steered arm's "traffic steered into an unverified FIB"
+            // would report the designed protection as the worst fault
+            // the module has. The FIB in question was verified by the
+            // previous daemon and is being deliberately preserved; what
+            // the operator needs is the reason convergence has not
+            // started, not an alarm that invites them to restart it.
+            FibSync::NeverVerified if self.resync_deferred.is_some() => {
+                let (have, want) = self.resync_deferred.expect("checked above");
+                (
+                    HealthState::Degraded,
+                    Some(format!(
+                        "resync deferred: the route source is still loading ({have} of the \
+                         {want} required); the adopted FIB keeps forwarding untouched until \
+                         it catches up"
+                    )),
+                )
+            }
             FibSync::NeverVerified if self.steered => (
                 HealthState::Unhealthy,
                 Some("traffic steered into an unverified FIB".into()),

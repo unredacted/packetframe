@@ -409,6 +409,7 @@ impl Transport {
             }
         })?;
         let len = parse_frame_header(&hdr);
+
         if len > MAX_PAYLOAD {
             return Err(TransportError::PayloadTooLarge(len));
         }
