@@ -552,6 +552,76 @@ pub fn find_loopback(t: &mut Transport) -> Result<Option<u32>, TransportError> {
     Ok(found.first().copied())
 }
 
+/// `VNET_API_ERROR_DUPLICATE_IF_ADDRESS` from vnet/error.h (stable/2506).
+///
+/// VPP's error string says "already present on another interface" and the
+/// string is wrong: `ip4_add_del_interface_address_internal` returns this
+/// for an exact-prefix re-add on the **same** interface. The
+/// cross-interface conflict is `-105 ADDRESS_IN_USE` — which is what the
+/// shadow produced when a second loopback was given the first one's
+/// address, and that observation is what disambiguates the two. Checked
+/// against the source rather than recalled, because "re-adding an address
+/// is idempotent" was the recalled version and it is false.
+pub const VNET_API_ERROR_DUPLICATE_IF_ADDRESS: i32 = -127;
+
+/// Reconcile an adopted loopback: re-assert its address and admin-up.
+///
+/// Discovery alone is not adoption. [`find_loopback`] matches by name,
+/// and a name proves nothing about the two properties `create_loopback`
+/// establishes after creating: the address members borrow, and admin-up.
+/// A daemon crash between `create_loopback`'s create and its address-add
+/// leaves exactly that — a named, addressless loopback — and adopting it
+/// blind puts every member behind `ip4-not-enabled` with the FIB verified
+/// green. The member reuse path re-asserts admin-up, MAC and unnumbered
+/// for the same reason; this is the loopback's version of that reconcile
+/// point.
+///
+/// The address re-assert cannot be a plain "must return 0": VPP answers
+/// an exact re-add on the same interface with
+/// [`VNET_API_ERROR_DUPLICATE_IF_ADDRESS`], which here means *the address
+/// is already exactly where we want it* — the common case on every
+/// healthy adoption. Anything else, including `-105 ADDRESS_IN_USE`
+/// (something *else* holds the address), stays fatal.
+pub fn adopt_loopback(
+    t: &mut Transport,
+    loop_idx: u32,
+    addr: Ipv4Prefix,
+) -> Result<(), AttachError> {
+    let reply = t.request::<SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply>(
+        SwInterfaceAddDelAddress {
+            context: 0,
+            sw_if_index: loop_idx,
+            is_add: true,
+            del_all: false,
+            prefix: prefix_of(addr),
+        },
+    )?;
+    if reply.retval != 0 && reply.retval != VNET_API_ERROR_DUPLICATE_IF_ADDRESS {
+        return Err(AttachError::Refused {
+            step: "sw_interface_add_del_address (adopt)",
+            port: "loop0".into(),
+            retval: reply.retval,
+            detail: format!("{}/{}", addr.addr, addr.prefix_len),
+        });
+    }
+
+    let reply =
+        t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
+            context: 0,
+            sw_if_index: loop_idx,
+            flags: IF_STATUS_ADMIN_UP,
+        })?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_flags(loop0, adopt)",
+            port: "loop0".into(),
+            retval: reply.retval,
+            detail: String::new(),
+        });
+    }
+    Ok(())
+}
+
 /// Create the loopback that member ports borrow an address from.
 ///
 /// One per VPP, holding the router address. Returns its `sw_if_index`

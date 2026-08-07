@@ -617,13 +617,19 @@ impl ConvergenceEngine {
             // loopback and its address; creating a second one and
             // assigning the same address fails ADDRESS_IN_USE, and the
             // attach step never completes.
+            //
+            // Adoption then reconciles rather than trusting the name:
+            // the address and admin-up are re-asserted, because a crash
+            // between create and address-add leaves a named loopback
+            // with neither, and no whitelisted message can dump
+            // addresses to check.
             None => match crate::attach::find_loopback(t) {
                 Ok(Some(idx)) => {
                     tracing::info!(
                         sw_if_index = idx,
                         "reusing the loopback this VPP already has rather than creating another"
                     );
-                    Ok(idx)
+                    crate::attach::adopt_loopback(t, idx, self.loopback).map(|()| idx)
                 }
                 Ok(None) => crate::attach::create_loopback(t, self.loopback),
                 Err(e) => Err(e.into()),
