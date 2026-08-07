@@ -193,6 +193,7 @@ fn tc_parse_error_bumps_both_shared_and_tc_counter() {
 
     let parse_before = h.stat(StatIdx::ErrParse);
     let parse_tc_before = h.stat(StatIdx::ErrParseTc);
+    let breakdown_before = tc_parse_breakdown(&h);
 
     let (verdict, out) = h.run_tc(&runt);
     assert_eq!(verdict, tc_action::TC_ACT_OK);
@@ -204,12 +205,59 @@ fn tc_parse_error_bumps_both_shared_and_tc_counter() {
         "tc parse failure must be attributable per-hook"
     );
 
+    // And attributable to a SITE, which is the point of the breakdown:
+    // this frame clears the L2 check and dies on the v4 header, so the
+    // v4 arm must move and no other. Asserted as "which one moved"
+    // rather than on an absolute value, because a counter that only has
+    // to be non-zero is satisfied by every site bumping at once — which
+    // is exactly the bug a breakdown exists to rule out.
+    let breakdown_after = tc_parse_breakdown(&h);
+    assert_eq!(
+        moved(&breakdown_before, &breakdown_after),
+        vec!["err_parse_tc_l3_v4"],
+        "before={breakdown_before:?} after={breakdown_after:?}"
+    );
+
     // The same runt through the XDP hook bumps only the shared
     // counter: `err_parse - err_parse_tc` must stay the XDP share.
     let (verdict, _) = h.run(&runt);
     assert_eq!(verdict, xdp_action::XDP_PASS);
     assert_eq!(h.stat(StatIdx::ErrParse), parse_before + 2);
     assert_eq!(h.stat(StatIdx::ErrParseTc), parse_tc_before + 1);
+    assert_eq!(
+        tc_parse_breakdown(&h),
+        breakdown_after,
+        "the XDP hook must not touch the tc breakdown"
+    );
+
+    // The invariant the four exist to satisfy: they partition
+    // `err_parse_tc`. A site added later that forgets its counter
+    // breaks this rather than silently shrinking the total.
+    let total: u64 = breakdown_after.iter().map(|(_, v)| v).sum();
+    assert_eq!(
+        total,
+        h.stat(StatIdx::ErrParseTc),
+        "the breakdown must account for every tc parse failure"
+    );
+}
+
+/// The four sites, named, so a failure says which one moved.
+fn tc_parse_breakdown(h: &Harness) -> Vec<(&'static str, u64)> {
+    vec![
+        ("err_parse_tc_l2", h.stat(StatIdx::ErrParseTcL2)),
+        ("err_parse_tc_vlan", h.stat(StatIdx::ErrParseTcVlan)),
+        ("err_parse_tc_l3_v4", h.stat(StatIdx::ErrParseTcL3V4)),
+        ("err_parse_tc_l3_v6", h.stat(StatIdx::ErrParseTcL3V6)),
+    ]
+}
+
+fn moved(before: &[(&'static str, u64)], after: &[(&'static str, u64)]) -> Vec<&'static str> {
+    before
+        .iter()
+        .zip(after)
+        .filter(|((_, b), (_, a))| a > b)
+        .map(|((n, _), _)| *n)
+        .collect()
 }
 
 #[test]

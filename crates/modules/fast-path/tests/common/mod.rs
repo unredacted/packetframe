@@ -55,7 +55,29 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V2: u32 = 1;
-pub const STATS_COUNT: u32 = 46;
+pub const STATS_COUNT: u32 = 50;
+
+/// This mirror cannot drift from the library's count again.
+///
+/// It did: the four `err_parse_tc_*` counters were appended to
+/// `bpf/src/maps.rs` and to `metrics::COUNTER_NAMES`, and this constant
+/// beside them was missed. Nothing on a dev host noticed, because the
+/// macOS BPF build falls back to a stub and no real map is ever loaded
+/// to disagree — it surfaced only in CI's sudo-gated attach step, as
+/// `InvalidValueSize { size: 368, expected: 400 }`, which is 46 vs 50
+/// counters and reads like nothing of the sort.
+///
+/// A `const` assertion fails at compile time instead — though note
+/// *where*: these test files are `#![cfg(target_os = "linux")]`, so this
+/// module does not compile on a macOS host at all and the assertion is
+/// invisible there too. It fires under the per-target check
+/// (`--target x86_64-unknown-linux-gnu --all-targets`), which is the
+/// local gate that sees Linux-only test code — verified by setting this
+/// to 46 and watching it fail.
+const _: () = assert!(
+    STATS_COUNT as usize == packetframe_fast_path::metrics::COUNTER_COUNT,
+    "STATS_COUNT must equal metrics::COUNTER_COUNT — append to both, or the      harness types a map value size the BPF program did not write"
+);
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
 /// uses these to flip forwarding modes on the live BPF program.
@@ -121,6 +143,10 @@ pub enum StatIdx {
     FibCacheMiss = 43,
     FibCacheStale = 44,
     ErrParseTc = 45,
+    ErrParseTcL2 = 46,
+    ErrParseTcVlan = 47,
+    ErrParseTcL3V4 = 48,
+    ErrParseTcL3V6 = 49,
 }
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a

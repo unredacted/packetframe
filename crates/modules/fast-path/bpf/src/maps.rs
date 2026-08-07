@@ -212,12 +212,42 @@ pub enum StatIdx {
     /// excess unattributable without flipping datapaths. During any
     /// mixed rollout, `err_parse - err_parse_tc` is the XDP share.
     ErrParseTc = 45,
+    // --- v0.2.10: which bounds check produced `ErrParseTc`. Append-only.
+    //
+    // All four producers are the same statement — the bytes I need are
+    // not in front of me — and under `cls_bpf` that does NOT mean a
+    // runt: `data`..`data_end` spans only the LINEAR part of the skb, so
+    // a GRO-coalesced or page-fragmented frame can carry its L3 header
+    // outside the window while being perfectly well formed. Splitting
+    // them is what turns "0.18% unexplained" into a specific claim, and
+    // the split is diagnostic ONLY: no remedy is applied until these
+    // say which site fires. See docs/runbooks/tc-datapath.md.
+    //
+    // Each is bumped IN ADDITION to `ErrParse` and `ErrParseTc`, so the
+    // existing two keep their meaning and dashboards keyed on them do
+    // not move. The four must sum to `err_parse_tc`.
+    /// Shorter than an Ethernet header.
+    ErrParseTcL2 = 46,
+    /// 802.1Q/ad frame shorter than `EthHdr + VLAN_HDR_LEN`. Only the
+    /// INLINE-tag path can reach this; a tag lifted into `vlan_tci` by
+    /// the driver never parses bytes.
+    ErrParseTcVlan = 47,
+    /// Shorter than the IPv4 header at its offset. The arm the
+    /// non-linear-skb hypothesis predicts, since L3 sits furthest into
+    /// the frame.
+    ErrParseTcL3V4 = 48,
+    /// Shorter than the IPv6 header at its offset. Separate from the v4
+    /// arm because the headers differ in size (40 vs 20), so a linear
+    /// window that truncates one may not truncate the other — and if the
+    /// counts split by family rather than by depth, the hypothesis is
+    /// wrong.
+    ErrParseTcL3V6 = 49,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 46;
+pub const STATS_COUNT: u32 = 50;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
