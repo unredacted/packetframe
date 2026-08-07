@@ -164,6 +164,27 @@ pub trait RouteSource {
     fn backlog(&self) -> u64 {
         0
     }
+
+    /// How many routes the source currently holds.
+    ///
+    /// Exists for one consumer: the adopted-resync deferral. A resync is
+    /// a diff whose withdrawals are "everything the ledger holds that the
+    /// source does not" — which is only meaningful when the source is
+    /// COMPLETE. A daemon restart is precisely when it is not: the BGP
+    /// feed reconnects at startup and takes tens of seconds to reload,
+    /// and an adopted ledger diffed against that window queues mass
+    /// withdrawals against a live, possibly steered VPP. Observed on the
+    /// shadow (drill (d), 2026-08-07): ~1M withdrawals began draining a
+    /// verified forwarding table, convergence failed, and the teardown
+    /// killed the adopted VPP that preserve-on-restart exists to keep.
+    ///
+    /// The default walks the table, which is fine for fixtures; the live
+    /// feed overrides it with its mirror's O(1) length.
+    fn route_count(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_route(&mut |_, _| n += 1);
+        n
+    }
 }
 
 /// One route change: the prefix, and its new nexthop set — or `None`

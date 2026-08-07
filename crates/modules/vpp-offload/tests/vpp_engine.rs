@@ -568,3 +568,44 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
         "the stale route is withdrawn and nothing else is: {deleted:?}"
     );
 }
+
+/// The generated `Encode` and `Decode` must agree on a reply's
+/// geometry, proven by round-tripping a ping through the fake.
+///
+/// `control_ping_reply` carries `client_index` mid-body (after retval —
+/// schema fact, not header convention). The decoder consumed it
+/// positionally; the encoder skipped it as "transport-owned", so every
+/// fake-built ping reply was 4 bytes short of what the client demands.
+/// Nothing in production encodes a reply — only the fakes do — which is
+/// how EVERY fake-backed test ran its liveness path on a silently
+/// failing ping (error, disconnect, reconnect next tick) without one
+/// test noticing: they all converge inside the wedge budget. Found the
+/// first time a test deliberately sat in a live state for minutes (the
+/// adopted-resync deferral), which the wedge detector then "caught".
+///
+/// The codegen now emits a placeholder for mid-body transport-owned
+/// fields, and this pins the symmetry where it was missing.
+#[test]
+fn a_fakes_ping_reply_is_decodable_not_just_writable() {
+    const SIX: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "ping-geometry",
+        Behaviour {
+            existing_routes: SIX,
+            ..Default::default()
+        },
+    );
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.ping().expect("a bare ping must decode");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+    let adopted = engine.adopt_vpp_fib().expect("dump");
+    assert_eq!(adopted, 3);
+    engine
+        .ping()
+        .expect("the stream must still be clean after a populated dump");
+}

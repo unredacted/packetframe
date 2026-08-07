@@ -64,6 +64,29 @@ use crate::supervisor::{Event, State, Supervisor};
 
 /// What the world reports. Every one of these is an observation; none
 /// of them requests a state change.
+/// What one `drain_batch` pass accomplished.
+///
+/// A bool almost sufficed, and the third case is why it could not: an
+/// adopted resync whose route source is still loading is neither "done"
+/// (that would send the supervisor to verify against a diff that never
+/// ran) nor "more to drain" (that asks for an immediate re-tick and
+/// spins a core polling a count that changes at feed speed, not tick
+/// speed). It is its own thing — deliberate waiting — and the driver
+/// treats it as such: no `SyncComplete`, no re-tick, and the phase
+/// deadline is re-armed so `CONVERGENCE_BUDGET` times the convergence
+/// rather than bird's reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    /// Nothing left pending.
+    Idle,
+    /// A batch went out; more remains.
+    More,
+    /// The adopted resync is deliberately deferred: the route source
+    /// holds `have` routes against a floor of `want`. See
+    /// [`crate::runtime::ADOPTED_SOURCE_FLOOR_DIVISOR`].
+    AwaitingSource { have: u64, want: u64 },
+}
+
 pub trait Observe {
     /// Non-blocking. `Some(status)` = the process has exited.
     ///
@@ -82,14 +105,13 @@ pub trait Observe {
     fn ping(&mut self) -> Result<(), String>;
 
     /// Drain **one bounded batch** of pending routes.
-    /// `Ok(true)` = nothing left pending.
     ///
     /// Bounded is the contract, not an implementation detail. A blocking
     /// full-table drain would hold the loop for the whole convergence
     /// budget, during which no ping is sent and no exit is noticed — so
     /// the wedge detector would either be useless or fire on a VPP that
     /// was working fine.
-    fn drain_batch(&mut self) -> Result<bool, String>;
+    fn drain_batch(&mut self) -> Result<Drain, String>;
 }
 
 /// One tick's result.
@@ -266,9 +288,20 @@ impl Driver {
                     // Empty means the resync is done — and only the
                     // drain can say so, which is why this is observed
                     // rather than assumed after issuing StartResync.
-                    Ok(true) if resyncing => events.push(Event::SyncComplete),
-                    Ok(true) => {}
-                    Ok(false) => more_to_drain = true,
+                    Ok(Drain::Idle) if resyncing => events.push(Event::SyncComplete),
+                    Ok(Drain::Idle) => {}
+                    Ok(Drain::More) => more_to_drain = true,
+                    // Deliberate waiting, not progress and not
+                    // completion. The phase deadline is pushed forward
+                    // on every deferred tick so `CONVERGENCE_BUDGET`
+                    // starts when the diff actually runs — otherwise a
+                    // slow feed reload spends the budget and
+                    // `PhaseTimedOut` tears down a healthy adopted VPP,
+                    // which is the same defect the deferral exists to
+                    // prevent, arriving through the clock.
+                    Ok(Drain::AwaitingSource { .. }) => {
+                        self.sched.extend_phase(now, self.sup.phase());
+                    }
                     // Failing mid-resync is a convergence failure: the
                     // table is known-incomplete and nothing is forwarding
                     // through it yet.
@@ -476,6 +509,9 @@ mod tests {
         api: bool,
         /// Batches remaining before the drain reports empty.
         batches: usize,
+        /// Drain calls that report `AwaitingSource` before any batch
+        /// moves — the deferred adopted resync.
+        deferred_ticks: usize,
         drain_fails: bool,
         ping_fails: bool,
         pings: usize,
@@ -499,13 +535,21 @@ mod tests {
                 Ok(())
             }
         }
-        fn drain_batch(&mut self) -> Result<bool, String> {
+        fn drain_batch(&mut self) -> Result<Drain, String> {
             self.drains += 1;
             if self.drain_fails {
                 return Err("socket closed".into());
             }
+            if let Some(n) = self.deferred_ticks.checked_sub(1) {
+                self.deferred_ticks = n;
+                return Ok(Drain::AwaitingSource { have: 0, want: 1 });
+            }
             self.batches = self.batches.saturating_sub(1);
-            Ok(self.batches == 0)
+            Ok(if self.batches == 0 {
+                Drain::Idle
+            } else {
+                Drain::More
+            })
         }
     }
 

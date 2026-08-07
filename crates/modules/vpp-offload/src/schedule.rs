@@ -82,6 +82,26 @@ impl Schedule {
         }
     }
 
+    /// Push the phase deadline forward: the current phase is
+    /// deliberately waiting, not working.
+    ///
+    /// Distinct from [`Self::arm_phase`], whose same-kind arm is a no-op
+    /// by design — transitions within a phase must share one budget. A
+    /// deferred adopted resync is the case that needs the opposite: it
+    /// is *inside* the Convergence phase but has chosen not to start the
+    /// diff until the route source finishes loading, and letting the
+    /// budget run during that wait re-creates the very teardown the
+    /// deferral prevents, arriving through the clock instead of the
+    /// drain. Restarting the budget from `now` on each deferred tick
+    /// means it begins counting when the work does.
+    pub fn extend_phase(&mut self, now: Instant, phase: Option<(PhaseKind, Duration)>) {
+        if let Some((kind, budget)) = phase {
+            if self.phase_kind == Some(kind) {
+                self.phase_deadline = Some(now + budget);
+            }
+        }
+    }
+
     /// Arm the restart backoff, from `Action::ArmBackoff`.
     ///
     /// Also disarms the phase deadline: the backoff states have no phase

@@ -43,7 +43,7 @@ impl RouteSource for Mirror {
     }
 }
 
-fn runtime_for(fake: &Fake, n_routes: u8) -> Runtime {
+fn runtime_with_source(fake: &Fake, source: Box<dyn RouteSource>) -> Runtime {
     let engine = ConvergenceEngine::new(
         &fake.path,
         vec![PortAttach {
@@ -61,18 +61,22 @@ fn runtime_for(fake: &Fake, n_routes: u8) -> Runtime {
             prefix_len: 32,
         },
     );
-    let mirror = Mirror {
-        routes: (0..n_routes).map(|i| fake_vpp::v4(0, i)).collect(),
-    };
     Runtime::new(
         engine,
-        Box::new(mirror),
+        source,
         Box::new(SteeringUnavailable),
         Box::new(NullStore),
         Box::new(NoResources),
         "/usr/bin/vpp",
         "/tmp/startup.conf",
     )
+}
+
+fn runtime_for(fake: &Fake, n_routes: u8) -> Runtime {
+    let mirror = Mirror {
+        routes: (0..n_routes).map(|i| fake_vpp::v4(0, i)).collect(),
+    };
+    runtime_with_source(fake, Box::new(mirror))
 }
 
 /// The production loop shape: tick, inject completed work, honour the
@@ -662,5 +666,179 @@ fn a_nexthop_first_seen_after_convergence_gets_its_adjacency() {
         saw_neigh,
         "the new nexthop's static neighbour was never programmed — its routes \
          would install, verify clean, and blackhole"
+    );
+}
+
+/// Drill (d) on the shadow (2026-08-07), pinned end to end.
+///
+/// A daemon restart adopted a steered VPP forwarding a verified table,
+/// and the adopted resync ran ~6 s later — against a route source whose
+/// BGP feed had just reconnected and held almost nothing. The diff read
+/// "the source is authoritative" literally and queued ~1M withdrawals
+/// against the live dataplane; the drain began emptying the forwarding
+/// table (5.43 s of measured loss), convergence failed, and the teardown
+/// killed the very VPP preserve-on-restart exists to keep.
+///
+/// The fix under test: the adopted diff is DEFERRED while the source
+/// holds less than the floor (`adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`).
+/// While deferred, nothing touches VPP — no withdrawals, no upserts, no
+/// phase timeout however long bird takes — and the deferral is visible
+/// on the status surface. When the source crosses the floor, the diff
+/// runs and withdraws exactly what is genuinely gone.
+#[test]
+fn an_adopted_resync_waits_for_the_source_instead_of_withdrawing_the_table() {
+    use std::sync::{Arc, Mutex};
+
+    /// A mirror the test can fill while the runtime holds it — the
+    /// route feed mid-reload, as a fixture.
+    struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
+    impl RouteSource for SharedMirror {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in self.0.lock().unwrap().iter() {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+
+    // The surviving VPP forwards six routes that look self-installed.
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 3, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 4, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 5, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "loop-defer",
+        fake_vpp::Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    // The feed has delivered one route of an eventual five: well below
+    // the floor of 6/2 = 3.
+    let shared = Arc::new(Mutex::new(vec![fake_vpp::v4(0, 0)]));
+    let rt = runtime_with_source(&fake, Box::new(SharedMirror(shared.clone())));
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        // Steered — the case whose blackhole this exists to prevent.
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    rt.set_steered(true);
+
+    // Hold below the floor for far longer than CONVERGENCE_BUDGET,
+    // pacing the clock by each tick's own permitted sleep — jumping it
+    // in big steps would outrun the ping cadence and fabricate a wedge
+    // the way no wall clock ever does. Nothing may time out and nothing
+    // may reach VPP's FIB.
+    let mut now = t0;
+    let mut held = Vec::new();
+    let past_budget = t0 + Duration::from_secs(150);
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..2_000 {
+            if now >= past_budget {
+                break;
+            }
+            let t = d.tick(now, &mut obs, &mut fx);
+            held.extend(t.events.clone());
+            assert!(
+                !t.events.contains(&Event::PhaseTimedOut),
+                "the convergence budget must time the diff, not bird's reload: {:?}",
+                t.events
+            );
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "a deferred resync must not report complete: {:?}",
+                t.events
+            );
+            for e in rt.take_pending() {
+                held.extend(d.inject(now, e, &mut fx).events);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        now >= past_budget,
+        "the loop must actually outlast CONVERGENCE_BUDGET for this to prove anything"
+    );
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "still converging, still steered, still untouched; saw {held:?}"
+    );
+    let touched: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "no route op may reach a live table while the source loads: {touched:?}"
+    );
+    assert_eq!(
+        rt.status().resync_deferred,
+        Some((1, 3)),
+        "the deferral must be visible, not silent"
+    );
+
+    // The feed finishes: five routes survive, 10.0.5.0/24 was withdrawn
+    // while packetframe was down.
+    *shared.lock().unwrap() = (0..5).map(|i| fake_vpp::v4(0, i)).collect();
+
+    let mut seen: Vec<Event> = Vec::new();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..64 {
+            now += Duration::from_millis(100);
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            if seen.contains(&Event::SyncComplete) {
+                break;
+            }
+        }
+    }
+    assert!(
+        seen.contains(&Event::SyncComplete),
+        "once the source crosses the floor the resync must actually run: {seen:?}"
+    );
+    assert!(
+        rt.status().resync_deferred.is_none(),
+        "the deferral must clear when the diff runs"
+    );
+
+    // And the diff withdrew exactly the route that is genuinely gone —
+    // not the table.
+    let deletes: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![([10, 0, 5, 0], 24)],
+        "one withdrawal for the one prefix the source really dropped"
     );
 }

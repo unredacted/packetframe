@@ -1001,6 +1001,7 @@ fn run_loop(
             rs.parked_ops,
             driver.api_health(now),
             fib,
+            rs.resync_deferred,
             rs.port_links,
             rs.store_error.clone(),
             rs.drain_error.clone(),
