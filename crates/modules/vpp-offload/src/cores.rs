@@ -219,16 +219,7 @@ fn mask_too_small(e: &std::io::Error) -> bool {
 #[cfg(target_os = "linux")]
 pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), String> {
     let mut edited = 0usize;
-    // `restorable` starts as all of VPP's cores and is narrowed by every
-    // thread we observe, ending as the intersection: the cores a thread
-    // born later can be given back without guessing at its creator's
-    // policy.
-    let mut saved = AffinitySnapshot {
-        restorable: std::iter::once(map.main)
-            .chain(map.workers.iter().copied())
-            .collect(),
-        ..Default::default()
-    };
+    let mut saved = AffinitySnapshot::default();
     let mut errors: Vec<String> = Vec::new();
     // Rescan until a whole pass finds nothing new.
     //
@@ -305,15 +296,6 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
                 // Threads exit between readdir and here; a vanished tid is
                 // not a fault.
                 continue;
-            }
-            let before = mask;
-            // Narrow the intersection with this thread's ORIGINAL
-            // policy — first pass only, since that is the only pass
-            // whose masks predate our own edits.
-            if first_pass {
-                saved
-                    .restorable
-                    .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
             }
             // Exactly the VPP cores this thread actually held — the set
             // release will put back, and nothing more.
@@ -405,11 +387,15 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
 /// failed to set has an EMPTY removed set, so release leaves it exactly
 /// as found while still proving it is not a post-attach stranger.
 ///
-/// Only threads seen on the FIRST scan pass appear here. Later passes
-/// exist to catch threads spawned mid-scan, and those carry a mask this
-/// function already narrowed — recording that as their "original" would
-/// both empty `restorable` and promise them nothing back. They belong
-/// on the descendant path, which `restorable` answers correctly.
+/// Only threads seen on the FIRST scan pass appear here, and only they
+/// are ever edited by release. Later passes exist to catch threads
+/// spawned mid-scan; those carry a mask this function already narrowed,
+/// so there is no original policy to record for them — and release
+/// leaves them alone rather than guessing. They keep a mask missing
+/// VPP's cores until the daemon restarts, which is under-restoration:
+/// the direction this whole mechanism prefers, and the only one that
+/// cannot override an operator who retuned that thread by hand while
+/// VPP was attached (review finding).
 ///
 /// A thread born DURING the restricted epoch has no capture, and no
 /// exact inverse exists for it — we never saw its creator's original
@@ -436,16 +422,6 @@ pub struct AffinitySnapshot {
     /// rather than growing a second one.
     #[cfg(target_os = "linux")]
     masks: Vec<(libc::pid_t, u64, Vec<u16>)>,
-    /// VPP cores present in the original mask of every observed thread.
-    /// See the type docs: the only cores a post-attach thread can be
-    /// given back without guessing.
-    ///
-    /// Read only by the Linux `release_daemon_to`; the non-Linux stubs
-    /// never restrict, so nothing there consults it. Gated to match
-    /// `masks` rather than `allow(dead_code)`, so a genuinely unread
-    /// field on Linux would still be caught.
-    #[cfg(target_os = "linux")]
-    restorable: Vec<u16>,
 }
 
 impl std::fmt::Debug for AffinitySnapshot {
@@ -491,9 +467,27 @@ pub fn release_daemon_to(saved: &AffinitySnapshot) -> Result<usize, String> {
         // The tid must match AND be the same thread: a reused tid names
         // a stranger, whose mask is none of our business to restore.
         let started = thread_start_ticks(tid);
-        // Read the CURRENT mask either way: release edits what the
-        // thread has now, so an operator's mid-attachment `taskset`
-        // survives (review finding).
+        // Only a thread THIS attachment restricted is edited. A thread
+        // born during the epoch — or a reused tid, which is the same
+        // thing from here — is left exactly as it is: we never took a
+        // core from it, we do not know what its creator's policy was,
+        // and an operator may have retuned it by hand since. Adding
+        // anything there would override a live policy on a guess, and
+        // the guess has now been wrong in three distinct ways (review
+        // findings). Under-restoring until the daemon's next start is
+        // the direction this mechanism prefers.
+        let Some((_, _, removed)) = saved
+            .masks
+            .iter()
+            .find(|(t, s, _)| *t == tid && Some(*s) == started)
+        else {
+            continue;
+        };
+        if removed.is_empty() {
+            continue; // nothing was taken; nothing to give back
+        }
+        // The CURRENT mask, so an operator's mid-attachment `taskset`
+        // survives — release adds bits, it never replaces a policy.
         let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         let rc = unsafe {
             libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
@@ -507,21 +501,7 @@ pub fn release_daemon_to(saved: &AffinitySnapshot) -> Result<usize, String> {
             }
             continue; // vanished between readdir and here
         }
-        let give_back: &[u16] = match saved
-            .masks
-            .iter()
-            .find(|(t, s, _)| *t == tid && Some(*s) == started)
-        {
-            // A surviving thread gets back exactly the cores THIS
-            // attachment took from it — never a whole stale mask.
-            Some((_, _, removed)) => removed,
-            // Born during the restricted epoch (or a reused tid, which
-            // is the same thing from here): no per-thread record
-            // applies, so only the cores EVERY pre-existing thread held
-            // go back — see `AffinitySnapshot`.
-            None => &saved.restorable,
-        };
-        for cpu in give_back {
+        for cpu in removed {
             unsafe { libc::CPU_SET(*cpu as usize, &mut mask) };
         }
         let rc =
@@ -682,18 +662,17 @@ mod affinity_tests {
         assert_eq!(rc, 0);
     }
 
-    /// A thread born during the restricted epoch must never be handed a
-    /// core its creator's policy excluded.
+    /// A thread born during the restricted epoch is left alone by
+    /// release — never handed a core on a guess.
     ///
-    /// No exact inverse exists for such a thread — we never saw its
-    /// creator's original mask — so release adds only the VPP cores
-    /// EVERY observed thread held. Here the calling thread's policy
-    /// excludes VPP's core, so that intersection is empty and the child
-    /// must come back with nothing added. Unioning all of VPP's cores
-    /// (the previous behaviour) hands it a core the operator never
-    /// allowed; that is what this pins.
+    /// We took nothing from it, we never saw its creator's policy, and
+    /// an operator may have retuned it by hand since. Three successive
+    /// review findings showed every flavour of guess here to be wrong
+    /// in some reachable case, so release now edits only the threads it
+    /// actually restricted. This pins the consequence: the child does
+    /// not acquire VPP's core.
     #[test]
-    fn a_thread_born_after_restriction_gains_only_universally_held_cores() {
+    fn a_thread_born_after_restriction_is_left_alone_by_release() {
         use std::sync::mpsc::channel;
 
         let _serialised = lock_affinity();
