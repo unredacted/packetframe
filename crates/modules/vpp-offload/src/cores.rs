@@ -408,6 +408,31 @@ pub fn release_daemon_to(_saved: &AffinitySnapshot) -> Result<usize, String> {
 mod affinity_tests {
     use super::*;
 
+    /// Serialises the tests in this module, because what they exercise
+    /// is **process-wide**: `restrict_daemon_from` walks
+    /// `/proc/self/task` and edits every TID — including the harness
+    /// thread running the *other* test. Under the default parallel
+    /// harness each test therefore rewrites the other's mask mid-
+    /// assertion, which passes alone and with `--test-threads=1` and
+    /// fails when both run together (review finding; CI had been
+    /// getting away with it on timing).
+    ///
+    /// Held for the whole snapshot-to-restoration interval, not just
+    /// the syscall: the window that must be exclusive is "my mask is
+    /// modified", which spans every assertion between them.
+    ///
+    /// Poisoning is absorbed deliberately. A panicking test leaves the
+    /// masks it was mid-way through restoring, and the next test's
+    /// first act is to capture and later restore them itself — so the
+    /// lock's job is mutual exclusion, not integrity, and refusing to
+    /// run after an unrelated failure would just hide the second
+    /// result behind the first.
+    static AFFINITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_affinity() -> std::sync::MutexGuard<'static, ()> {
+        AFFINITY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn current_mask() -> libc::cpu_set_t {
         let mut got: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         let rc =
@@ -436,6 +461,7 @@ mod affinity_tests {
     /// (review finding).
     #[test]
     fn restriction_subtracts_and_release_restores_the_saved_masks() {
+        let _serialised = lock_affinity();
         let before = current_mask();
         let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
             .filter(|&c| unsafe { libc::CPU_ISSET(c, &before) })
@@ -506,6 +532,7 @@ mod affinity_tests {
     fn a_thread_born_after_restriction_gains_only_universally_held_cores() {
         use std::sync::mpsc::channel;
 
+        let _serialised = lock_affinity();
         let before = current_mask();
         let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
             .filter(|&c| unsafe { libc::CPU_ISSET(c, &before) })
