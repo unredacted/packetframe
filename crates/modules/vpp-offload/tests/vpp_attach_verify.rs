@@ -526,19 +526,23 @@ fn addr_key(p: packetframe_common::config::Ipv4Prefix) -> Vec<u8> {
     k
 }
 
-/// The common case of every healthy adoption: the loopback already holds
-/// the address, and VPP answers the re-assert with -127
-/// DUPLICATE_IF_ADDRESS — its spelling of "already exactly where you
-/// want it". Adoption must read that as success.
+/// Adoption re-asserts admin-up and sends NO address message — pinned
+/// against the exact hardware scenario that killed the re-assert
+/// design (shadow, 2026-08-08).
 ///
-/// Remove the -127 acceptance from `adopt_loopback` and this fails,
-/// which is the point: the fake now refuses duplicates the way VPP does,
-/// so an address-shaped adoption bug fails on host CI instead of on the
-/// shadow.
+/// The member port is unnumbered to the loopback, so the router
+/// address is visible on it; VPP's conflict scan therefore answers a
+/// loopback address re-add with `-105 ADDRESS_IN_USE` on every healthy
+/// adoption, indistinguishable from a genuine conflict. The seeded
+/// address on the MEMBER below is that borrow, as close as this fake
+/// can express it (it does not model unnumbered — which is exactly how
+/// the re-assert design passed CI and failed on hardware). If adoption
+/// ever asks the address question again, this fake refuses it the way
+/// the real NIC did, and this test fails the way the shadow did.
 #[test]
-fn an_adopted_loopback_holding_its_address_reconciles_clean() {
+fn adoption_reasserts_admin_up_and_never_touches_the_address() {
     let fake = Fake::start_seeded(
-        "loopdup",
+        "loopadoptup",
         AttachBehaviour {
             dev_index: 3,
             sw_if_index: 7,
@@ -550,84 +554,27 @@ fn an_adopted_loopback_holding_its_address_reconciles_clean() {
             (LOOP_IF_INDEX, "loop0".into(), 3),
         ],
         false,
-        vec![(LOOP_IF_INDEX, addr_key(loop_addr()))],
+        // The unnumbered borrow: the member "holds" the router address.
+        vec![(7, addr_key(loop_addr()))],
     );
     let mut t = fake.connect();
 
     let found = packetframe_vpp_offload::attach::find_loopback(&mut t)
         .expect("dump")
         .expect("loop0 seeded");
-    packetframe_vpp_offload::attach::adopt_loopback(&mut t, found, loop_addr())
-        .expect("a duplicate address on the adopted loopback is the healthy case");
+    packetframe_vpp_offload::attach::adopt_loopback(&mut t, found)
+        .expect("a healthy adoption must not be refused over the borrowed address");
 
     let seen = fake.observed();
     assert!(
-        seen.contains(&"sw_interface_add_del_address".to_string()),
-        "the address must be re-asserted, not assumed: {seen:?}"
+        !seen.contains(&"sw_interface_add_del_address".to_string()),
+        "the address must not be probed on adoption — the answer is -105 through the \
+         unnumbered borrow and carries no signal: {seen:?}"
     );
     assert!(
         seen.contains(&"sw_interface_set_flags".to_string()),
-        "admin-up must be re-asserted, as the member reuse path does: {seen:?}"
+        "admin-up is still re-asserted, as the member reuse path does: {seen:?}"
     );
-}
-
-/// A crash between `create_loopback`'s create and its address-add leaves
-/// a named, addressless loopback. Blind adoption then puts every member
-/// behind `ip4-not-enabled` with the FIB verified green. Reconcile adds
-/// the missing address — proven by the second adopt answering
-/// "duplicate", which it can only do if the first one's add took.
-#[test]
-fn an_adopted_loopback_that_lost_its_address_gets_it_back() {
-    let fake = Fake::start_seeded(
-        "loopbare",
-        AttachBehaviour {
-            dev_index: 3,
-            sw_if_index: 7,
-            ..Default::default()
-        },
-        LookupBehaviour::Missing,
-        vec![(LOOP_IF_INDEX, "loop0".into(), 3)],
-        false,
-        Vec::new(), // the crash window: loop0 exists, no address
-    );
-    let mut t = fake.connect();
-
-    packetframe_vpp_offload::attach::adopt_loopback(&mut t, LOOP_IF_INDEX, loop_addr())
-        .expect("an addressless adopted loopback must be repaired, not trusted");
-    packetframe_vpp_offload::attach::adopt_loopback(&mut t, LOOP_IF_INDEX, loop_addr())
-        .expect("the repair must have taken: the second pass sees the duplicate");
-}
-
-/// -105 stays fatal. The duplicate acceptance is for the address being
-/// exactly where we want it; an address held by a *different* interface
-/// is a conflict, and whitelisting broadly would adopt an addressless
-/// loopback while something else answers for the router address.
-#[test]
-fn a_cross_interface_address_conflict_still_refuses() {
-    let fake = Fake::start_seeded(
-        "loopconflict",
-        AttachBehaviour {
-            dev_index: 3,
-            sw_if_index: 7,
-            ..Default::default()
-        },
-        LookupBehaviour::Missing,
-        vec![
-            (7, "octeon0/0".into(), 3),
-            (LOOP_IF_INDEX, "loop0".into(), 3),
-        ],
-        false,
-        // The router address lives on the member port, not the loopback.
-        vec![(7, addr_key(loop_addr()))],
-    );
-    let mut t = fake.connect();
-
-    let err = packetframe_vpp_offload::attach::adopt_loopback(&mut t, LOOP_IF_INDEX, loop_addr())
-        .expect_err("an address held elsewhere is a conflict, not a reconcile");
-    match err {
-        AttachError::Refused { retval, .. } => assert_eq!(retval, -105),
-        other => panic!("expected Refused with ADDRESS_IN_USE, got {other:?}"),
-    }
 }
 
 /// The MAC readback catches a driver that says yes and does nothing.
