@@ -387,7 +387,7 @@ pub struct VppOffloadModule {
     /// teardown that finished successfully afterwards left the daemon
     /// confined to a subset of its cores until restart, even though VPP
     /// was gone (review finding).
-    deferred_core_release: Option<(cores::CoreMap, cores::AffinitySnapshot)>,
+    deferred_core_release: Option<cores::AffinitySnapshot>,
     /// Set when a `detach` could not confirm the teardown.
     ///
     /// Outlives the attachment on purpose. `detach` takes `attached` before
@@ -495,15 +495,15 @@ impl VppOffloadModule {
         // so the cores held across the budget overrun go back now, with
         // the operator's saved masks. A late teardown that settled dirty
         // keeps them: resources may still be held on those cores.
-        if let Some((cm, snap)) = self.deferred_core_release.take() {
+        if let Some(snap) = self.deferred_core_release.take() {
             if self.teardown_failure.is_none() {
-                if let Err(e) = cores::release_daemon_to(&cm, &snap) {
+                if let Err(e) = cores::release_daemon_to(&snap) {
                     tracing::warn!(error = %e, "could not return VPP's cores to the daemon");
                 }
             } else {
-                // Dirty settle: hold the cores AND keep the pair, so a
-                // later reconcile that flips to clean can still restore.
-                self.deferred_core_release = Some((cm, snap));
+                // Dirty settle: hold the cores AND keep the snapshot, so
+                // a later reconcile that flips to clean can still restore.
+                self.deferred_core_release = Some(snap);
             }
         }
     }
@@ -860,7 +860,7 @@ impl Module for VppOffloadModule {
         // affinity restore needs them on every exit — including the one
         // where `stop()` overruns and `attached` is gone by the time the
         // teardown settles.
-        let core_release = (attached.cores.clone(), attached.affinity.clone());
+        let core_release = attached.affinity.clone();
         // `stop` drives the supervisor's full teardown ordering —
         // unsteer if steered, abort convergence, kill, release — and
         // waits out its bounded patience. The final snapshot is the only
@@ -909,8 +909,7 @@ impl Module for VppOffloadModule {
         // with the operator's pre-restriction masks. This path did not
         // stash into `deferred_core_release` (pending was None), so there
         // is nothing there to double-release.
-        let (cm, snap) = &core_release;
-        if let Err(e) = cores::release_daemon_to(cm, snap) {
+        if let Err(e) = cores::release_daemon_to(&core_release) {
             tracing::warn!(error = %e, "could not return VPP's cores to the daemon");
         }
         Ok(())

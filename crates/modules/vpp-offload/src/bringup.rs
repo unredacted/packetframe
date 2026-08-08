@@ -370,7 +370,7 @@ pub fn bring_up(
             // Nothing was acquired and no VPP exists: the affinity
             // restriction protects nothing, and keeping it would leave
             // the daemon short two cores over a failed attach.
-            let _ = cores::release_daemon_to(&core_map, &affinity);
+            let _ = cores::release_daemon_to(&affinity);
             return Err(e);
         }
     };
@@ -417,6 +417,14 @@ pub fn bring_up(
         // through. That is the hazard `Disposition::MustLeak` exists to
         // avoid, arriving by a different route. A leaked VF is a line in
         // `packetframe status`; memory corruption is not.
+        // The affinity snapshot is deliberately dropped here, and that
+        // is not a leak: a CPU mask is per-process state, and an attach
+        // that returns Err ends the daemon — the loader unwinds every
+        // module and `run` exits (RunError::Startup). The `detach --all`
+        // this message recommends is a DIFFERENT process whose mask was
+        // never touched, so there is nothing for it to restore.
+        // Retaining the snapshot for it would be state kept for a
+        // caller that cannot exist.
         Err(e) if crate::service::may_hold_resources(&e) => Err(format!(
             "{e} The acquired VF(s) and hugepage reservation were deliberately NOT released \
              for that reason; the state file still records them, so `packetframe detach \
@@ -426,7 +434,7 @@ pub fn bring_up(
             // No VPP survived this path (the may-hold arm above catches
             // the one that might), so the cores need no protection and
             // the daemon gets them back.
-            let _ = cores::release_daemon_to(&core_map, &affinity);
+            let _ = cores::release_daemon_to(&affinity);
             Err(match acquire::release(&paths.sys, state) {
                 Ok(()) => format!("{e}; everything acquired was released"),
                 Err(re) => format!(

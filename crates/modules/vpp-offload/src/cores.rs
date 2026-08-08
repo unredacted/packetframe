@@ -194,7 +194,16 @@ pub const SYSFS_CPU: &str = "/sys/devices/system/cpu";
 #[cfg(target_os = "linux")]
 pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), String> {
     let mut edited = 0usize;
-    let mut saved = AffinitySnapshot::default();
+    // `restorable` starts as all of VPP's cores and is narrowed by every
+    // thread we observe, ending as the intersection: the cores a thread
+    // born later can be given back without guessing at its creator's
+    // policy.
+    let mut saved = AffinitySnapshot {
+        restorable: std::iter::once(map.main)
+            .chain(map.workers.iter().copied())
+            .collect(),
+        ..Default::default()
+    };
     let mut errors: Vec<String> = Vec::new();
     let tasks =
         std::fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?;
@@ -227,6 +236,10 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
         // and wrongly unioned VPP's cores on release, broadening a
         // policy it never had restricted.
         saved.masks.push((tid, before));
+        // Narrow the intersection with this thread's original policy.
+        saved
+            .restorable
+            .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
         for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
             unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
         }
@@ -270,13 +283,33 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
 /// rightly: an operator mask that itself excluded one of VPP's cores
 /// would gain it back on rollback or detach, widening the daemon onto
 /// silicon the operator reserved. Surviving threads restore their
-/// captured mask verbatim; threads born during the restricted epoch
-/// (no capture) fall back to union, which is exact for them — they
-/// inherited a restricted mask whose only edit was ours.
+/// captured mask verbatim.
+///
+/// A thread born DURING the restricted epoch has no capture, and no
+/// exact inverse exists for it — we never saw its creator's original
+/// mask, only the restricted one it inherited. So it gets
+/// [`Self::restorable`] rather than every VPP core: the cores that
+/// EVERY observed thread originally held. Whatever ancestor the new
+/// thread descends from was one of those threads, so each core in that
+/// intersection was demonstrably in its inherited policy and adding it
+/// back cannot broaden anything. Cores held by only some pre-existing
+/// threads stay off — under-restoring a new thread until the daemon's
+/// next start, which is the safe direction and the one the operator
+/// can reason about.
 #[derive(Default, Clone)]
 pub struct AffinitySnapshot {
     #[cfg(target_os = "linux")]
     masks: Vec<(libc::pid_t, libc::cpu_set_t)>,
+    /// VPP cores present in the original mask of every observed thread.
+    /// See the type docs: the only cores a post-attach thread can be
+    /// given back without guessing.
+    ///
+    /// Read only by the Linux `release_daemon_to`; the non-Linux stubs
+    /// never restrict, so nothing there consults it. Gated to match
+    /// `masks` rather than `allow(dead_code)`, so a genuinely unread
+    /// field on Linux would still be caught.
+    #[cfg(target_os = "linux")]
+    restorable: Vec<u16>,
 }
 
 impl std::fmt::Debug for AffinitySnapshot {
@@ -292,8 +325,13 @@ impl std::fmt::Debug for AffinitySnapshot {
 /// is left to protect — a bring-up that rolled back cleanly, and a
 /// detach whose teardown completed (including one that settles late,
 /// after `detach` itself returned).
+///
+/// Takes only the snapshot: it carries both the per-thread originals
+/// and the `restorable` set, so the [`CoreMap`] is not needed here and
+/// is not accepted — a parameter nothing reads is a parameter that can
+/// disagree with the one restriction used.
 #[cfg(target_os = "linux")]
-pub fn release_daemon_to(map: &CoreMap, saved: &AffinitySnapshot) -> Result<usize, String> {
+pub fn release_daemon_to(saved: &AffinitySnapshot) -> Result<usize, String> {
     let mut edited = 0usize;
     let mut errors: Vec<String> = Vec::new();
     let tasks =
@@ -311,9 +349,11 @@ pub fn release_daemon_to(map: &CoreMap, saved: &AffinitySnapshot) -> Result<usiz
             // verbatim — including any exclusion of VPP's cores the
             // operator had already made.
             Some((_, m)) => *m,
-            // Born during the restricted epoch: its inherited mask is a
-            // restricted one whose only edit was ours, so the union is
-            // exact.
+            // Born during the restricted epoch: no capture exists, so
+            // only the cores EVERY pre-existing thread held go back —
+            // see `AffinitySnapshot`. Adding all of VPP's cores here
+            // would hand a child a core its creator's policy never
+            // allowed (review finding).
             None => {
                 let mut m: libc::cpu_set_t = unsafe { std::mem::zeroed() };
                 let rc = unsafe {
@@ -322,8 +362,8 @@ pub fn release_daemon_to(map: &CoreMap, saved: &AffinitySnapshot) -> Result<usiz
                 if rc != 0 {
                     continue; // vanished between readdir and here
                 }
-                for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
-                    unsafe { libc::CPU_SET(cpu as usize, &mut m) };
+                for cpu in &saved.restorable {
+                    unsafe { libc::CPU_SET(*cpu as usize, &mut m) };
                 }
                 m
             }
@@ -360,7 +400,7 @@ pub fn restrict_daemon_from(_map: &CoreMap) -> Result<(usize, AffinitySnapshot),
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn release_daemon_to(_map: &CoreMap, _saved: &AffinitySnapshot) -> Result<usize, String> {
+pub fn release_daemon_to(_saved: &AffinitySnapshot) -> Result<usize, String> {
     Ok(0)
 }
 
@@ -418,7 +458,7 @@ mod affinity_tests {
         assert!(isset(a), "the rest kept");
         assert!(!isset(c), "subtract, never rebuild");
 
-        release_daemon_to(&map, &snap).expect("release");
+        release_daemon_to(&snap).expect("release");
         assert!(isset(b), "the saved mask gave VPP's core back");
         assert!(!isset(c), "and added nothing the operator excluded");
 
@@ -426,7 +466,7 @@ mod affinity_tests {
         // that ALREADY excluded VPP's core must not gain it back.
         set_mask(&[a]);
         let (_, snap2) = restrict_daemon_from(&map).expect("restrict2");
-        release_daemon_to(&map, &snap2).expect("release2");
+        release_daemon_to(&snap2).expect("release2");
         assert!(
             !isset(b),
             "a mask that never held VPP's core must not acquire it on release"
@@ -441,10 +481,75 @@ mod affinity_tests {
         set_mask(&[b]);
         let (_, snap3) = restrict_daemon_from(&map).expect("skip tolerated");
         assert!(isset(b), "unschedulable is worse than unprotected");
-        release_daemon_to(&map, &snap3).expect("release3");
+        release_daemon_to(&snap3).expect("release3");
         assert!(
             isset(b) && !isset(a) && !isset(c),
             "a skipped thread's original mask is restored verbatim, never unioned"
+        );
+
+        let rc =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &before) };
+        assert_eq!(rc, 0);
+    }
+
+    /// A thread born during the restricted epoch must never be handed a
+    /// core its creator's policy excluded.
+    ///
+    /// No exact inverse exists for such a thread — we never saw its
+    /// creator's original mask — so release adds only the VPP cores
+    /// EVERY observed thread held. Here the calling thread's policy
+    /// excludes VPP's core, so that intersection is empty and the child
+    /// must come back with nothing added. Unioning all of VPP's cores
+    /// (the previous behaviour) hands it a core the operator never
+    /// allowed; that is what this pins.
+    #[test]
+    fn a_thread_born_after_restriction_gains_only_universally_held_cores() {
+        use std::sync::mpsc::channel;
+
+        let before = current_mask();
+        let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &before) })
+            .collect();
+        if allowed.len() < 3 {
+            return;
+        }
+        let (a, b, c) = (allowed[0], allowed[1], allowed[2]);
+
+        // VPP takes b; this thread's policy is {a, c} — b excluded, so
+        // b is NOT universally held.
+        set_mask(&[a, c]);
+        let map = CoreMap {
+            main: b as u16,
+            workers: vec![],
+        };
+        let (_, snap) = restrict_daemon_from(&map).expect("restrict");
+
+        let (born_tx, born_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        let (got_tx, got_rx) = channel();
+        let child = std::thread::spawn(move || {
+            born_tx.send(()).expect("announce");
+            go_rx.recv().expect("wait for release");
+            let mut m: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut m)
+            };
+            assert_eq!(rc, 0);
+            got_tx
+                .send(unsafe { libc::CPU_ISSET(b, &m) })
+                .expect("report");
+        });
+        born_rx.recv().expect("child exists before release");
+
+        release_daemon_to(&snap).expect("release");
+        go_tx.send(()).expect("let the child read its mask");
+        let child_has_vpp_core = got_rx.recv().expect("child reported");
+        child.join().expect("child joined");
+
+        assert!(
+            !child_has_vpp_core,
+            "a thread born after restriction must not gain a core its creator's \
+             policy excluded"
         );
 
         let rc =
