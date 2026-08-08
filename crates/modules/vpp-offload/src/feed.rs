@@ -98,6 +98,12 @@ pub struct FeedStats {
 
 #[derive(Default)]
 struct Inner {
+    /// Mutations ever applied, monotonic. The adopted-resync gate's
+    /// quiescence signal: net table size hides churn (adds balanced by
+    /// withdrawals read as zero growth) and reads a shrinking source as
+    /// quiet, and both of those mid-reload would release a diff against
+    /// an incomplete mirror (review finding). Every mutator bumps this.
+    seq: u64,
     /// The authoritative mirror: every prefix the other tier resolved.
     routes: BTreeMap<PrefixKey, SetId>,
     /// Interned nexthop sets, indexed by [`SetId`]. Append-only.
@@ -176,6 +182,7 @@ impl RouteFeed {
 impl ResolvedRouteSink for RouteFeed {
     fn route_resolved(&self, prefix: IpPrefix, nexthops: &[IpAddr]) {
         let mut g = self.lock();
+        g.seq += 1;
         let id = g.intern(nexthops);
         let key = PrefixKey::from(prefix);
         g.routes.insert(key, id);
@@ -184,6 +191,7 @@ impl ResolvedRouteSink for RouteFeed {
 
     fn route_withdrawn(&self, prefix: IpPrefix) {
         let mut g = self.lock();
+        g.seq += 1;
         let key = PrefixKey::from(prefix);
         g.routes.remove(&key);
         // Queued even when the mirror held nothing. A withdrawal for a
@@ -197,12 +205,14 @@ impl ResolvedRouteSink for RouteFeed {
 
     fn neighbour_resolved(&self, nh: IpAddr, mac: [u8; 6], ifindex: u32) {
         let mut g = self.lock();
+        g.seq += 1;
         g.neighbours.insert(nh, (mac, ifindex));
         g.neigh_pending.insert(nh, Some((mac, ifindex)));
     }
 
     fn neighbour_lost(&self, nh: IpAddr) {
         let mut g = self.lock();
+        g.seq += 1;
         g.neighbours.remove(&nh);
         // Queued even if the map held nothing, for the same reason a
         // withdrawal is: the engine's nexthop map is filled by resync too,
@@ -255,6 +265,10 @@ impl RouteSource for RouteFeed {
         // The mirror's own length — O(1), safe to poll every tick while
         // an adopted resync waits for the feed to finish loading.
         self.lock().routes.len() as u64
+    }
+
+    fn change_seq(&self) -> u64 {
+        self.lock().seq
     }
 
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
@@ -328,6 +342,18 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
         (**self).for_each_neighbour(visit)
+    }
+    // EVERY method with a default body must be forwarded here by hand,
+    // because a default hides its own omission: this delegation compiled
+    // cleanly while routing `route_count` — polled every ~50 ms by the
+    // adopted-resync gate, and this Arc is exactly what the production
+    // loader boxes — to the default full-mirror walk instead of the
+    // O(1) length one deref away (review finding).
+    fn route_count(&self) -> u64 {
+        (**self).route_count()
+    }
+    fn change_seq(&self) -> u64 {
+        (**self).change_seq()
     }
 }
 

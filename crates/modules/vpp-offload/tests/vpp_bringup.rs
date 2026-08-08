@@ -50,6 +50,15 @@ const ALLOW: [IpPrefix; 1] = [IpPrefix::V4 {
 /// route source; convergence itself is `vpp_service.rs`'s job.
 struct Mirror;
 impl RouteSource for Mirror {
+    fn route_count(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_route(&mut |_, _| n += 1);
+        n
+    }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         visit(fake_vpp::v4(0, 0), &[fake_vpp::nh()]);
     }

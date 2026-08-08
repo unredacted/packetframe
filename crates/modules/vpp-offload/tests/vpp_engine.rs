@@ -34,6 +34,15 @@ struct Mirror {
 }
 
 impl RouteSource for Mirror {
+    fn route_count(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_route(&mut |_, _| n += 1);
+        n
+    }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.routes {
             visit(*p, &[nh()]);
@@ -258,6 +267,15 @@ struct OrphanedMirror {
 }
 
 impl RouteSource for OrphanedMirror {
+    fn route_count(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_route(&mut |_, _| n += 1);
+        n
+    }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.routes {
             visit(*p, &[nh()]);
@@ -445,6 +463,15 @@ fn static_neighbours_are_programmed_before_the_routes_that_need_them() {
 fn neighbours_on_foreign_devices_are_skipped() {
     struct MixedMirror;
     impl RouteSource for MixedMirror {
+        fn route_count(&self) -> u64 {
+            let mut n = 0u64;
+            self.for_each_route(&mut |_, _| n += 1);
+            n
+        }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
+        }
+
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             visit(v4(0, 0), &[nh()]);
         }

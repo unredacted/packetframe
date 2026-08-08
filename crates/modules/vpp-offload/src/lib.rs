@@ -986,6 +986,12 @@ mod tests {
         ) {
         }
         fn for_each_neighbour(&self, _: &mut dyn FnMut(std::net::IpAddr, &str, [u8; 6])) {}
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
     }
 
     /// A published snapshot the loop would produce in the designed

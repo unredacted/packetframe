@@ -589,14 +589,25 @@ impl StatusSnapshot {
             // started, not an alarm that invites them to restart it.
             FibSync::NeverVerified if self.resync_deferred.is_some() => {
                 let (have, want) = self.resync_deferred.expect("checked above");
-                (
-                    HealthState::Degraded,
-                    Some(format!(
+                // Two phases, two messages: below the floor the source
+                // is plainly still loading; at or above it the gate is
+                // waiting for the growth to stop, because a loading
+                // feed passes through every count on its way to full
+                // and only quiescence says "done".
+                let msg = if have < want {
+                    format!(
                         "resync deferred: the route source is still loading ({have} of the \
                          {want} required); the adopted FIB keeps forwarding untouched until \
                          it catches up"
-                    )),
-                )
+                    )
+                } else {
+                    format!(
+                        "resync deferred: the route source holds {have} routes and is still \
+                         growing; the diff runs once the feed goes quiet, and the adopted \
+                         FIB keeps forwarding untouched until then"
+                    )
+                };
+                (HealthState::Degraded, Some(msg))
             }
             FibSync::NeverVerified if self.steered => (
                 HealthState::Unhealthy,

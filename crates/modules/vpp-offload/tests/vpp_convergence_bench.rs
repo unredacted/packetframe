@@ -103,6 +103,12 @@ impl RouteSource for FileSource {
             visit(*ip, dev, *mac);
         }
     }
+    fn route_count(&self) -> u64 {
+        self.routes.len() as u64
+    }
+    fn change_seq(&self) -> u64 {
+        self.routes.len() as u64
+    }
 }
 
 fn parse_prefix(s: &str) -> Option<IpPrefix> {
