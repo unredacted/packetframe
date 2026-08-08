@@ -100,6 +100,9 @@ pub struct Attached {
     /// dataplane: it may already be forwarding.
     pub acquired: Acquired,
     pub adopted_process: bool,
+    /// Each thread's affinity as captured before the restriction, so
+    /// the release paths restore the operator's policy verbatim.
+    pub affinity: cores::AffinitySnapshot,
 }
 
 /// The PF's MAC, from `/sys/class/net/<iface>/address`.
@@ -330,7 +333,60 @@ pub fn bring_up(
         );
     };
 
-    let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
+    // The daemon vacates VPP's cores here — after the LAST pure check,
+    // so a refused config costs no affinity change, and before anything
+    // whose failure the rollback below undoes. The harm this prevents
+    // arrives through the scheduler, not the API: a resync's mirror
+    // walk landing on the worker's core preempts the poll loop, the
+    // 1024-descriptor rx ring overflows in ~2 s, and the drops happen
+    // at the NIC where no VPP counter sees them — a constant ~5.4 s of
+    // loss at every adopted release until this call existed (shadow,
+    // 2026-08-08). Warn-and-continue on partial failure: a cgroup that
+    // refuses the mask degrades protection, and failing the attach over
+    // it would brick deployments that share cores gracefully today.
+    let affinity = match cores::restrict_daemon_from(&core_map) {
+        // `threads == 0` is NOT success: no mask changed, so the daemon
+        // is still free to run on VPP's cores. Logging it at info as a
+        // restriction would be the claim-because-requested shape this
+        // module exists to avoid — say plainly that it did not happen.
+        Ok((0, saved)) => {
+            tracing::warn!(
+                vpp_main = core_map.main,
+                vpp_workers = ?core_map.workers,
+                "no daemon thread accepted an affinity change; the daemon can still be \
+                 scheduled onto VPP's cores and resync bursts may preempt the worker"
+            );
+            saved
+        }
+        Ok((threads, saved)) => {
+            tracing::info!(
+                threads,
+                vpp_main = core_map.main,
+                vpp_workers = ?core_map.workers,
+                "daemon threads restricted away from VPP's cores"
+            );
+            saved
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not restrict the daemon off VPP's cores; expect loss during \
+                 resync bursts if they share a core with a worker"
+            );
+            cores::AffinitySnapshot::default()
+        }
+    };
+
+    let (state, acquired) = match acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes) {
+        Ok(v) => v,
+        Err(e) => {
+            // Nothing was acquired and no VPP exists: the affinity
+            // restriction protects nothing, and keeping it would leave
+            // the daemon short two cores over a failed attach.
+            let _ = cores::release_daemon_to(&affinity);
+            return Err(e);
+        }
+    };
 
     // From here, every failure releases. `?` would return holding VFs
     // and a hugepage reservation that only the state file knows about —
@@ -348,7 +404,13 @@ pub fn bring_up(
         completeness,
         loopback,
     ) {
-        Ok(attached) => Ok(attached),
+        Ok(mut attached) => {
+            // The snapshot rides with the handle so detach — including a
+            // teardown that settles after detach returns — can restore
+            // the pre-restriction masks exactly.
+            attached.affinity = affinity;
+            Ok(attached)
+        }
         // A supervision panic is the one failure that must NOT roll back.
         //
         // NOT covered by a test, and the reason is structural: the window
@@ -368,17 +430,31 @@ pub fn bring_up(
         // through. That is the hazard `Disposition::MustLeak` exists to
         // avoid, arriving by a different route. A leaked VF is a line in
         // `packetframe status`; memory corruption is not.
+        // The affinity snapshot is deliberately dropped here, and that
+        // is not a leak: a CPU mask is per-process state, and an attach
+        // that returns Err ends the daemon — the loader unwinds every
+        // module and `run` exits (RunError::Startup). The `detach --all`
+        // this message recommends is a DIFFERENT process whose mask was
+        // never touched, so there is nothing for it to restore.
+        // Retaining the snapshot for it would be state kept for a
+        // caller that cannot exist.
         Err(e) if crate::service::may_hold_resources(&e) => Err(format!(
             "{e} The acquired VF(s) and hugepage reservation were deliberately NOT released \
              for that reason; the state file still records them, so `packetframe detach \
              --all` can release them once VPP is confirmed gone."
         )),
-        Err(e) => Err(match acquire::release(&paths.sys, state) {
-            Ok(()) => format!("{e}; everything acquired was released"),
-            Err(re) => format!(
-                "{e}; AND the rollback did not complete: {re} — run `packetframe detach --all`"
-            ),
-        }),
+        Err(e) => {
+            // No VPP survived this path (the may-hold arm above catches
+            // the one that might), so the cores need no protection and
+            // the daemon gets them back.
+            let _ = cores::release_daemon_to(&affinity);
+            Err(match acquire::release(&paths.sys, state) {
+                Ok(()) => format!("{e}; everything acquired was released"),
+                Err(re) => format!(
+                    "{e}; AND the rollback did not complete: {re} — run `packetframe detach --all`"
+                ),
+            })
+        }
     }
 }
 
@@ -721,6 +797,10 @@ fn finish(
         cores: core_map.clone(),
         acquired,
         adopted_process,
+        // Placeholder; `bring_up` overwrites it with the real capture,
+        // which it owns because the restriction happens before `finish`
+        // is called.
+        affinity: cores::AffinitySnapshot::default(),
     })
 }
 
