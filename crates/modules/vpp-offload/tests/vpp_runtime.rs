@@ -135,6 +135,15 @@ fn the_full_loop_converges_an_adopted_vpp_to_ready() {
         d.inject(t0, Event::Adopted { steered: false }, &mut fx);
     }
     assert_eq!(d.state(), State::Syncing);
+    // An adoption that found an EMPTY FIB has no withdrawal universe to
+    // protect, so the source-quiescence gate must not engage — a floor
+    // of zero would reduce it to a bare wait that defers an empty
+    // dataplane behind a loading feed (review finding on the
+    // quiescence PR).
+    assert!(
+        rt.status().resync_deferred.is_none(),
+        "adopting nothing must start the resync immediately"
+    );
 
     let (_, events) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
 

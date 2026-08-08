@@ -922,26 +922,49 @@ impl Effects for EffectsView {
             // seconds to reload. Diffing an adopted ledger against that
             // window queues ~everything as a withdrawal — against a
             // live, possibly steered VPP (drill (d), 2026-08-07). EVERY
-            // adoption defers, even one whose source already looks
-            // complete — a count cannot say "complete", only the
-            // floor-plus-quiescence gate in `drain_batch` can, and an
-            // above-floor count at this instant is exactly what a
+            // adoption of a POPULATED FIB defers, even one whose source
+            // already looks complete — a count cannot say "complete",
+            // only the floor-plus-quiescence gate in `drain_batch` can,
+            // and an above-floor count at this instant is exactly what a
             // half-finished reload looks like (2026-08-08). One path to
             // the diff, ~1.5–3 s of deliberate patience on the path
             // that used to skip it.
-            let have = source.route_count();
-            tracing::info!(
-                have,
-                adopted,
-                "adopted resync deferred until the route source is loaded and quiet; \
-                 the adopted FIB keeps forwarding untouched meanwhile"
-            );
-            Some(DeferredResync {
-                adopted,
-                floor: adopted / ADOPTED_SOURCE_FLOOR_DIVISOR,
-                last_have: have,
-                quiet_ticks: 0,
-            })
+            //
+            // `adopted == 0` — a fresh spawn, or a survivor with an
+            // empty FIB — starts immediately instead: there is no
+            // withdrawal universe to protect, the resync is pure
+            // installs that safely trickle in as the feed loads, and a
+            // floor of zero would otherwise turn the gate into a bare
+            // quiescence wait — deferring an EMPTY dataplane behind a
+            // loading feed, the one situation where converging as fast
+            // as routes arrive is strictly better (review finding on
+            // this PR).
+            if adopted == 0 {
+                let _plan = engine.begin_resync(source.as_ref());
+                // Neighbours between attach and the first drain, and
+                // fatal on refusal: a route through an unprogrammed
+                // adjacency installs cleanly, verifies cleanly, and
+                // drops every packet.
+                engine
+                    .program_neighbours(source.as_ref())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())?;
+                None
+            } else {
+                let have = source.route_count();
+                tracing::info!(
+                    have,
+                    adopted,
+                    "adopted resync deferred until the route source is loaded and quiet; \
+                     the adopted FIB keeps forwarding untouched meanwhile"
+                );
+                Some(DeferredResync {
+                    adopted,
+                    floor: adopted / ADOPTED_SOURCE_FLOOR_DIVISOR,
+                    last_have: have,
+                    quiet_ticks: 0,
+                })
+            }
         };
         c.deferred_resync = deferral;
         Ok(())
