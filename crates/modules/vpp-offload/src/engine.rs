@@ -352,6 +352,24 @@ pub struct ConvergenceEngine {
     pending: PendingMap,
     ledger: RouteLedger,
     nexthops: NexthopMap,
+    /// Static neighbours VPP has ACKNOWLEDGED holding, keyed by
+    /// `(sw_if_index, nexthop)` with the MAC as the value.
+    ///
+    /// The single ledger both neighbour-programming paths consult
+    /// before sending, because a re-add of an identical static
+    /// neighbour is not a no-op: VPP replaces the entry and walks every
+    /// dependent FIB entry — ~1M routes hang off ONE adjacency on this
+    /// topology — null-noding traffic through it for the duration.
+    /// #146 taught `program_neighbours` to skip via a dump and the
+    /// 5.5 s blackhole did not move, because `apply_changes` is a
+    /// second path to the same message: the deltas accumulated during
+    /// the resync deferral re-added the very neighbour the resync walk
+    /// had just left untouched. Two paths, one ledger, one skip.
+    ///
+    /// Written only on VPP's acknowledgement (in `send_neighbour`) or
+    /// from VPP's own dump (in `program_neighbours`); cleared with the
+    /// process, because it describes a table that died with it.
+    neighbours_installed: std::collections::HashMap<(u32, IpAddr), [u8; 6]>,
     drainer: Drainer,
 
     /// Whether MCAM rules are diverting traffic right now.
@@ -406,6 +424,7 @@ impl ConvergenceEngine {
             pending: PendingMap::new(),
             ledger: RouteLedger::new(Capacity::new(high_water_routes)),
             nexthops: NexthopMap::new(members),
+            neighbours_installed: std::collections::HashMap::new(),
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
             steered: false,
             last_api_error: None,
@@ -785,6 +804,12 @@ impl ConvergenceEngine {
                 }
             }
         }
+        // Seed the acknowledged ledger from VPP's own answer, so the
+        // DELTA path's skip covers adopted entries too — not only ones
+        // this process sent.
+        for &(idx, ip, mac) in &existing {
+            self.neighbours_installed.insert((idx, ip), mac);
+        }
 
         // Collect first: the visitor borrows `src` while the sends need
         // `&mut self`.
@@ -859,12 +884,22 @@ impl ConvergenceEngine {
             // because every route through that nexthop would install
             // cleanly and then blackhole.
             if !is_add {
+                self.neighbours_installed.remove(&(sw_if_index, ip));
                 return Ok(());
             }
             return Err(EngineError::NeighbourRefused {
                 nexthop: ip,
                 retval: reply.retval,
             });
+        }
+        // Recorded on the acknowledgement, in the one function both
+        // callers share — the ledger the skip consults must have a
+        // single writer, or the two paths drift apart again.
+        if is_add {
+            self.neighbours_installed
+                .insert((sw_if_index, ip), mac_address);
+        } else {
+            self.neighbours_installed.remove(&(sw_if_index, ip));
         }
         Ok(())
     }
@@ -1013,7 +1048,16 @@ impl ConvergenceEngine {
                         .resolve(&nh)
                         .and_then(|t| self.port_index.get(&t))
                     {
-                        self.send_neighbour(nh, idx, mac, true)?;
+                        // Identical to what VPP acknowledged: nothing to
+                        // send. The delta path re-learning a neighbour at
+                        // daemon start is routine — the resolver re-reads
+                        // the kernel table — and re-adding it walks every
+                        // dependent route (the second door of the 5.5 s
+                        // adoption blackhole; the first was
+                        // `program_neighbours`).
+                        if self.neighbours_installed.get(&(idx, nh)) != Some(&mac) {
+                            self.send_neighbour(nh, idx, mac, true)?;
+                        }
                     }
                 }
                 // Forgotten rather than left at its last known device —
@@ -1219,6 +1263,8 @@ impl ConvergenceEngine {
         // attach unnumber every member to an interface that no longer
         // exists — which VPP would refuse, or worse accept.
         self.loop_index = None;
+        // The neighbour ledger describes the dead instance's table.
+        self.neighbours_installed.clear();
         self.pending = PendingMap::new();
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;
