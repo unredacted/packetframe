@@ -251,29 +251,6 @@ pub fn bring_up(
     let workers = cfg.total_workers();
     let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;
     let core_map = cores::derive_from_sysfs(&paths.sysfs_cpu, workers)?;
-    // The daemon vacates VPP's cores BEFORE any VPP exists to protect,
-    // because the harm arrives through the scheduler, not through the
-    // API: a resync's mirror walk landing on the worker's core preempts
-    // the poll loop, the rx ring (1024 descriptors ≈ 2 s at the drill
-    // rate) overflows, and the drops happen at the NIC where no VPP
-    // counter sees them. Measured as a constant ~5.4 s of loss at every
-    // adopted release until this call existed (shadow, 2026-08-08).
-    // Warn-and-continue on partial failure: a cgroup that refuses the
-    // mask degrades protection, and failing the attach over it would
-    // brick deployments that share cores gracefully today.
-    match cores::restrict_daemon_from(&core_map) {
-        Ok(threads) => tracing::info!(
-            threads,
-            vpp_main = core_map.main,
-            vpp_workers = ?core_map.workers,
-            "daemon threads restricted away from VPP's cores"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not restrict the daemon off VPP's cores; expect loss during \
-             resync bursts if they share a core with a worker"
-        ),
-    }
 
     let hugepage_bytes = paths.sys.hugepage_bytes;
     if hugepage_bytes == 0 {
@@ -353,7 +330,41 @@ pub fn bring_up(
         );
     };
 
-    let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
+    // The daemon vacates VPP's cores here — after the LAST pure check,
+    // so a refused config costs no affinity change, and before anything
+    // whose failure the rollback below undoes. The harm this prevents
+    // arrives through the scheduler, not the API: a resync's mirror
+    // walk landing on the worker's core preempts the poll loop, the
+    // 1024-descriptor rx ring overflows in ~2 s, and the drops happen
+    // at the NIC where no VPP counter sees them — a constant ~5.4 s of
+    // loss at every adopted release until this call existed (shadow,
+    // 2026-08-08). Warn-and-continue on partial failure: a cgroup that
+    // refuses the mask degrades protection, and failing the attach over
+    // it would brick deployments that share cores gracefully today.
+    match cores::restrict_daemon_from(&core_map) {
+        Ok(threads) => tracing::info!(
+            threads,
+            vpp_main = core_map.main,
+            vpp_workers = ?core_map.workers,
+            "daemon threads restricted away from VPP's cores"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not restrict the daemon off VPP's cores; expect loss during \
+             resync bursts if they share a core with a worker"
+        ),
+    }
+
+    let (state, acquired) = match acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes) {
+        Ok(v) => v,
+        Err(e) => {
+            // Nothing was acquired and no VPP exists: the affinity
+            // restriction protects nothing, and keeping it would leave
+            // the daemon short two cores over a failed attach.
+            let _ = cores::release_daemon_to(&core_map);
+            return Err(e);
+        }
+    };
 
     // From here, every failure releases. `?` would return holding VFs
     // and a hugepage reservation that only the state file knows about —
@@ -396,12 +407,18 @@ pub fn bring_up(
              for that reason; the state file still records them, so `packetframe detach \
              --all` can release them once VPP is confirmed gone."
         )),
-        Err(e) => Err(match acquire::release(&paths.sys, state) {
-            Ok(()) => format!("{e}; everything acquired was released"),
-            Err(re) => format!(
-                "{e}; AND the rollback did not complete: {re} — run `packetframe detach --all`"
-            ),
-        }),
+        Err(e) => {
+            // No VPP survived this path (the may-hold arm above catches
+            // the one that might), so the cores need no protection and
+            // the daemon gets them back.
+            let _ = cores::release_daemon_to(&core_map);
+            Err(match acquire::release(&paths.sys, state) {
+                Ok(()) => format!("{e}; everything acquired was released"),
+                Err(re) => format!(
+                    "{e}; AND the rollback did not complete: {re} — run `packetframe detach --all`"
+                ),
+            })
+        }
     }
 }
 

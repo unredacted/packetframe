@@ -867,6 +867,13 @@ impl Module for VppOffloadModule {
                 }
             )));
         }
+        // The teardown completed and released everything: no VPP is
+        // left to protect, so the daemon gets its cores back. Failure
+        // paths above deliberately do NOT — resources still held means
+        // a VPP may still be running on those cores.
+        if let Err(e) = cores::release_daemon_to(&attached.cores) {
+            tracing::warn!(error = %e, "could not return VPP's cores to the daemon");
+        }
         Ok(())
     }
 
