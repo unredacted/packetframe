@@ -772,7 +772,12 @@ impl ConvergenceEngine {
                 }
             };
             for d in details {
-                if d.neighbor.flags & IP_NEIGHBOR_STATIC == 0 {
+                // EXACT flags, not a bit test: `send_neighbour` programs
+                // precisely IP_NEIGHBOR_STATIC, so an entry carrying any
+                // extra flag (STATIC|NO_FIB_ENTRY, say) is not the entry
+                // we would create, and skipping it would silently
+                // preserve the difference forever (review finding).
+                if d.neighbor.flags != IP_NEIGHBOR_STATIC {
                     continue;
                 }
                 if let Some(ip) = crate::fib_sync::from_address(&d.neighbor.ip_address) {

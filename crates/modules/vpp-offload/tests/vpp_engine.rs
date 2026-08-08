@@ -657,6 +657,8 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
     const MAC_C: [u8; 6] = [0x02, 0, 0, 0, 0, 0xcc];
     const STATIC: u8 = 1;
 
+    const MAC_D: [u8; 6] = [0x02, 0, 0, 0, 0, 0xdd];
+
     struct ThreeNeighbours;
     impl RouteSource for ThreeNeighbours {
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
@@ -664,6 +666,7 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
             visit(nh(), "eth4", MAC); // identical in VPP: keep
             visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), "eth4", MAC_B); // stale MAC: replace
             visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12)), "eth4", MAC_C); // missing: add
+            visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 13)), "eth4", MAC_D); // extra flags: replace
         }
         fn route_count(&self) -> u64 {
             0
@@ -678,6 +681,9 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
     const EXISTING_NEIGHBOURS: &[([u8; 4], u32, [u8; 6], u8)] = &[
         ([192, 0, 2, 1], ASSIGNED_INDEX, MAC, STATIC),
         ([192, 0, 2, 11], ASSIGNED_INDEX, MAC_B_OLD, STATIC),
+        // Right MAC, extra flag: not the entry we would create, so it
+        // must be re-programmed to exactly STATIC, not preserved.
+        ([192, 0, 2, 13], ASSIGNED_INDEX, MAC_D, STATIC | 4),
     ];
     let fake = Fake::start_behaving(
         "adopt-neigh",
@@ -697,8 +703,8 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
         .program_neighbours(&ThreeNeighbours)
         .expect("programming");
     assert_eq!(
-        programmed, 2,
-        "exactly the stale one and the missing one; the identical one is kept"
+        programmed, 3,
+        "the stale-MAC, missing, and extra-flag neighbours; only the exact match is kept"
     );
 
     let sent_macs: Vec<[u8; 6]> = fake
@@ -715,7 +721,7 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
          re-adding walks every dependent route: {sent_macs:?}"
     );
     assert!(
-        sent_macs.contains(&MAC_B) && sent_macs.contains(&MAC_C),
-        "the stale and missing neighbours must both be programmed: {sent_macs:?}"
+        sent_macs.contains(&MAC_B) && sent_macs.contains(&MAC_C) && sent_macs.contains(&MAC_D),
+        "the stale, missing, and extra-flag neighbours must all be programmed: {sent_macs:?}"
     );
 }
