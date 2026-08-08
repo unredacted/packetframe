@@ -230,84 +230,128 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
         ..Default::default()
     };
     let mut errors: Vec<String> = Vec::new();
-    let tasks =
-        std::fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?;
-    for entry in tasks.flatten() {
-        let Some(tid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<libc::pid_t>().ok())
-        else {
-            continue;
-        };
-        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
-        };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            if mask_too_small(&err) {
-                return Err(format!(
-                    "this host's CPU mask is wider than a fixed cpu_set_t ({} CPUs) can \
+    // Rescan until a whole pass finds nothing new.
+    //
+    // One pass is not enough, and the gap is reachable rather than
+    // theoretical: the fast-path runtime is already live before VPP
+    // attaches, and its integrity checker uses `spawn_blocking`
+    // (`fast-path/src/fib/integrity.rs`). A thread created DURING the
+    // walk, by a creator we have not visited yet, inherits an
+    // unrestricted mask and may never appear in the directory batch we
+    // already read — leaving it free to run on VPP's cores forever,
+    // which is precisely the interference this function exists to stop
+    // (review finding).
+    //
+    // Once a pass adds nothing, every thread alive is restricted, so
+    // anything created after can only inherit a restricted mask. The
+    // cap bounds a daemon that spawns continuously; hitting it means
+    // protection is partial and says so, rather than looping.
+    const MAX_PASSES: u32 = 8;
+    let mut passes = 0u32;
+    loop {
+        passes += 1;
+        let mut found_new = 0usize;
+        let tasks =
+            std::fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?;
+        for entry in tasks.flatten() {
+            let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            // Identity first, so an already-processed thread costs one
+            // stat and nothing else — and so a tid reused mid-loop is
+            // treated as the new thread it is.
+            let Some(started) = thread_start_ticks(tid) else {
+                continue; // exited between readdir and here
+            };
+            if saved
+                .masks
+                .iter()
+                .any(|(t, st, _)| *t == tid && *st == started)
+            {
+                continue;
+            }
+            found_new += 1;
+            let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
+            };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if mask_too_small(&err) {
+                    return Err(format!(
+                        "this host's CPU mask is wider than a fixed cpu_set_t ({} CPUs) can \
                      express, so the daemon cannot be kept off VPP's cores from inside the \
                      process: {err}. Pin it externally instead (systemd `CPUAffinity=`), or \
                      expect resync bursts to preempt the VPP worker",
-                    libc::CPU_SETSIZE
-                ));
+                        libc::CPU_SETSIZE
+                    ));
+                }
+                // Threads exit between readdir and here; a vanished tid is
+                // not a fault.
+                continue;
             }
-            // Threads exit between readdir and here; a vanished tid is
-            // not a fault.
-            continue;
-        }
-        // The identity, captured with the mask: see `AffinitySnapshot`.
-        let Some(started) = thread_start_ticks(tid) else {
-            continue; // exited between the two reads
-        };
-        let before = mask;
-        // Record EVERY thread we observed, with its original mask —
-        // before deciding whether to change it. Release keys on this:
-        // a tid present here restores its original verbatim (a no-op for
-        // the ones we leave untouched below), and only a tid ABSENT is
-        // treated as born-after-restriction and unioned. Recording just
-        // the successfully-restricted threads was the bug (review
-        // finding): a thread skipped for an empty mask, or one whose
-        // setaffinity failed, would then be missing from the snapshot
-        // and wrongly unioned VPP's cores on release, broadening a
-        // policy it never had restricted.
-        // Narrow the intersection with this thread's original policy.
-        saved
-            .restorable
-            .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
-        // Exactly the VPP cores this thread actually held — the set
-        // release will put back, and nothing more.
-        let mut removed: Vec<u16> = Vec::new();
-        for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
-            if unsafe { libc::CPU_ISSET(cpu as usize, &mask) } {
-                unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
-                removed.push(cpu);
+            let before = mask;
+            // Record EVERY thread we observed, with its original mask —
+            // before deciding whether to change it. Release keys on this:
+            // a tid present here restores its original verbatim (a no-op for
+            // the ones we leave untouched below), and only a tid ABSENT is
+            // treated as born-after-restriction and unioned. Recording just
+            // the successfully-restricted threads was the bug (review
+            // finding): a thread skipped for an empty mask, or one whose
+            // setaffinity failed, would then be missing from the snapshot
+            // and wrongly unioned VPP's cores on release, broadening a
+            // policy it never had restricted.
+            // Narrow the intersection with this thread's original policy.
+            saved
+                .restorable
+                .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
+            // Exactly the VPP cores this thread actually held — the set
+            // release will put back, and nothing more.
+            let mut removed: Vec<u16> = Vec::new();
+            for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
+                if unsafe { libc::CPU_ISSET(cpu as usize, &mask) } {
+                    unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
+                    removed.push(cpu);
+                }
             }
-        }
-        if unsafe { libc::CPU_COUNT(&mask) } == 0 {
-            tracing::warn!(
-                tid,
-                "this thread's whole mask IS VPP's cores; leaving it untouched — an \
+            if unsafe { libc::CPU_COUNT(&mask) } == 0 {
+                tracing::warn!(
+                    tid,
+                    "this thread's whole mask IS VPP's cores; leaving it untouched — an \
                  unschedulable thread is worse than an unprotected worker"
-            );
-            // Observed, but nothing removed: recorded so release knows
-            // it is not a post-attach stranger, and leaves it alone.
-            saved.masks.push((tid, started, Vec::new()));
-            continue;
+                );
+                // Observed, but nothing removed: recorded so release knows
+                // it is not a post-attach stranger, and leaves it alone.
+                saved.masks.push((tid, started, Vec::new()));
+                continue;
+            }
+            let rc = unsafe {
+                libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask)
+            };
+            if rc == 0 {
+                edited += 1;
+                saved.masks.push((tid, started, removed));
+            } else {
+                // The change did not land, so nothing was removed from this
+                // thread — but it was observed, and release must know that.
+                saved.masks.push((tid, started, Vec::new()));
+                errors.push(format!("tid {tid}: {}", std::io::Error::last_os_error()));
+            }
         }
-        let rc =
-            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
-        if rc == 0 {
-            edited += 1;
-            saved.masks.push((tid, started, removed));
-        } else {
-            // The change did not land, so nothing was removed from this
-            // thread — but it was observed, and release must know that.
-            saved.masks.push((tid, started, Vec::new()));
-            errors.push(format!("tid {tid}: {}", std::io::Error::last_os_error()));
+        if found_new == 0 {
+            break;
+        }
+        if passes >= MAX_PASSES {
+            tracing::warn!(
+                passes,
+                "threads are still appearing after {passes} affinity passes; some may remain \
+                 eligible for VPP's cores"
+            );
+            break;
         }
     }
     // Not an error even when nothing was restricted: the snapshot still
@@ -395,6 +439,14 @@ impl std::fmt::Debug for AffinitySnapshot {
 /// is left to protect — a bring-up that rolled back cleanly, and a
 /// detach whose teardown completed (including one that settles late,
 /// after `detach` itself returned).
+///
+/// Single-pass, deliberately, where restriction rescans to a fixpoint.
+/// The asymmetry follows the consequence: a thread missed by
+/// RESTRICTION can run on VPP's cores and preempt the poll loop, which
+/// is the fault this whole mechanism exists to prevent; a thread missed
+/// by RELEASE merely keeps a narrower mask than it might, costing
+/// scheduling breadth on a daemon that no longer has a VPP to protect,
+/// and correcting itself at the next daemon start.
 ///
 /// Takes only the snapshot: it carries both the per-thread originals
 /// and the `restorable` set, so the [`CoreMap`] is not needed here and
