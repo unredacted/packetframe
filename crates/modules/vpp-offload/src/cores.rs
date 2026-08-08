@@ -167,6 +167,31 @@ pub fn derive_from_sysfs(sysfs_cpu: &std::path::Path, workers: u32) -> Result<Co
 /// Where the CPU topology lives on a running kernel.
 pub const SYSFS_CPU: &str = "/sys/devices/system/cpu";
 
+/// A thread's start time, for the identity check in
+/// [`AffinitySnapshot`]. `None` when the thread has already exited or
+/// its stat line cannot be parsed — both of which make it un-restorable
+/// rather than a fault.
+#[cfg(target_os = "linux")]
+fn thread_start_ticks(tid: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+    crate::process::parse_start_ticks(&stat)
+}
+
+/// Whether a `sched_getaffinity`/`setaffinity` failure means this host
+/// has more CPUs than a fixed `cpu_set_t` can express.
+///
+/// The kernel answers `EINVAL` when the supplied mask is smaller than
+/// its own cpumask. Treating that like a vanished thread — which the
+/// first version did — made every TID "skip", returned `Ok(0)`, and let
+/// attach log that the daemon had been restricted while it remained
+/// free to run on VPP's cores: a claim recorded because the effect was
+/// requested rather than observed. Named and refused instead (review
+/// finding).
+#[cfg(target_os = "linux")]
+fn mask_too_small(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EINVAL)
+}
+
 /// Keep every thread of THIS daemon off VPP's cores — by SUBTRACTING
 /// them from each thread's current mask, never by rebuilding one.
 ///
@@ -220,10 +245,24 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
             libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
         };
         if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if mask_too_small(&err) {
+                return Err(format!(
+                    "this host's CPU mask is wider than a fixed cpu_set_t ({} CPUs) can \
+                     express, so the daemon cannot be kept off VPP's cores from inside the \
+                     process: {err}. Pin it externally instead (systemd `CPUAffinity=`), or \
+                     expect resync bursts to preempt the VPP worker",
+                    libc::CPU_SETSIZE
+                ));
+            }
             // Threads exit between readdir and here; a vanished tid is
             // not a fault.
             continue;
         }
+        // The identity, captured with the mask: see `AffinitySnapshot`.
+        let Some(started) = thread_start_ticks(tid) else {
+            continue; // exited between the two reads
+        };
         let before = mask;
         // Record EVERY thread we observed, with its original mask —
         // before deciding whether to change it. Release keys on this:
@@ -235,7 +274,7 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
         // setaffinity failed, would then be missing from the snapshot
         // and wrongly unioned VPP's cores on release, broadening a
         // policy it never had restricted.
-        saved.masks.push((tid, before));
+        saved.masks.push((tid, started, before));
         // Narrow the intersection with this thread's original policy.
         saved
             .restorable
@@ -298,8 +337,18 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
 /// can reason about.
 #[derive(Default, Clone)]
 pub struct AffinitySnapshot {
+    /// `(tid, start_ticks, original mask)`.
+    ///
+    /// The start time is what makes the tid an IDENTITY rather than a
+    /// number. A thread can exit during a long attachment and Linux can
+    /// reuse its tid; restoring the dead thread's mask onto its
+    /// namesake would hand a live thread a policy that was never its
+    /// own (review finding). This is the same identity-must-be-whole
+    /// rule [`crate::process`] applies to an adopted VPP — pid alone is
+    /// never enough — and it reuses that module's `/proc` stat parser
+    /// rather than growing a second one.
     #[cfg(target_os = "linux")]
-    masks: Vec<(libc::pid_t, libc::cpu_set_t)>,
+    masks: Vec<(libc::pid_t, u64, libc::cpu_set_t)>,
     /// VPP cores present in the original mask of every observed thread.
     /// See the type docs: the only cores a post-attach thread can be
     /// given back without guessing.
@@ -344,13 +393,21 @@ pub fn release_daemon_to(saved: &AffinitySnapshot) -> Result<usize, String> {
         else {
             continue;
         };
-        let mask = match saved.masks.iter().find(|(t, _)| *t == tid) {
+        // The tid must match AND be the same thread: a reused tid names
+        // a stranger, whose mask is none of our business to restore.
+        let started = thread_start_ticks(tid);
+        let mask = match saved
+            .masks
+            .iter()
+            .find(|(t, s, _)| *t == tid && Some(*s) == started)
+        {
             // A surviving thread gets its pre-restriction mask back,
             // verbatim — including any exclusion of VPP's cores the
             // operator had already made.
-            Some((_, m)) => *m,
-            // Born during the restricted epoch: no capture exists, so
-            // only the cores EVERY pre-existing thread held go back —
+            Some((_, _, m)) => *m,
+            // Born during the restricted epoch (or a reused tid, which
+            // is the same thing from here): no capture applies, so only
+            // the cores EVERY pre-existing thread held go back —
             // see `AffinitySnapshot`. Adding all of VPP's cores here
             // would hand a child a core its creator's policy never
             // allowed (review finding).
@@ -360,6 +417,13 @@ pub fn release_daemon_to(saved: &AffinitySnapshot) -> Result<usize, String> {
                     libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut m)
                 };
                 if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if mask_too_small(&err) {
+                        return Err(format!(
+                            "this host's CPU mask is wider than a fixed cpu_set_t can \
+                             express: {err}"
+                        ));
+                    }
                     continue; // vanished between readdir and here
                 }
                 for cpu in &saved.restorable {

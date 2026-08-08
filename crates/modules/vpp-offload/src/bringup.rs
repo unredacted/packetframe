@@ -345,6 +345,19 @@ pub fn bring_up(
     // refuses the mask degrades protection, and failing the attach over
     // it would brick deployments that share cores gracefully today.
     let affinity = match cores::restrict_daemon_from(&core_map) {
+        // `threads == 0` is NOT success: no mask changed, so the daemon
+        // is still free to run on VPP's cores. Logging it at info as a
+        // restriction would be the claim-because-requested shape this
+        // module exists to avoid — say plainly that it did not happen.
+        Ok((0, saved)) => {
+            tracing::warn!(
+                vpp_main = core_map.main,
+                vpp_workers = ?core_map.workers,
+                "no daemon thread accepted an affinity change; the daemon can still be \
+                 scheduled onto VPP's cores and resync bursts may preempt the worker"
+            );
+            saved
+        }
         Ok((threads, saved)) => {
             tracing::info!(
                 threads,
