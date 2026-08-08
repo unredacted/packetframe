@@ -31,11 +31,12 @@ use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, ControlPingReply, CreateLoopbackReply, DevAttachReply,
-    DevCreatePortIfReply, FibPath, FibPathNh, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute,
-    IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
-    Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceDetails,
-    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetUnnumberedReply,
-    ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
+    IpNeighborDetails, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
+    IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
+    SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
+    SwInterfaceSetMacAddressReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -140,6 +141,11 @@ pub struct Behaviour {
     /// `VerifyFailed` teardown from a test, because the verdict arrives
     /// as an INJECTED event rather than from an ordinary tick.
     pub verify_mismatch: bool,
+    /// Static neighbours this VPP already holds when the client
+    /// connects, as `(v4 octets, sw_if_index, mac, flags)`. Adoption
+    /// must leave an identical one untouched: re-adding walks every
+    /// dependent route (5.51 s of null-node on the shadow, 2026-08-08).
+    pub existing_neighbours: &'static [([u8; 4], u32, [u8; 6], u8)],
     /// Prefixes this VPP already holds when the client connects, as
     /// `(addr, len, sw_if_index, nexthop_is_set)`.
     ///
@@ -311,6 +317,31 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
                     stats_index: 0,
                 }
                 .encode(&mut out);
+            }
+            // A DUMP, streamed like the others: details frames, no
+            // terminator, ended by the trailing control_ping's reply.
+            "ip_neighbor_dump" => {
+                for &(ip, sw_if_index, mac, flags) in behaviour.existing_neighbours {
+                    let mut d = reply_head("ip_neighbor_details");
+                    let mut un = [0u8; 16];
+                    un[..4].copy_from_slice(&ip);
+                    IpNeighborDetails {
+                        context: ctx,
+                        age: 1.0,
+                        neighbor: IpNeighbor {
+                            sw_if_index,
+                            flags,
+                            mac_address: mac,
+                            ip_address: Address {
+                                af: ADDRESS_IP4,
+                                un: AddressUnion(un),
+                            },
+                        },
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
             }
             "ip_neighbor_add_del" => {
                 let mut d = Decoder::new(&req);

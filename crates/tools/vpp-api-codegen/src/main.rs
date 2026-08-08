@@ -51,6 +51,17 @@ const MESSAGES: &[&str] = &[
     "ip_route_details",
     "ip_neighbor_add_del",
     "ip_neighbor_add_del_reply",
+    // Reading VPP's neighbour table back, so adoption programs only the
+    // neighbours VPP is MISSING. Re-adding an existing static neighbour
+    // is not a no-op: VPP replaces the entry (the dump's own `age`
+    // resets), and the replacement walks every dependent FIB entry —
+    // ~1M routes hang off ONE adjacency on this topology — during which
+    // traffic through it goes to null-node. Measured on the shadow
+    // (2026-08-08): a 5.51 s blackhole at the moment of an otherwise
+    // perfect adoption, and 21,055 blackholed packets across the three
+    // drill-(d) runs that re-added it blind.
+    "ip_neighbor_dump",
+    "ip_neighbor_details",
     // Interface state.
     "sw_interface_set_flags",
     "sw_interface_set_flags_reply",

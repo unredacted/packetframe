@@ -636,3 +636,92 @@ fn a_fakes_ping_reply_is_decodable_not_just_writable() {
         .ping()
         .expect("the stream must still be clean after a populated dump");
 }
+
+/// Adoption programs only the neighbours VPP is missing or holds wrong.
+///
+/// Re-adding an existing static neighbour is not a no-op: VPP replaces
+/// the entry and walks every dependent FIB entry — ~1M routes hang off
+/// ONE adjacency on this topology — and traffic through it goes to
+/// null-node for the duration. Measured on the shadow (2026-08-08):
+/// 5.51 s of blackhole at the moment of an otherwise perfect adoption,
+/// 21,055 blackholed packets across the three drill-(d) runs that
+/// re-added it blind.
+///
+/// Three neighbours, three verdicts: an identical one is left
+/// untouched; one whose MAC changed is re-programmed (that walk is the
+/// price of correctness); one VPP lacks is programmed.
+#[test]
+fn adoption_programs_only_missing_or_stale_neighbours() {
+    const MAC_B: [u8; 6] = [0x02, 0, 0, 0, 0, 0xbb];
+    const MAC_B_OLD: [u8; 6] = [0x02, 0, 0, 0, 0, 0xb0];
+    const MAC_C: [u8; 6] = [0x02, 0, 0, 0, 0, 0xcc];
+    const STATIC: u8 = 1;
+
+    const MAC_D: [u8; 6] = [0x02, 0, 0, 0, 0, 0xdd];
+
+    struct ThreeNeighbours;
+    impl RouteSource for ThreeNeighbours {
+        fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC); // identical in VPP: keep
+            visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), "eth4", MAC_B); // stale MAC: replace
+            visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12)), "eth4", MAC_C); // missing: add
+            visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 13)), "eth4", MAC_D); // extra flags: replace
+        }
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    // nh() is 192.0.2.1 (see fake_vpp); VPP already holds it correct,
+    // and holds .11 with a MAC the resolver has since replaced.
+    const EXISTING_NEIGHBOURS: &[([u8; 4], u32, [u8; 6], u8)] = &[
+        ([192, 0, 2, 1], ASSIGNED_INDEX, MAC, STATIC),
+        ([192, 0, 2, 11], ASSIGNED_INDEX, MAC_B_OLD, STATIC),
+        // Right MAC, extra flag: not the entry we would create, so it
+        // must be re-programmed to exactly STATIC, not preserved.
+        ([192, 0, 2, 13], ASSIGNED_INDEX, MAC_D, STATIC | 4),
+    ];
+    let fake = Fake::start_behaving(
+        "adopt-neigh",
+        Behaviour {
+            existing_neighbours: EXISTING_NEIGHBOURS,
+            ..Default::default()
+        },
+    );
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+    // The nexthop->device map is refreshed by the resync walk;
+    // program_neighbours resolves against it.
+    engine.begin_resync(&ThreeNeighbours);
+
+    let programmed = engine
+        .program_neighbours(&ThreeNeighbours)
+        .expect("programming");
+    assert_eq!(
+        programmed, 3,
+        "the stale-MAC, missing, and extra-flag neighbours; only the exact match is kept"
+    );
+
+    let sent_macs: Vec<[u8; 6]> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Neighbour { mac, .. } => Some(mac),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !sent_macs.contains(&MAC),
+        "the neighbour VPP already holds correct must not be re-added — \
+         re-adding walks every dependent route: {sent_macs:?}"
+    );
+    assert!(
+        sent_macs.contains(&MAC_B) && sent_macs.contains(&MAC_C) && sent_macs.contains(&MAC_D),
+        "the stale, missing, and extra-flag neighbours must all be programmed: {sent_macs:?}"
+    );
+}

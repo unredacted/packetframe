@@ -47,8 +47,8 @@ use crate::sink::{Capacity, NexthopMap, PendingMap, RouteLedger, SinkCounts};
 use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
 use crate::vpp_api::generated::{
-    IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpRoute, IpRouteDetails, IpRouteDump,
-    IpTable, FIB_API_PATH_TYPE_NORMAL,
+    IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump,
+    IpRoute, IpRouteDetails, IpRouteDump, IpTable, ADDRESS_IP4, FIB_API_PATH_TYPE_NORMAL,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -739,6 +739,53 @@ impl ConvergenceEngine {
             return Err(EngineError::NotConnected);
         }
 
+        // What VPP already holds — so nothing it has is re-added.
+        //
+        // Re-adding an existing static neighbour is NOT a no-op: VPP
+        // replaces the entry (the dump's own `age` field resets), and
+        // the replacement walks every dependent FIB entry. On this
+        // topology ~1M routes resolve through ONE adjacency, and while
+        // that walk runs, traffic through it goes to null-node.
+        // Measured on the shadow (2026-08-08): a 5.51 s blackhole at
+        // the moment of an otherwise perfect adoption, 21,055
+        // `null-node blackholed` across the three drill-(d) runs that
+        // re-added blind. Discover, don't recreate — the same rule as
+        // ports and the loopback, one object further down.
+        //
+        // Skipped only on an EXACT match (interface, MAC, and the
+        // static flag): an entry with a stale MAC must be replaced —
+        // that walk is the price of correctness — and a dynamic entry
+        // must be replaced with a static one, because VPP can never
+        // refresh it here (MCAM cannot steer ARP).
+        let mut existing: HashSet<(u32, IpAddr, [u8; 6])> = HashSet::new();
+        {
+            let t = self.transport.as_mut().expect("checked just above");
+            let details: Vec<IpNeighborDetails> = match t.dump(IpNeighborDump {
+                context: 0,
+                sw_if_index: u32::MAX,
+                af: ADDRESS_IP4,
+            }) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.disconnect();
+                    return Err(EngineError::Transport(e));
+                }
+            };
+            for d in details {
+                // EXACT flags, not a bit test: `send_neighbour` programs
+                // precisely IP_NEIGHBOR_STATIC, so an entry carrying any
+                // extra flag (STATIC|NO_FIB_ENTRY, say) is not the entry
+                // we would create, and skipping it would silently
+                // preserve the difference forever (review finding).
+                if d.neighbor.flags != IP_NEIGHBOR_STATIC {
+                    continue;
+                }
+                if let Some(ip) = crate::fib_sync::from_address(&d.neighbor.ip_address) {
+                    existing.insert((d.neighbor.sw_if_index, ip, d.neighbor.mac_address));
+                }
+            }
+        }
+
         // Collect first: the visitor borrows `src` while the sends need
         // `&mut self`.
         let mut wanted: Vec<(IpAddr, u32, [u8; 6])> = Vec::new();
@@ -755,9 +802,22 @@ impl ConvergenceEngine {
         }
 
         let mut programmed = 0u64;
+        let mut kept = 0u64;
         for (ip, sw_if_index, mac_address) in wanted {
+            if existing.contains(&(sw_if_index, ip, mac_address)) {
+                kept += 1;
+                continue;
+            }
             self.send_neighbour(ip, sw_if_index, mac_address, true)?;
             programmed += 1;
+        }
+        if kept > 0 {
+            tracing::info!(
+                kept,
+                programmed,
+                "neighbours VPP already holds correct were left untouched; re-adding one \
+                 walks every dependent route"
+            );
         }
         Ok(programmed)
     }

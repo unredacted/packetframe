@@ -123,6 +123,21 @@ pub fn to_address(ip: IpAddr) -> Address {
     }
 }
 
+/// The inverse of [`to_address`], for reading VPP's neighbour table
+/// back. `None` for an address family the wire can carry but this
+/// module does not speak.
+pub fn from_address(a: &Address) -> Option<IpAddr> {
+    match a.af {
+        ADDRESS_IP4 => {
+            let mut o = [0u8; 4];
+            o.copy_from_slice(&a.un.0[..4]);
+            Some(IpAddr::V4(o.into()))
+        }
+        ADDRESS_IP6 => Some(IpAddr::V6(a.un.0.into())),
+        _ => None,
+    }
+}
+
 /// A delete for `prefix`. VPP matches deletes on the prefix alone, so
 /// no paths are needed — and sending them would only invite a mismatch
 /// against whatever was actually installed.

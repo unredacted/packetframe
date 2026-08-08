@@ -33,6 +33,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "ip_route_details", crc: "0xbda8f315", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "ip_neighbor_add_del", crc: "0x0607c257", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "ip_neighbor_add_del_reply", crc: "0x1992deab", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "ip_neighbor_dump", crc: "0xd817a484", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "ip_neighbor_details", crc: "0xe29d79f0", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_flags", crc: "0xf5aec1b8", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_flags_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_mac_address", crc: "0xc536e7eb", context_offset: 6, client_index_prefix: true },
@@ -1009,6 +1011,83 @@ impl Decode for IpNeighborAddDelReply {
 impl Message for IpNeighborAddDelReply {
     const NAME: &'static str = "ip_neighbor_add_del_reply";
     const CRC: &'static str = "0x1992deab";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `ip_neighbor_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpNeighborDump {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub af: u8,
+}
+
+impl Encode for IpNeighborDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.af as u8).to_be_bytes());
+    }
+}
+
+impl Decode for IpNeighborDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let af = d.u8()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            af,
+        })
+    }
+}
+
+impl Message for IpNeighborDump {
+    const NAME: &'static str = "ip_neighbor_dump";
+    const CRC: &'static str = "0xd817a484";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `ip_neighbor_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpNeighborDetails {
+    pub context: u32,
+    pub age: f64,
+    pub neighbor: IpNeighbor,
+}
+
+impl Encode for IpNeighborDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.age).to_be_bytes());
+        self.neighbor.encode(buf);
+    }
+}
+
+impl Decode for IpNeighborDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let age = d.f64()?;
+        let neighbor = IpNeighbor::decode(d)?;
+        Ok(Self {
+            context,
+            age,
+            neighbor,
+        })
+    }
+}
+
+impl Message for IpNeighborDetails {
+    const NAME: &'static str = "ip_neighbor_details";
+    const CRC: &'static str = "0xe29d79f0";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }
