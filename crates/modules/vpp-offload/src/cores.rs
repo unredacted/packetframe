@@ -216,6 +216,17 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
             continue;
         }
         let before = mask;
+        // Record EVERY thread we observed, with its original mask —
+        // before deciding whether to change it. Release keys on this:
+        // a tid present here restores its original verbatim (a no-op for
+        // the ones we leave untouched below), and only a tid ABSENT is
+        // treated as born-after-restriction and unioned. Recording just
+        // the successfully-restricted threads was the bug (review
+        // finding): a thread skipped for an empty mask, or one whose
+        // setaffinity failed, would then be missing from the snapshot
+        // and wrongly unioned VPP's cores on release, broadening a
+        // policy it never had restricted.
+        saved.masks.push((tid, before));
         for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
             unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
         }
@@ -231,17 +242,16 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
             unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
         if rc == 0 {
             edited += 1;
-            saved.masks.push((tid, before));
         } else {
             errors.push(format!("tid {tid}: {}", std::io::Error::last_os_error()));
         }
     }
-    if edited == 0 && !errors.is_empty() {
-        return Err(format!(
-            "no thread accepted its affinity change: {}",
-            errors.join("; ")
-        ));
-    }
+    // Not an error even when nothing was restricted: the snapshot still
+    // names every pre-existing thread, which is what keeps a later
+    // release from unioning cores onto a thread that was never touched.
+    // Degraded protection is a warning; discarding the snapshot via `Err`
+    // (the caller falls back to an empty one) is what actually caused the
+    // broadening.
     if !errors.is_empty() {
         tracing::warn!(
             edited,
@@ -422,11 +432,20 @@ mod affinity_tests {
             "a mask that never held VPP's core must not acquire it on release"
         );
 
-        // A mask that IS VPP's cores is skipped, not emptied.
+        // A mask that IS VPP's cores is skipped, not emptied — AND the
+        // skipped thread must still be recorded, so release restores its
+        // original verbatim rather than unioning (which here would be a
+        // no-op, but the recording is what makes a DIFFERENT skipped
+        // thread safe). Narrow to {a, b}, exclude c, so a broadening
+        // union would be visible as c appearing.
         set_mask(&[b]);
         let (_, snap3) = restrict_daemon_from(&map).expect("skip tolerated");
         assert!(isset(b), "unschedulable is worse than unprotected");
         release_daemon_to(&map, &snap3).expect("release3");
+        assert!(
+            isset(b) && !isset(a) && !isset(c),
+            "a skipped thread's original mask is restored verbatim, never unioned"
+        );
 
         let rc =
             unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &before) };
