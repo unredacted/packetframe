@@ -274,13 +274,18 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
         // setaffinity failed, would then be missing from the snapshot
         // and wrongly unioned VPP's cores on release, broadening a
         // policy it never had restricted.
-        saved.masks.push((tid, started, before));
         // Narrow the intersection with this thread's original policy.
         saved
             .restorable
             .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
+        // Exactly the VPP cores this thread actually held — the set
+        // release will put back, and nothing more.
+        let mut removed: Vec<u16> = Vec::new();
         for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
-            unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
+            if unsafe { libc::CPU_ISSET(cpu as usize, &mask) } {
+                unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
+                removed.push(cpu);
+            }
         }
         if unsafe { libc::CPU_COUNT(&mask) } == 0 {
             tracing::warn!(
@@ -288,13 +293,20 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
                 "this thread's whole mask IS VPP's cores; leaving it untouched — an \
                  unschedulable thread is worse than an unprotected worker"
             );
+            // Observed, but nothing removed: recorded so release knows
+            // it is not a post-attach stranger, and leaves it alone.
+            saved.masks.push((tid, started, Vec::new()));
             continue;
         }
         let rc =
             unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
         if rc == 0 {
             edited += 1;
+            saved.masks.push((tid, started, removed));
         } else {
+            // The change did not land, so nothing was removed from this
+            // thread — but it was observed, and release must know that.
+            saved.masks.push((tid, started, Vec::new()));
             errors.push(format!("tid {tid}: {}", std::io::Error::last_os_error()));
         }
     }
@@ -315,14 +327,23 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
     Ok((edited, saved))
 }
 
-/// The masks each thread held BEFORE restriction, so release restores
-/// the operator's policy exactly rather than approximating it.
+/// What this attachment removed from each thread, so release is the
+/// exact inverse of the restriction and nothing else.
 ///
-/// Union-on-release was the first design and review rejected it
-/// rightly: an operator mask that itself excluded one of VPP's cores
-/// would gain it back on rollback or detach, widening the daemon onto
-/// silicon the operator reserved. Surviving threads restore their
-/// captured mask verbatim.
+/// Storing the whole pre-attach mask was the previous design and review
+/// rejected it rightly: restoring it verbatim discards any change the
+/// operator made WHILE VPP was attached (a `taskset` mid-attachment),
+/// re-enabling CPUs they had since excluded. Restriction only ever
+/// clears VPP-core bits, so its inverse is to set exactly those bits
+/// back on whatever the thread's mask is at release time — every other
+/// bit, however it got that way, is left alone.
+///
+/// Recording the removed set per thread also subsumes two earlier
+/// findings for free: a thread whose policy already excluded a VPP core
+/// has that core in nobody's removed set, so it can never gain it; and
+/// a thread we observed but skipped (its mask would have emptied) or
+/// failed to set has an EMPTY removed set, so release leaves it exactly
+/// as found while still proving it is not a post-attach stranger.
 ///
 /// A thread born DURING the restricted epoch has no capture, and no
 /// exact inverse exists for it — we never saw its creator's original
@@ -337,7 +358,7 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
 /// can reason about.
 #[derive(Default, Clone)]
 pub struct AffinitySnapshot {
-    /// `(tid, start_ticks, original mask)`.
+    /// `(tid, start_ticks, the VPP cores THIS attachment removed)`.
     ///
     /// The start time is what makes the tid an IDENTITY rather than a
     /// number. A thread can exit during a long attachment and Linux can
@@ -348,7 +369,7 @@ pub struct AffinitySnapshot {
     /// never enough — and it reuses that module's `/proc` stat parser
     /// rather than growing a second one.
     #[cfg(target_os = "linux")]
-    masks: Vec<(libc::pid_t, u64, libc::cpu_set_t)>,
+    masks: Vec<(libc::pid_t, u64, Vec<u16>)>,
     /// VPP cores present in the original mask of every observed thread.
     /// See the type docs: the only cores a post-attach thread can be
     /// given back without guessing.
@@ -396,42 +417,39 @@ pub fn release_daemon_to(saved: &AffinitySnapshot) -> Result<usize, String> {
         // The tid must match AND be the same thread: a reused tid names
         // a stranger, whose mask is none of our business to restore.
         let started = thread_start_ticks(tid);
-        let mask = match saved
+        // Read the CURRENT mask either way: release edits what the
+        // thread has now, so an operator's mid-attachment `taskset`
+        // survives (review finding).
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if mask_too_small(&err) {
+                return Err(format!(
+                    "this host's CPU mask is wider than a fixed cpu_set_t can express: {err}"
+                ));
+            }
+            continue; // vanished between readdir and here
+        }
+        let give_back: &[u16] = match saved
             .masks
             .iter()
             .find(|(t, s, _)| *t == tid && Some(*s) == started)
         {
-            // A surviving thread gets its pre-restriction mask back,
-            // verbatim — including any exclusion of VPP's cores the
-            // operator had already made.
-            Some((_, _, m)) => *m,
+            // A surviving thread gets back exactly the cores THIS
+            // attachment took from it — never a whole stale mask.
+            Some((_, _, removed)) => removed,
             // Born during the restricted epoch (or a reused tid, which
-            // is the same thing from here): no capture applies, so only
-            // the cores EVERY pre-existing thread held go back —
-            // see `AffinitySnapshot`. Adding all of VPP's cores here
-            // would hand a child a core its creator's policy never
-            // allowed (review finding).
-            None => {
-                let mut m: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-                let rc = unsafe {
-                    libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut m)
-                };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    if mask_too_small(&err) {
-                        return Err(format!(
-                            "this host's CPU mask is wider than a fixed cpu_set_t can \
-                             express: {err}"
-                        ));
-                    }
-                    continue; // vanished between readdir and here
-                }
-                for cpu in &saved.restorable {
-                    unsafe { libc::CPU_SET(*cpu as usize, &mut m) };
-                }
-                m
-            }
+            // is the same thing from here): no per-thread record
+            // applies, so only the cores EVERY pre-existing thread held
+            // go back — see `AffinitySnapshot`.
+            None => &saved.restorable,
         };
+        for cpu in give_back {
+            unsafe { libc::CPU_SET(*cpu as usize, &mut mask) };
+        }
         let rc =
             unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
         if rc == 0 {
@@ -548,9 +566,17 @@ mod affinity_tests {
         assert!(isset(a), "the rest kept");
         assert!(!isset(c), "subtract, never rebuild");
 
+        // An operator retunes the daemon WHILE VPP is attached: c is
+        // added, and that change must survive release. Restoring a
+        // whole pre-attach mask would silently discard it (review
+        // finding); adding back only what was removed cannot.
+        set_mask(&[a, c]);
         release_daemon_to(&snap).expect("release");
-        assert!(isset(b), "the saved mask gave VPP's core back");
-        assert!(!isset(c), "and added nothing the operator excluded");
+        assert!(isset(b), "the core this attachment removed came back");
+        assert!(
+            isset(c),
+            "an affinity change made during the attachment must survive release"
+        );
 
         // The finding that killed union-on-release: an operator mask
         // that ALREADY excluded VPP's core must not gain it back.
