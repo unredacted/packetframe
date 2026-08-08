@@ -510,6 +510,9 @@ fn verify_adoptable(
 pub struct FileStore {
     state: ResourceState,
     state_dir: PathBuf,
+    /// See [`FileStore::with_spawn_cores`]. Empty on the adopt path,
+    /// where the recorded placement is already the running VPP's.
+    spawn_cores: Vec<u16>,
 }
 
 impl FileStore {
@@ -520,7 +523,24 @@ impl FileStore {
         Self {
             state,
             state_dir: state_dir.into(),
+            spawn_cores: Vec::new(),
         }
+    }
+
+    /// The CPUs any VPP **this daemon spawns** will run on: the
+    /// placement rendered into startup.conf at attach, which VPP reads
+    /// at start and which does not change while this daemon lives.
+    ///
+    /// Recorded here rather than at the attach-time adopt-or-spawn
+    /// decision because EVERY spawn must update it, not just the first:
+    /// a daemon that adopts an old VPP and later respawns after it dies
+    /// would otherwise keep naming the dead process's cores, and the
+    /// next daemon would vacate a placement nothing runs on (review
+    /// finding). `process_changed` is the one point every spawn passes
+    /// through, so it is the one place this is written.
+    pub fn with_spawn_cores(mut self, cores: Vec<u16>) -> Self {
+        self.spawn_cores = cores;
+        self
     }
 
     pub fn state(&self) -> &ResourceState {
@@ -545,6 +565,18 @@ impl IdentityStore for FileStore {
                 self.state.vpp_pid = Some(id.pid);
                 self.state.vpp_start_ticks = Some(id.start_ticks);
                 self.state.vpp_boot_id = id.boot_id;
+                // A process this daemon started runs on the placement
+                // this daemon rendered — see `with_spawn_cores`. Every
+                // identity reaching here is such a spawn: adoption
+                // records none (the file already holds it), so
+                // `Runtime::spawn` is the only caller with `Some`.
+                //
+                // The emptiness guard is for a store built without a
+                // placement — the unit fixtures — so they cannot blank
+                // a field they know nothing about.
+                if !self.spawn_cores.is_empty() {
+                    self.state.vpp_cores = self.spawn_cores.clone();
+                }
             }
             None => {
                 self.state.vpp_pid = None;
@@ -635,6 +667,13 @@ impl ResourceOwner {
             paths,
             released: false,
         }
+    }
+
+    /// See [`FileStore::with_spawn_cores`] — the placement every VPP
+    /// this daemon spawns will use.
+    pub fn with_spawn_cores(mut self, cores: Vec<u16>) -> Self {
+        self.store = self.store.with_spawn_cores(cores);
+        self
     }
 }
 

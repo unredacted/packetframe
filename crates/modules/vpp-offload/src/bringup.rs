@@ -677,18 +677,24 @@ fn finish(
         // borrow checker just refused.
         let inherited_rule_count: usize =
             state.steer_rules.iter().map(|(_, locs)| locs.len()).sum();
-        // Not adopting means the supervisor will SPAWN, and it will spawn
-        // against the startup.conf just rendered from `core_map` — so
-        // that, not whatever a previous VPP used, is where this process's
-        // threads will be. Recording it here keeps the file describing the
-        // VPP that actually exists; leaving the old value would have the
-        // next daemon vacate a placement nothing runs on, which is the
-        // same silent preemption one generation removed (review finding).
-        let mut state = state;
-        if adopted.is_none() {
-            state.vpp_cores = spawn_cores;
-        }
-        let owner = SharedOwner::new(ResourceOwner::new(state, sys));
+        // The placement any VPP this daemon spawns will run on, handed
+        // to the store rather than written once here: EVERY spawn must
+        // update the record, not just an attach-time decision. A daemon
+        // that adopts an old VPP and later respawns after it dies would
+        // otherwise keep naming the dead process's cores, and the next
+        // daemon would vacate a placement nothing runs on (review
+        // finding). `process_changed` is the single point every spawn
+        // passes through, so the record is written there.
+        //
+        // Unconditional, including on the adopt path: `adopt_process`
+        // records no identity (the file already holds the adopted
+        // one), so the only thing that ever reaches
+        // `process_changed(Some(..))` is a spawn by this daemon — and
+        // an adopted VPP that later dies is replaced by exactly such a
+        // spawn. Gating this on `adopted.is_none()` would leave that
+        // replacement unrecorded, which is the case this finding is
+        // about.
+        let owner = SharedOwner::new(ResourceOwner::new(state, sys).with_spawn_cores(spawn_cores));
         let runtime = Runtime::new(
             engine,
             source,
