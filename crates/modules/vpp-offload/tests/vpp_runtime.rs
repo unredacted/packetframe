@@ -842,3 +842,156 @@ fn an_adopted_resync_waits_for_the_source_instead_of_withdrawing_the_table() {
         "one withdrawal for the one prefix the source really dropped"
     );
 }
+
+/// The floor is not the release condition — quiescence is. Pinned
+/// against the second drill-(d) failure (shadow, 2026-08-08): the
+/// floor-only gate released the diff at have=527,557 of an eventual
+/// 1.05M, withdrew the not-yet-reloaded half from the live steered
+/// VPP, and the drill flow measured 12.75 s of blackhole. A loading
+/// feed passes through every count on its way to full, so a source
+/// that keeps growing must keep deferring — however far past the
+/// floor it is.
+#[test]
+fn a_source_still_growing_past_the_floor_keeps_deferring() {
+    use std::sync::{Arc, Mutex};
+
+    struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
+    impl RouteSource for SharedMirror {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in self.0.lock().unwrap().iter() {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+
+    /// A stranger prefix per index, disjoint from the adopted set.
+    fn stranger(i: usize) -> IpPrefix {
+        IpPrefix::V4 {
+            addr: [10, 9, (i / 250) as u8, (i % 250) as u8],
+            prefix_len: 32,
+        }
+    }
+
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 3, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 4, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 5, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "loop-grow",
+        fake_vpp::Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    let shared = Arc::new(Mutex::new(vec![fake_vpp::v4(0, 0)]));
+    let rt = runtime_with_source(&fake, Box::new(SharedMirror(shared.clone())));
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // The feed loads in big strides: every tick adds 200 routes — far
+    // past the floor of 3 within two ticks, and far above the quiet
+    // threshold every single tick. The mid-load reality, as a fixture.
+    let mut now = t0;
+    let mut n_strangers = 0usize;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..12 {
+            {
+                let mut g = shared.lock().unwrap();
+                for i in n_strangers..n_strangers + 200 {
+                    g.push(stranger(i));
+                }
+            }
+            n_strangers += 200;
+            let t = d.tick(now, &mut obs, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "a growing source must keep the diff deferred, however far past the \
+                 floor: {:?}",
+                t.events
+            );
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    let touched: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "no route op may reach the live table while the feed grows: {touched:?}"
+    );
+
+    // The reload finishes: the last stride lands the surviving five of
+    // the six adopted prefixes, then the feed goes quiet.
+    {
+        let mut g = shared.lock().unwrap();
+        for i in 0..5u8 {
+            g.push(fake_vpp::v4(0, i));
+        }
+    }
+    let mut seen: Vec<Event> = Vec::new();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..128 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            if seen.contains(&Event::SyncComplete) {
+                break;
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        seen.contains(&Event::SyncComplete),
+        "a quiet, loaded source must release the diff: {seen:?}"
+    );
+
+    // And the withdrawal set is exactly the one genuinely-gone prefix,
+    // not the half of the table that happened to load late.
+    let deletes: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![([10, 0, 5, 0], 24)],
+        "one withdrawal for the one prefix the source really dropped"
+    );
+}

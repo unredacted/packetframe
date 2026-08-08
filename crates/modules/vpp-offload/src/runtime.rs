@@ -299,32 +299,72 @@ struct Core {
     /// operator would see a stalled `pending_ops` with nothing saying
     /// why.
     last_drain_error: Option<String>,
-    /// `Some(floor)` while an adopted resync is deferred: the diff will
-    /// not run until the route source holds at least `floor` routes.
-    ///
-    /// Set by `start_resync` when it adopts a populated FIB and finds
-    /// the source still loading; cleared by `drain_batch` when the
-    /// source crosses the floor and the diff actually begins. While
-    /// set, the adopted VPP is left exactly as found — steered, routes
-    /// intact — because a diff against a loading source is ~all
-    /// withdrawals, and draining those into a live dataplane is the
-    /// drill-(d) blackhole (2026-08-07).
-    deferred_resync_floor: Option<u64>,
+    /// `Some` while an adopted resync is deferred, holding the release
+    /// gate's state. Set by `start_resync` on EVERY adoption of a
+    /// populated FIB; cleared by `drain_batch` when the gate opens and
+    /// the diff actually begins. While set, the adopted VPP is left
+    /// exactly as found — steered, routes intact — because a diff
+    /// against a loading source is ~all withdrawals, and draining those
+    /// into a live dataplane is the drill-(d) blackhole (2026-08-07).
+    deferred_resync: Option<DeferredResync>,
 }
 
-/// An adopted resync is deferred while the route source holds fewer
-/// routes than `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
+/// Release-gate state for a deferred adopted resync. See
+/// [`ADOPTED_SOURCE_FLOOR_DIVISOR`] and [`SOURCE_QUIET_TICKS`] for the
+/// two conditions, and why both are load-bearing.
+#[derive(Debug, Clone, Copy)]
+struct DeferredResync {
+    /// Routes adopted from VPP's FIB — the diff's withdrawal universe.
+    adopted: u64,
+    /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
+    floor: u64,
+    /// The source's count at the previous check, for the growth test.
+    last_have: u64,
+    /// Consecutive checks with sub-threshold growth.
+    quiet_ticks: u32,
+}
+
+/// The adopted diff runs only when the source holds at least
+/// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR` routes **and** has been
+/// quiet for [`SOURCE_QUIET_TICKS`] checks. Both conditions, because
+/// each covers the other's blind spot:
 ///
-/// Half, not "equal": the source and the adopted FIB legitimately
-/// differ by whatever churned while packetframe was down, and demanding
-/// near-parity would deadlock against a genuinely shrunken table (an
-/// upstream loss can remove a real fraction). Half is far above any
-/// plausible legitimate shrink and far below any partially-loaded feed
-/// — the two distributions this constant separates. If the source
-/// never crosses the floor (feed down), the deferral holds forever and
-/// health stays degraded: stale-but-verified forwarding plus an alarm
-/// beats withdrawing a live table.
+/// - **Quiescence alone** releases against a DEAD feed — a source that
+///   never loaded anything is perfectly quiet, and the diff would
+///   withdraw the entire adopted table, which is the original disaster.
+///   The floor holds that case deferred forever, health degraded:
+///   stale-but-verified forwarding plus an alarm beats withdrawing a
+///   live table.
+/// - **The floor alone** releases MID-LOAD, because a loading feed
+///   passes through every fraction on its way to full — by
+///   construction, not by bad luck. The first version used only the
+///   floor and hardware billed it precisely (shadow, 2026-08-08): the
+///   diff ran at have=527,557 of an eventual 1.05M, withdrew the
+///   not-yet-reloaded half from the live steered VPP, and the drill
+///   flow measured 12.75 s of blackhole. A count threshold cannot
+///   distinguish "loading, at 60%" from "loaded, shrunk to 60%"; only
+///   the growth rate can.
 pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
+
+/// Consecutive sub-threshold-growth checks before the source counts as
+/// loaded. Checks happen on the driver's tick cadence (sub-second), so
+/// this costs an adoption ~1.5–3 s — paid even when the source was
+/// already complete, deliberately, so there is exactly one path to the
+/// diff. The residual risk is a feed that stalls mid-load for the whole
+/// window; on this fleet the feed is one hop away (bird reloads at
+/// ~18k routes/s observed), making a multi-second silent stall the rare
+/// case, and its cost is bounded by the same deltas that finish the
+/// load.
+pub const SOURCE_QUIET_TICKS: u32 = 3;
+
+/// Growth per check below which the source is "quiet": 1/1024th of the
+/// adopted table, floored at 64 so tiny fixtures release promptly.
+/// Steady-state BGP churn on the reference fleet is tens of routes per
+/// second; a reload is tens of thousands — three orders of magnitude
+/// apart, so the exact divisor is not delicate.
+fn source_quiet_threshold(adopted: u64) -> u64 {
+    (adopted / 1024).max(64)
+}
 
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
@@ -366,7 +406,7 @@ impl Runtime {
                 pending: Vec::new(),
                 last_store_error: None,
                 last_drain_error: None,
-                deferred_resync_floor: None,
+                deferred_resync: None,
             })),
         }
     }
@@ -469,9 +509,7 @@ impl Runtime {
             drain_error: c.last_drain_error.clone(),
             source_backlog: c.source.backlog(),
             steer_configured_ports: c.steering.configured_ports(),
-            resync_deferred: c
-                .deferred_resync_floor
-                .map(|want| (c.source.route_count(), want)),
+            resync_deferred: c.deferred_resync.map(|d| (c.source.route_count(), d.floor)),
         }
     }
 }
@@ -500,7 +538,7 @@ pub struct RuntimeStatus {
     /// backlog there means VPP is not accepting.
     pub source_backlog: u64,
     /// `Some((have, want))` while an adopted resync is deferred for a
-    /// still-loading route source. See `Core::deferred_resync_floor`.
+    /// still-loading route source. See `Core::deferred_resync`.
     pub resync_deferred: Option<(u64, u64)>,
 }
 
@@ -653,15 +691,34 @@ impl Observe for ObserveView {
         // coming diff reads the full mirror and covers them, and
         // applying a partial feed's withdrawals early is the exact
         // hazard being deferred.
-        if let Some(floor) = c.deferred_resync_floor {
+        if let Some(mut d) = c.deferred_resync {
             let have = c.source.route_count();
-            if have < floor {
-                return Ok(crate::driver::Drain::AwaitingSource { have, want: floor });
+            // Both gates, in order: below the floor nothing else
+            // matters, and above it only sustained quiet counts — a
+            // loading feed passes through the floor by construction,
+            // which is how the floor-only version withdrew half a live
+            // table (2026-08-08).
+            let still_loading = have < d.floor
+                || have.saturating_sub(d.last_have) > source_quiet_threshold(d.adopted);
+            let released = if still_loading {
+                d.quiet_ticks = 0;
+                false
+            } else {
+                d.quiet_ticks += 1;
+                d.quiet_ticks >= SOURCE_QUIET_TICKS
+            };
+            d.last_have = have;
+            if !released {
+                c.deferred_resync = Some(d);
+                return Ok(crate::driver::Drain::AwaitingSource {
+                    have,
+                    want: d.floor,
+                });
             }
             tracing::info!(
                 have,
-                floor,
-                "route source crossed the deferral floor; running the adopted resync diff"
+                adopted = d.adopted,
+                "route source loaded and quiet; running the adopted resync diff"
             );
             {
                 let Core { engine, source, .. } = &mut *c;
@@ -671,7 +728,7 @@ impl Observe for ObserveView {
                     .map(|_| ())
                     .map_err(|e| e.to_string())?;
             }
-            c.deferred_resync_floor = None;
+            c.deferred_resync = None;
         }
         // Live changes are pulled in FIRST, so a route learned while VPP
         // was already converged goes out in this same batch rather than
@@ -864,37 +921,29 @@ impl Effects for EffectsView {
             // has not: the feed reconnects at startup and takes tens of
             // seconds to reload. Diffing an adopted ledger against that
             // window queues ~everything as a withdrawal — against a
-            // live, possibly steered VPP. Drill (d) on the shadow
-            // (2026-08-07): the drain began emptying a verified
-            // forwarding table, convergence failed, and the teardown
-            // killed the adopted VPP. So the diff waits below the floor;
-            // `drain_batch` runs it once the source crosses.
-            let floor = adopted / ADOPTED_SOURCE_FLOOR_DIVISOR;
+            // live, possibly steered VPP (drill (d), 2026-08-07). EVERY
+            // adoption defers, even one whose source already looks
+            // complete — a count cannot say "complete", only the
+            // floor-plus-quiescence gate in `drain_batch` can, and an
+            // above-floor count at this instant is exactly what a
+            // half-finished reload looks like (2026-08-08). One path to
+            // the diff, ~1.5–3 s of deliberate patience on the path
+            // that used to skip it.
             let have = source.route_count();
-            if have < floor {
-                tracing::warn!(
-                    have,
-                    adopted,
-                    floor,
-                    "adopted resync deferred: the route source is still loading, and a diff \
-                     now would withdraw most of a table VPP is forwarding with; keeping the \
-                     adopted FIB untouched until the source catches up"
-                );
-                Some(floor)
-            } else {
-                let _plan = engine.begin_resync(source.as_ref());
-                // Neighbours between attach and the first drain, and
-                // fatal on refusal: a route through an unprogrammed
-                // adjacency installs cleanly, verifies cleanly, and
-                // drops every packet.
-                engine
-                    .program_neighbours(source.as_ref())
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())?;
-                None
-            }
+            tracing::info!(
+                have,
+                adopted,
+                "adopted resync deferred until the route source is loaded and quiet; \
+                 the adopted FIB keeps forwarding untouched meanwhile"
+            );
+            Some(DeferredResync {
+                adopted,
+                floor: adopted / ADOPTED_SOURCE_FLOOR_DIVISOR,
+                last_have: have,
+                quiet_ticks: 0,
+            })
         };
-        c.deferred_resync_floor = deferral;
+        c.deferred_resync = deferral;
         Ok(())
     }
 
