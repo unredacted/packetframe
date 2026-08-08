@@ -248,8 +248,23 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
     // protection is partial and says so, rather than looping.
     const MAX_PASSES: u32 = 8;
     let mut passes = 0u32;
+    // Loop bookkeeping, deliberately SEPARATE from `saved.masks`.
+    //
+    // Only the first pass sees threads in their pre-restriction state,
+    // so only the first pass may contribute to the restoration record.
+    // A thread discovered later was created by an already-restricted
+    // parent, so the mask it carries is one WE caused — treating it as
+    // that thread's original policy would intersect `restorable` down
+    // to nothing (poisoning restoration for every post-attach thread)
+    // and record it as having nothing to give back, leaving it narrowed
+    // until the daemon restarts (review finding, caused by the rescan
+    // added one commit earlier). Later passes therefore restrict but do
+    // not record, which puts those threads on release's descendant path
+    // where `restorable` is the right answer for them.
+    let mut seen: Vec<(libc::pid_t, u64)> = Vec::new();
     loop {
         passes += 1;
+        let first_pass = passes == 1;
         let mut found_new = 0usize;
         let tasks =
             std::fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?;
@@ -267,13 +282,10 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
             let Some(started) = thread_start_ticks(tid) else {
                 continue; // exited between readdir and here
             };
-            if saved
-                .masks
-                .iter()
-                .any(|(t, st, _)| *t == tid && *st == started)
-            {
+            if seen.iter().any(|(t, st)| *t == tid && *st == started) {
                 continue;
             }
+            seen.push((tid, started));
             found_new += 1;
             let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
             let rc = unsafe {
@@ -295,20 +307,14 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
                 continue;
             }
             let before = mask;
-            // Record EVERY thread we observed, with its original mask —
-            // before deciding whether to change it. Release keys on this:
-            // a tid present here restores its original verbatim (a no-op for
-            // the ones we leave untouched below), and only a tid ABSENT is
-            // treated as born-after-restriction and unioned. Recording just
-            // the successfully-restricted threads was the bug (review
-            // finding): a thread skipped for an empty mask, or one whose
-            // setaffinity failed, would then be missing from the snapshot
-            // and wrongly unioned VPP's cores on release, broadening a
-            // policy it never had restricted.
-            // Narrow the intersection with this thread's original policy.
-            saved
-                .restorable
-                .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
+            // Narrow the intersection with this thread's ORIGINAL
+            // policy — first pass only, since that is the only pass
+            // whose masks predate our own edits.
+            if first_pass {
+                saved
+                    .restorable
+                    .retain(|cpu| unsafe { libc::CPU_ISSET(*cpu as usize, &before) });
+            }
             // Exactly the VPP cores this thread actually held — the set
             // release will put back, and nothing more.
             let mut removed: Vec<u16> = Vec::new();
@@ -324,9 +330,14 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
                     "this thread's whole mask IS VPP's cores; leaving it untouched — an \
                  unschedulable thread is worse than an unprotected worker"
                 );
-                // Observed, but nothing removed: recorded so release knows
-                // it is not a post-attach stranger, and leaves it alone.
-                saved.masks.push((tid, started, Vec::new()));
+                // Observed with nothing removed. Recorded ONLY on the
+                // first pass, where it proves the thread is not a
+                // post-attach stranger and release must leave it alone;
+                // a later-pass thread belongs on the descendant path
+                // instead.
+                if first_pass {
+                    saved.masks.push((tid, started, Vec::new()));
+                }
                 continue;
             }
             let rc = unsafe {
@@ -334,11 +345,16 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
             };
             if rc == 0 {
                 edited += 1;
-                saved.masks.push((tid, started, removed));
+                if first_pass {
+                    saved.masks.push((tid, started, removed));
+                }
             } else {
-                // The change did not land, so nothing was removed from this
-                // thread — but it was observed, and release must know that.
-                saved.masks.push((tid, started, Vec::new()));
+                // The change did not land, so nothing was removed from
+                // this thread — but it was observed, and (on the first
+                // pass) release must know that.
+                if first_pass {
+                    saved.masks.push((tid, started, Vec::new()));
+                }
                 errors.push(format!("tid {tid}: {}", std::io::Error::last_os_error()));
             }
         }
@@ -388,6 +404,12 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<(usize, AffinitySnapshot), 
 /// a thread we observed but skipped (its mask would have emptied) or
 /// failed to set has an EMPTY removed set, so release leaves it exactly
 /// as found while still proving it is not a post-attach stranger.
+///
+/// Only threads seen on the FIRST scan pass appear here. Later passes
+/// exist to catch threads spawned mid-scan, and those carry a mask this
+/// function already narrowed — recording that as their "original" would
+/// both empty `restorable` and promise them nothing back. They belong
+/// on the descendant path, which `restorable` answers correctly.
 ///
 /// A thread born DURING the restricted epoch has no capture, and no
 /// exact inverse exists for it — we never saw its creator's original
