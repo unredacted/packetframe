@@ -1004,3 +1004,143 @@ fn a_source_still_growing_past_the_floor_keeps_deferring() {
         "one withdrawal for the one prefix the source really dropped"
     );
 }
+
+/// Quiescence is a rate over elapsed time, never a per-check delta —
+/// pinned at production's check cadence.
+///
+/// The service loop caps its sleeps at 50 ms for stop-responsiveness,
+/// so `drain_batch` can be checked twenty times a second. At that
+/// cadence an 18k routes/s reload adds only ~900 per check — under any
+/// plausible per-check threshold — so a per-check gate calls a
+/// full-speed reload "quiet" and releases the diff ~150 ms into it
+/// (review finding on this PR). This drives the gate at exactly that
+/// cadence with per-check growth small and the RATE unmistakably a
+/// reload, and insists the diff stays shut.
+#[test]
+fn quiescence_is_a_rate_not_a_per_check_delta() {
+    use std::sync::{Arc, Mutex};
+
+    struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
+    impl RouteSource for SharedMirror {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in self.0.lock().unwrap().iter() {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+    fn stranger(i: usize) -> IpPrefix {
+        IpPrefix::V4 {
+            addr: [10, 8, (i / 250) as u8, (i % 250) as u8],
+            prefix_len: 32,
+        }
+    }
+
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 3, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 4, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 5, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "loop-cadence",
+        fake_vpp::Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    let shared = Arc::new(Mutex::new(vec![fake_vpp::v4(0, 0)]));
+    let rt = runtime_with_source(&fake, Box::new(SharedMirror(shared.clone())));
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // 30 routes per 50 ms check: tiny per check, 600/s as a rate —
+    // ten times the quiet threshold. The clock advances by the 50 ms
+    // production cap regardless of the tick's requested sleep, which
+    // is exactly what the service loop does.
+    let mut now = t0;
+    let mut n = 0usize;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..80 {
+            {
+                let mut g = shared.lock().unwrap();
+                for i in n..n + 30 {
+                    g.push(stranger(i));
+                }
+            }
+            n += 30;
+            now += Duration::from_millis(50);
+            let t = d.tick(now, &mut obs, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "a reload checked often enough to look small per-check must still \
+                 read as loading: {:?}",
+                t.events
+            );
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+        }
+    }
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    assert!(
+        fake.drain_events()
+            .into_iter()
+            .all(|e| !matches!(e, fake_vpp::Event::Route(_))),
+        "no route op may reach the live table during the reload"
+    );
+
+    // The reload ends; the source completes and goes quiet. Release
+    // needs SOURCE_QUIET_FOR of sustained quiet, then the diff runs.
+    {
+        let mut g = shared.lock().unwrap();
+        for i in 0..5u8 {
+            g.push(fake_vpp::v4(0, i));
+        }
+    }
+    let mut seen: Vec<Event> = Vec::new();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..128 {
+            now += Duration::from_millis(50);
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            if seen.contains(&Event::SyncComplete) {
+                break;
+            }
+        }
+    }
+    assert!(
+        seen.contains(&Event::SyncComplete),
+        "a quiet, loaded source must release the diff: {seen:?}"
+    );
+    let deletes: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![([10, 0, 5, 0], 24)],
+        "one withdrawal for the one prefix the source really dropped"
+    );
+}

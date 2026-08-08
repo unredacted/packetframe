@@ -111,7 +111,12 @@ pub trait Observe {
     /// budget, during which no ping is sent and no exit is noticed — so
     /// the wedge detector would either be useless or fire on a VPP that
     /// was working fine.
-    fn drain_batch(&mut self) -> Result<Drain, String>;
+    /// `now` is the loop's clock, for the adopted-resync release gate:
+    /// quiescence is a RATE over elapsed time, never a count of calls —
+    /// the production loop caps sleeps at 50 ms for stop-responsiveness,
+    /// so per-call growth shrinks with cadence and a per-call threshold
+    /// would call a full-speed reload "quiet" (review finding).
+    fn drain_batch(&mut self, now: Instant) -> Result<Drain, String>;
 }
 
 /// One tick's result.
@@ -284,7 +289,7 @@ impl Driver {
             // the settled tick's sleep to run the resync phase deadline
             // out and fail a convergence that was fine.
             if (resyncing || api_up_at_entry) && before != State::Verifying {
-                match obs.drain_batch() {
+                match obs.drain_batch(now) {
                     // Empty means the resync is done — and only the
                     // drain can say so, which is why this is observed
                     // rather than assumed after issuing StartResync.
@@ -535,7 +540,7 @@ mod tests {
                 Ok(())
             }
         }
-        fn drain_batch(&mut self) -> Result<Drain, String> {
+        fn drain_batch(&mut self, _now: Instant) -> Result<Drain, String> {
             self.drains += 1;
             if self.drain_fails {
                 return Err("socket closed".into());

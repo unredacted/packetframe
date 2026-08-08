@@ -318,10 +318,15 @@ struct DeferredResync {
     adopted: u64,
     /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
     floor: u64,
-    /// The source's count at the previous check, for the growth test.
+    /// The source's count at the previous check, for the growth rate.
     last_have: u64,
-    /// Consecutive checks with sub-threshold growth.
-    quiet_ticks: u32,
+    /// When `last_have` was observed. `None` until the first check —
+    /// a rate needs two observations.
+    last_check: Option<std::time::Instant>,
+    /// Since when the source has stayed below the quiet rate, or `None`
+    /// while it is loading. Release requires this to have lasted
+    /// [`SOURCE_QUIET_FOR`].
+    quiet_since: Option<std::time::Instant>,
 }
 
 /// The adopted diff runs only when the source holds at least
@@ -346,23 +351,26 @@ struct DeferredResync {
 ///   the growth rate can.
 pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
 
-/// Consecutive sub-threshold-growth checks before the source counts as
-/// loaded. Checks happen on the driver's tick cadence (sub-second), so
-/// this costs an adoption ~1.5–3 s — paid even when the source was
-/// already complete, deliberately, so there is exactly one path to the
-/// diff. The residual risk is a feed that stalls mid-load for the whole
-/// window; on this fleet the feed is one hop away (bird reloads at
-/// ~18k routes/s observed), making a multi-second silent stall the rare
-/// case, and its cost is bounded by the same deltas that finish the
-/// load.
-pub const SOURCE_QUIET_TICKS: u32 = 3;
+/// How long the source must stay below the quiet RATE before it counts
+/// as loaded. A duration, never a number of checks: the production loop
+/// caps its sleeps at 50 ms for stop-responsiveness, so check cadence is
+/// an implementation detail that varies by two orders of magnitude
+/// between the service loop and the tests — a per-check threshold
+/// shrinks per-call growth with cadence until a full-speed reload
+/// classifies as quiet (review finding; at 50 ms checks an 18k routes/s
+/// reload adds ~900 per check). This costs every populated adoption
+/// ~2 s of deliberate patience. The residual risk is a feed that stalls
+/// mid-load for the whole window; the feed is one hop away on this
+/// fleet, making a 2 s silent stall the rare case, and its cost is
+/// bounded by the same deltas that finish the load.
+pub const SOURCE_QUIET_FOR: Duration = Duration::from_secs(2);
 
-/// Growth per check below which the source is "quiet": 1/1024th of the
-/// adopted table, floored at 64 so tiny fixtures release promptly.
-/// Steady-state BGP churn on the reference fleet is tens of routes per
-/// second; a reload is tens of thousands — three orders of magnitude
-/// apart, so the exact divisor is not delicate.
-fn source_quiet_threshold(adopted: u64) -> u64 {
+/// Growth rate (routes per second) below which the source is "quiet":
+/// 1/1024th of the adopted table per second, floored at 64/s so tiny
+/// fixtures release promptly. Steady-state BGP churn on the reference
+/// fleet is tens of routes per second; a reload is ~18k/s — orders of
+/// magnitude on either side, so the exact divisor is not delicate.
+fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
     (adopted / 1024).max(64)
 }
 
@@ -682,7 +690,7 @@ impl Observe for ObserveView {
             .map_err(|e| e.to_string())
     }
 
-    fn drain_batch(&mut self) -> Result<crate::driver::Drain, String> {
+    fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, String> {
         let mut c = self.core.borrow_mut();
         // A deferred adopted resync is re-checked here, on the driver's
         // paced cadence, because this is the only Observe call that runs
@@ -694,20 +702,35 @@ impl Observe for ObserveView {
         if let Some(mut d) = c.deferred_resync {
             let have = c.source.route_count();
             // Both gates, in order: below the floor nothing else
-            // matters, and above it only sustained quiet counts — a
-            // loading feed passes through the floor by construction,
-            // which is how the floor-only version withdrew half a live
-            // table (2026-08-08).
-            let still_loading = have < d.floor
-                || have.saturating_sub(d.last_have) > source_quiet_threshold(d.adopted);
-            let released = if still_loading {
-                d.quiet_ticks = 0;
-                false
-            } else {
-                d.quiet_ticks += 1;
-                d.quiet_ticks >= SOURCE_QUIET_TICKS
+            // matters, and above it only quiet SUSTAINED FOR A DURATION
+            // counts — a loading feed passes through the floor by
+            // construction (the floor-only version withdrew half a live
+            // table, 2026-08-08), and "quiet" is a rate over elapsed
+            // time, never a per-call delta: the production loop caps
+            // its sleeps at 50 ms, so a per-call threshold shrinks with
+            // cadence until a full-speed reload classifies as quiet.
+            let growth_per_sec = match d.last_check {
+                // A rate needs two observations; the first check only
+                // baselines, and reports as loading — which a source
+                // this young almost certainly is.
+                None => u64::MAX,
+                Some(prev) => {
+                    let ms = now.duration_since(prev).as_millis().max(1) as u64;
+                    have.saturating_sub(d.last_have).saturating_mul(1_000) / ms
+                }
             };
+            let still_loading =
+                have < d.floor || growth_per_sec > source_quiet_rate_per_sec(d.adopted);
+            if still_loading {
+                d.quiet_since = None;
+            } else if d.quiet_since.is_none() {
+                d.quiet_since = Some(now);
+            }
+            let released = d
+                .quiet_since
+                .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
             d.last_have = have;
+            d.last_check = Some(now);
             if !released {
                 c.deferred_resync = Some(d);
                 return Ok(crate::driver::Drain::AwaitingSource {
@@ -962,7 +985,8 @@ impl Effects for EffectsView {
                     adopted,
                     floor: adopted / ADOPTED_SOURCE_FLOOR_DIVISOR,
                     last_have: have,
-                    quiet_ticks: 0,
+                    last_check: None,
+                    quiet_since: None,
                 })
             }
         };
@@ -1293,7 +1317,7 @@ mod tests {
         assert_eq!(obs.poll_exit(), None);
         assert!(!obs.api_ready(), "nothing is listening");
         assert!(obs.ping().is_err());
-        assert!(obs.drain_batch().is_err());
+        assert!(obs.drain_batch(std::time::Instant::now()).is_err());
     }
 
     /// A store that fails at spawn time must kill the child. A VPP
