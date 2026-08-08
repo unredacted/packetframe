@@ -581,6 +581,23 @@ fn finish(
             ));
         }
     };
+    // A recorded process whose PLACEMENT is unknown must not be adopted.
+    //
+    // Same rule as the incomplete identity cookie above, and the same
+    // rule `expected_routes == 0` follows in `acquire`: unknown is not
+    // the same as unconstrained. VPP fixes thread placement at start,
+    // so if the file names a live VPP but not the cores it runs on —
+    // a state written by a binary from before `vpp_cores` existed —
+    // then this daemon cannot know which CPUs to keep off. It would
+    // vacate the freshly derived set, which is only right if the online
+    // CPU set has not changed since, and being wrong reinstates the
+    // preemption silently.
+    if prior.is_some() && state.vpp_cores.is_empty() {
+        return Err(format!(
+            "{}: the state file records a running VPP but not the CPUs it was placed on              (written by a packetframe from before that was recorded). Its worker's core              cannot be known, so this daemon cannot guarantee it stays off it, and a              resync burst sharing that core is exactly the packet loss this avoids. Stop              that VPP and `packetframe detach --all`, then attach again — the new record              will carry the placement.",
+            crate::service::MAY_HOLD_RESOURCES
+        ));
+    }
     let adopted: Option<VppProcess> = match prior {
         // A FAILED adoption is marked, because failing is not the same as
         // finding nothing: `adopt` declines cleanly (`Ok(None)`) when the
@@ -640,6 +657,11 @@ fn finish(
     // (see `service`), which is also why the resource owner is built in
     // here rather than passed in: it shares one record between the
     // identity store and the release seam through an `Rc`.
+    // Owned before the factory closure captures it: the closure outlives
+    // this borrow of `core_map`.
+    let spawn_cores: Vec<u16> = std::iter::once(core_map.main)
+        .chain(core_map.workers.iter().copied())
+        .collect();
     let factory: LoopFactory = Box::new(move || {
         let engine = ConvergenceEngine::new(
             api_socket_path,
@@ -655,6 +677,17 @@ fn finish(
         // borrow checker just refused.
         let inherited_rule_count: usize =
             state.steer_rules.iter().map(|(_, locs)| locs.len()).sum();
+        // Not adopting means the supervisor will SPAWN, and it will spawn
+        // against the startup.conf just rendered from `core_map` — so
+        // that, not whatever a previous VPP used, is where this process's
+        // threads will be. Recording it here keeps the file describing the
+        // VPP that actually exists; leaving the old value would have the
+        // next daemon vacate a placement nothing runs on, which is the
+        // same silent preemption one generation removed (review finding).
+        let mut state = state;
+        if adopted.is_none() {
+            state.vpp_cores = spawn_cores;
+        }
         let owner = SharedOwner::new(ResourceOwner::new(state, sys));
         let runtime = Runtime::new(
             engine,
