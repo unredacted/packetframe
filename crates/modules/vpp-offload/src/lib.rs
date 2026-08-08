@@ -989,6 +989,9 @@ mod tests {
         fn route_count(&self) -> u64 {
             0
         }
+        fn change_seq(&self) -> u64 {
+            0
+        }
     }
 
     /// A published snapshot the loop would produce in the designed

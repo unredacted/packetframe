@@ -32,6 +32,9 @@ impl RouteSource for Mirror {
         self.for_each_route(&mut |_, _| n += 1);
         n
     }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
 
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.0 {

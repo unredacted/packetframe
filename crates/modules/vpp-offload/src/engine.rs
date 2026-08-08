@@ -188,6 +188,17 @@ pub trait RouteSource {
     /// The compiler now makes every implementor answer; a fixture's
     /// answer is one line.
     fn route_count(&self) -> u64;
+
+    /// Mutations ever applied to this source — a monotonic activity
+    /// counter, NOT the table size. The adopted-resync gate's
+    /// quiescence signal: net size hides balanced churn and reads a
+    /// shrinking source as quiet, and both of those mid-reload would
+    /// release a diff against an incomplete mirror (review finding). A
+    /// static fixture may return any constant (including its length);
+    /// what matters is that it changes exactly when the source does.
+    /// No default body, same reason as `route_count`: a defaulted
+    /// method lets a delegating wrapper silently not-delegate.
+    fn change_seq(&self) -> u64;
 }
 
 /// One route change: the prefix, and its new nexthop set — or `None`
@@ -1198,6 +1209,9 @@ mod tests {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
             n
+        }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
         }
 
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {

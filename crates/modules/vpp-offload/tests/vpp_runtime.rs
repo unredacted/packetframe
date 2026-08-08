@@ -38,6 +38,9 @@ impl RouteSource for Mirror {
         self.for_each_route(&mut |_, _| n += 1);
         n
     }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
 
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.routes {
@@ -713,6 +716,9 @@ fn an_adopted_resync_waits_for_the_source_instead_of_withdrawing_the_table() {
             self.for_each_route(&mut |_, _| n += 1);
             n
         }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
+        }
 
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             for p in self.0.lock().unwrap().iter() {
@@ -883,6 +889,9 @@ fn a_source_still_growing_past_the_floor_keeps_deferring() {
             self.for_each_route(&mut |_, _| n += 1);
             n
         }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
+        }
 
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             for p in self.0.lock().unwrap().iter() {
@@ -1044,6 +1053,9 @@ fn quiescence_is_a_rate_not_a_per_check_delta() {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
             n
+        }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
         }
 
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
@@ -1233,4 +1245,134 @@ fn a_dead_source_never_releases_a_populated_adoption() {
             .all(|e| !matches!(e, fake_vpp::Event::Route(_))),
         "the sole live route must not be withdrawn"
     );
+}
+
+/// Quiescence is measured on the change counter, not on net table size.
+///
+/// A source churning in place — every add balanced by a withdrawal —
+/// has zero net growth and is anything but quiet; releasing the diff
+/// into that turbulence withdraws whatever the churn has not yet
+/// restored (review finding). This holds a source whose SIZE never
+/// moves while its change counter runs hot, far past the quiet window,
+/// and insists the diff stays shut; when the churn stops, it releases.
+#[test]
+fn balanced_churn_is_not_quiescence() {
+    use std::sync::{Arc, Mutex};
+
+    /// Fixed-size route set with an explicit activity counter.
+    struct ChurningMirror {
+        routes: Vec<IpPrefix>,
+        seq: Arc<Mutex<u64>>,
+    }
+    impl RouteSource for ChurningMirror {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in &self.routes {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            *self.seq.lock().unwrap()
+        }
+    }
+
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 3, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 4, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 5, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "loop-churn",
+        fake_vpp::Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    let seq = Arc::new(Mutex::new(0u64));
+    // Above the floor from the first check: five of the six adopted
+    // prefixes. Only the churn keeps the gate shut.
+    let rt = runtime_with_source(
+        &fake,
+        Box::new(ChurningMirror {
+            routes: (0..5).map(|i| fake_vpp::v4(0, i)).collect(),
+            seq: seq.clone(),
+        }),
+    );
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // 100 mutations per 100 ms check = 1000/s, fifteen times the quiet
+    // threshold — with the table size frozen throughout.
+    let mut now = t0;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..60 {
+            *seq.lock().unwrap() += 100;
+            now += Duration::from_millis(100);
+            let t = d.tick(now, &mut obs, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "balanced churn has zero net growth and must still read as \
+                 loading: {:?}",
+                t.events
+            );
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+        }
+    }
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    assert!(
+        fake.drain_events()
+            .into_iter()
+            .all(|e| !matches!(e, fake_vpp::Event::Route(_))),
+        "no route op may reach the live table during churn"
+    );
+
+    // The churn stops; the gate releases and the diff withdraws exactly
+    // the one genuinely-gone prefix.
+    let mut seen: Vec<Event> = Vec::new();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..128 {
+            now += Duration::from_millis(100);
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            if seen.contains(&Event::SyncComplete) {
+                break;
+            }
+        }
+    }
+    assert!(
+        seen.contains(&Event::SyncComplete),
+        "a genuinely quiet source must release the diff: {seen:?}"
+    );
+    let deletes: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deletes, vec![([10, 0, 5, 0], 24)]);
 }

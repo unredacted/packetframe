@@ -318,9 +318,11 @@ struct DeferredResync {
     adopted: u64,
     /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
     floor: u64,
-    /// The source's count at the previous check, for the growth rate.
-    last_have: u64,
-    /// When `last_have` was observed. `None` until the first check —
+    /// The source's change counter at the previous check, for the
+    /// activity rate. The COUNTER, not the table size: net size hides
+    /// balanced churn and reads a shrinking source as quiet.
+    last_seq: u64,
+    /// When `last_seq` was observed. `None` until the first check —
     /// a rate needs two observations.
     last_check: Option<std::time::Instant>,
     /// Since when the source has stayed below the quiet rate, or `None`
@@ -365,11 +367,14 @@ pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
 /// bounded by the same deltas that finish the load.
 pub const SOURCE_QUIET_FOR: Duration = Duration::from_secs(2);
 
-/// Growth rate (routes per second) below which the source is "quiet":
-/// 1/1024th of the adopted table per second, floored at 64/s so tiny
-/// fixtures release promptly. Steady-state BGP churn on the reference
-/// fleet is tens of routes per second; a reload is ~18k/s — orders of
-/// magnitude on either side, so the exact divisor is not delicate.
+/// Activity rate (mutations per second) below which the source is
+/// "quiet": 1/1024th of the adopted table per second, floored at 64/s
+/// so tiny fixtures release promptly. Measured on the CHANGE COUNTER,
+/// not on table growth — balanced churn and active shrink are zero
+/// growth and are anything but quiet (review finding). Steady-state
+/// BGP churn on the reference fleet is tens of mutations per second; a
+/// reload is ~18k/s — orders of magnitude on either side, so the exact
+/// divisor is not delicate.
 fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
     (adopted / 1024).max(64)
 }
@@ -709,18 +714,19 @@ impl Observe for ObserveView {
             // time, never a per-call delta: the production loop caps
             // its sleeps at 50 ms, so a per-call threshold shrinks with
             // cadence until a full-speed reload classifies as quiet.
-            let growth_per_sec = match d.last_check {
+            let seq = c.source.change_seq();
+            let activity_per_sec = match d.last_check {
                 // A rate needs two observations; the first check only
                 // baselines, and reports as loading — which a source
                 // this young almost certainly is.
                 None => u64::MAX,
                 Some(prev) => {
                     let ms = now.duration_since(prev).as_millis().max(1) as u64;
-                    have.saturating_sub(d.last_have).saturating_mul(1_000) / ms
+                    seq.saturating_sub(d.last_seq).saturating_mul(1_000) / ms
                 }
             };
             let still_loading =
-                have < d.floor || growth_per_sec > source_quiet_rate_per_sec(d.adopted);
+                have < d.floor || activity_per_sec > source_quiet_rate_per_sec(d.adopted);
             if still_loading {
                 d.quiet_since = None;
             } else if d.quiet_since.is_none() {
@@ -729,7 +735,7 @@ impl Observe for ObserveView {
             let released = d
                 .quiet_since
                 .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
-            d.last_have = have;
+            d.last_seq = seq;
             d.last_check = Some(now);
             if !released {
                 c.deferred_resync = Some(d);
@@ -975,6 +981,7 @@ impl Effects for EffectsView {
                 None
             } else {
                 let have = source.route_count();
+                let seq = source.change_seq();
                 tracing::info!(
                     have,
                     adopted,
@@ -990,7 +997,7 @@ impl Effects for EffectsView {
                     // exists for (review finding). A populated
                     // adoption's floor is never satisfied by nothing.
                     floor: (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
-                    last_have: have,
+                    last_seq: seq,
                     last_check: None,
                     quiet_since: None,
                 })
@@ -1058,6 +1065,9 @@ mod tests {
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
         fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
             0
         }
     }

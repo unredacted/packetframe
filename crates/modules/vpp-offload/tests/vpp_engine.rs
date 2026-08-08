@@ -39,6 +39,9 @@ impl RouteSource for Mirror {
         self.for_each_route(&mut |_, _| n += 1);
         n
     }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
 
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.routes {
@@ -269,6 +272,9 @@ impl RouteSource for OrphanedMirror {
         self.for_each_route(&mut |_, _| n += 1);
         n
     }
+    fn change_seq(&self) -> u64 {
+        self.route_count()
+    }
 
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.routes {
@@ -461,6 +467,9 @@ fn neighbours_on_foreign_devices_are_skipped() {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
             n
+        }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
         }
 
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
