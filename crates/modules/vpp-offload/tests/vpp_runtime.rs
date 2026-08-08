@@ -33,6 +33,12 @@ struct Mirror {
 }
 
 impl RouteSource for Mirror {
+    fn route_count(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_route(&mut |_, _| n += 1);
+        n
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.routes {
             visit(*p, &[fake_vpp::nh()]);
@@ -702,6 +708,12 @@ fn an_adopted_resync_waits_for_the_source_instead_of_withdrawing_the_table() {
     /// route feed mid-reload, as a fixture.
     struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn route_count(&self) -> u64 {
+            let mut n = 0u64;
+            self.for_each_route(&mut |_, _| n += 1);
+            n
+        }
+
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             for p in self.0.lock().unwrap().iter() {
                 visit(*p, &[fake_vpp::nh()]);
@@ -866,6 +878,12 @@ fn a_source_still_growing_past_the_floor_keeps_deferring() {
 
     struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn route_count(&self) -> u64 {
+            let mut n = 0u64;
+            self.for_each_route(&mut |_, _| n += 1);
+            n
+        }
+
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             for p in self.0.lock().unwrap().iter() {
                 visit(*p, &[fake_vpp::nh()]);
@@ -1022,6 +1040,12 @@ fn quiescence_is_a_rate_not_a_per_check_delta() {
 
     struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn route_count(&self) -> u64 {
+            let mut n = 0u64;
+            self.for_each_route(&mut |_, _| n += 1);
+            n
+        }
+
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             for p in self.0.lock().unwrap().iter() {
                 visit(*p, &[fake_vpp::nh()]);

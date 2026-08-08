@@ -329,6 +329,15 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
         (**self).for_each_neighbour(visit)
     }
+    // EVERY method with a default body must be forwarded here by hand,
+    // because a default hides its own omission: this delegation compiled
+    // cleanly while routing `route_count` — polled every ~50 ms by the
+    // adopted-resync gate, and this Arc is exactly what the production
+    // loader boxes — to the default full-mirror walk instead of the
+    // O(1) length one deref away (review finding).
+    fn route_count(&self) -> u64 {
+        (**self).route_count()
+    }
 }
 
 /// Kernel interface name for `ifindex`, or `None` if the link is gone.

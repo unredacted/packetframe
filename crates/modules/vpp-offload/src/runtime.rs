@@ -1051,6 +1051,9 @@ mod tests {
     impl RouteSource for EmptySource {
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+        fn route_count(&self) -> u64 {
+            0
+        }
     }
 
     fn engine() -> ConvergenceEngine {

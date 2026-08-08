@@ -27,6 +27,12 @@ use packetframe_vpp_offload::supervisor::{Event, State};
 
 struct Mirror(Vec<IpPrefix>);
 impl RouteSource for Mirror {
+    fn route_count(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_route(&mut |_, _| n += 1);
+        n
+    }
+
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for p in &self.0 {
             visit(*p, &[fake_vpp::nh()]);
