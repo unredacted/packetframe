@@ -217,7 +217,7 @@ fn mask_too_small(e: &std::io::Error) -> bool {
 /// Applied to every task in `/proc/self/task`; threads spawned later
 /// inherit their creator's mask.
 #[cfg(target_os = "linux")]
-pub fn restrict_daemon_from(map: &CoreMap) -> Result<usize, String> {
+pub fn restrict_daemon_from(vpp_cores: &[u16]) -> Result<usize, String> {
     let mut edited = 0usize;
     let mut errors: Vec<String> = Vec::new();
     // Rescan until a whole pass finds nothing new.
@@ -286,14 +286,8 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<usize, String> {
                 // not a fault.
                 continue;
             }
-            // Exactly the VPP cores this thread actually held — the set
-            // release will put back, and nothing more.
-            let mut removed: Vec<u16> = Vec::new();
-            for cpu in std::iter::once(map.main).chain(map.workers.iter().copied()) {
-                if unsafe { libc::CPU_ISSET(cpu as usize, &mask) } {
-                    unsafe { libc::CPU_CLR(cpu as usize, &mut mask) };
-                    removed.push(cpu);
-                }
+            for cpu in vpp_cores {
+                unsafe { libc::CPU_CLR(*cpu as usize, &mut mask) };
             }
             if unsafe { libc::CPU_COUNT(&mask) } == 0 {
                 tracing::warn!(
@@ -359,7 +353,7 @@ pub fn restrict_daemon_from(map: &CoreMap) -> Result<usize, String> {
 // design, not by omission.
 
 #[cfg(not(target_os = "linux"))]
-pub fn restrict_daemon_from(_map: &CoreMap) -> Result<usize, String> {
+pub fn restrict_daemon_from(_vpp_cores: &[u16]) -> Result<usize, String> {
     // Non-Linux never attaches a VPP; there is nothing to protect.
     Ok(0)
 }
@@ -424,15 +418,12 @@ mod affinity_tests {
             return; // cannot express "narrower than allowed" here
         }
         let (a, b, c) = (allowed[0], allowed[1], allowed[2]);
-        let map = CoreMap {
-            main: b as u16,
-            workers: vec![],
-        };
+        let vpp = [b as u16];
 
         // Operator narrowed the daemon to {a, b}; VPP takes b. Their
         // exclusion of c must survive: subtract, never rebuild.
         set_mask(&[a, b]);
-        let edited = restrict_daemon_from(&map).expect("restrict");
+        let edited = restrict_daemon_from(&vpp).expect("restrict");
         assert!(edited >= 1, "at least this thread was edited");
         assert!(!isset(b), "VPP's core is excluded");
         assert!(isset(a), "the rest of the policy is kept");
@@ -441,7 +432,7 @@ mod affinity_tests {
         // A mask that IS VPP's cores is skipped, not emptied: an
         // unschedulable thread is worse than an unprotected worker.
         set_mask(&[b]);
-        restrict_daemon_from(&map).expect("skip tolerated");
+        restrict_daemon_from(&vpp).expect("skip tolerated");
         assert!(isset(b), "the only usable core is left in place");
 
         let rc =
@@ -472,10 +463,7 @@ mod affinity_tests {
         }
         let (a, b) = (allowed[0], allowed[1]);
         set_mask(&[a, b]);
-        let map = CoreMap {
-            main: b as u16,
-            workers: vec![],
-        };
+        let vpp = [b as u16];
 
         let (born_tx, born_rx) = channel();
         let (go_tx, go_rx) = channel();
@@ -494,7 +482,7 @@ mod affinity_tests {
         });
         born_rx.recv().expect("child exists before the scan");
 
-        restrict_daemon_from(&map).expect("restrict");
+        restrict_daemon_from(&vpp).expect("restrict");
         go_tx.send(()).expect("let the child read its mask");
         let child_on_vpp_core = got_rx.recv().expect("child reported");
         child.join().expect("child joined");

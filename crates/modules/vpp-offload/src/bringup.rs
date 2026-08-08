@@ -341,21 +341,48 @@ pub fn bring_up(
     // 2026-08-08). Warn-and-continue on partial failure: a cgroup that
     // refuses the mask degrades protection, and failing the attach over
     // it would brick deployments that share cores gracefully today.
-    match cores::restrict_daemon_from(&core_map) {
+    // The cores to vacate: the map just derived, PLUS any placement a
+    // previous attach recorded.
+    //
+    // The union rather than either alone, because which one is right
+    // depends on something not yet known here — whether `finish` below
+    // will adopt a surviving VPP or spawn a fresh one. VPP fixes thread
+    // placement at start, so an adopted VPP is on the RECORDED cores
+    // while a fresh one will be on the DERIVED cores, and the two differ
+    // exactly when the online CPU set changed in between (a core
+    // offlined for thermal reasons, or administratively). Vacating both
+    // sets is correct under either outcome and costs the daemon nothing
+    // when they agree, which is every ordinary restart (review finding).
+    let derived_cores: Vec<u16> = std::iter::once(core_map.main)
+        .chain(core_map.workers.iter().copied())
+        .collect();
+    let mut vacate = derived_cores.clone();
+    if let Ok(Some(prior)) = ResourceState::load(&paths.sys.state_dir) {
+        for cpu in prior.vpp_cores {
+            if !vacate.contains(&cpu) {
+                tracing::info!(
+                    cpu,
+                    "a previous attach placed a VPP thread here; vacating it too in case \
+                     this attach adopts that VPP rather than spawning a new one"
+                );
+                vacate.push(cpu);
+            }
+        }
+    }
+    vacate.sort_unstable();
+    match cores::restrict_daemon_from(&vacate) {
         // `0` is NOT success: no mask changed, so the daemon is still
         // free to run on VPP's cores. Logging it as a restriction would
         // be the claim-because-requested shape this module exists to
         // avoid — say plainly that it did not happen.
         Ok(0) => tracing::warn!(
-            vpp_main = core_map.main,
-            vpp_workers = ?core_map.workers,
+            vacated = ?vacate,
             "no daemon thread accepted an affinity change; the daemon can still be \
              scheduled onto VPP's cores and resync bursts may preempt the worker"
         ),
         Ok(threads) => tracing::info!(
             threads,
-            vpp_main = core_map.main,
-            vpp_workers = ?core_map.workers,
+            vacated = ?vacate,
             "daemon threads restricted away from VPP's cores"
         ),
         Err(e) => tracing::warn!(
@@ -369,7 +396,13 @@ pub fn bring_up(
     // any other failure path: see `cores::restrict_daemon_from` — a CPU
     // mask is per-process state and every one of these paths ends the
     // daemon, so there is nothing to hand it back to.
-    let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
+    let (state, acquired) = acquire::acquire(
+        &paths.sys,
+        &ports,
+        pages,
+        cfg.expected_routes,
+        &derived_cores,
+    )?;
 
     // From here, every failure releases. `?` would return holding VFs
     // and a hugepage reservation that only the state file knows about —
