@@ -167,6 +167,132 @@ pub fn derive_from_sysfs(sysfs_cpu: &std::path::Path, workers: u32) -> Result<Co
 /// Where the CPU topology lives on a running kernel.
 pub const SYSFS_CPU: &str = "/sys/devices/system/cpu";
 
+/// Keep every thread of THIS daemon off VPP's cores.
+///
+/// The missing half of the plan's "cpuset + SCHED_FIFO" promise, found
+/// by a week of drills (shadow, 2026-08-08). VPP's worker polls its rx
+/// ring from a dedicated core, but `isolcpus` on this fleet belongs to
+/// unifi-core and nothing constrained the daemon: at every adopted
+/// resync's release, `begin_resync` walks a 1.3M-entry mirror and the
+/// first drain batches encode thousands of routes — seconds of
+/// memory-heavy burst that the scheduler was free to place on the
+/// worker's core. A preempted poll loop overflows a 1024-descriptor rx
+/// ring in ~2 s at the drill rate, and the drops happen at the NIC,
+/// invisible to every VPP error counter — which is how three correct
+/// fixes to the FIB-side work at the release instant each left the
+/// measured ~5.4 s gap unmoved.
+///
+/// Applied to every task in `/proc/self/task` at attach; threads
+/// spawned afterwards inherit their creator's mask. Errors are
+/// collected, not fatal: a cgroup cpuset that refuses us is a reason to
+/// warn, and refusing to attach over it would fail deployments that
+/// merely share cores gracefully today.
+#[cfg(target_os = "linux")]
+pub fn restrict_daemon_from(map: &CoreMap) -> Result<usize, String> {
+    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if online <= 0 {
+        return Err("cannot determine online CPU count".into());
+    }
+    let mut kept = 0usize;
+    for cpu in 0..online as u16 {
+        if cpu == map.main || map.workers.contains(&cpu) {
+            continue;
+        }
+        unsafe { libc::CPU_SET(cpu as usize, &mut mask) };
+        kept += 1;
+    }
+    if kept == 0 {
+        return Err("the core map claims every online CPU; refusing an empty mask".into());
+    }
+    let mut set = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let tasks =
+        std::fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?;
+    for entry in tasks.flatten() {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let rc =
+            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
+        if rc == 0 {
+            set += 1;
+        } else {
+            errors.push(format!("tid {tid}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    if set == 0 {
+        return Err(format!(
+            "no thread accepted the affinity mask: {}",
+            errors.join("; ")
+        ));
+    }
+    if !errors.is_empty() {
+        tracing::warn!(
+            set,
+            failed = errors.len(),
+            "some threads kept their old affinity: {}",
+            errors.join("; ")
+        );
+    }
+    Ok(set)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn restrict_daemon_from(_map: &CoreMap) -> Result<usize, String> {
+    // Non-Linux never attaches a VPP; there is nothing to protect.
+    Ok(0)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod affinity_tests {
+    use super::*;
+
+    /// The mask really lands on the calling process: after restriction,
+    /// the current thread's affinity excludes VPP's cores and includes
+    /// at least one other. Read back via sched_getaffinity — asserting
+    /// the syscall's effect, not our intent to make it.
+    #[test]
+    fn restriction_excludes_vpp_cores_and_keeps_the_rest() {
+        let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if online < 2 {
+            // A single-CPU runner cannot express "everything but".
+            return;
+        }
+        let map = CoreMap {
+            main: (online - 1) as u16,
+            workers: vec![],
+        };
+        let set = restrict_daemon_from(&map).expect("restriction");
+        assert!(set >= 1, "at least this thread's mask was set");
+
+        let mut got: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let rc =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut got) };
+        assert_eq!(rc, 0);
+        assert!(
+            !unsafe { libc::CPU_ISSET((online - 1) as usize, &got) },
+            "VPP's core must be excluded"
+        );
+        assert!(
+            unsafe { libc::CPU_ISSET(0, &got) },
+            "the remaining cores must stay usable"
+        );
+
+        // Restore a full mask so later tests in this process are not
+        // constrained by this one.
+        let mut all: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        for cpu in 0..online as usize {
+            unsafe { libc::CPU_SET(cpu, &mut all) };
+        }
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &all) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
