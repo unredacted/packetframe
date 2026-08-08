@@ -552,59 +552,35 @@ pub fn find_loopback(t: &mut Transport) -> Result<Option<u32>, TransportError> {
     Ok(found.first().copied())
 }
 
-/// `VNET_API_ERROR_DUPLICATE_IF_ADDRESS` from vnet/error.h (stable/2506).
+/// Reconcile an adopted loopback: re-assert admin-up, and admin-up
+/// ONLY.
 ///
-/// VPP's error string says "already present on another interface" and the
-/// string is wrong: `ip4_add_del_interface_address_internal` returns this
-/// for an exact-prefix re-add on the **same** interface. The
-/// cross-interface conflict is `-105 ADDRESS_IN_USE` — which is what the
-/// shadow produced when a second loopback was given the first one's
-/// address, and that observation is what disambiguates the two. Checked
-/// against the source rather than recalled, because "re-adding an address
-/// is idempotent" was the recalled version and it is false.
-pub const VNET_API_ERROR_DUPLICATE_IF_ADDRESS: i32 = -127;
-
-/// Reconcile an adopted loopback: re-assert its address and admin-up.
+/// The address is deliberately **not** re-asserted, and the history is
+/// the argument. The first version trusted the name alone; the second
+/// re-asserted the address, accepting `-127 DUPLICATE_IF_ADDRESS` as
+/// "already exactly where we want it" (correct per stable/2506 source
+/// for a plain same-interface re-add). Hardware then refuted the model
+/// (shadow, 2026-08-08): with member ports **unnumbered to the
+/// loopback**, VPP's cross-interface conflict scan sees the borrowed
+/// address as held by another interface and answers `-105
+/// ADDRESS_IN_USE` — on every healthy adoption of this design's own
+/// steady state. `-105` is also the genuine-conflict signal, so on this
+/// topology the re-assert carries zero distinguishing information, and
+/// whitelisting it would bless real conflicts. The failure it caused
+/// was not hypothetical: the refusal drove teardown, killed the adopted
+/// VPP, and the fresh respawn re-steered into a 6-second-old partial
+/// table for 27 s of measured blackhole.
 ///
-/// Discovery alone is not adoption. [`find_loopback`] matches by name,
-/// and a name proves nothing about the two properties `create_loopback`
-/// establishes after creating: the address members borrow, and admin-up.
-/// A daemon crash between `create_loopback`'s create and its address-add
-/// leaves exactly that — a named, addressless loopback — and adopting it
-/// blind puts every member behind `ip4-not-enabled` with the FIB verified
-/// green. The member reuse path re-asserts admin-up, MAC and unnumbered
-/// for the same reason; this is the loopback's version of that reconcile
-/// point.
-///
-/// The address re-assert cannot be a plain "must return 0": VPP answers
-/// an exact re-add on the same interface with
-/// [`VNET_API_ERROR_DUPLICATE_IF_ADDRESS`], which here means *the address
-/// is already exactly where we want it* — the common case on every
-/// healthy adoption. Anything else, including `-105 ADDRESS_IN_USE`
-/// (something *else* holds the address), stays fatal.
-pub fn adopt_loopback(
-    t: &mut Transport,
-    loop_idx: u32,
-    addr: Ipv4Prefix,
-) -> Result<(), AttachError> {
-    let reply = t.request::<SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply>(
-        SwInterfaceAddDelAddress {
-            context: 0,
-            sw_if_index: loop_idx,
-            is_add: true,
-            del_all: false,
-            prefix: prefix_of(addr),
-        },
-    )?;
-    if reply.retval != 0 && reply.retval != VNET_API_ERROR_DUPLICATE_IF_ADDRESS {
-        return Err(AttachError::Refused {
-            step: "sw_interface_add_del_address (adopt)",
-            port: "loop0".into(),
-            retval: reply.retval,
-            detail: format!("{}/{}", addr.addr, addr.prefix_len),
-        });
-    }
-
+/// What this deliberately leaves open: a daemon crash between
+/// `create_loopback`'s create and its address-add leaves a named,
+/// addressless loopback that adoption will trust. That window is two
+/// adjacent API round trips on a unix socket, no whitelisted message
+/// can dump addresses to check (`sw_interface_dump` reports MACs, not
+/// prefixes), and the cure measured worse than the disease. Closing it
+/// properly means adding `ip_address_dump` to the API whitelist and
+/// doing a true readback — tracked as future hardening, not faked with
+/// a probe whose answer cannot be interpreted.
+pub fn adopt_loopback(t: &mut Transport, loop_idx: u32) -> Result<(), AttachError> {
     let reply =
         t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
             context: 0,
