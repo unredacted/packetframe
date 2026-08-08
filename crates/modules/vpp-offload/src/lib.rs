@@ -867,6 +867,9 @@ impl Module for VppOffloadModule {
                 }
             )));
         }
+        // The daemon's affinity restriction is deliberately not undone:
+        // a CPU mask is per-process state and every caller of this
+        // method exits the process (see `cores::restrict_daemon_from`).
         Ok(())
     }
 

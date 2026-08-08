@@ -123,6 +123,7 @@ pub fn acquire(
     ports: &[(String, u16)],
     pages: u32,
     expected_routes: u64,
+    vpp_cores: &[u16],
 ) -> Result<(ResourceState, Acquired), String> {
     // How many leading ports are already recorded. Adoption with a
     // complete record returns early below; a PARTIAL record — a daemon
@@ -224,6 +225,11 @@ pub fn acquire(
         None => {
             let mut state = ResourceState::empty();
             state.expected_routes = expected_routes;
+            // Placement, recorded for the same reason as the sizing:
+            // VPP fixes it at start, so only the file can tell the next
+            // daemon where a surviving VPP's threads actually are. See
+            // `ResourceState::vpp_cores`.
+            state.vpp_cores = vpp_cores.to_vec();
             // Hugepages first. Record the PRIOR count before touching
             // the pool: release restores this value, because zeroing
             // is only correct when the reservation was created from
@@ -504,6 +510,9 @@ fn verify_adoptable(
 pub struct FileStore {
     state: ResourceState,
     state_dir: PathBuf,
+    /// See [`FileStore::with_spawn_cores`]. Empty on the adopt path,
+    /// where the recorded placement is already the running VPP's.
+    spawn_cores: Vec<u16>,
 }
 
 impl FileStore {
@@ -514,7 +523,24 @@ impl FileStore {
         Self {
             state,
             state_dir: state_dir.into(),
+            spawn_cores: Vec::new(),
         }
+    }
+
+    /// The CPUs any VPP **this daemon spawns** will run on: the
+    /// placement rendered into startup.conf at attach, which VPP reads
+    /// at start and which does not change while this daemon lives.
+    ///
+    /// Recorded here rather than at the attach-time adopt-or-spawn
+    /// decision because EVERY spawn must update it, not just the first:
+    /// a daemon that adopts an old VPP and later respawns after it dies
+    /// would otherwise keep naming the dead process's cores, and the
+    /// next daemon would vacate a placement nothing runs on (review
+    /// finding). `process_changed` is the one point every spawn passes
+    /// through, so it is the one place this is written.
+    pub fn with_spawn_cores(mut self, cores: Vec<u16>) -> Self {
+        self.spawn_cores = cores;
+        self
     }
 
     pub fn state(&self) -> &ResourceState {
@@ -539,6 +565,18 @@ impl IdentityStore for FileStore {
                 self.state.vpp_pid = Some(id.pid);
                 self.state.vpp_start_ticks = Some(id.start_ticks);
                 self.state.vpp_boot_id = id.boot_id;
+                // A process this daemon started runs on the placement
+                // this daemon rendered — see `with_spawn_cores`. Every
+                // identity reaching here is such a spawn: adoption
+                // records none (the file already holds it), so
+                // `Runtime::spawn` is the only caller with `Some`.
+                //
+                // The emptiness guard is for a store built without a
+                // placement — the unit fixtures — so they cannot blank
+                // a field they know nothing about.
+                if !self.spawn_cores.is_empty() {
+                    self.state.vpp_cores = self.spawn_cores.clone();
+                }
             }
             None => {
                 self.state.vpp_pid = None;
@@ -629,6 +667,13 @@ impl ResourceOwner {
             paths,
             released: false,
         }
+    }
+
+    /// See [`FileStore::with_spawn_cores`] — the placement every VPP
+    /// this daemon spawns will use.
+    pub fn with_spawn_cores(mut self, cores: Vec<u16>) -> Self {
+        self.store = self.store.with_spawn_cores(cores);
+        self
     }
 }
 
@@ -833,7 +878,7 @@ mod tests {
             "fresh",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, how) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         assert_eq!(how, Acquired::Fresh);
         assert_eq!(state.hugepage_pages, 8);
         assert_eq!(state.hugepage_prior_pages, 0);
@@ -856,7 +901,7 @@ mod tests {
         fs::create_dir_all(&dev).unwrap();
         fs::write(dev.join("sriov_numvfs"), "0").unwrap(); // no virtfn0
 
-        let err = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap_err();
         assert!(err.contains("eth3"), "{err}");
         assert!(err.contains("rolled back"), "{err}");
 
@@ -894,14 +939,14 @@ mod tests {
             "adopt",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (first, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (first, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         plant_vfio_links(&f, &["0002:07:00.0", "0002:07:00.1"]);
-        let (second, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (second, how) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         assert_eq!(how, Acquired::Adopted);
         assert_eq!(second, first);
 
         // A config whose port set changed must be refused, not merged.
-        let err = acquire(&f.paths, &[("eth2".into(), 1)], 8, ROUTES).unwrap_err();
+        let err = acquire(&f.paths, &[("eth2".into(), 1)], 8, ROUTES, &[]).unwrap_err();
         assert!(err.contains("cannot change across an adoption"), "{err}");
     }
 
@@ -915,7 +960,7 @@ mod tests {
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
         fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "3").unwrap();
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         assert_eq!(state.hugepage_prior_pages, 3);
 
         release(&f.paths, state).unwrap();
@@ -938,7 +983,7 @@ mod tests {
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
         fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "10").unwrap();
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         assert_eq!(state.hugepage_pages, 0, "we own nothing");
 
         release(&f.paths, state).unwrap();
@@ -959,7 +1004,7 @@ mod tests {
             "store",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let mut store = FileStore::new(state, &f.paths.state_dir);
 
         store
@@ -1018,7 +1063,7 @@ mod tests {
         // breaks.
         fs::create_dir_all(f.paths.state_dir.join("vpp-offload.json.tmp")).unwrap();
 
-        let err = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap_err();
         assert!(err.contains("could not record"), "{err}");
         assert!(err.contains("rolled back"), "{err}");
         // Nothing survives: the hugepage reservation is back to prior.
@@ -1040,7 +1085,7 @@ mod tests {
             "hpadopt",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (_state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (_state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         #[cfg(unix)]
         for pci in ["0002:07:00.0", "0002:07:00.1"] {
             std::os::unix::fs::symlink(
@@ -1052,7 +1097,7 @@ mod tests {
         // The reset nobody asked for.
         fs::write(f.paths.hugepage_pool.join("nr_hugepages"), "0").unwrap();
 
-        let (_, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (_, how) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         assert_eq!(how, Acquired::Adopted);
         assert_eq!(
             fs::read_to_string(f.paths.hugepage_pool.join("nr_hugepages"))
@@ -1072,9 +1117,9 @@ mod tests {
             "cores",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let _ = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let _ = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let changed = vec![("eth2".to_string(), 1u16), ("eth3".to_string(), 4u16)];
-        let err = acquire(&f.paths, &changed, 8, ROUTES).unwrap_err();
+        let err = acquire(&f.paths, &changed, 8, ROUTES, &[]).unwrap_err();
         assert!(err.contains("core counts"), "{err}");
     }
 
@@ -1090,16 +1135,16 @@ mod tests {
             "sizing",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, 1_600_000).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, 1_600_000, &[]).unwrap();
         assert_eq!(state.expected_routes, 1_600_000, "sizing was not recorded");
         plant_vfio_links(&f, &["0002:07:00.0", "0002:07:00.1"]);
 
-        let err = acquire(&f.paths, &two_ports(), 8, 2_000_000).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, 2_000_000, &[]).unwrap_err();
         assert!(err.contains("expected-routes 1600000"), "{err}");
         assert!(err.contains("detach --all"), "{err}");
 
         // The unchanged figure still adopts.
-        let (_, how) = acquire(&f.paths, &two_ports(), 8, 1_600_000).unwrap();
+        let (_, how) = acquire(&f.paths, &two_ports(), 8, 1_600_000, &[]).unwrap();
         assert_eq!(how, Acquired::Adopted);
     }
 
@@ -1119,7 +1164,7 @@ mod tests {
             "sizing-old",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (mut state, _) = acquire(&f.paths, &two_ports(), 8, 1_600_000).unwrap();
+        let (mut state, _) = acquire(&f.paths, &two_ports(), 8, 1_600_000, &[]).unwrap();
         plant_vfio_links(&f, &["0002:07:00.0", "0002:07:00.1"]);
         state.expected_routes = 0;
         state.save(&f.paths.state_dir).unwrap();
@@ -1128,7 +1173,7 @@ mod tests {
         // sized it — the point is that neither can be *established*, so
         // agreeing by luck must not be the difference.
         for routes in [2_000_000, 1_600_000] {
-            let err = acquire(&f.paths, &two_ports(), 8, routes).unwrap_err();
+            let err = acquire(&f.paths, &two_ports(), 8, routes, &[]).unwrap_err();
             assert!(err.contains("records no `expected-routes`"), "{err}");
             assert!(err.contains("detach --all"), "{err}");
         }
@@ -1147,7 +1192,7 @@ mod tests {
             "wrongpool",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let mut wrong = f.paths.clone();
         wrong.hugepage_bytes = 2 << 20; // detach pointed at the 2 MiB pool
         let err = release(&wrong, state).unwrap_err();
@@ -1172,7 +1217,7 @@ mod tests {
             "gonevf",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         // eth3's VF disappears out from under the record.
         fs::remove_dir_all(f.paths.pci_devices.join("0002:07:00.1")).unwrap();
 
@@ -1201,7 +1246,7 @@ mod tests {
         fs::create_dir_all(&dev).unwrap();
         fs::write(dev.join("sriov_numvfs"), "3").unwrap();
 
-        let err = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap_err();
+        let err = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap_err();
         assert!(err.contains("refuses to guess"), "{err}");
         assert_eq!(
             fs::read_to_string(dev.join("sriov_numvfs")).unwrap(),
@@ -1223,7 +1268,7 @@ mod tests {
         // Simulate the interruption: acquire both, then rewrite the
         // state as if the daemon died before eth3's save — eth3's VF
         // exists and is vfio-bound, but the record stops at eth2.
-        let (mut state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (mut state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         state.ports.truncate(1);
         state.save(&f.paths.state_dir).unwrap();
         #[cfg(unix)]
@@ -1235,7 +1280,7 @@ mod tests {
             .unwrap();
         }
 
-        let (resumed, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (resumed, how) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         assert_eq!(how, Acquired::Resumed);
         assert_eq!(resumed.ports.len(), 2);
         assert_eq!(
@@ -1256,7 +1301,7 @@ mod tests {
             "poolchg",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let _ = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let _ = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         #[cfg(unix)]
         for pci in ["0002:07:00.0", "0002:07:00.1"] {
             std::os::unix::fs::symlink(
@@ -1273,7 +1318,7 @@ mod tests {
         fs::create_dir_all(&wrong.hugepage_pool).unwrap();
         fs::write(wrong.hugepage_pool.join("nr_hugepages"), "0").unwrap();
 
-        let err = acquire(&wrong, &two_ports(), 8, ROUTES).unwrap_err();
+        let err = acquire(&wrong, &two_ports(), 8, ROUTES, &[]).unwrap_err();
         assert!(err.contains("wrong pool"), "{err}");
         assert_eq!(
             fs::read_to_string(wrong.hugepage_pool.join("nr_hugepages"))
@@ -1293,7 +1338,7 @@ mod tests {
             "sweep",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         fs::write(f.paths.hugetlbfs.join("rtemap_0"), "").unwrap();
         fs::write(f.paths.hugetlbfs.join("rtemap_7"), "").unwrap();
 
@@ -1318,7 +1363,7 @@ mod tests {
             "owner",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let mut owner = SharedOwner::new(ResourceOwner::new(state, f.paths.clone()));
 
         // A spawn is recorded the ordinary way, while resources are held.
@@ -1359,7 +1404,7 @@ mod tests {
             "owner-partial",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let mut owner = SharedOwner::new(ResourceOwner::new(state, f.paths.clone()));
 
         // Make eth2's release fail: remove the netdev dir the numvfs
@@ -1404,7 +1449,7 @@ mod tests {
             "owner-steer",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let mut owner = ResourceOwner::new(state, f.paths.clone());
 
         let rules = vec![
@@ -1436,7 +1481,7 @@ mod tests {
             "owner-unsteer",
             &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
         );
-        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &[]).unwrap();
         let mut owner = ResourceOwner::new(state, f.paths.clone());
 
         owner
