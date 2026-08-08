@@ -979,11 +979,28 @@ impl ConvergenceEngine {
     /// Whether a route read back from VPP is one this module installed.
     /// See [`Self::adopt_vpp_fib`] for why the answer must be
     /// conservative.
+    ///
+    /// The adj-fib exclusion is the hard-won clause. VPP auto-creates a
+    /// host route for every neighbour — `169.254.254.2/32` via the
+    /// member port here — and it wears our exact signature: NORMAL
+    /// path, owned interface, non-zero nexthop. Adopting it hands it to
+    /// the diff, the route source never advertises it, and every
+    /// adoption withdrew the neighbour's own host route: cover churn on
+    /// the adjacency every route in the table resolves through, a
+    /// dependent walk over ~1M entries, and a constant ~5.5 s blackhole
+    /// that survived BOTH neighbour-send fixes because nothing here
+    /// sent a neighbour message at all — the withdrawal recreated the
+    /// entry from the route side (neighbour age reset at the release
+    /// instant with both senders provably silent, shadow 2026-08-08).
+    /// The tell is exact: a host route whose prefix IS its own nexthop,
+    /// which this module never installs — our prefixes are the DFZ and
+    /// our nexthops are the interconnect.
     fn looks_self_installed(&self, route: &IpRoute) -> bool {
         route.paths.iter().any(|p| {
             p.r#type == FIB_API_PATH_TYPE_NORMAL
                 && self.port_index.owns(p.sw_if_index)
                 && p.nh.address.0.iter().any(|b| *b != 0)
+                && !is_neighbour_adj_fib(route, &p.nh.address.0)
         })
     }
 
@@ -1280,6 +1297,20 @@ impl ConvergenceEngine {
 
 /// splitmix64. Deterministic successor so verify samples differ per pass
 /// while staying replayable from the recorded seed.
+/// The adj-fib signature: a HOST route whose prefix is its own nexthop.
+///
+/// `nh` is the path's 16-byte wire address (v4 in the first four bytes,
+/// zero-padded — the same layout `Prefix.address.un` uses), so equality
+/// over the whole union plus the host length is the exact test. See
+/// [`ConvergenceEngine::looks_self_installed`] for why this exists.
+fn is_neighbour_adj_fib(route: &IpRoute, nh: &[u8; 16]) -> bool {
+    let host = match route.prefix.address.af {
+        crate::vpp_api::generated::ADDRESS_IP4 => route.prefix.len == 32,
+        _ => route.prefix.len == 128,
+    };
+    host && route.prefix.address.un.0 == *nh
+}
+
 fn next_seed(prev: u64) -> u64 {
     let mut z = prev.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

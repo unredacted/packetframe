@@ -826,3 +826,69 @@ fn the_delta_path_does_not_re_add_an_acknowledged_neighbour() {
         "a genuine MAC change must be programmed"
     );
 }
+
+/// The neighbour's adj-fib is never adopted — so never withdrawn.
+///
+/// VPP auto-creates a host route for each neighbour (192.0.2.1/32 via
+/// the member port here), and it wears the self-installed signature
+/// exactly: NORMAL path, owned interface, non-zero nexthop. Adopting it
+/// handed it to the diff, the source never advertises it, and every
+/// adoption withdrew the neighbour's own host route — cover churn on
+/// the one adjacency the whole table resolves through, a ~1M-entry
+/// dependent walk, and a constant ~5.5 s blackhole that survived both
+/// neighbour-send fixes because no neighbour message was involved at
+/// all (shadow, 2026-08-08). The tell is exact: a host route whose
+/// prefix IS its own nexthop, which this module never installs.
+#[test]
+fn the_neighbours_adj_fib_is_never_adopted_or_withdrawn() {
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        // A route we really installed, still advertised.
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        // The neighbour's adj-fib: host route, prefix == its own nexthop.
+        ([192, 0, 2, 1], 32, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "adopt-adjfib",
+        Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+
+    let mirror = Mirror {
+        routes: vec![v4(0, 1)],
+    };
+    let adopted = engine.adopt_vpp_fib().expect("readback");
+    assert_eq!(
+        adopted, 1,
+        "the real route is adopted; the neighbour's adj-fib is VPP's, not ours"
+    );
+
+    let plan = engine.begin_resync(&mirror);
+    assert_eq!(
+        plan.withdrawals, 0,
+        "nothing to withdraw — and above all not the host route covering the \
+         adjacency every route in the table resolves through: {plan:?}"
+    );
+
+    while !engine.drain_batch().expect("drain").0 {}
+    let deletes: Vec<[u8; 4]> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Route(WireRoute {
+                is_add: false,
+                addr,
+                ..
+            }) => Some(addr),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        deletes.is_empty(),
+        "no withdrawal may reach VPP, least of all the adj-fib: {deletes:?}"
+    );
+}
