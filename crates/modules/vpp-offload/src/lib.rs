@@ -378,6 +378,16 @@ pub struct VppOffloadModule {
     /// and why — instead of the message pointing at a status nobody can
     /// reach.
     teardown_pending: Option<service::PendingTeardown>,
+    /// VPP's cores and the pre-restriction masks, held across a pending
+    /// teardown so `reconcile_pending_teardown` can restore the daemon's
+    /// affinity once a late teardown settles clean.
+    ///
+    /// Without this, a `stop()` that overran the detach budget dropped
+    /// `attached` — and with it the `CoreMap`/`AffinitySnapshot` — so a
+    /// teardown that finished successfully afterwards left the daemon
+    /// confined to a subset of its cores until restart, even though VPP
+    /// was gone (review finding).
+    deferred_core_release: Option<(cores::CoreMap, cores::AffinitySnapshot)>,
     /// Set when a `detach` could not confirm the teardown.
     ///
     /// Outlives the attachment on purpose. `detach` takes `attached` before
@@ -400,6 +410,7 @@ impl VppOffloadModule {
             source: None,
             attached: None,
             teardown_pending: None,
+            deferred_core_release: None,
             teardown_failure: None,
         }
     }
@@ -480,6 +491,21 @@ impl VppOffloadModule {
         // `None` clears the provisional failure: it finished cleanly after
         // all, and the failure was about the budget rather than the outcome.
         self.teardown_failure = settled_verdict(&final_status);
+        // A late teardown that settled clean means VPP is finally gone —
+        // so the cores held across the budget overrun go back now, with
+        // the operator's saved masks. A late teardown that settled dirty
+        // keeps them: resources may still be held on those cores.
+        if let Some((cm, snap)) = self.deferred_core_release.take() {
+            if self.teardown_failure.is_none() {
+                if let Err(e) = cores::release_daemon_to(&cm, &snap) {
+                    tracing::warn!(error = %e, "could not return VPP's cores to the daemon");
+                }
+            } else {
+                // Dirty settle: hold the cores AND keep the pair, so a
+                // later reconcile that flips to clean can still restore.
+                self.deferred_core_release = Some((cm, snap));
+            }
+        }
     }
 
     /// Record a teardown that could not be confirmed, and build the error
@@ -830,6 +856,11 @@ impl Module for VppOffloadModule {
         let Some(attached) = self.attached.take() else {
             return Ok(());
         };
+        // Captured before `stop()` consumes the service, because the
+        // affinity restore needs them on every exit — including the one
+        // where `stop()` overruns and `attached` is gone by the time the
+        // teardown settles.
+        let core_release = (attached.cores.clone(), attached.affinity.clone());
         // `stop` drives the supervisor's full teardown ordering —
         // unsteer if steered, abort convergence, kill, release — and
         // waits out its bounded patience. The final snapshot is the only
@@ -839,6 +870,12 @@ impl Module for VppOffloadModule {
         // dropped: `stop()`'s message sends the operator to `packetframe
         // status`, and this is what makes that reachable — `health_check`
         // below reports through it until the loop settles.
+        if report.pending.is_some() {
+            // Hand the cores to reconciliation, which runs when the loop
+            // finally settles: releasing now would return them while VPP
+            // may still be alive on them.
+            self.deferred_core_release = Some(core_release.clone());
+        }
         self.teardown_pending = report.pending;
         let Some(p) = report.published else {
             return Err(self.remember_teardown_failure(
@@ -867,11 +904,13 @@ impl Module for VppOffloadModule {
                 }
             )));
         }
-        // The teardown completed and released everything: no VPP is
-        // left to protect, so the daemon gets its cores back. Failure
-        // paths above deliberately do NOT — resources still held means
-        // a VPP may still be running on those cores.
-        if let Err(e) = cores::release_daemon_to(&attached.cores) {
+        // The teardown completed synchronously and released everything:
+        // no VPP is left to protect, so the daemon gets its cores back
+        // with the operator's pre-restriction masks. This path did not
+        // stash into `deferred_core_release` (pending was None), so there
+        // is nothing there to double-release.
+        let (cm, snap) = &core_release;
+        if let Err(e) = cores::release_daemon_to(cm, snap) {
             tracing::warn!(error = %e, "could not return VPP's cores to the daemon");
         }
         Ok(())

@@ -100,6 +100,9 @@ pub struct Attached {
     /// dataplane: it may already be forwarding.
     pub acquired: Acquired,
     pub adopted_process: bool,
+    /// Each thread's affinity as captured before the restriction, so
+    /// the release paths restore the operator's policy verbatim.
+    pub affinity: cores::AffinitySnapshot,
 }
 
 /// The PF's MAC, from `/sys/class/net/<iface>/address`.
@@ -341,19 +344,25 @@ pub fn bring_up(
     // 2026-08-08). Warn-and-continue on partial failure: a cgroup that
     // refuses the mask degrades protection, and failing the attach over
     // it would brick deployments that share cores gracefully today.
-    match cores::restrict_daemon_from(&core_map) {
-        Ok(threads) => tracing::info!(
-            threads,
-            vpp_main = core_map.main,
-            vpp_workers = ?core_map.workers,
-            "daemon threads restricted away from VPP's cores"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not restrict the daemon off VPP's cores; expect loss during \
-             resync bursts if they share a core with a worker"
-        ),
-    }
+    let affinity = match cores::restrict_daemon_from(&core_map) {
+        Ok((threads, saved)) => {
+            tracing::info!(
+                threads,
+                vpp_main = core_map.main,
+                vpp_workers = ?core_map.workers,
+                "daemon threads restricted away from VPP's cores"
+            );
+            saved
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not restrict the daemon off VPP's cores; expect loss during \
+                 resync bursts if they share a core with a worker"
+            );
+            cores::AffinitySnapshot::default()
+        }
+    };
 
     let (state, acquired) = match acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes) {
         Ok(v) => v,
@@ -361,7 +370,7 @@ pub fn bring_up(
             // Nothing was acquired and no VPP exists: the affinity
             // restriction protects nothing, and keeping it would leave
             // the daemon short two cores over a failed attach.
-            let _ = cores::release_daemon_to(&core_map);
+            let _ = cores::release_daemon_to(&core_map, &affinity);
             return Err(e);
         }
     };
@@ -382,7 +391,13 @@ pub fn bring_up(
         completeness,
         loopback,
     ) {
-        Ok(attached) => Ok(attached),
+        Ok(mut attached) => {
+            // The snapshot rides with the handle so detach — including a
+            // teardown that settles after detach returns — can restore
+            // the pre-restriction masks exactly.
+            attached.affinity = affinity;
+            Ok(attached)
+        }
         // A supervision panic is the one failure that must NOT roll back.
         //
         // NOT covered by a test, and the reason is structural: the window
@@ -411,7 +426,7 @@ pub fn bring_up(
             // No VPP survived this path (the may-hold arm above catches
             // the one that might), so the cores need no protection and
             // the daemon gets them back.
-            let _ = cores::release_daemon_to(&core_map);
+            let _ = cores::release_daemon_to(&core_map, &affinity);
             Err(match acquire::release(&paths.sys, state) {
                 Ok(()) => format!("{e}; everything acquired was released"),
                 Err(re) => format!(
@@ -761,6 +776,10 @@ fn finish(
         cores: core_map.clone(),
         acquired,
         adopted_process,
+        // Placeholder; `bring_up` overwrites it with the real capture,
+        // which it owns because the restriction happens before `finish`
+        // is called.
+        affinity: cores::AffinitySnapshot::default(),
     })
 }
 
