@@ -1168,3 +1168,69 @@ fn quiescence_is_a_rate_not_a_per_check_delta() {
         "one withdrawal for the one prefix the source really dropped"
     );
 }
+
+/// A dead source never releases a populated adoption — at any scale.
+///
+/// `adopted = 1` floors to zero under integer division, and a floor of
+/// zero is satisfied by an EMPTY source: dead feed, perfectly quiet,
+/// gate opens, diff withdraws the one route the VPP is forwarding with
+/// (review finding). The floor is clamped to 1 for any populated
+/// adoption; this holds a one-route survivor against an empty source
+/// far past the quiet window and insists nothing moves.
+#[test]
+fn a_dead_source_never_releases_a_populated_adoption() {
+    const ONE: &[([u8; 4], u8, u32, bool)] = &[([10, 0, 0, 0], 24, ASSIGNED_INDEX, true)];
+    let fake = Fake::start_behaving(
+        "loop-dead-feed",
+        fake_vpp::Behaviour {
+            existing_routes: ONE,
+            ..Default::default()
+        },
+    );
+    // The feed never delivers anything: the daemon restarted and its
+    // route source is dead.
+    let rt = runtime_with_source(&fake, Box::new(Mirror { routes: Vec::new() }));
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // Far past SOURCE_QUIET_FOR: a dead feed is perfectly quiet, so
+    // only the floor stands between it and the diff.
+    let mut now = t0;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..200 {
+            now += Duration::from_millis(100);
+            let t = d.tick(now, &mut obs, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "a dead source must never satisfy the gate: {:?}",
+                t.events
+            );
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "still holding, still steered"
+    );
+    assert!(
+        fake.drain_events()
+            .into_iter()
+            .all(|e| !matches!(e, fake_vpp::Event::Route(_))),
+        "the sole live route must not be withdrawn"
+    );
+}

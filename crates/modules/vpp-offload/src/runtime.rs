@@ -983,7 +983,13 @@ impl Effects for EffectsView {
                 );
                 Some(DeferredResync {
                     adopted,
-                    floor: adopted / ADOPTED_SOURCE_FLOOR_DIVISOR,
+                    // Clamped to 1: integer division floors adopted=1
+                    // to zero, and a floor of zero lets a DEAD source
+                    // (have=0) pass the gate, go quiet, and withdraw
+                    // the sole live route — the exact case the floor
+                    // exists for (review finding). A populated
+                    // adoption's floor is never satisfied by nothing.
+                    floor: (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
                     last_have: have,
                     last_check: None,
                     quiet_since: None,
