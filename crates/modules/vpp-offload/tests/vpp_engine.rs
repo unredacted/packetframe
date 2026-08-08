@@ -725,3 +725,104 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
         "the stale, missing, and extra-flag neighbours must all be programmed: {sent_macs:?}"
     );
 }
+
+/// The delta path consults the same acknowledged-neighbour ledger as
+/// the resync path — pinned against the second door of the 5.5 s
+/// adoption blackhole (shadow, 2026-08-08).
+///
+/// #146 taught `program_neighbours` to skip neighbours VPP already
+/// holds, and the measured gap did not move: the deltas accumulated
+/// during the resync deferral re-added the very neighbour the resync
+/// walk had just left untouched, through `apply_changes` — a second
+/// path to the same message. Both paths now consult one ledger,
+/// written only on VPP's acknowledgement or from VPP's own dump.
+#[test]
+fn the_delta_path_does_not_re_add_an_acknowledged_neighbour() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+    use std::sync::Mutex;
+
+    const STATIC: u8 = 1;
+    const MAC_NEW: [u8; 6] = [0x02, 0, 0, 0, 0, 0xee];
+
+    /// A source whose deltas the test scripts per drain.
+    struct ScriptedSource {
+        changes: Mutex<Vec<SourceChanges>>,
+    }
+    impl RouteSource for ScriptedSource {
+        fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC);
+        }
+        fn drain_changes(&self, _max: usize) -> SourceChanges {
+            self.changes.lock().unwrap().pop().unwrap_or_default()
+        }
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    // VPP already holds the neighbour, correct and static.
+    const EXISTING_NEIGHBOURS: &[([u8; 4], u32, [u8; 6], u8)] =
+        &[([192, 0, 2, 1], ASSIGNED_INDEX, MAC, STATIC)];
+    let fake = Fake::start_behaving(
+        "delta-neigh",
+        Behaviour {
+            existing_neighbours: EXISTING_NEIGHBOURS,
+            ..Default::default()
+        },
+    );
+    let src = ScriptedSource {
+        // Popped in reverse: first drain re-announces the identical
+        // neighbour (the daemon-start re-learn), second changes its MAC.
+        changes: Mutex::new(vec![
+            SourceChanges {
+                routes: Vec::new(),
+                neighbours: vec![(nh(), Some(("eth4".into(), MAC_NEW)))],
+            },
+            SourceChanges {
+                routes: Vec::new(),
+                neighbours: vec![(nh(), Some(("eth4".into(), MAC)))],
+            },
+        ]),
+    };
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+    engine.begin_resync(&src);
+    // Seeds the ledger from VPP's dump; sends nothing (kept=1).
+    assert_eq!(engine.program_neighbours(&src).expect("programming"), 0);
+    let _ = fake.drain_events();
+
+    // Delta 1: identical re-announcement — the ledger must absorb it.
+    engine.apply_changes(&src, 64).expect("identical delta");
+    let sent: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Neighbour { .. }))
+        .collect();
+    assert!(
+        sent.is_empty(),
+        "an identical re-announcement must not reach VPP — re-adding walks \
+         every dependent route: {sent:?}"
+    );
+
+    // Delta 2: the MAC genuinely changed — that walk is the price of
+    // correctness, and the send must happen.
+    engine.apply_changes(&src, 64).expect("changed delta");
+    let sent: Vec<[u8; 6]> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Neighbour { mac, .. } => Some(mac),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        vec![MAC_NEW],
+        "a genuine MAC change must be programmed"
+    );
+}
