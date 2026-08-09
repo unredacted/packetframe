@@ -548,7 +548,15 @@ pub(super) mod sys {
                         req.fs = *stored;
                         Ok(())
                     }
-                    None => Err(std::io::Error::other("ENOENT: no rule at that location")),
+                    // `NotFound`, not a bare string: ENOENT is how the
+                    // real driver answers for an empty location, and
+                    // `delete` classifies on the error KIND — a fake
+                    // whose absent-rule error is unclassifiable would
+                    // hide exactly the branch the fake exists to test.
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "ENOENT: no rule at that location",
+                    )),
                 },
                 ETHTOOL_SRXCLSRLDEL => {
                     if nic.undeletable.contains(&req.fs.location) {
@@ -556,7 +564,10 @@ pub(super) mod sys {
                     }
                     match nic.rules.remove(&key) {
                         Some(_) => Ok(()),
-                        None => Err(std::io::Error::other("ENOENT: no rule at that location")),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "ENOENT: no rule at that location",
+                        )),
                     }
                 }
                 other => Err(std::io::Error::other(format!(
@@ -605,8 +616,26 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// What removing one rule actually did.
+enum Removal {
+    Removed,
+    /// The NIC answered ENOENT: no rule at that location. Absent IS
+    /// the removal's postcondition — nothing there is steering traffic
+    /// — so it counts as removed, not as a failure. The case is real,
+    /// not defensive: the UniFi controller wipes classifier state on
+    /// provisioning, so rules the ledger faithfully records can vanish
+    /// while the daemon is down. Treating that as a failed delete kept
+    /// the ledger populated forever — unsteer refused, the VF was
+    /// withheld, and the deferred adopted reconciliation waited on an
+    /// unsteer that could never be acknowledged (review finding).
+    ///
+    /// ENOENT only. EBUSY, EINVAL and the rest keep failing loudly:
+    /// they say nothing about whether a rule is still matching.
+    AlreadyAbsent,
+}
+
 /// Remove one rule by location.
-fn delete(iface: &str, location: u32) -> Result<(), String> {
+fn delete(iface: &str, location: u32) -> Result<Removal, String> {
     let mut req = Rxnfc {
         cmd: ETHTOOL_SRXCLSRLDEL,
         fs: RxFlowSpec {
@@ -615,8 +644,11 @@ fn delete(iface: &str, location: u32) -> Result<(), String> {
         },
         ..Rxnfc::default()
     };
-    sys::ethtool(iface, &mut req)
-        .map_err(|e| format!("deleting ntuple rule at loc {location}: {e}"))
+    match sys::ethtool(iface, &mut req) {
+        Ok(()) => Ok(Removal::Removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Removal::AlreadyAbsent),
+        Err(e) => Err(format!("deleting ntuple rule at loc {location}: {e}")),
+    }
 }
 
 /// The real [`crate::runtime::Steering`], replacing the placeholder.
@@ -659,9 +691,19 @@ impl NtupleSteering {
     fn remove_all(&mut self, victims: Vec<(String, u32)>) -> Vec<String> {
         let mut failed = Vec::new();
         for (iface, loc) in victims {
-            if let Err(e) = delete(&iface, loc) {
-                failed.push(format!("{iface} loc {loc}: {e}"));
-                self.installed.push((iface, loc));
+            match delete(&iface, loc) {
+                Ok(Removal::Removed) => {}
+                Ok(Removal::AlreadyAbsent) => tracing::info!(
+                    iface,
+                    loc,
+                    "ntuple rule was already gone — the controller wipes classifier \
+                     state on provisioning — and absent is what a removal is for, so \
+                     it counts as removed"
+                ),
+                Err(e) => {
+                    failed.push(format!("{iface} loc {loc}: {e}"));
+                    self.installed.push((iface, loc));
+                }
             }
         }
         failed
@@ -1045,6 +1087,28 @@ mod tests {
         let e = s.unsteer().expect_err("must refuse while rules remain");
         assert!(e.contains("must not be released"), "{e}");
         assert_eq!(s.installed().len(), 2, "still recorded after the refusal");
+    }
+
+    /// Rules the controller wiped behind the ledger's back are already
+    /// unsteered — `unsteer` must say so, not fail. The failing version
+    /// wedged the whole adopted pipeline: the ledger stayed populated,
+    /// every re-requested unsteer failed on the same ENOENT, and the
+    /// deferred reconciliation waited forever on an acknowledgement
+    /// that could never come (review finding on the pre-dump gate).
+    #[test]
+    fn vanished_rules_count_as_removed_not_as_failures() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
+        // The state file remembers two rules; the NIC holds neither.
+        s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
+
+        s.unsteer()
+            .expect("absent rules satisfy the removal's postcondition");
+        assert!(
+            s.installed().is_empty(),
+            "nothing may stay recorded when nothing is steering"
+        );
     }
 
     /// Adopted locations survive into `unsteer`.
