@@ -1606,8 +1606,9 @@ mod steered {
 /// steering returns only after the verified resync.
 #[test]
 fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
-    let (fake, shared, log, rt, _session) =
+    let (fake, shared, log, rt, session) =
         steered::fixture("steered-adopt", &[fake_vpp::v4(0, 0)], 160);
+    session.set_up(true);
     let mut d = Driver::new();
     let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 40);
     assert_eq!(
@@ -1648,6 +1649,40 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
         vec![([10, 0, 4, 0], 24), ([10, 0, 5, 0], 24)],
         "two withdrawals for the two prefixes the source really dropped"
     );
+}
+
+/// The floor answers SIZE and nothing else, so meeting it must not
+/// release alone (review finding): a small `expected-routes` shrinks
+/// the floor beneath what neighbour-synthesized local routes supply
+/// with the feed dead, and unsteering onto those is the blackhole
+/// every round of this gate has been about. Liveness is the session
+/// handle to answer, on the floor path too — and turning the session
+/// on is exactly what lets the same state release.
+#[test]
+fn a_met_floor_without_a_live_session_stays_deferred() {
+    // Capacity 160 -> floor 10; twelve routes meet it. The session is
+    // down: this mirror is a husk, however comfortably it clears the
+    // floor.
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (fake, shared, log, rt, session) = steered::fixture("steered-floor-dead", &full, 160);
+    let mut d = Driver::new();
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 400);
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a met floor with a dead session must stay deferred"
+    );
+    let _ = shared;
+
+    // The session comes up: the very same mirror is now evidence, and
+    // the ordinary floor release proceeds.
+    session.set_up(true);
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
 /// The capacity floor is an UPPER sizing bound wearing a lower bound's

@@ -907,16 +907,26 @@ impl Observe for ObserveView {
                     //    SMALL_TABLE_QUIET_FOR), and the hold-length
                     //    quiet is what bounds a hung session going
                     //    stale at "up".
+                    let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     let complete = view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && c.completeness
                             .as_ref()
                             .is_some_and(|h| h.verdict().permits_steering());
                     let small_table_loaded = have > 0
-                        && c.feed_session.as_ref().is_some_and(|f| f.is_up())
+                        && live
                         && view
                             .rate_quiet_for
                             .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
-                    let released = view.released || complete || small_table_loaded;
+                    // The floor answers SIZE and nothing else, so it
+                    // does not release alone: a small `expected-routes`
+                    // shrinks it beneath what neighbour-synthesized
+                    // routes can supply with the feed dead (capacity
+                    // 176 puts it at 11; review finding). Liveness is
+                    // the session's to answer on every path — only the
+                    // completeness authority substitutes, because a
+                    // mirror that MATCHES bird's count has bird alive
+                    // in the comparison itself.
+                    let released = (view.released && live) || complete || small_table_loaded;
                     if !released {
                         c.deferred_resync =
                             Some(DeferredResync::AwaitingFallback { gate, last_request });

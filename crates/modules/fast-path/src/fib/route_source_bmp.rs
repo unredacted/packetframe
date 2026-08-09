@@ -128,6 +128,14 @@ pub struct BmpStation {
     /// Session-liveness handle, reported to the second tier. See
     /// [`packetframe_common::fib::FeedSession`].
     session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+    /// Monitored peers currently up on this connection, by BMP PeerUp
+    /// and PeerDown. The liveness handle follows THIS set, never the
+    /// TCP transport: bird's monitoring connection stays established
+    /// while every BGP peer it monitors is down, and PeerDown has
+    /// already wiped their routes — reporting "up" on the socket alone
+    /// would let a second tier trust a mirror that just lost its feed
+    /// (review finding).
+    up_peers: std::sync::Mutex<std::collections::HashSet<PeerId>>,
 }
 
 /// Re-export for callers building the station.
@@ -157,6 +165,7 @@ impl BmpStation {
             require_loc_rib: false,
             peer_acl: Vec::new(),
             session: None,
+            up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -256,12 +265,13 @@ impl BmpStation {
                                 continue;
                             }
                             info!(%addr, "BMP client connected");
-                            if let Some(sess) = &self.session {
-                                sess.set_up(true);
-                            }
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
                             }
+                            // The connection ended, and per-peer state
+                            // ended with it: whatever PeerUps this
+                            // session delivered are no longer evidence.
+                            self.up_peers.lock().expect("up_peers lock").clear();
                             if let Some(sess) = &self.session {
                                 sess.set_up(false);
                             } else {
@@ -424,6 +434,11 @@ impl BmpStation {
                 {
                     warn!(?peer_id, error = %e, "PeerUp dispatch failed");
                 }
+                let mut up = self.up_peers.lock().expect("up_peers lock");
+                up.insert(peer_id);
+                if let Some(sess) = &self.session {
+                    sess.set_up(true);
+                }
             }
             BmpMessageBody::PeerDownNotification(_) => {
                 let pph = match &msg.per_peer_header {
@@ -438,6 +453,13 @@ impl BmpStation {
                     .await
                 {
                     warn!(?peer_id, error = %e, "PeerDown dispatch failed");
+                }
+                let mut up = self.up_peers.lock().expect("up_peers lock");
+                up.remove(&peer_id);
+                if up.is_empty() {
+                    if let Some(sess) = &self.session {
+                        sess.set_up(false);
+                    }
                 }
             }
             BmpMessageBody::RouteMonitoring(rm) => {
