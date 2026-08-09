@@ -196,6 +196,7 @@ fn a_fresh_attach_acquires_renders_and_supervises() {
         Box::new(Mirror),
         &ALLOW,
         None,
+        None,
         &McamBudget::default(),
     )
     .expect("bring-up");
@@ -315,6 +316,7 @@ fn a_config_that_cannot_work_touches_nothing() {
         Box::new(Mirror),
         &ALLOW,
         None,
+        None,
         &McamBudget::default(),
     )
     .err()
@@ -329,6 +331,7 @@ fn a_config_that_cannot_work_touches_nothing() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )
@@ -349,6 +352,7 @@ fn a_config_that_cannot_work_touches_nothing() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )
@@ -403,6 +407,7 @@ fn a_failure_after_acquisition_releases_what_it_took() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )
@@ -513,6 +518,7 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
         Box::new(Mirror),
         &v6_only,
         None,
+        None,
         &McamBudget::default(),
     )
     .err()
@@ -538,6 +544,7 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     );
@@ -575,6 +582,7 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
         Box::new(Mirror),
         &ALLOW,
         None,
+        None,
         &McamBudget::default(),
     )
     .expect("first attach");
@@ -604,6 +612,7 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )
@@ -656,6 +665,7 @@ fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
         Box::new(Mirror),
         &ALLOW,
         None,
+        None,
         &McamBudget::default(),
     )
     .expect("first attach");
@@ -687,6 +697,7 @@ fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )
@@ -727,6 +738,7 @@ fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
         Box::new(Mirror),
         &ALLOW,
         None,
+        None,
         &McamBudget::default(),
     )
     .expect("first attach");
@@ -753,6 +765,7 @@ fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )
@@ -794,6 +807,7 @@ fn requiring_completeness_with_no_publisher_is_refused_at_attach() {
         &host.paths,
         Box::new(Mirror),
         &ALLOW,
+        None,
         None,
         &McamBudget::default(),
     )

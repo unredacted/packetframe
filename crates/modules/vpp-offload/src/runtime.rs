@@ -289,6 +289,12 @@ struct Core {
     /// authority to compare against (the shadow has no bird of its own)
     /// and the operator owns the judgement instead.
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    /// The feed session-liveness handle: whether the BGP/BMP session
+    /// that fills the mirror is up RIGHT NOW, written by the session
+    /// owner in the fast-path controller. `None` when the wiring has no
+    /// second tier or a harness never set one; the small-table release
+    /// is then simply off.
+    feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
     /// Why the last drain failed, or `None` if the last one succeeded.
     ///
     /// Recorded here rather than left to the caller because the caller
@@ -299,24 +305,24 @@ struct Core {
     /// operator would see a stalled `pending_ops` with nothing saying
     /// why.
     last_drain_error: Option<String>,
-    /// `Some` while an adopted resync is deferred, holding the release
-    /// gate's state. Set by `start_resync` on EVERY adoption of a
-    /// populated FIB; cleared by `drain_batch` when the gate opens and
-    /// the diff actually begins. While set, the adopted VPP is left
-    /// exactly as found — steered, routes intact — because a diff
-    /// against a loading source is ~all withdrawals, and draining those
-    /// into a live dataplane is the drill-(d) blackhole (2026-08-07).
+    /// `Some` while an adopted reconciliation is deferred, holding the
+    /// release gate's state. Set by `start_resync` on every adoption
+    /// that has anything to protect; cleared by `drain_batch` when the
+    /// gate opens and the work actually begins. While set, the adopted
+    /// VPP is left exactly as found — routes intact, and on the steered
+    /// stage even its FIB unread — because a diff against a loading
+    /// source is ~all withdrawals (drill (d), 2026-08-07), and the dump
+    /// itself freezes VPP's workers (drill (d10), 2026-08-09). See
+    /// [`DeferredResync`] for the two stages.
     deferred_resync: Option<DeferredResync>,
 }
 
-/// Release-gate state for a deferred adopted resync. See
-/// [`ADOPTED_SOURCE_FLOOR_DIVISOR`] and [`SOURCE_QUIET_TICKS`] for the
-/// two conditions, and why both are load-bearing.
+/// The loaded-and-quiet release gate, shared by both deferral stages.
+/// See [`ADOPTED_SOURCE_FLOOR_DIVISOR`] for why the floor and the
+/// quiescence are BOTH load-bearing.
 #[derive(Debug, Clone, Copy)]
-struct DeferredResync {
-    /// Routes adopted from VPP's FIB — the diff's withdrawal universe.
-    adopted: u64,
-    /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
+struct SourceGate {
+    /// Minimum source size before quiescence even counts.
     floor: u64,
     /// The source's change counter at the previous check, for the
     /// activity rate. The COUNTER, not the table size: net size hides
@@ -329,7 +335,220 @@ struct DeferredResync {
     /// while it is loading. Release requires this to have lasted
     /// [`SOURCE_QUIET_FOR`].
     quiet_since: Option<std::time::Instant>,
+    /// Since when the RATE alone has been quiet, floor ignored. The
+    /// pre-dump stage's alternate releases need quiet that the floor
+    /// cannot veto — they exist precisely for tables the floor is
+    /// wrong about.
+    rate_quiet_since: Option<std::time::Instant>,
 }
+
+/// What one gate observation saw. `released` is the coupled
+/// floor-plus-quiescence verdict both stages share; the other fields
+/// serve the pre-dump stage's alternate releases, which must work
+/// exactly where the floor does not.
+#[derive(Debug, Clone, Copy)]
+struct GateView {
+    released: bool,
+    /// How long the rate alone has been quiet, floor ignored.
+    rate_quiet_for: Option<Duration>,
+}
+
+impl SourceGate {
+    fn new(floor: u64, seq_baseline: u64) -> Self {
+        Self {
+            floor,
+            last_seq: seq_baseline,
+            last_check: None,
+            quiet_since: None,
+            rate_quiet_since: None,
+        }
+    }
+
+    /// One paced observation; `true` once loaded-and-quiet has held for
+    /// [`SOURCE_QUIET_FOR`]. Both gates, in order: below the floor
+    /// nothing else matters, and above it only quiet SUSTAINED FOR A
+    /// DURATION counts — a loading feed passes through the floor by
+    /// construction (the floor-only version withdrew half a live table,
+    /// 2026-08-08), and "quiet" is a rate over elapsed time, never a
+    /// per-call delta: the production loop caps its sleeps at 50 ms, so
+    /// a per-call threshold shrinks with cadence until a full-speed
+    /// reload classifies as quiet.
+    /// `live` conditions BOTH quiet trackers: quiet accumulated while
+    /// the feed was down is not evidence of anything — a dead session
+    /// is perfectly quiet — and without the reset, the first OPEN or
+    /// BMP frame after an outage would release instantly on stale
+    /// quiet, before the fresh session had streamed a single route
+    /// (review finding). Rebaselining continuously while down also
+    /// covers the up-transition: the clock starts from the moment
+    /// liveness returns.
+    /// Forget every piece of quiet evidence and restart the rate
+    /// baseline at `seq_now`. Called when a validation OUTSIDE the
+    /// gate rejects what the gate released — the post-dump churn
+    /// check — because reinserting an unchanged gate let the very
+    /// next tick average the rejected burst below the rate, keep the
+    /// pre-dump `quiet_since`, and re-release immediately: the
+    /// rejection undone one tick later (review finding). After this,
+    /// the source must establish a fresh sustained quiet interval.
+    fn rebaseline(&mut self, seq_now: u64) {
+        self.last_seq = seq_now;
+        self.last_check = None;
+        self.quiet_since = None;
+        self.rate_quiet_since = None;
+    }
+
+    /// `quiet_rate` is supplied per observation, not stored, because
+    /// the honest basis DIFFERS by stage and time: the diff stage
+    /// scales it to the dumped table it protects, while the pre-dump
+    /// stage must scale it to the mirror AS OBSERVED — a
+    /// capacity-scaled rate let a 16M sizing call a steady 10k/s
+    /// reload quiet and release mid-load at the floor (review
+    /// finding). A rate frozen at construction cannot track a mirror
+    /// that is still growing.
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        have: u64,
+        seq: u64,
+        live: bool,
+        quiet_rate: u64,
+    ) -> GateView {
+        let activity_per_sec = match self.last_check {
+            // A rate needs two observations; the first check only
+            // baselines, and reports as loading — which a source
+            // this young almost certainly is.
+            None => u64::MAX,
+            Some(prev) => {
+                let ms = now.duration_since(prev).as_millis().max(1) as u64;
+                seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
+            }
+        };
+        let rate_quiet = live && activity_per_sec <= quiet_rate;
+        if !rate_quiet {
+            self.rate_quiet_since = None;
+        } else if self.rate_quiet_since.is_none() {
+            self.rate_quiet_since = Some(now);
+        }
+        let still_loading = have < self.floor || !rate_quiet;
+        if still_loading {
+            self.quiet_since = None;
+        } else if self.quiet_since.is_none() {
+            self.quiet_since = Some(now);
+        }
+        let released = self
+            .quiet_since
+            .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
+        self.last_seq = seq;
+        self.last_check = Some(now);
+        GateView {
+            released,
+            rate_quiet_for: self.rate_quiet_since.map(|s| now.duration_since(s)),
+        }
+    }
+}
+
+/// Which direction the deferral last asked the supervisor to move
+/// steering. See `DeferredResync::AwaitingFallback::last_request`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerRequest {
+    Settle,
+    Revoke,
+}
+
+/// What a deferred adopted reconciliation is waiting for.
+#[derive(Debug, Clone, Copy)]
+enum DeferredResync {
+    /// A STEERED adoption: even the FIB DUMP is deferred. VPP processes
+    /// `ip_route_dump` with every worker parked in barrier sync — the
+    /// message is not mp-safe (`ip_api.c` marks `ip_route_add_del`
+    /// thread-safe but not the dump), so at the reference table the
+    /// dump is ~5.4 s of the NIC dropping frames no VPP counter sees
+    /// (drill (d10), shadow 2026-08-09; invariant across six prior runs
+    /// because every one of them ran this dump at attach). It may only
+    /// run against a VPP carrying no traffic. Once the source is loaded
+    /// and quiet — which means the eBPF tier is equally loaded, both
+    /// consuming the same mirror commits — the runtime asks the
+    /// supervisor to unsteer ([`Event::FallbackSettled`]) and dumps
+    /// only after the NIC ledger confirms the rules are gone.
+    /// `steer_wanted` survives the unsteer, so `VerifyPassed` re-steers
+    /// on the existing verified path.
+    AwaitingFallback {
+        gate: SourceGate,
+        /// The last steering request and when it was made, so a
+        /// refused or unacknowledged transition is re-asked every
+        /// [`UNSTEER_REQUEST_EVERY`] instead of on each 50 ms tick.
+        /// The KIND is part of the record because opposite transitions
+        /// must not share a throttle: a revocation arriving just after
+        /// an acknowledged unsteer is the safety path, and waiting out
+        /// the unsteer's pace window left traffic on a collapsing
+        /// fallback for up to five seconds (review finding).
+        last_request: Option<(SteerRequest, std::time::Instant)>,
+        /// True from the moment this deferral's unsteer is observed
+        /// complete until the gate re-releases: the revocation path
+        /// keeps re-asking on THIS flag, never on the ledger being
+        /// empty — a partial restore leaves rules in the ledger, and
+        /// gating on emptiness is what wedged half the allowlist on
+        /// the condemned fallback with no retry (review finding).
+        restoring: bool,
+    },
+    /// An UNSTEERED adoption whose dump has already run — harmlessly,
+    /// because with no rules installed nothing is on VPP for the
+    /// barrier to stall. The DIFF is deferred until the source is
+    /// loaded and quiet, exactly the original gate: a diff against a
+    /// loading source is ~all withdrawals.
+    AwaitingDiff { adopted: u64, gate: SourceGate },
+}
+
+impl DeferredResync {
+    fn floor(&self) -> u64 {
+        match self {
+            DeferredResync::AwaitingFallback { gate, .. } => gate.floor,
+            DeferredResync::AwaitingDiff { gate, .. } => gate.floor,
+        }
+    }
+}
+
+/// Floor for the pre-dump stage, as a fraction of the ledger's route
+/// capacity. Before the dump the adopted table's size is unknowable —
+/// reading it is exactly what is being deferred — so the floor that
+/// keeps a dead or trickling source from triggering an unsteer needs
+/// another basis, and capacity is the one available: it derives from
+/// the operator's `expected-routes`, so it scales with the deployment
+/// instead of encoding this fleet's table.
+///
+/// Capacity is an UPPER sizing bound, though, so this floor is only
+/// one of three releases — a deployment whose real table sits below
+/// `capacity / 16` (the default sizing over a small table qualifies)
+/// would otherwise defer forever (review finding). The other two, in
+/// the `AwaitingFallback` arm: the completeness authority where a bird
+/// exists to compare against, and the session-backed small-table
+/// clause under [`SMALL_TABLE_QUIET_FOR`].
+pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
+
+/// The pre-dump stage's small-table release: the feed session is UP,
+/// the mirror is non-empty, and the rate has been quiet this long. The
+/// session handle is what three failed proxies were reaching for
+/// (capacity fractions, arrival deltas, absolute minimums - each a
+/// review finding): no mirror-side count can distinguish a loaded
+/// small table from the husk a dead session leaves behind, because
+/// neighbour-synthesized local routes alone can number in the
+/// hundreds. Liveness comes from the session owner instead, and quiet
+/// supplies the completion evidence.
+///
+/// The DURATION still matters: it must outlast the BGP hold time,
+/// because a HUNG session reads as up until the hold expires - the
+/// listener then closes it and reports down, which is what bounds how
+/// long "up" can be stale. Default holds are 90 s and the fleet feed
+/// negotiates 90; 150 s covers them with margin. A deployment that
+/// raises its hold beyond this should size `expected-routes` within
+/// 16x of its table or run `require-table-complete on`, both of which
+/// release without this clause.
+const SMALL_TABLE_QUIET_FOR: Duration = Duration::from_secs(150);
+
+/// How often a refused or unacknowledged unsteer is re-requested while
+/// the pre-dump stage waits. Paced because the gate re-checks every
+/// driver tick: asking on each one would emit an action per 50 ms at a
+/// NIC that just refused the last one.
+const UNSTEER_REQUEST_EVERY: Duration = Duration::from_secs(5);
 
 /// The adopted diff runs only when the source holds at least
 /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR` routes **and** has been
@@ -379,6 +598,35 @@ fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
     (adopted / 1024).max(64)
 }
 
+/// The authority's CURRENT word, or `None` when no authority is
+/// configured: the cached verdict must still permit steering AND the
+/// report must still describe the mirror as it is now (its authority
+/// count against `mirror_now`, under the same drift bound the verdict
+/// itself enforces). One function because it has two callers — the
+/// release computation and the post-dump revalidation — and the review
+/// caught them drifting apart twice: first the /2 bound diverging from
+/// the policy, then the veto trusting the cached verdict while only
+/// the `complete` release recomputed (a stale Converged carried a
+/// since-shrunken mirror through the floor path for the length of the
+/// dump).
+fn authority_current(
+    completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    mirror_now: u64,
+) -> Option<bool> {
+    completeness.as_ref().map(|h| {
+        h.verdict().permits_steering()
+            && h.latest().is_some_and(|r| {
+                let now_r = packetframe_common::fib::CompletenessReport {
+                    mirror_routes: mirror_now,
+                    ..r
+                };
+                now_r
+                    .drift()
+                    .is_some_and(|d| d <= packetframe_common::fib::STEER_MAX_DRIFT)
+            })
+    })
+}
+
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
     core: Rc<RefCell<Core>>,
@@ -407,6 +655,7 @@ impl Runtime {
         Self {
             core: Rc::new(RefCell::new(Core {
                 completeness: None,
+                feed_session: None,
                 engine,
                 process: None,
                 source,
@@ -462,6 +711,14 @@ impl Runtime {
         handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
     ) {
         self.core.borrow_mut().completeness = Some(handle);
+    }
+
+    /// Attach the feed session-liveness handle. The small-table
+    /// release consults it, because no mirror-side count can
+    /// distinguish a loaded small table from the husk a dead session
+    /// leaves behind.
+    pub fn feed_session(&self, handle: std::sync::Arc<packetframe_common::fib::FeedSession>) {
+        self.core.borrow_mut().feed_session = Some(handle);
     }
 
     /// Point steering at a new set of ports and rules.
@@ -522,7 +779,9 @@ impl Runtime {
             drain_error: c.last_drain_error.clone(),
             source_backlog: c.source.backlog(),
             steer_configured_ports: c.steering.configured_ports(),
-            resync_deferred: c.deferred_resync.map(|d| (c.source.route_count(), d.floor)),
+            resync_deferred: c
+                .deferred_resync
+                .map(|d| (c.source.route_count(), d.floor())),
         }
     }
 }
@@ -704,60 +963,248 @@ impl Observe for ObserveView {
         // coming diff reads the full mirror and covers them, and
         // applying a partial feed's withdrawals early is the exact
         // hazard being deferred.
-        if let Some(mut d) = c.deferred_resync {
+        if let Some(d) = c.deferred_resync {
             let have = c.source.route_count();
-            // Both gates, in order: below the floor nothing else
-            // matters, and above it only quiet SUSTAINED FOR A DURATION
-            // counts — a loading feed passes through the floor by
-            // construction (the floor-only version withdrew half a live
-            // table, 2026-08-08), and "quiet" is a rate over elapsed
-            // time, never a per-call delta: the production loop caps
-            // its sleeps at 50 ms, so a per-call threshold shrinks with
-            // cadence until a full-speed reload classifies as quiet.
             let seq = c.source.change_seq();
-            let activity_per_sec = match d.last_check {
-                // A rate needs two observations; the first check only
-                // baselines, and reports as loading — which a source
-                // this young almost certainly is.
-                None => u64::MAX,
-                Some(prev) => {
-                    let ms = now.duration_since(prev).as_millis().max(1) as u64;
-                    seq.saturating_sub(d.last_seq).saturating_mul(1_000) / ms
+            match d {
+                DeferredResync::AwaitingFallback {
+                    mut gate,
+                    mut last_request,
+                    mut restoring,
+                } => {
+                    let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
+                    // Rate scaled to the mirror as observed — never
+                    // to capacity, which is a ceiling, not a table.
+                    let view = gate.observe(now, have, seq, live, source_quiet_rate_per_sec(have));
+                    let want = gate.floor;
+                    // Three ways the fallback proves itself ready,
+                    // because the floor alone cannot: capacity is an
+                    // upper sizing bound, so a real table below
+                    // capacity/16 would defer forever on it (review
+                    // finding).
+                    //  - the coupled floor+quiescence release, for
+                    //    tables within 16x of their sizing (the fleet);
+                    //  - the completeness authority, where a bird
+                    //    exists — the exact signal, and the same one
+                    //    `Effects::steer` gates on;
+                    //  - a non-empty mirror whose feed SESSION is up,
+                    //    quiet longer than the BGP hold time: the
+                    //    session handle is the liveness authority no
+                    //    mirror-side count could be (see
+                    //    SMALL_TABLE_QUIET_FOR), and the hold-length
+                    //    quiet is what bounds a hung session going
+                    //    stale at "up".
+                    // The authority's CURRENT word gates every path:
+                    // the cached verdict alone let a stale Converged
+                    // carry a since-shrunken mirror through the floor
+                    // release for the length of the dump (review
+                    // finding). `authority_current` recomputes the
+                    // report against the mirror as it is now; None
+                    // means no authority is configured and the proxies
+                    // stand on their own.
+                    let authority = authority_current(&c.completeness, have);
+                    let veto = authority == Some(false);
+                    let complete = live
+                        && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
+                        && authority == Some(true);
+                    let small_table_loaded = have > 0
+                        && live
+                        && view
+                            .rate_quiet_for
+                            .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
+                    let released =
+                        !veto && ((view.released && live) || complete || small_table_loaded);
+                    let unsteered = c.steering.installed().is_empty();
+                    if !released {
+                        // Revocation AFTER the unsteer was acknowledged
+                        // — the feed dropped in the window before the
+                        // dump. The adopted FIB is still whole (nothing
+                        // has touched it), so ask for the traffic back
+                        // rather than leaving it idle over a fallback
+                        // that may be losing routes (review finding).
+                        // Paced like the unsteer request; a refused
+                        // steer is re-asked the same way.
+                        // `restoring` LATCHES on the first observation
+                        // of this deferral's unsteer having landed, and
+                        // the re-ask keys on the latch, never on the
+                        // ledger being empty: a PARTIAL restore leaves
+                        // rules in the ledger, and gating on emptiness
+                        // wedged half the allowlist on the condemned
+                        // fallback with no retry (review finding).
+                        // RestoreSteer is a reconcile, so re-asking
+                        // over an already-complete set is an idempotent
+                        // re-assert.
+                        if unsteered || restoring {
+                            restoring = true;
+                            // Same-kind pacing only: the first
+                            // revocation after an acknowledged unsteer
+                            // goes out immediately.
+                            let ask = last_request.is_none_or(|(kind, t)| {
+                                kind != SteerRequest::Revoke
+                                    || now.duration_since(t) >= UNSTEER_REQUEST_EVERY
+                            });
+                            if ask {
+                                c.pending.push(Event::FallbackRevoked);
+                                last_request = Some((SteerRequest::Revoke, now));
+                            }
+                        }
+                        c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                            gate,
+                            last_request,
+                            restoring,
+                        });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    if !unsteered {
+                        // A re-release after a revocation cycle starts
+                        // the settle/unsteer sequence over.
+                        restoring = false;
+                        // The fallback can carry the traffic now; ask the
+                        // supervisor to take it off VPP. Through the
+                        // machine, never `steering.unsteer()` from here:
+                        // the ledger persist and the `steered` fact live
+                        // with the executor, and a second unsteer path is
+                        // two owners for one NIC.
+                        let ask = last_request.is_none_or(|(kind, t)| {
+                            kind != SteerRequest::Settle
+                                || now.duration_since(t) >= UNSTEER_REQUEST_EVERY
+                        });
+                        if ask {
+                            c.pending.push(Event::FallbackSettled);
+                            last_request = Some((SteerRequest::Settle, now));
+                        }
+                        c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                            gate,
+                            last_request,
+                            restoring,
+                        });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    // Unsteered and quiet: the dump is free — nothing is
+                    // on VPP for the barrier to stall.
+                    {
+                        let Core {
+                            engine,
+                            source,
+                            feed_session,
+                            completeness,
+                            ..
+                        } = &mut *c;
+                        let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+                        // Revalidate on the FAR side of the dump: it
+                        // blocks this thread for seconds, and the world
+                        // it re-checks is the MIRROR, not just the
+                        // transport — a live BGP soft reload withdraws
+                        // and reannounces with the session up and a
+                        // cached verdict still permitting, and a diff
+                        // snapshotted in that trough queues withdrawals
+                        // that destroy the intact FIB just read (review
+                        // finding, twice: liveness alone was the first
+                        // version's check). Three current facts must
+                        // hold:
+                        //  - the session is still up;
+                        //  - the mirror moved during the dump at no
+                        //    more than the gate's own quiet rate — any
+                        //    faster and the quiet that released us is
+                        //    retroactively false;
+                        //  - a configured authority's report, recomputed
+                        //    against the mirror AS IT IS NOW, still
+                        //    permits.
+                        // The deferral is KEPT on refusal: the ledger
+                        // holds the dumped FIB (the dump no-ops on a
+                        // populated ledger), the revocation path
+                        // re-steers, and a later release diffs against
+                        // a recovered source.
+                        let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
+                        let have_now = source.route_count();
+                        let seq_now = source.change_seq();
+                        // An ABSOLUTE budget for the whole dump, never
+                        // a dump-wide average: dividing by the dump's
+                        // duration let a withdrawal burst early in a
+                        // slow dump dilute into "settled" across the
+                        // idle seconds that followed (review finding —
+                        // twice: the first fix was claimed and never
+                        // landed, caught by the reviewer reading the
+                        // actual expression). The entire dump may see
+                        // at most what a legitimately quiet source
+                        // produces in one SOURCE_QUIET_FOR window,
+                        // scaled by the mirror being protected.
+                        let churn_budget =
+                            source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs();
+                        let dump_churn = seq_now.saturating_sub(seq);
+                        // Both bounds, because each covers the other's
+                        // small end: the absolute budget is 128
+                        // mutations at the 64/s floor, which is noise
+                        // for a 1M mirror and a 99% wipe for a
+                        // 100-route one (review finding). Half is the
+                        // same fraction the diff-stage floor has always
+                        // used for "the source still knows the table".
+                        let mirror_settled =
+                            have_now >= (have / 2).max(1) && dump_churn <= churn_budget;
+                        let authority_agrees =
+                            authority_current(completeness, have_now) != Some(false);
+                        if !live_now || !mirror_settled || !authority_agrees {
+                            tracing::warn!(
+                                adopted,
+                                live = live_now,
+                                dump_churn,
+                                churn_budget,
+                                have_now,
+                                "the feed changed while VPP's FIB was being dumped; holding \
+                                 the diff — the adopted routes stay in the ledger and the \
+                                 reconciliation resumes when the source is ready again"
+                            );
+                            gate.rebaseline(seq_now);
+                            c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                                gate,
+                                last_request,
+                                restoring: true,
+                            });
+                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                        }
+                        tracing::info!(
+                            have,
+                            adopted,
+                            "route source loaded and quiet and VPP unsteered; dumped its \
+                             FIB against no traffic and running the adopted resync diff"
+                        );
+                        let _plan = engine.begin_resync(source.as_ref());
+                        engine
+                            .program_neighbours(source.as_ref())
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    c.deferred_resync = None;
                 }
-            };
-            let still_loading =
-                have < d.floor || activity_per_sec > source_quiet_rate_per_sec(d.adopted);
-            if still_loading {
-                d.quiet_since = None;
-            } else if d.quiet_since.is_none() {
-                d.quiet_since = Some(now);
+                DeferredResync::AwaitingDiff { adopted, mut gate } => {
+                    // The diff stage has no session requirement (its
+                    // floor is measured against the DUMPED table, and
+                    // nothing at this stage is steered), so quiet needs
+                    // no liveness conditioning: pass live.
+                    let released = gate
+                        .observe(now, have, seq, true, source_quiet_rate_per_sec(adopted))
+                        .released;
+                    if !released {
+                        let want = gate.floor;
+                        c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    tracing::info!(
+                        have,
+                        adopted,
+                        "route source loaded and quiet; running the adopted resync diff"
+                    );
+                    {
+                        let Core { engine, source, .. } = &mut *c;
+                        let _plan = engine.begin_resync(source.as_ref());
+                        engine
+                            .program_neighbours(source.as_ref())
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    c.deferred_resync = None;
+                }
             }
-            let released = d
-                .quiet_since
-                .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
-            d.last_seq = seq;
-            d.last_check = Some(now);
-            if !released {
-                c.deferred_resync = Some(d);
-                return Ok(crate::driver::Drain::AwaitingSource {
-                    have,
-                    want: d.floor,
-                });
-            }
-            tracing::info!(
-                have,
-                adopted = d.adopted,
-                "route source loaded and quiet; running the adopted resync diff"
-            );
-            {
-                let Core { engine, source, .. } = &mut *c;
-                let _plan = engine.begin_resync(source.as_ref());
-                engine
-                    .program_neighbours(source.as_ref())
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())?;
-            }
-            c.deferred_resync = None;
         }
         // Live changes are pulled in FIRST, so a route learned while VPP
         // was already converged goes out in this same batch rather than
@@ -848,6 +1295,23 @@ impl Effects for EffectsView {
         outcome
     }
 
+    fn restore_steer(&mut self) -> Result<(), String> {
+        // NO completeness gate, deliberately — the one divergence from
+        // `steer`, and the whole reason this method exists. The gate
+        // protects traffic from a VPP synced off an incomplete MIRROR;
+        // the adoptee's FIB was never built from the mirror, and a
+        // verdict condemning the mirror is precisely when traffic
+        // belongs back on the intact adoptee rather than on the
+        // fallback the verdict condemned (review finding: the gate
+        // blocked the restoration exactly when its verdict caused the
+        // revocation). Reachable only through Action::RestoreSteer,
+        // which only (AdoptedResyncing, FallbackRevoked) emits.
+        let mut c = self.core.borrow_mut();
+        let outcome = c.steering.steer();
+        c.record_steering();
+        outcome
+    }
+
     fn steer(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
         // The completeness gate, HERE rather than at either caller.
@@ -928,8 +1392,39 @@ impl Effects for EffectsView {
 
     fn start_resync(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
-        // Split borrow: the engine walks the source while both live in
-        // the same core.
+        // A steered start is necessarily a steered ADOPTION: rules
+        // reach the NIC only after a verify, which no fresh spawn has
+        // had, and inherited orphan rules are torn down before
+        // `StartRequested` is ever injected. It is also the one case
+        // where `adopt_vpp_fib` must NOT run yet: the dump parks every
+        // VPP worker in barrier sync (see
+        // `DeferredResync::AwaitingFallback`), and this VPP is the one
+        // carrying the traffic. Defer everything — the dump included —
+        // until the fallback tier can take over. The NIC ledger is the
+        // discriminator, not the supervisor's belief, because rules in
+        // the NIC are what puts packets on VPP.
+        if !c.steering.installed().is_empty() {
+            let capacity = c.engine.route_capacity();
+            let floor = (capacity / FALLBACK_FLOOR_DIVISOR).max(1);
+            let seq = c.source.change_seq();
+            tracing::info!(
+                floor,
+                "adopted VPP is steered, so reading its FIB waits: the dump freezes \
+                 every worker for seconds (ip_route_dump holds VPP's barrier). Once the \
+                 route source is loaded and quiet the eBPF tier takes the traffic, the \
+                 dump runs against an idle VPP, and steering returns after the verified \
+                 resync"
+            );
+            c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                gate: SourceGate::new(floor, seq),
+                last_request: None,
+                restoring: false,
+            });
+            return Ok(());
+        }
+        // Unsteered: nothing is on VPP, so the dump's worker stall
+        // costs no packets. Split borrow: the engine walks the source
+        // while both live in the same core.
         let deferral = {
             let Core { engine, source, .. } = &mut *c;
             // BEFORE the diff, because the diff is what consumes it: the
@@ -949,15 +1444,13 @@ impl Effects for EffectsView {
             // finished loading, and a daemon restart is exactly when it
             // has not: the feed reconnects at startup and takes tens of
             // seconds to reload. Diffing an adopted ledger against that
-            // window queues ~everything as a withdrawal — against a
-            // live, possibly steered VPP (drill (d), 2026-08-07). EVERY
-            // adoption of a POPULATED FIB defers, even one whose source
-            // already looks complete — a count cannot say "complete",
-            // only the floor-plus-quiescence gate in `drain_batch` can,
-            // and an above-floor count at this instant is exactly what a
-            // half-finished reload looks like (2026-08-08). One path to
-            // the diff, ~1.5–3 s of deliberate patience on the path
-            // that used to skip it.
+            // window queues ~everything as a withdrawal (drill (d),
+            // 2026-08-07). EVERY adoption of a POPULATED FIB defers,
+            // even one whose source already looks complete — a count
+            // cannot say "complete", only the floor-plus-quiescence gate
+            // in `drain_batch` can, and an above-floor count at this
+            // instant is exactly what a half-finished reload looks like
+            // (2026-08-08).
             //
             // `adopted == 0` — a fresh spawn, or a survivor with an
             // empty FIB — starts immediately instead: there is no
@@ -988,7 +1481,7 @@ impl Effects for EffectsView {
                     "adopted resync deferred until the route source is loaded and quiet; \
                      the adopted FIB keeps forwarding untouched meanwhile"
                 );
-                Some(DeferredResync {
+                Some(DeferredResync::AwaitingDiff {
                     adopted,
                     // Clamped to 1: integer division floors adopted=1
                     // to zero, and a floor of zero lets a DEAD source
@@ -996,10 +1489,7 @@ impl Effects for EffectsView {
                     // the sole live route — the exact case the floor
                     // exists for (review finding). A populated
                     // adoption's floor is never satisfied by nothing.
-                    floor: (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
-                    last_seq: seq,
-                    last_check: None,
-                    quiet_since: None,
+                    gate: SourceGate::new((adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1), seq),
                 })
             }
         };

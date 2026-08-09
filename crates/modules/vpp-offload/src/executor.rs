@@ -46,6 +46,11 @@ pub trait Effects {
     /// Install MCAM steering rules.
     fn steer(&mut self) -> Result<(), String>;
 
+    /// Re-install steering for the intact adoptee, bypassing the
+    /// completeness gate — see [`Action::RestoreSteer`] for why the
+    /// gate inverts on this one path.
+    fn restore_steer(&mut self) -> Result<(), String>;
+
     /// Whether the steering ledger currently names any rule in the NIC.
     ///
     /// Read after a failed [`Self::steer`] so the supervisor is *told*
@@ -186,6 +191,26 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                     out.events.push(Event::ConvergenceFailed);
                 }
             }
+            Action::RestoreSteer => out.events.push(match fx.restore_steer() {
+                Ok(()) => {
+                    tracing::info!(
+                        "steering RESTORED: the adopted VPP's intact FIB takes the traffic \
+                         back while the fallback is not ready"
+                    );
+                    Event::Steered
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        rules_remain = fx.steering_in_place(),
+                        "restore-steer failed; traffic stays on the eBPF tier"
+                    );
+                    out.failures.push((*action, e));
+                    Event::SteerFailed {
+                        rules_remain: fx.steering_in_place(),
+                    }
+                }
+            }),
             Action::Steer => out.events.push(match fx.steer() {
                 Ok(()) => {
                     // The one action that moves customer traffic between
@@ -270,6 +295,10 @@ mod tests {
             err_if(self.fail_unsteer, "ioctl refused")
         }
         fn steer(&mut self) -> Result<(), String> {
+            self.calls.push("steer");
+            err_if(self.fail_steer, "no free MCAM loc")
+        }
+        fn restore_steer(&mut self) -> Result<(), String> {
             self.calls.push("steer");
             err_if(self.fail_steer, "no free MCAM loc")
         }

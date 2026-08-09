@@ -167,6 +167,10 @@ pub struct BgpListenerConfig {
     /// checks are the only identity binding available in the
     /// absence of TCP-MD5 / TCP-AO.
     pub expected_peer_ip: Option<IpAddr>,
+    /// Session-liveness handle, reported to the second tier. See
+    /// [`packetframe_common::fib::FeedSession`] for why this travels
+    /// out-of-band of the route events.
+    pub session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 }
 
 impl BgpListenerConfig {
@@ -179,6 +183,7 @@ impl BgpListenerConfig {
             hold_time: DEFAULT_HOLD_TIME,
             peer_acl: Vec::new(),
             expected_peer_ip: None,
+            session: None,
         }
     }
 }
@@ -287,6 +292,14 @@ impl BgpListener {
                             } else {
                                 info!("BGP client disconnected cleanly");
                             }
+                            // However the session ended — clean close,
+                            // NOTIFICATION, hold-timer expiry — it is
+                            // down now, and the hold timer above is what
+                            // bounds how long a hung session could have
+                            // kept the flag stale.
+                            if let Some(sess) = &self.cfg.session {
+                                sess.set_up(false);
+                            }
                             if let Err(e) = self
                                 .prog_handle
                                 .apply_route_event(RouteEvent::Resync)
@@ -385,6 +398,13 @@ impl BgpListener {
             tokio::time::interval(Duration::from_secs(effective_hold.max(3) as u64 / 3));
         keepalive_tick.tick().await; // skip immediate fire
         let mut hold_deadline = Instant::now() + Duration::from_secs(effective_hold as u64);
+        // Deliberately NOT live yet: OPEN proves the SESSION, not the
+        // table. A session that establishes and then delays its first
+        // UPDATE would read as live-and-quiet, and two seconds of
+        // pre-stream quiet releases the second tier's gate onto a
+        // mirror holding only local routes (review finding). Liveness
+        // raises at the InitiationComplete heuristic below — the same
+        // initial-RIB-settled definition the BMP path uses.
         let mut last_update: Option<Instant> = None;
         let mut init_complete_fired = false;
         let mut quiescence_tick = tokio::time::interval(Duration::from_secs(1));
@@ -407,7 +427,10 @@ impl BgpListener {
                         Some(m) => {
                             // Any inbound traffic resets hold.
                             hold_deadline = Instant::now() + Duration::from_secs(effective_hold as u64);
-                            self.process_msg(m, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await;
+                            if let Err(e) = self.process_msg(m, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await {
+                                reader.abort();
+                                return Err(e);
+                            }
                         }
                         None => {
                             // Reader exited, surface the result.
@@ -457,6 +480,16 @@ impl BgpListener {
                                         "InitiationComplete fired"
                                     );
                                     init_complete_fired = true;
+                                    // The initial RIB has settled: the
+                                    // mirror now holds what this session
+                                    // has to give, which is what "live"
+                                    // must mean to the second tier's
+                                    // release gate. Every session exit
+                                    // still runs through the accept
+                                    // loop's set_up(false).
+                                    if let Some(sess) = &self.cfg.session {
+                                        sess.set_up(true);
+                                    }
                                 }
                             }
                         }
@@ -466,6 +499,12 @@ impl BgpListener {
         }
     }
 
+    /// `Err` is session-fatal: the caller must tear the connection
+    /// down. It was `()` until a review pass caught the oversized-
+    /// UPDATE arm logging "closing session" while only returning from
+    /// this helper — the connection lived on, quiesced, fired
+    /// InitiationComplete, and marked a feed LIVE whose last UPDATE
+    /// had been thrown away whole.
     async fn process_msg(
         &self,
         msg: BgpMessage,
@@ -473,7 +512,7 @@ impl BgpListener {
         peer_asn: u32,
         last_update: &mut Option<Instant>,
         updates_seen: &mut usize,
-    ) {
+    ) -> Result<(), RouteSourceError> {
         match msg {
             BgpMessage::Open(_) => {
                 // Spurious post-handshake OPEN, bird shouldn't do
@@ -484,12 +523,17 @@ impl BgpListener {
                 // Hold timer reset already happened; no further work.
             }
             BgpMessage::Notification(n) => {
-                // BgpError is a typed enum (MessageHeaderError,
-                // OpenError, UpdateError, HoldTimerExpired, Cease, ...);
-                // log the Debug repr, operator can grep on it.
-                warn!(error = ?n.error, "received NOTIFICATION; closing session");
-                // Reader will see EOF after bird closes; that path
-                // emits Resync via the accept loop.
+                // Session-fatal for real, not just in the log line: a
+                // NOTIFICATION ends the session per RFC 4271, and while
+                // bird usually closes the TCP right after (the reader
+                // would see EOF), waiting on the peer's close leaves a
+                // window where the connection quiesces, settles, and
+                // reports a feed live that its peer has already
+                // renounced.
+                return Err(RouteSourceError::recoverable(format!(
+                    "received NOTIFICATION ({:?}); closing session",
+                    n.error
+                )));
             }
             BgpMessage::Update(update) => {
                 *last_update = Some(Instant::now());
@@ -522,12 +566,13 @@ impl BgpListener {
                     // attacker-shaped UPDATE to just keep adding to
                     // the per-message budget. Close, emit Resync,
                     // let the peer reconnect.
-                    warn!(
-                        elems = elems.len(),
-                        cap = MAX_ELEMS_PER_UPDATE,
-                        "BGP UPDATE elem count exceeds per-message cap; closing session"
-                    );
-                    return;
+                    return Err(RouteSourceError::recoverable(format!(
+                        "BGP UPDATE fanned out to {} elems (cap {}); closing session — a \
+                         skipped UPDATE must not leave a session that later settles and \
+                         reports a feed live with that UPDATE's prefixes missing",
+                        elems.len(),
+                        MAX_ELEMS_PER_UPDATE
+                    )));
                 }
                 for elem in elems {
                     let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
@@ -540,6 +585,7 @@ impl BgpListener {
                 }
             }
         }
+        Ok(())
     }
 }
 

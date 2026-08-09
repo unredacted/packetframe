@@ -140,6 +140,25 @@ pub enum Event {
     Adopted {
         steered: bool,
     },
+    /// The runtime's deferred adopted reconciliation reports that the
+    /// route source is loaded and quiet. The eBPF tier consumes the
+    /// same mirror commits, so it is equally loaded — meaning it can
+    /// carry the traffic while VPP's FIB is read. And it must:
+    /// `ip_route_dump` is not mp-safe, so VPP processes it with every
+    /// worker parked in barrier sync — ~5.4 s of the NIC dropping
+    /// frames no counter sees, at the reference table (shadow,
+    /// 2026-08-09). Meaningful only while an adopted resync is
+    /// deferred; every other state ignores it as stale.
+    FallbackSettled,
+    /// The inverse: readiness was REVOKED after the unsteer had
+    /// already been acknowledged — the feed dropped in the window
+    /// between the acknowledgement and the FIB dump. The adopted
+    /// VPP's FIB is still intact (nothing has touched it yet), so the
+    /// safe recovery is to put traffic BACK on it and return to
+    /// waiting, rather than leaving it idle while the fallback loses
+    /// routes underneath the traffic (review finding). Meaningful
+    /// only in `AdoptedResyncing`; elsewhere it is stale.
+    FallbackRevoked,
     /// The binary API answered.
     ApiUp,
     /// The pending map drained to empty.
@@ -293,6 +312,15 @@ pub enum Event {
 /// and "restart then unsteer" differ by an outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Re-install steering for an adopted VPP whose reconciliation was
+    /// revoked after the unsteer — WITHOUT the completeness gate that
+    /// [`Action::Steer`] runs through. The gate protects traffic from
+    /// a VPP synced off an incomplete MIRROR; the adoptee's FIB was
+    /// never built from the mirror, and a condemning verdict is
+    /// exactly when traffic belongs back on it (review finding: the
+    /// gate blocked the restoration precisely when its verdict caused
+    /// the revocation).
+    RestoreSteer,
     /// Remove MCAM rules. First in any teardown.
     Unsteer,
     /// Kill the process if it is still alive.
@@ -482,6 +510,62 @@ impl Supervisor {
                 // correctly-forwarding dataplane to do it.
                 self.state = if steered { AdoptedResyncing } else { Syncing };
                 vec![Action::AttachDevices, Action::StartResync]
+            }
+
+            // --- rule 3, refined by measurement ---
+            // Adoption still never tears steering down just to resync —
+            // but READING the adopted FIB stalls it: the dump holds
+            // VPP's worker barrier for seconds. So once the runtime
+            // reports the fallback tier loaded and quiet, unsteering
+            // FIRST is what keeps packets flowing, and the dump runs
+            // against a VPP carrying nothing. `steer_wanted` was set at
+            // adoption and survives, so `VerifyPassed` re-steers on the
+            // existing verified path; `steered` clears only on the
+            // `Unsteered` acknowledgement, as everywhere else.
+            (AdoptedResyncing, FallbackSettled) => {
+                if self.steered {
+                    vec![Action::Unsteer]
+                } else {
+                    vec![]
+                }
+            }
+            // The window between the unsteer acknowledgement and the
+            // dump: the fallback stopped being ready, the adopted FIB
+            // is still whole — re-steer it. `steer_wanted` was set at
+            // adoption; a refused steer (the completeness gate, say)
+            // lands in the catch-all and the runtime re-asks, paced.
+            (AdoptedResyncing, FallbackRevoked) => {
+                // On `steer_wanted` alone, NOT `!steered`: a partial
+                // restore leaves rules in the NIC and `steered` true —
+                // and gating on unsteered-ness is what wedged half the
+                // allowlist on the condemned fallback with no retry
+                // (review finding). `RestoreSteer` is a reconcile, so
+                // re-asking over an already-complete set is a cheap
+                // idempotent re-assert, the same move the UniFi wipe
+                // recovery leans on.
+                if self.steer_wanted {
+                    vec![Action::RestoreSteer]
+                } else {
+                    vec![]
+                }
+            }
+            // A restoration that failed part-way: some rules are in
+            // the NIC, some are not. Recorded exactly as reported —
+            // `steered` must reflect whether ANYTHING diverts traffic,
+            // or the next teardown skips the Unsteer it owes — and the
+            // runtime's paced FallbackRevoked keeps re-asking until
+            // the reconcile completes.
+            (AdoptedResyncing, SteerFailed { rules_remain }) => {
+                self.steered = rules_remain;
+                vec![]
+            }
+            // The acknowledgement for that re-steer. Without this arm
+            // the catch-all would swallow it and the machine would
+            // believe traffic still on the fallback — suppressing the
+            // Unsteer that the next gate release owes.
+            (AdoptedResyncing, Event::Steered) => {
+                self.steered = true;
+                vec![]
             }
 
             // --- converging ---
@@ -858,6 +942,71 @@ mod tests {
             vec![Action::AttachDevices, Action::StartResync],
             "device attach must precede the resync"
         );
+    }
+
+    #[test]
+    fn fallback_settled_unsteers_only_a_steered_adopted_resync() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        assert_eq!(s.state(), State::AdoptedResyncing);
+        assert_eq!(
+            s.on(Event::FallbackSettled),
+            vec![Action::Unsteer],
+            "a steered adoption is unsteered so the dump runs against an idle VPP"
+        );
+        // Until the acknowledgement arrives the request is re-askable,
+        // and after it the same event asks for nothing.
+        assert_eq!(s.on(Event::FallbackSettled), vec![Action::Unsteer]);
+        s.on(Event::Unsteered);
+        assert!(
+            s.on(Event::FallbackSettled).is_empty(),
+            "an acknowledged unsteer leaves nothing to ask for"
+        );
+        // The want survives for the re-steer after verify.
+        s.on(Event::SyncComplete);
+        s.on(Event::VerifyPassed);
+        assert_eq!(s.state(), State::Ready);
+
+        // Any state without a deferred adopted resync ignores it.
+        let mut fresh = Supervisor::new();
+        assert!(fresh.on(Event::FallbackSettled).is_empty());
+        fresh.on(Event::StartRequested);
+        assert!(fresh.on(Event::FallbackSettled).is_empty());
+    }
+
+    /// The revocation window: unsteer acknowledged, then the fallback
+    /// stops being ready before the dump — the intact adopted FIB gets
+    /// the traffic back.
+    #[test]
+    fn revoked_readiness_re_steers_the_intact_adopted_vpp() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        assert_eq!(s.on(Event::FallbackSettled), vec![Action::Unsteer]);
+        s.on(Event::Unsteered);
+        assert_eq!(
+            s.on(Event::FallbackRevoked),
+            vec![Action::RestoreSteer],
+            "an unsteered adoption with a revoked fallback takes traffic back, \
+             ungated — the veto that revoked it must not block the restore"
+        );
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::AdoptedResyncing, "still converging");
+        assert_eq!(
+            s.on(Event::FallbackRevoked),
+            vec![Action::RestoreSteer],
+            "re-asking over a complete set is an idempotent re-assert — gating on \
+             unsteered-ness is what wedged a PARTIAL restore forever"
+        );
+        // A partial failure records the truth and stays retryable.
+        s.on(Event::SteerFailed { rules_remain: true });
+        assert_eq!(
+            s.on(Event::FallbackRevoked),
+            vec![Action::RestoreSteer],
+            "rules half-in must keep retrying the reconcile"
+        );
+        // And the next release still owes an Unsteer, because the
+        // re-steer was acknowledged into `steered`.
+        assert_eq!(s.on(Event::FallbackSettled), vec![Action::Unsteer]);
     }
 
     #[test]

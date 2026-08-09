@@ -115,6 +115,16 @@ pub struct RouteController {
     integrity: Option<SharedSnapshot>,
 }
 
+/// The handles a second forwarding tier registers before attach — how
+/// complete the mirror is, and whether the feed's transport session is
+/// up. One struct because they are created together (the loader),
+/// stored together (both modules), and consumed together (here).
+#[derive(Default)]
+pub struct SecondTierSignals {
+    pub completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    pub feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+}
+
 impl RouteController {
     /// Build and start the controller. `bpffs_root` is the same
     /// `global.bpffs_root` path the loader pins maps under; the
@@ -133,8 +143,12 @@ impl RouteController {
         fallback_default: Option<FallbackDefaultSpec>,
         fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
         route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
-        completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+        signals: SecondTierSignals,
     ) -> Result<Self, ControllerError> {
+        let SecondTierSignals {
+            completeness,
+            feed_session,
+        } = signals;
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
         // BMP station are all I/O-bound so CPU is never the limit.
@@ -255,6 +269,7 @@ impl RouteController {
                     let mut backoff = LISTENER_BACKOFF_INITIAL;
                     loop {
                         let mut station = BmpStation::new(listen, prog.clone(), shut.clone())
+                            .with_feed_session(feed_session.clone())
                             .with_stall_gate(stall.clone())
                             .with_peer_acl(peer_acl_for_spawn.clone());
                         if require_loc_rib {
@@ -313,6 +328,7 @@ impl RouteController {
                 // v0.2.2: same retry-with-backoff pattern as BmpStation
                 // above. See that comment for rationale.
                 let mut cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
+                cfg.session = feed_session.clone();
                 cfg.peer_acl = peer_acl;
                 cfg.expected_peer_ip = expected_peer_ip;
                 // Capture the auth-posture fields before the spawn
@@ -361,6 +377,17 @@ impl RouteController {
                 );
             }
             None => {
+                // No external feed means no session that could be down:
+                // the mirror's content — local-prefix and neighbour
+                // state — IS this deployment's whole world, and it is
+                // resident the moment the resolver runs. Raised once
+                // and never lowered, deliberately: leaving the handle
+                // at its default "down" made every release clause
+                // unsatisfiable after a daemon restart, parking a
+                // steered adoption forever (review finding).
+                if let Some(h) = &feed_session {
+                    h.set_up(true);
+                }
                 info!(
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer \
                      (no route source, `route-source` not configured)"

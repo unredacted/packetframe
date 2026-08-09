@@ -157,6 +157,7 @@ pub fn bring_up(
     source: Box<dyn RouteSource + Send + Sync>,
     allowlist: &[packetframe_common::fib::IpPrefix],
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+    feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     budget: &McamBudget,
 ) -> Result<Attached, String> {
     // `require-table-complete on` with nothing publishing completeness
@@ -346,6 +347,7 @@ pub fn bring_up(
         &vpp_binary,
         steering,
         completeness,
+        feed_session,
         loopback,
     ) {
         Ok(attached) => Ok(attached),
@@ -416,6 +418,7 @@ fn finish(
     vpp_binary: &Path,
     steering: NtupleSteering,
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+    feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     loopback: packetframe_common::config::Ipv4Prefix,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
@@ -672,6 +675,9 @@ fn finish(
         );
         if let Some(handle) = completeness {
             runtime.require_table_complete(handle);
+        }
+        if let Some(handle) = feed_session {
+            runtime.feed_session(handle);
         }
         let initial = match adopted {
             Some(p) => {

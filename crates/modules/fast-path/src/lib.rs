@@ -83,6 +83,8 @@ pub struct FastPathModule {
     route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
     #[cfg(target_os = "linux")]
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    #[cfg(target_os = "linux")]
+    feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 }
 
 impl FastPathModule {
@@ -115,6 +117,17 @@ impl FastPathModule {
         handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
     ) {
         self.completeness = Some(handle);
+    }
+
+    /// Report the route feed's session liveness through `handle`, for
+    /// the second tier's release gating. Same constraint and caller as
+    /// [`Self::set_completeness`].
+    #[cfg(target_os = "linux")]
+    pub fn set_feed_session(
+        &mut self,
+        handle: std::sync::Arc<packetframe_common::fib::FeedSession>,
+    ) {
+        self.feed_session = Some(handle);
     }
 
     /// Snapshot of the current attach set for status reporting.
@@ -188,6 +201,7 @@ impl Module for FastPathModule {
             cfg,
             self.route_sink.clone(),
             self.completeness.clone(),
+            self.feed_session.clone(),
         )
     }
 
