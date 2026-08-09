@@ -1101,7 +1101,17 @@ impl Observe for ObserveView {
                         let dump_ms = dump_started.elapsed().as_millis().max(1) as u64;
                         let churn_per_sec =
                             seq_now.saturating_sub(seq).saturating_mul(1_000) / dump_ms;
-                        let mirror_settled = have_now > 0 && churn_per_sec <= gate.quiet_rate;
+                        // Bounded by the MIRROR being protected, never
+                        // by the sizing ceiling: gate.quiet_rate scales
+                        // with capacity, and a 16M-route sizing calls
+                        // 15.6k mutations/s quiet — ~78k routes lost
+                        // across a five-second dump would have read as
+                        // settled (review finding). The released
+                        // mirror's own scale is the honest yardstick,
+                        // the same arithmetic every other quiet bound
+                        // uses.
+                        let mirror_settled =
+                            have_now > 0 && churn_per_sec <= source_quiet_rate_per_sec(have);
                         let authority_agrees = completeness.as_ref().is_none_or(|h| {
                             h.verdict().permits_steering()
                                 && h.latest().is_some_and(|r| {

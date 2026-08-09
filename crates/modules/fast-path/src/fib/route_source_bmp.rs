@@ -417,25 +417,41 @@ impl BmpStation {
                     }
                 }
                 _ = tick.tick() => {
-                    if init_complete_fired {
-                        continue;
-                    }
-                    if let Some(last) = last_route_monitoring {
-                        if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
-                            if let Err(e) = self
-                                .prog_handle
-                                .apply_route_event(RouteEvent::InitiationComplete)
-                                .await
-                            {
-                                warn!(error = %e, "InitiationComplete dispatch failed");
-                            } else {
-                                // The station's own definition of
-                                // initial-stream readiness, and therefore
-                                // where a stream becomes LIVE for the
-                                // second tier: the dump has quiesced, so
-                                // the mirror now holds what the emitter
-                                // has. Guarded like the RM raise was: an
-                                // emitter that speaks peer lifecycle
+                    // Settlement is per EPOCH, not per connection: when
+                    // the last monitored peer goes down, `initiated` and
+                    // `saw_rm` reset, and the NEXT peer's dump must
+                    // quiesce all over again before liveness returns —
+                    // a PeerUp on an already-settled connection was
+                    // raising ahead of that peer's own dump (review
+                    // finding). The InitiationComplete EVENT still
+                    // fires once per connection; the programmer's GC
+                    // semantics are per connection, and only the
+                    // liveness settlement re-arms.
+                    let settled = self.initiated.load(std::sync::atomic::Ordering::Relaxed);
+                    let rm_this_epoch = self.saw_rm.load(std::sync::atomic::Ordering::Relaxed);
+                    if !settled && rm_this_epoch {
+                        if let Some(last) = last_route_monitoring {
+                            if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
+                                if !init_complete_fired {
+                                    if let Err(e) = self
+                                        .prog_handle
+                                        .apply_route_event(RouteEvent::InitiationComplete)
+                                        .await
+                                    {
+                                        warn!(error = %e, "InitiationComplete dispatch failed");
+                                        continue;
+                                    }
+                                    info!(
+                                        frames_parsed,
+                                        quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
+                                        "InitiationComplete fired"
+                                    );
+                                    init_complete_fired = true;
+                                }
+                                // The stream (or this epoch's re-dump)
+                                // has quiesced: the mirror holds what
+                                // the emitter has. Guarded as always —
+                                // an emitter that speaks peer lifecycle
                                 // with no peer up stays down.
                                 self.initiated
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -452,12 +468,6 @@ impl BmpStation {
                                         sess.set_up(true);
                                     }
                                 }
-                                info!(
-                                    frames_parsed,
-                                    quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
-                                    "InitiationComplete fired"
-                                );
-                                init_complete_fired = true;
                             }
                         }
                     }
@@ -556,6 +566,17 @@ impl BmpStation {
                     if let Some(sess) = &self.session {
                         sess.set_up(false);
                     }
+                    // The epoch ended with the last peer: whatever RM
+                    // settled BEFORE is no evidence about the next
+                    // peer's table, so settlement re-arms — the next
+                    // PeerUp records itself and waits for its own
+                    // dump's quiescence (review finding: an
+                    // already-settled connection re-raised on the new
+                    // PeerUp before that peer had streamed a frame).
+                    self.initiated
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.saw_rm
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             BmpMessageBody::RouteMonitoring(rm) => {
