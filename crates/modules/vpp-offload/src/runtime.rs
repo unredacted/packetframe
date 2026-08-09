@@ -324,9 +324,6 @@ struct Core {
 struct SourceGate {
     /// Minimum source size before quiescence even counts.
     floor: u64,
-    /// Mutations per second below which the source is quiet — see
-    /// [`source_quiet_rate_per_sec`].
-    quiet_rate: u64,
     /// The source's change counter at the previous check, for the
     /// activity rate. The COUNTER, not the table size: net size hides
     /// balanced churn and reads a shrinking source as quiet.
@@ -357,10 +354,9 @@ struct GateView {
 }
 
 impl SourceGate {
-    fn new(floor: u64, quiet_rate: u64, seq_baseline: u64) -> Self {
+    fn new(floor: u64, seq_baseline: u64) -> Self {
         Self {
             floor,
-            quiet_rate,
             last_seq: seq_baseline,
             last_check: None,
             quiet_since: None,
@@ -385,7 +381,22 @@ impl SourceGate {
     /// (review finding). Rebaselining continuously while down also
     /// covers the up-transition: the clock starts from the moment
     /// liveness returns.
-    fn observe(&mut self, now: std::time::Instant, have: u64, seq: u64, live: bool) -> GateView {
+    /// `quiet_rate` is supplied per observation, not stored, because
+    /// the honest basis DIFFERS by stage and time: the diff stage
+    /// scales it to the dumped table it protects, while the pre-dump
+    /// stage must scale it to the mirror AS OBSERVED — a
+    /// capacity-scaled rate let a 16M sizing call a steady 10k/s
+    /// reload quiet and release mid-load at the floor (review
+    /// finding). A rate frozen at construction cannot track a mirror
+    /// that is still growing.
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        have: u64,
+        seq: u64,
+        live: bool,
+        quiet_rate: u64,
+    ) -> GateView {
         let activity_per_sec = match self.last_check {
             // A rate needs two observations; the first check only
             // baselines, and reports as loading — which a source
@@ -396,7 +407,7 @@ impl SourceGate {
                 seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
             }
         };
-        let rate_quiet = live && activity_per_sec <= self.quiet_rate;
+        let rate_quiet = live && activity_per_sec <= quiet_rate;
         if !rate_quiet {
             self.rate_quiet_since = None;
         } else if self.rate_quiet_since.is_none() {
@@ -918,7 +929,9 @@ impl Observe for ObserveView {
                     mut restoring,
                 } => {
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
-                    let view = gate.observe(now, have, seq, live);
+                    // Rate scaled to the mirror as observed — never
+                    // to capacity, which is a ceiling, not a table.
+                    let view = gate.observe(now, have, seq, live, source_quiet_rate_per_sec(have));
                     let want = gate.floor;
                     // Three ways the fallback proves itself ready,
                     // because the floor alone cannot: capacity is an
@@ -1111,7 +1124,15 @@ impl Observe for ObserveView {
                         let churn_budget =
                             source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs();
                         let dump_churn = seq_now.saturating_sub(seq);
-                        let mirror_settled = have_now > 0 && dump_churn <= churn_budget;
+                        // Both bounds, because each covers the other's
+                        // small end: the absolute budget is 128
+                        // mutations at the 64/s floor, which is noise
+                        // for a 1M mirror and a 99% wipe for a
+                        // 100-route one (review finding). Half is the
+                        // same fraction the diff-stage floor has always
+                        // used for "the source still knows the table".
+                        let mirror_settled =
+                            have_now >= (have / 2).max(1) && dump_churn <= churn_budget;
                         let authority_agrees = completeness.as_ref().is_none_or(|h| {
                             h.verdict().permits_steering()
                                 && h.latest().is_some_and(|r| {
@@ -1161,7 +1182,9 @@ impl Observe for ObserveView {
                     // floor is measured against the DUMPED table, and
                     // nothing at this stage is steered), so quiet needs
                     // no liveness conditioning: pass live.
-                    let released = gate.observe(now, have, seq, true).released;
+                    let released = gate
+                        .observe(now, have, seq, true, source_quiet_rate_per_sec(adopted))
+                        .released;
                     if !released {
                         let want = gate.floor;
                         c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });
@@ -1394,7 +1417,7 @@ impl Effects for EffectsView {
                  resync"
             );
             c.deferred_resync = Some(DeferredResync::AwaitingFallback {
-                gate: SourceGate::new(floor, source_quiet_rate_per_sec(capacity), seq),
+                gate: SourceGate::new(floor, seq),
                 last_request: None,
                 restoring: false,
             });
@@ -1467,11 +1490,7 @@ impl Effects for EffectsView {
                     // the sole live route — the exact case the floor
                     // exists for (review finding). A populated
                     // adoption's floor is never satisfied by nothing.
-                    gate: SourceGate::new(
-                        (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
-                        source_quiet_rate_per_sec(adopted),
-                        seq,
-                    ),
+                    gate: SourceGate::new((adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1), seq),
                 })
             }
         };
