@@ -1454,6 +1454,7 @@ mod steered {
 
     pub type Log = Arc<Mutex<Vec<&'static str>>>;
     pub type SharedRoutes = Arc<Mutex<Vec<IpPrefix>>>;
+    pub type Session = Arc<packetframe_common::fib::FeedSession>;
 
     /// A steered adoption over a six-route VPP, mirror starting with
     /// `initial` routes, rules already in the NIC. The pre-dump floor
@@ -1464,7 +1465,7 @@ mod steered {
         name: &str,
         initial: &[IpPrefix],
         capacity: u64,
-    ) -> (Fake, SharedRoutes, Log, Runtime) {
+    ) -> (Fake, SharedRoutes, Log, Runtime, Session) {
         let fake = Fake::start_behaving(
             name,
             fake_vpp::Behaviour {
@@ -1483,7 +1484,11 @@ mod steered {
             }),
             capacity,
         );
-        (fake, shared, log, rt)
+        // Down until a test raises it, exactly like the real handle
+        // before the listener's first Established.
+        let session: Session = Arc::new(packetframe_common::fib::FeedSession::new());
+        rt.feed_session(session.clone());
+        (fake, shared, log, rt, session)
     }
 
     /// Adopt-steered, then confirm ticks below the release leave VPP
@@ -1601,7 +1606,8 @@ mod steered {
 /// steering returns only after the verified resync.
 #[test]
 fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
-    let (fake, shared, log, rt) = steered::fixture("steered-adopt", &[fake_vpp::v4(0, 0)], 160);
+    let (fake, shared, log, rt, _session) =
+        steered::fixture("steered-adopt", &[fake_vpp::v4(0, 0)], 160);
     let mut d = Driver::new();
     let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 40);
     assert_eq!(
@@ -1646,35 +1652,32 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
 
 /// The capacity floor is an UPPER sizing bound wearing a lower bound's
 /// hat, so it cannot be the only release (review finding): a deployment
-/// whose real table sits below capacity/16 — the default sizing over a
-/// small site — would defer forever. The small-table clause releases a
-/// mirror past SMALL_TABLE_MIN_ROUTES once it has been quiet longer
-/// than the BGP hold time: a session that died mid-load cannot stay
-/// quietly wrong past the hold (the PeerDown wipe empties it first),
-/// and the husk the wipe leaves cannot reach the minimum.
-///
-/// The mirror here starts PARTIALLY LOADED before the adoption is even
-/// injected — the loader starts the feed before vpp-offload attaches,
-/// so routes that predate the gate are the normal case, and a release
-/// condition counting only post-gate arrivals never fires (review
-/// finding, second round: `loaded_delta >= have` was exactly that).
+/// whose real table sits below capacity/16 - the default sizing over a
+/// small site - would defer forever. The small-table clause releases
+/// any non-empty mirror whose feed SESSION is up once it has been quiet
+/// longer than the BGP hold time. The session handle is the liveness
+/// authority no mirror-side count could be (three proxies fell to
+/// review: capacity fractions, arrival deltas, absolute minimums), so
+/// this works for a 100-route table as well as a 100k one, and no
+/// matter how much of the table loaded before the gate existed.
 #[test]
 fn a_small_table_releases_after_long_quiet_regardless_of_when_it_loaded() {
-    // Capacity 4096 → floor 256. The full table is 130 routes: past
-    // SMALL_TABLE_MIN_ROUTES (128), forever under the floor — only the
-    // small-table clause can release this.
+    // Capacity 4096 -> floor 256. The full table is 100 routes: under
+    // every count any proxy ever used - only session liveness plus
+    // long quiet can release this.
     let full: Vec<IpPrefix> = (0..4)
         .map(|i| fake_vpp::v4(0, i))
-        .chain((0..126).map(|i| fake_vpp::v4(1, i)))
+        .chain((0..96).map(|i| fake_vpp::v4(1, i)))
         .collect();
-    let (fake, shared, log, rt) = steered::fixture("steered-small", &full[..60], 4096);
+    let (fake, shared, log, rt, session) = steered::fixture("steered-small", &full[..60], 4096);
+    session.set_up(true);
     let mut d = Driver::new();
     let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
 
     // The rest of the load arrives after the gate exists.
     *shared.lock().unwrap() = full;
 
-    // 150 s of paced quiet at ≤250 ms a tick needs a real budget.
+    // 150 s of paced quiet at <=250 ms a tick needs a real budget.
     let (_, events) = steered::run_paced(&mut d, &rt, now, 8_192, |d| d.state() == State::Steered);
 
     assert_eq!(
@@ -1693,19 +1696,20 @@ fn a_small_table_releases_after_long_quiet_regardless_of_when_it_loaded() {
     );
 }
 
-/// A dead source releases nothing, ever: quiet is exactly what a feed
-/// that never loaded looks like, and unsteering onto an empty fallback
-/// is the original disaster. Neither does the husk a session death
-/// leaves behind — the handful of neighbour-synthesized routes that
-/// did not come from the session — however long it stays quiet: it
-/// cannot reach SMALL_TABLE_MIN_ROUTES. Held deferred with health
-/// degraded — stale-but-verified forwarding plus an alarm beats an
-/// outage.
+/// A dead source releases nothing, ever - and "dead" means the
+/// SESSION is down, not any particular mirror size. Local-prefix ARP
+/// scavenging can synthesize hundreds of routes with no bird behind
+/// them (review finding: up to 1024 hosts), so the husk left after a
+/// session death can dwarf any count threshold. With the session
+/// handle down, no amount of quiet releases: unsteering onto a
+/// fallback that lost its feed is the original disaster. Held deferred
+/// with health degraded - stale-but-verified forwarding plus an alarm
+/// beats an outage.
 #[test]
 fn a_dead_source_never_triggers_the_unsteer() {
-    let (fake, shared, log, rt) = steered::fixture("steered-dead", &[], 4096);
+    let (fake, shared, log, rt, session) = steered::fixture("steered-dead", &[], 4096);
     let mut d = Driver::new();
-    // Far past SMALL_TABLE_QUIET_FOR at ≤250 ms a tick, empty.
+    // Far past SMALL_TABLE_QUIET_FOR at <=250 ms a tick, empty.
     let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 2_000);
     assert_eq!(
         d.state(),
@@ -1713,9 +1717,11 @@ fn a_dead_source_never_triggers_the_unsteer() {
         "an empty, silent source must hold the adoption deferred forever"
     );
 
-    // The session dies leaving the synth husk: eight local routes that
-    // never came from bird. Quiet past every window, still no release.
-    *shared.lock().unwrap() = (0..8).map(|i| fake_vpp::v4(3, i)).collect();
+    // The session died and left a LARGE husk: two hundred synthesized
+    // local routes that never came from bird. Quiet past every window,
+    // session down, still no release.
+    session.set_up(false);
+    *shared.lock().unwrap() = (0..200).map(|i| fake_vpp::v4(3, i)).collect();
     {
         let (mut obs, mut fx) = rt.views();
         for _ in 0..2_000 {
@@ -1732,7 +1738,7 @@ fn a_dead_source_never_triggers_the_unsteer() {
     assert_eq!(
         d.state(),
         State::AdoptedResyncing,
-        "a synth-only husk must not count as a loaded table"
+        "a session-less husk must not count as a loaded table, whatever its size"
     );
     assert!(
         log.lock().unwrap().is_empty(),
@@ -1741,7 +1747,7 @@ fn a_dead_source_never_triggers_the_unsteer() {
     );
     assert_eq!(
         rt.status().resync_deferred,
-        Some((8, 256)),
+        Some((200, 256)),
         "and the deferral must be visible, not silent"
     );
 }
@@ -1753,7 +1759,7 @@ fn a_dead_source_never_triggers_the_unsteer() {
 fn completeness_releases_a_below_floor_table_promptly() {
     use packetframe_common::fib::{CompletenessReport, TableCompleteness};
 
-    let (fake, shared, log, rt) = steered::fixture("steered-complete", &[], 160);
+    let (fake, shared, log, rt, _session) = steered::fixture("steered-complete", &[], 160);
     let handle = std::sync::Arc::new(TableCompleteness::new());
     rt.require_table_complete(handle.clone());
     let mut d = Driver::new();

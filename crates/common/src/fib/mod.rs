@@ -355,6 +355,41 @@ impl TableCompleteness {
     }
 }
 
+/// Whether the route feed's transport session is up right now —
+/// written by whichever session owner feeds the mirror (the BGP
+/// listener or the BMP station), read by consumers that must
+/// distinguish "the source finished loading" from "the source is gone
+/// and left its last answer standing".
+///
+/// Out-of-band of the route-event stream on purpose: the BGP listener
+/// deliberately does NOT wipe the mirror on session loss — stale
+/// forwarding while bird restarts beats an empty table — so session
+/// lifecycle cannot be inferred downstream from route events, and a
+/// count of mirror routes says nothing about liveness (review
+/// finding: neighbour-synthesized local routes alone can number in
+/// the hundreds, so no husk-size bound works either).
+#[derive(Debug, Default)]
+pub struct FeedSession(std::sync::atomic::AtomicBool);
+
+impl FeedSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The session owner's report. `true` only while a session is
+    /// actually established — for BGP, after the OPEN exchange; set
+    /// back to `false` the moment the connection handler returns,
+    /// including on hold-timer expiry, which is what bounds how long
+    /// a hung session can keep this stale.
+    pub fn set_up(&self, up: bool) {
+        self.0.store(up, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_up(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod peer_id_tests {
     use super::*;

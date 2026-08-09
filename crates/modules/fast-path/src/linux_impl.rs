@@ -1181,6 +1181,7 @@ pub fn attach(
     cfg: &ModuleConfig<'_>,
     route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 ) -> ModuleResult<Vec<Attachment>> {
     // v0.2.5: load `finalize` first so its FD is available for the
     // MUTATION_PROGS[0] population below. Order matters: fast_path's
@@ -1636,7 +1637,10 @@ pub fn attach(
             fallback_default,
             fdb_pin_chains,
             route_sink,
-            completeness,
+            crate::fib::controller::SecondTierSignals {
+                completeness,
+                feed_session,
+            },
         )
         .map_err(|e| {
             ModuleError::other(MODULE_NAME, format!("RouteController start failed: {e}"))

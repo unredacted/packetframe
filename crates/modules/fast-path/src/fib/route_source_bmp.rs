@@ -125,6 +125,9 @@ pub struct BmpStation {
     /// source IP must fall within at least one entry or the
     /// connection is dropped before the BMP framing starts.
     peer_acl: Vec<ipnet::IpNet>,
+    /// Session-liveness handle, reported to the second tier. See
+    /// [`packetframe_common::fib::FeedSession`].
+    session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 }
 
 /// Re-export for callers building the station.
@@ -153,7 +156,18 @@ impl BmpStation {
             stall_gate: None,
             require_loc_rib: false,
             peer_acl: Vec::new(),
+            session: None,
         }
+    }
+
+    /// Report session liveness through `handle`. `None` reports to
+    /// nobody, which is every deployment without a second tier.
+    pub fn with_feed_session(
+        mut self,
+        handle: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+    ) -> Self {
+        self.session = handle;
+        self
     }
 
     /// Attach the integrity checker's snapshot so `run()` spawns a
@@ -242,8 +256,14 @@ impl BmpStation {
                                 continue;
                             }
                             info!(%addr, "BMP client connected");
+                            if let Some(sess) = &self.session {
+                                sess.set_up(true);
+                            }
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
+                            }
+                            if let Some(sess) = &self.session {
+                                sess.set_up(false);
                             } else {
                                 info!("BMP client disconnected cleanly");
                             }

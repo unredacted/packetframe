@@ -289,6 +289,12 @@ struct Core {
     /// authority to compare against (the shadow has no bird of its own)
     /// and the operator owns the judgement instead.
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    /// The feed session-liveness handle: whether the BGP/BMP session
+    /// that fills the mirror is up RIGHT NOW, written by the session
+    /// owner in the fast-path controller. `None` when the wiring has no
+    /// second tier or a harness never set one; the small-table release
+    /// is then simply off.
+    feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
     /// Why the last drain failed, or `None` if the last one succeeded.
     ///
     /// Recorded here rather than left to the caller because the caller
@@ -460,39 +466,29 @@ impl DeferredResync {
 /// `capacity / 16` (the default sizing over a small table qualifies)
 /// would otherwise defer forever (review finding). The other two, in
 /// the `AwaitingFallback` arm: the completeness authority where a bird
-/// exists to compare against, and the small-table clause under
-/// [`SMALL_TABLE_QUIET_FOR`] / [`SMALL_TABLE_MIN_ROUTES`].
+/// exists to compare against, and the session-backed small-table
+/// clause under [`SMALL_TABLE_QUIET_FOR`].
 pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
 
-/// The pre-dump stage's small-table release: rate-quiet sustained this
-/// long, together with at least [`SMALL_TABLE_MIN_ROUTES`] in the
-/// mirror, counts as loaded even below the capacity floor. The
-/// DURATION is one of the two load-bearing parts: it must outlast the
-/// BGP hold time, because a feed that died or hung mid-load cannot
-/// stay quietly wrong longer than that — the session drops, the
-/// PeerDown wipe empties the mirror of everything the session carried,
-/// and the wipe's own churn resets the quiet tracker. Default holds
-/// are 90 s and the fleet's feed negotiates 90; 150 s covers them with
-/// margin. A deployment that raises its hold beyond this should size
-/// `expected-routes` within 16x of its table or run
-/// `require-table-complete on`, both of which release without this
-/// clause.
+/// The pre-dump stage's small-table release: the feed session is UP,
+/// the mirror is non-empty, and the rate has been quiet this long. The
+/// session handle is what three failed proxies were reaching for
+/// (capacity fractions, arrival deltas, absolute minimums - each a
+/// review finding): no mirror-side count can distinguish a loaded
+/// small table from the husk a dead session leaves behind, because
+/// neighbour-synthesized local routes alone can number in the
+/// hundreds. Liveness comes from the session owner instead, and quiet
+/// supplies the completion evidence.
+///
+/// The DURATION still matters: it must outlast the BGP hold time,
+/// because a HUNG session reads as up until the hold expires - the
+/// listener then closes it and reports down, which is what bounds how
+/// long "up" can be stale. Default holds are 90 s and the fleet feed
+/// negotiates 90; 150 s covers them with margin. A deployment that
+/// raises its hold beyond this should size `expected-routes` within
+/// 16x of its table or run `require-table-complete on`, both of which
+/// release without this clause.
 const SMALL_TABLE_QUIET_FOR: Duration = Duration::from_secs(150);
-
-/// The other load-bearing part: what quiet-past-the-hold leaves behind
-/// after a session death is a mirror holding only what did NOT come
-/// from the session — neighbour-synthesized local routes, bounded by
-/// the hosts physically present on the box's L2s, i.e. dozens. No
-/// in-process signal can distinguish "watched a load" from "watched a
-/// wipe": the mirror starts empty every daemon start, so its content
-/// IS the observed mutations — a change-counter baseline is a
-/// tautology, and one taken at gate creation additionally missed
-/// whatever loaded before attach (review finding). An absolute
-/// minimum the husk cannot reach is the honest discriminator. A site
-/// with a genuine table under 128 routes releases through the floor
-/// instead, by sizing `expected-routes` at or under 2048 — whose
-/// floor, not coincidentally, is exactly 128.
-const SMALL_TABLE_MIN_ROUTES: u64 = 128;
 
 /// How often a refused or unacknowledged unsteer is re-requested while
 /// the pre-dump stage waits. Paced because the gate re-checks every
@@ -576,6 +572,7 @@ impl Runtime {
         Self {
             core: Rc::new(RefCell::new(Core {
                 completeness: None,
+                feed_session: None,
                 engine,
                 process: None,
                 source,
@@ -631,6 +628,14 @@ impl Runtime {
         handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
     ) {
         self.core.borrow_mut().completeness = Some(handle);
+    }
+
+    /// Attach the feed session-liveness handle. The small-table
+    /// release consults it, because no mirror-side count can
+    /// distinguish a loaded small table from the husk a dead session
+    /// leaves behind.
+    pub fn feed_session(&self, handle: std::sync::Arc<packetframe_common::fib::FeedSession>) {
+        self.core.borrow_mut().feed_session = Some(handle);
     }
 
     /// Point steering at a new set of ports and rules.
@@ -895,16 +900,19 @@ impl Observe for ObserveView {
                     //  - the completeness authority, where a bird
                     //    exists — the exact signal, and the same one
                     //    `Effects::steer` gates on;
-                    //  - a table past SMALL_TABLE_MIN_ROUTES that has
-                    //    been quiet longer than the BGP hold time — see
-                    //    the two constants for why that pair separates
-                    //    "small and loaded" from the synth-only husk a
-                    //    dead session leaves behind.
+                    //  - a non-empty mirror whose feed SESSION is up,
+                    //    quiet longer than the BGP hold time: the
+                    //    session handle is the liveness authority no
+                    //    mirror-side count could be (see
+                    //    SMALL_TABLE_QUIET_FOR), and the hold-length
+                    //    quiet is what bounds a hung session going
+                    //    stale at "up".
                     let complete = view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && c.completeness
                             .as_ref()
                             .is_some_and(|h| h.verdict().permits_steering());
-                    let small_table_loaded = have >= SMALL_TABLE_MIN_ROUTES
+                    let small_table_loaded = have > 0
+                        && c.feed_session.as_ref().is_some_and(|f| f.is_up())
                         && view
                             .rate_quiet_for
                             .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);

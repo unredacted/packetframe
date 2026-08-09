@@ -167,6 +167,10 @@ pub struct BgpListenerConfig {
     /// checks are the only identity binding available in the
     /// absence of TCP-MD5 / TCP-AO.
     pub expected_peer_ip: Option<IpAddr>,
+    /// Session-liveness handle, reported to the second tier. See
+    /// [`packetframe_common::fib::FeedSession`] for why this travels
+    /// out-of-band of the route events.
+    pub session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 }
 
 impl BgpListenerConfig {
@@ -179,6 +183,7 @@ impl BgpListenerConfig {
             hold_time: DEFAULT_HOLD_TIME,
             peer_acl: Vec::new(),
             expected_peer_ip: None,
+            session: None,
         }
     }
 }
@@ -287,6 +292,14 @@ impl BgpListener {
                             } else {
                                 info!("BGP client disconnected cleanly");
                             }
+                            // However the session ended — clean close,
+                            // NOTIFICATION, hold-timer expiry — it is
+                            // down now, and the hold timer above is what
+                            // bounds how long a hung session could have
+                            // kept the flag stale.
+                            if let Some(sess) = &self.cfg.session {
+                                sess.set_up(false);
+                            }
                             if let Err(e) = self
                                 .prog_handle
                                 .apply_route_event(RouteEvent::Resync)
@@ -385,6 +398,12 @@ impl BgpListener {
             tokio::time::interval(Duration::from_secs(effective_hold.max(3) as u64 / 3));
         keepalive_tick.tick().await; // skip immediate fire
         let mut hold_deadline = Instant::now() + Duration::from_secs(effective_hold as u64);
+        // Established: OPENs exchanged, our KEEPALIVE sent. Everything
+        // before this point was handshake, and every exit below runs
+        // through the accept loop's set_up(false).
+        if let Some(sess) = &self.cfg.session {
+            sess.set_up(true);
+        }
         let mut last_update: Option<Instant> = None;
         let mut init_complete_fired = false;
         let mut quiescence_tick = tokio::time::interval(Duration::from_secs(1));

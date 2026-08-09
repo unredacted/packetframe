@@ -368,6 +368,9 @@ pub struct VppOffloadModule {
     /// loader wires it, which it does only when a route authority
     /// exists; see [`Self::set_completeness`].
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    /// The feed's session-liveness handle, when the loader wired one;
+    /// see [`Self::set_feed_session`].
+    feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
     /// `Some` once supervision is running.
     attached: Option<bringup::Attached>,
     /// A teardown still running in the background after `detach` returned.
@@ -395,6 +398,7 @@ impl VppOffloadModule {
         Self {
             allowlist: std::sync::Arc::new(SharedAllowlist::default()),
             completeness: None,
+            feed_session: None,
             cfg: VppOffloadConfig::default(),
             state_dir: std::path::PathBuf::new(),
             source: None,
@@ -449,6 +453,21 @@ impl VppOffloadModule {
         handle: std::sync::Arc<packetframe_common::fib::TableCompleteness>,
     ) {
         self.completeness = Some(handle);
+    }
+
+    /// Hand the module the feed's session-liveness handle.
+    ///
+    /// Read by the deferred adopted reconciliation: a small table's
+    /// release needs to know the session that fed the mirror is still
+    /// up, because no mirror-side count can distinguish a loaded small
+    /// table from the husk a dead session leaves behind (review
+    /// finding). Absent, the small-table release is simply off — the
+    /// capacity floor and the completeness authority still release.
+    pub fn set_feed_session(
+        &mut self,
+        handle: std::sync::Arc<packetframe_common::fib::FeedSession>,
+    ) {
+        self.feed_session = Some(handle);
     }
 
     /// Settle a finished background teardown and replace the provisional
@@ -725,6 +744,7 @@ impl Module for VppOffloadModule {
             source,
             &allowlist,
             self.completeness.clone(),
+            self.feed_session.clone(),
             &budget,
         ) {
             Ok(a) => a,

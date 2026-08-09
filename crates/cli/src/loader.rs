@@ -267,6 +267,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         .as_ref()
         .map(|_| std::sync::Arc::new(packetframe_common::fib::TableCompleteness::new()));
 
+    // Whether the feed's BGP/BMP session is up right now, written by
+    // the session owner inside the fast-path controller and read by
+    // vpp-offload's deferred-reconciliation gate. Same wiring rule as
+    // completeness: one object, both tiers, built only when both exist.
+    #[cfg(feature = "vpp-offload")]
+    let feed_session = feed
+        .as_ref()
+        .map(|_| std::sync::Arc::new(packetframe_common::fib::FeedSession::new()));
+
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
@@ -280,6 +289,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 #[cfg(feature = "vpp-offload")]
                 if let Some(c) = &completeness {
                     m.set_completeness(c.clone());
+                }
+                #[cfg(feature = "vpp-offload")]
+                if let Some(h) = &feed_session {
+                    m.set_feed_session(h.clone());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
@@ -297,6 +310,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 m.set_allowlist(allowlist.clone());
                 if let Some(c) = &completeness {
                     m.set_completeness(c.clone());
+                }
+                if let Some(h) = &feed_session {
+                    m.set_feed_session(h.clone());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
