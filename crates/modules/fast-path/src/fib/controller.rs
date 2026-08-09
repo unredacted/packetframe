@@ -377,6 +377,17 @@ impl RouteController {
                 );
             }
             None => {
+                // No external feed means no session that could be down:
+                // the mirror's content — local-prefix and neighbour
+                // state — IS this deployment's whole world, and it is
+                // resident the moment the resolver runs. Raised once
+                // and never lowered, deliberately: leaving the handle
+                // at its default "down" made every release clause
+                // unsatisfiable after a daemon restart, parking a
+                // steered adoption forever (review finding).
+                if let Some(h) = &feed_session {
+                    h.set_up(true);
+                }
                 info!(
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer \
                      (no route source, `route-source` not configured)"

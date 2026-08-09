@@ -957,12 +957,29 @@ impl Observe for ObserveView {
                     // proves bird was alive at REPORT time, and `live`
                     // is what makes that claim current.
                     let released = (view.released && live) || complete || small_table_loaded;
+                    let unsteered = c.steering.installed().is_empty();
                     if !released {
+                        // Revocation AFTER the unsteer was acknowledged
+                        // — the feed dropped in the window before the
+                        // dump. The adopted FIB is still whole (nothing
+                        // has touched it), so ask for the traffic back
+                        // rather than leaving it idle over a fallback
+                        // that may be losing routes (review finding).
+                        // Paced like the unsteer request; a refused
+                        // steer is re-asked the same way.
+                        if unsteered {
+                            let ask = last_request
+                                .is_none_or(|t| now.duration_since(t) >= UNSTEER_REQUEST_EVERY);
+                            if ask {
+                                c.pending.push(Event::FallbackRevoked);
+                                last_request = Some(now);
+                            }
+                        }
                         c.deferred_resync =
                             Some(DeferredResync::AwaitingFallback { gate, last_request });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
-                    if !c.steering.installed().is_empty() {
+                    if !unsteered {
                         // The fallback can carry the traffic now; ask the
                         // supervisor to take it off VPP. Through the
                         // machine, never `steering.unsteer()` from here:

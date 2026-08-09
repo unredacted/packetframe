@@ -150,6 +150,15 @@ pub enum Event {
     /// 2026-08-09). Meaningful only while an adopted resync is
     /// deferred; every other state ignores it as stale.
     FallbackSettled,
+    /// The inverse: readiness was REVOKED after the unsteer had
+    /// already been acknowledged — the feed dropped in the window
+    /// between the acknowledgement and the FIB dump. The adopted
+    /// VPP's FIB is still intact (nothing has touched it yet), so the
+    /// safe recovery is to put traffic BACK on it and return to
+    /// waiting, rather than leaving it idle while the fallback loses
+    /// routes underneath the traffic (review finding). Meaningful
+    /// only in `AdoptedResyncing`; elsewhere it is stale.
+    FallbackRevoked,
     /// The binary API answered.
     ApiUp,
     /// The pending map drained to empty.
@@ -510,6 +519,26 @@ impl Supervisor {
                 } else {
                     vec![]
                 }
+            }
+            // The window between the unsteer acknowledgement and the
+            // dump: the fallback stopped being ready, the adopted FIB
+            // is still whole — re-steer it. `steer_wanted` was set at
+            // adoption; a refused steer (the completeness gate, say)
+            // lands in the catch-all and the runtime re-asks, paced.
+            (AdoptedResyncing, FallbackRevoked) => {
+                if !self.steered && self.steer_wanted {
+                    vec![Action::Steer]
+                } else {
+                    vec![]
+                }
+            }
+            // The acknowledgement for that re-steer. Without this arm
+            // the catch-all would swallow it and the machine would
+            // believe traffic still on the fallback — suppressing the
+            // Unsteer that the next gate release owes.
+            (AdoptedResyncing, Event::Steered) => {
+                self.steered = true;
+                vec![]
             }
 
             // --- converging ---
@@ -916,6 +945,31 @@ mod tests {
         assert!(fresh.on(Event::FallbackSettled).is_empty());
         fresh.on(Event::StartRequested);
         assert!(fresh.on(Event::FallbackSettled).is_empty());
+    }
+
+    /// The revocation window: unsteer acknowledged, then the fallback
+    /// stops being ready before the dump — the intact adopted FIB gets
+    /// the traffic back.
+    #[test]
+    fn revoked_readiness_re_steers_the_intact_adopted_vpp() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        assert_eq!(s.on(Event::FallbackSettled), vec![Action::Unsteer]);
+        s.on(Event::Unsteered);
+        assert_eq!(
+            s.on(Event::FallbackRevoked),
+            vec![Action::Steer],
+            "an unsteered adoption with a revoked fallback takes traffic back"
+        );
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::AdoptedResyncing, "still converging");
+        assert!(
+            s.on(Event::FallbackRevoked).is_empty(),
+            "already steered again; nothing to do"
+        );
+        // And the next release still owes an Unsteer, because the
+        // re-steer was acknowledged into `steered`.
+        assert_eq!(s.on(Event::FallbackSettled), vec![Action::Unsteer]);
     }
 
     #[test]

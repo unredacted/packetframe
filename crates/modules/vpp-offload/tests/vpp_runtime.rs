@@ -1806,6 +1806,112 @@ fn a_dead_source_never_triggers_the_unsteer() {
     );
 }
 
+/// The revocation window: the gate released, the unsteer was
+/// acknowledged - and the feed dropped before the dump ran. The
+/// adopted FIB is still whole, so the traffic goes BACK onto it
+/// (review finding: parking here left traffic on a fallback that a
+/// BMP PeerDown was simultaneously emptying). When readiness returns,
+/// the ordinary cycle resumes from the top.
+#[test]
+fn a_revoked_fallback_re_steers_the_intact_adopted_vpp() {
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (fake, _shared, log, rt, session) = steered::fixture("steered-revoke", &full, 160);
+    session.set_up(true);
+    let mut d = Driver::new();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(Instant::now(), Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // Tick until the unsteer lands, then IMMEDIATELY drop the session
+    // - the dump must not run on the next tick.
+    let mut now = Instant::now();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..512 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            rt.set_steered(d.supervisor().is_steered());
+            let unsteer_landed = log.lock().unwrap().as_slice() == ["unsteer"];
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+            if unsteer_landed {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer"],
+        "window reached"
+    );
+    session.set_up(false);
+
+    // The revocation path: traffic back on the intact VPP, no dump.
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..512 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            rt.set_steered(d.supervisor().is_steered());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+            if log.lock().unwrap().len() == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "revoked readiness must put traffic back on the adopted VPP"
+    );
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "still waiting, steered again"
+    );
+    let touched: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "the dump and diff must not have run against the revoked window: {touched:?}"
+    );
+
+    // Readiness returns: the ordinary cycle completes from the top.
+    session.set_up(true);
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer", "unsteer", "steer"],
+        "the resumed cycle repeats the full sequence"
+    );
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
 /// Where a bird exists, completeness is the exact readiness signal -
 /// but a report is a snapshot, so it releases only alongside CURRENT
 /// session liveness (review finding: a PeerDown wipe inside the
