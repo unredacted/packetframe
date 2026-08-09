@@ -581,23 +581,6 @@ fn finish(
             ));
         }
     };
-    // A recorded process whose PLACEMENT is unknown must not be adopted.
-    //
-    // Same rule as the incomplete identity cookie above, and the same
-    // rule `expected_routes == 0` follows in `acquire`: unknown is not
-    // the same as unconstrained. VPP fixes thread placement at start,
-    // so if the file names a live VPP but not the cores it runs on —
-    // a state written by a binary from before `vpp_cores` existed —
-    // then this daemon cannot know which CPUs to keep off. It would
-    // vacate the freshly derived set, which is only right if the online
-    // CPU set has not changed since, and being wrong reinstates the
-    // preemption silently.
-    if prior.is_some() && state.vpp_cores.is_empty() {
-        return Err(format!(
-            "{}: the state file records a running VPP but not the CPUs it was placed on              (written by a packetframe from before that was recorded). Its worker's core              cannot be known, so this daemon cannot guarantee it stays off it, and a              resync burst sharing that core is exactly the packet loss this avoids. Stop              that VPP and `packetframe detach --all`, then attach again — the new record              will carry the placement.",
-            crate::service::MAY_HOLD_RESOURCES
-        ));
-    }
     let adopted: Option<VppProcess> = match prior {
         // A FAILED adoption is marked, because failing is not the same as
         // finding nothing: `adopt` declines cleanly (`Ok(None)`) when the
@@ -615,6 +598,32 @@ fn finish(
         })?,
         None => None,
     };
+    // A LIVE adopted process whose placement is unknown must not be kept.
+    //
+    // Checked here rather than on the record alone, because the record
+    // naming a pid does not mean that pid is running: `adopt` answers
+    // `Ok(None)` for one that is gone, and a dead VPP constrains
+    // nothing — this daemon will spawn a fresh one and record where it
+    // put it. Refusing on the record was the first version and it
+    // refused every upgrade whose recorded VPP had already exited,
+    // which is most of them (observed on the shadow, 2026-08-08).
+    //
+    // For a process that IS running the refusal stands, and for the
+    // same reason the incomplete identity cookie is refused above:
+    // unknown is not unconstrained. VPP fixes placement at start, so a
+    // record without it cannot say which cores to keep off, and being
+    // wrong reinstates the preemption silently.
+    if adopted.is_some() && state.vpp_cores.is_empty() {
+        return Err(format!(
+            "{}: the state file records a running VPP but not the CPUs it was placed on \
+             (written by a packetframe from before that was recorded). Its worker's core \
+             cannot be known, so this daemon cannot guarantee it stays off it, and a \
+             resync burst sharing that core is exactly the packet loss this avoids. Stop \
+             that VPP and `packetframe detach --all`, then attach again — the new record \
+             will carry the placement.",
+            crate::service::MAY_HOLD_RESOURCES
+        ));
+    }
     // Whether that VPP is diverting traffic right now. From the recorded
     // steering rules, because that is the only durable evidence — and
     // getting it wrong in the `false` direction would run the resync on
