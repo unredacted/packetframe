@@ -146,6 +146,14 @@ pub struct BmpStation {
     /// peers all die empties its Loc-RIB through RM withdrawals rather
     /// than going silent, which the mirror then reflects honestly.
     saw_rm: std::sync::atomic::AtomicBool,
+    /// Whether this connection has EVER sent a PeerUp. An emitter that
+    /// speaks peer lifecycle gets peer-set semantics: when its last
+    /// monitored peer goes down, the feed is down, however many RM
+    /// frames were streamed before — a sticky RM bit would disable the
+    /// peer-set transition for every mode, not just the Loc-RIB
+    /// streams that lack notifications (review finding). `saw_rm`
+    /// attests liveness only for connections that never spoke PeerUp.
+    saw_peer_up: std::sync::atomic::AtomicBool,
 }
 
 /// Re-export for callers building the station.
@@ -177,6 +185,7 @@ impl BmpStation {
             session: None,
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_rm: std::sync::atomic::AtomicBool::new(false),
+            saw_peer_up: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -285,6 +294,8 @@ impl BmpStation {
                             self.up_peers.lock().expect("up_peers lock").clear();
                             self.saw_rm
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
+                            self.saw_peer_up
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             if let Some(sess) = &self.session {
                                 sess.set_up(false);
                             } else {
@@ -351,8 +362,19 @@ impl BmpStation {
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
                                 self.saw_rm.store(true, Ordering::Relaxed);
-                                if let Some(sess) = &self.session {
-                                    sess.set_up(true);
+                                // An RM frame attests the feed only for
+                                // a connection that does not speak peer
+                                // lifecycle; on one that does, straggler
+                                // frames after the last PeerDown must
+                                // not resurrect a down feed.
+                                let peers_speak =
+                                    self.saw_peer_up.load(Ordering::Relaxed);
+                                let peers_up =
+                                    !self.up_peers.lock().expect("up_peers lock").is_empty();
+                                if !peers_speak || peers_up {
+                                    if let Some(sess) = &self.session {
+                                        sess.set_up(true);
+                                    }
                                 }
                             }
                             // Loc-RIB safety check happens inside
@@ -429,6 +451,8 @@ impl BmpStation {
                 self.up_peers.lock().expect("up_peers lock").clear();
                 self.saw_rm
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.saw_peer_up
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(sess) = &self.session {
                     sess.set_up(false);
                 }
@@ -457,6 +481,8 @@ impl BmpStation {
                 {
                     warn!(?peer_id, error = %e, "PeerUp dispatch failed");
                 }
+                self.saw_peer_up
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut up = self.up_peers.lock().expect("up_peers lock");
                 up.insert(peer_id);
                 if let Some(sess) = &self.session {
@@ -479,7 +505,13 @@ impl BmpStation {
                 }
                 let mut up = self.up_peers.lock().expect("up_peers lock");
                 up.remove(&peer_id);
-                if up.is_empty() && !self.saw_rm.load(std::sync::atomic::Ordering::Relaxed) {
+                // Peer-lifecycle emitters get peer-set semantics: last
+                // peer down = feed down, RM history notwithstanding.
+                // Only a connection that never spoke PeerUp may lean on
+                // its RM stream (the Loc-RIB case).
+                let rm_attests = !self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
+                    && self.saw_rm.load(std::sync::atomic::Ordering::Relaxed);
+                if up.is_empty() && !rm_attests {
                     if let Some(sess) = &self.session {
                         sess.set_up(false);
                     }

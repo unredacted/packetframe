@@ -377,7 +377,15 @@ impl SourceGate {
     /// per-call delta: the production loop caps its sleeps at 50 ms, so
     /// a per-call threshold shrinks with cadence until a full-speed
     /// reload classifies as quiet.
-    fn observe(&mut self, now: std::time::Instant, have: u64, seq: u64) -> GateView {
+    /// `live` conditions BOTH quiet trackers: quiet accumulated while
+    /// the feed was down is not evidence of anything — a dead session
+    /// is perfectly quiet — and without the reset, the first OPEN or
+    /// BMP frame after an outage would release instantly on stale
+    /// quiet, before the fresh session had streamed a single route
+    /// (review finding). Rebaselining continuously while down also
+    /// covers the up-transition: the clock starts from the moment
+    /// liveness returns.
+    fn observe(&mut self, now: std::time::Instant, have: u64, seq: u64, live: bool) -> GateView {
         let activity_per_sec = match self.last_check {
             // A rate needs two observations; the first check only
             // baselines, and reports as loading — which a source
@@ -388,7 +396,7 @@ impl SourceGate {
                 seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
             }
         };
-        let rate_quiet = activity_per_sec <= self.quiet_rate;
+        let rate_quiet = live && activity_per_sec <= self.quiet_rate;
         if !rate_quiet {
             self.rate_quiet_since = None;
         } else if self.rate_quiet_since.is_none() {
@@ -888,7 +896,8 @@ impl Observe for ObserveView {
                     mut gate,
                     mut last_request,
                 } => {
-                    let view = gate.observe(now, have, seq);
+                    let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
+                    let view = gate.observe(now, have, seq, live);
                     let want = gate.floor;
                     // Three ways the fallback proves itself ready,
                     // because the floor alone cannot: capacity is an
@@ -907,22 +916,31 @@ impl Observe for ObserveView {
                     //    SMALL_TABLE_QUIET_FOR), and the hold-length
                     //    quiet is what bounds a hung session going
                     //    stale at "up".
-                    let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     // The completeness verdict is a REPORT — a snapshot
                     // valid for up to STEER_MAX_REPORT_AGE — so it
                     // attests liveness at report time, not now: a
                     // PeerDown wipe inside that window would otherwise
                     // ride a stale Converged onto an empty fallback
                     // (review finding). Hence `live` here too, plus a
-                    // sanity bound that the mirror the report described
-                    // has not collapsed since — half, not equality,
-                    // because legitimate churn between checker runs
-                    // must not invalidate the authority.
+                    // requirement that the CURRENT mirror would still
+                    // pass the SAME steering policy the report passed:
+                    // the report's authority count against today's
+                    // mirror, under the same drift bound. A /2 bound
+                    // here permitted a 50% collapse to ride a verdict
+                    // whose policy allows 1% (review finding).
                     let complete = live
                         && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && c.completeness.as_ref().is_some_and(|h| {
                             h.verdict().permits_steering()
-                                && h.latest().is_some_and(|r| have >= r.mirror_routes / 2)
+                                && h.latest().is_some_and(|r| {
+                                    let now_r = packetframe_common::fib::CompletenessReport {
+                                        mirror_routes: have,
+                                        ..r
+                                    };
+                                    now_r.drift().is_some_and(|d| {
+                                        d <= packetframe_common::fib::STEER_MAX_DRIFT
+                                    })
+                                })
                         });
                     let small_table_loaded = have > 0
                         && live
@@ -983,7 +1001,11 @@ impl Observe for ObserveView {
                     c.deferred_resync = None;
                 }
                 DeferredResync::AwaitingDiff { adopted, mut gate } => {
-                    let released = gate.observe(now, have, seq).released;
+                    // The diff stage has no session requirement (its
+                    // floor is measured against the DUMPED table, and
+                    // nothing at this stage is steered), so quiet needs
+                    // no liveness conditioning: pass live.
+                    let released = gate.observe(now, have, seq, true).released;
                     if !released {
                         let want = gate.floor;
                         c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });

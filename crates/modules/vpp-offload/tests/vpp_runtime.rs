@@ -1677,9 +1677,28 @@ fn a_met_floor_without_a_live_session_stays_deferred() {
     );
     let _ = shared;
 
-    // The session comes up: the very same mirror is now evidence, and
-    // the ordinary floor release proceeds.
+    // The session comes up. The very same mirror is now evidence — but
+    // not INSTANTLY: quiet accumulated while the feed was down attests
+    // nothing, so the clock restarts at the up-transition (review
+    // finding: without the reset, the first OPEN after an outage
+    // released on stale quiet before a single route had arrived).
     session.set_up(true);
+    let mut now = now;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..4 {
+            let _t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += Duration::from_millis(100);
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "the up-transition must restart the quiet clock, not release on stale quiet"
+    );
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
     assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
