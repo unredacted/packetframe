@@ -398,12 +398,13 @@ impl BgpListener {
             tokio::time::interval(Duration::from_secs(effective_hold.max(3) as u64 / 3));
         keepalive_tick.tick().await; // skip immediate fire
         let mut hold_deadline = Instant::now() + Duration::from_secs(effective_hold as u64);
-        // Established: OPENs exchanged, our KEEPALIVE sent. Everything
-        // before this point was handshake, and every exit below runs
-        // through the accept loop's set_up(false).
-        if let Some(sess) = &self.cfg.session {
-            sess.set_up(true);
-        }
+        // Deliberately NOT live yet: OPEN proves the SESSION, not the
+        // table. A session that establishes and then delays its first
+        // UPDATE would read as live-and-quiet, and two seconds of
+        // pre-stream quiet releases the second tier's gate onto a
+        // mirror holding only local routes (review finding). Liveness
+        // raises at the InitiationComplete heuristic below — the same
+        // initial-RIB-settled definition the BMP path uses.
         let mut last_update: Option<Instant> = None;
         let mut init_complete_fired = false;
         let mut quiescence_tick = tokio::time::interval(Duration::from_secs(1));
@@ -476,6 +477,16 @@ impl BgpListener {
                                         "InitiationComplete fired"
                                     );
                                     init_complete_fired = true;
+                                    // The initial RIB has settled: the
+                                    // mirror now holds what this session
+                                    // has to give, which is what "live"
+                                    // must mean to the second tier's
+                                    // release gate. Every session exit
+                                    // still runs through the accept
+                                    // loop's set_up(false).
+                                    if let Some(sess) = &self.cfg.session {
+                                        sess.set_up(true);
+                                    }
                                 }
                             }
                         }

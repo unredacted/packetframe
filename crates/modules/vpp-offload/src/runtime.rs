@@ -456,6 +456,13 @@ enum DeferredResync {
         /// the unsteer's pace window left traffic on a collapsing
         /// fallback for up to five seconds (review finding).
         last_request: Option<(SteerRequest, std::time::Instant)>,
+        /// True from the moment this deferral's unsteer is observed
+        /// complete until the gate re-releases: the revocation path
+        /// keeps re-asking on THIS flag, never on the ledger being
+        /// empty — a partial restore leaves rules in the ledger, and
+        /// gating on emptiness is what wedged half the allowlist on
+        /// the condemned fallback with no retry (review finding).
+        restoring: bool,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -908,6 +915,7 @@ impl Observe for ObserveView {
                 DeferredResync::AwaitingFallback {
                     mut gate,
                     mut last_request,
+                    mut restoring,
                 } => {
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     let view = gate.observe(now, have, seq, live);
@@ -995,7 +1003,18 @@ impl Observe for ObserveView {
                         // that may be losing routes (review finding).
                         // Paced like the unsteer request; a refused
                         // steer is re-asked the same way.
-                        if unsteered {
+                        // `restoring` LATCHES on the first observation
+                        // of this deferral's unsteer having landed, and
+                        // the re-ask keys on the latch, never on the
+                        // ledger being empty: a PARTIAL restore leaves
+                        // rules in the ledger, and gating on emptiness
+                        // wedged half the allowlist on the condemned
+                        // fallback with no retry (review finding).
+                        // RestoreSteer is a reconcile, so re-asking
+                        // over an already-complete set is an idempotent
+                        // re-assert.
+                        if unsteered || restoring {
+                            restoring = true;
                             // Same-kind pacing only: the first
                             // revocation after an acknowledged unsteer
                             // goes out immediately.
@@ -1008,11 +1027,17 @@ impl Observe for ObserveView {
                                 last_request = Some((SteerRequest::Revoke, now));
                             }
                         }
-                        c.deferred_resync =
-                            Some(DeferredResync::AwaitingFallback { gate, last_request });
+                        c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                            gate,
+                            last_request,
+                            restoring,
+                        });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
                     if !unsteered {
+                        // A re-release after a revocation cycle starts
+                        // the settle/unsteer sequence over.
+                        restoring = false;
                         // The fallback can carry the traffic now; ask the
                         // supervisor to take it off VPP. Through the
                         // machine, never `steering.unsteer()` from here:
@@ -1027,8 +1052,11 @@ impl Observe for ObserveView {
                             c.pending.push(Event::FallbackSettled);
                             last_request = Some((SteerRequest::Settle, now));
                         }
-                        c.deferred_resync =
-                            Some(DeferredResync::AwaitingFallback { gate, last_request });
+                        c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                            gate,
+                            last_request,
+                            restoring,
+                        });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
                     // Unsteered and quiet: the dump is free — nothing is
@@ -1096,8 +1124,11 @@ impl Observe for ObserveView {
                                  the diff — the adopted routes stay in the ledger and the \
                                  reconciliation resumes when the source is ready again"
                             );
-                            c.deferred_resync =
-                                Some(DeferredResync::AwaitingFallback { gate, last_request });
+                            c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                                gate,
+                                last_request,
+                                restoring: true,
+                            });
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
                         tracing::info!(
@@ -1354,6 +1385,7 @@ impl Effects for EffectsView {
             c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                 gate: SourceGate::new(floor, source_quiet_rate_per_sec(capacity), seq),
                 last_request: None,
+                restoring: false,
             });
             return Ok(());
         }

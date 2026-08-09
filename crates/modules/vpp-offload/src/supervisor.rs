@@ -535,11 +535,29 @@ impl Supervisor {
             // adoption; a refused steer (the completeness gate, say)
             // lands in the catch-all and the runtime re-asks, paced.
             (AdoptedResyncing, FallbackRevoked) => {
-                if !self.steered && self.steer_wanted {
+                // On `steer_wanted` alone, NOT `!steered`: a partial
+                // restore leaves rules in the NIC and `steered` true —
+                // and gating on unsteered-ness is what wedged half the
+                // allowlist on the condemned fallback with no retry
+                // (review finding). `RestoreSteer` is a reconcile, so
+                // re-asking over an already-complete set is a cheap
+                // idempotent re-assert, the same move the UniFi wipe
+                // recovery leans on.
+                if self.steer_wanted {
                     vec![Action::RestoreSteer]
                 } else {
                     vec![]
                 }
+            }
+            // A restoration that failed part-way: some rules are in
+            // the NIC, some are not. Recorded exactly as reported —
+            // `steered` must reflect whether ANYTHING diverts traffic,
+            // or the next teardown skips the Unsteer it owes — and the
+            // runtime's paced FallbackRevoked keeps re-asking until
+            // the reconcile completes.
+            (AdoptedResyncing, SteerFailed { rules_remain }) => {
+                self.steered = rules_remain;
+                vec![]
             }
             // The acknowledgement for that re-steer. Without this arm
             // the catch-all would swallow it and the machine would
@@ -973,9 +991,18 @@ mod tests {
         );
         s.on(Event::Steered);
         assert_eq!(s.state(), State::AdoptedResyncing, "still converging");
-        assert!(
-            s.on(Event::FallbackRevoked).is_empty(),
-            "already steered again; nothing to do"
+        assert_eq!(
+            s.on(Event::FallbackRevoked),
+            vec![Action::RestoreSteer],
+            "re-asking over a complete set is an idempotent re-assert — gating on \
+             unsteered-ness is what wedged a PARTIAL restore forever"
+        );
+        // A partial failure records the truth and stays retryable.
+        s.on(Event::SteerFailed { rules_remain: true });
+        assert_eq!(
+            s.on(Event::FallbackRevoked),
+            vec![Action::RestoreSteer],
+            "rules half-in must keep retrying the reconcile"
         );
         // And the next release still owes an Unsteer, because the
         // re-steer was acknowledged into `steered`.
