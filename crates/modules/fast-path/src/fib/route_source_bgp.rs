@@ -427,7 +427,10 @@ impl BgpListener {
                         Some(m) => {
                             // Any inbound traffic resets hold.
                             hold_deadline = Instant::now() + Duration::from_secs(effective_hold as u64);
-                            self.process_msg(m, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await;
+                            if let Err(e) = self.process_msg(m, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await {
+                                reader.abort();
+                                return Err(e);
+                            }
                         }
                         None => {
                             // Reader exited, surface the result.
@@ -496,6 +499,12 @@ impl BgpListener {
         }
     }
 
+    /// `Err` is session-fatal: the caller must tear the connection
+    /// down. It was `()` until a review pass caught the oversized-
+    /// UPDATE arm logging "closing session" while only returning from
+    /// this helper — the connection lived on, quiesced, fired
+    /// InitiationComplete, and marked a feed LIVE whose last UPDATE
+    /// had been thrown away whole.
     async fn process_msg(
         &self,
         msg: BgpMessage,
@@ -503,7 +512,7 @@ impl BgpListener {
         peer_asn: u32,
         last_update: &mut Option<Instant>,
         updates_seen: &mut usize,
-    ) {
+    ) -> Result<(), RouteSourceError> {
         match msg {
             BgpMessage::Open(_) => {
                 // Spurious post-handshake OPEN, bird shouldn't do
@@ -514,12 +523,17 @@ impl BgpListener {
                 // Hold timer reset already happened; no further work.
             }
             BgpMessage::Notification(n) => {
-                // BgpError is a typed enum (MessageHeaderError,
-                // OpenError, UpdateError, HoldTimerExpired, Cease, ...);
-                // log the Debug repr, operator can grep on it.
-                warn!(error = ?n.error, "received NOTIFICATION; closing session");
-                // Reader will see EOF after bird closes; that path
-                // emits Resync via the accept loop.
+                // Session-fatal for real, not just in the log line: a
+                // NOTIFICATION ends the session per RFC 4271, and while
+                // bird usually closes the TCP right after (the reader
+                // would see EOF), waiting on the peer's close leaves a
+                // window where the connection quiesces, settles, and
+                // reports a feed live that its peer has already
+                // renounced.
+                return Err(RouteSourceError::recoverable(format!(
+                    "received NOTIFICATION ({:?}); closing session",
+                    n.error
+                )));
             }
             BgpMessage::Update(update) => {
                 *last_update = Some(Instant::now());
@@ -552,12 +566,13 @@ impl BgpListener {
                     // attacker-shaped UPDATE to just keep adding to
                     // the per-message budget. Close, emit Resync,
                     // let the peer reconnect.
-                    warn!(
-                        elems = elems.len(),
-                        cap = MAX_ELEMS_PER_UPDATE,
-                        "BGP UPDATE elem count exceeds per-message cap; closing session"
-                    );
-                    return;
+                    return Err(RouteSourceError::recoverable(format!(
+                        "BGP UPDATE fanned out to {} elems (cap {}); closing session — a \
+                         skipped UPDATE must not leave a session that later settles and \
+                         reports a feed live with that UPDATE's prefixes missing",
+                        elems.len(),
+                        MAX_ELEMS_PER_UPDATE
+                    )));
                 }
                 for elem in elems {
                     let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
@@ -570,6 +585,7 @@ impl BgpListener {
                 }
             }
         }
+        Ok(())
     }
 }
 
