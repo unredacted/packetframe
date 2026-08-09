@@ -956,7 +956,22 @@ impl Observe for ObserveView {
                     // completeness authority included — its report
                     // proves bird was alive at REPORT time, and `live`
                     // is what makes that claim current.
-                    let released = (view.released && live) || complete || small_table_loaded;
+                    // A configured authority that currently says NO is
+                    // a VETO, not a bystander: with the verdict
+                    // Incomplete, the mirror is KNOWN to be missing
+                    // more than the drift policy allows, and no count
+                    // or quiet proxy may out-vote that knowledge — a
+                    // live session whose load merely stalls for two
+                    // seconds past the floor would otherwise unsteer
+                    // onto a table the authority had already condemned
+                    // (review finding). No handle, no veto: birdless
+                    // deployments still release on the proxies.
+                    let veto = c
+                        .completeness
+                        .as_ref()
+                        .is_some_and(|h| !h.verdict().permits_steering());
+                    let released =
+                        !veto && ((view.released && live) || complete || small_table_loaded);
                     let unsteered = c.steering.installed().is_empty();
                     if !released {
                         // Revocation AFTER the unsteer was acknowledged
@@ -997,12 +1012,43 @@ impl Observe for ObserveView {
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
                     // Unsteered and quiet: the dump is free — nothing is
-                    // on VPP for the barrier to stall. The diff follows
-                    // immediately; the source this gate just called
-                    // loaded is the same one it reads.
+                    // on VPP for the barrier to stall.
                     {
-                        let Core { engine, source, .. } = &mut *c;
+                        let Core {
+                            engine,
+                            source,
+                            feed_session,
+                            completeness,
+                            ..
+                        } = &mut *c;
                         let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+                        // Revalidate on the FAR side of the dump: it
+                        // blocks this thread for seconds, and a feed
+                        // that collapsed mid-walk would hand the diff a
+                        // husk — whose withdrawals destroy the intact
+                        // FIB just read, with traffic already on the
+                        // incomplete fallback (review finding). The
+                        // deferral is KEPT on refusal: the ledger now
+                        // holds the dumped FIB (the dump is a no-op on
+                        // a populated ledger), the revocation path
+                        // re-steers, and a later release diffs against
+                        // a recovered source.
+                        let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
+                        let veto_now = completeness
+                            .as_ref()
+                            .is_some_and(|h| !h.verdict().permits_steering());
+                        if !live_now || veto_now {
+                            tracing::warn!(
+                                adopted,
+                                live = live_now,
+                                "the feed changed while VPP's FIB was being dumped; holding \
+                                 the diff — the adopted routes stay in the ledger and the \
+                                 reconciliation resumes when the source is ready again"
+                            );
+                            c.deferred_resync =
+                                Some(DeferredResync::AwaitingFallback { gate, last_request });
+                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                        }
                         tracing::info!(
                             have,
                             adopted,

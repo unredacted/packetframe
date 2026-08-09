@@ -1806,6 +1806,50 @@ fn a_dead_source_never_triggers_the_unsteer() {
     );
 }
 
+/// A configured authority that says Incomplete VETOES the proxies: a
+/// met floor and a live, quiet session must not out-vote a verdict
+/// that the mirror is missing more than the drift policy allows
+/// (review finding: a load stalling two seconds past the floor would
+/// otherwise unsteer onto a table the authority had condemned). The
+/// same state releases the moment the authority agrees.
+#[test]
+fn an_incomplete_verdict_vetoes_every_proxy_release() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (fake, _shared, log, rt, session) = steered::fixture("steered-veto", &full, 160);
+    session.set_up(true);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    // The authority knows the world is ~1000 routes; the mirror holds
+    // twelve. Floor met, session live, quiet - and condemned.
+    handle.publish(CompletenessReport {
+        authority_routes: 1000,
+        mirror_routes: 12,
+        at: std::time::Instant::now(),
+    });
+    let mut d = Driver::new();
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 400);
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "an Incomplete verdict must hold every proxy release"
+    );
+
+    // The authority agrees: the ordinary release proceeds.
+    handle.publish(CompletenessReport {
+        authority_routes: 12,
+        mirror_routes: 12,
+        at: std::time::Instant::now(),
+    });
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
 /// The revocation window: the gate released, the unsteer was
 /// acknowledged - and the feed dropped before the dump ran. The
 /// adopted FIB is still whole, so the traffic goes BACK onto it
