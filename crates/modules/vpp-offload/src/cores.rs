@@ -332,6 +332,122 @@ pub fn restrict_daemon_from(vpp_cores: &[u16]) -> Result<usize, String> {
     Ok(edited)
 }
 
+/// A thread pinned to at most this many CPUs is *placement*; anything
+/// wider is a scheduling pool. One CPU is VPP's own shape — it pins its
+/// main thread to `main-core` and each worker to its `corelist-workers`
+/// CPU (vlib/threads.c, `pthread_setaffinity_np`) — and two tolerates
+/// an operator pairing a thread with a sibling. VPP's helper threads
+/// either inherit the main thread's pin (counted, harmlessly, as
+/// main-core again) or run unpinned across the host, and treating a
+/// wide inherited mask as placement would vacate the daemon from
+/// everywhere.
+#[cfg(target_os = "linux")]
+const PINNED_WIDTH_MAX: i32 = 2;
+
+/// The CPUs a running VPP's pinned threads occupy, observed from
+/// `/proc/<pid>/task` — never remembered from a record.
+///
+/// This is how an ADOPTED VPP's cores are learned. Observation rather
+/// than a state-file record is load-bearing, not a style choice: the
+/// recorded placement this replaced produced a review finding for
+/// every lifecycle that could outdate it (stale after a supervised
+/// respawn, wrong across an upgrade from a file predating the field,
+/// and an upgrade guard whose refusal left the box an unsupervised
+/// VPP as its only forwarding tier). The live masks cannot go stale
+/// and survive an operator retuning the process by hand.
+///
+/// Affinity is a per-thread attribute and `sched_getaffinity` reads
+/// any tid's mask (the getter carries no privilege gate, and this
+/// daemon is root regardless). An empty answer means no thread is
+/// pinned narrowly enough to be placement; an `Err` means the process
+/// could not be inspected at all — or turned out mid-scan not to be
+/// the process asked about. The caller must treat both as "observe
+/// failed, fall back to the derived map with a warning" — never as
+/// "pinned nowhere, nothing to vacate".
+///
+/// `start_ticks` is the identity the pid must still carry, and it is
+/// re-verified AFTER the walk, which covers the walk: if the process
+/// at `pid` still has the adopted start time when the scan is done,
+/// then it had it throughout — a pid does not return to a process
+/// that lost it. Without this, a VPP that exits after adoption and
+/// has its LEADER pid recycled rebinds the whole `/proc/<pid>/task`
+/// path to the replacement process, and the per-tid membership check
+/// below then vouches for every one of the stranger's threads
+/// (review finding — the same identity rule as adoption itself,
+/// `(pid, start_ticks)`, applied to the read side).
+#[cfg(target_os = "linux")]
+pub fn observed_placement(pid: i32, start_ticks: u64) -> Result<Vec<u16>, String> {
+    let task_dir = format!("/proc/{pid}/task");
+    let tasks = std::fs::read_dir(&task_dir).map_err(|e| format!("{task_dir}: {e}"))?;
+    let mut cores: Vec<u16> = Vec::new();
+    for entry in tasks.flatten() {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut mask)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if mask_too_small(&err) {
+                return Err(format!(
+                    "this host's CPU mask is wider than a fixed cpu_set_t ({} CPUs) can \
+                     express, so the adopted VPP's placement cannot be read: {err}",
+                    libc::CPU_SETSIZE
+                ));
+            }
+            continue; // thread exited between readdir and here
+        }
+        if unsafe { libc::CPU_COUNT(&mask) } > PINNED_WIDTH_MAX {
+            continue;
+        }
+        // The tid must still be VPP's AFTER the read, not just at
+        // readdir: `sched_getaffinity` addresses tids globally, so a
+        // VPP thread that exited in between can have its tid recycled
+        // by an unrelated process, whose narrow mask would then be
+        // subtracted from every daemon thread as if it were placement —
+        // and the restriction is one-way, so wrongly for good. A task
+        // directory lists only its own thread group's tids, so this
+        // existence check fails for a tid that migrated to a foreign
+        // process, while a reuse WITHIN VPP names a VPP thread anyway.
+        // Same identity discipline as `restrict_daemon_from`'s
+        // `(tid, start_ticks)` set, shaped for a foreign process
+        // (review finding).
+        if !std::path::Path::new(&task_dir)
+            .join(tid.to_string())
+            .exists()
+        {
+            continue;
+        }
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            if unsafe { libc::CPU_ISSET(cpu, &mask) } && !cores.contains(&(cpu as u16)) {
+                cores.push(cpu as u16);
+            }
+        }
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|e| format!("pid {pid} vanished during the placement scan: {e}"))?;
+    if crate::process::parse_start_ticks(&stat) != Some(start_ticks) {
+        return Err(format!(
+            "the process now at pid {pid} is not the adopted VPP (start-time cookie \
+             changed during the scan), so the masks just read belong to a stranger"
+        ));
+    }
+    cores.sort_unstable();
+    Ok(cores)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn observed_placement(_pid: i32, _start_ticks: u64) -> Result<Vec<u16>, String> {
+    // Non-Linux never has a VPP to observe.
+    Err("thread affinity is not readable on this platform".into())
+}
+
 // There is deliberately **no** inverse of `restrict_daemon_from`.
 //
 // A CPU affinity mask is per-process state, and every path that stops
@@ -438,6 +554,60 @@ mod affinity_tests {
         let rc =
             unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &before) };
         assert_eq!(rc, 0);
+    }
+
+    /// Observation reads placement from the threads themselves: a
+    /// narrowly pinned thread's CPU is reported, a wide default mask
+    /// is not. Exercised against this very process, which is exactly
+    /// how production reads an adopted VPP — same procfs walk, same
+    /// syscall, different pid.
+    #[test]
+    fn observed_placement_reports_pinned_threads_and_ignores_wide_ones() {
+        use std::sync::mpsc::channel;
+
+        let _serialised = lock_affinity();
+        let before = current_mask();
+        let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &before) })
+            .collect();
+        if allowed.len() < 4 {
+            return; // every mask here would read as "pinned"
+        }
+        let (a, b) = (allowed[0], allowed[1]);
+
+        let (pinned_tx, pinned_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let child = std::thread::spawn(move || {
+            set_mask(&[a]); // pid 0: this thread only
+            pinned_tx.send(()).expect("announce the pin");
+            done_rx.recv().expect("hold the pin until observed");
+        });
+        pinned_rx.recv().expect("child pinned before observing");
+
+        let own_pid = std::process::id() as i32;
+        let own_ticks = crate::process::parse_start_ticks(
+            &std::fs::read_to_string(format!("/proc/{own_pid}/stat")).expect("own stat"),
+        )
+        .expect("own start ticks");
+        let observed = observed_placement(own_pid, own_ticks).expect("observe self");
+        done_tx.send(()).expect("release the child");
+        child.join().expect("child joined");
+
+        assert!(
+            observed.contains(&(a as u16)),
+            "the pinned thread's CPU is the placement: {observed:?}"
+        );
+        assert!(
+            !observed.contains(&(b as u16)),
+            "a CPU held only by wide-mask threads is not placement: {observed:?}"
+        );
+
+        // A pid wearing the wrong start-time cookie is a stranger, and
+        // a stranger's masks must be refused, not returned.
+        assert!(
+            observed_placement(own_pid, own_ticks ^ 1).is_err(),
+            "an identity mismatch must refuse the observation"
+        );
     }
 
     /// A thread created while the scan is running is still restricted.
