@@ -403,8 +403,16 @@ impl BgpListener {
         // UPDATE would read as live-and-quiet, and two seconds of
         // pre-stream quiet releases the second tier's gate onto a
         // mirror holding only local routes (review finding). Liveness
-        // raises at the InitiationComplete heuristic below — the same
-        // initial-RIB-settled definition the BMP path uses.
+        // raises on the FIRST UPDATE of the session — the stream has
+        // started, which is all "live" must attest. It must NOT wait
+        // for post-stream silence: a live DFZ feed never pauses five
+        // seconds (measured on the shadow, 2026-08-09 — 91 minutes of
+        // session, zero InitiationComplete firings, the reconciliation
+        // wedged behind a silence that cannot come). Whether the load
+        // has FINISHED is the release gate's question, and its
+        // mirror-scaled rate answers it: an initial load runs orders
+        // of magnitude above the quiet rate, so live-but-loading can
+        // never release early.
         let mut last_update: Option<Instant> = None;
         let mut init_complete_fired = false;
         let mut quiescence_tick = tokio::time::interval(Duration::from_secs(1));
@@ -480,16 +488,6 @@ impl BgpListener {
                                         "InitiationComplete fired"
                                     );
                                     init_complete_fired = true;
-                                    // The initial RIB has settled: the
-                                    // mirror now holds what this session
-                                    // has to give, which is what "live"
-                                    // must mean to the second tier's
-                                    // release gate. Every session exit
-                                    // still runs through the accept
-                                    // loop's set_up(false).
-                                    if let Some(sess) = &self.cfg.session {
-                                        sess.set_up(true);
-                                    }
                                 }
                             }
                         }
@@ -538,6 +536,14 @@ impl BgpListener {
             BgpMessage::Update(update) => {
                 *last_update = Some(Instant::now());
                 *updates_seen += 1;
+                if *updates_seen == 1 {
+                    // The stream has started; see the handshake note
+                    // for why this — and not post-stream silence — is
+                    // where the session becomes live.
+                    if let Some(sess) = &self.cfg.session {
+                        sess.set_up(true);
+                    }
+                }
                 let now_unix = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
