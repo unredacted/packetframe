@@ -474,6 +474,21 @@ impl BmpStation {
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
                                     }
+                                } else {
+                                    // Declined AND consumed: a peerless
+                                    // straggler frame is not testimony
+                                    // about any future epoch. Leaving
+                                    // the evidence cached let the next
+                                    // PeerUp settle on the very next
+                                    // tick, off a frame that predated
+                                    // the peer entirely (review
+                                    // finding, third pass at this
+                                    // hole). The new peer's dump must
+                                    // produce its own frames and its
+                                    // own quiescence.
+                                    self.saw_rm
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    last_route_monitoring = None;
                                 }
                             }
                         }
