@@ -394,6 +394,24 @@ pub fn observed_placement(pid: i32) -> Result<Vec<u16>, String> {
         if unsafe { libc::CPU_COUNT(&mask) } > PINNED_WIDTH_MAX {
             continue;
         }
+        // The tid must still be VPP's AFTER the read, not just at
+        // readdir: `sched_getaffinity` addresses tids globally, so a
+        // VPP thread that exited in between can have its tid recycled
+        // by an unrelated process, whose narrow mask would then be
+        // subtracted from every daemon thread as if it were placement —
+        // and the restriction is one-way, so wrongly for good. A task
+        // directory lists only its own thread group's tids, so this
+        // existence check fails for a tid that migrated to a foreign
+        // process, while a reuse WITHIN VPP names a VPP thread anyway.
+        // Same identity discipline as `restrict_daemon_from`'s
+        // `(tid, start_ticks)` set, shaped for a foreign process
+        // (review finding).
+        if !std::path::Path::new(&task_dir)
+            .join(tid.to_string())
+            .exists()
+        {
+            continue;
+        }
         for cpu in 0..libc::CPU_SETSIZE as usize {
             if unsafe { libc::CPU_ISSET(cpu, &mask) } && !cores.contains(&(cpu as u16)) {
                 cores.push(cpu as u16);
