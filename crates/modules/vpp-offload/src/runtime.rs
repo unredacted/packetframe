@@ -420,6 +420,14 @@ impl SourceGate {
     }
 }
 
+/// Which direction the deferral last asked the supervisor to move
+/// steering. See `DeferredResync::AwaitingFallback::last_request`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerRequest {
+    Settle,
+    Revoke,
+}
+
 /// What a deferred adopted reconciliation is waiting for.
 #[derive(Debug, Clone, Copy)]
 enum DeferredResync {
@@ -439,10 +447,15 @@ enum DeferredResync {
     /// on the existing verified path.
     AwaitingFallback {
         gate: SourceGate,
-        /// When the unsteer was last requested, so a refused or
-        /// unacknowledged removal is re-asked every
+        /// The last steering request and when it was made, so a
+        /// refused or unacknowledged transition is re-asked every
         /// [`UNSTEER_REQUEST_EVERY`] instead of on each 50 ms tick.
-        last_request: Option<std::time::Instant>,
+        /// The KIND is part of the record because opposite transitions
+        /// must not share a throttle: a revocation arriving just after
+        /// an acknowledged unsteer is the safety path, and waiting out
+        /// the unsteer's pace window left traffic on a collapsing
+        /// fallback for up to five seconds (review finding).
+        last_request: Option<(SteerRequest, std::time::Instant)>,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -983,11 +996,16 @@ impl Observe for ObserveView {
                         // Paced like the unsteer request; a refused
                         // steer is re-asked the same way.
                         if unsteered {
-                            let ask = last_request
-                                .is_none_or(|t| now.duration_since(t) >= UNSTEER_REQUEST_EVERY);
+                            // Same-kind pacing only: the first
+                            // revocation after an acknowledged unsteer
+                            // goes out immediately.
+                            let ask = last_request.is_none_or(|(kind, t)| {
+                                kind != SteerRequest::Revoke
+                                    || now.duration_since(t) >= UNSTEER_REQUEST_EVERY
+                            });
                             if ask {
                                 c.pending.push(Event::FallbackRevoked);
-                                last_request = Some(now);
+                                last_request = Some((SteerRequest::Revoke, now));
                             }
                         }
                         c.deferred_resync =
@@ -1001,11 +1019,13 @@ impl Observe for ObserveView {
                         // the ledger persist and the `steered` fact live
                         // with the executor, and a second unsteer path is
                         // two owners for one NIC.
-                        let ask = last_request
-                            .is_none_or(|t| now.duration_since(t) >= UNSTEER_REQUEST_EVERY);
+                        let ask = last_request.is_none_or(|(kind, t)| {
+                            kind != SteerRequest::Settle
+                                || now.duration_since(t) >= UNSTEER_REQUEST_EVERY
+                        });
                         if ask {
                             c.pending.push(Event::FallbackSettled);
-                            last_request = Some(now);
+                            last_request = Some((SteerRequest::Settle, now));
                         }
                         c.deferred_resync =
                             Some(DeferredResync::AwaitingFallback { gate, last_request });

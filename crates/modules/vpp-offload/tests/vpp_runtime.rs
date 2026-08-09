@@ -2013,10 +2013,14 @@ fn a_revoked_fallback_re_steers_the_intact_adopted_vpp() {
     );
     session.set_up(false);
 
-    // The revocation path: traffic back on the intact VPP, no dump.
+    // The revocation path: traffic back on the intact VPP, no dump —
+    // and IMMEDIATELY: the safety restoration must not wait out the
+    // preceding unsteer request's pace window (review finding: the
+    // shared throttle held it ~5 s while PeerDown emptied the
+    // fallback). Three ticks is transport, not throttle.
     {
         let (mut obs, mut fx) = rt.views();
-        for _ in 0..512 {
+        for _ in 0..3 {
             let t = d.tick(now, &mut obs, &mut fx);
             for e in rt.take_pending() {
                 d.inject(now, e, &mut fx);

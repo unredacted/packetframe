@@ -139,12 +139,15 @@ pub struct BmpStation {
     /// Whether this connection has delivered a RouteMonitoring frame.
     /// RFC 9069 Loc-RIB streams need not send PeerUp for the synthetic
     /// Loc-RIB instance (review finding — and Loc-RIB is precisely the
-    /// mode `require-loc-rib` documents), so for them the RM stream
-    /// itself is the liveness evidence: it is the thing that delivers
-    /// the table. The handle is up while EITHER a monitored peer is up
-    /// or this connection has streamed RM; an emitter whose upstream
-    /// peers all die empties its Loc-RIB through RM withdrawals rather
-    /// than going silent, which the mirror then reflects honestly.
+    /// mode `require-loc-rib` documents), so for them the stream itself
+    /// is the liveness evidence — but only once it has SETTLED: the
+    /// raise happens at InitiationComplete, the station's definition of
+    /// initial-stream readiness, never on the first frame (review
+    /// finding: a dump stalling after frame one would otherwise read
+    /// as live-quiet-loaded for up to the read timeout). This flag's
+    /// remaining job is the peer-set arbitration below: a connection
+    /// that streamed RM without ever speaking PeerUp keeps its
+    /// liveness across an incidental PeerDown.
     saw_rm: std::sync::atomic::AtomicBool,
     /// Whether this connection has EVER sent a PeerUp. An emitter that
     /// speaks peer lifecycle gets peer-set semantics: when its last
@@ -361,21 +364,17 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
+                                // Deliberately NOT a liveness raise: a
+                                // single frame proves the stream began,
+                                // not that the initial dump landed — a
+                                // dump that stalls after frame one would
+                                // otherwise read as a live, quiet, loaded
+                                // feed for up to the read timeout (review
+                                // finding). Liveness for a Loc-RIB stream
+                                // raises at InitiationComplete below —
+                                // the station's own definition of
+                                // initial-stream readiness.
                                 self.saw_rm.store(true, Ordering::Relaxed);
-                                // An RM frame attests the feed only for
-                                // a connection that does not speak peer
-                                // lifecycle; on one that does, straggler
-                                // frames after the last PeerDown must
-                                // not resurrect a down feed.
-                                let peers_speak =
-                                    self.saw_peer_up.load(Ordering::Relaxed);
-                                let peers_up =
-                                    !self.up_peers.lock().expect("up_peers lock").is_empty();
-                                if !peers_speak || peers_up {
-                                    if let Some(sess) = &self.session {
-                                        sess.set_up(true);
-                                    }
-                                }
                             }
                             // Loc-RIB safety check happens inside
                             // process_msg; a violation returns Err and
@@ -418,6 +417,27 @@ impl BmpStation {
                             {
                                 warn!(error = %e, "InitiationComplete dispatch failed");
                             } else {
+                                // The station's own definition of
+                                // initial-stream readiness, and therefore
+                                // where a Loc-RIB stream becomes LIVE for
+                                // the second tier: the dump has quiesced,
+                                // so the mirror now holds what the
+                                // emitter has. Guarded like the RM raise
+                                // was: an emitter that speaks peer
+                                // lifecycle with no peer up stays down.
+                                let peers_speak = self
+                                    .saw_peer_up
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let peers_up = !self
+                                    .up_peers
+                                    .lock()
+                                    .expect("up_peers lock")
+                                    .is_empty();
+                                if !peers_speak || peers_up {
+                                    if let Some(sess) = &self.session {
+                                        sess.set_up(true);
+                                    }
+                                }
                                 info!(
                                     frames_parsed,
                                     quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
