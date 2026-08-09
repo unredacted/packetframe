@@ -1959,6 +1959,48 @@ fn a_condemning_verdict_cannot_block_its_own_revocations_restore() {
     );
 }
 
+/// A still-valid Converged report must not carry a mirror that has
+/// SINCE shrunk past the drift policy through the floor release: the
+/// authority's word is recomputed against the mirror as it is now, on
+/// every path, not just the completeness release (review finding: the
+/// veto trusted the cached verdict while only `complete` recomputed).
+#[test]
+fn a_stale_convergence_cannot_carry_a_shrunken_mirror() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (fake, shared, log, rt, session) = steered::fixture("steered-shrunk", &full, 160);
+    session.set_up(true);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    // The authority saw twelve of twelve — and then the mirror lost
+    // one route while the report stayed fresh and Converged. Eleven
+    // still clears the floor of ten; the drift (1/12) does not clear
+    // the 1% policy, and that must gate the FLOOR path too.
+    handle.publish(CompletenessReport {
+        authority_routes: 12,
+        mirror_routes: 12,
+        at: std::time::Instant::now(),
+    });
+    shared.lock().unwrap().pop();
+    let mut d = Driver::new();
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 400);
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a shrunken mirror under a stale Converged must not release"
+    );
+
+    // The route returns: the authority's recomputed word agrees again.
+    shared.lock().unwrap().push(fake_vpp::v4(1, 7));
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
 /// The revocation window: the gate released, the unsteer was
 /// acknowledged - and the feed dropped before the dump ran. The
 /// adopted FIB is still whole, so the traffic goes BACK onto it

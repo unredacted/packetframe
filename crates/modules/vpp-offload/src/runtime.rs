@@ -598,6 +598,35 @@ fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
     (adopted / 1024).max(64)
 }
 
+/// The authority's CURRENT word, or `None` when no authority is
+/// configured: the cached verdict must still permit steering AND the
+/// report must still describe the mirror as it is now (its authority
+/// count against `mirror_now`, under the same drift bound the verdict
+/// itself enforces). One function because it has two callers — the
+/// release computation and the post-dump revalidation — and the review
+/// caught them drifting apart twice: first the /2 bound diverging from
+/// the policy, then the veto trusting the cached verdict while only
+/// the `complete` release recomputed (a stale Converged carried a
+/// since-shrunken mirror through the floor path for the length of the
+/// dump).
+fn authority_current(
+    completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    mirror_now: u64,
+) -> Option<bool> {
+    completeness.as_ref().map(|h| {
+        h.verdict().permits_steering()
+            && h.latest().is_some_and(|r| {
+                let now_r = packetframe_common::fib::CompletenessReport {
+                    mirror_routes: mirror_now,
+                    ..r
+                };
+                now_r
+                    .drift()
+                    .is_some_and(|d| d <= packetframe_common::fib::STEER_MAX_DRIFT)
+            })
+    })
+}
+
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
     core: Rc<RefCell<Core>>,
@@ -965,60 +994,24 @@ impl Observe for ObserveView {
                     //    SMALL_TABLE_QUIET_FOR), and the hold-length
                     //    quiet is what bounds a hung session going
                     //    stale at "up".
-                    // The completeness verdict is a REPORT — a snapshot
-                    // valid for up to STEER_MAX_REPORT_AGE — so it
-                    // attests liveness at report time, not now: a
-                    // PeerDown wipe inside that window would otherwise
-                    // ride a stale Converged onto an empty fallback
-                    // (review finding). Hence `live` here too, plus a
-                    // requirement that the CURRENT mirror would still
-                    // pass the SAME steering policy the report passed:
-                    // the report's authority count against today's
-                    // mirror, under the same drift bound. A /2 bound
-                    // here permitted a 50% collapse to ride a verdict
-                    // whose policy allows 1% (review finding).
+                    // The authority's CURRENT word gates every path:
+                    // the cached verdict alone let a stale Converged
+                    // carry a since-shrunken mirror through the floor
+                    // release for the length of the dump (review
+                    // finding). `authority_current` recomputes the
+                    // report against the mirror as it is now; None
+                    // means no authority is configured and the proxies
+                    // stand on their own.
+                    let authority = authority_current(&c.completeness, have);
+                    let veto = authority == Some(false);
                     let complete = live
                         && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
-                        && c.completeness.as_ref().is_some_and(|h| {
-                            h.verdict().permits_steering()
-                                && h.latest().is_some_and(|r| {
-                                    let now_r = packetframe_common::fib::CompletenessReport {
-                                        mirror_routes: have,
-                                        ..r
-                                    };
-                                    now_r.drift().is_some_and(|d| {
-                                        d <= packetframe_common::fib::STEER_MAX_DRIFT
-                                    })
-                                })
-                        });
+                        && authority == Some(true);
                     let small_table_loaded = have > 0
                         && live
                         && view
                             .rate_quiet_for
                             .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
-                    // The floor answers SIZE and nothing else, so it
-                    // does not release alone: a small `expected-routes`
-                    // shrinks it beneath what neighbour-synthesized
-                    // routes can supply with the feed dead (capacity
-                    // 176 puts it at 11; review finding). Liveness is
-                    // the session's to answer on every path, the
-                    // completeness authority included — its report
-                    // proves bird was alive at REPORT time, and `live`
-                    // is what makes that claim current.
-                    // A configured authority that currently says NO is
-                    // a VETO, not a bystander: with the verdict
-                    // Incomplete, the mirror is KNOWN to be missing
-                    // more than the drift policy allows, and no count
-                    // or quiet proxy may out-vote that knowledge — a
-                    // live session whose load merely stalls for two
-                    // seconds past the floor would otherwise unsteer
-                    // onto a table the authority had already condemned
-                    // (review finding). No handle, no veto: birdless
-                    // deployments still release on the proxies.
-                    let veto = c
-                        .completeness
-                        .as_ref()
-                        .is_some_and(|h| !h.verdict().permits_steering());
                     let released =
                         !veto && ((view.released && live) || complete || small_table_loaded);
                     let unsteered = c.steering.installed().is_empty();
@@ -1148,18 +1141,8 @@ impl Observe for ObserveView {
                         // used for "the source still knows the table".
                         let mirror_settled =
                             have_now >= (have / 2).max(1) && dump_churn <= churn_budget;
-                        let authority_agrees = completeness.as_ref().is_none_or(|h| {
-                            h.verdict().permits_steering()
-                                && h.latest().is_some_and(|r| {
-                                    let now_r = packetframe_common::fib::CompletenessReport {
-                                        mirror_routes: have_now,
-                                        ..r
-                                    };
-                                    now_r.drift().is_some_and(|d| {
-                                        d <= packetframe_common::fib::STEER_MAX_DRIFT
-                                    })
-                                })
-                        });
+                        let authority_agrees =
+                            authority_current(completeness, have_now) != Some(false);
                         if !live_now || !mirror_settled || !authority_agrees {
                             tracing::warn!(
                                 adopted,
