@@ -452,9 +452,14 @@ impl BmpStation {
                                 // has quiesced: the mirror holds what
                                 // the emitter has. Guarded as always —
                                 // an emitter that speaks peer lifecycle
-                                // with no peer up stays down.
-                                self.initiated
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                // with no peer up stays down — and the
+                                // SETTLEMENT itself carries the same
+                                // guard: a peerless straggler frame
+                                // after the last PeerDown must not
+                                // prime the next epoch, or the next
+                                // PeerUp would raise off the cached
+                                // flag before its own dump arrived
+                                // (review finding).
                                 let peers_speak = self
                                     .saw_peer_up
                                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -464,6 +469,8 @@ impl BmpStation {
                                     .expect("up_peers lock")
                                     .is_empty();
                                 if !peers_speak || peers_up {
+                                    self.initiated
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
                                     }

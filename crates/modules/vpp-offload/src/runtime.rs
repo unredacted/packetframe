@@ -1069,7 +1069,6 @@ impl Observe for ObserveView {
                             completeness,
                             ..
                         } = &mut *c;
-                        let dump_started = std::time::Instant::now();
                         let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
                         // Revalidate on the FAR side of the dump: it
                         // blocks this thread for seconds, and the world
@@ -1098,20 +1097,21 @@ impl Observe for ObserveView {
                         let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
                         let have_now = source.route_count();
                         let seq_now = source.change_seq();
-                        let dump_ms = dump_started.elapsed().as_millis().max(1) as u64;
-                        let churn_per_sec =
-                            seq_now.saturating_sub(seq).saturating_mul(1_000) / dump_ms;
-                        // Bounded by the MIRROR being protected, never
-                        // by the sizing ceiling: gate.quiet_rate scales
-                        // with capacity, and a 16M-route sizing calls
-                        // 15.6k mutations/s quiet — ~78k routes lost
-                        // across a five-second dump would have read as
-                        // settled (review finding). The released
-                        // mirror's own scale is the honest yardstick,
-                        // the same arithmetic every other quiet bound
-                        // uses.
-                        let mirror_settled =
-                            have_now > 0 && churn_per_sec <= source_quiet_rate_per_sec(have);
+                        // An ABSOLUTE budget for the whole dump, never
+                        // a dump-wide average: dividing by the dump's
+                        // duration let a withdrawal burst early in a
+                        // slow dump dilute into "settled" across the
+                        // idle seconds that followed (review finding —
+                        // twice: the first fix was claimed and never
+                        // landed, caught by the reviewer reading the
+                        // actual expression). The entire dump may see
+                        // at most what a legitimately quiet source
+                        // produces in one SOURCE_QUIET_FOR window,
+                        // scaled by the mirror being protected.
+                        let churn_budget =
+                            source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs();
+                        let dump_churn = seq_now.saturating_sub(seq);
+                        let mirror_settled = have_now > 0 && dump_churn <= churn_budget;
                         let authority_agrees = completeness.as_ref().is_none_or(|h| {
                             h.verdict().permits_steering()
                                 && h.latest().is_some_and(|r| {
@@ -1128,7 +1128,8 @@ impl Observe for ObserveView {
                             tracing::warn!(
                                 adopted,
                                 live = live_now,
-                                churn_per_sec,
+                                dump_churn,
+                                churn_budget,
                                 have_now,
                                 "the feed changed while VPP's FIB was being dumped; holding \
                                  the diff — the adopted routes stay in the ledger and the \
