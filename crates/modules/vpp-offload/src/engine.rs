@@ -1293,6 +1293,15 @@ impl ConvergenceEngine {
         // process it was applied to.
         self.ledger.capacity()
     }
+
+    /// The route capacity in force — the high-water policy derived from
+    /// the operator's `expected-routes`. The pre-dump deferral floor is
+    /// computed from this, because at that point the adopted table's
+    /// size is unknowable: reading it is exactly the thing being
+    /// deferred.
+    pub fn route_capacity(&self) -> u64 {
+        self.ledger.capacity().high_water()
+    }
 }
 
 /// splitmix64. Deterministic successor so verify samples differ per pass

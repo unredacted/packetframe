@@ -299,25 +299,28 @@ struct Core {
     /// operator would see a stalled `pending_ops` with nothing saying
     /// why.
     last_drain_error: Option<String>,
-    /// `Some` while an adopted resync is deferred, holding the release
-    /// gate's state. Set by `start_resync` on EVERY adoption of a
-    /// populated FIB; cleared by `drain_batch` when the gate opens and
-    /// the diff actually begins. While set, the adopted VPP is left
-    /// exactly as found — steered, routes intact — because a diff
-    /// against a loading source is ~all withdrawals, and draining those
-    /// into a live dataplane is the drill-(d) blackhole (2026-08-07).
+    /// `Some` while an adopted reconciliation is deferred, holding the
+    /// release gate's state. Set by `start_resync` on every adoption
+    /// that has anything to protect; cleared by `drain_batch` when the
+    /// gate opens and the work actually begins. While set, the adopted
+    /// VPP is left exactly as found — routes intact, and on the steered
+    /// stage even its FIB unread — because a diff against a loading
+    /// source is ~all withdrawals (drill (d), 2026-08-07), and the dump
+    /// itself freezes VPP's workers (drill (d10), 2026-08-09). See
+    /// [`DeferredResync`] for the two stages.
     deferred_resync: Option<DeferredResync>,
 }
 
-/// Release-gate state for a deferred adopted resync. See
-/// [`ADOPTED_SOURCE_FLOOR_DIVISOR`] and [`SOURCE_QUIET_TICKS`] for the
-/// two conditions, and why both are load-bearing.
+/// The loaded-and-quiet release gate, shared by both deferral stages.
+/// See [`ADOPTED_SOURCE_FLOOR_DIVISOR`] for why the floor and the
+/// quiescence are BOTH load-bearing.
 #[derive(Debug, Clone, Copy)]
-struct DeferredResync {
-    /// Routes adopted from VPP's FIB — the diff's withdrawal universe.
-    adopted: u64,
-    /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR`.
+struct SourceGate {
+    /// Minimum source size before quiescence even counts.
     floor: u64,
+    /// Mutations per second below which the source is quiet — see
+    /// [`source_quiet_rate_per_sec`].
+    quiet_rate: u64,
     /// The source's change counter at the previous check, for the
     /// activity rate. The COUNTER, not the table size: net size hides
     /// balanced churn and reads a shrinking source as quiet.
@@ -330,6 +333,111 @@ struct DeferredResync {
     /// [`SOURCE_QUIET_FOR`].
     quiet_since: Option<std::time::Instant>,
 }
+
+impl SourceGate {
+    fn new(floor: u64, quiet_rate: u64, seq_baseline: u64) -> Self {
+        Self {
+            floor,
+            quiet_rate,
+            last_seq: seq_baseline,
+            last_check: None,
+            quiet_since: None,
+        }
+    }
+
+    /// One paced observation; `true` once loaded-and-quiet has held for
+    /// [`SOURCE_QUIET_FOR`]. Both gates, in order: below the floor
+    /// nothing else matters, and above it only quiet SUSTAINED FOR A
+    /// DURATION counts — a loading feed passes through the floor by
+    /// construction (the floor-only version withdrew half a live table,
+    /// 2026-08-08), and "quiet" is a rate over elapsed time, never a
+    /// per-call delta: the production loop caps its sleeps at 50 ms, so
+    /// a per-call threshold shrinks with cadence until a full-speed
+    /// reload classifies as quiet.
+    fn observe(&mut self, now: std::time::Instant, have: u64, seq: u64) -> bool {
+        let activity_per_sec = match self.last_check {
+            // A rate needs two observations; the first check only
+            // baselines, and reports as loading — which a source
+            // this young almost certainly is.
+            None => u64::MAX,
+            Some(prev) => {
+                let ms = now.duration_since(prev).as_millis().max(1) as u64;
+                seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
+            }
+        };
+        let still_loading = have < self.floor || activity_per_sec > self.quiet_rate;
+        if still_loading {
+            self.quiet_since = None;
+        } else if self.quiet_since.is_none() {
+            self.quiet_since = Some(now);
+        }
+        let released = self
+            .quiet_since
+            .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
+        self.last_seq = seq;
+        self.last_check = Some(now);
+        released
+    }
+}
+
+/// What a deferred adopted reconciliation is waiting for.
+#[derive(Debug, Clone, Copy)]
+enum DeferredResync {
+    /// A STEERED adoption: even the FIB DUMP is deferred. VPP processes
+    /// `ip_route_dump` with every worker parked in barrier sync — the
+    /// message is not mp-safe (`ip_api.c` marks `ip_route_add_del`
+    /// thread-safe but not the dump), so at the reference table the
+    /// dump is ~5.4 s of the NIC dropping frames no VPP counter sees
+    /// (drill (d10), shadow 2026-08-09; invariant across six prior runs
+    /// because every one of them ran this dump at attach). It may only
+    /// run against a VPP carrying no traffic. Once the source is loaded
+    /// and quiet — which means the eBPF tier is equally loaded, both
+    /// consuming the same mirror commits — the runtime asks the
+    /// supervisor to unsteer ([`Event::FallbackSettled`]) and dumps
+    /// only after the NIC ledger confirms the rules are gone.
+    /// `steer_wanted` survives the unsteer, so `VerifyPassed` re-steers
+    /// on the existing verified path.
+    AwaitingFallback {
+        gate: SourceGate,
+        /// When the unsteer was last requested, so a refused or
+        /// unacknowledged removal is re-asked every
+        /// [`UNSTEER_REQUEST_EVERY`] instead of on each 50 ms tick.
+        last_request: Option<std::time::Instant>,
+    },
+    /// An UNSTEERED adoption whose dump has already run — harmlessly,
+    /// because with no rules installed nothing is on VPP for the
+    /// barrier to stall. The DIFF is deferred until the source is
+    /// loaded and quiet, exactly the original gate: a diff against a
+    /// loading source is ~all withdrawals.
+    AwaitingDiff { adopted: u64, gate: SourceGate },
+}
+
+impl DeferredResync {
+    fn floor(&self) -> u64 {
+        match self {
+            DeferredResync::AwaitingFallback { gate, .. } => gate.floor,
+            DeferredResync::AwaitingDiff { gate, .. } => gate.floor,
+        }
+    }
+}
+
+/// Floor for the pre-dump stage, as a fraction of the ledger's route
+/// capacity. Before the dump the adopted table's size is unknowable —
+/// reading it is exactly what is being deferred — so the floor that
+/// keeps a dead or trickling source from triggering an unsteer needs
+/// another basis, and capacity is the honest one available: it derives
+/// from the operator's `expected-routes`, so it scales with the
+/// deployment instead of encoding this fleet's table. Sixteen keeps
+/// both failure modes far away: any real table passes under anything
+/// short of 16x oversizing, and a dead source — the case floors exist
+/// for — sits orders of magnitude below.
+pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
+
+/// How often a refused or unacknowledged unsteer is re-requested while
+/// the pre-dump stage waits. Paced because the gate re-checks every
+/// driver tick: asking on each one would emit an action per 50 ms at a
+/// NIC that just refused the last one.
+const UNSTEER_REQUEST_EVERY: Duration = Duration::from_secs(5);
 
 /// The adopted diff runs only when the source holds at least
 /// `adopted / ADOPTED_SOURCE_FLOOR_DIVISOR` routes **and** has been
@@ -522,7 +630,9 @@ impl Runtime {
             drain_error: c.last_drain_error.clone(),
             source_backlog: c.source.backlog(),
             steer_configured_ports: c.steering.configured_ports(),
-            resync_deferred: c.deferred_resync.map(|d| (c.source.route_count(), d.floor)),
+            resync_deferred: c
+                .deferred_resync
+                .map(|d| (c.source.route_count(), d.floor())),
         }
     }
 }
@@ -704,60 +814,82 @@ impl Observe for ObserveView {
         // coming diff reads the full mirror and covers them, and
         // applying a partial feed's withdrawals early is the exact
         // hazard being deferred.
-        if let Some(mut d) = c.deferred_resync {
+        if let Some(d) = c.deferred_resync {
             let have = c.source.route_count();
-            // Both gates, in order: below the floor nothing else
-            // matters, and above it only quiet SUSTAINED FOR A DURATION
-            // counts — a loading feed passes through the floor by
-            // construction (the floor-only version withdrew half a live
-            // table, 2026-08-08), and "quiet" is a rate over elapsed
-            // time, never a per-call delta: the production loop caps
-            // its sleeps at 50 ms, so a per-call threshold shrinks with
-            // cadence until a full-speed reload classifies as quiet.
             let seq = c.source.change_seq();
-            let activity_per_sec = match d.last_check {
-                // A rate needs two observations; the first check only
-                // baselines, and reports as loading — which a source
-                // this young almost certainly is.
-                None => u64::MAX,
-                Some(prev) => {
-                    let ms = now.duration_since(prev).as_millis().max(1) as u64;
-                    seq.saturating_sub(d.last_seq).saturating_mul(1_000) / ms
+            match d {
+                DeferredResync::AwaitingFallback {
+                    mut gate,
+                    mut last_request,
+                } => {
+                    let released = gate.observe(now, have, seq);
+                    let want = gate.floor;
+                    if !released {
+                        c.deferred_resync =
+                            Some(DeferredResync::AwaitingFallback { gate, last_request });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    if !c.steering.installed().is_empty() {
+                        // The fallback can carry the traffic now; ask the
+                        // supervisor to take it off VPP. Through the
+                        // machine, never `steering.unsteer()` from here:
+                        // the ledger persist and the `steered` fact live
+                        // with the executor, and a second unsteer path is
+                        // two owners for one NIC.
+                        let ask = last_request
+                            .is_none_or(|t| now.duration_since(t) >= UNSTEER_REQUEST_EVERY);
+                        if ask {
+                            c.pending.push(Event::FallbackSettled);
+                            last_request = Some(now);
+                        }
+                        c.deferred_resync =
+                            Some(DeferredResync::AwaitingFallback { gate, last_request });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    // Unsteered and quiet: the dump is free — nothing is
+                    // on VPP for the barrier to stall. The diff follows
+                    // immediately; the source this gate just called
+                    // loaded is the same one it reads.
+                    {
+                        let Core { engine, source, .. } = &mut *c;
+                        let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+                        tracing::info!(
+                            have,
+                            adopted,
+                            "route source loaded and quiet and VPP unsteered; dumped its \
+                             FIB against no traffic and running the adopted resync diff"
+                        );
+                        let _plan = engine.begin_resync(source.as_ref());
+                        engine
+                            .program_neighbours(source.as_ref())
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    c.deferred_resync = None;
                 }
-            };
-            let still_loading =
-                have < d.floor || activity_per_sec > source_quiet_rate_per_sec(d.adopted);
-            if still_loading {
-                d.quiet_since = None;
-            } else if d.quiet_since.is_none() {
-                d.quiet_since = Some(now);
+                DeferredResync::AwaitingDiff { adopted, mut gate } => {
+                    let released = gate.observe(now, have, seq);
+                    if !released {
+                        let want = gate.floor;
+                        c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    tracing::info!(
+                        have,
+                        adopted,
+                        "route source loaded and quiet; running the adopted resync diff"
+                    );
+                    {
+                        let Core { engine, source, .. } = &mut *c;
+                        let _plan = engine.begin_resync(source.as_ref());
+                        engine
+                            .program_neighbours(source.as_ref())
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    c.deferred_resync = None;
+                }
             }
-            let released = d
-                .quiet_since
-                .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
-            d.last_seq = seq;
-            d.last_check = Some(now);
-            if !released {
-                c.deferred_resync = Some(d);
-                return Ok(crate::driver::Drain::AwaitingSource {
-                    have,
-                    want: d.floor,
-                });
-            }
-            tracing::info!(
-                have,
-                adopted = d.adopted,
-                "route source loaded and quiet; running the adopted resync diff"
-            );
-            {
-                let Core { engine, source, .. } = &mut *c;
-                let _plan = engine.begin_resync(source.as_ref());
-                engine
-                    .program_neighbours(source.as_ref())
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())?;
-            }
-            c.deferred_resync = None;
         }
         // Live changes are pulled in FIRST, so a route learned while VPP
         // was already converged goes out in this same batch rather than
@@ -928,8 +1060,38 @@ impl Effects for EffectsView {
 
     fn start_resync(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
-        // Split borrow: the engine walks the source while both live in
-        // the same core.
+        // A steered start is necessarily a steered ADOPTION: rules
+        // reach the NIC only after a verify, which no fresh spawn has
+        // had, and inherited orphan rules are torn down before
+        // `StartRequested` is ever injected. It is also the one case
+        // where `adopt_vpp_fib` must NOT run yet: the dump parks every
+        // VPP worker in barrier sync (see
+        // `DeferredResync::AwaitingFallback`), and this VPP is the one
+        // carrying the traffic. Defer everything — the dump included —
+        // until the fallback tier can take over. The NIC ledger is the
+        // discriminator, not the supervisor's belief, because rules in
+        // the NIC are what puts packets on VPP.
+        if !c.steering.installed().is_empty() {
+            let capacity = c.engine.route_capacity();
+            let floor = (capacity / FALLBACK_FLOOR_DIVISOR).max(1);
+            let seq = c.source.change_seq();
+            tracing::info!(
+                floor,
+                "adopted VPP is steered, so reading its FIB waits: the dump freezes \
+                 every worker for seconds (ip_route_dump holds VPP's barrier). Once the \
+                 route source is loaded and quiet the eBPF tier takes the traffic, the \
+                 dump runs against an idle VPP, and steering returns after the verified \
+                 resync"
+            );
+            c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                gate: SourceGate::new(floor, source_quiet_rate_per_sec(capacity), seq),
+                last_request: None,
+            });
+            return Ok(());
+        }
+        // Unsteered: nothing is on VPP, so the dump's worker stall
+        // costs no packets. Split borrow: the engine walks the source
+        // while both live in the same core.
         let deferral = {
             let Core { engine, source, .. } = &mut *c;
             // BEFORE the diff, because the diff is what consumes it: the
@@ -949,15 +1111,13 @@ impl Effects for EffectsView {
             // finished loading, and a daemon restart is exactly when it
             // has not: the feed reconnects at startup and takes tens of
             // seconds to reload. Diffing an adopted ledger against that
-            // window queues ~everything as a withdrawal — against a
-            // live, possibly steered VPP (drill (d), 2026-08-07). EVERY
-            // adoption of a POPULATED FIB defers, even one whose source
-            // already looks complete — a count cannot say "complete",
-            // only the floor-plus-quiescence gate in `drain_batch` can,
-            // and an above-floor count at this instant is exactly what a
-            // half-finished reload looks like (2026-08-08). One path to
-            // the diff, ~1.5–3 s of deliberate patience on the path
-            // that used to skip it.
+            // window queues ~everything as a withdrawal (drill (d),
+            // 2026-08-07). EVERY adoption of a POPULATED FIB defers,
+            // even one whose source already looks complete — a count
+            // cannot say "complete", only the floor-plus-quiescence gate
+            // in `drain_batch` can, and an above-floor count at this
+            // instant is exactly what a half-finished reload looks like
+            // (2026-08-08).
             //
             // `adopted == 0` — a fresh spawn, or a survivor with an
             // empty FIB — starts immediately instead: there is no
@@ -988,7 +1148,7 @@ impl Effects for EffectsView {
                     "adopted resync deferred until the route source is loaded and quiet; \
                      the adopted FIB keeps forwarding untouched meanwhile"
                 );
-                Some(DeferredResync {
+                Some(DeferredResync::AwaitingDiff {
                     adopted,
                     // Clamped to 1: integer division floors adopted=1
                     // to zero, and a floor of zero lets a DEAD source
@@ -996,10 +1156,11 @@ impl Effects for EffectsView {
                     // the sole live route — the exact case the floor
                     // exists for (review finding). A populated
                     // adoption's floor is never satisfied by nothing.
-                    floor: (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
-                    last_seq: seq,
-                    last_check: None,
-                    quiet_since: None,
+                    gate: SourceGate::new(
+                        (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
+                        source_quiet_rate_per_sec(adopted),
+                        seq,
+                    ),
                 })
             }
         };

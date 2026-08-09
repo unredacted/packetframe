@@ -52,7 +52,12 @@ impl RouteSource for Mirror {
     }
 }
 
-fn runtime_with_source(fake: &Fake, source: Box<dyn RouteSource>) -> Runtime {
+fn runtime_custom(
+    fake: &Fake,
+    source: Box<dyn RouteSource>,
+    steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+    capacity: u64,
+) -> Runtime {
     let engine = ConvergenceEngine::new(
         &fake.path,
         vec![PortAttach {
@@ -63,7 +68,7 @@ fn runtime_with_source(fake: &Fake, source: Box<dyn RouteSource>) -> Runtime {
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         }],
         vec!["eth4".into()],
-        1_000_000,
+        capacity,
         FamilyPolicy::V4Only,
         packetframe_common::config::Ipv4Prefix {
             addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -73,12 +78,16 @@ fn runtime_with_source(fake: &Fake, source: Box<dyn RouteSource>) -> Runtime {
     Runtime::new(
         engine,
         source,
-        Box::new(SteeringUnavailable),
+        steering,
         Box::new(NullStore),
         Box::new(NoResources),
         "/usr/bin/vpp",
         "/tmp/startup.conf",
     )
+}
+
+fn runtime_with_source(fake: &Fake, source: Box<dyn RouteSource>) -> Runtime {
+    runtime_custom(fake, source, Box::new(SteeringUnavailable), 1_000_000)
 }
 
 fn runtime_for(fake: &Fake, n_routes: u8) -> Runtime {
@@ -1375,4 +1384,200 @@ fn balanced_churn_is_not_quiescence() {
         })
         .collect();
     assert_eq!(deletes, vec![([10, 0, 5, 0], 24)]);
+}
+
+/// The drill-(d10) regression (shadow, 2026-08-09): a steered adoption
+/// must not read VPP's FIB while traffic is on it. `ip_route_dump` is
+/// not mp-safe, so VPP parks every worker in barrier sync for the whole
+/// walk — ~5.4 s at the reference table, dropped at the NIC where no
+/// counter sees it, and invariant across six drill runs because every
+/// one of them ran the dump at attach. The sequence under test:
+/// nothing touches VPP until the source is loaded and quiet; then the
+/// supervisor unsteers FIRST; the dump runs against an idle VPP; and
+/// steering returns only after the verified resync.
+#[test]
+fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
+    use std::sync::{Arc, Mutex};
+
+    struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
+    impl RouteSource for SharedMirror {
+        fn route_count(&self) -> u64 {
+            let mut n = 0u64;
+            self.for_each_route(&mut |_, _| n += 1);
+            n
+        }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in self.0.lock().unwrap().iter() {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+
+    /// A NIC that acknowledges both directions and remembers the order
+    /// they happened in — the ordering IS the property under test.
+    struct RecordingSteering {
+        rules: Vec<(String, u32)>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl packetframe_vpp_offload::runtime::Steering for RecordingSteering {
+        fn configured_ports(&self) -> usize {
+            1
+        }
+        fn steer(&mut self) -> Result<(), String> {
+            self.log.lock().unwrap().push("steer");
+            self.rules = vec![("eth4".into(), 1)];
+            Ok(())
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            self.log.lock().unwrap().push("unsteer");
+            self.rules.clear();
+            Ok(())
+        }
+        fn installed(&self) -> Vec<(String, u32)> {
+            self.rules.clone()
+        }
+        fn retarget(
+            &mut self,
+            _ports: Vec<(String, u32)>,
+            _plan: packetframe_vpp_offload::steer::RuleSet,
+        ) {
+        }
+    }
+
+    // The surviving VPP forwards six routes.
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 3, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 4, 0], 24, ASSIGNED_INDEX, true),
+        ([10, 0, 5, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "steered-adopt",
+        fake_vpp::Behaviour {
+            existing_routes: EXISTING,
+            ..Default::default()
+        },
+    );
+    // The feed has delivered one route so far — far below the floor.
+    let shared = Arc::new(Mutex::new(vec![fake_vpp::v4(0, 0)]));
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    // Capacity 160 → a pre-dump floor of 160/16 = 10. That the floor is
+    // 10 and not 6/2 = 3 is itself evidence: 3 would mean the adopted
+    // table had been READ, which is the stall this test forbids.
+    let rt = runtime_custom(
+        &fake,
+        Box::new(SharedMirror(shared.clone())),
+        Box::new(RecordingSteering {
+            rules: vec![("eth4".into(), 1)],
+            log: log.clone(),
+        }),
+        160,
+    );
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    rt.set_steered(true);
+
+    // Below the floor: VPP must be left exactly as found — steered,
+    // FIB unread, no route ops, no unsteer request.
+    let mut now = t0;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..40 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "nothing may complete while the source loads: {:?}",
+                t.events
+            );
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        rt.status().resync_deferred,
+        Some((1, 10)),
+        "the floor must be capacity-derived (160/16), not adopted-derived (6/2) — \
+         an adopted-derived floor means the FIB was read while steered"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "no steering transition below the floor: {:?}",
+        log.lock().unwrap()
+    );
+    let touched: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "no route op may reach a steered VPP before the unsteer: {touched:?}"
+    );
+
+    // The feed finishes: twelve routes, one of VPP's six (10.0.5.0/24)
+    // genuinely withdrawn while packetframe was down.
+    *shared.lock().unwrap() = (0..5)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..7).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+
+    let (_, events) = run_until(&mut d, &rt, now, |d| d.state() == State::Steered);
+
+    // The order is the contract: traffic left VPP before its FIB was
+    // read, and returned only through the verified path.
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "unsteer must precede the dump and the re-steer must be the last transition"
+    );
+    assert!(
+        events.contains(&Event::SyncComplete) && events.contains(&Event::VerifyPassed),
+        "the reconciliation must actually run once unsteered: {events:?}"
+    );
+    assert!(
+        rt.status().resync_deferred.is_none(),
+        "the deferral must clear when the reconciliation runs"
+    );
+    // And the diff withdrew exactly the one prefix the source dropped —
+    // proof the dump ran and seeded the withdrawal universe.
+    let deletes: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![([10, 0, 5, 0], 24)],
+        "one withdrawal for the one prefix the source really dropped"
+    );
 }

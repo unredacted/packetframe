@@ -213,6 +213,13 @@ impl Capacity {
         Self { high_water_routes }
     }
 
+    /// The high-water route count this policy enforces. Exposed for the
+    /// pre-dump deferral floor, which needs a table-scale number at a
+    /// moment when the adopted table itself cannot yet be read.
+    pub fn high_water(&self) -> u64 {
+        self.high_water_routes
+    }
+
     fn has_headroom(&self, installed: u64) -> bool {
         installed < self.high_water_routes
     }

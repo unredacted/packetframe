@@ -140,6 +140,16 @@ pub enum Event {
     Adopted {
         steered: bool,
     },
+    /// The runtime's deferred adopted reconciliation reports that the
+    /// route source is loaded and quiet. The eBPF tier consumes the
+    /// same mirror commits, so it is equally loaded — meaning it can
+    /// carry the traffic while VPP's FIB is read. And it must:
+    /// `ip_route_dump` is not mp-safe, so VPP processes it with every
+    /// worker parked in barrier sync — ~5.4 s of the NIC dropping
+    /// frames no counter sees, at the reference table (shadow,
+    /// 2026-08-09). Meaningful only while an adopted resync is
+    /// deferred; every other state ignores it as stale.
+    FallbackSettled,
     /// The binary API answered.
     ApiUp,
     /// The pending map drained to empty.
@@ -482,6 +492,24 @@ impl Supervisor {
                 // correctly-forwarding dataplane to do it.
                 self.state = if steered { AdoptedResyncing } else { Syncing };
                 vec![Action::AttachDevices, Action::StartResync]
+            }
+
+            // --- rule 3, refined by measurement ---
+            // Adoption still never tears steering down just to resync —
+            // but READING the adopted FIB stalls it: the dump holds
+            // VPP's worker barrier for seconds. So once the runtime
+            // reports the fallback tier loaded and quiet, unsteering
+            // FIRST is what keeps packets flowing, and the dump runs
+            // against a VPP carrying nothing. `steer_wanted` was set at
+            // adoption and survives, so `VerifyPassed` re-steers on the
+            // existing verified path; `steered` clears only on the
+            // `Unsteered` acknowledgement, as everywhere else.
+            (AdoptedResyncing, FallbackSettled) => {
+                if self.steered {
+                    vec![Action::Unsteer]
+                } else {
+                    vec![]
+                }
             }
 
             // --- converging ---
@@ -858,6 +886,36 @@ mod tests {
             vec![Action::AttachDevices, Action::StartResync],
             "device attach must precede the resync"
         );
+    }
+
+    #[test]
+    fn fallback_settled_unsteers_only_a_steered_adopted_resync() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        assert_eq!(s.state(), State::AdoptedResyncing);
+        assert_eq!(
+            s.on(Event::FallbackSettled),
+            vec![Action::Unsteer],
+            "a steered adoption is unsteered so the dump runs against an idle VPP"
+        );
+        // Until the acknowledgement arrives the request is re-askable,
+        // and after it the same event asks for nothing.
+        assert_eq!(s.on(Event::FallbackSettled), vec![Action::Unsteer]);
+        s.on(Event::Unsteered);
+        assert!(
+            s.on(Event::FallbackSettled).is_empty(),
+            "an acknowledged unsteer leaves nothing to ask for"
+        );
+        // The want survives for the re-steer after verify.
+        s.on(Event::SyncComplete);
+        s.on(Event::VerifyPassed);
+        assert_eq!(s.state(), State::Ready);
+
+        // Any state without a deferred adopted resync ignores it.
+        let mut fresh = Supervisor::new();
+        assert!(fresh.on(Event::FallbackSettled).is_empty());
+        fresh.on(Event::StartRequested);
+        assert!(fresh.on(Event::FallbackSettled).is_empty());
     }
 
     #[test]
