@@ -157,6 +157,15 @@ pub struct BmpStation {
     /// streams that lack notifications (review finding). `saw_rm`
     /// attests liveness only for connections that never spoke PeerUp.
     saw_peer_up: std::sync::atomic::AtomicBool,
+    /// Whether this connection's initial stream has settled
+    /// (InitiationComplete fired). Liveness raises pass through this:
+    /// a PeerUp that precedes a delayed initial dump proves a peer,
+    /// not a table, and raising on it let two seconds of pre-stream
+    /// quiet release the second tier's gate (review finding — the
+    /// same flaw the BGP and Loc-RIB paths shed, at the last raise
+    /// site that still had it). A PeerUp arriving AFTER settlement
+    /// raises immediately, which is the mid-session peer-join case.
+    initiated: std::sync::atomic::AtomicBool,
 }
 
 /// Re-export for callers building the station.
@@ -189,6 +198,7 @@ impl BmpStation {
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
+            initiated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -298,6 +308,8 @@ impl BmpStation {
                             self.saw_rm
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            self.initiated
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             if let Some(sess) = &self.session {
                                 sess.set_up(false);
@@ -419,12 +431,14 @@ impl BmpStation {
                             } else {
                                 // The station's own definition of
                                 // initial-stream readiness, and therefore
-                                // where a Loc-RIB stream becomes LIVE for
-                                // the second tier: the dump has quiesced,
-                                // so the mirror now holds what the
-                                // emitter has. Guarded like the RM raise
-                                // was: an emitter that speaks peer
-                                // lifecycle with no peer up stays down.
+                                // where a stream becomes LIVE for the
+                                // second tier: the dump has quiesced, so
+                                // the mirror now holds what the emitter
+                                // has. Guarded like the RM raise was: an
+                                // emitter that speaks peer lifecycle
+                                // with no peer up stays down.
+                                self.initiated
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                                 let peers_speak = self
                                     .saw_peer_up
                                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -473,6 +487,8 @@ impl BmpStation {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.initiated
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(sess) = &self.session {
                     sess.set_up(false);
                 }
@@ -505,8 +521,13 @@ impl BmpStation {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut up = self.up_peers.lock().expect("up_peers lock");
                 up.insert(peer_id);
-                if let Some(sess) = &self.session {
-                    sess.set_up(true);
+                // Bookkeeping always; liveness only once the initial
+                // stream has settled. Before that, a peer is a promise
+                // of a table, not a table.
+                if self.initiated.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(sess) = &self.session {
+                        sess.set_up(true);
+                    }
                 }
             }
             BmpMessageBody::PeerDownNotification(_) => {
