@@ -136,6 +136,16 @@ pub struct BmpStation {
     /// would let a second tier trust a mirror that just lost its feed
     /// (review finding).
     up_peers: std::sync::Mutex<std::collections::HashSet<PeerId>>,
+    /// Whether this connection has delivered a RouteMonitoring frame.
+    /// RFC 9069 Loc-RIB streams need not send PeerUp for the synthetic
+    /// Loc-RIB instance (review finding — and Loc-RIB is precisely the
+    /// mode `require-loc-rib` documents), so for them the RM stream
+    /// itself is the liveness evidence: it is the thing that delivers
+    /// the table. The handle is up while EITHER a monitored peer is up
+    /// or this connection has streamed RM; an emitter whose upstream
+    /// peers all die empties its Loc-RIB through RM withdrawals rather
+    /// than going silent, which the mirror then reflects honestly.
+    saw_rm: std::sync::atomic::AtomicBool,
 }
 
 /// Re-export for callers building the station.
@@ -166,6 +176,7 @@ impl BmpStation {
             peer_acl: Vec::new(),
             session: None,
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            saw_rm: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -272,6 +283,8 @@ impl BmpStation {
                             // ended with it: whatever PeerUps this
                             // session delivered are no longer evidence.
                             self.up_peers.lock().expect("up_peers lock").clear();
+                            self.saw_rm
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             if let Some(sess) = &self.session {
                                 sess.set_up(false);
                             } else {
@@ -337,6 +350,10 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
+                                self.saw_rm.store(true, Ordering::Relaxed);
+                                if let Some(sess) = &self.session {
+                                    sess.set_up(true);
+                                }
                             }
                             // Loc-RIB safety check happens inside
                             // process_msg; a violation returns Err and
@@ -409,6 +426,12 @@ impl BmpStation {
             }
             BmpMessageBody::TerminationMessage(_) => {
                 info!("BMP TERMINATION received from bird");
+                self.up_peers.lock().expect("up_peers lock").clear();
+                self.saw_rm
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Some(sess) = &self.session {
+                    sess.set_up(false);
+                }
             }
             BmpMessageBody::PeerUpNotification(_) => {
                 let pph = match &msg.per_peer_header {
@@ -456,7 +479,7 @@ impl BmpStation {
                 }
                 let mut up = self.up_peers.lock().expect("up_peers lock");
                 up.remove(&peer_id);
-                if up.is_empty() {
+                if up.is_empty() && !self.saw_rm.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Some(sess) = &self.session {
                         sess.set_up(false);
                     }

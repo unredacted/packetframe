@@ -908,10 +908,22 @@ impl Observe for ObserveView {
                     //    quiet is what bounds a hung session going
                     //    stale at "up".
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
-                    let complete = view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
-                        && c.completeness
-                            .as_ref()
-                            .is_some_and(|h| h.verdict().permits_steering());
+                    // The completeness verdict is a REPORT — a snapshot
+                    // valid for up to STEER_MAX_REPORT_AGE — so it
+                    // attests liveness at report time, not now: a
+                    // PeerDown wipe inside that window would otherwise
+                    // ride a stale Converged onto an empty fallback
+                    // (review finding). Hence `live` here too, plus a
+                    // sanity bound that the mirror the report described
+                    // has not collapsed since — half, not equality,
+                    // because legitimate churn between checker runs
+                    // must not invalidate the authority.
+                    let complete = live
+                        && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
+                        && c.completeness.as_ref().is_some_and(|h| {
+                            h.verdict().permits_steering()
+                                && h.latest().is_some_and(|r| have >= r.mirror_routes / 2)
+                        });
                     let small_table_loaded = have > 0
                         && live
                         && view
@@ -922,10 +934,10 @@ impl Observe for ObserveView {
                     // shrinks it beneath what neighbour-synthesized
                     // routes can supply with the feed dead (capacity
                     // 176 puts it at 11; review finding). Liveness is
-                    // the session's to answer on every path — only the
-                    // completeness authority substitutes, because a
-                    // mirror that MATCHES bird's count has bird alive
-                    // in the comparison itself.
+                    // the session's to answer on every path, the
+                    // completeness authority included — its report
+                    // proves bird was alive at REPORT time, and `live`
+                    // is what makes that claim current.
                     let released = (view.released && live) || complete || small_table_loaded;
                     if !released {
                         c.deferred_resync =

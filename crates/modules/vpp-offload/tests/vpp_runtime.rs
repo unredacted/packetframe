@@ -1787,18 +1787,21 @@ fn a_dead_source_never_triggers_the_unsteer() {
     );
 }
 
-/// Where a bird exists, completeness is the exact readiness signal —
-/// the same one `Effects::steer` gates on — and it releases a table the
-/// capacity floor is wrong about without waiting out the hold time.
+/// Where a bird exists, completeness is the exact readiness signal -
+/// but a report is a snapshot, so it releases only alongside CURRENT
+/// session liveness (review finding: a PeerDown wipe inside the
+/// report's validity window must not ride a stale Converged onto an
+/// empty fallback). With both in hand it releases a table the capacity
+/// floor is wrong about without waiting out the hold time.
 #[test]
 fn completeness_releases_a_below_floor_table_promptly() {
     use packetframe_common::fib::{CompletenessReport, TableCompleteness};
 
-    let (fake, shared, log, rt, _session) = steered::fixture("steered-complete", &[], 160);
+    let (fake, shared, log, rt, session) = steered::fixture("steered-complete", &[], 160);
     let handle = std::sync::Arc::new(TableCompleteness::new());
     rt.require_table_complete(handle.clone());
     let mut d = Driver::new();
-    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
+    let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
 
     *shared.lock().unwrap() = (0..4).map(|i| fake_vpp::v4(0, i)).collect();
     handle.publish(CompletenessReport {
@@ -1806,6 +1809,28 @@ fn completeness_releases_a_below_floor_table_promptly() {
         mirror_routes: 4,
         at: std::time::Instant::now(),
     });
+
+    // A Converged report with the session DOWN is a snapshot of a
+    // world that may have ended - it must not release by itself.
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..200 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a cached Converged without current liveness must not release"
+    );
+    session.set_up(true);
 
     // Well under the 150 s small-table wait: the authority short-cuts.
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
