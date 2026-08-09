@@ -337,10 +337,6 @@ struct SourceGate {
     /// cannot veto — they exist precisely for tables the floor is
     /// wrong about.
     rate_quiet_since: Option<std::time::Instant>,
-    /// The change counter when this gate was created, so
-    /// [`GateView::loaded_delta`] can report how much of a reload has
-    /// actually been observed.
-    seq_baseline: u64,
 }
 
 /// What one gate observation saw. `released` is the coupled
@@ -352,10 +348,6 @@ struct GateView {
     released: bool,
     /// How long the rate alone has been quiet, floor ignored.
     rate_quiet_for: Option<Duration>,
-    /// Change-counter advance since the gate was created — evidence a
-    /// reload actually happened, as opposed to a feed that never
-    /// delivered anything.
-    loaded_delta: u64,
 }
 
 impl SourceGate {
@@ -367,7 +359,6 @@ impl SourceGate {
             last_check: None,
             quiet_since: None,
             rate_quiet_since: None,
-            seq_baseline,
         }
     }
 
@@ -411,7 +402,6 @@ impl SourceGate {
         GateView {
             released,
             rate_quiet_for: self.rate_quiet_since.map(|s| now.duration_since(s)),
-            loaded_delta: seq.saturating_sub(self.seq_baseline),
         }
     }
 }
@@ -470,24 +460,39 @@ impl DeferredResync {
 /// `capacity / 16` (the default sizing over a small table qualifies)
 /// would otherwise defer forever (review finding). The other two, in
 /// the `AwaitingFallback` arm: the completeness authority where a bird
-/// exists to compare against, and the observed-reload-plus-long-quiet
-/// clause under [`SMALL_TABLE_QUIET_FOR`].
+/// exists to compare against, and the small-table clause under
+/// [`SMALL_TABLE_QUIET_FOR`] / [`SMALL_TABLE_MIN_ROUTES`].
 pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
 
 /// The pre-dump stage's small-table release: rate-quiet sustained this
-/// long, together with an observed full reload (the change counter
-/// advanced by at least the table size since the gate was created),
-/// counts as loaded even below the capacity floor. The DURATION is the
-/// load-bearing part: it must outlast the BGP hold time, because a
-/// feed that died or hung mid-load cannot stay quietly wrong longer
-/// than that — the session drops, the PeerDown wipe empties the
-/// mirror, and the wipe's own churn resets both quiet trackers.
-/// Default holds are 90 s and the fleet's feed negotiates 90; 150 s
-/// covers them with margin. A deployment that raises its hold beyond
-/// this should size `expected-routes` within 16x of its table or run
+/// long, together with at least [`SMALL_TABLE_MIN_ROUTES`] in the
+/// mirror, counts as loaded even below the capacity floor. The
+/// DURATION is one of the two load-bearing parts: it must outlast the
+/// BGP hold time, because a feed that died or hung mid-load cannot
+/// stay quietly wrong longer than that — the session drops, the
+/// PeerDown wipe empties the mirror of everything the session carried,
+/// and the wipe's own churn resets the quiet tracker. Default holds
+/// are 90 s and the fleet's feed negotiates 90; 150 s covers them with
+/// margin. A deployment that raises its hold beyond this should size
+/// `expected-routes` within 16x of its table or run
 /// `require-table-complete on`, both of which release without this
 /// clause.
 const SMALL_TABLE_QUIET_FOR: Duration = Duration::from_secs(150);
+
+/// The other load-bearing part: what quiet-past-the-hold leaves behind
+/// after a session death is a mirror holding only what did NOT come
+/// from the session — neighbour-synthesized local routes, bounded by
+/// the hosts physically present on the box's L2s, i.e. dozens. No
+/// in-process signal can distinguish "watched a load" from "watched a
+/// wipe": the mirror starts empty every daemon start, so its content
+/// IS the observed mutations — a change-counter baseline is a
+/// tautology, and one taken at gate creation additionally missed
+/// whatever loaded before attach (review finding). An absolute
+/// minimum the husk cannot reach is the honest discriminator. A site
+/// with a genuine table under 128 routes releases through the floor
+/// instead, by sizing `expected-routes` at or under 2048 — whose
+/// floor, not coincidentally, is exactly 128.
+const SMALL_TABLE_MIN_ROUTES: u64 = 128;
 
 /// How often a refused or unacknowledged unsteer is re-requested while
 /// the pre-dump stage waits. Paced because the gate re-checks every
@@ -890,17 +895,16 @@ impl Observe for ObserveView {
                     //  - the completeness authority, where a bird
                     //    exists — the exact signal, and the same one
                     //    `Effects::steer` gates on;
-                    //  - an observed full reload followed by quiet
-                    //    longer than the BGP hold time — see
-                    //    SMALL_TABLE_QUIET_FOR for why that duration
-                    //    makes "small and loaded" distinguishable from
-                    //    "died mid-load".
+                    //  - a table past SMALL_TABLE_MIN_ROUTES that has
+                    //    been quiet longer than the BGP hold time — see
+                    //    the two constants for why that pair separates
+                    //    "small and loaded" from the synth-only husk a
+                    //    dead session leaves behind.
                     let complete = view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && c.completeness
                             .as_ref()
                             .is_some_and(|h| h.verdict().permits_steering());
-                    let small_table_loaded = have > 0
-                        && view.loaded_delta >= have
+                    let small_table_loaded = have >= SMALL_TABLE_MIN_ROUTES
                         && view
                             .rate_quiet_for
                             .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
