@@ -554,7 +554,7 @@ fn finish(
         .chain(core_map.workers.iter().copied())
         .collect();
     if let Some(vpp) = &adopted {
-        match cores::observed_placement(vpp.pid()) {
+        match cores::observed_placement(vpp.pid(), vpp.start_ticks()) {
             Ok(observed) if observed.is_empty() => tracing::warn!(
                 pid = vpp.pid(),
                 "the adopted VPP has no pinned threads to observe; vacating the derived \

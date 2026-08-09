@@ -360,11 +360,23 @@ const PINNED_WIDTH_MAX: i32 = 2;
 /// any tid's mask (the getter carries no privilege gate, and this
 /// daemon is root regardless). An empty answer means no thread is
 /// pinned narrowly enough to be placement; an `Err` means the process
-/// could not be inspected at all. The caller must treat both as
-/// "observe failed, fall back to the derived map with a warning" —
-/// never as "pinned nowhere, nothing to vacate".
+/// could not be inspected at all — or turned out mid-scan not to be
+/// the process asked about. The caller must treat both as "observe
+/// failed, fall back to the derived map with a warning" — never as
+/// "pinned nowhere, nothing to vacate".
+///
+/// `start_ticks` is the identity the pid must still carry, and it is
+/// re-verified AFTER the walk, which covers the walk: if the process
+/// at `pid` still has the adopted start time when the scan is done,
+/// then it had it throughout — a pid does not return to a process
+/// that lost it. Without this, a VPP that exits after adoption and
+/// has its LEADER pid recycled rebinds the whole `/proc/<pid>/task`
+/// path to the replacement process, and the per-tid membership check
+/// below then vouches for every one of the stranger's threads
+/// (review finding — the same identity rule as adoption itself,
+/// `(pid, start_ticks)`, applied to the read side).
 #[cfg(target_os = "linux")]
-pub fn observed_placement(pid: i32) -> Result<Vec<u16>, String> {
+pub fn observed_placement(pid: i32, start_ticks: u64) -> Result<Vec<u16>, String> {
     let task_dir = format!("/proc/{pid}/task");
     let tasks = std::fs::read_dir(&task_dir).map_err(|e| format!("{task_dir}: {e}"))?;
     let mut cores: Vec<u16> = Vec::new();
@@ -418,12 +430,20 @@ pub fn observed_placement(pid: i32) -> Result<Vec<u16>, String> {
             }
         }
     }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|e| format!("pid {pid} vanished during the placement scan: {e}"))?;
+    if crate::process::parse_start_ticks(&stat) != Some(start_ticks) {
+        return Err(format!(
+            "the process now at pid {pid} is not the adopted VPP (start-time cookie \
+             changed during the scan), so the masks just read belong to a stranger"
+        ));
+    }
     cores.sort_unstable();
     Ok(cores)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn observed_placement(_pid: i32) -> Result<Vec<u16>, String> {
+pub fn observed_placement(_pid: i32, _start_ticks: u64) -> Result<Vec<u16>, String> {
     // Non-Linux never has a VPP to observe.
     Err("thread affinity is not readable on this platform".into())
 }
@@ -564,7 +584,12 @@ mod affinity_tests {
         });
         pinned_rx.recv().expect("child pinned before observing");
 
-        let observed = observed_placement(std::process::id() as i32).expect("observe self");
+        let own_pid = std::process::id() as i32;
+        let own_ticks = crate::process::parse_start_ticks(
+            &std::fs::read_to_string(format!("/proc/{own_pid}/stat")).expect("own stat"),
+        )
+        .expect("own start ticks");
+        let observed = observed_placement(own_pid, own_ticks).expect("observe self");
         done_tx.send(()).expect("release the child");
         child.join().expect("child joined");
 
@@ -575,6 +600,13 @@ mod affinity_tests {
         assert!(
             !observed.contains(&(b as u16)),
             "a CPU held only by wide-mask threads is not placement: {observed:?}"
+        );
+
+        // A pid wearing the wrong start-time cookie is a stranger, and
+        // a stranger's masks must be refused, not returned.
+        assert!(
+            observed_placement(own_pid, own_ticks ^ 1).is_err(),
+            "an identity mismatch must refuse the observation"
         );
     }
 
