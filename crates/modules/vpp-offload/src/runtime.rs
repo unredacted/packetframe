@@ -381,6 +381,21 @@ impl SourceGate {
     /// (review finding). Rebaselining continuously while down also
     /// covers the up-transition: the clock starts from the moment
     /// liveness returns.
+    /// Forget every piece of quiet evidence and restart the rate
+    /// baseline at `seq_now`. Called when a validation OUTSIDE the
+    /// gate rejects what the gate released — the post-dump churn
+    /// check — because reinserting an unchanged gate let the very
+    /// next tick average the rejected burst below the rate, keep the
+    /// pre-dump `quiet_since`, and re-release immediately: the
+    /// rejection undone one tick later (review finding). After this,
+    /// the source must establish a fresh sustained quiet interval.
+    fn rebaseline(&mut self, seq_now: u64) {
+        self.last_seq = seq_now;
+        self.last_check = None;
+        self.quiet_since = None;
+        self.rate_quiet_since = None;
+    }
+
     /// `quiet_rate` is supplied per observation, not stored, because
     /// the honest basis DIFFERS by stage and time: the diff stage
     /// scales it to the dumped table it protects, while the pre-dump
@@ -1156,6 +1171,7 @@ impl Observe for ObserveView {
                                  the diff — the adopted routes stay in the ledger and the \
                                  reconciliation resumes when the source is ready again"
                             );
+                            gate.rebaseline(seq_now);
                             c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                                 gate,
                                 last_request,
