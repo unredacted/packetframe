@@ -312,6 +312,15 @@ pub enum Event {
 /// and "restart then unsteer" differ by an outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Re-install steering for an adopted VPP whose reconciliation was
+    /// revoked after the unsteer — WITHOUT the completeness gate that
+    /// [`Action::Steer`] runs through. The gate protects traffic from
+    /// a VPP synced off an incomplete MIRROR; the adoptee's FIB was
+    /// never built from the mirror, and a condemning verdict is
+    /// exactly when traffic belongs back on it (review finding: the
+    /// gate blocked the restoration precisely when its verdict caused
+    /// the revocation).
+    RestoreSteer,
     /// Remove MCAM rules. First in any teardown.
     Unsteer,
     /// Kill the process if it is still alive.
@@ -527,7 +536,7 @@ impl Supervisor {
             // lands in the catch-all and the runtime re-asks, paced.
             (AdoptedResyncing, FallbackRevoked) => {
                 if !self.steered && self.steer_wanted {
-                    vec![Action::Steer]
+                    vec![Action::RestoreSteer]
                 } else {
                     vec![]
                 }
@@ -958,8 +967,9 @@ mod tests {
         s.on(Event::Unsteered);
         assert_eq!(
             s.on(Event::FallbackRevoked),
-            vec![Action::Steer],
-            "an unsteered adoption with a revoked fallback takes traffic back"
+            vec![Action::RestoreSteer],
+            "an unsteered adoption with a revoked fallback takes traffic back, \
+             ungated — the veto that revoked it must not block the restore"
         );
         s.on(Event::Steered);
         assert_eq!(s.state(), State::AdoptedResyncing, "still converging");

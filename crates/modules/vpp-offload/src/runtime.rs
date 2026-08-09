@@ -1021,26 +1021,57 @@ impl Observe for ObserveView {
                             completeness,
                             ..
                         } = &mut *c;
+                        let dump_started = std::time::Instant::now();
                         let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
                         // Revalidate on the FAR side of the dump: it
-                        // blocks this thread for seconds, and a feed
-                        // that collapsed mid-walk would hand the diff a
-                        // husk — whose withdrawals destroy the intact
-                        // FIB just read, with traffic already on the
-                        // incomplete fallback (review finding). The
-                        // deferral is KEPT on refusal: the ledger now
-                        // holds the dumped FIB (the dump is a no-op on
-                        // a populated ledger), the revocation path
+                        // blocks this thread for seconds, and the world
+                        // it re-checks is the MIRROR, not just the
+                        // transport — a live BGP soft reload withdraws
+                        // and reannounces with the session up and a
+                        // cached verdict still permitting, and a diff
+                        // snapshotted in that trough queues withdrawals
+                        // that destroy the intact FIB just read (review
+                        // finding, twice: liveness alone was the first
+                        // version's check). Three current facts must
+                        // hold:
+                        //  - the session is still up;
+                        //  - the mirror moved during the dump at no
+                        //    more than the gate's own quiet rate — any
+                        //    faster and the quiet that released us is
+                        //    retroactively false;
+                        //  - a configured authority's report, recomputed
+                        //    against the mirror AS IT IS NOW, still
+                        //    permits.
+                        // The deferral is KEPT on refusal: the ledger
+                        // holds the dumped FIB (the dump no-ops on a
+                        // populated ledger), the revocation path
                         // re-steers, and a later release diffs against
                         // a recovered source.
                         let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
-                        let veto_now = completeness
-                            .as_ref()
-                            .is_some_and(|h| !h.verdict().permits_steering());
-                        if !live_now || veto_now {
+                        let have_now = source.route_count();
+                        let seq_now = source.change_seq();
+                        let dump_ms = dump_started.elapsed().as_millis().max(1) as u64;
+                        let churn_per_sec =
+                            seq_now.saturating_sub(seq).saturating_mul(1_000) / dump_ms;
+                        let mirror_settled = have_now > 0 && churn_per_sec <= gate.quiet_rate;
+                        let authority_agrees = completeness.as_ref().is_none_or(|h| {
+                            h.verdict().permits_steering()
+                                && h.latest().is_some_and(|r| {
+                                    let now_r = packetframe_common::fib::CompletenessReport {
+                                        mirror_routes: have_now,
+                                        ..r
+                                    };
+                                    now_r.drift().is_some_and(|d| {
+                                        d <= packetframe_common::fib::STEER_MAX_DRIFT
+                                    })
+                                })
+                        });
+                        if !live_now || !mirror_settled || !authority_agrees {
                             tracing::warn!(
                                 adopted,
                                 live = live_now,
+                                churn_per_sec,
+                                have_now,
                                 "the feed changed while VPP's FIB was being dumped; holding \
                                  the diff — the adopted routes stay in the ledger and the \
                                  reconciliation resumes when the source is ready again"
@@ -1176,6 +1207,23 @@ impl Effects for EffectsView {
     fn unsteer(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
         let outcome = c.steering.unsteer();
+        c.record_steering();
+        outcome
+    }
+
+    fn restore_steer(&mut self) -> Result<(), String> {
+        // NO completeness gate, deliberately — the one divergence from
+        // `steer`, and the whole reason this method exists. The gate
+        // protects traffic from a VPP synced off an incomplete MIRROR;
+        // the adoptee's FIB was never built from the mirror, and a
+        // verdict condemning the mirror is precisely when traffic
+        // belongs back on the intact adoptee rather than on the
+        // fallback the verdict condemned (review finding: the gate
+        // blocked the restoration exactly when its verdict caused the
+        // revocation). Reachable only through Action::RestoreSteer,
+        // which only (AdoptedResyncing, FallbackRevoked) emits.
+        let mut c = self.core.borrow_mut();
+        let outcome = c.steering.steer();
         c.record_steering();
         outcome
     }

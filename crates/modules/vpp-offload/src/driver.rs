@@ -582,6 +582,10 @@ mod tests {
             self.calls.push("steer");
             Ok(())
         }
+        fn restore_steer(&mut self) -> Result<(), String> {
+            self.calls.push("steer");
+            Ok(())
+        }
         fn kill(&mut self) -> Disposition {
             self.calls.push("kill");
             self.kill_disposition.unwrap_or(Disposition::SafeToRelease)
@@ -1362,6 +1366,9 @@ mod tests {
                 Ok(())
             }
             fn steer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn restore_steer(&mut self) -> Result<(), String> {
                 Ok(())
             }
             fn kill(&mut self) -> Disposition {

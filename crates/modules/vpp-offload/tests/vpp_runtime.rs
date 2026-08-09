@@ -1850,6 +1850,115 @@ fn an_incomplete_verdict_vetoes_every_proxy_release() {
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
+/// The veto-driven revocation: the authority turns Incomplete after
+/// the unsteer landed. The restoration steer must BYPASS the
+/// completeness gate - a plain steer refuses on exactly the verdict
+/// that caused the revocation, which parked traffic forever on the
+/// condemned fallback while the intact adoptee idled (review finding).
+#[test]
+fn a_condemning_verdict_cannot_block_its_own_revocations_restore() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (fake, _shared, log, rt, session) = steered::fixture("steered-veto-restore", &full, 160);
+    session.set_up(true);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    handle.publish(CompletenessReport {
+        authority_routes: 12,
+        mirror_routes: 12,
+        at: std::time::Instant::now(),
+    });
+    let mut d = Driver::new();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(Instant::now(), Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // Tick until the unsteer lands, then the authority condemns the
+    // mirror before the dump tick.
+    let mut now = Instant::now();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..512 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            rt.set_steered(d.supervisor().is_steered());
+            let unsteer_landed = log.lock().unwrap().as_slice() == ["unsteer"];
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+            if unsteer_landed {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer"],
+        "window reached"
+    );
+    handle.publish(CompletenessReport {
+        authority_routes: 1000,
+        mirror_routes: 12,
+        at: std::time::Instant::now(),
+    });
+
+    // The veto revokes; the restore must go through DESPITE the
+    // verdict - that is the entire point of the ungated action.
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..512 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            rt.set_steered(d.supervisor().is_steered());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+            if log.lock().unwrap().len() == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "the condemning verdict must not block the restoration it caused"
+    );
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "steered again, still waiting"
+    );
+    let touched: Vec<_> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "no dump, no diff under the veto: {touched:?}"
+    );
+}
+
 /// The revocation window: the gate released, the unsteer was
 /// acknowledged - and the feed dropped before the dump ran. The
 /// adopted FIB is still whole, so the traffic goes BACK onto it
