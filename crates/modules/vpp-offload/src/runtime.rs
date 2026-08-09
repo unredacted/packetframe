@@ -332,6 +332,30 @@ struct SourceGate {
     /// while it is loading. Release requires this to have lasted
     /// [`SOURCE_QUIET_FOR`].
     quiet_since: Option<std::time::Instant>,
+    /// Since when the RATE alone has been quiet, floor ignored. The
+    /// pre-dump stage's alternate releases need quiet that the floor
+    /// cannot veto — they exist precisely for tables the floor is
+    /// wrong about.
+    rate_quiet_since: Option<std::time::Instant>,
+    /// The change counter when this gate was created, so
+    /// [`GateView::loaded_delta`] can report how much of a reload has
+    /// actually been observed.
+    seq_baseline: u64,
+}
+
+/// What one gate observation saw. `released` is the coupled
+/// floor-plus-quiescence verdict both stages share; the other fields
+/// serve the pre-dump stage's alternate releases, which must work
+/// exactly where the floor does not.
+#[derive(Debug, Clone, Copy)]
+struct GateView {
+    released: bool,
+    /// How long the rate alone has been quiet, floor ignored.
+    rate_quiet_for: Option<Duration>,
+    /// Change-counter advance since the gate was created — evidence a
+    /// reload actually happened, as opposed to a feed that never
+    /// delivered anything.
+    loaded_delta: u64,
 }
 
 impl SourceGate {
@@ -342,6 +366,8 @@ impl SourceGate {
             last_seq: seq_baseline,
             last_check: None,
             quiet_since: None,
+            rate_quiet_since: None,
+            seq_baseline,
         }
     }
 
@@ -354,7 +380,7 @@ impl SourceGate {
     /// per-call delta: the production loop caps its sleeps at 50 ms, so
     /// a per-call threshold shrinks with cadence until a full-speed
     /// reload classifies as quiet.
-    fn observe(&mut self, now: std::time::Instant, have: u64, seq: u64) -> bool {
+    fn observe(&mut self, now: std::time::Instant, have: u64, seq: u64) -> GateView {
         let activity_per_sec = match self.last_check {
             // A rate needs two observations; the first check only
             // baselines, and reports as loading — which a source
@@ -365,7 +391,13 @@ impl SourceGate {
                 seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
             }
         };
-        let still_loading = have < self.floor || activity_per_sec > self.quiet_rate;
+        let rate_quiet = activity_per_sec <= self.quiet_rate;
+        if !rate_quiet {
+            self.rate_quiet_since = None;
+        } else if self.rate_quiet_since.is_none() {
+            self.rate_quiet_since = Some(now);
+        }
+        let still_loading = have < self.floor || !rate_quiet;
         if still_loading {
             self.quiet_since = None;
         } else if self.quiet_since.is_none() {
@@ -376,7 +408,11 @@ impl SourceGate {
             .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
         self.last_seq = seq;
         self.last_check = Some(now);
-        released
+        GateView {
+            released,
+            rate_quiet_for: self.rate_quiet_since.map(|s| now.duration_since(s)),
+            loaded_delta: seq.saturating_sub(self.seq_baseline),
+        }
     }
 }
 
@@ -425,13 +461,33 @@ impl DeferredResync {
 /// capacity. Before the dump the adopted table's size is unknowable —
 /// reading it is exactly what is being deferred — so the floor that
 /// keeps a dead or trickling source from triggering an unsteer needs
-/// another basis, and capacity is the honest one available: it derives
-/// from the operator's `expected-routes`, so it scales with the
-/// deployment instead of encoding this fleet's table. Sixteen keeps
-/// both failure modes far away: any real table passes under anything
-/// short of 16x oversizing, and a dead source — the case floors exist
-/// for — sits orders of magnitude below.
+/// another basis, and capacity is the one available: it derives from
+/// the operator's `expected-routes`, so it scales with the deployment
+/// instead of encoding this fleet's table.
+///
+/// Capacity is an UPPER sizing bound, though, so this floor is only
+/// one of three releases — a deployment whose real table sits below
+/// `capacity / 16` (the default sizing over a small table qualifies)
+/// would otherwise defer forever (review finding). The other two, in
+/// the `AwaitingFallback` arm: the completeness authority where a bird
+/// exists to compare against, and the observed-reload-plus-long-quiet
+/// clause under [`SMALL_TABLE_QUIET_FOR`].
 pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
+
+/// The pre-dump stage's small-table release: rate-quiet sustained this
+/// long, together with an observed full reload (the change counter
+/// advanced by at least the table size since the gate was created),
+/// counts as loaded even below the capacity floor. The DURATION is the
+/// load-bearing part: it must outlast the BGP hold time, because a
+/// feed that died or hung mid-load cannot stay quietly wrong longer
+/// than that — the session drops, the PeerDown wipe empties the
+/// mirror, and the wipe's own churn resets both quiet trackers.
+/// Default holds are 90 s and the fleet's feed negotiates 90; 150 s
+/// covers them with margin. A deployment that raises its hold beyond
+/// this should size `expected-routes` within 16x of its table or run
+/// `require-table-complete on`, both of which release without this
+/// clause.
+const SMALL_TABLE_QUIET_FOR: Duration = Duration::from_secs(150);
 
 /// How often a refused or unacknowledged unsteer is re-requested while
 /// the pre-dump stage waits. Paced because the gate re-checks every
@@ -822,8 +878,33 @@ impl Observe for ObserveView {
                     mut gate,
                     mut last_request,
                 } => {
-                    let released = gate.observe(now, have, seq);
+                    let view = gate.observe(now, have, seq);
                     let want = gate.floor;
+                    // Three ways the fallback proves itself ready,
+                    // because the floor alone cannot: capacity is an
+                    // upper sizing bound, so a real table below
+                    // capacity/16 would defer forever on it (review
+                    // finding).
+                    //  - the coupled floor+quiescence release, for
+                    //    tables within 16x of their sizing (the fleet);
+                    //  - the completeness authority, where a bird
+                    //    exists — the exact signal, and the same one
+                    //    `Effects::steer` gates on;
+                    //  - an observed full reload followed by quiet
+                    //    longer than the BGP hold time — see
+                    //    SMALL_TABLE_QUIET_FOR for why that duration
+                    //    makes "small and loaded" distinguishable from
+                    //    "died mid-load".
+                    let complete = view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
+                        && c.completeness
+                            .as_ref()
+                            .is_some_and(|h| h.verdict().permits_steering());
+                    let small_table_loaded = have > 0
+                        && view.loaded_delta >= have
+                        && view
+                            .rate_quiet_for
+                            .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
+                    let released = view.released || complete || small_table_loaded;
                     if !released {
                         c.deferred_resync =
                             Some(DeferredResync::AwaitingFallback { gate, last_request });
@@ -868,7 +949,7 @@ impl Observe for ObserveView {
                     c.deferred_resync = None;
                 }
                 DeferredResync::AwaitingDiff { adopted, mut gate } => {
-                    let released = gate.observe(now, have, seq);
+                    let released = gate.observe(now, have, seq).released;
                     if !released {
                         let want = gate.floor;
                         c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });

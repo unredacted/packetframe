@@ -1386,20 +1386,12 @@ fn balanced_churn_is_not_quiescence() {
     assert_eq!(deletes, vec![([10, 0, 5, 0], 24)]);
 }
 
-/// The drill-(d10) regression (shadow, 2026-08-09): a steered adoption
-/// must not read VPP's FIB while traffic is on it. `ip_route_dump` is
-/// not mp-safe, so VPP parks every worker in barrier sync for the whole
-/// walk — ~5.4 s at the reference table, dropped at the NIC where no
-/// counter sees it, and invariant across six drill runs because every
-/// one of them ran the dump at attach. The sequence under test:
-/// nothing touches VPP until the source is loaded and quiet; then the
-/// supervisor unsteers FIRST; the dump runs against an idle VPP; and
-/// steering returns only after the verified resync.
-#[test]
-fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
+/// Fixtures shared by the steered-adoption tests below.
+mod steered {
+    use super::*;
     use std::sync::{Arc, Mutex};
 
-    struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
+    pub struct SharedMirror(pub Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
@@ -1421,9 +1413,9 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
 
     /// A NIC that acknowledges both directions and remembers the order
     /// they happened in — the ordering IS the property under test.
-    struct RecordingSteering {
-        rules: Vec<(String, u32)>,
-        log: Arc<Mutex<Vec<&'static str>>>,
+    pub struct RecordingSteering {
+        pub rules: Vec<(String, u32)>,
+        pub log: Arc<Mutex<Vec<&'static str>>>,
     }
     impl packetframe_vpp_offload::runtime::Steering for RecordingSteering {
         fn configured_ports(&self) -> usize {
@@ -1450,8 +1442,8 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
         }
     }
 
-    // The surviving VPP forwards six routes.
-    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+    /// The surviving VPP forwards six routes.
+    pub const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
         ([10, 0, 0, 0], 24, ASSIGNED_INDEX, true),
         ([10, 0, 1, 0], 24, ASSIGNED_INDEX, true),
         ([10, 0, 2, 0], 24, ASSIGNED_INDEX, true),
@@ -1459,53 +1451,66 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
         ([10, 0, 4, 0], 24, ASSIGNED_INDEX, true),
         ([10, 0, 5, 0], 24, ASSIGNED_INDEX, true),
     ];
-    let fake = Fake::start_behaving(
-        "steered-adopt",
-        fake_vpp::Behaviour {
-            existing_routes: EXISTING,
-            ..Default::default()
-        },
-    );
-    // The feed has delivered one route so far — far below the floor.
-    let shared = Arc::new(Mutex::new(vec![fake_vpp::v4(0, 0)]));
-    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
-    // Capacity 160 → a pre-dump floor of 160/16 = 10. That the floor is
-    // 10 and not 6/2 = 3 is itself evidence: 3 would mean the adopted
-    // table had been READ, which is the stall this test forbids.
-    let rt = runtime_custom(
-        &fake,
-        Box::new(SharedMirror(shared.clone())),
-        Box::new(RecordingSteering {
-            rules: vec![("eth4".into(), 1)],
-            log: log.clone(),
-        }),
-        160,
-    );
-    let mut d = Driver::new();
-    let t0 = Instant::now();
 
-    {
-        let (mut obs, _) = rt.views();
-        use packetframe_vpp_offload::driver::Observe as _;
-        assert!(obs.api_ready(), "the fake must answer the handshake");
-    }
-    {
-        let (_, mut fx) = rt.views();
-        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
-    }
-    assert_eq!(d.state(), State::AdoptedResyncing);
-    rt.set_steered(true);
+    pub type Log = Arc<Mutex<Vec<&'static str>>>;
+    pub type SharedRoutes = Arc<Mutex<Vec<IpPrefix>>>;
 
-    // Below the floor: VPP must be left exactly as found — steered,
-    // FIB unread, no route ops, no unsteer request.
-    let mut now = t0;
-    {
+    /// A steered adoption over a six-route VPP, mirror starting with
+    /// `initial` routes, rules already in the NIC. Capacity 160 makes
+    /// the pre-dump floor 160/16 = 10 — and that the floor is 10 and
+    /// not 6/2 = 3 is itself evidence the adopted table has not been
+    /// READ, which is the stall these tests forbid.
+    pub fn fixture(name: &str, initial: &[IpPrefix]) -> (Fake, SharedRoutes, Log, Runtime) {
+        let fake = Fake::start_behaving(
+            name,
+            fake_vpp::Behaviour {
+                existing_routes: EXISTING,
+                ..Default::default()
+            },
+        );
+        let shared: SharedRoutes = Arc::new(Mutex::new(initial.to_vec()));
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime_custom(
+            &fake,
+            Box::new(SharedMirror(shared.clone())),
+            Box::new(RecordingSteering {
+                rules: vec![("eth4".into(), 1)],
+                log: log.clone(),
+            }),
+            160,
+        );
+        (fake, shared, log, rt)
+    }
+
+    /// Adopt-steered, then confirm ticks below the release leave VPP
+    /// exactly as found: no route op, no steering transition.
+    pub fn adopt_and_hold(
+        d: &mut Driver,
+        rt: &Runtime,
+        fake: &Fake,
+        log: &Log,
+        t0: Instant,
+        ticks: usize,
+    ) -> Instant {
+        {
+            let (mut obs, _) = rt.views();
+            use packetframe_vpp_offload::driver::Observe as _;
+            assert!(obs.api_ready(), "the fake must answer the handshake");
+        }
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        }
+        assert_eq!(d.state(), State::AdoptedResyncing);
+        rt.set_steered(true);
+
+        let mut now = t0;
         let (mut obs, mut fx) = rt.views();
-        for _ in 0..40 {
+        for _ in 0..ticks {
             let t = d.tick(now, &mut obs, &mut fx);
             assert!(
                 !t.events.contains(&Event::SyncComplete),
-                "nothing may complete while the source loads: {:?}",
+                "nothing may complete while the fallback is unproven: {:?}",
                 t.events
             );
             for e in rt.take_pending() {
@@ -1516,39 +1521,100 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
                 .unwrap_or(Duration::from_millis(100))
                 .max(Duration::from_millis(1));
         }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "no steering transition below the release: {:?}",
+            log.lock().unwrap()
+        );
+        let touched: Vec<_> = fake
+            .drain_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fake_vpp::Event::Route(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            touched.is_empty(),
+            "no route op may reach a steered VPP before the unsteer: {touched:?}"
+        );
+        now
     }
+
+    /// `run_until` with a caller-chosen bound, for stop conditions that
+    /// legitimately need many paced ticks (the 150 s small-table quiet).
+    pub fn run_paced(
+        d: &mut Driver,
+        rt: &Runtime,
+        mut now: Instant,
+        max_ticks: usize,
+        stop: impl Fn(&Driver) -> bool,
+    ) -> (Instant, Vec<Event>) {
+        let (mut obs, mut fx) = rt.views();
+        let mut seen = Vec::new();
+        for _ in 0..max_ticks {
+            if stop(d) {
+                return (now, seen);
+            }
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            for e in rt.take_pending() {
+                let it = d.inject(now, e, &mut fx);
+                seen.extend(it.events);
+            }
+            rt.set_steered(d.supervisor().is_steered());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        panic!("loop did not reach the stop condition; events: {seen:?}");
+    }
+
+    /// The withdrawals the fake saw, sorted for a stable comparison.
+    pub fn deletes(fake: &Fake) -> Vec<([u8; 4], u8)> {
+        let mut v: Vec<_> = fake
+            .drain_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+/// The drill-(d10) regression (shadow, 2026-08-09): a steered adoption
+/// must not read VPP's FIB while traffic is on it. `ip_route_dump` is
+/// not mp-safe, so VPP parks every worker in barrier sync for the whole
+/// walk — ~5.4 s at the reference table, dropped at the NIC where no
+/// counter sees it, and invariant across six drill runs because every
+/// one of them ran the dump at attach. The sequence under test: nothing
+/// touches VPP until the source is loaded and quiet; then the
+/// supervisor unsteers FIRST; the dump runs against an idle VPP; and
+/// steering returns only after the verified resync.
+#[test]
+fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
+    let (fake, shared, log, rt) = steered::fixture("steered-adopt", &[fake_vpp::v4(0, 0)]);
+    let mut d = Driver::new();
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 40);
     assert_eq!(
         rt.status().resync_deferred,
         Some((1, 10)),
         "the floor must be capacity-derived (160/16), not adopted-derived (6/2) — \
          an adopted-derived floor means the FIB was read while steered"
     );
-    assert!(
-        log.lock().unwrap().is_empty(),
-        "no steering transition below the floor: {:?}",
-        log.lock().unwrap()
-    );
-    let touched: Vec<_> = fake
-        .drain_events()
-        .into_iter()
-        .filter_map(|e| match e {
-            fake_vpp::Event::Route(r) => Some(r),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        touched.is_empty(),
-        "no route op may reach a steered VPP before the unsteer: {touched:?}"
-    );
 
-    // The feed finishes: twelve routes, one of VPP's six (10.0.5.0/24)
-    // genuinely withdrawn while packetframe was down.
-    *shared.lock().unwrap() = (0..5)
+    // The feed finishes: twelve routes, two of VPP's six genuinely
+    // withdrawn while packetframe was down.
+    *shared.lock().unwrap() = (0..4)
         .map(|i| fake_vpp::v4(0, i))
-        .chain((0..7).map(|i| fake_vpp::v4(1, i)))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
         .collect();
 
-    let (_, events) = run_until(&mut d, &rt, now, |d| d.state() == State::Steered);
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
 
     // The order is the contract: traffic left VPP before its FIB was
     // read, and returned only through the verified path.
@@ -1565,19 +1631,96 @@ fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
         rt.status().resync_deferred.is_none(),
         "the deferral must clear when the reconciliation runs"
     );
-    // And the diff withdrew exactly the one prefix the source dropped —
+    // And the diff withdrew exactly the prefixes the source dropped —
     // proof the dump ran and seeded the withdrawal universe.
-    let deletes: Vec<_> = fake
-        .drain_events()
-        .into_iter()
-        .filter_map(|e| match e {
-            fake_vpp::Event::Route(r) if !r.is_add => Some((r.addr, r.len)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        deletes,
-        vec![([10, 0, 5, 0], 24)],
-        "one withdrawal for the one prefix the source really dropped"
+        steered::deletes(&fake),
+        vec![([10, 0, 4, 0], 24), ([10, 0, 5, 0], 24)],
+        "two withdrawals for the two prefixes the source really dropped"
     );
+}
+
+/// The capacity floor is an UPPER sizing bound wearing a lower bound's
+/// hat, so it cannot be the only release (review finding): a deployment
+/// whose real table sits below capacity/16 — the default sizing over a
+/// small site — would defer forever. The small-table clause releases on
+/// an observed full reload plus quiet sustained past the BGP hold time,
+/// which is what makes "small and loaded" distinguishable from "died
+/// mid-load": a dead session cannot stay quietly wrong longer than the
+/// hold — the PeerDown wipe empties the mirror first.
+#[test]
+fn a_small_table_releases_after_a_full_reload_and_long_quiet() {
+    let (fake, shared, log, rt) = steered::fixture("steered-small", &[]);
+    let mut d = Driver::new();
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
+
+    // The whole table this site has: four routes — forever below the
+    // floor of ten.
+    *shared.lock().unwrap() = (0..4).map(|i| fake_vpp::v4(0, i)).collect();
+
+    // 150 s of paced quiet at ≤250 ms a tick needs a real budget.
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 8_192, |d| d.state() == State::Steered);
+
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "the small-table release must follow the same unsteer-first sequence"
+    );
+    assert!(
+        events.contains(&Event::SyncComplete) && events.contains(&Event::VerifyPassed),
+        "{events:?}"
+    );
+    assert_eq!(
+        steered::deletes(&fake),
+        vec![([10, 0, 4, 0], 24), ([10, 0, 5, 0], 24)],
+        "the reconciliation still withdraws what the small table lacks"
+    );
+}
+
+/// A dead source releases nothing, ever: quiet is exactly what a feed
+/// that never loaded looks like, and unsteering onto an empty fallback
+/// is the original disaster. Held deferred with health degraded —
+/// stale-but-verified forwarding plus an alarm beats an outage.
+#[test]
+fn a_dead_source_never_triggers_the_unsteer() {
+    let (fake, _shared, log, rt) = steered::fixture("steered-dead", &[]);
+    let mut d = Driver::new();
+    // Far past SMALL_TABLE_QUIET_FOR at ≤250 ms a tick.
+    let _ = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 2_000);
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "an empty, silent source must hold the adoption deferred forever"
+    );
+    assert_eq!(
+        rt.status().resync_deferred,
+        Some((0, 10)),
+        "and the deferral must be visible, not silent"
+    );
+}
+
+/// Where a bird exists, completeness is the exact readiness signal —
+/// the same one `Effects::steer` gates on — and it releases a table the
+/// capacity floor is wrong about without waiting out the hold time.
+#[test]
+fn completeness_releases_a_below_floor_table_promptly() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+    let (fake, shared, log, rt) = steered::fixture("steered-complete", &[]);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    let mut d = Driver::new();
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
+
+    *shared.lock().unwrap() = (0..4).map(|i| fake_vpp::v4(0, i)).collect();
+    handle.publish(CompletenessReport {
+        authority_routes: 4,
+        mirror_routes: 4,
+        at: std::time::Instant::now(),
+    });
+
+    // Well under the 150 s small-table wait: the authority short-cuts.
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
