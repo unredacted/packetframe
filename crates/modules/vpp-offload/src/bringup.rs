@@ -330,79 +330,7 @@ pub fn bring_up(
         );
     };
 
-    // The daemon vacates VPP's cores here — after the LAST pure check,
-    // so a refused config costs no affinity change, and before anything
-    // whose failure the rollback below undoes. The harm this prevents
-    // arrives through the scheduler, not the API: a resync's mirror
-    // walk landing on the worker's core preempts the poll loop, the
-    // 1024-descriptor rx ring overflows in ~2 s, and the drops happen
-    // at the NIC where no VPP counter sees them — a constant ~5.4 s of
-    // loss at every adopted release until this call existed (shadow,
-    // 2026-08-08). Warn-and-continue on partial failure: a cgroup that
-    // refuses the mask degrades protection, and failing the attach over
-    // it would brick deployments that share cores gracefully today.
-    // The cores to vacate: the map just derived, PLUS any placement a
-    // previous attach recorded.
-    //
-    // The union rather than either alone, because which one is right
-    // depends on something not yet known here — whether `finish` below
-    // will adopt a surviving VPP or spawn a fresh one. VPP fixes thread
-    // placement at start, so an adopted VPP is on the RECORDED cores
-    // while a fresh one will be on the DERIVED cores, and the two differ
-    // exactly when the online CPU set changed in between (a core
-    // offlined for thermal reasons, or administratively). Vacating both
-    // sets is correct under either outcome and costs the daemon nothing
-    // when they agree, which is every ordinary restart (review finding).
-    let derived_cores: Vec<u16> = std::iter::once(core_map.main)
-        .chain(core_map.workers.iter().copied())
-        .collect();
-    let mut vacate = derived_cores.clone();
-    if let Ok(Some(prior)) = ResourceState::load(&paths.sys.state_dir) {
-        for cpu in prior.vpp_cores {
-            if !vacate.contains(&cpu) {
-                tracing::info!(
-                    cpu,
-                    "a previous attach placed a VPP thread here; vacating it too in case \
-                     this attach adopts that VPP rather than spawning a new one"
-                );
-                vacate.push(cpu);
-            }
-        }
-    }
-    vacate.sort_unstable();
-    match cores::restrict_daemon_from(&vacate) {
-        // `0` is NOT success: no mask changed, so the daemon is still
-        // free to run on VPP's cores. Logging it as a restriction would
-        // be the claim-because-requested shape this module exists to
-        // avoid — say plainly that it did not happen.
-        Ok(0) => tracing::warn!(
-            vacated = ?vacate,
-            "no daemon thread accepted an affinity change; the daemon can still be \
-             scheduled onto VPP's cores and resync bursts may preempt the worker"
-        ),
-        Ok(threads) => tracing::info!(
-            threads,
-            vacated = ?vacate,
-            "daemon threads restricted away from VPP's cores"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not restrict the daemon off VPP's cores; expect loss during \
-             resync bursts if they share a core with a worker"
-        ),
-    }
-
-    // The affinity restriction is deliberately NOT undone on this or
-    // any other failure path: see `cores::restrict_daemon_from` — a CPU
-    // mask is per-process state and every one of these paths ends the
-    // daemon, so there is nothing to hand it back to.
-    let (state, acquired) = acquire::acquire(
-        &paths.sys,
-        &ports,
-        pages,
-        cfg.expected_routes,
-        &derived_cores,
-    )?;
+    let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
 
     // From here, every failure releases. `?` would return holding VFs
     // and a hugepage reservation that only the state file knows about —
@@ -598,31 +526,82 @@ fn finish(
         })?,
         None => None,
     };
-    // A LIVE adopted process whose placement is unknown must not be kept.
+    // The daemon vacates VPP's cores here — after adoption has settled
+    // WHOSE cores they are, and before the loop that will do the
+    // bursting starts. The harm arrives through the scheduler, not the
+    // API: a resync's mirror walk landing on the worker's core
+    // preempts the poll loop, the 1024-descriptor rx ring overflows in
+    // ~2 s, and the drops happen at the NIC where no VPP counter sees
+    // them — a constant ~5.4 s of loss at every adopted release until
+    // this existed (shadow, 2026-08-08).
     //
-    // Checked here rather than on the record alone, because the record
-    // naming a pid does not mean that pid is running: `adopt` answers
-    // `Ok(None)` for one that is gone, and a dead VPP constrains
-    // nothing — this daemon will spawn a fresh one and record where it
-    // put it. Refusing on the record was the first version and it
-    // refused every upgrade whose recorded VPP had already exited,
-    // which is most of them (observed on the shadow, 2026-08-08).
+    // The set starts from the derived map, which is where any VPP this
+    // daemon spawns — at attach or as a later supervised respawn —
+    // will be placed. For an ADOPTED process it adds the cores the
+    // process's pinned threads are OBSERVED on, read live from
+    // /proc/<pid>/task (`cores::observed_placement`). Observed rather
+    // than recorded, deliberately: the state-file placement this
+    // replaces went stale along every lifecycle review examined, and
+    // its upgrade guard refused the attach outright — leaving the box
+    // an unsupervised VPP as its only forwarding tier, strictly worse
+    // than the preemption it guarded against (shadow, 2026-08-08).
     //
-    // For a process that IS running the refusal stands, and for the
-    // same reason the incomplete identity cookie is refused above:
-    // unknown is not unconstrained. VPP fixes placement at start, so a
-    // record without it cannot say which cores to keep off, and being
-    // wrong reinstates the preemption silently.
-    if adopted.is_some() && state.vpp_cores.is_empty() {
-        return Err(format!(
-            "{}: the state file records a running VPP but not the CPUs it was placed on \
-             (written by a packetframe from before that was recorded). Its worker's core \
-             cannot be known, so this daemon cannot guarantee it stays off it, and a \
-             resync burst sharing that core is exactly the packet loss this avoids. Stop \
-             that VPP and `packetframe detach --all`, then attach again — the new record \
-             will carry the placement.",
-            crate::service::MAY_HOLD_RESOURCES
-        ));
+    // Every partial failure warns and continues: degraded protection
+    // beats a refused attach for exactly the reason above. And the
+    // restriction is one-way — see `cores::restrict_daemon_from` for
+    // why no path can ever want it undone.
+    let mut vacate: Vec<u16> = std::iter::once(core_map.main)
+        .chain(core_map.workers.iter().copied())
+        .collect();
+    if let Some(vpp) = &adopted {
+        match cores::observed_placement(vpp.pid()) {
+            Ok(observed) if observed.is_empty() => tracing::warn!(
+                pid = vpp.pid(),
+                "the adopted VPP has no pinned threads to observe; vacating the derived \
+                 map only — if its real placement differs, resync bursts may preempt its \
+                 worker"
+            ),
+            Ok(observed) => {
+                for cpu in observed {
+                    if !vacate.contains(&cpu) {
+                        tracing::info!(
+                            cpu,
+                            "the adopted VPP has a thread pinned here, outside the derived \
+                             map; vacating this core too"
+                        );
+                        vacate.push(cpu);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                pid = vpp.pid(),
+                error = %e,
+                "could not observe the adopted VPP's placement; vacating the derived map \
+                 only — if its real placement differs, resync bursts may preempt its worker"
+            ),
+        }
+    }
+    vacate.sort_unstable();
+    match cores::restrict_daemon_from(&vacate) {
+        // `0` is NOT success: no mask changed, so the daemon is still
+        // free to run on VPP's cores. Logging it as a restriction would
+        // be the claim-because-requested shape this module exists to
+        // avoid — say plainly that it did not happen.
+        Ok(0) => tracing::warn!(
+            vacated = ?vacate,
+            "no daemon thread accepted an affinity change; the daemon can still be \
+             scheduled onto VPP's cores and resync bursts may preempt the worker"
+        ),
+        Ok(threads) => tracing::info!(
+            threads,
+            vacated = ?vacate,
+            "daemon threads restricted away from VPP's cores"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not restrict the daemon off VPP's cores; expect loss during \
+             resync bursts if they share a core with a worker"
+        ),
     }
     // Whether that VPP is diverting traffic right now. From the recorded
     // steering rules, because that is the only durable evidence — and
@@ -666,11 +645,6 @@ fn finish(
     // (see `service`), which is also why the resource owner is built in
     // here rather than passed in: it shares one record between the
     // identity store and the release seam through an `Rc`.
-    // Owned before the factory closure captures it: the closure outlives
-    // this borrow of `core_map`.
-    let spawn_cores: Vec<u16> = std::iter::once(core_map.main)
-        .chain(core_map.workers.iter().copied())
-        .collect();
     let factory: LoopFactory = Box::new(move || {
         let engine = ConvergenceEngine::new(
             api_socket_path,
@@ -686,24 +660,7 @@ fn finish(
         // borrow checker just refused.
         let inherited_rule_count: usize =
             state.steer_rules.iter().map(|(_, locs)| locs.len()).sum();
-        // The placement any VPP this daemon spawns will run on, handed
-        // to the store rather than written once here: EVERY spawn must
-        // update the record, not just an attach-time decision. A daemon
-        // that adopts an old VPP and later respawns after it dies would
-        // otherwise keep naming the dead process's cores, and the next
-        // daemon would vacate a placement nothing runs on (review
-        // finding). `process_changed` is the single point every spawn
-        // passes through, so the record is written there.
-        //
-        // Unconditional, including on the adopt path: `adopt_process`
-        // records no identity (the file already holds the adopted
-        // one), so the only thing that ever reaches
-        // `process_changed(Some(..))` is a spawn by this daemon — and
-        // an adopted VPP that later dies is replaced by exactly such a
-        // spawn. Gating this on `adopted.is_none()` would leave that
-        // replacement unrecorded, which is the case this finding is
-        // about.
-        let owner = SharedOwner::new(ResourceOwner::new(state, sys).with_spawn_cores(spawn_cores));
+        let owner = SharedOwner::new(ResourceOwner::new(state, sys));
         let runtime = Runtime::new(
             engine,
             source,

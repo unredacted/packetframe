@@ -121,26 +121,6 @@ pub struct ResourceState {
     /// newer than this field.)
     #[serde(default)]
     pub expected_routes: u64,
-    /// The CPUs VPP's threads were placed on — main plus every worker,
-    /// as one flat set.
-    ///
-    /// Recorded for the same reason as `expected_routes`, and it is the
-    /// same failure one variable over: VPP fixes thread placement **at
-    /// start**, so a daemon restart that re-derives the map from a
-    /// CHANGED online CPU set (a core offlined for thermal reasons, or
-    /// administratively) computes cores the surviving VPP is not on.
-    /// The daemon would then vacate the wrong CPUs and leave the real
-    /// worker sharing one with a resync burst — silently restoring the
-    /// preemption this whole mechanism exists to remove, and doing it
-    /// only on an adoption, which is where it is hardest to notice.
-    ///
-    /// `serde(default)` for the reason the field above carries it: a
-    /// file written before this existed must still parse, since
-    /// `detach --all` reads the same struct and a parse error would
-    /// wedge the release door. An empty set simply means "nothing
-    /// recorded", and the derived map stands alone.
-    #[serde(default)]
-    pub vpp_cores: Vec<u16>,
     /// Hugepages reserved at attach: (pool bytes, page count).
     /// `(0, 0)` = attach found a sufficient pre-existing reservation
     /// and owns nothing (release then leaves reservations alone).
@@ -208,7 +188,6 @@ impl ResourceState {
         Self {
             version: STATE_VERSION,
             expected_routes: 0,
-            vpp_cores: Vec::new(),
             hugepage_pool_bytes: 0,
             hugepage_pages: 0,
             hugepage_prior_pages: 0,
