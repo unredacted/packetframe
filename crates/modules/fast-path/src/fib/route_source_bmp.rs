@@ -136,20 +136,6 @@ pub struct BmpStation {
     /// would let a second tier trust a mirror that just lost its feed
     /// (review finding).
     up_peers: std::sync::Mutex<std::collections::HashSet<PeerId>>,
-    /// Whether this connection has delivered a RouteMonitoring frame —
-    /// i.e. the STREAM HAS STARTED. That is the whole liveness bar for
-    /// an emitter that never speaks peer lifecycle (RFC 9069 Loc-RIB,
-    /// precisely the mode `require-loc-rib` documents), by the same
-    /// reasoning as the BGP listener's first-UPDATE raise (#152):
-    /// whether the load has FINISHED was never the session owner's
-    /// question — the release gate's floor and authority answer it,
-    /// and a stalled or partial dump cannot release through either
-    /// (below the floor by arithmetic; condemned by the authority's
-    /// current-mirror drift). The settle/epoch machinery that used to
-    /// guard this raise served only the deleted small-table release,
-    /// and its quiescence definition wedged on continuously-churning
-    /// feeds — the same fault #152 fixed for BGP.
-    saw_rm: std::sync::atomic::AtomicBool,
     /// Whether this connection has EVER sent a PeerUp. An emitter that
     /// speaks peer lifecycle gets peer-set semantics both ways: PeerUp
     /// raises, and when the last monitored peer goes down the feed is
@@ -216,7 +202,6 @@ impl BmpStation {
             peer_acl: Vec::new(),
             session: None,
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
-            saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
             stale_state_possible: std::sync::atomic::AtomicBool::new(false),
             pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
@@ -378,8 +363,6 @@ impl BmpStation {
                             // ended with it: whatever PeerUps this
                             // session delivered are no longer evidence.
                             self.up_peers.lock().expect("up_peers lock").clear();
-                            self.saw_rm
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             // Whatever this stream left in the mirror
@@ -439,7 +422,29 @@ impl BmpStation {
                     match msg {
                         Some(m) => {
                             frames_parsed += 1;
-                            if matches!(m.message_body, BmpMessageBody::RouteMonitoring(_)) {
+                            let is_route_monitoring =
+                                matches!(m.message_body, BmpMessageBody::RouteMonitoring(_));
+                            // VALIDATE FIRST. `process_msg` rejects a
+                            // RouteMonitoring frame outright when
+                            // `require-loc-rib` refuses its peer type or
+                            // its fan-out exceeds MAX_ELEMS_PER_UPDATE,
+                            // and a rejected frame is not stream
+                            // evidence of any kind. Raising ahead of it
+                            // opened a whole feed EPOCH on a frame the
+                            // session was about to be torn down over —
+                            // and a runtime that sampled that transient
+                            // raise during an adopted deferral baselined
+                            // on it, so the next healthy connection read
+                            // as a flap and the attested release path
+                            // was gone for good (review finding). The
+                            // stall-monitor timestamps move with it for
+                            // the same reason: a refused frame is not
+                            // progress.
+                            if let Err(e) = self.process_msg(m).await {
+                                reader.abort();
+                                return Err(e);
+                            }
+                            if is_route_monitoring {
                                 let now = std::time::Instant::now();
                                 last_route_monitoring = Some(now);
                                 // Publish wall-clock unix seconds so
@@ -451,7 +456,6 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
-                                self.saw_rm.store(true, Ordering::Relaxed);
                                 // Pulses are counted in process_msg, in
                                 // ROUTE-ELEMENT units — see the pulse
                                 // site there for why frames are the
@@ -474,15 +478,6 @@ impl BmpStation {
                                         sess.set_up(true);
                                     }
                                 }
-                            }
-                            // Loc-RIB safety check happens inside
-                            // process_msg; a violation returns Err and
-                            // tears down the session here. Bird (or
-                            // whoever) will reconnect; the operator
-                            // sees the error log.
-                            if let Err(e) = self.process_msg(m).await {
-                                reader.abort();
-                                return Err(e);
                             }
                         }
                         None => {
@@ -583,8 +578,6 @@ impl BmpStation {
             BmpMessageBody::TerminationMessage(_) => {
                 info!("BMP TERMINATION received from bird");
                 self.up_peers.lock().expect("up_peers lock").clear();
-                self.saw_rm
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 let stale = self.mirror_holds_state().await;
