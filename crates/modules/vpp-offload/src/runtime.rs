@@ -521,14 +521,19 @@ enum DeferredResync {
         /// gating on emptiness is what wedged half the allowlist on
         /// the condemned fallback with no retry (review finding).
         restoring: bool,
-        /// The feed session's epoch count when this deferral began. A
-        /// flap since then means the world may have been reloaded
-        /// underneath the cached authority report — a 900 s-old
-        /// Converged cannot attest that routes belong to the CURRENT
-        /// stream (review finding) — so a flapped deferral adopts the
-        /// full unattested posture, authority or not, until it
-        /// releases or is recreated.
-        epoch: u64,
+        /// The feed session's epoch count at the FIRST live
+        /// observation of this deferral — `None` until the session has
+        /// been seen up. A later epoch advance means the session went
+        /// down and up again underneath us: the world may have been
+        /// reloaded, a cached authority report cannot attest that
+        /// routes belong to the current stream (review finding), and
+        /// the deferral adopts the full unattested posture until it
+        /// releases. Baselined at first-up rather than at creation
+        /// because the deferral is normally created BEFORE the feed
+        /// connects — counting the initial raise as a flap demoted
+        /// every ordinary release (caught by the completeness test
+        /// before it shipped).
+        epoch: Option<u64>,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -1042,7 +1047,7 @@ impl Observe for ObserveView {
                     mut gate,
                     mut last_request,
                     mut restoring,
-                    epoch,
+                    mut epoch,
                 } => {
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     // Rate scaled to the mirror as observed — never
@@ -1060,10 +1065,11 @@ impl Observe for ObserveView {
                     // full unattested posture until it releases
                     // (review finding). The fleet's steady 40 s release
                     // never flaps and never pays this.
-                    let flapped = c
-                        .feed_session
-                        .as_ref()
-                        .is_some_and(|f| f.epoch_count() != epoch);
+                    let current_epoch = c.feed_session.as_ref().map(|f| f.epoch_count());
+                    if live && epoch.is_none() {
+                        epoch = current_epoch;
+                    }
+                    let flapped = matches!((epoch, current_epoch), (Some(e), Some(c_)) if c_ != e);
                     let attested = c.completeness.is_some() && !flapped;
                     let view = gate.observe(
                         now,
@@ -1111,7 +1117,15 @@ impl Observe for ObserveView {
                     // stand on their own.
                     let authority = authority_current(&c.completeness, have);
                     let veto = authority == Some(false);
+                    // `!flapped` here too: a positive authority word is
+                    // epoch-blind — the report may predate the
+                    // reconnect entirely, and stale prior-session
+                    // routes keep its counts aligned (review finding:
+                    // round twelve demoted only the floor door). A
+                    // NEGATIVE word still vetoes regardless of epoch;
+                    // caution does not expire.
                     let complete = live
+                        && !flapped
                         && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && authority == Some(true);
                     let released = !veto && ((view.released && live) || complete);
@@ -1240,9 +1254,10 @@ impl Observe for ObserveView {
                         // just promised was not happening — accepting
                         // ~2k elements of it here undid the zero-rate
                         // release one step later (review finding).
-                        let flapped_now = feed_session
-                            .as_ref()
-                            .is_some_and(|f| f.epoch_count() != epoch);
+                        let flapped_now = matches!(
+                            (epoch, feed_session.as_ref().map(|f| f.epoch_count())),
+                            (Some(e), Some(c_)) if c_ != e
+                        );
                         let churn_budget = if completeness.is_some() && !flapped_now {
                             source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs()
                         } else {
@@ -1552,7 +1567,7 @@ impl Effects for EffectsView {
                 gate: SourceGate::new(floor, seq),
                 last_request: None,
                 restoring: false,
-                epoch: c.feed_session.as_ref().map_or(0, |f| f.epoch_count()),
+                epoch: None,
             });
             return Ok(());
         }

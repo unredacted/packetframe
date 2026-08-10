@@ -158,24 +158,19 @@ pub struct BmpStation {
     /// findings, kept from the epoch era because they are about
     /// SEMANTICS, not settling).
     saw_peer_up: std::sync::atomic::AtomicBool,
-    /// Streams that DELIVERED FRAMES over this station's lifetime —
-    /// counted at each connection's first RouteMonitoring frame, not
-    /// at accept, because the hazard this guards is stale MIRROR
-    /// content and a connection that streamed nothing left none
-    /// (counting accepts let an early aborted client flip the next
-    /// real stream into reconnect mode and wedge it behind a
-    /// quiescence a continuous feed never provides; review finding).
-    /// The FIRST contributing stream may raise liveness on its first
-    /// frame — the mirror is empty by construction, so there is no
-    /// stale floor-credit, and the load's own pulses keep the gate
-    /// loud until the dump ends. A LATER stream may not: the mirror
-    /// still counts the prior stream's unseen routes until
-    /// InitiationComplete's GC removes them, so it raises at
-    /// InitiationComplete instead — by definition after the GC. If
-    /// continuous churn keeps InitiationComplete from firing, the
-    /// stale routes also never leave: deferring is correct for
-    /// exactly as long as releasing would be wrong.
-    contributing_streams: std::sync::atomic::AtomicU64,
+    /// Whether a PREVIOUS stream's advertisements may still be in the
+    /// mirror — the actual variable every earlier proxy (connection
+    /// counts, contributing-stream counts) was reaching for (review
+    /// findings, four refinements). Set when a connection that applied
+    /// announcements ends; cleared by the only two events that destroy
+    /// prior-stream state: InitiationComplete's GC, and a last-peer
+    /// PeerDown wipe. While false, a stream's first frame may raise
+    /// liveness — there is no stale floor-credit to release against.
+    /// While true, the raise waits for InitiationComplete, which
+    /// clears this by definition. A stream that announced and then
+    /// withdrew everything (or was wiped by PeerDown) leaves nothing,
+    /// and the next stream rightly starts fresh.
+    stale_state_possible: std::sync::atomic::AtomicBool,
     /// Whether THIS connection has been counted as a contributor —
     /// set when a validated, non-empty RouteMonitoring frame is
     /// applied, cleared with the connection. Counting anywhere earlier
@@ -225,7 +220,7 @@ impl BmpStation {
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
-            contributing_streams: std::sync::atomic::AtomicU64::new(0),
+            stale_state_possible: std::sync::atomic::AtomicBool::new(false),
             contributed_this_conn: std::sync::atomic::AtomicBool::new(false),
             pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
         }
@@ -350,8 +345,16 @@ impl BmpStation {
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
-                            self.contributed_this_conn
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            // A contributing stream's state outlives its
+                            // connection — until the GC or a wipe says
+                            // otherwise.
+                            if self
+                                .contributed_this_conn
+                                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                self.stale_state_possible
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
@@ -418,21 +421,15 @@ impl BmpStation {
                                 // ROUTE-ELEMENT units — see the pulse
                                 // site there for why frames are the
                                 // wrong unit.
-                                // First contributing stream only — see
-                                // `contributing_streams` for why a
-                                // later stream must wait for the GC. The
-                                // peer-set arbitration stands: on a
-                                // peer-speaking connection a straggler
-                                // frame after the last PeerDown raises
-                                // nothing.
-                                // == 0, not <= 1: the counter excludes
-                                // the current stream until its first
-                                // applied frame, which lands AFTER this
-                                // raise decision for the same frame.
-                                let first_stream = self
-                                    .contributing_streams
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    == 0;
+                                // Raise only when no previous stream's
+                                // state can be lingering — see
+                                // `stale_state_possible`. The peer-set
+                                // arbitration stands: on a peer-speaking
+                                // connection a straggler frame after the
+                                // last PeerDown raises nothing.
+                                let first_stream = !self
+                                    .stale_state_possible
+                                    .load(std::sync::atomic::Ordering::Relaxed);
                                 let peers_speak =
                                     self.saw_peer_up.load(Ordering::Relaxed);
                                 let peers_up =
@@ -498,6 +495,11 @@ impl BmpStation {
                             "InitiationComplete fired"
                         );
                         init_complete_fired = true;
+                        // The GC this event triggers removes every
+                        // unseen prior-stream route: whatever staleness
+                        // was possible is now gone.
+                        self.stale_state_possible
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                     // Re-armable raise: quiescence counts only when the
                     // stream it followed is NEWER than the last
@@ -550,8 +552,13 @@ impl BmpStation {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.contributed_this_conn
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if self
+                    .contributed_this_conn
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.stale_state_possible
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.lower_session();
             }
             BmpMessageBody::PeerUpNotification(_) => {
@@ -634,6 +641,13 @@ impl BmpStation {
                 // Loc-RIB shape) never lowers here — its liveness
                 // lives and dies with the connection itself.
                 if up.is_empty() && self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Every monitored peer's routes have been dropped by
+                    // the successive PeerDown dispatches: nothing of any
+                    // stream — prior or current — remains in the mirror.
+                    self.stale_state_possible
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.contributed_this_conn
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.lower_session();
                 }
             }
@@ -721,22 +735,15 @@ impl BmpStation {
                     let is_add = matches!(event, RouteEvent::Add { .. });
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
                         warn!(?peer_id, error = %e, "route event dispatch failed");
-                    } else if is_add
-                        && !self
-                            .contributed_this_conn
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        // Contribution is latched HERE — a dispatched
-                        // ANNOUNCEMENT — because the reconnect guard's
-                        // noun is mirror state and only an applied Add
-                        // creates any: withdrawal-only streams and
-                        // announcements skipped for unusable prefixes
-                        // or missing nexthops leave nothing stale
-                        // (review finding, third refinement — frame
-                        // edge, then validated frame, now applied
-                        // element).
-                        self.contributing_streams
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else if is_add {
+                        // A dispatched ANNOUNCEMENT is what creates
+                        // mirror state — withdrawal-only streams and
+                        // skipped announcements leave nothing (review
+                        // findings, successive refinements). The flag
+                        // transfers to `stale_state_possible` when the
+                        // connection ends with it still set.
+                        self.contributed_this_conn
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
