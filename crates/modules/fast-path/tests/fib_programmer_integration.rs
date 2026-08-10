@@ -1738,26 +1738,25 @@ fn every_way_a_prefix_stops_forwarding_reaches_the_sink() {
     assert!(install < withdraw, "install must precede withdrawal");
 }
 
-/// A withdrawal reaches the sink even when this tier's own LPM delete
-/// fails.
+/// An entry that has already left the map is a completed withdrawal,
+/// not a failure — and the sink hears it either way.
 ///
-/// The two tiers diverge in the direction that matters here: the prefix
-/// leaves this mirror (the removal happens first) while the second tier
-/// — the STEERED one — keeps forwarding a route BGP withdrew, with no
-/// retry and nothing upstream that would notice, because every counter
-/// and every readback verify samples the mirror that already forgot it.
-/// The fallback tier's stuck LPM entry is the lesser failure and it is
-/// already reported.
+/// The mirror and the LPM trie can disagree (a delete that landed while
+/// its reply was lost, an out-of-band removal), and the delete's GOAL is
+/// "no such entry". Reporting ENOENT as a map fault made that
+/// disagreement look like a broken map, and — now that
+/// `has_session_routes` counts unrepaired deletions — would hold a
+/// second tier's deferral open over a prefix that is already gone. Same
+/// rule and reasoning as `ntuple::Removal::AlreadyAbsent`; every other
+/// errno still fails loudly.
 ///
-/// The failure is injected by deleting the LPM entry behind the
-/// programmer's back through a second handle to the same pin (see the
-/// module docstring), which makes its own delete return ENOENT. The
-/// `is_err` assertion is load-bearing, not decoration: without it a
-/// change that stopped the delete from failing would leave this test
-/// passing while testing nothing.
+/// The withdrawal reaching the sink is asserted alongside it because the
+/// two travel together: `withdraw_from_mirror` removes and notifies as
+/// one step, before the fallible delete, precisely so the second tier is
+/// never stranded by whatever the map does next.
 #[test]
 #[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
-fn a_withdrawal_reaches_the_sink_even_when_the_local_delete_fails() {
+fn an_entry_already_gone_from_the_map_is_a_completed_withdrawal() {
     let (h, sink) = ProgrammerHarness::with_sink();
     let prefix = IpPrefix::V4 {
         addr: [198, 18, 9, 0],
@@ -1779,6 +1778,9 @@ fn a_withdrawal_reaches_the_sink_even_when_the_local_delete_fails() {
             .expect("apply Add");
     });
 
+    // Remove the entry behind the programmer's back through a second
+    // handle to the same pin (see the module docstring), so its own
+    // delete meets ENOENT.
     let mut fib_v4 = open_lpm_v4(&h.pins.path("FIB_V4"));
     fib_v4
         .remove(&LpmKey::new(24, [198, 18, 9, 0]))
@@ -1795,15 +1797,21 @@ fn a_withdrawal_reaches_the_sink_even_when_the_local_delete_fails() {
     });
 
     assert!(
-        del.is_err(),
-        "the local delete was supposed to fail — without that this test \
-         exercises the ordinary path and proves nothing"
+        del.is_ok(),
+        "an entry that is already gone is the outcome a delete wanted: {del:?}"
     );
     let calls = sink.calls();
     assert!(
         calls.contains(&SinkCall::Withdrawn(prefix)),
-        "the second tier must hear the withdrawal even though this tier's \
-         delete failed, or it forwards a withdrawn prefix forever: {calls:?}"
+        "the second tier must hear the withdrawal regardless of what the \
+         map did: {calls:?}"
+    );
+    // Nothing owed either, so a second tier asking whether this session
+    // left anything behind gets a clean answer rather than a deferral
+    // held open over a prefix that is already gone.
+    assert!(
+        !h.run(async { h.handle.has_session_routes().await.expect("query") }),
+        "an already-absent entry leaves no repair outstanding"
     );
 }
 
