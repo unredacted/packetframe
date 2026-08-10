@@ -591,18 +591,22 @@ const UNSTEER_REQUEST_EVERY: Duration = Duration::from_secs(5);
 ///   the growth rate can.
 pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
 
-/// The activity rate an UNATTESTED release tolerates: the flat noise
-/// floor, never the mirror-scaled rate. Scaling quiet to the mirror is
-/// churn tolerance for a settled session — but across a reconnect the
-/// mirror still counts the prior session's routes, so a million-route
-/// stale mirror bought a ~976 element/s allowance and a reconnect dump
-/// trickling at 200/s read as quiet mid-reload (review finding). With
-/// no authority to veto a partial table, quiet must mean NOISE:
-/// steady-state churn passes under this, a reload of any pace does
-/// not. Attested releases keep the scaled rate — their authority
-/// carries the completion truth and its current-mirror drift vetoes
-/// partial tables regardless.
-pub const UNATTESTED_QUIET_RATE_PER_SEC: u64 = 64;
+/// The activity rate an UNATTESTED release tolerates: ZERO. Any
+/// allowance re-opens the same hole at a slower speed — the
+/// mirror-scaled rate admitted a 200/s reconnect trickle, and the
+/// 64/s noise floor that replaced it admitted a 64/s one, which can
+/// run indefinitely while its sub-5s frame cadence also holds off
+/// InitiationComplete and the GC forever (review findings, in that
+/// order). Without an authority there is no way to distinguish slow
+/// churn from a throttled reload, so the gate does not try: an
+/// unattested release requires the stream and the mirror to be
+/// LITERALLY still for the whole window. Real feeds have such
+/// windows between churn bursts; a feed busy enough not to simply
+/// keeps the deferral — visible, remedied, and correct. Attested
+/// releases keep the mirror-scaled rate: their authority carries
+/// completion truth and vetoes partial tables on current-mirror
+/// drift regardless of quiet.
+pub const UNATTESTED_QUIET_RATE_PER_SEC: u64 = 0;
 
 /// The quiet a release must show when NO completeness authority is
 /// configured. Five seconds, deliberately equal to both listeners'
@@ -1206,8 +1210,18 @@ impl Observe for ObserveView {
                         // at most what a legitimately quiet source
                         // produces in one SOURCE_QUIET_FOR window,
                         // scaled by the mirror being protected.
-                        let churn_budget =
-                            source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs();
+                        // The same authority split as the release that
+                        // authorized this dump: an unattested budget of
+                        // zero, because a reconnect trickle running
+                        // through the dump window is a reload the gate
+                        // just promised was not happening — accepting
+                        // ~2k elements of it here undid the zero-rate
+                        // release one step later (review finding).
+                        let churn_budget = if completeness.is_some() {
+                            source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs()
+                        } else {
+                            UNATTESTED_QUIET_RATE_PER_SEC * UNATTESTED_QUIET_FOR.as_secs()
+                        };
                         // Max, not sum, for the same double-count
                         // reason as the gate's rate.
                         let dump_churn = seq_now
