@@ -458,16 +458,23 @@ struct RouteRecord {
     /// Mirrors what `fib_value` points at. Used to release refcounts
     /// when the union changes or the prefix is torn down.
     nexthop_ips: Vec<IpAddr>,
-    /// Whether a ROUTE-SOURCE peer has ever advertised this prefix, as
-    /// opposed to only the resolver's synthetic `local_arp` /32s.
+    /// Whether the CURRENTLY INSTALLED value is backed by a
+    /// route-source advertisement, as opposed to only the resolver's
+    /// synthetic `local_arp` /32s.
     ///
-    /// Latched rather than derived, because by the time a prefix is torn
-    /// down its advertisements are already drained — the withdrawal
-    /// happens precisely BECAUSE the map emptied — so nothing at that
-    /// point can still say who owned it. Read when a failed delete is
-    /// queued, so a local-prefix fault cannot be reported as leftover
-    /// session state.
-    had_session_advertisement: bool,
+    /// Recomputed from the live advertisements on every install, not
+    /// latched on first sight: a prefix whose session advertisement is
+    /// withdrawn while a `local_arp` route remains becomes purely
+    /// local, and an ever-set latch went on reporting a later stuck
+    /// LOCAL entry as previous-session state — withholding a BMP
+    /// stream's first-frame liveness raise over something no session
+    /// owns (review finding).
+    ///
+    /// Stored on the record rather than derived at teardown because by
+    /// then the advertisements are drained — the withdrawal happens
+    /// precisely BECAUSE the map emptied — so only a value captured
+    /// while they existed can answer for what is in the trie.
+    session_derived: bool,
 }
 
 /// A single advertisement contributing to a prefix's FIB entry.
@@ -1621,10 +1628,8 @@ impl FibProgrammer {
             local_pref,
             seen_this_session: true,
         };
-        let from_session = peer_id.as_local_arp_ifindex().is_none();
         let rec = self.upsert_empty_record(prefix);
         rec.advertisements.insert(key, adv);
-        rec.had_session_advertisement |= from_session;
         self.routes_by_peer
             .entry(peer_id)
             .or_default()
@@ -1776,7 +1781,7 @@ impl FibProgrammer {
                         attempts: 1,
                         fib_value: rec.fib_value,
                         nexthop_ips: rec.nexthop_ips,
-                        from_session: rec.had_session_advertisement,
+                        from_session: rec.session_derived,
                     });
                 warn!(?prefix, error = %e, "FIB delete failed; queued for retry");
                 return Err(e);
@@ -1800,6 +1805,21 @@ impl FibProgrammer {
             // be a route the second tier keeps forwarding after this one
             // stopped.
             return Ok(());
+        }
+
+        // Provenance of the value that is about to be, or already is,
+        // installed. Placed after the withdrawal branch on purpose: up
+        // there the advertisements are already gone, and what a queued
+        // delete needs is who backed the value still in the trie. Placed
+        // before the no-change shortcut for the same reason it exists —
+        // dropping a session advertisement can leave the nexthop set
+        // identical while changing whose it is.
+        if let Some(rec) = self.lookup_mirror_mut(&prefix) {
+            let session = rec
+                .advertisements
+                .keys()
+                .any(|(peer, _)| peer.as_local_arp_ifindex().is_none());
+            rec.session_derived = session;
         }
 
         // 3. No-change shortcut: identical NH set already installed.
@@ -1960,7 +1980,7 @@ impl FibProgrammer {
                     advertisements: BTreeMap::new(),
                     fib_value: FibValue::single(0),
                     nexthop_ips: Vec::new(),
-                    had_session_advertisement: false,
+                    session_derived: false,
                 }),
             IpPrefix::V6 { addr, prefix_len } => self
                 .routes_v6
@@ -1969,7 +1989,7 @@ impl FibProgrammer {
                     advertisements: BTreeMap::new(),
                     fib_value: FibValue::single(0),
                     nexthop_ips: Vec::new(),
-                    had_session_advertisement: false,
+                    session_derived: false,
                 }),
         }
     }
