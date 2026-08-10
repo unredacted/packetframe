@@ -813,6 +813,7 @@ impl Runtime {
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
+            completeness_attested: c.completeness.is_some(),
         }
     }
 }
@@ -843,6 +844,11 @@ pub struct RuntimeStatus {
     /// `Some((have, want))` while an adopted resync is deferred for a
     /// still-loading route source. See `Core::deferred_resync`.
     pub resync_deferred: Option<(u64, u64)>,
+    /// Whether a completeness authority is configured — the deferral
+    /// health text depends on it: an attested deployment's below-floor
+    /// wait resolves through the authority, and telling it to "add
+    /// bird" recommends the thing it already has.
+    pub completeness_attested: bool,
 }
 
 impl Core {

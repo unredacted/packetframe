@@ -316,8 +316,12 @@ rate whether or not it changed the mirror, so a reannouncement dump
 holds the gate loud until it actually ends:
 
 1. **The floor**: the mirror holds ≥ `expected-routes`-derived
-   capacity / 16 and has been rate-quiet for 2 s. This is the fleet's
-   door — a full-table box releases ~40 s after attach.
+   capacity / 16 and has been rate-quiet for **2 s when a completeness
+   authority is configured, 5 s without one** — five being both
+   listeners' own initiation-complete standard, because an unattested
+   release may not claim completion on less evidence than the protocol
+   itself requires. This is the fleet's door — a full-table box with
+   bird releases ~40 s after attach.
 2. **The completeness authority** (`require-table-complete on`): bird's
    count agrees with the mirror, recomputed against the mirror as it is
    at release time. A negative verdict vetoes door 1 as well.

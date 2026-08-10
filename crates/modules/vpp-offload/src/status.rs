@@ -273,6 +273,8 @@ pub struct StatusSnapshot {
     /// FIB is deliberately left forwarding, so this reads as Degraded
     /// with the reason, never as steered-but-broken.
     pub resync_deferred: Option<(u64, u64)>,
+    /// See [`crate::runtime::RuntimeStatus::completeness_attested`].
+    pub completeness_attested: bool,
     pub ports: Vec<PortLink>,
     /// The runtime could not persist something it observed.
     ///
@@ -324,6 +326,7 @@ impl StatusSnapshot {
             api,
             fib,
             None,
+            false,
             ports,
             None,
             None,
@@ -346,6 +349,7 @@ impl StatusSnapshot {
         api: ApiHealth,
         fib: FibSync,
         resync_deferred: Option<(u64, u64)>,
+        completeness_attested: bool,
         ports: Vec<PortLink>,
         store_error: Option<String>,
         drain_error: Option<String>,
@@ -365,6 +369,7 @@ impl StatusSnapshot {
             api,
             fib,
             resync_deferred,
+            completeness_attested,
             ports,
             store_error,
             drain_error,
@@ -594,15 +599,25 @@ impl StatusSnapshot {
                 // waiting for the growth to stop, because a loading
                 // feed passes through every count on its way to full
                 // and only quiescence says "done".
-                let msg = if have < want {
+                let msg = if have < want && self.completeness_attested {
+                    format!(
+                        "resync deferred: the route source holds {have} routes, below the \
+                         release floor of {want}; the adopted FIB keeps forwarding \
+                         untouched. The completeness authority can release this once its \
+                         report agrees with the mirror — expected within one integrity \
+                         interval (300 s). If it persists well beyond that, check the \
+                         integrity checker and bird rather than the sizing"
+                    )
+                } else if have < want {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
                          untouched. If the source is still loading this clears itself — \
                          but if {have} IS the whole table, the gate will never release: \
-                         it refuses to guess completeness below the floor, by design. \
-                         Size `expected-routes` within 16x of the real table, or give \
-                         this box a bird and enable `require-table-complete`"
+                         with no authority it refuses to guess completeness below the \
+                         floor, by design. Size `expected-routes` within 16x of the real \
+                         table, or give this box a bird and enable \
+                         `require-table-complete`"
                     )
                 } else {
                     format!(
