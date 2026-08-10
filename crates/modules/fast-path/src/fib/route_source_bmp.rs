@@ -734,6 +734,38 @@ impl BmpStation {
                     )));
                 }
                 let peer_id = peer_id_from_header(pph);
+                // The peer-set arbitration applies to the DATA, not
+                // only to the raise. On an emitter that speaks peer
+                // lifecycle, PeerDown means that peer's routes are
+                // gone; a RouteMonitoring frame that arrives after it
+                // was in flight when the PeerDown was written and is
+                // stale by the emitter's own ordering, BMP being one
+                // in-order stream.
+                //
+                // Installing it puts a dead peer's route in the mirror
+                // that nothing will ever remove — PeerDown does not
+                // fire twice for a peer already down, and
+                // `InitiationComplete` is one-shot per connection — and
+                // leaves `stale_state_possible` reading false over it,
+                // because the last-peer PeerDown counted the mirror
+                // BEFORE this arrived. A later PeerUp then takes the
+                // first-frame path, raises, AND marks the new epoch
+                // reconciled over state belonging to the old one
+                // (review finding). Suppressing the raise while
+                // accepting the routes was half a rule.
+                if self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
+                    && !self
+                        .up_peers
+                        .lock()
+                        .expect("up_peers lock")
+                        .contains(&peer_id)
+                {
+                    debug!(
+                        ?peer_id,
+                        "RouteMonitoring for a peer that is not up; dropping the frame"
+                    );
+                    return Ok(());
+                }
                 // Elementor converts the UPDATE wrapped in this
                 // RouteMonitoring into one BgpElem per prefix.
                 let elems = Elementor::bgp_to_elems(
