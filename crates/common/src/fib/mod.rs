@@ -424,11 +424,28 @@ pub struct FeedLiveness {
     pub up: bool,
     /// Down-to-up transitions. See [`FeedSession::set_up`].
     pub epoch: u64,
+    /// The stale-route GC has completed for THIS epoch. See
+    /// [`FeedSession::mark_reconciled`].
+    pub reconciled: bool,
 }
 
 impl FeedSession {
-    /// Bit 0 of `state`; the epoch occupies the remaining 63.
+    /// Bit 0 of `state`.
     const UP_BIT: u64 = 1;
+
+    /// Bit 1 of `state`: the stale-route GC has completed for the
+    /// CURRENT epoch, so the mirror holds this session's routes and
+    /// nothing of the one before it.
+    ///
+    /// It rides in the same word as the epoch because it is a claim
+    /// ABOUT that epoch — read apart, a consumer could pair a new
+    /// epoch with the previous epoch's reconciliation and treat a
+    /// mid-reannounce mirror as current. Cleared by every down-to-up
+    /// transition, set only by [`FeedSession::mark_reconciled`].
+    const RECONCILED_BIT: u64 = 1 << 1;
+
+    /// The epoch occupies the remaining 62 bits.
+    const EPOCH_SHIFT: u32 = 2;
 
     pub fn new() -> Self {
         Self::default()
@@ -451,20 +468,51 @@ impl FeedSession {
             std::sync::atomic::Ordering::Acquire,
             |cur| {
                 let was_up = cur & Self::UP_BIT != 0;
-                let epoch = cur >> 1;
-                let epoch = if up && !was_up { epoch + 1 } else { epoch };
-                Some((epoch << 1) | u64::from(up))
+                let mut epoch = cur >> Self::EPOCH_SHIFT;
+                let mut reconciled = cur & Self::RECONCILED_BIT != 0;
+                if up && !was_up {
+                    epoch += 1;
+                    // A new epoch has not been reconciled by anything.
+                    reconciled = false;
+                }
+                Some(
+                    (epoch << Self::EPOCH_SHIFT)
+                        | if reconciled { Self::RECONCILED_BIT } else { 0 }
+                        | u64::from(up),
+                )
             },
         );
     }
 
-    /// Liveness and epoch as one observation. Prefer this wherever both
-    /// are used — see [`FeedLiveness`].
+    /// The session owner reports that the stale-route GC has completed
+    /// for the current epoch — for BGP and BMP, a successful
+    /// [`RouteEvent::InitiationComplete`] dispatch.
+    ///
+    /// This is the ONLY honest evidence that the mirror holds this
+    /// session's routes and none of the previous one's. A completeness
+    /// report cannot stand in for it: the checker compares counts, and
+    /// a mid-reannouncement mirror carrying the prior session's unseen
+    /// routes keeps the count aligned, so a positive report can be
+    /// published over exactly the state this attests against (review
+    /// finding).
+    ///
+    /// Safe as a read-modify-write because the session owner is the
+    /// sole writer of this word and its raise and its GC completion are
+    /// sequential within one task; nothing can clear the epoch between
+    /// the GC and this call.
+    pub fn mark_reconciled(&self) {
+        self.state
+            .fetch_or(Self::RECONCILED_BIT, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Liveness, epoch and reconciliation as one observation. Prefer
+    /// this wherever more than one is used — see [`FeedLiveness`].
     pub fn liveness(&self) -> FeedLiveness {
         let s = self.state.load(std::sync::atomic::Ordering::Acquire);
         FeedLiveness {
             up: s & Self::UP_BIT != 0,
-            epoch: s >> 1,
+            reconciled: s & Self::RECONCILED_BIT != 0,
+            epoch: s >> Self::EPOCH_SHIFT,
         }
     }
 
@@ -744,36 +792,62 @@ mod tests {
     /// busy-loop whose failure is probabilistic either way.
     #[test]
     fn liveness_and_epoch_move_together() {
+        let l = |up, epoch, reconciled| FeedLiveness {
+            up,
+            epoch,
+            reconciled,
+        };
         let s = FeedSession::new();
-        assert_eq!(
-            s.liveness(),
-            FeedLiveness {
-                up: false,
-                epoch: 0
-            }
-        );
+        assert_eq!(s.liveness(), l(false, 0, false));
         s.set_up(true);
-        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 1 });
+        assert_eq!(s.liveness(), l(true, 1, false));
         // A repeated raise is not a new epoch — the session never left.
         s.set_up(true);
-        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 1 });
+        assert_eq!(s.liveness(), l(true, 1, false));
         // Nor does lowering discard the epoch: consumers compare it
         // across the boundary, which is the whole point.
         s.set_up(false);
-        assert_eq!(
-            s.liveness(),
-            FeedLiveness {
-                up: false,
-                epoch: 1
-            }
-        );
+        assert_eq!(s.liveness(), l(false, 1, false));
         s.set_up(true);
-        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 2 });
+        assert_eq!(s.liveness(), l(true, 2, false));
         // Pulses share the struct but not the word.
         s.pulse_n(7);
         s.pulse();
         assert_eq!(s.pulse_count(), 8);
-        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 2 });
+        assert_eq!(s.liveness(), l(true, 2, false));
+    }
+
+    /// Reconciliation belongs to the epoch it happened in.
+    ///
+    /// A GC that ran against the previous session's mirror says nothing
+    /// about this one, so the bit cannot survive a raise — that is the
+    /// whole reason it shares a word with the epoch rather than sitting
+    /// beside it.
+    #[test]
+    fn reconciliation_does_not_survive_a_new_epoch() {
+        let s = FeedSession::new();
+        s.set_up(true);
+        s.mark_reconciled();
+        let seen = s.liveness();
+        assert!(seen.reconciled && seen.up && seen.epoch == 1, "{seen:?}");
+
+        // Lowering alone does not invalidate the GC: the mirror is
+        // still the epoch's that ran it.
+        s.set_up(false);
+        assert!(s.liveness().reconciled);
+
+        // Raising opens a new epoch, which nothing has reconciled.
+        s.set_up(true);
+        let after = s.liveness();
+        assert_eq!(after.epoch, 2);
+        assert!(
+            !after.reconciled,
+            "a new epoch starts unreconciled, however recently the \
+             previous one's GC ran: {after:?}"
+        );
+        s.mark_reconciled();
+        assert!(s.liveness().reconciled);
+        assert_eq!(s.liveness().epoch, 2, "reconciling does not move the epoch");
     }
 
     #[test]

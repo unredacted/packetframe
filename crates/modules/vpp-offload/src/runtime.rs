@@ -534,8 +534,8 @@ enum DeferredResync {
         /// every ordinary release (caught by the completeness test
         /// before it shipped).
         epoch: Option<u64>,
-        /// When this deferral first OBSERVED the epoch advance, while
-        /// the demotion still stands. `None` means no outstanding flap.
+        /// True while this deferral's attestation is demoted by a
+        /// session flap it has observed.
         ///
         /// The demotion has to be revocable or it is a wedge, not a
         /// safeguard. What a flap invalidates is the AUTHORITY'S WORD,
@@ -553,7 +553,7 @@ enum DeferredResync {
         /// attested path returns. A report that is merely NEWER is
         /// enough: its own drift check is what judges whether the
         /// current stream has actually converged.
-        flap_at: Option<std::time::Instant>,
+        demoted: bool,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -1068,7 +1068,7 @@ impl Observe for ObserveView {
                     mut last_request,
                     mut restoring,
                     mut epoch,
-                    mut flap_at,
+                    mut demoted,
                 } => {
                     // ONE observation for both — see `FeedLiveness`. Read
                     // separately, `live` could come from after a raise
@@ -1090,7 +1090,7 @@ impl Observe for ObserveView {
                     // report cannot attest that routes belong to the
                     // current one — so a flapped deferral takes the
                     // full unattested posture UNTIL A REPORT NEWER THAN
-                    // THE FLAP ARRIVES (see `flap_at`; latching it
+                    // THE GC HAS RUN (see `demoted`; latching it
                     // forever turned an ordinary session bounce into a
                     // deferral that could never release). The fleet's
                     // steady 40 s release never flaps and never pays
@@ -1099,38 +1099,37 @@ impl Observe for ObserveView {
                     if live && epoch.is_none() {
                         epoch = current_epoch;
                     }
-                    if matches!((epoch, current_epoch), (Some(e), Some(c_)) if c_ != e)
-                        && flap_at.is_none()
-                    {
-                        // Stamped from the SAME clock as
-                        // `CompletenessReport::at`, not from the tick's
-                        // `now`. The two are the same source in
-                        // production and diverge under a driven clock,
-                        // and comparing a fabricated tick time against
-                        // a real publication time is not a comparison —
-                        // it is the shape `TableCompleteness::verdict`
-                        // already avoids by aging reports against
-                        // `Instant::now()`.
-                        flap_at = Some(std::time::Instant::now());
+                    if matches!((epoch, current_epoch), (Some(e), Some(c_)) if c_ != e) {
+                        demoted = true;
                     }
-                    if let Some(seen_at) = flap_at {
-                        // A comparison MADE after the flap describes the
-                        // current session. Re-baseline onto the epoch
-                        // that report belongs to, and let the attested
-                        // door back in; if the new stream has not
-                        // actually converged, the report's own drift is
-                        // what says so — and says it as a veto.
-                        let fresh_report = c
-                            .completeness
-                            .as_ref()
-                            .and_then(|h| h.latest())
-                            .is_some_and(|r| r.at > seen_at);
-                        if fresh_report {
-                            epoch = current_epoch;
-                            flap_at = None;
-                        }
+                    // Only the GC lifts it. A completeness report
+                    // published after the flap is NOT evidence the
+                    // mirror is this session's: the checker compares
+                    // counts, and a reannouncement still carrying the
+                    // previous session's unseen routes keeps the count
+                    // aligned — so a positive post-flap report can sit
+                    // over a half-current mirror, and if the
+                    // reannouncement trickles below the attested quiet
+                    // rate the gate would release and diff against it
+                    // (review finding, refuting the timestamp test that
+                    // stood here). `InitiationComplete`'s GC is the one
+                    // event that destroys prior-session state, and
+                    // `reconciled` is stamped for the epoch it ran in.
+                    if demoted && liveness.is_some_and(|l| l.reconciled) {
+                        epoch = current_epoch;
+                        demoted = false;
                     }
-                    let flapped = flap_at.is_some();
+                    // Consequence, accepted deliberately: on a feed
+                    // whose churn never yields the initiation-complete
+                    // silence, a flap mid-deferral holds the deferral in
+                    // the unattested posture indefinitely. That is the
+                    // safe direction and a visible one — VPP keeps
+                    // forwarding the FIB it was adopted with, health
+                    // reports the deferral — and it is the same bargain
+                    // FALLBACK_FLOOR_DIVISOR already makes: refuse
+                    // visibly rather than release on evidence that does
+                    // not mean what it appears to.
+                    let flapped = demoted;
                     let attested = c.completeness.is_some() && !flapped;
                     let view = gate.observe(
                         now,
@@ -1229,7 +1228,7 @@ impl Observe for ObserveView {
                             last_request,
                             restoring,
                             epoch,
-                            flap_at,
+                            demoted,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1256,7 +1255,7 @@ impl Observe for ObserveView {
                             last_request,
                             restoring,
                             epoch,
-                            flap_at,
+                            demoted,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1362,7 +1361,7 @@ impl Observe for ObserveView {
                                 last_request,
                                 restoring: true,
                                 epoch,
-                                flap_at,
+                                demoted,
                             });
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
@@ -1635,7 +1634,7 @@ impl Effects for EffectsView {
                 last_request: None,
                 restoring: false,
                 epoch: None,
-                flap_at: None,
+                demoted: false,
             });
             return Ok(());
         }

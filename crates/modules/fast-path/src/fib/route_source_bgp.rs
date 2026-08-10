@@ -488,6 +488,17 @@ impl BgpListener {
                                         "InitiationComplete fired"
                                     );
                                     init_complete_fired = true;
+                                    // The GC this event triggers removed
+                                    // every unseen prior-session route,
+                                    // so the mirror is now this epoch's
+                                    // and nothing of the one before it.
+                                    // The second tier's gate treats this
+                                    // — and nothing else — as grounds to
+                                    // trust an authority report again
+                                    // after a session flap.
+                                    if let Some(sess) = &self.cfg.session {
+                                        sess.mark_reconciled();
+                                    }
                                 }
                             }
                         }

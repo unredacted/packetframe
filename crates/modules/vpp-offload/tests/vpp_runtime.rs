@@ -2292,17 +2292,42 @@ fn a_flap_demotes_attestation_only_until_a_newer_report_arrives() {
         log.lock().unwrap()
     );
 
-    // The integrity checker publishes again for the recovered session.
+    // A NEWER REPORT IS NOT ENOUGH, and this is the half that matters:
+    // the checker compares counts, and a mirror still carrying the
+    // previous session's unseen routes keeps the count aligned, so a
+    // positive post-flap report can sit over a half-current mirror.
     handle.publish(CompletenessReport {
         authority_routes: 4,
         mirror_routes: 4,
         at: std::time::Instant::now(),
     });
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..400 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a fresher report is a count comparison, not proof the mirror is \
+         this session's — it must not restore attestation"
+    );
+
+    // The stale-route GC completing for this epoch is what does.
+    session.mark_reconciled();
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
     assert_eq!(
         log.lock().unwrap().as_slice(),
         &["unsteer", "steer"],
-        "a post-flap report restores the attested release"
+        "the current epoch's GC restores the attested release"
     );
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }

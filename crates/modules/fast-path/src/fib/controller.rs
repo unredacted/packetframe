@@ -387,6 +387,12 @@ impl RouteController {
                 // steered adoption forever (review finding).
                 if let Some(h) = &feed_session {
                     h.set_up(true);
+                    // ...and reconciled by definition: with no external
+                    // feed there is no prior session whose routes could
+                    // linger, so there is no GC to wait for. Without
+                    // this the gate would treat a feedless deployment
+                    // as permanently un-attestable.
+                    h.mark_reconciled();
                 }
                 info!(
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer \

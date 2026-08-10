@@ -540,6 +540,13 @@ impl BmpStation {
                         // was possible is now gone.
                         self.stale_state_possible
                             .store(false, std::sync::atomic::Ordering::Relaxed);
+                        // Same fact, reported to the second tier: the
+                        // mirror is now this epoch's. Its gate treats
+                        // this — and nothing else — as grounds to trust
+                        // an authority report again after a flap.
+                        if let Some(sess) = &self.session {
+                            sess.mark_reconciled();
+                        }
                     }
                     // Re-armable raise: quiescence counts only when the
                     // stream it followed is NEWER than the last
