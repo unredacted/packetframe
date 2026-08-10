@@ -1950,25 +1950,71 @@ impl FibProgrammer {
         result
     }
 
+    /// Remove `prefix` from the FIB trie.
+    ///
+    /// **ENOENT is success.** The goal of a delete is "no such entry",
+    /// so reaching it by another route — a mirror and map that
+    /// disagree, a removal from outside this process — is the outcome,
+    /// not a fault. Reporting it as a map failure made that
+    /// disagreement look like a broken map, and left the caller
+    /// propagating an error over a prefix that was already gone. Same
+    /// rule and reasoning as [`crate::steer`]'s `Removal::AlreadyAbsent`.
+    /// ENOENT only: EPERM, EINVAL and the rest keep failing loudly,
+    /// because they say nothing about whether the entry survived.
+    ///
+    /// **Known gap, deliberately not closed here.** A failure that is
+    /// NOT ENOENT leaves a stale entry that nothing retries: the
+    /// withdrawal branch removes the mirror record before this call (so
+    /// the second tier hears the withdrawal even when our own map write
+    /// fails — see `withdraw_from_mirror`), which leaves nothing to
+    /// drive a repair, and this tier forwards a withdrawn prefix until
+    /// the next full resync. A retry mechanism for it was written and
+    /// removed: it needs state that survives the record, and every
+    /// version of that state was itself a source of blackholes,
+    /// misroutes and refcount leaks under reannouncement races — worse
+    /// faults, and more reachable ones, than the condition it repaired.
+    /// The residual is genuinely rare (on an LPM trie, a non-ENOENT
+    /// delete failure means EPERM or a kernel fault, not load), it is
+    /// logged by the caller, and a resync corrects it. Closing it wants
+    /// a design that can be tested, which this harness cannot do: the
+    /// only injectable delete failure is ENOENT.
     fn delete_fib_entry(&mut self, prefix: &IpPrefix) -> Result<(), ProgrammerError> {
-        let result = match prefix {
+        let raw = match prefix {
             IpPrefix::V4 { addr, prefix_len } => {
                 let key = LpmKey::new(u32::from(*prefix_len), *addr);
-                self.fib_v4
-                    .remove(&key)
-                    .map_err(|e| ProgrammerError::MapWrite(format!("FIB_V4 remove: {e}")))
+                self.fib_v4.remove(&key).map_err(|e| ("FIB_V4", e))
             }
             IpPrefix::V6 { addr, prefix_len } => {
                 let key = LpmKey::new(u32::from(*prefix_len), *addr);
-                self.fib_v6
-                    .remove(&key)
-                    .map_err(|e| ProgrammerError::MapWrite(format!("FIB_V6 remove: {e}")))
+                self.fib_v6.remove(&key).map_err(|e| ("FIB_V6", e))
             }
         };
-        if result.is_ok() {
-            self.bump_cache_generation();
+        match raw {
+            Ok(()) => {
+                self.bump_cache_generation();
+                Ok(())
+            }
+            Err((map, aya::maps::MapError::SyscallError(e)))
+                if e.io_error.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                // BUMPED HERE TOO, and not as bookkeeping: the caller
+                // reclaims this prefix's nexthop and ECMP slots once
+                // this returns Ok, and the grace queue that makes that
+                // safe assumes a generation bump has invalidated every
+                // cached `FibValue` first. Without one, a cache entry
+                // stamped before the trie lost the prefix stays valid
+                // indefinitely — 100 ms of grace buys nothing against a
+                // cache that was never told — and packets dereference
+                // freed or reused slots.
+                self.bump_cache_generation();
+                debug!(
+                    ?prefix,
+                    map, "FIB delete found no entry; the mirror and the map disagreed"
+                );
+                Ok(())
+            }
+            Err((map, e)) => Err(ProgrammerError::MapWrite(format!("{map} remove: {e}"))),
         }
-        result
     }
 
     // --- ECMP group ops ---
