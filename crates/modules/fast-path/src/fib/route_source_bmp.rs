@@ -684,20 +684,6 @@ impl BmpStation {
                     // route-scaled rates is noise.
                     sess.pulse_n((elems.len() as u64).max(1));
                 }
-                // Contribution is counted HERE — a validated, non-empty
-                // frame, past the loc-rib and size checks — because the
-                // reconnect guard's noun is mirror state, and only
-                // frames that reach the apply loop can leave any (review
-                // finding: counting at the frame edge counted rejected
-                // and empty frames).
-                if !elems.is_empty()
-                    && !self
-                        .contributed_this_conn
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.contributing_streams
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
                 for elem in elems {
                     let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {
                         Some(p) => p,
@@ -732,8 +718,25 @@ impl BmpStation {
                             path_id: None,
                         },
                     };
+                    let is_add = matches!(event, RouteEvent::Add { .. });
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
                         warn!(?peer_id, error = %e, "route event dispatch failed");
+                    } else if is_add
+                        && !self
+                            .contributed_this_conn
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Contribution is latched HERE — a dispatched
+                        // ANNOUNCEMENT — because the reconnect guard's
+                        // noun is mirror state and only an applied Add
+                        // creates any: withdrawal-only streams and
+                        // announcements skipped for unusable prefixes
+                        // or missing nexthops leave nothing stale
+                        // (review finding, third refinement — frame
+                        // edge, then validated frame, now applied
+                        // element).
+                        self.contributing_streams
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }

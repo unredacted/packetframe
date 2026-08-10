@@ -380,6 +380,8 @@ pub struct FeedSession {
     /// folds it into its activity rate: quiet means the STREAM went
     /// quiet, not merely that nothing changed.
     pulses: std::sync::atomic::AtomicU64,
+    /// Down-to-up transitions. See [`Self::epoch_count`].
+    epochs: std::sync::atomic::AtomicU64,
 }
 
 impl FeedSession {
@@ -393,7 +395,22 @@ impl FeedSession {
     /// including on hold-timer expiry, which is what bounds how long
     /// a hung session can keep this stale.
     pub fn set_up(&self, up: bool) {
-        self.up.store(up, std::sync::atomic::Ordering::Relaxed);
+        let was = self.up.swap(up, std::sync::atomic::Ordering::Relaxed);
+        if up && !was {
+            // A down-to-up transition opens a session EPOCH. Consumers
+            // that cached evidence across the boundary can compare
+            // epoch counts to learn the world may have been reloaded
+            // underneath them (review finding: an attested release
+            // trusted a pre-reconnect report against a mid-reannounce
+            // mirror).
+            self.epochs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// How many down-to-up transitions this session has seen.
+    pub fn epoch_count(&self) -> u64 {
+        self.epochs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn is_up(&self) -> bool {

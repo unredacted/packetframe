@@ -521,6 +521,14 @@ enum DeferredResync {
         /// gating on emptiness is what wedged half the allowlist on
         /// the condemned fallback with no retry (review finding).
         restoring: bool,
+        /// The feed session's epoch count when this deferral began. A
+        /// flap since then means the world may have been reloaded
+        /// underneath the cached authority report — a 900 s-old
+        /// Converged cannot attest that routes belong to the CURRENT
+        /// stream (review finding) — so a flapped deferral adopts the
+        /// full unattested posture, authority or not, until it
+        /// releases or is recreated.
+        epoch: u64,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -1034,6 +1042,7 @@ impl Observe for ObserveView {
                     mut gate,
                     mut last_request,
                     mut restoring,
+                    epoch,
                 } => {
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     // Rate scaled to the mirror as observed — never
@@ -1043,7 +1052,19 @@ impl Observe for ObserveView {
                     // authority, quiet must at least match the
                     // protocol's own initiation-complete standard —
                     // see UNATTESTED_QUIET_FOR.
-                    let authority_present = c.completeness.is_some();
+                    // The attested fast path holds only while the
+                    // session has NOT flapped under this deferral: a
+                    // reconnect reopens the stream epoch, and a cached
+                    // report cannot attest that routes belong to the
+                    // current one — so a flapped deferral takes the
+                    // full unattested posture until it releases
+                    // (review finding). The fleet's steady 40 s release
+                    // never flaps and never pays this.
+                    let flapped = c
+                        .feed_session
+                        .as_ref()
+                        .is_some_and(|f| f.epoch_count() != epoch);
+                    let attested = c.completeness.is_some() && !flapped;
                     let view = gate.observe(
                         now,
                         SourceSample {
@@ -1052,12 +1073,12 @@ impl Observe for ObserveView {
                             pulses,
                             live,
                         },
-                        if authority_present {
+                        if attested {
                             source_quiet_rate_per_sec(have)
                         } else {
                             UNATTESTED_QUIET_RATE_PER_SEC
                         },
-                        if authority_present {
+                        if attested {
                             SOURCE_QUIET_FOR
                         } else {
                             UNATTESTED_QUIET_FOR
@@ -1132,6 +1153,7 @@ impl Observe for ObserveView {
                             gate,
                             last_request,
                             restoring,
+                            epoch,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1157,6 +1179,7 @@ impl Observe for ObserveView {
                             gate,
                             last_request,
                             restoring,
+                            epoch,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1217,7 +1240,10 @@ impl Observe for ObserveView {
                         // just promised was not happening — accepting
                         // ~2k elements of it here undid the zero-rate
                         // release one step later (review finding).
-                        let churn_budget = if completeness.is_some() {
+                        let flapped_now = feed_session
+                            .as_ref()
+                            .is_some_and(|f| f.epoch_count() != epoch);
+                        let churn_budget = if completeness.is_some() && !flapped_now {
                             source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs()
                         } else {
                             UNATTESTED_QUIET_RATE_PER_SEC * UNATTESTED_QUIET_FOR.as_secs()
@@ -1254,6 +1280,7 @@ impl Observe for ObserveView {
                                 gate,
                                 last_request,
                                 restoring: true,
+                                epoch,
                             });
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
@@ -1525,6 +1552,7 @@ impl Effects for EffectsView {
                 gate: SourceGate::new(floor, seq),
                 last_request: None,
                 restoring: false,
+                epoch: c.feed_session.as_ref().map_or(0, |f| f.epoch_count()),
             });
             return Ok(());
         }
