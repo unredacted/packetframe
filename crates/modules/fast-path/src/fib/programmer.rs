@@ -131,6 +131,11 @@ struct PendingDelete {
     attempts: u32,
     fib_value: FibValue,
     nexthop_ips: Vec<IpAddr>,
+    /// Whether the prefix ever carried a route-source advertisement.
+    /// A stuck `local_arp` /32 is a real fault but it is not a previous
+    /// STREAM's state, and reporting it as such would deny every future
+    /// BMP stream its first-frame liveness raise (review finding).
+    from_session: bool,
 }
 
 /// Consecutive failed delete attempts before the log escalates to an
@@ -453,6 +458,16 @@ struct RouteRecord {
     /// Mirrors what `fib_value` points at. Used to release refcounts
     /// when the union changes or the prefix is torn down.
     nexthop_ips: Vec<IpAddr>,
+    /// Whether a ROUTE-SOURCE peer has ever advertised this prefix, as
+    /// opposed to only the resolver's synthetic `local_arp` /32s.
+    ///
+    /// Latched rather than derived, because by the time a prefix is torn
+    /// down its advertisements are already drained — the withdrawal
+    /// happens precisely BECAUSE the map emptied — so nothing at that
+    /// point can still say who owned it. Read when a failed delete is
+    /// queued, so a local-prefix fault cannot be reported as leftover
+    /// session state.
+    had_session_advertisement: bool,
 }
 
 /// A single advertisement contributing to a prefix's FIB entry.
@@ -886,7 +901,7 @@ impl FibProgrammer {
                 // forwarding after the source withdrew it — session
                 // state by any reading, and the reason the review
                 // finding that prompted this work pointed here.
-                let any = !self.pending_deletes.is_empty()
+                let any = self.pending_deletes.values().any(|p| p.from_session)
                     || !self.recompute_owed.is_empty()
                     || self
                         .routes_by_peer
@@ -1606,8 +1621,10 @@ impl FibProgrammer {
             local_pref,
             seen_this_session: true,
         };
+        let from_session = peer_id.as_local_arp_ifindex().is_none();
         let rec = self.upsert_empty_record(prefix);
         rec.advertisements.insert(key, adv);
+        rec.had_session_advertisement |= from_session;
         self.routes_by_peer
             .entry(peer_id)
             .or_default()
@@ -1744,14 +1761,23 @@ impl FibProgrammer {
                 // The reclaim is deliberately NOT done now: the LPM
                 // entry still resolves through these IDs, so freeing
                 // them for reuse is a misroute rather than a leak.
-                self.pending_deletes.insert(
-                    prefix,
-                    PendingDelete {
+                // `entry`, never `insert`: an existing pending entry
+                // holds the value that is STILL in the trie, because a
+                // successful reinstall would have cancelled it at the
+                // mirror commit. Overwriting it dropped that payload
+                // without reclaiming it, leaking a nexthop or ECMP
+                // refcount on every failed withdraw/reannounce/withdraw
+                // cycle (review finding) — and would have replaced the
+                // live value with one the map never took.
+                self.pending_deletes
+                    .entry(prefix)
+                    .and_modify(|p| p.attempts += 1)
+                    .or_insert(PendingDelete {
                         attempts: 1,
                         fib_value: rec.fib_value,
                         nexthop_ips: rec.nexthop_ips,
-                    },
-                );
+                        from_session: rec.had_session_advertisement,
+                    });
                 warn!(?prefix, error = %e, "FIB delete failed; queued for retry");
                 return Err(e);
             }
@@ -1845,6 +1871,28 @@ impl FibProgrammer {
             rec.nexthop_ips = allocated_ips;
         }
         self.reclaim_prior(prior_fib, prior_nh_ips);
+        // A queued delete for this prefix is now SUPERSEDED — and this
+        // is the only place that may say so. `write_fib_entry` above
+        // succeeded and the mirror commit has just landed, so the stale
+        // entry the delete was chasing has been overwritten; retrying it
+        // would remove the route this call installed, and the mirror's
+        // no-change shortcut would then keep every identical
+        // re-announcement from writing it back (review finding).
+        //
+        // Deciding this at the RETRY instead — "a mirror record exists,
+        // so it must have been reinstalled" — was wrong, because
+        // `upsert_advertisement` creates the record BEFORE the map
+        // write. A reannouncement whose write FAILED leaves a record
+        // behind with the old value still in the trie, and cancelling
+        // there released IDs the dataplane could still reach (review
+        // finding). Presence of a record proves an attempt; only this
+        // line proves an outcome.
+        if let Some(p) = self.pending_deletes.remove(&prefix) {
+            // Its payload was never reclaimed — the failure path skips
+            // that deliberately, since the entry could still resolve
+            // through those IDs. The overwrite has now retired it.
+            self.reclaim_prior(Some(p.fib_value), p.nexthop_ips);
+        }
         // After the mirror commit, never before. The second tier is told
         // what this one *installed*, so the announcement has to follow
         // the write it describes — announcing the intent would republish
@@ -1912,6 +1960,7 @@ impl FibProgrammer {
                     advertisements: BTreeMap::new(),
                     fib_value: FibValue::single(0),
                     nexthop_ips: Vec::new(),
+                    had_session_advertisement: false,
                 }),
             IpPrefix::V6 { addr, prefix_len } => self
                 .routes_v6
@@ -1920,6 +1969,7 @@ impl FibProgrammer {
                     advertisements: BTreeMap::new(),
                     fib_value: FibValue::single(0),
                     nexthop_ips: Vec::new(),
+                    had_session_advertisement: false,
                 }),
         }
     }
@@ -2043,6 +2093,19 @@ impl FibProgrammer {
             Err((map, aya::maps::MapError::SyscallError(e)))
                 if e.io_error.raw_os_error() == Some(libc::ENOENT) =>
             {
+                // BUMPED HERE TOO, and this is not bookkeeping: the
+                // caller reclaims the prefix's nexthop and ECMP slots
+                // once this returns Ok, and the grace queue that makes
+                // that safe assumes a generation bump has already
+                // invalidated every cached `FibValue`. Without one, a
+                // destination-cache entry stamped before the entry
+                // vanished stays valid indefinitely — the 100 ms grace
+                // buys nothing against a cache that was never told —
+                // and packets dereference freed or reused slots
+                // (review finding). The trie no longer holds this
+                // prefix; that is a change the cache has to see,
+                // whoever made it.
+                self.bump_cache_generation();
                 debug!(
                     ?prefix,
                     map, "FIB delete found no entry; the mirror and the map disagreed"
@@ -2074,36 +2137,6 @@ impl FibProgrammer {
         }
         let due: Vec<IpPrefix> = self.pending_deletes.keys().copied().collect();
         for prefix in due {
-            // SUPERSEDED? The withdrawal removed the mirror record, so a
-            // record present now means a later announcement wrote a
-            // fresh entry over the stale one. Deleting here would remove
-            // the route that announcement installed — and because the
-            // mirror holds it, every identical re-announcement would
-            // then take the no-change shortcut and never write it back:
-            // a blackholed prefix with BOTH tiers reporting it
-            // installed, which is worse than the stale entry this whole
-            // mechanism exists to clear (review finding).
-            //
-            // Checked HERE rather than cancelled from the install path,
-            // so no present or future way of reinstalling a prefix has
-            // to remember to do it.
-            if self.lookup_mirror(&prefix).is_some() {
-                if let Some(p) = self.pending_deletes.remove(&prefix) {
-                    debug!(
-                        ?prefix,
-                        attempts = p.attempts,
-                        "pending FIB delete superseded by a reinstall"
-                    );
-                    // The overwrite retired the old value, so it can go
-                    // through the ordinary grace queue now. Neither
-                    // side could have done this earlier: the failure
-                    // path skips the reclaim on purpose, and the
-                    // install path saw `prior_state == None` because
-                    // the withdrawal had already taken the record.
-                    self.reclaim_prior(Some(p.fib_value), p.nexthop_ips);
-                }
-                continue;
-            }
             match self.delete_fib_entry(&prefix) {
                 Ok(_) => {
                     if let Some(p) = self.pending_deletes.remove(&prefix) {
