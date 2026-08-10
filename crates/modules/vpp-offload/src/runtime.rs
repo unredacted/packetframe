@@ -353,6 +353,17 @@ struct SourceGate {
     rate_quiet_since: Option<std::time::Instant>,
 }
 
+/// One tick's reading of the source, taken by the caller and handed to
+/// [`SourceGate::observe`] whole — the gate consumes a consistent
+/// snapshot, and the observe signature stays within reason.
+#[derive(Debug, Clone, Copy)]
+struct SourceSample {
+    have: u64,
+    seq: u64,
+    pulses: u64,
+    live: bool,
+}
+
 /// What one gate observation saw. `released` is the coupled
 /// floor-plus-quiescence verdict both stages share; the other fields
 /// serve the pre-dump stage's alternate releases, which must work
@@ -420,12 +431,16 @@ impl SourceGate {
     fn observe(
         &mut self,
         now: std::time::Instant,
-        have: u64,
-        seq: u64,
-        pulses: u64,
-        live: bool,
+        sample: SourceSample,
         quiet_rate: u64,
+        quiet_for: Duration,
     ) -> GateView {
+        let SourceSample {
+            have,
+            seq,
+            pulses,
+            live,
+        } = sample;
         let activity_per_sec = match self.last_check {
             // A rate needs two observations; the first check only
             // baselines, and reports as loading — which a source
@@ -452,7 +467,7 @@ impl SourceGate {
         }
         let released = self
             .quiet_since
-            .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
+            .is_some_and(|since| now.duration_since(since) >= quiet_for);
         self.last_seq = seq;
         self.last_pulses = pulses;
         self.last_check = Some(now);
@@ -575,6 +590,18 @@ const UNSTEER_REQUEST_EVERY: Duration = Duration::from_secs(5);
 ///   distinguish "loading, at 60%" from "loaded, shrunk to 60%"; only
 ///   the growth rate can.
 pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
+
+/// The quiet a release must show when NO completeness authority is
+/// configured. Five seconds, deliberately equal to both listeners'
+/// INIT_COMPLETE_QUIESCENCE: that is each protocol's own definition of
+/// "the initial dump is complete", and a release that has no authority
+/// to attest completion must not claim it on LESS evidence than the
+/// protocol itself requires — two seconds of stall mid-dump released a
+/// partial mirror whose only sin was pausing (review finding). With an
+/// authority present the shorter window stands, because the authority
+/// carries the completion truth and its current-mirror drift vetoes a
+/// partial table regardless of quiet.
+pub const UNATTESTED_QUIET_FOR: Duration = Duration::from_secs(5);
 
 /// How long the source must stay below the quiet RATE before it counts
 /// as loaded. A duration, never a number of checks: the production loop
@@ -988,13 +1015,26 @@ impl Observe for ObserveView {
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     // Rate scaled to the mirror as observed — never
                     // to capacity, which is a ceiling, not a table.
+                    // The floor door's quiet requirement depends on
+                    // whether anyone can attest completion: with no
+                    // authority, quiet must at least match the
+                    // protocol's own initiation-complete standard —
+                    // see UNATTESTED_QUIET_FOR.
+                    let authority_present = c.completeness.is_some();
                     let view = gate.observe(
                         now,
-                        have,
-                        seq,
-                        pulses,
-                        live,
+                        SourceSample {
+                            have,
+                            seq,
+                            pulses,
+                            live,
+                        },
                         source_quiet_rate_per_sec(have),
+                        if authority_present {
+                            SOURCE_QUIET_FOR
+                        } else {
+                            UNATTESTED_QUIET_FOR
+                        },
                     );
                     let want = gate.floor;
                     // Three ways the fallback proves itself ready,
@@ -1202,11 +1242,14 @@ impl Observe for ObserveView {
                     let released = gate
                         .observe(
                             now,
-                            have,
-                            seq,
-                            pulses,
-                            true,
+                            SourceSample {
+                                have,
+                                seq,
+                                pulses,
+                                live: true,
+                            },
                             source_quiet_rate_per_sec(adopted),
+                            SOURCE_QUIET_FOR,
                         )
                         .released;
                     if !released {

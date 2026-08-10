@@ -658,8 +658,13 @@ impl BmpStation {
                     // not: the gate compares activity against
                     // route-scaled quiet rates, and counting frames let
                     // a batched million-route reannouncement dump read
-                    // as quiet (review finding).
-                    sess.pulse_n(elems.len() as u64);
+                    // as quiet (review finding). Floored at one unit: an
+                    // empty End-of-RIB frame represents no routes but IS
+                    // stream evidence, and freshness must advance or a
+                    // legitimately empty table can never re-raise after
+                    // the GC (review finding) — one unit against
+                    // route-scaled rates is noise.
+                    sess.pulse_n((elems.len() as u64).max(1));
                 }
                 for elem in elems {
                     let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {

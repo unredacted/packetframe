@@ -587,8 +587,11 @@ impl BgpListener {
                     // compares activity against route-scaled quiet
                     // rates — counting frames instead of the elements
                     // they fan out to let a batched million-route dump
-                    // read as quiet (review finding).
-                    sess.pulse_n(elems.len() as u64);
+                    // read as quiet (review finding). Floored at one
+                    // unit so an empty UPDATE (End-of-RIB shape) still
+                    // counts as stream evidence — one unit against
+                    // route-scaled rates is noise.
+                    sess.pulse_n((elems.len() as u64).max(1));
                 }
                 for elem in elems {
                     let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
