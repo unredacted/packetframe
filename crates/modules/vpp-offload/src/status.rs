@@ -602,9 +602,13 @@ impl StatusSnapshot {
                     )
                 } else {
                     format!(
-                        "resync deferred: the route source holds {have} routes and is still \
-                         growing; the diff runs once the feed goes quiet, and the adopted \
-                         FIB keeps forwarding untouched until then"
+                        "resync deferred: the route source holds {have} routes (release \
+                         floor {want}); the diff runs once the source is live and quiet, \
+                         and the adopted FIB keeps forwarding untouched until then. If \
+                         this persists with a fully loaded table, the gate has no honest \
+                         authority to release on: size `expected-routes` within 16x of \
+                         the real table, or give this box a bird and enable \
+                         `require-table-complete`"
                     )
                 };
                 (HealthState::Degraded, Some(msg))

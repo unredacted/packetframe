@@ -136,36 +136,28 @@ pub struct BmpStation {
     /// would let a second tier trust a mirror that just lost its feed
     /// (review finding).
     up_peers: std::sync::Mutex<std::collections::HashSet<PeerId>>,
-    /// Whether this connection has delivered a RouteMonitoring frame.
-    /// RFC 9069 Loc-RIB streams need not send PeerUp for the synthetic
-    /// Loc-RIB instance (review finding — and Loc-RIB is precisely the
-    /// mode `require-loc-rib` documents), so for them the stream itself
-    /// is the liveness evidence — but only once it has SETTLED: the
-    /// raise happens at InitiationComplete, the station's definition of
-    /// initial-stream readiness, never on the first frame (review
-    /// finding: a dump stalling after frame one would otherwise read
-    /// as live-quiet-loaded for up to the read timeout). This flag's
-    /// remaining job is the peer-set arbitration below: a connection
-    /// that streamed RM without ever speaking PeerUp keeps its
-    /// liveness across an incidental PeerDown.
+    /// Whether this connection has delivered a RouteMonitoring frame —
+    /// i.e. the STREAM HAS STARTED. That is the whole liveness bar for
+    /// an emitter that never speaks peer lifecycle (RFC 9069 Loc-RIB,
+    /// precisely the mode `require-loc-rib` documents), by the same
+    /// reasoning as the BGP listener's first-UPDATE raise (#152):
+    /// whether the load has FINISHED was never the session owner's
+    /// question — the release gate's floor and authority answer it,
+    /// and a stalled or partial dump cannot release through either
+    /// (below the floor by arithmetic; condemned by the authority's
+    /// current-mirror drift). The settle/epoch machinery that used to
+    /// guard this raise served only the deleted small-table release,
+    /// and its quiescence definition wedged on continuously-churning
+    /// feeds — the same fault #152 fixed for BGP.
     saw_rm: std::sync::atomic::AtomicBool,
     /// Whether this connection has EVER sent a PeerUp. An emitter that
-    /// speaks peer lifecycle gets peer-set semantics: when its last
-    /// monitored peer goes down, the feed is down, however many RM
-    /// frames were streamed before — a sticky RM bit would disable the
-    /// peer-set transition for every mode, not just the Loc-RIB
-    /// streams that lack notifications (review finding). `saw_rm`
-    /// attests liveness only for connections that never spoke PeerUp.
+    /// speaks peer lifecycle gets peer-set semantics both ways: PeerUp
+    /// raises, and when the last monitored peer goes down the feed is
+    /// down, however many RM frames were streamed before — while a
+    /// straggler RM after the last PeerDown raises nothing (review
+    /// findings, kept from the epoch era because they are about
+    /// SEMANTICS, not settling).
     saw_peer_up: std::sync::atomic::AtomicBool,
-    /// Whether this connection's initial stream has settled
-    /// (InitiationComplete fired). Liveness raises pass through this:
-    /// a PeerUp that precedes a delayed initial dump proves a peer,
-    /// not a table, and raising on it let two seconds of pre-stream
-    /// quiet release the second tier's gate (review finding — the
-    /// same flaw the BGP and Loc-RIB paths shed, at the last raise
-    /// site that still had it). A PeerUp arriving AFTER settlement
-    /// raises immediately, which is the mid-session peer-join case.
-    initiated: std::sync::atomic::AtomicBool,
 }
 
 /// Re-export for callers building the station.
@@ -198,7 +190,6 @@ impl BmpStation {
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
-            initiated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -309,8 +300,6 @@ impl BmpStation {
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
-                            self.initiated
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             if let Some(sess) = &self.session {
                                 sess.set_up(false);
                             } else {
@@ -376,17 +365,23 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
-                                // Deliberately NOT a liveness raise: a
-                                // single frame proves the stream began,
-                                // not that the initial dump landed — a
-                                // dump that stalls after frame one would
-                                // otherwise read as a live, quiet, loaded
-                                // feed for up to the read timeout (review
-                                // finding). Liveness for a Loc-RIB stream
-                                // raises at InitiationComplete below —
-                                // the station's own definition of
-                                // initial-stream readiness.
                                 self.saw_rm.store(true, Ordering::Relaxed);
+                                // The stream has started — see the
+                                // saw_rm field for why that, and not
+                                // any settle heuristic, is the raise.
+                                // The peer-set arbitration stands: on a
+                                // peer-speaking connection a straggler
+                                // frame after the last PeerDown raises
+                                // nothing.
+                                let peers_speak =
+                                    self.saw_peer_up.load(Ordering::Relaxed);
+                                let peers_up =
+                                    !self.up_peers.lock().expect("up_peers lock").is_empty();
+                                if !peers_speak || peers_up {
+                                    if let Some(sess) = &self.session {
+                                        sess.set_up(true);
+                                    }
+                                }
                             }
                             // Loc-RIB safety check happens inside
                             // process_msg; a violation returns Err and
@@ -417,79 +412,24 @@ impl BmpStation {
                     }
                 }
                 _ = tick.tick() => {
-                    // Settlement is per EPOCH, not per connection: when
-                    // the last monitored peer goes down, `initiated` and
-                    // `saw_rm` reset, and the NEXT peer's dump must
-                    // quiesce all over again before liveness returns —
-                    // a PeerUp on an already-settled connection was
-                    // raising ahead of that peer's own dump (review
-                    // finding). The InitiationComplete EVENT still
-                    // fires once per connection; the programmer's GC
-                    // semantics are per connection, and only the
-                    // liveness settlement re-arms.
-                    let settled = self.initiated.load(std::sync::atomic::Ordering::Relaxed);
-                    let rm_this_epoch = self.saw_rm.load(std::sync::atomic::Ordering::Relaxed);
-                    if !settled && rm_this_epoch {
-                        if let Some(last) = last_route_monitoring {
-                            if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
-                                if !init_complete_fired {
-                                    if let Err(e) = self
-                                        .prog_handle
-                                        .apply_route_event(RouteEvent::InitiationComplete)
-                                        .await
-                                    {
-                                        warn!(error = %e, "InitiationComplete dispatch failed");
-                                        continue;
-                                    }
-                                    info!(
-                                        frames_parsed,
-                                        quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
-                                        "InitiationComplete fired"
-                                    );
-                                    init_complete_fired = true;
-                                }
-                                // The stream (or this epoch's re-dump)
-                                // has quiesced: the mirror holds what
-                                // the emitter has. Guarded as always —
-                                // an emitter that speaks peer lifecycle
-                                // with no peer up stays down — and the
-                                // SETTLEMENT itself carries the same
-                                // guard: a peerless straggler frame
-                                // after the last PeerDown must not
-                                // prime the next epoch, or the next
-                                // PeerUp would raise off the cached
-                                // flag before its own dump arrived
-                                // (review finding).
-                                let peers_speak = self
-                                    .saw_peer_up
-                                    .load(std::sync::atomic::Ordering::Relaxed);
-                                let peers_up = !self
-                                    .up_peers
-                                    .lock()
-                                    .expect("up_peers lock")
-                                    .is_empty();
-                                if !peers_speak || peers_up {
-                                    self.initiated
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    if let Some(sess) = &self.session {
-                                        sess.set_up(true);
-                                    }
-                                } else {
-                                    // Declined AND consumed: a peerless
-                                    // straggler frame is not testimony
-                                    // about any future epoch. Leaving
-                                    // the evidence cached let the next
-                                    // PeerUp settle on the very next
-                                    // tick, off a frame that predated
-                                    // the peer entirely (review
-                                    // finding, third pass at this
-                                    // hole). The new peer's dump must
-                                    // produce its own frames and its
-                                    // own quiescence.
-                                    self.saw_rm
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                                    last_route_monitoring = None;
-                                }
+                    if init_complete_fired {
+                        continue;
+                    }
+                    if let Some(last) = last_route_monitoring {
+                        if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
+                            if let Err(e) = self
+                                .prog_handle
+                                .apply_route_event(RouteEvent::InitiationComplete)
+                                .await
+                            {
+                                warn!(error = %e, "InitiationComplete dispatch failed");
+                            } else {
+                                info!(
+                                    frames_parsed,
+                                    quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
+                                    "InitiationComplete fired"
+                                );
+                                init_complete_fired = true;
                             }
                         }
                     }
@@ -518,8 +458,6 @@ impl BmpStation {
                 self.saw_rm
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.initiated
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(sess) = &self.session {
                     sess.set_up(false);
@@ -553,13 +491,11 @@ impl BmpStation {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut up = self.up_peers.lock().expect("up_peers lock");
                 up.insert(peer_id);
-                // Bookkeeping always; liveness only once the initial
-                // stream has settled. Before that, a peer is a promise
-                // of a table, not a table.
-                if self.initiated.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(sess) = &self.session {
-                        sess.set_up(true);
-                    }
+                // A peer up on a peer-speaking connection is the feed
+                // being up; the release gate's floor and authority own
+                // the has-it-loaded question (see saw_rm).
+                if let Some(sess) = &self.session {
+                    sess.set_up(true);
                 }
             }
             BmpMessageBody::PeerDownNotification(_) => {
@@ -582,23 +518,15 @@ impl BmpStation {
                 // peer down = feed down, RM history notwithstanding.
                 // Only a connection that never spoke PeerUp may lean on
                 // its RM stream (the Loc-RIB case).
-                let rm_attests = !self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
-                    && self.saw_rm.load(std::sync::atomic::Ordering::Relaxed);
-                if up.is_empty() && !rm_attests {
+                // Peer-set semantics: the last monitored peer going
+                // down means the feed is down, whatever was streamed
+                // before. A connection that never spoke PeerUp (the
+                // Loc-RIB shape) never lowers here — its liveness
+                // lives and dies with the connection itself.
+                if up.is_empty() && self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Some(sess) = &self.session {
                         sess.set_up(false);
                     }
-                    // The epoch ended with the last peer: whatever RM
-                    // settled BEFORE is no evidence about the next
-                    // peer's table, so settlement re-arms — the next
-                    // PeerUp records itself and waits for its own
-                    // dump's quiescence (review finding: an
-                    // already-settled connection re-raised on the new
-                    // PeerUp before that peer had streamed a frame).
-                    self.initiated
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    self.saw_rm
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             BmpMessageBody::RouteMonitoring(rm) => {

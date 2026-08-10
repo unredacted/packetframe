@@ -1551,7 +1551,7 @@ mod steered {
     }
 
     /// `run_until` with a caller-chosen bound, for stop conditions that
-    /// legitimately need many paced ticks (the 150 s small-table quiet).
+    /// legitimately need many paced ticks (long deferral holds).
     pub fn run_paced(
         d: &mut Driver,
         rt: &Runtime,
@@ -1704,49 +1704,35 @@ fn a_met_floor_without_a_live_session_stays_deferred() {
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
-/// The capacity floor is an UPPER sizing bound wearing a lower bound's
-/// hat, so it cannot be the only release (review finding): a deployment
-/// whose real table sits below capacity/16 - the default sizing over a
-/// small site - would defer forever. The small-table clause releases
-/// any non-empty mirror whose feed SESSION is up once it has been quiet
-/// longer than the BGP hold time. The session handle is the liveness
-/// authority no mirror-side count could be (three proxies fell to
-/// review: capacity fractions, arrival deltas, absolute minimums), so
-/// this works for a 100-route table as well as a 100k one, and no
-/// matter how much of the table loaded before the gate existed.
+/// The narrowed contract: a below-floor table with no authority NEVER
+/// releases — deliberately. The session is up, the mirror loaded and
+/// quiet for minutes, and nothing honest can say a 100-route mirror is
+/// complete when the operator declared sizing for 4096-route scale.
+/// The remedy lives in the health text (size expected-routes within
+/// 16x of the real table, or add bird); the small-table heuristic that
+/// used to guess here was deleted after ten review rounds of corner
+/// cases and a fleet-path wedge (#151/#152 retrospective).
 #[test]
-fn a_small_table_releases_after_long_quiet_regardless_of_when_it_loaded() {
-    // Capacity 4096 -> floor 256. The full table is 100 routes: under
-    // every count any proxy ever used - only session liveness plus
-    // long quiet can release this.
+fn a_below_floor_table_without_an_authority_defers_forever() {
+    // Capacity 4096 -> floor 256. The whole table is 100 routes,
+    // session up, quiet far past every window that ever existed.
     let full: Vec<IpPrefix> = (0..4)
         .map(|i| fake_vpp::v4(0, i))
         .chain((0..96).map(|i| fake_vpp::v4(1, i)))
         .collect();
-    let (fake, shared, log, rt, session) = steered::fixture("steered-small", &full[..60], 4096);
+    let (fake, _shared, log, rt, session) = steered::fixture("steered-below-floor", &full, 4096);
     session.set_up(true);
     let mut d = Driver::new();
-    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
-
-    // The rest of the load arrives after the gate exists.
-    *shared.lock().unwrap() = full;
-
-    // 150 s of paced quiet at <=250 ms a tick needs a real budget.
-    let (_, events) = steered::run_paced(&mut d, &rt, now, 8_192, |d| d.state() == State::Steered);
-
+    let _ = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 2_000);
     assert_eq!(
-        log.lock().unwrap().as_slice(),
-        &["unsteer", "steer"],
-        "the small-table release must follow the same unsteer-first sequence"
-    );
-    assert!(
-        events.contains(&Event::SyncComplete) && events.contains(&Event::VerifyPassed),
-        "{events:?}"
+        d.state(),
+        State::AdoptedResyncing,
+        "below the floor with no authority, the deferral is the designed terminal state"
     );
     assert_eq!(
-        steered::deletes(&fake),
-        vec![([10, 0, 4, 0], 24), ([10, 0, 5, 0], 24)],
-        "the reconciliation still withdraws what the small table lacks"
+        rt.status().resync_deferred,
+        Some((100, 256)),
+        "and it is visible, with the floor named"
     );
 }
 
@@ -1763,7 +1749,7 @@ fn a_small_table_releases_after_long_quiet_regardless_of_when_it_loaded() {
 fn a_dead_source_never_triggers_the_unsteer() {
     let (fake, shared, log, rt, session) = steered::fixture("steered-dead", &[], 4096);
     let mut d = Driver::new();
-    // Far past SMALL_TABLE_QUIET_FOR at <=250 ms a tick, empty.
+    // Far past every quiet window at <=250 ms a tick, empty.
     let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 2_000);
     assert_eq!(
         d.state(),
@@ -2156,7 +2142,7 @@ fn completeness_releases_a_below_floor_table_promptly() {
     );
     session.set_up(true);
 
-    // Well under the 150 s small-table wait: the authority short-cuts.
+    // The authority is the release for a below-floor table.
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
     assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");

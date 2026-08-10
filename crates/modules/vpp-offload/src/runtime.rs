@@ -515,34 +515,21 @@ impl DeferredResync {
 /// the operator's `expected-routes`, so it scales with the deployment
 /// instead of encoding this fleet's table.
 ///
-/// Capacity is an UPPER sizing bound, though, so this floor is only
-/// one of three releases — a deployment whose real table sits below
-/// `capacity / 16` (the default sizing over a small table qualifies)
-/// would otherwise defer forever (review finding). The other two, in
-/// the `AwaitingFallback` arm: the completeness authority where a bird
-/// exists to compare against, and the session-backed small-table
-/// clause under [`SMALL_TABLE_QUIET_FOR`].
+/// Capacity is an UPPER sizing bound, so this floor doubles as a
+/// CONTRACT: with `require-table-complete off` there is no authority
+/// to say a small table is complete, and the release gate refuses to
+/// guess — a deployment whose real table sits below `capacity / 16`
+/// defers its adopted reconciliation indefinitely, visibly, with the
+/// remedy in the health text (size `expected-routes` within 16x of
+/// the real table, or add bird and enable the authority). A
+/// session-backed small-table heuristic existed briefly and was
+/// removed deliberately: ten of PR #151's twenty review rounds were
+/// spent on its corner cases, every one serving a configuration the
+/// fleet does not run, and its liveness settling wedged the FLEET
+/// path within hours of merging (#152). Supported configurations
+/// release in seconds through the floor or the authority; everything
+/// else is refused by arithmetic rather than guarded by heuristics.
 pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
-
-/// The pre-dump stage's small-table release: the feed session is UP,
-/// the mirror is non-empty, and the rate has been quiet this long. The
-/// session handle is what three failed proxies were reaching for
-/// (capacity fractions, arrival deltas, absolute minimums - each a
-/// review finding): no mirror-side count can distinguish a loaded
-/// small table from the husk a dead session leaves behind, because
-/// neighbour-synthesized local routes alone can number in the
-/// hundreds. Liveness comes from the session owner instead, and quiet
-/// supplies the completion evidence.
-///
-/// The DURATION still matters: it must outlast the BGP hold time,
-/// because a HUNG session reads as up until the hold expires - the
-/// listener then closes it and reports down, which is what bounds how
-/// long "up" can be stale. Default holds are 90 s and the fleet feed
-/// negotiates 90; 150 s covers them with margin. A deployment that
-/// raises its hold beyond this should size `expected-routes` within
-/// 16x of its table or run `require-table-complete on`, both of which
-/// release without this clause.
-const SMALL_TABLE_QUIET_FOR: Duration = Duration::from_secs(150);
 
 /// How often a refused or unacknowledged unsteer is re-requested while
 /// the pre-dump stage waits. Paced because the gate re-checks every
@@ -986,14 +973,13 @@ impl Observe for ObserveView {
                     //    tables within 16x of their sizing (the fleet);
                     //  - the completeness authority, where a bird
                     //    exists — the exact signal, and the same one
-                    //    `Effects::steer` gates on;
-                    //  - a non-empty mirror whose feed SESSION is up,
-                    //    quiet longer than the BGP hold time: the
-                    //    session handle is the liveness authority no
-                    //    mirror-side count could be (see
-                    //    SMALL_TABLE_QUIET_FOR), and the hold-length
-                    //    quiet is what bounds a hung session going
-                    //    stale at "up".
+                    //    `Effects::steer` gates on.
+                    // TWO releases, deliberately not three: a
+                    // below-floor table with no authority defers
+                    // forever, visibly, because nothing honest can say
+                    // it is complete — see FALLBACK_FLOOR_DIVISOR for
+                    // the contract and for what happened to the
+                    // heuristic that used to guess.
                     // The authority's CURRENT word gates every path:
                     // the cached verdict alone let a stale Converged
                     // carry a since-shrunken mirror through the floor
@@ -1007,13 +993,7 @@ impl Observe for ObserveView {
                     let complete = live
                         && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && authority == Some(true);
-                    let small_table_loaded = have > 0
-                        && live
-                        && view
-                            .rate_quiet_for
-                            .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
-                    let released =
-                        !veto && ((view.released && live) || complete || small_table_loaded);
+                    let released = !veto && ((view.released && live) || complete);
                     let unsteered = c.steering.installed().is_empty();
                     if !released {
                         // Revocation AFTER the unsteer was acknowledged
