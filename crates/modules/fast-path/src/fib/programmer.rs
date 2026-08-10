@@ -2074,6 +2074,36 @@ impl FibProgrammer {
         }
         let due: Vec<IpPrefix> = self.pending_deletes.keys().copied().collect();
         for prefix in due {
+            // SUPERSEDED? The withdrawal removed the mirror record, so a
+            // record present now means a later announcement wrote a
+            // fresh entry over the stale one. Deleting here would remove
+            // the route that announcement installed — and because the
+            // mirror holds it, every identical re-announcement would
+            // then take the no-change shortcut and never write it back:
+            // a blackholed prefix with BOTH tiers reporting it
+            // installed, which is worse than the stale entry this whole
+            // mechanism exists to clear (review finding).
+            //
+            // Checked HERE rather than cancelled from the install path,
+            // so no present or future way of reinstalling a prefix has
+            // to remember to do it.
+            if self.lookup_mirror(&prefix).is_some() {
+                if let Some(p) = self.pending_deletes.remove(&prefix) {
+                    debug!(
+                        ?prefix,
+                        attempts = p.attempts,
+                        "pending FIB delete superseded by a reinstall"
+                    );
+                    // The overwrite retired the old value, so it can go
+                    // through the ordinary grace queue now. Neither
+                    // side could have done this earlier: the failure
+                    // path skips the reclaim on purpose, and the
+                    // install path saw `prior_state == None` because
+                    // the withdrawal had already taken the record.
+                    self.reclaim_prior(Some(p.fib_value), p.nexthop_ips);
+                }
+                continue;
+            }
             match self.delete_fib_entry(&prefix) {
                 Ok(_) => {
                     if let Some(p) = self.pending_deletes.remove(&prefix) {
