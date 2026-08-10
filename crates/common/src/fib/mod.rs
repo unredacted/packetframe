@@ -400,12 +400,21 @@ impl FeedSession {
         self.up.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// One frame of stream activity arrived, whether or not it changed
-    /// anything. See the field doc for why the mirror's own counter is
-    /// not enough.
+    /// One unit of stream activity, whether or not it changed anything.
+    /// See the field doc for why the mirror's own counter is not
+    /// enough. The UNIT is one route element, not one frame — the gate
+    /// compares this against route-scaled quiet rates, and a frame can
+    /// fan out to thousands of elements, so frame-counting let a
+    /// batched million-route dump read as quiet (review finding). Use
+    /// [`Self::pulse_n`] with the element count wherever it is known.
     pub fn pulse(&self) {
+        self.pulse_n(1);
+    }
+
+    /// `n` route elements of stream activity in one frame.
+    pub fn pulse_n(&self, n: u64) {
         self.pulses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn pulse_count(&self) -> u64 {

@@ -536,13 +536,6 @@ impl BgpListener {
             BgpMessage::Update(update) => {
                 *last_update = Some(Instant::now());
                 *updates_seen += 1;
-                if let Some(sess) = &self.cfg.session {
-                    // Every UPDATE pulses, changed or not: a reconnect
-                    // reannounces an unchanged table, the mirror never
-                    // moves, and the release gate must still read the
-                    // stream as loud until it actually ends.
-                    sess.pulse();
-                }
                 if *updates_seen == 1 {
                     // The stream has started; see the handshake note
                     // for why this — and not post-stream silence — is
@@ -586,6 +579,16 @@ impl BgpListener {
                         elems.len(),
                         MAX_ELEMS_PER_UPDATE
                     )));
+                }
+                if let Some(sess) = &self.cfg.session {
+                    // Stream activity in ROUTE-ELEMENT units, changed
+                    // or not: a reconnect reannounces an unchanged
+                    // table, the mirror never moves, and the gate
+                    // compares activity against route-scaled quiet
+                    // rates — counting frames instead of the elements
+                    // they fan out to let a batched million-route dump
+                    // read as quiet (review finding).
+                    sess.pulse_n(elems.len() as u64);
                 }
                 for elem in elems {
                     let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {

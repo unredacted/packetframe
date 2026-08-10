@@ -173,14 +173,14 @@ pub struct BmpStation {
     /// the stale routes also never leave — deferring is correct for
     /// exactly as long as releasing would be wrong.
     connections: std::sync::atomic::AtomicU64,
-    /// The session pulse count at the moment liveness was last
-    /// LOWERED. The re-armable raise below requires stream evidence
-    /// newer than this — frames seen SINCE the lowering — so a later
-    /// peer epoch can re-establish the session (a one-shot raise left
-    /// it down for the socket's lifetime after any post-dump
-    /// last-peer-down; review finding), while a quiescence that
-    /// predates the lowering cannot: the raise needs a new stream,
-    /// not an old silence.
+    /// The session pulse count at the last liveness BOUNDARY — a
+    /// lowering, or an epoch-opening PeerUp (which consumes any
+    /// peerless straggler pulses that preceded it; review finding).
+    /// The re-armable raise requires stream evidence newer than this:
+    /// elements seen since the boundary, so a later peer epoch can
+    /// re-establish the session (a one-shot raise left it down for
+    /// the socket's lifetime; review finding) while neither an old
+    /// silence nor another peer's stragglers can.
     pulses_at_lower: std::sync::atomic::AtomicU64,
 }
 
@@ -402,13 +402,10 @@ impl BmpStation {
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
                                 self.saw_rm.store(true, Ordering::Relaxed);
-                                if let Some(sess) = &self.session {
-                                    // Changed or not, a frame is stream
-                                    // activity — reannouncement dumps
-                                    // never move the mirror, and the
-                                    // gate must read them as loud.
-                                    sess.pulse();
-                                }
+                                // Pulses are counted in process_msg, in
+                                // ROUTE-ELEMENT units — see the pulse
+                                // site there for why frames are the
+                                // wrong unit.
                                 // First connection only — see the
                                 // `connections` field for why a
                                 // reconnect must wait for the GC. The
@@ -566,7 +563,21 @@ impl BmpStation {
                 self.saw_peer_up
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut up = self.up_peers.lock().expect("up_peers lock");
+                let opens_epoch = up.is_empty();
                 up.insert(peer_id);
+                if opens_epoch {
+                    // An epoch-opening PeerUp CONSUMES whatever pulses
+                    // preceded it: a peerless straggler frame after the
+                    // last PeerDown must not count as this new peer's
+                    // stream, or the next quiesced tick would raise
+                    // before the peer supplied a single route (review
+                    // finding). Freshness now means frames after THIS
+                    // peer came up.
+                    if let Some(sess) = &self.session {
+                        self.pulses_at_lower
+                            .store(sess.pulse_count(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 // Bookkeeping only — no raise. PeerUp precedes the
                 // dump, and across a reconnect the mirror still holds
                 // the PRIOR session's unseen routes (Resync marks them,
@@ -641,6 +652,14 @@ impl BmpStation {
                         elems.len(),
                         MAX_ELEMS_PER_UPDATE
                     )));
+                }
+                if let Some(sess) = &self.session {
+                    // Stream activity in ROUTE-ELEMENT units, changed or
+                    // not: the gate compares activity against
+                    // route-scaled quiet rates, and counting frames let
+                    // a batched million-route reannouncement dump read
+                    // as quiet (review finding).
+                    sess.pulse_n(elems.len() as u64);
                 }
                 for elem in elems {
                     let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {
