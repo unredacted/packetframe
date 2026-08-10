@@ -514,6 +514,10 @@ impl BmpStation {
                     if !quiesced {
                         continue;
                     }
+                    // Whether THIS pass ran the GC. The second tier is
+                    // told after the raise below, never before — see
+                    // the mark site for why the order is load-bearing.
+                    let mut gc_just_ran = false;
                     // The EVENT is one-shot per connection — the
                     // programmer's GC semantics. The RAISE below is
                     // deliberately not: a one-shot raise left the
@@ -540,13 +544,9 @@ impl BmpStation {
                         // was possible is now gone.
                         self.stale_state_possible
                             .store(false, std::sync::atomic::Ordering::Relaxed);
-                        // Same fact, reported to the second tier: the
-                        // mirror is now this epoch's. Its gate treats
-                        // this — and nothing else — as grounds to trust
-                        // an authority report again after a flap.
-                        if let Some(sess) = &self.session {
-                            sess.mark_reconciled();
-                        }
+                        // Reported to the second tier BELOW, after the
+                        // raise — not here. See the mark site.
+                        gc_just_ran = true;
                     }
                     // Re-armable raise: quiescence counts only when the
                     // stream it followed is NEWER than the last
@@ -571,6 +571,24 @@ impl BmpStation {
                             .is_empty();
                         if fresh_stream && (!peers_speak || peers_up) {
                             sess.set_up(true);
+                        }
+                        // AFTER the raise, never inside the GC block
+                        // above. On a reconnect the first frame
+                        // deliberately does not raise — prior-stream
+                        // routes are still in the mirror — so the
+                        // session is still DOWN at the old epoch when
+                        // the GC runs, and the raise immediately below
+                        // it opens a new one. Marking before the raise
+                        // therefore stamped the epoch that was ending,
+                        // and `set_up` cleared it a line later; with
+                        // the event one-shot per connection nothing
+                        // ever marked again, so an ordinary BMP
+                        // reconnect left the second tier's deferral
+                        // permanently demoted (review finding). The
+                        // epoch this GC belongs to is whichever one is
+                        // current once the raise has had its say.
+                        if gc_just_ran {
+                            sess.mark_reconciled();
                         }
                     }
                 }

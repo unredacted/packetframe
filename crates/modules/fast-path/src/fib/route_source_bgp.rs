@@ -496,6 +496,18 @@ impl BgpListener {
                                     // — and nothing else — as grounds to
                                     // trust an authority report again
                                     // after a session flap.
+                                    //
+                                    // Safe HERE, unlike the BMP station,
+                                    // because this arm is gated on
+                                    // `last_update` being set — and that
+                                    // is assigned in the same block that
+                                    // raises on the first UPDATE, so the
+                                    // epoch is already open. Marking
+                                    // before a raise stamps the epoch
+                                    // that is ending and `set_up` clears
+                                    // it a moment later (review finding,
+                                    // on the BMP path). Do not move this
+                                    // above the raise.
                                     if let Some(sess) = &self.cfg.session {
                                         sess.mark_reconciled();
                                     }
