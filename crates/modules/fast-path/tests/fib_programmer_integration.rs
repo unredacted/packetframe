@@ -1967,6 +1967,85 @@ fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
     );
 }
 
+/// `has_session_routes` answers for route-source peers only.
+///
+/// The mirror is shared with the neighbour resolver's `local-prefix`
+/// /32s, which are resident for the daemon's life and belong to no
+/// session. A caller asking "did the previous stream leave anything
+/// behind" — the BMP station, at every stream boundary — must see a
+/// clean slate when the session's own routes are gone, or no stream
+/// ever earns its first-frame liveness raise.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn only_route_source_peers_count_as_session_routes() {
+    let h = ProgrammerHarness::new();
+    let session_peer = PeerId(0x6060);
+    let local_peer = PeerId::local_arp(33);
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 3, 0, 1));
+    let session_prefix = IpPrefix::V4 {
+        addr: [198, 18, 30, 0],
+        prefix_len: 24,
+    };
+    let local_prefix = IpPrefix::V4 {
+        addr: [10, 3, 0, 9],
+        prefix_len: 32,
+    };
+
+    let add = |peer: PeerId, prefix: IpPrefix| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![nh],
+        path_id: None,
+        local_pref: None,
+    };
+
+    h.run(async {
+        assert!(
+            !h.handle.has_session_routes().await.expect("query"),
+            "a fresh programmer holds no session routes"
+        );
+        h.handle
+            .apply_route_event(add(session_peer, session_prefix))
+            .await
+            .expect("session route");
+        assert!(
+            h.handle.has_session_routes().await.expect("query"),
+            "a route-source advertisement counts"
+        );
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: session_peer,
+                prefix: session_prefix,
+                path_id: None,
+            })
+            .await
+            .expect("withdraw session route");
+        assert!(
+            !h.handle.has_session_routes().await.expect("query"),
+            "withdrawing the session's last route leaves a clean slate"
+        );
+        // The local /32 arrives and must not resurrect the answer.
+        h.handle
+            .apply_route_event(add(local_peer, local_prefix))
+            .await
+            .expect("local-prefix route");
+        assert!(
+            !h.handle.has_session_routes().await.expect("query"),
+            "a local-prefix /32 belongs to no session — counting it denies \
+             every future stream its first-frame raise"
+        );
+        // ...and does not mask a real one either.
+        h.handle
+            .apply_route_event(add(session_peer, session_prefix))
+            .await
+            .expect("session route again");
+        assert!(
+            h.handle.has_session_routes().await.expect("query"),
+            "a session route alongside a local one still counts"
+        );
+    });
+}
+
 /// Re-advertising an identical nexthop set announces nothing.
 ///
 /// Not an optimisation: under a peering flap the same prefix is

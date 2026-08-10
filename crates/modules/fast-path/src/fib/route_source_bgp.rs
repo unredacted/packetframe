@@ -534,22 +534,6 @@ impl BgpListener {
                 )));
             }
             BgpMessage::Update(update) => {
-                *last_update = Some(Instant::now());
-                *updates_seen += 1;
-                if *updates_seen == 1 {
-                    // The stream has started; see the handshake note
-                    // for why this — and not post-stream silence — is
-                    // where the session becomes live.
-                    if let Some(sess) = &self.cfg.session {
-                        sess.set_up(true);
-                    }
-                }
-                let now_unix = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                self.last_update_unix.store(now_unix, Ordering::Relaxed);
-
                 // Pretend the peer-IP for Elementor is the listen
                 // address (bird-side IP isn't carried in BGP UPDATE
                 // we know it from the connection, but Elementor
@@ -579,6 +563,58 @@ impl BgpListener {
                         elems.len(),
                         MAX_ELEMS_PER_UPDATE
                     )));
+                }
+                // ACCEPTED — and not one line earlier. Everything below
+                // records this UPDATE as stream evidence, and the cap
+                // above closes the session, so recording it first meant
+                // publishing a feed EPOCH for an UPDATE that never
+                // applied. A runtime sampling that transient raise
+                // during an adopted deferral baselines on it, the next
+                // healthy connection reads as a flap, and the
+                // attestation is gone for good (review finding; the
+                // BMP path had the same ordering).
+                *last_update = Some(Instant::now());
+                *updates_seen += 1;
+                self.last_update_unix.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                    Ordering::Relaxed,
+                );
+                if *updates_seen == 1 {
+                    // The stream has started; see the handshake note
+                    // for why this — and not post-stream silence — is
+                    // where the session becomes live.
+                    //
+                    // DELIBERATELY UNLIKE `BmpStation`, which withholds
+                    // this raise while a previous stream's routes may
+                    // still sit in the mirror (`stale_state_possible`)
+                    // and waits for InitiationComplete's GC. The
+                    // asymmetry is the point, not an oversight: that
+                    // wait is five seconds of UPDATE silence, and a
+                    // live DFZ feed does not go quiet for five seconds
+                    // — measured on the shadow 2026-08-09, 91 minutes
+                    // of session and zero InitiationComplete firings.
+                    // Porting the guard here would re-create #152 on
+                    // the one path the fleet actually runs, trading a
+                    // narrow staleness window for a reconciliation that
+                    // never happens at all.
+                    //
+                    // What covers the window instead: a reconnect's
+                    // stale credit only reaches the floor door if the
+                    // stream ALSO stalls immediately (a streaming dump
+                    // runs orders of magnitude above the quiet rate),
+                    // and on any deployment with a completeness
+                    // authority the drift a stale mirror shows against
+                    // bird's current count vetoes the release outright.
+                    // The residual is an unattested deployment whose
+                    // feed reconnects and then stops mid-dump; it is
+                    // named here rather than closed, because closing it
+                    // the obvious way is worse.
+                    if let Some(sess) = &self.cfg.session {
+                        sess.set_up(true);
+                    }
                 }
                 if let Some(sess) = &self.cfg.session {
                     // Stream activity in ROUTE-ELEMENT units, changed

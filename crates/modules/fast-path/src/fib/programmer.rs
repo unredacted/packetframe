@@ -244,6 +244,25 @@ impl FibProgrammerHandle {
             .map_err(|_| ProgrammerError::Shutdown)?;
         rx.await.map_err(|_| ProgrammerError::Shutdown)
     }
+
+    /// Whether any advertisement from a ROUTE-SOURCE peer is still in
+    /// the mirror.
+    ///
+    /// Deliberately narrower than [`Self::mirror_counts`], which counts
+    /// the whole shared mirror — including the synthetic `local-prefix`
+    /// /32s and /128s the neighbour resolver injects through this same
+    /// handle under [`PeerId::local_arp`]. Those are resident for the
+    /// daemon's life and belong to no session, so a caller asking "did
+    /// the previous stream leave anything behind" gets a permanent
+    /// `true` from them and never sees a clean slate (review finding).
+    pub async fn has_session_routes(&self) -> Result<bool, ProgrammerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::HasSessionRoutes { reply: tx })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown)?;
+        rx.await.map_err(|_| ProgrammerError::Shutdown)
+    }
 }
 
 /// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
@@ -307,6 +326,9 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
                 Command::MirrorCounts { reply } => {
                     let _ = reply.send((0, 0));
                 }
+                Command::HasSessionRoutes { reply } => {
+                    let _ = reply.send(false);
+                }
                 // Fire-and-forget; nothing to record or reply to.
                 Command::SetCacheEnabled { .. } | Command::SetNexthopPin { .. } => {}
             }
@@ -336,6 +358,9 @@ enum Command {
     MirrorCounts {
         reply: oneshot::Sender<(usize, usize)>,
     },
+    /// Report whether any route-source peer still holds an
+    /// advertisement. See [`FibProgrammerHandle::has_session_routes`].
+    HasSessionRoutes { reply: oneshot::Sender<bool> },
     /// Flip the destination cache on or off. Fire-and-forget: config
     /// apply and SIGHUP reconcile send this instead of touching
     /// FIB_CACHE_CFG themselves — the programmer is the map's sole
@@ -793,6 +818,17 @@ impl FibProgrammer {
             }
             Command::MirrorCounts { reply } => {
                 let _ = reply.send((self.routes_v4.len(), self.routes_v6.len()));
+            }
+            Command::HasSessionRoutes { reply } => {
+                // `routes_by_peer` drops a peer's entry when its last
+                // prefix goes, so a present key means live
+                // advertisements. Local-arp peers are the resolver's
+                // synthetic /32s, not any session's.
+                let any = self
+                    .routes_by_peer
+                    .keys()
+                    .any(|p| p.as_local_arp_ifindex().is_none());
+                let _ = reply.send(any);
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
             Command::SetNexthopPin { ip, pin } => self.set_nexthop_pin(ip, pin),

@@ -242,17 +242,27 @@ impl BmpStation {
     /// is the exact evidence this function exists to refuse (review
     /// finding).
     ///
+    /// It asks for ROUTE-SOURCE advertisements, not for a raw route
+    /// count. The mirror is SHARED: the neighbour resolver injects
+    /// `local-prefix` /32s and /128s through this same handle, they are
+    /// resident for the daemon's life, and they belong to no session —
+    /// so counting them meant every reconnect found "prior state", no
+    /// stream ever earned its first-frame raise, and a continuously
+    /// active feed could stay down indefinitely (review finding). Nor
+    /// can they be the stale floor credit this guards: a handful of
+    /// local /32s is nowhere near capacity/16.
+    ///
     /// Both families count. Only v4 reaches VPP today
     /// (`FamilyPolicy::V4Only`), so a v6-only remnant carries no floor
     /// credit and this over-defers — but the station has no business
     /// knowing the second tier's family policy, and over-deferring is
-    /// the safe direction. An unavailable count reads as "possible"
+    /// the safe direction. An unavailable answer reads as "possible"
     /// for the same reason.
     async fn mirror_holds_state(&self) -> bool {
-        match self.prog_handle.mirror_counts().await {
-            Ok((v4, v6)) => v4 + v6 > 0,
+        match self.prog_handle.has_session_routes().await {
+            Ok(any) => any,
             Err(e) => {
-                warn!(error = %e, "mirror count unavailable; assuming prior-stream state remains");
+                warn!(error = %e, "mirror query unavailable; assuming prior-stream state remains");
                 true
             }
         }
