@@ -32,7 +32,7 @@ use aya::maps::{Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
-use packetframe_fast_path::fib::programmer::FibProgrammer;
+use packetframe_fast_path::fib::programmer::{FibProgrammer, ECMP_GROUPS_CAP};
 use packetframe_fast_path::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_FAMILY_V4,
     NH_FAMILY_V6, NH_STATE_INCOMPLETE,
@@ -1804,6 +1804,166 @@ fn a_withdrawal_reaches_the_sink_even_when_the_local_delete_fails() {
         calls.contains(&SinkCall::Withdrawn(prefix)),
         "the second tier must hear the withdrawal even though this tier's \
          delete failed, or it forwards a withdrawn prefix forever: {calls:?}"
+    );
+}
+
+/// A GC whose recompute failed keeps reporting failure until it
+/// actually reconciles — and then announces the corrected set.
+///
+/// `gc_unseen` drains the unseen advertisements before recomputing, so
+/// its failure is not retryable by re-running the sweep: the victims
+/// are gone and the next GC collects none. Reporting `Ok(0)` there is
+/// the dangerous answer, because the prefix is still installed with the
+/// *withdrawn* stream's nexthops and the second tier reads a successful
+/// GC as "the mirror is current" — which is exactly the evidence the
+/// BMP station clears its stale-state suspicion on.
+///
+/// The failure is injected by exhausting the ECMP group pool: after the
+/// GC drops one of the target's two advertisements, the remaining
+/// nexthop set is a new signature and has nowhere to allocate. Freeing
+/// a group afterwards proves the debt clears on reconciliation rather
+/// than latching.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let peer_old = PeerId(0x5150);
+    let peer_new = PeerId(0x5151);
+    let target = IpPrefix::V4 {
+        addr: [198, 18, 20, 0],
+        prefix_len: 24,
+    };
+    let nh_old = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1));
+    let nh_a = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 2));
+    let nh_b = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 3));
+
+    let add = |peer: PeerId, prefix: IpPrefix, nexthops: Vec<IpAddr>| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops,
+        path_id: None,
+        local_pref: None,
+    };
+
+    // The target takes a group of its own first, so exhausting the pool
+    // below cannot deny it the set it is already installed with.
+    h.run(async {
+        h.handle
+            .apply_route_event(add(peer_old, target, vec![nh_old]))
+            .await
+            .expect("target via the old stream");
+        h.handle
+            .apply_route_event(add(peer_new, target, vec![nh_a, nh_b]))
+            .await
+            .expect("target via the new stream");
+    });
+
+    // Fill the ECMP pool with distinct pairs until allocation refuses.
+    // Discovered rather than hard-coded: a capacity change must not
+    // turn this into a test that exercises the ordinary path.
+    let mut filler: Vec<IpPrefix> = Vec::new();
+    let exhausted = h.run(async {
+        for i in 0..(ECMP_GROUPS_CAP + 8) {
+            let prefix = IpPrefix::V4 {
+                addr: [100, 64, (i >> 8) as u8, (i & 0xff) as u8],
+                prefix_len: 32,
+            };
+            let n1 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + i * 2));
+            let n2 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + i * 2 + 1));
+            if h.handle
+                .apply_route_event(add(peer_new, prefix, vec![n1, n2]))
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            filler.push(prefix);
+        }
+        false
+    });
+    assert!(
+        exhausted,
+        "the ECMP pool never filled — this test cannot inject its failure"
+    );
+
+    // New session: everything is re-announced except the target's old
+    // advertisement, which is what the GC must withdraw.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("resync");
+        for (i, prefix) in filler.iter().enumerate() {
+            let n1 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + (i as u32) * 2));
+            let n2 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + (i as u32) * 2 + 1));
+            h.handle
+                .apply_route_event(add(peer_new, *prefix, vec![n1, n2]))
+                .await
+                .expect("re-announce filler");
+        }
+        h.handle
+            .apply_route_event(add(peer_new, target, vec![nh_a, nh_b]))
+            .await
+            .expect("re-announce target");
+    });
+
+    let first = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        first.is_err(),
+        "the GC recompute was supposed to fail on an exhausted pool"
+    );
+    assert!(
+        !sink
+            .calls()
+            .contains(&SinkCall::Resolved(target, vec![nh_a, nh_b])),
+        "the corrected set cannot have been announced — the recompute failed"
+    );
+
+    // The regression: the sweep finds no victims this time, and used to
+    // report success over a prefix still carrying the withdrawn
+    // stream's nexthop.
+    let retry = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        retry.is_err(),
+        "a GC that collected no victims must not report success while a \
+         previous GC's recompute is still owed"
+    );
+
+    // Free a group and let the grace queue release it, then the debt
+    // must clear and the second tier must hear the corrected set.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer_new,
+                prefix: filler[0],
+                path_id: None,
+            })
+            .await
+            .expect("free one filler");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    });
+    let settled = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        settled.is_ok(),
+        "with a group free the owed recompute must succeed: {settled:?}"
+    );
+    assert!(
+        sink.calls()
+            .contains(&SinkCall::Resolved(target, vec![nh_a, nh_b])),
+        "the second tier must end up with the post-GC nexthop set: {:?}",
+        sink.calls()
     );
 }
 

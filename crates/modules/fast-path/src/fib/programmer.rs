@@ -524,6 +524,18 @@ pub struct FibProgrammer {
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
 
+    /// Prefixes whose GC recompute failed and has not since succeeded.
+    ///
+    /// `gc_unseen` drains the unseen advertisements before recomputing,
+    /// so a failure there is not retryable by re-running the sweep: the
+    /// victims are gone, the next GC collects none, and it would report
+    /// a vacuous `Ok` over a prefix still installed with the withdrawn
+    /// stream's nexthops — which a second tier reads as "the GC
+    /// finished, the mirror is current" (review finding). Retried at
+    /// the next GC and cleared by any successful recompute of the
+    /// prefix; while non-empty, the GC is not complete and says so.
+    gc_recompute_owed: HashSet<IpPrefix>,
+
     // --- Second tier (Phase 4) ---
     /// Where the resolved FIB is announced, when a second forwarding
     /// tier is configured. `None` in every harness and in any run
@@ -701,6 +713,7 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
+                gc_recompute_owed: HashSet::new(),
                 route_sink: None,
                 cache_cfg,
                 cache_enabled: false,
@@ -1432,14 +1445,35 @@ impl FibProgrammer {
             }
         }
         let count = victims.len();
-        let mut touched: HashSet<IpPrefix> = HashSet::new();
+        // Carry forward whatever a previous GC left unreconciled — see
+        // `gc_recompute_owed`. Starting from an empty set is what made a
+        // retry report success over work it had not done.
+        let mut touched: HashSet<IpPrefix> = std::mem::take(&mut self.gc_recompute_owed);
         for (prefix, (peer_id, path_id)) in victims {
             if self.remove_advertisement(peer_id, &prefix, path_id) {
                 touched.insert(prefix);
             }
         }
+        // Every prefix gets its attempt. A `?` here abandoned the rest
+        // of the sweep with their advertisements already drained, and
+        // `touched` is a HashSet, so *which* prefixes were abandoned
+        // depended on iteration order (review finding).
+        let mut first_err: Option<ProgrammerError> = None;
         for prefix in touched {
-            self.recompute_fib_entry(prefix)?;
+            if let Err(e) = self.recompute_fib_entry(prefix) {
+                self.gc_recompute_owed.insert(prefix);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            warn!(
+                owed = self.gc_recompute_owed.len(),
+                error = %e,
+                "GC recompute failed; prefixes retained for the next GC"
+            );
+            return Err(e);
         }
         Ok(count)
     }
@@ -1536,7 +1570,23 @@ impl FibProgrammer {
     /// stay safe across the transition; full tear-downs free
     /// immediately because the BPF LPM entry is gone and no new
     /// lookup can land on the prior IDs.
+    ///
+    /// Success clears any GC debt on `prefix` — see
+    /// [`Self::gc_recompute_owed`]. That is wrapped around every exit
+    /// rather than written at the one the GC takes, because the
+    /// no-change shortcut is also a reconciliation: it can only fire
+    /// when the mirror already holds the desired set, and the mirror
+    /// commit and the sink announcement have no fallible call between
+    /// them, so the second tier is current whenever it does.
     fn recompute_fib_entry(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
+        let outcome = self.recompute_fib_entry_inner(prefix);
+        if outcome.is_ok() {
+            self.gc_recompute_owed.remove(&prefix);
+        }
+        outcome
+    }
+
+    fn recompute_fib_entry_inner(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
         // 1. Compute the desired sorted, deduplicated NH set, restricted
         // to advertisements at the maximum local-pref tier present on
         // this prefix. This preserves operator-encoded BGP preferences
