@@ -534,6 +534,26 @@ enum DeferredResync {
         /// every ordinary release (caught by the completeness test
         /// before it shipped).
         epoch: Option<u64>,
+        /// When this deferral first OBSERVED the epoch advance, while
+        /// the demotion still stands. `None` means no outstanding flap.
+        ///
+        /// The demotion has to be revocable or it is a wedge, not a
+        /// safeguard. What a flap invalidates is the AUTHORITY'S WORD,
+        /// because a report from before the reconnect cannot attest
+        /// that routes belong to the current stream — and the integrity
+        /// checker publishes a new one every few minutes, which can.
+        /// Latching `flapped` forever meant a single ordinary session
+        /// bounce (bird restart, hold-timer expiry) permanently
+        /// disabled the completeness door: a below-floor authoritative
+        /// deployment could then never release at all, and an
+        /// above-floor churning one fell to the zero-rate posture it
+        /// never satisfies (review finding). So the demotion lasts
+        /// exactly until a report timestamped after this moment
+        /// arrives, at which point the epoch re-baselines and the
+        /// attested path returns. A report that is merely NEWER is
+        /// enough: its own drift check is what judges whether the
+        /// current stream has actually converged.
+        flap_at: Option<std::time::Instant>,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -1048,6 +1068,7 @@ impl Observe for ObserveView {
                     mut last_request,
                     mut restoring,
                     mut epoch,
+                    mut flap_at,
                 } => {
                     // ONE observation for both — see `FeedLiveness`. Read
                     // separately, `live` could come from after a raise
@@ -1068,14 +1089,48 @@ impl Observe for ObserveView {
                     // reconnect reopens the stream epoch, and a cached
                     // report cannot attest that routes belong to the
                     // current one — so a flapped deferral takes the
-                    // full unattested posture until it releases
-                    // (review finding). The fleet's steady 40 s release
-                    // never flaps and never pays this.
+                    // full unattested posture UNTIL A REPORT NEWER THAN
+                    // THE FLAP ARRIVES (see `flap_at`; latching it
+                    // forever turned an ordinary session bounce into a
+                    // deferral that could never release). The fleet's
+                    // steady 40 s release never flaps and never pays
+                    // this at all.
                     let current_epoch = liveness.map(|l| l.epoch);
                     if live && epoch.is_none() {
                         epoch = current_epoch;
                     }
-                    let flapped = matches!((epoch, current_epoch), (Some(e), Some(c_)) if c_ != e);
+                    if matches!((epoch, current_epoch), (Some(e), Some(c_)) if c_ != e)
+                        && flap_at.is_none()
+                    {
+                        // Stamped from the SAME clock as
+                        // `CompletenessReport::at`, not from the tick's
+                        // `now`. The two are the same source in
+                        // production and diverge under a driven clock,
+                        // and comparing a fabricated tick time against
+                        // a real publication time is not a comparison —
+                        // it is the shape `TableCompleteness::verdict`
+                        // already avoids by aging reports against
+                        // `Instant::now()`.
+                        flap_at = Some(std::time::Instant::now());
+                    }
+                    if let Some(seen_at) = flap_at {
+                        // A comparison MADE after the flap describes the
+                        // current session. Re-baseline onto the epoch
+                        // that report belongs to, and let the attested
+                        // door back in; if the new stream has not
+                        // actually converged, the report's own drift is
+                        // what says so — and says it as a veto.
+                        let fresh_report = c
+                            .completeness
+                            .as_ref()
+                            .and_then(|h| h.latest())
+                            .is_some_and(|r| r.at > seen_at);
+                        if fresh_report {
+                            epoch = current_epoch;
+                            flap_at = None;
+                        }
+                    }
+                    let flapped = flap_at.is_some();
                     let attested = c.completeness.is_some() && !flapped;
                     let view = gate.observe(
                         now,
@@ -1174,6 +1229,7 @@ impl Observe for ObserveView {
                             last_request,
                             restoring,
                             epoch,
+                            flap_at,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1200,6 +1256,7 @@ impl Observe for ObserveView {
                             last_request,
                             restoring,
                             epoch,
+                            flap_at,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1305,6 +1362,7 @@ impl Observe for ObserveView {
                                 last_request,
                                 restoring: true,
                                 epoch,
+                                flap_at,
                             });
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
@@ -1577,6 +1635,7 @@ impl Effects for EffectsView {
                 last_request: None,
                 restoring: false,
                 epoch: None,
+                flap_at: None,
             });
             return Ok(());
         }

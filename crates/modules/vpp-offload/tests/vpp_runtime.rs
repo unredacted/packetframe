@@ -2213,3 +2213,96 @@ fn completeness_releases_a_below_floor_table_promptly() {
     assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
+
+/// A session flap demotes the attested door, and a report published
+/// after the flap restores it.
+///
+/// The demotion is right — a report from before the reconnect cannot
+/// attest that routes belong to the current stream — but it has to
+/// expire, or an ordinary bird restart during a deferral is terminal:
+/// a below-floor table has no other door, so it would never release at
+/// all. Both halves are asserted, because a fix that simply stopped
+/// demoting would pass a test that only checked the second.
+#[test]
+fn a_flap_demotes_attestation_only_until_a_newer_report_arrives() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+    let (fake, shared, log, rt, session) = steered::fixture("steered-reflap", &[], 160);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    let mut d = Driver::new();
+    let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
+
+    *shared.lock().unwrap() = (0..4).map(|i| fake_vpp::v4(0, i)).collect();
+    // Raise, then let the deferral OBSERVE the raise: the epoch is
+    // baselined at the first live observation, so flapping before any
+    // tick would baseline onto the post-flap epoch and there would be
+    // no flap to see. Nothing releases in this window — with no report
+    // published the authority word is a veto.
+    session.set_up(true);
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..40 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "no report yet — the authority vetoes, nothing has released"
+    );
+
+    // A report lands, and THEN the session bounces, so the report
+    // predates the current stream and cannot attest it.
+    handle.publish(CompletenessReport {
+        authority_routes: 4,
+        mirror_routes: 4,
+        at: std::time::Instant::now(),
+    });
+    session.set_up(false);
+    session.set_up(true);
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..400 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a report older than the flap cannot attest the current stream"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing may be unsteered on pre-flap evidence: {:?}",
+        log.lock().unwrap()
+    );
+
+    // The integrity checker publishes again for the recovered session.
+    handle.publish(CompletenessReport {
+        authority_routes: 4,
+        mirror_routes: 4,
+        at: std::time::Instant::now(),
+    });
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "a post-flap report restores the attested release"
+    );
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
