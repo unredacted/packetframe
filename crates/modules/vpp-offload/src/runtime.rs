@@ -1049,7 +1049,13 @@ impl Observe for ObserveView {
                     mut restoring,
                     mut epoch,
                 } => {
-                    let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
+                    // ONE observation for both — see `FeedLiveness`. Read
+                    // separately, `live` could come from after a raise
+                    // and the epoch from before its increment, and the
+                    // next tick's higher epoch reads as a flap on what
+                    // was an ordinary first raise (review finding).
+                    let liveness = c.feed_session.as_ref().map(|f| f.liveness());
+                    let live = liveness.is_some_and(|l| l.up);
                     // Rate scaled to the mirror as observed — never
                     // to capacity, which is a ceiling, not a table.
                     // The floor door's quiet requirement depends on
@@ -1065,7 +1071,7 @@ impl Observe for ObserveView {
                     // full unattested posture until it releases
                     // (review finding). The fleet's steady 40 s release
                     // never flaps and never pays this.
-                    let current_epoch = c.feed_session.as_ref().map(|f| f.epoch_count());
+                    let current_epoch = liveness.map(|l| l.epoch);
                     if live && epoch.is_none() {
                         epoch = current_epoch;
                     }
@@ -1232,7 +1238,10 @@ impl Observe for ObserveView {
                         // populated ledger), the revocation path
                         // re-steers, and a later release diffs against
                         // a recovered source.
-                        let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
+                        // One observation for liveness and epoch, as at
+                        // the deferral site above.
+                        let liveness_now = feed_session.as_ref().map(|f| f.liveness());
+                        let live_now = liveness_now.is_some_and(|l| l.up);
                         let have_now = source.route_count();
                         let seq_now = source.change_seq();
                         let pulses_now = feed_session.as_ref().map_or(0, |f| f.pulse_count());
@@ -1255,7 +1264,7 @@ impl Observe for ObserveView {
                         // ~2k elements of it here undid the zero-rate
                         // release one step later (review finding).
                         let flapped_now = matches!(
-                            (epoch, feed_session.as_ref().map(|f| f.epoch_count())),
+                            (epoch, liveness_now.map(|l| l.epoch)),
                             (Some(e), Some(c_)) if c_ != e
                         );
                         let churn_budget = if completeness.is_some() && !flapped_now {

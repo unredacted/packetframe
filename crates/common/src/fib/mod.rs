@@ -370,7 +370,21 @@ impl TableCompleteness {
 /// the hundreds, so no husk-size bound works either).
 #[derive(Debug, Default)]
 pub struct FeedSession {
-    up: std::sync::atomic::AtomicBool,
+    /// Liveness and epoch in ONE word: bit 0 is up, the rest is the
+    /// epoch count.
+    ///
+    /// They were two atomics, and a consumer reading them separately
+    /// could see `up` from after a raise and the epoch from before its
+    /// increment — caching a stale baseline, then reading the
+    /// increment on its next tick and classifying an ordinary FIRST
+    /// raise as a session flap (review finding). That costs the
+    /// attestation, which demotes the release gate to its zero-rate
+    /// posture, which a continuously churning feed never satisfies:
+    /// the deferral never releases. Publishing the epoch first with
+    /// release/acquire would close that direction only; one word makes
+    /// the pair inseparable in both, and there is no ordering left to
+    /// reason about at the call sites.
+    state: std::sync::atomic::AtomicU64,
     /// Stream activity the mirror cannot see: a reconnect's dump
     /// REANNOUNCES mostly-unchanged routes, which take the
     /// programmer's no-change early return and never reach the mirror
@@ -380,11 +394,26 @@ pub struct FeedSession {
     /// folds it into its activity rate: quiet means the STREAM went
     /// quiet, not merely that nothing changed.
     pulses: std::sync::atomic::AtomicU64,
-    /// Down-to-up transitions. See [`Self::epoch_count`].
-    epochs: std::sync::atomic::AtomicU64,
+}
+
+/// A coupled reading of a [`FeedSession`]'s liveness and epoch.
+///
+/// [`FeedSession::liveness`] is the only reader, deliberately: separate
+/// `is_up()` / `epoch_count()` accessors are what let a consumer mix a
+/// post-raise liveness with a pre-increment epoch. A consumer deciding
+/// "live, and is this the same session I baselined against" reaches
+/// that decision from one observation or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedLiveness {
+    pub up: bool,
+    /// Down-to-up transitions. See [`FeedSession::set_up`].
+    pub epoch: u64,
 }
 
 impl FeedSession {
+    /// Bit 0 of `state`; the epoch occupies the remaining 63.
+    const UP_BIT: u64 = 1;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -394,27 +423,33 @@ impl FeedSession {
     /// back to `false` the moment the connection handler returns,
     /// including on hold-timer expiry, which is what bounds how long
     /// a hung session can keep this stale.
+    /// A down-to-up transition opens a session EPOCH, published in the
+    /// same store as the liveness it belongs to. Consumers that cached
+    /// evidence across the boundary compare epoch counts to learn the
+    /// world may have been reloaded underneath them (review finding: an
+    /// attested release trusted a pre-reconnect report against a
+    /// mid-reannounce mirror).
     pub fn set_up(&self, up: bool) {
-        let was = self.up.swap(up, std::sync::atomic::Ordering::Relaxed);
-        if up && !was {
-            // A down-to-up transition opens a session EPOCH. Consumers
-            // that cached evidence across the boundary can compare
-            // epoch counts to learn the world may have been reloaded
-            // underneath them (review finding: an attested release
-            // trusted a pre-reconnect report against a mid-reannounce
-            // mirror).
-            self.epochs
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.state.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| {
+                let was_up = cur & Self::UP_BIT != 0;
+                let epoch = cur >> 1;
+                let epoch = if up && !was_up { epoch + 1 } else { epoch };
+                Some((epoch << 1) | u64::from(up))
+            },
+        );
+    }
+
+    /// Liveness and epoch as one observation. Prefer this wherever both
+    /// are used — see [`FeedLiveness`].
+    pub fn liveness(&self) -> FeedLiveness {
+        let s = self.state.load(std::sync::atomic::Ordering::Acquire);
+        FeedLiveness {
+            up: s & Self::UP_BIT != 0,
+            epoch: s >> 1,
         }
-    }
-
-    /// How many down-to-up transitions this session has seen.
-    pub fn epoch_count(&self) -> u64 {
-        self.epochs.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn is_up(&self) -> bool {
-        self.up.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// One unit of stream activity, whether or not it changed anything.
@@ -653,6 +688,51 @@ impl std::error::Error for NeighError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The epoch counts down-to-up transitions and rides in the same
+    /// word as the liveness it belongs to.
+    ///
+    /// This pins the bit-packing's arithmetic — a shift or mask error
+    /// would silently mis-count epochs, and mis-counted epochs read as
+    /// session flaps, which cost the release gate its attestation. It
+    /// does NOT prove the race it was written for: that a reader can
+    /// never pair a post-raise `up` with a pre-increment epoch is a
+    /// property of the single load, not of any sequence a test can
+    /// drive, and reproducing the old interleaving would take a
+    /// busy-loop whose failure is probabilistic either way.
+    #[test]
+    fn liveness_and_epoch_move_together() {
+        let s = FeedSession::new();
+        assert_eq!(
+            s.liveness(),
+            FeedLiveness {
+                up: false,
+                epoch: 0
+            }
+        );
+        s.set_up(true);
+        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 1 });
+        // A repeated raise is not a new epoch — the session never left.
+        s.set_up(true);
+        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 1 });
+        // Nor does lowering discard the epoch: consumers compare it
+        // across the boundary, which is the whole point.
+        s.set_up(false);
+        assert_eq!(
+            s.liveness(),
+            FeedLiveness {
+                up: false,
+                epoch: 1
+            }
+        );
+        s.set_up(true);
+        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 2 });
+        // Pulses share the struct but not the word.
+        s.pulse_n(7);
+        s.pulse();
+        assert_eq!(s.pulse_count(), 8);
+        assert_eq!(s.liveness(), FeedLiveness { up: true, epoch: 2 });
+    }
 
     #[test]
     fn ip_prefix_variants_are_distinct() {
