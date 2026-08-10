@@ -1002,7 +1002,7 @@ fn run_loop(
             driver.api_health(now),
             fib,
             rs.resync_deferred,
-            rs.completeness_attested,
+            rs.authority,
             rs.port_links,
             rs.store_error.clone(),
             rs.drain_error.clone(),

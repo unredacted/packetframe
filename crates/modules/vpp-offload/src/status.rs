@@ -273,8 +273,8 @@ pub struct StatusSnapshot {
     /// FIB is deliberately left forwarding, so this reads as Degraded
     /// with the reason, never as steered-but-broken.
     pub resync_deferred: Option<(u64, u64)>,
-    /// See [`crate::runtime::RuntimeStatus::completeness_attested`].
-    pub completeness_attested: bool,
+    /// See [`crate::runtime::RuntimeStatus::authority`].
+    pub authority: crate::runtime::AuthorityPosture,
     pub ports: Vec<PortLink>,
     /// The runtime could not persist something it observed.
     ///
@@ -326,7 +326,9 @@ impl StatusSnapshot {
             api,
             fib,
             None,
-            false,
+            // No deferral in this shorthand, so the posture is unread;
+            // Absent is the honest default rather than a claim.
+            crate::runtime::AuthorityPosture::Absent,
             ports,
             None,
             None,
@@ -349,7 +351,7 @@ impl StatusSnapshot {
         api: ApiHealth,
         fib: FibSync,
         resync_deferred: Option<(u64, u64)>,
-        completeness_attested: bool,
+        authority: crate::runtime::AuthorityPosture,
         ports: Vec<PortLink>,
         store_error: Option<String>,
         drain_error: Option<String>,
@@ -369,7 +371,7 @@ impl StatusSnapshot {
             api,
             fib,
             resync_deferred,
-            completeness_attested,
+            authority,
             ports,
             store_error,
             drain_error,
@@ -599,7 +601,8 @@ impl StatusSnapshot {
                 // waiting for the growth to stop, because a loading
                 // feed passes through every count on its way to full
                 // and only quiescence says "done".
-                let msg = if have < want && self.completeness_attested {
+                use crate::runtime::AuthorityPosture;
+                let msg = if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
@@ -607,6 +610,21 @@ impl StatusSnapshot {
                          report agrees with the mirror — expected within one integrity \
                          interval (300 s). If it persists well beyond that, check the \
                          integrity checker and bird rather than the sizing"
+                    )
+                } else if have < want && self.authority == AuthorityPosture::DemotedByFlap {
+                    format!(
+                        "resync deferred: the route source holds {have} routes, below the \
+                         release floor of {want}; the adopted FIB keeps forwarding \
+                         untouched. The feed session reconnected under this deferral, so \
+                         the authority's report can no longer attest that the mirror is \
+                         THIS session's — a count can match while a reannouncement is \
+                         still mid-flight. Attestation returns when the source reports \
+                         its initiation-complete GC, which needs 5 s without updates: on \
+                         a continuously active DFZ feed that gap may never arrive, and \
+                         this deferral can hold indefinitely BY DESIGN. Nothing is \
+                         dropping — VPP forwards the FIB it was adopted with. To resolve \
+                         it, let the feed idle briefly, or restart the daemon once the \
+                         table is loaded so the adoption starts unsteered"
                     )
                 } else if have < want {
                     format!(

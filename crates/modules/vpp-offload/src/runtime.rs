@@ -450,7 +450,19 @@ impl SourceGate {
                 let ms = now.duration_since(prev).as_millis().max(1) as u64;
                 let mirror_delta = seq.saturating_sub(self.last_seq);
                 let pulse_delta = pulses.saturating_sub(self.last_pulses);
-                mirror_delta.max(pulse_delta).saturating_mul(1_000) / ms
+                // ROUNDED UP, so activity can never divide away. Ticks
+                // are not pinned to one second, and truncating integer
+                // division turned one pulse over two seconds into a
+                // rate of ZERO — which the unattested posture, whose
+                // quiet_rate IS zero to demand literal silence, then
+                // accepted as quiet and let the five-second clock run
+                // through actual stream activity (review finding).
+                // Overstating by at most 1/s is free against every
+                // mirror-scaled rate and is the safe direction anyway.
+                mirror_delta
+                    .max(pulse_delta)
+                    .saturating_mul(1_000)
+                    .div_ceil(ms)
             }
         };
         let rate_quiet = live && activity_per_sec <= quiet_rate;
@@ -863,9 +875,37 @@ impl Runtime {
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
-            completeness_attested: c.completeness.is_some(),
+            authority: if c.completeness.is_none() {
+                AuthorityPosture::Absent
+            } else if matches!(
+                &c.deferred_resync,
+                Some(DeferredResync::AwaitingFallback { demoted: true, .. })
+            ) {
+                AuthorityPosture::DemotedByFlap
+            } else {
+                AuthorityPosture::Attesting
+            },
         }
     }
+}
+
+/// What the completeness authority can currently say, for the health
+/// text.
+///
+/// Three states rather than a bool plus a second bool, because the
+/// interesting case is neither "configured" nor "absent": an authority
+/// that exists but whose word this deferral may not use. Reported as
+/// one field so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityPosture {
+    /// No `require-table-complete` handle; the proxies stand alone.
+    Absent,
+    /// Configured and usable.
+    Attesting,
+    /// Configured, but this deferral saw the feed flap and has not yet
+    /// seen the current epoch reconciled, so the authority's word
+    /// cannot be trusted to describe the current stream.
+    DemotedByFlap,
 }
 
 /// One coherent snapshot of the runtime's observable state, for the
@@ -894,11 +934,12 @@ pub struct RuntimeStatus {
     /// `Some((have, want))` while an adopted resync is deferred for a
     /// still-loading route source. See `Core::deferred_resync`.
     pub resync_deferred: Option<(u64, u64)>,
-    /// Whether a completeness authority is configured — the deferral
-    /// health text depends on it: an attested deployment's below-floor
-    /// wait resolves through the authority, and telling it to "add
-    /// bird" recommends the thing it already has.
-    pub completeness_attested: bool,
+    /// What the authority can say right now — the deferral health text
+    /// depends on it: an attested deployment's below-floor wait
+    /// resolves through the authority and telling it to "add bird"
+    /// recommends the thing it already has, while a demoted one is
+    /// waiting on something else entirely.
+    pub authority: AuthorityPosture,
 }
 
 impl Core {
@@ -1765,6 +1806,55 @@ mod tests {
     // Only the Linux-gated process tests need these.
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+
+    /// Activity cannot divide away, however slowly the tick ran.
+    ///
+    /// The unattested posture sets `quiet_rate` to ZERO precisely to
+    /// demand literal silence, so a rate that truncates to zero is not
+    /// a rounding detail — it is the difference between "the stream
+    /// stopped" and "the stream is running and we divided it away".
+    /// Ticks are not pinned to one second, so the interval is the
+    /// attacker here, not the volume.
+    #[test]
+    fn one_pulse_over_a_slow_tick_is_not_silence() {
+        let sample = |pulses| SourceSample {
+            have: 1_000,
+            seq: 0,
+            pulses,
+            live: true,
+        };
+        let mut gate = SourceGate::new(0, 0);
+        let t0 = std::time::Instant::now();
+        // First observation only baselines.
+        gate.observe(t0, sample(0), 0, UNATTESTED_QUIET_FOR);
+
+        // One pulse two seconds later: 1 * 1000 / 2000 truncates to 0,
+        // and 0 <= 0 read as quiet.
+        let v = gate.observe(
+            t0 + Duration::from_secs(2),
+            sample(1),
+            0,
+            UNATTESTED_QUIET_FOR,
+        );
+        assert!(
+            v.rate_quiet_for.is_none(),
+            "a pulse is activity at any tick spacing; the zero-rate \
+             posture must see it"
+        );
+
+        // And genuine silence across the same slow tick still reads
+        // quiet — the fix must not make the gate unsatisfiable.
+        let v = gate.observe(
+            t0 + Duration::from_secs(4),
+            sample(1),
+            0,
+            UNATTESTED_QUIET_FOR,
+        );
+        assert!(
+            v.rate_quiet_for.is_some(),
+            "no new pulses is silence, whatever the interval"
+        );
+    }
 
     struct EmptySource;
     impl RouteSource for EmptySource {
