@@ -366,6 +366,13 @@ impl BmpStation {
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
                                 self.saw_rm.store(true, Ordering::Relaxed);
+                                if let Some(sess) = &self.session {
+                                    // Changed or not, a frame is stream
+                                    // activity — reannouncement dumps
+                                    // never move the mirror, and the
+                                    // gate must read them as loud.
+                                    sess.pulse();
+                                }
                                 // The stream has started — see the
                                 // saw_rm field for why that, and not
                                 // any settle heuristic, is the raise.

@@ -1987,6 +1987,65 @@ fn a_stale_convergence_cannot_carry_a_shrunken_mirror() {
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
+/// A reconnect dump REANNOUNCES an unchanged table: the mirror never
+/// moves, so a mutation counter reads quiet while the stream is at
+/// full rate (review finding - the no-change early return in the
+/// programmer swallows every unchanged route before the tee). The
+/// session pulse counter is what keeps the gate loud: frames count,
+/// changed or not.
+#[test]
+fn a_reannouncement_dump_holds_the_gate_loud() {
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (_fake, _shared, log, rt, session) = steered::fixture("steered-reannounce", &full, 160);
+    session.set_up(true);
+    let mut d = Driver::new();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(Instant::now(), Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // Floor met (12 >= 10), session up, mirror frozen - and the stream
+    // hammering: 200 pulses per tick stays far above the 64/s quiet
+    // rate at any driver cadence. Nothing may release.
+    let mut now = Instant::now();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..100 {
+            for _ in 0..200 {
+                session.pulse();
+            }
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "an actively streaming dump must hold the gate, mirror movement or not"
+    );
+    assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+
+    // The stream ends: quiet is real now, and the cycle proceeds.
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
 /// The revocation window: the gate released, the unsteer was
 /// acknowledged - and the feed dropped before the dump ran. The
 /// adopted FIB is still whole, so the traffic goes BACK onto it

@@ -369,7 +369,18 @@ impl TableCompleteness {
 /// finding: neighbour-synthesized local routes alone can number in
 /// the hundreds, so no husk-size bound works either).
 #[derive(Debug, Default)]
-pub struct FeedSession(std::sync::atomic::AtomicBool);
+pub struct FeedSession {
+    up: std::sync::atomic::AtomicBool,
+    /// Stream activity the mirror cannot see: a reconnect's dump
+    /// REANNOUNCES mostly-unchanged routes, which take the
+    /// programmer's no-change early return and never reach the mirror
+    /// — so a mutation counter reads quiet while the dump is actively
+    /// streaming (review finding). The session owner bumps this on
+    /// every UPDATE / RouteMonitoring frame, and the release gate
+    /// folds it into its activity rate: quiet means the STREAM went
+    /// quiet, not merely that nothing changed.
+    pulses: std::sync::atomic::AtomicU64,
+}
 
 impl FeedSession {
     pub fn new() -> Self {
@@ -382,11 +393,23 @@ impl FeedSession {
     /// including on hold-timer expiry, which is what bounds how long
     /// a hung session can keep this stale.
     pub fn set_up(&self, up: bool) {
-        self.0.store(up, std::sync::atomic::Ordering::Relaxed);
+        self.up.store(up, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn is_up(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.up.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One frame of stream activity arrived, whether or not it changed
+    /// anything. See the field doc for why the mirror's own counter is
+    /// not enough.
+    pub fn pulse(&self) {
+        self.pulses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn pulse_count(&self) -> u64 {
+        self.pulses.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

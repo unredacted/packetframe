@@ -952,7 +952,15 @@ impl Observe for ObserveView {
         // hazard being deferred.
         if let Some(d) = c.deferred_resync {
             let have = c.source.route_count();
-            let seq = c.source.change_seq();
+            // Mirror mutations PLUS stream pulses: a reconnect dump
+            // reannounces an unchanged table, the mirror never moves,
+            // and quiet must mean the STREAM went quiet (review
+            // finding). Both counters are monotone, so their sum is a
+            // single honest activity counter. The gate baselines
+            // overwrite themselves on first observation, so a
+            // mirror-only baseline elsewhere cannot skew the rate.
+            let seq =
+                c.source.change_seq() + c.feed_session.as_ref().map_or(0, |f| f.pulse_count());
             match d {
                 DeferredResync::AwaitingFallback {
                     mut gate,
@@ -1097,7 +1105,8 @@ impl Observe for ObserveView {
                         // a recovered source.
                         let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
                         let have_now = source.route_count();
-                        let seq_now = source.change_seq();
+                        let seq_now = source.change_seq()
+                            + feed_session.as_ref().map_or(0, |f| f.pulse_count());
                         // An ABSOLUTE budget for the whole dump, never
                         // a dump-wide average: dividing by the dump's
                         // duration let a withdrawal burst early in a
@@ -1386,7 +1395,8 @@ impl Effects for EffectsView {
         if !c.steering.installed().is_empty() {
             let capacity = c.engine.route_capacity();
             let floor = (capacity / FALLBACK_FLOOR_DIVISOR).max(1);
-            let seq = c.source.change_seq();
+            let seq =
+                c.source.change_seq() + c.feed_session.as_ref().map_or(0, |f| f.pulse_count());
             tracing::info!(
                 floor,
                 "adopted VPP is steered, so reading its FIB waits: the dump freezes \
