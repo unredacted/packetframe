@@ -302,12 +302,18 @@ A restart over a steered VPP defers its reconciliation (the FIB dump
 freezes every VPP worker — `ip_route_dump` is not mp-safe — so it only
 runs against an unsteered VPP). The deferral releases through exactly
 **two** doors, both requiring the feed session up (raised when the
-stream STARTS: the first UPDATE for BGP, the first RouteMonitoring
-frame for BMP — PeerUp is bookkeeping and raises nothing, because it
-precedes the dump). "Quiet" means the STREAM went quiet: every frame
-counts toward the activity rate whether or not it changed the mirror,
-so a reconnect's reannouncement dump holds the gate loud until it
-actually ends:
+stream STARTS — with one deliberate exception. For BGP it is the first
+UPDATE of the session. For BMP it is the first RouteMonitoring frame of
+the daemon's FIRST connection only; on a BMP RECONNECT the session
+stays down until InitiationComplete (~5 s of stream quiet after the
+dump), because until its GC runs the mirror still counts the previous
+session's routes and would credit the release floor with stale
+evidence. So during a reconnect an operator will see RouteMonitoring
+traffic flowing while the gate still reads the feed as down — that is
+correct, not stuck. PeerUp is bookkeeping and never raises. "Quiet"
+means the STREAM went quiet: every frame counts toward the activity
+rate whether or not it changed the mirror, so a reannouncement dump
+holds the gate loud until it actually ends:
 
 1. **The floor**: the mirror holds ≥ `expected-routes`-derived
    capacity / 16 and has been rate-quiet for 2 s. This is the fleet's

@@ -173,6 +173,15 @@ pub struct BmpStation {
     /// the stale routes also never leave — deferring is correct for
     /// exactly as long as releasing would be wrong.
     connections: std::sync::atomic::AtomicU64,
+    /// The session pulse count at the moment liveness was last
+    /// LOWERED. The re-armable raise below requires stream evidence
+    /// newer than this — frames seen SINCE the lowering — so a later
+    /// peer epoch can re-establish the session (a one-shot raise left
+    /// it down for the socket's lifetime after any post-dump
+    /// last-peer-down; review finding), while a quiescence that
+    /// predates the lowering cannot: the raise needs a new stream,
+    /// not an old silence.
+    pulses_at_lower: std::sync::atomic::AtomicU64,
 }
 
 /// Re-export for callers building the station.
@@ -206,6 +215,17 @@ impl BmpStation {
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
             connections: std::sync::atomic::AtomicU64::new(0),
+            pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Lower the session and remember how much stream had been seen:
+    /// the re-armable raise demands evidence newer than this moment.
+    fn lower_session(&self) {
+        if let Some(sess) = &self.session {
+            self.pulses_at_lower
+                .store(sess.pulse_count(), std::sync::atomic::Ordering::Relaxed);
+            sess.set_up(false);
         }
     }
 
@@ -309,6 +329,8 @@ impl BmpStation {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
+                            } else {
+                                info!("BMP client disconnected cleanly");
                             }
                             // The connection ended, and per-peer state
                             // ended with it: whatever PeerUps this
@@ -318,11 +340,7 @@ impl BmpStation {
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(sess) = &self.session {
-                                sess.set_up(false);
-                            } else {
-                                info!("BMP client disconnected cleanly");
-                            }
+                            self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
                             // flips seen_this_session=false on all routes;
@@ -441,44 +459,56 @@ impl BmpStation {
                     }
                 }
                 _ = tick.tick() => {
-                    if init_complete_fired {
+                    let quiesced = last_route_monitoring
+                        .is_some_and(|last| last.elapsed() >= INIT_COMPLETE_QUIESCENCE);
+                    if !quiesced {
                         continue;
                     }
-                    if let Some(last) = last_route_monitoring {
-                        if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
-                            if let Err(e) = self
-                                .prog_handle
-                                .apply_route_event(RouteEvent::InitiationComplete)
-                                .await
-                            {
-                                warn!(error = %e, "InitiationComplete dispatch failed");
-                            } else {
-                                info!(
-                                    frames_parsed,
-                                    quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
-                                    "InitiationComplete fired"
-                                );
-                                init_complete_fired = true;
-                                // A reconnect's raise happens HERE — by
-                                // definition after the GC that removed
-                                // the prior session's floor-credit (see
-                                // the `connections` field). Same
-                                // peer-set guard as the first-frame
-                                // raise.
-                                let peers_speak = self
-                                    .saw_peer_up
-                                    .load(std::sync::atomic::Ordering::Relaxed);
-                                let peers_up = !self
-                                    .up_peers
-                                    .lock()
-                                    .expect("up_peers lock")
-                                    .is_empty();
-                                if !peers_speak || peers_up {
-                                    if let Some(sess) = &self.session {
-                                        sess.set_up(true);
-                                    }
-                                }
-                            }
+                    // The EVENT is one-shot per connection — the
+                    // programmer's GC semantics. The RAISE below is
+                    // deliberately not: a one-shot raise left the
+                    // session down for the socket's lifetime after any
+                    // post-dump last-peer-down, with a healthy later
+                    // epoch unable to re-establish it (review finding).
+                    if !init_complete_fired {
+                        if let Err(e) = self
+                            .prog_handle
+                            .apply_route_event(RouteEvent::InitiationComplete)
+                            .await
+                        {
+                            warn!(error = %e, "InitiationComplete dispatch failed");
+                            continue;
+                        }
+                        info!(
+                            frames_parsed,
+                            quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
+                            "InitiationComplete fired"
+                        );
+                        init_complete_fired = true;
+                    }
+                    // Re-armable raise: quiescence counts only when the
+                    // stream it followed is NEWER than the last
+                    // lowering — frames since, not silence since — so a
+                    // later peer epoch re-establishes the session while
+                    // an old silence cannot (the pulse counter crosses
+                    // this boundary; connection-local flags could not,
+                    // which is what the epoch machinery kept getting
+                    // wrong). Same peer-set guard as everywhere.
+                    if let Some(sess) = &self.session {
+                        let fresh_stream = sess.pulse_count()
+                            > self
+                                .pulses_at_lower
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                        let peers_speak = self
+                            .saw_peer_up
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let peers_up = !self
+                            .up_peers
+                            .lock()
+                            .expect("up_peers lock")
+                            .is_empty();
+                        if fresh_stream && (!peers_speak || peers_up) {
+                            sess.set_up(true);
                         }
                     }
                 }
@@ -507,9 +537,7 @@ impl BmpStation {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                if let Some(sess) = &self.session {
-                    sess.set_up(false);
-                }
+                self.lower_session();
             }
             BmpMessageBody::PeerUpNotification(_) => {
                 let pph = match &msg.per_peer_header {
@@ -577,9 +605,7 @@ impl BmpStation {
                 // Loc-RIB shape) never lowers here — its liveness
                 // lives and dies with the connection itself.
                 if up.is_empty() && self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(sess) = &self.session {
-                        sess.set_up(false);
-                    }
+                    self.lower_session();
                 }
             }
             BmpMessageBody::RouteMonitoring(rm) => {
