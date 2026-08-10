@@ -296,6 +296,62 @@ teardown is about to unbind, so it stops rather than blackholing. The
 state file names exactly which rules remain; clear them by hand
 (`ethtool -N <iface> delete <loc>`) and re-run.
 
+## The adopted-reconciliation release gate: what it needs, and when it refuses
+
+A restart over a steered VPP defers its reconciliation (the FIB dump
+freezes every VPP worker — `ip_route_dump` is not mp-safe — so it only
+runs against an unsteered VPP). The deferral releases through exactly
+**two** doors, both requiring the feed session up (raised when the
+stream STARTS — with one deliberate exception. For BGP it is the first
+UPDATE of the session. For BMP it is the first RouteMonitoring frame,
+but only while **no earlier stream's routes are still in the mirror** —
+the station counts the mirror at each stream boundary rather than
+guessing from what the connection did. In practice that means the
+daemon's first connection raises on its first frame, and an ordinary
+RECONNECT (which leaves a full table behind) stays down until
+InitiationComplete (~5 s of stream quiet after the dump), because until
+its GC runs the mirror still counts the previous session's routes and
+would credit the release floor with stale evidence. Two corollaries
+worth knowing at 3 a.m.: a predecessor that withdrew everything leaves
+nothing, so the next stream raises immediately; and a peer-down wipe
+whose FIB deletes partially FAILED leaves routes behind, so the next
+stream does NOT — the count, not the intent, decides. So during a
+reconnect an operator will see RouteMonitoring traffic flowing while
+the gate still reads the feed as down — that is correct, not stuck. PeerUp is bookkeeping and never raises. "Quiet"
+means the STREAM went quiet: every frame counts toward the activity
+rate whether or not it changed the mirror, so a reannouncement dump
+holds the gate loud until it actually ends:
+
+1. **The floor**: the mirror holds ≥ `expected-routes`-derived
+   capacity / 16 and has been quiet for **2 s when a completeness
+   authority is configured, 5 s without one** — five being both
+   listeners' own initiation-complete standard, because an unattested
+   release may not claim completion on less evidence than the protocol
+   itself requires. And without an authority, quiet means LITERALLY
+   still: zero stream elements and zero mirror mutations for the whole
+   window, because no rate allowance can distinguish slow churn from a
+   throttled reload. Real feeds pause between churn bursts; one that
+   never does keeps the deferral, visibly. This is the fleet's door —
+   a full-table box with bird releases ~40 s after attach.
+2. **The completeness authority** (`require-table-complete on`): bird's
+   count agrees with the mirror, recomputed against the mirror as it is
+   at release time. A negative verdict vetoes door 1 as well.
+
+**There is no third door, deliberately.** A deployment whose real table
+sits below capacity/16 with no bird has nothing honest to release on,
+and the gate refuses to guess: the reconciliation defers indefinitely,
+`fib-synced` reports Degraded with this exact remedy, and the adopted
+FIB keeps forwarding untouched. Fix the configuration, not the gate —
+size `expected-routes` within 16× of the real table, or add bird and
+enable `require-table-complete`. (A heuristic third door existed for
+one day; ten review rounds of corner cases and one fleet-path wedge
+later, it was deleted. See PR #151/#152.)
+
+If `fib-synced` shows the deferral persisting on a box that SHOULD
+release: check the feed session actually started (`BGP client
+connected` + at least one UPDATE in the log), then check the mirror
+count against the floor in the health text.
+
 ## Triage by symptom
 
 ### `packetframe status` says STALE
@@ -407,43 +463,61 @@ Be precise about this when reasoning about an incident.
 | NPC MCAM block | 2048 entries, ~1689 free, 31 allocated per PF | from `npc/mcam_info`. **This is not the `loc` space** and must never be used to size one — doing so is what produced `base: 1024`, an out-of-range slot that failed the first steer this module ever attempted. |
 | First steer | **4 rules installed and readback-verified** | 2026-08-06, shadow eth1, locs 15/14/13/12, src+dst × 2 prefixes → VF 0. Installation only: eth1 carries the interconnect, so zero packets match. |
 | Steered-idle soak | **5 h 17 m**, rules intact, no restarts | 2026-08-06 overnight. Proves nothing wiped them; does **not** prove they survive a UniFi provisioning push — the re-assert path is still untested. |
-| Drill (d) adopt-while-steered | **PASS** | restart under a steered VPP; MCAM rule count sampled at 5 Hz never left 4, VPP never restarted, adoption took `Adopted {{ steered: true }}`. Loss unmeasured (no traffic peer). |
-| Restart Unhealthy window | **~10 s** | between adoption and the first verify. See the warning below — it is correct behaviour. |
+| Drill (a) kill -9 under load | teardown **325 ms**, recovery **40.7 s** | 2026-08-08, 500 pps constant-rate flow. The 50 ms teardown target was missed and is documented as a bound; recovery ≤ 90 s holds with margin. |
+| Drill (b) route change while down | **PASS** | the changed route was present in VPP before steering resumed. |
+| Drill (c) SIGSTOP wedge | detected in **1.81 s** (target ≤ 2 s) | 2026-08-08, ping-interval-bounded as designed. |
+| Drill (d) daemon death | **120,000/120,000 frames, zero loss** | 2026-08-08. The dataplane forwards independently of the daemon. |
+| Drill (d) restart over a steered VPP | **150,000/150,000 frames, worst gap 0.109 s** | 2026-08-09 (d12). Full cycle inside the window: adopt → defer → unsteer at +40 s → FIB dump against an idle VPP (~7 s of frozen workers, felt by nobody) → diff (2.5 h of churn reconciled) → verify → re-steer at +78 s. The 5.4 s outage of the pre-#151 design is gone. |
+| PMTUD through a steered path | **PASS** | frag-needed, mtu 1300, sourced from 169.254.254.3, ×5. Gate 0b item 7 closed. |
+| Steered packets reaching VPP | **PASS** | gate 0b item 1 closed 2026-08-07: allowlisted frames counted on octeon0/0, non-allowlisted stayed on the kernel path. |
+| Restart health window | Degraded ~40–80 s | see the note below — the deferral and reconcile are visible by design. |
 
 **Published but never measured:**
 
 | number | status |
 |---|---|
-| Crash blackhole ≤ 50 ms | UNMEASURED — needs a constant-rate flow |
-| Wedge detection ≤ 2 s | UNMEASURED |
-| Recovery ≤ 90 s | UNMEASURED |
-| `detach` < 1 s across N VFs | UNMEASURED — needs real VFs; relaxes to a documented best-effort bound if hardware says so |
-| Steered packets actually reaching VPP | UNMEASURED — gate 0b item 1's second half; needs a traffic peer |
-| PMTUD through a steered path | UNMEASURED — gate 0b item 7, unskippable |
+| `detach` < 1 s across N VFs | UNMEASURED — the last shadow item; relaxes to a documented best-effort bound if hardware says so |
 
-### A planned restart looks Unhealthy for ~10 seconds. Do not page on it.
+### A planned restart looks Degraded for 40-80 seconds. Do not page on it.
 
 Restarting packetframe over a **steered** VPP reports:
 
 ```
-vpp-offload: UNHEALTHY
-  fib-synced   UNHEALTHY — traffic steered into an unverified FIB
+vpp-offload: DEGRADED
+  fib-synced   DEGRADED — resync deferred: ... the adopted FIB keeps
+                          forwarding untouched
 ```
 
-for roughly ten seconds, then clears to `fib-synced healthy` on its own.
+for the length of the deferral plus the reconcile, then clears to
+`fib-synced healthy` on its own. Measured 2026-08-09 on the shadow
+(d12): unsteer at +40 s, re-steer at +78 s, worst forwarding gap
+0.109 s.
 
-This is correct and deliberate. An adopted VPP is presumed
-good-until-proven-stale: the module resyncs and verifies but does **not**
-unsteer first, because unsteering a correctly-forwarding VPP would create
-the blackhole the design exists to avoid. So between adoption and the
-first completed verify, traffic genuinely is diverted into a FIB this
-process has not yet checked — and the health surface refuses to call that
-healthy rather than papering over it.
+This is correct and deliberate, and it is DEGRADED rather than
+UNHEALTHY on purpose: the adopted VPP is forwarding a FIB the previous
+daemon verified, so packets are fine — what is unfinished is this
+daemon's reconciliation of it. Overall health tracks whether packets
+are forwarded correctly, not whether the offload has caught up.
+
+The shape changed with the deferred-dump design (#151). Before it, the
+module dumped VPP's FIB immediately at adoption and reported UNHEALTHY
+("traffic steered into an unverified FIB") for ~10 s — and that dump
+froze every VPP worker for 5.4 s, which is the outage the deferral
+exists to remove. If you are reading a runbook copy that describes the
+10 s Unhealthy window, it predates #151.
 
 Consequence for alerting: anything paging on `packetframe_vpp_health`
-will fire on every planned restart. Either alert on a sustained
-Unhealthy (30 s or more) or exclude the window explicitly. Measured
-2026-08-06 on the shadow during drill (d).
+fires on every planned restart. Alert on a sustained NOT-healthy state
+of **two minutes or more** — comfortably past the measured 80 s — or
+exclude the window explicitly. Thirty seconds, the pre-#151 guidance,
+now fires on every restart.
+
+One case where the wait is legitimately unbounded: if the feed session
+flaps DURING the deferral, the completeness authority is demoted until
+the source reports its initiation-complete GC, which needs 5 s without
+updates and which a live DFZ feed may never give. The deferral message
+says so explicitly when that is what is happening — read it before
+concluding the checker is broken. Nothing is dropping meanwhile.
 
 ### A member port needs two things admin-up does not give it
 

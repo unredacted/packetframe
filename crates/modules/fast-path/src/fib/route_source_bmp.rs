@@ -136,36 +136,42 @@ pub struct BmpStation {
     /// would let a second tier trust a mirror that just lost its feed
     /// (review finding).
     up_peers: std::sync::Mutex<std::collections::HashSet<PeerId>>,
-    /// Whether this connection has delivered a RouteMonitoring frame.
-    /// RFC 9069 Loc-RIB streams need not send PeerUp for the synthetic
-    /// Loc-RIB instance (review finding — and Loc-RIB is precisely the
-    /// mode `require-loc-rib` documents), so for them the stream itself
-    /// is the liveness evidence — but only once it has SETTLED: the
-    /// raise happens at InitiationComplete, the station's definition of
-    /// initial-stream readiness, never on the first frame (review
-    /// finding: a dump stalling after frame one would otherwise read
-    /// as live-quiet-loaded for up to the read timeout). This flag's
-    /// remaining job is the peer-set arbitration below: a connection
-    /// that streamed RM without ever speaking PeerUp keeps its
-    /// liveness across an incidental PeerDown.
-    saw_rm: std::sync::atomic::AtomicBool,
     /// Whether this connection has EVER sent a PeerUp. An emitter that
-    /// speaks peer lifecycle gets peer-set semantics: when its last
-    /// monitored peer goes down, the feed is down, however many RM
-    /// frames were streamed before — a sticky RM bit would disable the
-    /// peer-set transition for every mode, not just the Loc-RIB
-    /// streams that lack notifications (review finding). `saw_rm`
-    /// attests liveness only for connections that never spoke PeerUp.
+    /// speaks peer lifecycle gets peer-set semantics both ways: PeerUp
+    /// raises, and when the last monitored peer goes down the feed is
+    /// down, however many RM frames were streamed before — while a
+    /// straggler RM after the last PeerDown raises nothing (review
+    /// findings, kept from the epoch era because they are about
+    /// SEMANTICS, not settling).
     saw_peer_up: std::sync::atomic::AtomicBool,
-    /// Whether this connection's initial stream has settled
-    /// (InitiationComplete fired). Liveness raises pass through this:
-    /// a PeerUp that precedes a delayed initial dump proves a peer,
-    /// not a table, and raising on it let two seconds of pre-stream
-    /// quiet release the second tier's gate (review finding — the
-    /// same flaw the BGP and Loc-RIB paths shed, at the last raise
-    /// site that still had it). A PeerUp arriving AFTER settlement
-    /// raises immediately, which is the mid-session peer-join case.
-    initiated: std::sync::atomic::AtomicBool,
+    /// Whether a PREVIOUS stream's advertisements may still be in the
+    /// mirror — the actual variable every earlier proxy (connection
+    /// counts, contributing-stream counts, an ever-announced latch)
+    /// was reaching for (review findings, five refinements). It is now
+    /// answered by ASKING THE MIRROR at each boundary
+    /// ([`Self::mirror_holds_state`]) rather than by tracking what
+    /// this connection did: every latch was wrong in one direction or
+    /// the other, because what survives a connection is a property of
+    /// the mirror, not of the stream that wrote it. A stream that
+    /// announced and then withdrew everything leaves nothing, so the
+    /// next stream rightly starts fresh; a PeerDown wipe whose FIB
+    /// deletes partially FAILED leaves routes the programmer never
+    /// retracted from the second tier, so it rightly does not.
+    /// While false, a stream's first frame may raise liveness — there
+    /// is no stale floor-credit to release against. While true, the
+    /// raise waits for InitiationComplete (whose GC destroys exactly
+    /// this state, and which therefore clears it by definition) or for
+    /// the re-armable quiesced raise.
+    stale_state_possible: std::sync::atomic::AtomicBool,
+    /// The session pulse count at the last liveness BOUNDARY — a
+    /// lowering, or an epoch-opening PeerUp (which consumes any
+    /// peerless straggler pulses that preceded it; review finding).
+    /// The re-armable raise requires stream evidence newer than this:
+    /// elements seen since the boundary, so a later peer epoch can
+    /// re-establish the session (a one-shot raise left it down for
+    /// the socket's lifetime; review finding) while neither an old
+    /// silence nor another peer's stragglers can.
+    pulses_at_lower: std::sync::atomic::AtomicU64,
 }
 
 /// Re-export for callers building the station.
@@ -196,9 +202,69 @@ impl BmpStation {
             peer_acl: Vec::new(),
             session: None,
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
-            saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
-            initiated: std::sync::atomic::AtomicBool::new(false),
+            stale_state_possible: std::sync::atomic::AtomicBool::new(false),
+            pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Lower the session and remember how much stream had been seen:
+    /// the re-armable raise demands evidence newer than this moment.
+    fn lower_session(&self) {
+        if let Some(sess) = &self.session {
+            self.pulses_at_lower
+                .store(sess.pulse_count(), std::sync::atomic::Ordering::Relaxed);
+            sess.set_up(false);
+        }
+    }
+
+    /// Whether the programmer's mirror still holds routes — the direct
+    /// answer to what [`Self::stale_state_possible`] must record at a
+    /// stream boundary. The mirror is the second tier's own source
+    /// (`ResolvedRouteSink` fires on mirror commits), so a non-empty
+    /// mirror is precisely "floor credit the next stream would inherit
+    /// without having earned it".
+    ///
+    /// Ordering is free: commands share one channel and every route
+    /// dispatch at these sites is awaited, so a count sent afterwards
+    /// observes the wipe — including a wipe that only PARTIALLY
+    /// succeeded. `drop_routes_for_peer` logs and swallows map and
+    /// recompute failures, so "we dispatched PeerDown" is not evidence
+    /// the routes are gone (review finding). Counting them is.
+    ///
+    /// Reading THIS mirror answers for the second tier's because
+    /// `FibProgrammer::withdraw_from_mirror` makes removal and
+    /// withdrawal one step, and `route_resolved` fires only after the
+    /// mirror commit: the second tier's set is a subset of this one,
+    /// so empty here means empty there. Before that was true a failed
+    /// LPM delete trimmed this mirror while the second tier kept the
+    /// route — a count of zero over a stale above-floor table, which
+    /// is the exact evidence this function exists to refuse (review
+    /// finding).
+    ///
+    /// It asks for ROUTE-SOURCE advertisements, not for a raw route
+    /// count. The mirror is SHARED: the neighbour resolver injects
+    /// `local-prefix` /32s and /128s through this same handle, they are
+    /// resident for the daemon's life, and they belong to no session —
+    /// so counting them meant every reconnect found "prior state", no
+    /// stream ever earned its first-frame raise, and a continuously
+    /// active feed could stay down indefinitely (review finding). Nor
+    /// can they be the stale floor credit this guards: a handful of
+    /// local /32s is nowhere near capacity/16.
+    ///
+    /// Both families count. Only v4 reaches VPP today
+    /// (`FamilyPolicy::V4Only`), so a v6-only remnant carries no floor
+    /// credit and this over-defers — but the station has no business
+    /// knowing the second tier's family policy, and over-deferring is
+    /// the safe direction. An unavailable answer reads as "possible"
+    /// for the same reason.
+    async fn mirror_holds_state(&self) -> bool {
+        match self.prog_handle.has_session_routes().await {
+            Ok(any) => any,
+            Err(e) => {
+                warn!(error = %e, "mirror query unavailable; assuming prior-stream state remains");
+                true
+            }
         }
     }
 
@@ -300,22 +366,24 @@ impl BmpStation {
                             info!(%addr, "BMP client connected");
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
+                            } else {
+                                info!("BMP client disconnected cleanly");
                             }
                             // The connection ended, and per-peer state
                             // ended with it: whatever PeerUps this
                             // session delivered are no longer evidence.
                             self.up_peers.lock().expect("up_peers lock").clear();
-                            self.saw_rm
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
-                            self.initiated
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(sess) = &self.session {
-                                sess.set_up(false);
-                            } else {
-                                info!("BMP client disconnected cleanly");
-                            }
+                            // Whatever this stream left in the mirror
+                            // outlives its connection — until the GC or
+                            // a wipe says otherwise. Ask the mirror; a
+                            // stream that withdrew everything leaves the
+                            // next one nothing to inherit.
+                            let stale = self.mirror_holds_state().await;
+                            self.stale_state_possible
+                                .store(stale, std::sync::atomic::Ordering::Relaxed);
+                            self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
                             // flips seen_this_session=false on all routes;
@@ -364,7 +432,29 @@ impl BmpStation {
                     match msg {
                         Some(m) => {
                             frames_parsed += 1;
-                            if matches!(m.message_body, BmpMessageBody::RouteMonitoring(_)) {
+                            let is_route_monitoring =
+                                matches!(m.message_body, BmpMessageBody::RouteMonitoring(_));
+                            // VALIDATE FIRST. `process_msg` rejects a
+                            // RouteMonitoring frame outright when
+                            // `require-loc-rib` refuses its peer type or
+                            // its fan-out exceeds MAX_ELEMS_PER_UPDATE,
+                            // and a rejected frame is not stream
+                            // evidence of any kind. Raising ahead of it
+                            // opened a whole feed EPOCH on a frame the
+                            // session was about to be torn down over —
+                            // and a runtime that sampled that transient
+                            // raise during an adopted deferral baselined
+                            // on it, so the next healthy connection read
+                            // as a flap and the attested release path
+                            // was gone for good (review finding). The
+                            // stall-monitor timestamps move with it for
+                            // the same reason: a refused frame is not
+                            // progress.
+                            if let Err(e) = self.process_msg(m).await {
+                                reader.abort();
+                                return Err(e);
+                            }
+                            if is_route_monitoring {
                                 let now = std::time::Instant::now();
                                 last_route_monitoring = Some(now);
                                 // Publish wall-clock unix seconds so
@@ -376,26 +466,35 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
-                                // Deliberately NOT a liveness raise: a
-                                // single frame proves the stream began,
-                                // not that the initial dump landed — a
-                                // dump that stalls after frame one would
-                                // otherwise read as a live, quiet, loaded
-                                // feed for up to the read timeout (review
-                                // finding). Liveness for a Loc-RIB stream
-                                // raises at InitiationComplete below —
-                                // the station's own definition of
-                                // initial-stream readiness.
-                                self.saw_rm.store(true, Ordering::Relaxed);
-                            }
-                            // Loc-RIB safety check happens inside
-                            // process_msg; a violation returns Err and
-                            // tears down the session here. Bird (or
-                            // whoever) will reconnect; the operator
-                            // sees the error log.
-                            if let Err(e) = self.process_msg(m).await {
-                                reader.abort();
-                                return Err(e);
+                                // Pulses are counted in process_msg, in
+                                // ROUTE-ELEMENT units — see the pulse
+                                // site there for why frames are the
+                                // wrong unit.
+                                // Raise only when no previous stream's
+                                // state can be lingering — see
+                                // `stale_state_possible`. The peer-set
+                                // arbitration stands: on a peer-speaking
+                                // connection a straggler frame after the
+                                // last PeerDown raises nothing.
+                                let first_stream = !self
+                                    .stale_state_possible
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let peers_speak =
+                                    self.saw_peer_up.load(Ordering::Relaxed);
+                                let peers_up =
+                                    !self.up_peers.lock().expect("up_peers lock").is_empty();
+                                if first_stream && (!peers_speak || peers_up) {
+                                    if let Some(sess) = &self.session {
+                                        sess.set_up(true);
+                                        // Reconciled by the same fact
+                                        // that permitted the raise:
+                                        // `first_stream` IS "no older
+                                        // stream's routes remain". Marked
+                                        // after the raise so it stamps
+                                        // the epoch that raise opened.
+                                        sess.mark_reconciled();
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -417,80 +516,84 @@ impl BmpStation {
                     }
                 }
                 _ = tick.tick() => {
-                    // Settlement is per EPOCH, not per connection: when
-                    // the last monitored peer goes down, `initiated` and
-                    // `saw_rm` reset, and the NEXT peer's dump must
-                    // quiesce all over again before liveness returns —
-                    // a PeerUp on an already-settled connection was
-                    // raising ahead of that peer's own dump (review
-                    // finding). The InitiationComplete EVENT still
-                    // fires once per connection; the programmer's GC
-                    // semantics are per connection, and only the
-                    // liveness settlement re-arms.
-                    let settled = self.initiated.load(std::sync::atomic::Ordering::Relaxed);
-                    let rm_this_epoch = self.saw_rm.load(std::sync::atomic::Ordering::Relaxed);
-                    if !settled && rm_this_epoch {
-                        if let Some(last) = last_route_monitoring {
-                            if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
-                                if !init_complete_fired {
-                                    if let Err(e) = self
-                                        .prog_handle
-                                        .apply_route_event(RouteEvent::InitiationComplete)
-                                        .await
-                                    {
-                                        warn!(error = %e, "InitiationComplete dispatch failed");
-                                        continue;
-                                    }
-                                    info!(
-                                        frames_parsed,
-                                        quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
-                                        "InitiationComplete fired"
-                                    );
-                                    init_complete_fired = true;
-                                }
-                                // The stream (or this epoch's re-dump)
-                                // has quiesced: the mirror holds what
-                                // the emitter has. Guarded as always —
-                                // an emitter that speaks peer lifecycle
-                                // with no peer up stays down — and the
-                                // SETTLEMENT itself carries the same
-                                // guard: a peerless straggler frame
-                                // after the last PeerDown must not
-                                // prime the next epoch, or the next
-                                // PeerUp would raise off the cached
-                                // flag before its own dump arrived
-                                // (review finding).
-                                let peers_speak = self
-                                    .saw_peer_up
-                                    .load(std::sync::atomic::Ordering::Relaxed);
-                                let peers_up = !self
-                                    .up_peers
-                                    .lock()
-                                    .expect("up_peers lock")
-                                    .is_empty();
-                                if !peers_speak || peers_up {
-                                    self.initiated
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    if let Some(sess) = &self.session {
-                                        sess.set_up(true);
-                                    }
-                                } else {
-                                    // Declined AND consumed: a peerless
-                                    // straggler frame is not testimony
-                                    // about any future epoch. Leaving
-                                    // the evidence cached let the next
-                                    // PeerUp settle on the very next
-                                    // tick, off a frame that predated
-                                    // the peer entirely (review
-                                    // finding, third pass at this
-                                    // hole). The new peer's dump must
-                                    // produce its own frames and its
-                                    // own quiescence.
-                                    self.saw_rm
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                                    last_route_monitoring = None;
-                                }
-                            }
+                    let quiesced = last_route_monitoring
+                        .is_some_and(|last| last.elapsed() >= INIT_COMPLETE_QUIESCENCE);
+                    if !quiesced {
+                        continue;
+                    }
+                    // The EVENT is one-shot per connection — the
+                    // programmer's GC semantics. The RAISE below is
+                    // deliberately not: a one-shot raise left the
+                    // session down for the socket's lifetime after any
+                    // post-dump last-peer-down, with a healthy later
+                    // epoch unable to re-establish it (review finding).
+                    if !init_complete_fired {
+                        if let Err(e) = self
+                            .prog_handle
+                            .apply_route_event(RouteEvent::InitiationComplete)
+                            .await
+                        {
+                            warn!(error = %e, "InitiationComplete dispatch failed");
+                            continue;
+                        }
+                        info!(
+                            frames_parsed,
+                            quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
+                            "InitiationComplete fired"
+                        );
+                        init_complete_fired = true;
+                        // The GC this event triggers removes every
+                        // unseen prior-stream route: whatever staleness
+                        // was possible is now gone.
+                        self.stale_state_possible
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Re-armable raise: quiescence counts only when the
+                    // stream it followed is NEWER than the last
+                    // lowering — frames since, not silence since — so a
+                    // later peer epoch re-establishes the session while
+                    // an old silence cannot (the pulse counter crosses
+                    // this boundary; connection-local flags could not,
+                    // which is what the epoch machinery kept getting
+                    // wrong). Same peer-set guard as everywhere.
+                    if let Some(sess) = &self.session {
+                        let fresh_stream = sess.pulse_count()
+                            > self
+                                .pulses_at_lower
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                        let peers_speak = self
+                            .saw_peer_up
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let peers_up = !self
+                            .up_peers
+                            .lock()
+                            .expect("up_peers lock")
+                            .is_empty();
+                        if fresh_stream && (!peers_speak || peers_up) {
+                            sess.set_up(true);
+                        }
+                        // AFTER the raise, and keyed on the same
+                        // variable the raise is: `stale_state_possible`
+                        // false means the mirror carries nothing from a
+                        // stream older than the current epoch — set by
+                        // the GC, and equally by a last-peer PeerDown
+                        // whose wipe left nothing behind.
+                        //
+                        // Not keyed on the GC HAVING JUST RUN, which is
+                        // one-shot per connection: a later peer epoch on
+                        // the same connection (last peer down, new peer
+                        // streams) opens an epoch the GC will never fire
+                        // for again, and could then never be marked —
+                        // the same permanent demotion one layer in
+                        // (review finding). Marking is idempotent and
+                        // this pass is once a second, so re-asserting it
+                        // costs nothing and cannot go stale: every
+                        // epoch that clears the variable gets stamped.
+                        if !self
+                            .stale_state_possible
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            sess.mark_reconciled();
                         }
                     }
                 }
@@ -515,15 +618,12 @@ impl BmpStation {
             BmpMessageBody::TerminationMessage(_) => {
                 info!("BMP TERMINATION received from bird");
                 self.up_peers.lock().expect("up_peers lock").clear();
-                self.saw_rm
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.initiated
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                if let Some(sess) = &self.session {
-                    sess.set_up(false);
-                }
+                let stale = self.mirror_holds_state().await;
+                self.stale_state_possible
+                    .store(stale, std::sync::atomic::Ordering::Relaxed);
+                self.lower_session();
             }
             BmpMessageBody::PeerUpNotification(_) => {
                 let pph = match &msg.per_peer_header {
@@ -552,15 +652,32 @@ impl BmpStation {
                 self.saw_peer_up
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut up = self.up_peers.lock().expect("up_peers lock");
+                let opens_epoch = up.is_empty();
                 up.insert(peer_id);
-                // Bookkeeping always; liveness only once the initial
-                // stream has settled. Before that, a peer is a promise
-                // of a table, not a table.
-                if self.initiated.load(std::sync::atomic::Ordering::Relaxed) {
+                if opens_epoch {
+                    // An epoch-opening PeerUp CONSUMES whatever pulses
+                    // preceded it: a peerless straggler frame after the
+                    // last PeerDown must not count as this new peer's
+                    // stream, or the next quiesced tick would raise
+                    // before the peer supplied a single route (review
+                    // finding). Freshness now means frames after THIS
+                    // peer came up.
                     if let Some(sess) = &self.session {
-                        sess.set_up(true);
+                        self.pulses_at_lower
+                            .store(sess.pulse_count(), std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                // Bookkeeping only — no raise. PeerUp precedes the
+                // dump, and across a reconnect the mirror still holds
+                // the PRIOR session's unseen routes (Resync marks them,
+                // InitiationComplete GCs them), so raising here let a
+                // stale above-floor mirror pass the gate on fake quiet:
+                // quiet because the new dump had not STARTED, not
+                // because it finished (review finding). Only the
+                // stream itself raises — the first RouteMonitoring
+                // frame, exactly the BGP rule (#152) — and the load's
+                // own rate then keeps the gate loud until it is
+                // genuinely done.
             }
             BmpMessageBody::PeerDownNotification(_) => {
                 let pph = match &msg.per_peer_header {
@@ -576,29 +693,26 @@ impl BmpStation {
                 {
                     warn!(?peer_id, error = %e, "PeerDown dispatch failed");
                 }
-                let mut up = self.up_peers.lock().expect("up_peers lock");
-                up.remove(&peer_id);
-                // Peer-lifecycle emitters get peer-set semantics: last
-                // peer down = feed down, RM history notwithstanding.
-                // Only a connection that never spoke PeerUp may lean on
-                // its RM stream (the Loc-RIB case).
-                let rm_attests = !self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
-                    && self.saw_rm.load(std::sync::atomic::Ordering::Relaxed);
-                if up.is_empty() && !rm_attests {
-                    if let Some(sess) = &self.session {
-                        sess.set_up(false);
-                    }
-                    // The epoch ended with the last peer: whatever RM
-                    // settled BEFORE is no evidence about the next
-                    // peer's table, so settlement re-arms — the next
-                    // PeerUp records itself and waits for its own
-                    // dump's quiescence (review finding: an
-                    // already-settled connection re-raised on the new
-                    // PeerUp before that peer had streamed a frame).
-                    self.initiated
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    self.saw_rm
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                // Peer-set semantics: the last monitored peer going
+                // down means the feed is down, whatever was streamed
+                // before. A connection that never spoke PeerUp (the
+                // Loc-RIB shape) never lowers here — its liveness
+                // lives and dies with the connection itself.
+                // Scoped so the guard is not held across the await.
+                let last_peer_down = {
+                    let mut up = self.up_peers.lock().expect("up_peers lock");
+                    up.remove(&peer_id);
+                    up.is_empty() && self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                if last_peer_down {
+                    // The successive PeerDown dispatches were SUPPOSED
+                    // to drop every monitored peer's routes; whether
+                    // they did is a question for the mirror, not for
+                    // the dispatch that swallowed its own failures.
+                    let stale = self.mirror_holds_state().await;
+                    self.stale_state_possible
+                        .store(stale, std::sync::atomic::Ordering::Relaxed);
+                    self.lower_session();
                 }
             }
             BmpMessageBody::RouteMonitoring(rm) => {
@@ -620,6 +734,38 @@ impl BmpStation {
                     )));
                 }
                 let peer_id = peer_id_from_header(pph);
+                // The peer-set arbitration applies to the DATA, not
+                // only to the raise. On an emitter that speaks peer
+                // lifecycle, PeerDown means that peer's routes are
+                // gone; a RouteMonitoring frame that arrives after it
+                // was in flight when the PeerDown was written and is
+                // stale by the emitter's own ordering, BMP being one
+                // in-order stream.
+                //
+                // Installing it puts a dead peer's route in the mirror
+                // that nothing will ever remove — PeerDown does not
+                // fire twice for a peer already down, and
+                // `InitiationComplete` is one-shot per connection — and
+                // leaves `stale_state_possible` reading false over it,
+                // because the last-peer PeerDown counted the mirror
+                // BEFORE this arrived. A later PeerUp then takes the
+                // first-frame path, raises, AND marks the new epoch
+                // reconciled over state belonging to the old one
+                // (review finding). Suppressing the raise while
+                // accepting the routes was half a rule.
+                if self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
+                    && !self
+                        .up_peers
+                        .lock()
+                        .expect("up_peers lock")
+                        .contains(&peer_id)
+                {
+                    debug!(
+                        ?peer_id,
+                        "RouteMonitoring for a peer that is not up; dropping the frame"
+                    );
+                    return Ok(());
+                }
                 // Elementor converts the UPDATE wrapped in this
                 // RouteMonitoring into one BgpElem per prefix.
                 let elems = Elementor::bgp_to_elems(
@@ -634,6 +780,19 @@ impl BmpStation {
                         elems.len(),
                         MAX_ELEMS_PER_UPDATE
                     )));
+                }
+                if let Some(sess) = &self.session {
+                    // Stream activity in ROUTE-ELEMENT units, changed or
+                    // not: the gate compares activity against
+                    // route-scaled quiet rates, and counting frames let
+                    // a batched million-route reannouncement dump read
+                    // as quiet (review finding). Floored at one unit: an
+                    // empty End-of-RIB frame represents no routes but IS
+                    // stream evidence, and freshness must advance or a
+                    // legitimately empty table can never re-raise after
+                    // the GC (review finding) — one unit against
+                    // route-scaled rates is noise.
+                    sess.pulse_n((elems.len() as u64).max(1));
                 }
                 for elem in elems {
                     let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {

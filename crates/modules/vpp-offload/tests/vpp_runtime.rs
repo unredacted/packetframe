@@ -1551,7 +1551,7 @@ mod steered {
     }
 
     /// `run_until` with a caller-chosen bound, for stop conditions that
-    /// legitimately need many paced ticks (the 150 s small-table quiet).
+    /// legitimately need many paced ticks (long deferral holds).
     pub fn run_paced(
         d: &mut Driver,
         rt: &Runtime,
@@ -1704,49 +1704,35 @@ fn a_met_floor_without_a_live_session_stays_deferred() {
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
-/// The capacity floor is an UPPER sizing bound wearing a lower bound's
-/// hat, so it cannot be the only release (review finding): a deployment
-/// whose real table sits below capacity/16 - the default sizing over a
-/// small site - would defer forever. The small-table clause releases
-/// any non-empty mirror whose feed SESSION is up once it has been quiet
-/// longer than the BGP hold time. The session handle is the liveness
-/// authority no mirror-side count could be (three proxies fell to
-/// review: capacity fractions, arrival deltas, absolute minimums), so
-/// this works for a 100-route table as well as a 100k one, and no
-/// matter how much of the table loaded before the gate existed.
+/// The narrowed contract: a below-floor table with no authority NEVER
+/// releases — deliberately. The session is up, the mirror loaded and
+/// quiet for minutes, and nothing honest can say a 100-route mirror is
+/// complete when the operator declared sizing for 4096-route scale.
+/// The remedy lives in the health text (size expected-routes within
+/// 16x of the real table, or add bird); the small-table heuristic that
+/// used to guess here was deleted after ten review rounds of corner
+/// cases and a fleet-path wedge (#151/#152 retrospective).
 #[test]
-fn a_small_table_releases_after_long_quiet_regardless_of_when_it_loaded() {
-    // Capacity 4096 -> floor 256. The full table is 100 routes: under
-    // every count any proxy ever used - only session liveness plus
-    // long quiet can release this.
+fn a_below_floor_table_without_an_authority_defers_forever() {
+    // Capacity 4096 -> floor 256. The whole table is 100 routes,
+    // session up, quiet far past every window that ever existed.
     let full: Vec<IpPrefix> = (0..4)
         .map(|i| fake_vpp::v4(0, i))
         .chain((0..96).map(|i| fake_vpp::v4(1, i)))
         .collect();
-    let (fake, shared, log, rt, session) = steered::fixture("steered-small", &full[..60], 4096);
+    let (fake, _shared, log, rt, session) = steered::fixture("steered-below-floor", &full, 4096);
     session.set_up(true);
     let mut d = Driver::new();
-    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
-
-    // The rest of the load arrives after the gate exists.
-    *shared.lock().unwrap() = full;
-
-    // 150 s of paced quiet at <=250 ms a tick needs a real budget.
-    let (_, events) = steered::run_paced(&mut d, &rt, now, 8_192, |d| d.state() == State::Steered);
-
+    let _ = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 2_000);
     assert_eq!(
-        log.lock().unwrap().as_slice(),
-        &["unsteer", "steer"],
-        "the small-table release must follow the same unsteer-first sequence"
-    );
-    assert!(
-        events.contains(&Event::SyncComplete) && events.contains(&Event::VerifyPassed),
-        "{events:?}"
+        d.state(),
+        State::AdoptedResyncing,
+        "below the floor with no authority, the deferral is the designed terminal state"
     );
     assert_eq!(
-        steered::deletes(&fake),
-        vec![([10, 0, 4, 0], 24), ([10, 0, 5, 0], 24)],
-        "the reconciliation still withdraws what the small table lacks"
+        rt.status().resync_deferred,
+        Some((100, 256)),
+        "and it is visible, with the floor named"
     );
 }
 
@@ -1763,7 +1749,7 @@ fn a_small_table_releases_after_long_quiet_regardless_of_when_it_loaded() {
 fn a_dead_source_never_triggers_the_unsteer() {
     let (fake, shared, log, rt, session) = steered::fixture("steered-dead", &[], 4096);
     let mut d = Driver::new();
-    // Far past SMALL_TABLE_QUIET_FOR at <=250 ms a tick, empty.
+    // Far past every quiet window at <=250 ms a tick, empty.
     let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 2_000);
     assert_eq!(
         d.state(),
@@ -2001,6 +1987,65 @@ fn a_stale_convergence_cannot_carry_a_shrunken_mirror() {
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
+/// A reconnect dump REANNOUNCES an unchanged table: the mirror never
+/// moves, so a mutation counter reads quiet while the stream is at
+/// full rate (review finding - the no-change early return in the
+/// programmer swallows every unchanged route before the tee). The
+/// session pulse counter is what keeps the gate loud: frames count,
+/// changed or not.
+#[test]
+fn a_reannouncement_dump_holds_the_gate_loud() {
+    let full: Vec<IpPrefix> = (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect();
+    let (_fake, _shared, log, rt, session) = steered::fixture("steered-reannounce", &full, 160);
+    session.set_up(true);
+    let mut d = Driver::new();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(Instant::now(), Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // Floor met (12 >= 10), session up, mirror frozen - and the stream
+    // hammering: 200 pulses per tick stays far above the 64/s quiet
+    // rate at any driver cadence. Nothing may release.
+    let mut now = Instant::now();
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..100 {
+            for _ in 0..200 {
+                session.pulse();
+            }
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "an actively streaming dump must hold the gate, mirror movement or not"
+    );
+    assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+
+    // The stream ends: quiet is real now, and the cycle proceeds.
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
 /// The revocation window: the gate released, the unsteer was
 /// acknowledged - and the feed dropped before the dump ran. The
 /// adopted FIB is still whole, so the traffic goes BACK onto it
@@ -2103,8 +2148,15 @@ fn a_revoked_fallback_re_steers_the_intact_adopted_vpp() {
     // Readiness returns: the ordinary cycle completes from the top.
     session.set_up(true);
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    // Consecutive duplicates collapse before comparing: the paced
+    // RestoreSteer re-ask fires again if the wait outlasts its pace
+    // window, and re-asserting a complete set is an idempotent
+    // reconcile by design — the ORDER of transitions is the contract,
+    // not their repeat count.
+    let mut transitions = log.lock().unwrap().clone();
+    transitions.dedup();
     assert_eq!(
-        log.lock().unwrap().as_slice(),
+        transitions.as_slice(),
         &["unsteer", "steer", "unsteer", "steer"],
         "the resumed cycle repeats the full sequence"
     );
@@ -2156,8 +2208,126 @@ fn completeness_releases_a_below_floor_table_promptly() {
     );
     session.set_up(true);
 
-    // Well under the 150 s small-table wait: the authority short-cuts.
+    // The authority is the release for a below-floor table.
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
     assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
+/// A session flap demotes the attested door, and a report published
+/// after the flap restores it.
+///
+/// The demotion is right — a report from before the reconnect cannot
+/// attest that routes belong to the current stream — but it has to
+/// expire, or an ordinary bird restart during a deferral is terminal:
+/// a below-floor table has no other door, so it would never release at
+/// all. Both halves are asserted, because a fix that simply stopped
+/// demoting would pass a test that only checked the second.
+#[test]
+fn a_flap_demotes_attestation_only_until_a_newer_report_arrives() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+    let (fake, shared, log, rt, session) = steered::fixture("steered-reflap", &[], 160);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    let mut d = Driver::new();
+    let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
+
+    *shared.lock().unwrap() = (0..4).map(|i| fake_vpp::v4(0, i)).collect();
+    // Raise, then let the deferral OBSERVE the raise: the epoch is
+    // baselined at the first live observation, so flapping before any
+    // tick would baseline onto the post-flap epoch and there would be
+    // no flap to see. Nothing releases in this window — with no report
+    // published the authority word is a veto.
+    session.set_up(true);
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..40 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "no report yet — the authority vetoes, nothing has released"
+    );
+
+    // A report lands, and THEN the session bounces, so the report
+    // predates the current stream and cannot attest it.
+    handle.publish(CompletenessReport {
+        authority_routes: 4,
+        mirror_routes: 4,
+        at: std::time::Instant::now(),
+    });
+    session.set_up(false);
+    session.set_up(true);
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..400 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a report older than the flap cannot attest the current stream"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing may be unsteered on pre-flap evidence: {:?}",
+        log.lock().unwrap()
+    );
+
+    // A NEWER REPORT IS NOT ENOUGH, and this is the half that matters:
+    // the checker compares counts, and a mirror still carrying the
+    // previous session's unseen routes keeps the count aligned, so a
+    // positive post-flap report can sit over a half-current mirror.
+    handle.publish(CompletenessReport {
+        authority_routes: 4,
+        mirror_routes: 4,
+        at: std::time::Instant::now(),
+    });
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..400 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "a fresher report is a count comparison, not proof the mirror is \
+         this session's — it must not restore attestation"
+    );
+
+    // The stale-route GC completing for this epoch is what does.
+    session.mark_reconciled();
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "the current epoch's GC restores the attested release"
+    );
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }

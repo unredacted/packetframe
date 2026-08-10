@@ -121,6 +121,19 @@ impl PeerId {
     /// from RouteSource-derived hashes. See the type-level docs.
     const LOCAL_ARP_MARKER: u64 = 1u64 << 63;
 
+    /// The 31 bits between the marker and the ifindex, which
+    /// [`Self::local_arp`] leaves zero.
+    ///
+    /// Requiring them is what makes this a NAMESPACE rather than "any
+    /// value with the top bit set", and the type-level claim that
+    /// collision with a hashed PeerId is negligible is a claim about
+    /// the whole 32-bit layout — half of all hashes have the top bit
+    /// set, so the marker alone separates nothing. The predicate below
+    /// checked only the marker while this doc described all three
+    /// parts; the first consumer to depend on it inherited a coin flip
+    /// (review finding).
+    const LOCAL_ARP_RESERVED: u64 = 0x7FFF_FFFF_0000_0000;
+
     /// Synthesize a per-iface PeerId for the v0.2.1 connected
     /// fast-path source. `ifindex` is the kernel ifindex; PeerDown
     /// for this PeerId withdraws every /32 the resolver registered
@@ -131,8 +144,11 @@ impl PeerId {
 
     /// `Some(ifindex)` when this PeerId came from
     /// [`Self::local_arp`]; `None` otherwise.
+    ///
+    /// Tests the FULL layout — marker set, reserved field clear — not
+    /// the marker alone. See [`Self::LOCAL_ARP_RESERVED`].
     pub fn as_local_arp_ifindex(self) -> Option<u32> {
-        if self.0 & Self::LOCAL_ARP_MARKER != 0 {
+        if self.0 & Self::LOCAL_ARP_MARKER != 0 && self.0 & Self::LOCAL_ARP_RESERVED == 0 {
             Some((self.0 & 0xFFFF_FFFF) as u32)
         } else {
             None
@@ -369,9 +385,68 @@ impl TableCompleteness {
 /// finding: neighbour-synthesized local routes alone can number in
 /// the hundreds, so no husk-size bound works either).
 #[derive(Debug, Default)]
-pub struct FeedSession(std::sync::atomic::AtomicBool);
+pub struct FeedSession {
+    /// Liveness and epoch in ONE word: bit 0 is up, the rest is the
+    /// epoch count.
+    ///
+    /// They were two atomics, and a consumer reading them separately
+    /// could see `up` from after a raise and the epoch from before its
+    /// increment — caching a stale baseline, then reading the
+    /// increment on its next tick and classifying an ordinary FIRST
+    /// raise as a session flap (review finding). That costs the
+    /// attestation, which demotes the release gate to its zero-rate
+    /// posture, which a continuously churning feed never satisfies:
+    /// the deferral never releases. Publishing the epoch first with
+    /// release/acquire would close that direction only; one word makes
+    /// the pair inseparable in both, and there is no ordering left to
+    /// reason about at the call sites.
+    state: std::sync::atomic::AtomicU64,
+    /// Stream activity the mirror cannot see: a reconnect's dump
+    /// REANNOUNCES mostly-unchanged routes, which take the
+    /// programmer's no-change early return and never reach the mirror
+    /// — so a mutation counter reads quiet while the dump is actively
+    /// streaming (review finding). The session owner bumps this on
+    /// every UPDATE / RouteMonitoring frame, and the release gate
+    /// folds it into its activity rate: quiet means the STREAM went
+    /// quiet, not merely that nothing changed.
+    pulses: std::sync::atomic::AtomicU64,
+}
+
+/// A coupled reading of a [`FeedSession`]'s liveness and epoch.
+///
+/// [`FeedSession::liveness`] is the only reader, deliberately: separate
+/// `is_up()` / `epoch_count()` accessors are what let a consumer mix a
+/// post-raise liveness with a pre-increment epoch. A consumer deciding
+/// "live, and is this the same session I baselined against" reaches
+/// that decision from one observation or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedLiveness {
+    pub up: bool,
+    /// Down-to-up transitions. See [`FeedSession::set_up`].
+    pub epoch: u64,
+    /// The stale-route GC has completed for THIS epoch. See
+    /// [`FeedSession::mark_reconciled`].
+    pub reconciled: bool,
+}
 
 impl FeedSession {
+    /// Bit 0 of `state`.
+    const UP_BIT: u64 = 1;
+
+    /// Bit 1 of `state`: the stale-route GC has completed for the
+    /// CURRENT epoch, so the mirror holds this session's routes and
+    /// nothing of the one before it.
+    ///
+    /// It rides in the same word as the epoch because it is a claim
+    /// ABOUT that epoch — read apart, a consumer could pair a new
+    /// epoch with the previous epoch's reconciliation and treat a
+    /// mid-reannounce mirror as current. Cleared by every down-to-up
+    /// transition, set only by [`FeedSession::mark_reconciled`].
+    const RECONCILED_BIT: u64 = 1 << 1;
+
+    /// The epoch occupies the remaining 62 bits.
+    const EPOCH_SHIFT: u32 = 2;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -381,12 +456,85 @@ impl FeedSession {
     /// back to `false` the moment the connection handler returns,
     /// including on hold-timer expiry, which is what bounds how long
     /// a hung session can keep this stale.
+    /// A down-to-up transition opens a session EPOCH, published in the
+    /// same store as the liveness it belongs to. Consumers that cached
+    /// evidence across the boundary compare epoch counts to learn the
+    /// world may have been reloaded underneath them (review finding: an
+    /// attested release trusted a pre-reconnect report against a
+    /// mid-reannounce mirror).
     pub fn set_up(&self, up: bool) {
-        self.0.store(up, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.state.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| {
+                let was_up = cur & Self::UP_BIT != 0;
+                let mut epoch = cur >> Self::EPOCH_SHIFT;
+                let mut reconciled = cur & Self::RECONCILED_BIT != 0;
+                if up && !was_up {
+                    epoch += 1;
+                    // A new epoch has not been reconciled by anything.
+                    reconciled = false;
+                }
+                Some(
+                    (epoch << Self::EPOCH_SHIFT)
+                        | if reconciled { Self::RECONCILED_BIT } else { 0 }
+                        | u64::from(up),
+                )
+            },
+        );
     }
 
-    pub fn is_up(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    /// The session owner reports that the stale-route GC has completed
+    /// for the current epoch — for BGP and BMP, a successful
+    /// [`RouteEvent::InitiationComplete`] dispatch.
+    ///
+    /// This is the ONLY honest evidence that the mirror holds this
+    /// session's routes and none of the previous one's. A completeness
+    /// report cannot stand in for it: the checker compares counts, and
+    /// a mid-reannouncement mirror carrying the prior session's unseen
+    /// routes keeps the count aligned, so a positive report can be
+    /// published over exactly the state this attests against (review
+    /// finding).
+    ///
+    /// Safe as a read-modify-write because the session owner is the
+    /// sole writer of this word and its raise and its GC completion are
+    /// sequential within one task; nothing can clear the epoch between
+    /// the GC and this call.
+    pub fn mark_reconciled(&self) {
+        self.state
+            .fetch_or(Self::RECONCILED_BIT, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Liveness, epoch and reconciliation as one observation. Prefer
+    /// this wherever more than one is used — see [`FeedLiveness`].
+    pub fn liveness(&self) -> FeedLiveness {
+        let s = self.state.load(std::sync::atomic::Ordering::Acquire);
+        FeedLiveness {
+            up: s & Self::UP_BIT != 0,
+            reconciled: s & Self::RECONCILED_BIT != 0,
+            epoch: s >> Self::EPOCH_SHIFT,
+        }
+    }
+
+    /// One unit of stream activity, whether or not it changed anything.
+    /// See the field doc for why the mirror's own counter is not
+    /// enough. The UNIT is one route element, not one frame — the gate
+    /// compares this against route-scaled quiet rates, and a frame can
+    /// fan out to thousands of elements, so frame-counting let a
+    /// batched million-route dump read as quiet (review finding). Use
+    /// [`Self::pulse_n`] with the element count wherever it is known.
+    pub fn pulse(&self) {
+        self.pulse_n(1);
+    }
+
+    /// `n` route elements of stream activity in one frame.
+    pub fn pulse_n(&self, n: u64) {
+        self.pulses
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn pulse_count(&self) -> u64 {
+        self.pulses.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -408,6 +556,32 @@ mod peer_id_tests {
         // present as local-arp.
         assert_eq!(PeerId(0xdead_beef).as_local_arp_ifindex(), None);
         assert_eq!(PeerId(0).as_local_arp_ifindex(), None);
+        // ...and neither must a hash that merely HAPPENS to set the
+        // high bit, which is half of them. This is the case the
+        // original test could not fail on, because every value it
+        // tried had the high bit clear (review finding): the first
+        // consumer of this predicate then read ~50% of route-source
+        // peers as the resolver's synthetic ones.
+        assert_eq!(PeerId(0x8000_0001_dead_beef).as_local_arp_ifindex(), None);
+        assert_eq!(PeerId(u64::MAX).as_local_arp_ifindex(), None);
+    }
+
+    /// The invariant, rather than the cases I happened to think of:
+    /// setting ANY reserved bit takes a value out of the local-ARP
+    /// namespace, whatever the marker and ifindex say. A one-off mask
+    /// error passes a case list and fails this.
+    #[test]
+    fn any_reserved_bit_leaves_the_local_arp_namespace() {
+        let base = PeerId::local_arp(33);
+        assert_eq!(base.as_local_arp_ifindex(), Some(33));
+        for bit in 32..63 {
+            let intruder = PeerId(base.0 | (1u64 << bit));
+            assert_eq!(
+                intruder.as_local_arp_ifindex(),
+                None,
+                "bit {bit} is reserved; a value carrying it is not a local-ARP id"
+            );
+        }
     }
 
     #[test]
@@ -604,6 +778,77 @@ impl std::error::Error for NeighError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The epoch counts down-to-up transitions and rides in the same
+    /// word as the liveness it belongs to.
+    ///
+    /// This pins the bit-packing's arithmetic — a shift or mask error
+    /// would silently mis-count epochs, and mis-counted epochs read as
+    /// session flaps, which cost the release gate its attestation. It
+    /// does NOT prove the race it was written for: that a reader can
+    /// never pair a post-raise `up` with a pre-increment epoch is a
+    /// property of the single load, not of any sequence a test can
+    /// drive, and reproducing the old interleaving would take a
+    /// busy-loop whose failure is probabilistic either way.
+    #[test]
+    fn liveness_and_epoch_move_together() {
+        let l = |up, epoch, reconciled| FeedLiveness {
+            up,
+            epoch,
+            reconciled,
+        };
+        let s = FeedSession::new();
+        assert_eq!(s.liveness(), l(false, 0, false));
+        s.set_up(true);
+        assert_eq!(s.liveness(), l(true, 1, false));
+        // A repeated raise is not a new epoch — the session never left.
+        s.set_up(true);
+        assert_eq!(s.liveness(), l(true, 1, false));
+        // Nor does lowering discard the epoch: consumers compare it
+        // across the boundary, which is the whole point.
+        s.set_up(false);
+        assert_eq!(s.liveness(), l(false, 1, false));
+        s.set_up(true);
+        assert_eq!(s.liveness(), l(true, 2, false));
+        // Pulses share the struct but not the word.
+        s.pulse_n(7);
+        s.pulse();
+        assert_eq!(s.pulse_count(), 8);
+        assert_eq!(s.liveness(), l(true, 2, false));
+    }
+
+    /// Reconciliation belongs to the epoch it happened in.
+    ///
+    /// A GC that ran against the previous session's mirror says nothing
+    /// about this one, so the bit cannot survive a raise — that is the
+    /// whole reason it shares a word with the epoch rather than sitting
+    /// beside it.
+    #[test]
+    fn reconciliation_does_not_survive_a_new_epoch() {
+        let s = FeedSession::new();
+        s.set_up(true);
+        s.mark_reconciled();
+        let seen = s.liveness();
+        assert!(seen.reconciled && seen.up && seen.epoch == 1, "{seen:?}");
+
+        // Lowering alone does not invalidate the GC: the mirror is
+        // still the epoch's that ran it.
+        s.set_up(false);
+        assert!(s.liveness().reconciled);
+
+        // Raising opens a new epoch, which nothing has reconciled.
+        s.set_up(true);
+        let after = s.liveness();
+        assert_eq!(after.epoch, 2);
+        assert!(
+            !after.reconciled,
+            "a new epoch starts unreconciled, however recently the \
+             previous one's GC ran: {after:?}"
+        );
+        s.mark_reconciled();
+        assert!(s.liveness().reconciled);
+        assert_eq!(s.liveness().epoch, 2, "reconciling does not move the epoch");
+    }
 
     #[test]
     fn ip_prefix_variants_are_distinct() {

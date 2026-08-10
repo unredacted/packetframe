@@ -244,6 +244,25 @@ impl FibProgrammerHandle {
             .map_err(|_| ProgrammerError::Shutdown)?;
         rx.await.map_err(|_| ProgrammerError::Shutdown)
     }
+
+    /// Whether any advertisement from a ROUTE-SOURCE peer is still in
+    /// the mirror.
+    ///
+    /// Deliberately narrower than [`Self::mirror_counts`], which counts
+    /// the whole shared mirror — including the synthetic `local-prefix`
+    /// /32s and /128s the neighbour resolver injects through this same
+    /// handle under [`PeerId::local_arp`]. Those are resident for the
+    /// daemon's life and belong to no session, so a caller asking "did
+    /// the previous stream leave anything behind" gets a permanent
+    /// `true` from them and never sees a clean slate (review finding).
+    pub async fn has_session_routes(&self) -> Result<bool, ProgrammerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::HasSessionRoutes { reply: tx })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown)?;
+        rx.await.map_err(|_| ProgrammerError::Shutdown)
+    }
 }
 
 /// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
@@ -307,6 +326,9 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
                 Command::MirrorCounts { reply } => {
                     let _ = reply.send((0, 0));
                 }
+                Command::HasSessionRoutes { reply } => {
+                    let _ = reply.send(false);
+                }
                 // Fire-and-forget; nothing to record or reply to.
                 Command::SetCacheEnabled { .. } | Command::SetNexthopPin { .. } => {}
             }
@@ -336,6 +358,9 @@ enum Command {
     MirrorCounts {
         reply: oneshot::Sender<(usize, usize)>,
     },
+    /// Report whether any route-source peer still holds an
+    /// advertisement. See [`FibProgrammerHandle::has_session_routes`].
+    HasSessionRoutes { reply: oneshot::Sender<bool> },
     /// Flip the destination cache on or off. Fire-and-forget: config
     /// apply and SIGHUP reconcile send this instead of touching
     /// FIB_CACHE_CFG themselves — the programmer is the map's sole
@@ -524,6 +549,32 @@ pub struct FibProgrammer {
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
 
+    /// Prefixes whose recompute failed and has not since succeeded.
+    ///
+    /// Both producers drain the advertisements BEFORE recomputing, so
+    /// neither failure is retryable by re-running the operation that
+    /// caused it:
+    ///
+    /// - `gc_unseen` removes the unseen advertisements first, so the
+    ///   next GC collects no victims and would report a vacuous `Ok`
+    ///   over a prefix still installed with the withdrawn stream's
+    ///   nexthops — which a second tier reads as "the GC finished, the
+    ///   mirror is current".
+    /// - `drop_routes_for_peer` takes the peer's key out of
+    ///   `routes_by_peer` first, so after a failure nothing else
+    ///   records that the prefix may still forward over the departed
+    ///   peer's nexthops — which it does whenever another
+    ///   advertisement (a `local_arp` /32) keeps the record alive and
+    ///   the mirror keeps its pre-failure `nexthop_ips`.
+    ///
+    /// Both are review findings, and they are one shape: the ledger
+    /// says the route source is gone while the installed state says
+    /// otherwise. Retried at the next GC, cleared by any successful
+    /// recompute of the prefix. While non-empty the GC is not complete
+    /// and says so, and [`FibProgrammerHandle::has_session_routes`]
+    /// answers yes.
+    recompute_owed: HashSet<IpPrefix>,
+
     // --- Second tier (Phase 4) ---
     /// Where the resolved FIB is announced, when a second forwarding
     /// tier is configured. `None` in every harness and in any run
@@ -701,6 +752,7 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
+                recompute_owed: HashSet::new(),
                 route_sink: None,
                 cache_cfg,
                 cache_enabled: false,
@@ -780,6 +832,25 @@ impl FibProgrammer {
             }
             Command::MirrorCounts { reply } => {
                 let _ = reply.send((self.routes_v4.len(), self.routes_v6.len()));
+            }
+            Command::HasSessionRoutes { reply } => {
+                // `routes_by_peer` drops a peer's entry when its last
+                // prefix goes, so a present key means live
+                // advertisements. Local-arp peers are the resolver's
+                // synthetic /32s, not any session's.
+                // Surviving advertisement owners are not the whole
+                // answer. A recompute that failed leaves the RECORD —
+                // and so the second tier — holding the departed
+                // session's nexthops, while `drop_routes_for_peer` has
+                // already removed that peer's key here (review
+                // finding). Anything owed a repair counts as session
+                // state until the repair lands.
+                let any = !self.recompute_owed.is_empty()
+                    || self
+                        .routes_by_peer
+                        .keys()
+                        .any(|p| p.as_local_arp_ifindex().is_none());
+                let _ = reply.send(any);
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
             Command::SetNexthopPin { ip, pin } => self.set_nexthop_pin(ip, pin),
@@ -1370,6 +1441,14 @@ impl FibProgrammer {
                 continue;
             }
             if let Err(e) = self.recompute_fib_entry(prefix) {
+                // Owed, not merely logged. The peer's key left
+                // `routes_by_peer` before this loop began, so once the
+                // recompute fails nothing else records that this prefix
+                // may still be forwarding over the departed peer's
+                // nexthops — and it does, whenever another advertisement
+                // (a `local_arp` /32) keeps the record alive and the
+                // mirror keeps its pre-failure `nexthop_ips`.
+                self.recompute_owed.insert(prefix);
                 warn!(?peer_id, ?prefix, error = %e, "recompute after PeerDown failed");
             }
         }
@@ -1432,14 +1511,35 @@ impl FibProgrammer {
             }
         }
         let count = victims.len();
-        let mut touched: HashSet<IpPrefix> = HashSet::new();
+        // Carry forward whatever a previous GC left unreconciled — see
+        // `recompute_owed`. Starting from an empty set is what made a
+        // retry report success over work it had not done.
+        let mut touched: HashSet<IpPrefix> = std::mem::take(&mut self.recompute_owed);
         for (prefix, (peer_id, path_id)) in victims {
             if self.remove_advertisement(peer_id, &prefix, path_id) {
                 touched.insert(prefix);
             }
         }
+        // Every prefix gets its attempt. A `?` here abandoned the rest
+        // of the sweep with their advertisements already drained, and
+        // `touched` is a HashSet, so *which* prefixes were abandoned
+        // depended on iteration order (review finding).
+        let mut first_err: Option<ProgrammerError> = None;
         for prefix in touched {
-            self.recompute_fib_entry(prefix)?;
+            if let Err(e) = self.recompute_fib_entry(prefix) {
+                self.recompute_owed.insert(prefix);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            warn!(
+                owed = self.recompute_owed.len(),
+                error = %e,
+                "GC recompute failed; prefixes retained for the next GC"
+            );
+            return Err(e);
         }
         Ok(count)
     }
@@ -1536,7 +1636,23 @@ impl FibProgrammer {
     /// stay safe across the transition; full tear-downs free
     /// immediately because the BPF LPM entry is gone and no new
     /// lookup can land on the prior IDs.
+    ///
+    /// Success clears any GC debt on `prefix` — see
+    /// [`Self::recompute_owed`]. That is wrapped around every exit
+    /// rather than written at the one the GC takes, because the
+    /// no-change shortcut is also a reconciliation: it can only fire
+    /// when the mirror already holds the desired set, and the mirror
+    /// commit and the sink announcement have no fallible call between
+    /// them, so the second tier is current whenever it does.
     fn recompute_fib_entry(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
+        let outcome = self.recompute_fib_entry_inner(prefix);
+        if outcome.is_ok() {
+            self.recompute_owed.remove(&prefix);
+        }
+        outcome
+    }
+
+    fn recompute_fib_entry_inner(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
         // 1. Compute the desired sorted, deduplicated NH set, restricted
         // to advertisements at the maximum local-pref tier present on
         // this prefix. This preserves operator-encoded BGP preferences
@@ -1568,7 +1684,10 @@ impl FibProgrammer {
 
         // 2. Empty desired set: tear the prefix down.
         if desired_nhs.is_empty() {
-            let rec = match self.remove_mirror_direct(&prefix) {
+            // Removal and withdrawal are one step — see
+            // `withdraw_from_mirror`. In particular the `?` below can
+            // no longer strand the second tier.
+            let rec = match self.withdraw_from_mirror(&prefix) {
                 Some(r) => r,
                 None => return Ok(()),
             };
@@ -1586,14 +1705,11 @@ impl FibProgrammer {
             // The only place a prefix leaves the mirror — `desired_nhs`
             // empty covers an explicit Withdraw, the last advertisement
             // going away, and PeerDown, because all three arrive here by
-            // recomputing the union. `remove_mirror_direct` has exactly
+            // recomputing the union. `withdraw_from_mirror` has exactly
             // one caller (this one), which is what makes that claim
             // checkable rather than hopeful: a second removal path would
             // be a route the second tier keeps forwarding after this one
             // stopped.
-            if let Some(sink) = self.route_sink.as_deref() {
-                sink.route_withdrawn(prefix);
-            }
             return Ok(());
         }
 
@@ -1743,6 +1859,29 @@ impl FibProgrammer {
                     nexthop_ips: Vec::new(),
                 }),
         }
+    }
+
+    /// Drop `prefix` from the mirror AND tell the second tier, as one
+    /// step. Nothing else may call [`Self::remove_mirror_direct`].
+    ///
+    /// The two used to be separate statements with a `?` between them
+    /// — the LPM delete — and that gap was a real divergence: a failed
+    /// `delete_fib_entry` returned before the notification, so the
+    /// prefix left this tier's mirror while the second tier kept
+    /// forwarding it, with no retry and nothing to notice (review
+    /// finding). A withdrawal is not conditional on our own map write
+    /// succeeding: the route is gone upstream either way, and the
+    /// consumer's question is only "may I still forward this". Leaving
+    /// the STEERED tier forwarding a withdrawn prefix because the
+    /// FALLBACK tier's delete failed inverts which tier the failure
+    /// hurts. The stuck LPM entry stays this tier's problem, and it
+    /// already reports it.
+    fn withdraw_from_mirror(&mut self, prefix: &IpPrefix) -> Option<RouteRecord> {
+        let rec = self.remove_mirror_direct(prefix)?;
+        if let Some(sink) = self.route_sink.as_deref() {
+            sink.route_withdrawn(*prefix);
+        }
+        Some(rec)
     }
 
     fn remove_mirror_direct(&mut self, prefix: &IpPrefix) -> Option<RouteRecord> {

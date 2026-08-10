@@ -32,7 +32,7 @@ use aya::maps::{Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
-use packetframe_fast_path::fib::programmer::FibProgrammer;
+use packetframe_fast_path::fib::programmer::{FibProgrammer, ECMP_GROUPS_CAP};
 use packetframe_fast_path::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_FAMILY_V4,
     NH_FAMILY_V6, NH_STATE_INCOMPLETE,
@@ -1736,6 +1736,314 @@ fn every_way_a_prefix_stops_forwarding_reaches_the_sink() {
         .position(|c| *c == SinkCall::Withdrawn(by_del))
         .expect("withdrawal announced");
     assert!(install < withdraw, "install must precede withdrawal");
+}
+
+/// A withdrawal reaches the sink even when this tier's own LPM delete
+/// fails.
+///
+/// The two tiers diverge in the direction that matters here: the prefix
+/// leaves this mirror (the removal happens first) while the second tier
+/// — the STEERED one — keeps forwarding a route BGP withdrew, with no
+/// retry and nothing upstream that would notice, because every counter
+/// and every readback verify samples the mirror that already forgot it.
+/// The fallback tier's stuck LPM entry is the lesser failure and it is
+/// already reported.
+///
+/// The failure is injected by deleting the LPM entry behind the
+/// programmer's back through a second handle to the same pin (see the
+/// module docstring), which makes its own delete return ENOENT. The
+/// `is_err` assertion is load-bearing, not decoration: without it a
+/// change that stopped the delete from failing would leave this test
+/// passing while testing nothing.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_withdrawal_reaches_the_sink_even_when_the_local_delete_fails() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let prefix = IpPrefix::V4 {
+        addr: [198, 18, 9, 0],
+        prefix_len: 24,
+    };
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let peer = PeerId(0x4444);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("apply Add");
+    });
+
+    let mut fib_v4 = open_lpm_v4(&h.pins.path("FIB_V4"));
+    fib_v4
+        .remove(&LpmKey::new(24, [198, 18, 9, 0]))
+        .expect("out-of-band delete of the entry the programmer installed");
+
+    let del = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix,
+                path_id: None,
+            })
+            .await
+    });
+
+    assert!(
+        del.is_err(),
+        "the local delete was supposed to fail — without that this test \
+         exercises the ordinary path and proves nothing"
+    );
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&SinkCall::Withdrawn(prefix)),
+        "the second tier must hear the withdrawal even though this tier's \
+         delete failed, or it forwards a withdrawn prefix forever: {calls:?}"
+    );
+}
+
+/// A GC whose recompute failed keeps reporting failure until it
+/// actually reconciles — and then announces the corrected set.
+///
+/// `gc_unseen` drains the unseen advertisements before recomputing, so
+/// its failure is not retryable by re-running the sweep: the victims
+/// are gone and the next GC collects none. Reporting `Ok(0)` there is
+/// the dangerous answer, because the prefix is still installed with the
+/// *withdrawn* stream's nexthops and the second tier reads a successful
+/// GC as "the mirror is current" — which is exactly the evidence the
+/// BMP station clears its stale-state suspicion on.
+///
+/// The failure is injected by exhausting the ECMP group pool: after the
+/// GC drops one of the target's two advertisements, the remaining
+/// nexthop set is a new signature and has nowhere to allocate. Freeing
+/// a group afterwards proves the debt clears on reconciliation rather
+/// than latching.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let peer_old = PeerId(0x5150);
+    let peer_new = PeerId(0x5151);
+    let target = IpPrefix::V4 {
+        addr: [198, 18, 20, 0],
+        prefix_len: 24,
+    };
+    let nh_old = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1));
+    let nh_a = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 2));
+    let nh_b = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 3));
+
+    let add = |peer: PeerId, prefix: IpPrefix, nexthops: Vec<IpAddr>| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops,
+        path_id: None,
+        local_pref: None,
+    };
+
+    // The target takes a group of its own first, so exhausting the pool
+    // below cannot deny it the set it is already installed with.
+    h.run(async {
+        h.handle
+            .apply_route_event(add(peer_old, target, vec![nh_old]))
+            .await
+            .expect("target via the old stream");
+        h.handle
+            .apply_route_event(add(peer_new, target, vec![nh_a, nh_b]))
+            .await
+            .expect("target via the new stream");
+    });
+
+    // Fill the ECMP pool with distinct pairs until allocation refuses.
+    // Discovered rather than hard-coded: a capacity change must not
+    // turn this into a test that exercises the ordinary path.
+    let mut filler: Vec<IpPrefix> = Vec::new();
+    let exhausted = h.run(async {
+        for i in 0..(ECMP_GROUPS_CAP + 8) {
+            let prefix = IpPrefix::V4 {
+                addr: [100, 64, (i >> 8) as u8, (i & 0xff) as u8],
+                prefix_len: 32,
+            };
+            let n1 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + i * 2));
+            let n2 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + i * 2 + 1));
+            if h.handle
+                .apply_route_event(add(peer_new, prefix, vec![n1, n2]))
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            filler.push(prefix);
+        }
+        false
+    });
+    assert!(
+        exhausted,
+        "the ECMP pool never filled — this test cannot inject its failure"
+    );
+
+    // New session: everything is re-announced except the target's old
+    // advertisement, which is what the GC must withdraw.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("resync");
+        for (i, prefix) in filler.iter().enumerate() {
+            let n1 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + (i as u32) * 2));
+            let n2 = IpAddr::V4(Ipv4Addr::from(0x0a80_0000 + (i as u32) * 2 + 1));
+            h.handle
+                .apply_route_event(add(peer_new, *prefix, vec![n1, n2]))
+                .await
+                .expect("re-announce filler");
+        }
+        h.handle
+            .apply_route_event(add(peer_new, target, vec![nh_a, nh_b]))
+            .await
+            .expect("re-announce target");
+    });
+
+    let first = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        first.is_err(),
+        "the GC recompute was supposed to fail on an exhausted pool"
+    );
+    assert!(
+        !sink
+            .calls()
+            .contains(&SinkCall::Resolved(target, vec![nh_a, nh_b])),
+        "the corrected set cannot have been announced — the recompute failed"
+    );
+
+    // The regression: the sweep finds no victims this time, and used to
+    // report success over a prefix still carrying the withdrawn
+    // stream's nexthop.
+    let retry = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        retry.is_err(),
+        "a GC that collected no victims must not report success while a \
+         previous GC's recompute is still owed"
+    );
+
+    // Free a group and let the grace queue release it, then the debt
+    // must clear and the second tier must hear the corrected set.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer_new,
+                prefix: filler[0],
+                path_id: None,
+            })
+            .await
+            .expect("free one filler");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    });
+    let settled = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        settled.is_ok(),
+        "with a group free the owed recompute must succeed: {settled:?}"
+    );
+    assert!(
+        sink.calls()
+            .contains(&SinkCall::Resolved(target, vec![nh_a, nh_b])),
+        "the second tier must end up with the post-GC nexthop set: {:?}",
+        sink.calls()
+    );
+}
+
+/// `has_session_routes` answers for route-source peers only.
+///
+/// The mirror is shared with the neighbour resolver's `local-prefix`
+/// /32s, which are resident for the daemon's life and belong to no
+/// session. A caller asking "did the previous stream leave anything
+/// behind" — the BMP station, at every stream boundary — must see a
+/// clean slate when the session's own routes are gone, or no stream
+/// ever earns its first-frame liveness raise.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn only_route_source_peers_count_as_session_routes() {
+    let h = ProgrammerHarness::new();
+    let session_peer = PeerId(0x6060);
+    let local_peer = PeerId::local_arp(33);
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 3, 0, 1));
+    let session_prefix = IpPrefix::V4 {
+        addr: [198, 18, 30, 0],
+        prefix_len: 24,
+    };
+    let local_prefix = IpPrefix::V4 {
+        addr: [10, 3, 0, 9],
+        prefix_len: 32,
+    };
+
+    let add = |peer: PeerId, prefix: IpPrefix| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![nh],
+        path_id: None,
+        local_pref: None,
+    };
+
+    h.run(async {
+        assert!(
+            !h.handle.has_session_routes().await.expect("query"),
+            "a fresh programmer holds no session routes"
+        );
+        h.handle
+            .apply_route_event(add(session_peer, session_prefix))
+            .await
+            .expect("session route");
+        assert!(
+            h.handle.has_session_routes().await.expect("query"),
+            "a route-source advertisement counts"
+        );
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: session_peer,
+                prefix: session_prefix,
+                path_id: None,
+            })
+            .await
+            .expect("withdraw session route");
+        assert!(
+            !h.handle.has_session_routes().await.expect("query"),
+            "withdrawing the session's last route leaves a clean slate"
+        );
+        // The local /32 arrives and must not resurrect the answer.
+        h.handle
+            .apply_route_event(add(local_peer, local_prefix))
+            .await
+            .expect("local-prefix route");
+        assert!(
+            !h.handle.has_session_routes().await.expect("query"),
+            "a local-prefix /32 belongs to no session — counting it denies \
+             every future stream its first-frame raise"
+        );
+        // ...and does not mask a real one either.
+        h.handle
+            .apply_route_event(add(session_peer, session_prefix))
+            .await
+            .expect("session route again");
+        assert!(
+            h.handle.has_session_routes().await.expect("query"),
+            "a session route alongside a local one still counts"
+        );
+    });
 }
 
 /// Re-advertising an identical nexthop set announces nothing.

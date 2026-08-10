@@ -328,7 +328,18 @@ struct SourceGate {
     /// activity rate. The COUNTER, not the table size: net size hides
     /// balanced churn and reads a shrinking source as quiet.
     last_seq: u64,
-    /// When `last_seq` was observed. `None` until the first check —
+    /// The session pulse counter at the previous check. Tracked
+    /// SEPARATELY from `last_seq` so the activity rate is the MAX of
+    /// the two deltas, never their sum: a changed route bumps both
+    /// counters (the tee mutates the mirror AND its element pulses),
+    /// and summing recorded two units per route — steady churn at
+    /// half the quiet threshold read as at-threshold and held the
+    /// gate forever (review finding). Max counts a changed element
+    /// once, and still catches what each counter alone misses:
+    /// reannouncements pulse without mutating, local-state churn
+    /// mutates without pulsing.
+    last_pulses: u64,
+    /// When the counters were observed. `None` until the first check —
     /// a rate needs two observations.
     last_check: Option<std::time::Instant>,
     /// Since when the source has stayed below the quiet rate, or `None`
@@ -340,6 +351,17 @@ struct SourceGate {
     /// cannot veto — they exist precisely for tables the floor is
     /// wrong about.
     rate_quiet_since: Option<std::time::Instant>,
+}
+
+/// One tick's reading of the source, taken by the caller and handed to
+/// [`SourceGate::observe`] whole — the gate consumes a consistent
+/// snapshot, and the observe signature stays within reason.
+#[derive(Debug, Clone, Copy)]
+struct SourceSample {
+    have: u64,
+    seq: u64,
+    pulses: u64,
+    live: bool,
 }
 
 /// What one gate observation saw. `released` is the coupled
@@ -358,6 +380,7 @@ impl SourceGate {
         Self {
             floor,
             last_seq: seq_baseline,
+            last_pulses: 0,
             last_check: None,
             quiet_since: None,
             rate_quiet_since: None,
@@ -389,8 +412,9 @@ impl SourceGate {
     /// pre-dump `quiet_since`, and re-release immediately: the
     /// rejection undone one tick later (review finding). After this,
     /// the source must establish a fresh sustained quiet interval.
-    fn rebaseline(&mut self, seq_now: u64) {
+    fn rebaseline(&mut self, seq_now: u64, pulses_now: u64) {
         self.last_seq = seq_now;
+        self.last_pulses = pulses_now;
         self.last_check = None;
         self.quiet_since = None;
         self.rate_quiet_since = None;
@@ -407,11 +431,16 @@ impl SourceGate {
     fn observe(
         &mut self,
         now: std::time::Instant,
-        have: u64,
-        seq: u64,
-        live: bool,
+        sample: SourceSample,
         quiet_rate: u64,
+        quiet_for: Duration,
     ) -> GateView {
+        let SourceSample {
+            have,
+            seq,
+            pulses,
+            live,
+        } = sample;
         let activity_per_sec = match self.last_check {
             // A rate needs two observations; the first check only
             // baselines, and reports as loading — which a source
@@ -419,7 +448,21 @@ impl SourceGate {
             None => u64::MAX,
             Some(prev) => {
                 let ms = now.duration_since(prev).as_millis().max(1) as u64;
-                seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
+                let mirror_delta = seq.saturating_sub(self.last_seq);
+                let pulse_delta = pulses.saturating_sub(self.last_pulses);
+                // ROUNDED UP, so activity can never divide away. Ticks
+                // are not pinned to one second, and truncating integer
+                // division turned one pulse over two seconds into a
+                // rate of ZERO — which the unattested posture, whose
+                // quiet_rate IS zero to demand literal silence, then
+                // accepted as quiet and let the five-second clock run
+                // through actual stream activity (review finding).
+                // Overstating by at most 1/s is free against every
+                // mirror-scaled rate and is the safe direction anyway.
+                mirror_delta
+                    .max(pulse_delta)
+                    .saturating_mul(1_000)
+                    .div_ceil(ms)
             }
         };
         let rate_quiet = live && activity_per_sec <= quiet_rate;
@@ -436,8 +479,9 @@ impl SourceGate {
         }
         let released = self
             .quiet_since
-            .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
+            .is_some_and(|since| now.duration_since(since) >= quiet_for);
         self.last_seq = seq;
+        self.last_pulses = pulses;
         self.last_check = Some(now);
         GateView {
             released,
@@ -489,6 +533,39 @@ enum DeferredResync {
         /// gating on emptiness is what wedged half the allowlist on
         /// the condemned fallback with no retry (review finding).
         restoring: bool,
+        /// The feed session's epoch count at the FIRST live
+        /// observation of this deferral — `None` until the session has
+        /// been seen up. A later epoch advance means the session went
+        /// down and up again underneath us: the world may have been
+        /// reloaded, a cached authority report cannot attest that
+        /// routes belong to the current stream (review finding), and
+        /// the deferral adopts the full unattested posture until it
+        /// releases. Baselined at first-up rather than at creation
+        /// because the deferral is normally created BEFORE the feed
+        /// connects — counting the initial raise as a flap demoted
+        /// every ordinary release (caught by the completeness test
+        /// before it shipped).
+        epoch: Option<u64>,
+        /// True while this deferral's attestation is demoted by a
+        /// session flap it has observed.
+        ///
+        /// The demotion has to be revocable or it is a wedge, not a
+        /// safeguard. What a flap invalidates is the AUTHORITY'S WORD,
+        /// because a report from before the reconnect cannot attest
+        /// that routes belong to the current stream — and the integrity
+        /// checker publishes a new one every few minutes, which can.
+        /// Latching `flapped` forever meant a single ordinary session
+        /// bounce (bird restart, hold-timer expiry) permanently
+        /// disabled the completeness door: a below-floor authoritative
+        /// deployment could then never release at all, and an
+        /// above-floor churning one fell to the zero-rate posture it
+        /// never satisfies (review finding). So the demotion lasts
+        /// exactly until a report timestamped after this moment
+        /// arrives, at which point the epoch re-baselines and the
+        /// attested path returns. A report that is merely NEWER is
+        /// enough: its own drift check is what judges whether the
+        /// current stream has actually converged.
+        demoted: bool,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -515,34 +592,21 @@ impl DeferredResync {
 /// the operator's `expected-routes`, so it scales with the deployment
 /// instead of encoding this fleet's table.
 ///
-/// Capacity is an UPPER sizing bound, though, so this floor is only
-/// one of three releases — a deployment whose real table sits below
-/// `capacity / 16` (the default sizing over a small table qualifies)
-/// would otherwise defer forever (review finding). The other two, in
-/// the `AwaitingFallback` arm: the completeness authority where a bird
-/// exists to compare against, and the session-backed small-table
-/// clause under [`SMALL_TABLE_QUIET_FOR`].
+/// Capacity is an UPPER sizing bound, so this floor doubles as a
+/// CONTRACT: with `require-table-complete off` there is no authority
+/// to say a small table is complete, and the release gate refuses to
+/// guess — a deployment whose real table sits below `capacity / 16`
+/// defers its adopted reconciliation indefinitely, visibly, with the
+/// remedy in the health text (size `expected-routes` within 16x of
+/// the real table, or add bird and enable the authority). A
+/// session-backed small-table heuristic existed briefly and was
+/// removed deliberately: ten of PR #151's twenty review rounds were
+/// spent on its corner cases, every one serving a configuration the
+/// fleet does not run, and its liveness settling wedged the FLEET
+/// path within hours of merging (#152). Supported configurations
+/// release in seconds through the floor or the authority; everything
+/// else is refused by arithmetic rather than guarded by heuristics.
 pub const FALLBACK_FLOOR_DIVISOR: u64 = 16;
-
-/// The pre-dump stage's small-table release: the feed session is UP,
-/// the mirror is non-empty, and the rate has been quiet this long. The
-/// session handle is what three failed proxies were reaching for
-/// (capacity fractions, arrival deltas, absolute minimums - each a
-/// review finding): no mirror-side count can distinguish a loaded
-/// small table from the husk a dead session leaves behind, because
-/// neighbour-synthesized local routes alone can number in the
-/// hundreds. Liveness comes from the session owner instead, and quiet
-/// supplies the completion evidence.
-///
-/// The DURATION still matters: it must outlast the BGP hold time,
-/// because a HUNG session reads as up until the hold expires - the
-/// listener then closes it and reports down, which is what bounds how
-/// long "up" can be stale. Default holds are 90 s and the fleet feed
-/// negotiates 90; 150 s covers them with margin. A deployment that
-/// raises its hold beyond this should size `expected-routes` within
-/// 16x of its table or run `require-table-complete on`, both of which
-/// release without this clause.
-const SMALL_TABLE_QUIET_FOR: Duration = Duration::from_secs(150);
 
 /// How often a refused or unacknowledged unsteer is re-requested while
 /// the pre-dump stage waits. Paced because the gate re-checks every
@@ -571,6 +635,35 @@ const UNSTEER_REQUEST_EVERY: Duration = Duration::from_secs(5);
 ///   distinguish "loading, at 60%" from "loaded, shrunk to 60%"; only
 ///   the growth rate can.
 pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
+
+/// The activity rate an UNATTESTED release tolerates: ZERO. Any
+/// allowance re-opens the same hole at a slower speed — the
+/// mirror-scaled rate admitted a 200/s reconnect trickle, and the
+/// 64/s noise floor that replaced it admitted a 64/s one, which can
+/// run indefinitely while its sub-5s frame cadence also holds off
+/// InitiationComplete and the GC forever (review findings, in that
+/// order). Without an authority there is no way to distinguish slow
+/// churn from a throttled reload, so the gate does not try: an
+/// unattested release requires the stream and the mirror to be
+/// LITERALLY still for the whole window. Real feeds have such
+/// windows between churn bursts; a feed busy enough not to simply
+/// keeps the deferral — visible, remedied, and correct. Attested
+/// releases keep the mirror-scaled rate: their authority carries
+/// completion truth and vetoes partial tables on current-mirror
+/// drift regardless of quiet.
+pub const UNATTESTED_QUIET_RATE_PER_SEC: u64 = 0;
+
+/// The quiet a release must show when NO completeness authority is
+/// configured. Five seconds, deliberately equal to both listeners'
+/// INIT_COMPLETE_QUIESCENCE: that is each protocol's own definition of
+/// "the initial dump is complete", and a release that has no authority
+/// to attest completion must not claim it on LESS evidence than the
+/// protocol itself requires — two seconds of stall mid-dump released a
+/// partial mirror whose only sin was pausing (review finding). With an
+/// authority present the shorter window stands, because the authority
+/// carries the completion truth and its current-mirror drift vetoes a
+/// partial table regardless of quiet.
+pub const UNATTESTED_QUIET_FOR: Duration = Duration::from_secs(5);
 
 /// How long the source must stay below the quiet RATE before it counts
 /// as loaded. A duration, never a number of checks: the production loop
@@ -782,8 +875,37 @@ impl Runtime {
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
+            authority: if c.completeness.is_none() {
+                AuthorityPosture::Absent
+            } else if matches!(
+                &c.deferred_resync,
+                Some(DeferredResync::AwaitingFallback { demoted: true, .. })
+            ) {
+                AuthorityPosture::DemotedByFlap
+            } else {
+                AuthorityPosture::Attesting
+            },
         }
     }
+}
+
+/// What the completeness authority can currently say, for the health
+/// text.
+///
+/// Three states rather than a bool plus a second bool, because the
+/// interesting case is neither "configured" nor "absent": an authority
+/// that exists but whose word this deferral may not use. Reported as
+/// one field so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityPosture {
+    /// No `require-table-complete` handle; the proxies stand alone.
+    Absent,
+    /// Configured and usable.
+    Attesting,
+    /// Configured, but this deferral saw the feed flap and has not yet
+    /// seen the current epoch reconciled, so the authority's word
+    /// cannot be trusted to describe the current stream.
+    DemotedByFlap,
 }
 
 /// One coherent snapshot of the runtime's observable state, for the
@@ -812,6 +934,12 @@ pub struct RuntimeStatus {
     /// `Some((have, want))` while an adopted resync is deferred for a
     /// still-loading route source. See `Core::deferred_resync`.
     pub resync_deferred: Option<(u64, u64)>,
+    /// What the authority can say right now — the deferral health text
+    /// depends on it: an attested deployment's below-floor wait
+    /// resolves through the authority and telling it to "add bird"
+    /// recommends the thing it already has, while a demoted one is
+    /// waiting on something else entirely.
+    pub authority: AuthorityPosture,
 }
 
 impl Core {
@@ -965,17 +1093,104 @@ impl Observe for ObserveView {
         // hazard being deferred.
         if let Some(d) = c.deferred_resync {
             let have = c.source.route_count();
+            // Two counters, tracked separately: the gate takes the MAX
+            // of their deltas, never the sum — a changed route bumps
+            // both (its element pulses AND the tee mutates the mirror),
+            // and summing double-counted steady churn until half the
+            // quiet threshold read as at-threshold (review finding).
+            // Max still catches what each alone misses: reannouncement
+            // dumps pulse without mutating, local-state churn mutates
+            // without pulsing.
             let seq = c.source.change_seq();
+            let pulses = c.feed_session.as_ref().map_or(0, |f| f.pulse_count());
             match d {
                 DeferredResync::AwaitingFallback {
                     mut gate,
                     mut last_request,
                     mut restoring,
+                    mut epoch,
+                    mut demoted,
                 } => {
-                    let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
+                    // ONE observation for both — see `FeedLiveness`. Read
+                    // separately, `live` could come from after a raise
+                    // and the epoch from before its increment, and the
+                    // next tick's higher epoch reads as a flap on what
+                    // was an ordinary first raise (review finding).
+                    let liveness = c.feed_session.as_ref().map(|f| f.liveness());
+                    let live = liveness.is_some_and(|l| l.up);
                     // Rate scaled to the mirror as observed — never
                     // to capacity, which is a ceiling, not a table.
-                    let view = gate.observe(now, have, seq, live, source_quiet_rate_per_sec(have));
+                    // The floor door's quiet requirement depends on
+                    // whether anyone can attest completion: with no
+                    // authority, quiet must at least match the
+                    // protocol's own initiation-complete standard —
+                    // see UNATTESTED_QUIET_FOR.
+                    // The attested fast path holds only while the
+                    // session has NOT flapped under this deferral: a
+                    // reconnect reopens the stream epoch, and a cached
+                    // report cannot attest that routes belong to the
+                    // current one — so a flapped deferral takes the
+                    // full unattested posture UNTIL A REPORT NEWER THAN
+                    // THE GC HAS RUN (see `demoted`; latching it
+                    // forever turned an ordinary session bounce into a
+                    // deferral that could never release). The fleet's
+                    // steady 40 s release never flaps and never pays
+                    // this at all.
+                    let current_epoch = liveness.map(|l| l.epoch);
+                    if live && epoch.is_none() {
+                        epoch = current_epoch;
+                    }
+                    if matches!((epoch, current_epoch), (Some(e), Some(c_)) if c_ != e) {
+                        demoted = true;
+                    }
+                    // Only the GC lifts it. A completeness report
+                    // published after the flap is NOT evidence the
+                    // mirror is this session's: the checker compares
+                    // counts, and a reannouncement still carrying the
+                    // previous session's unseen routes keeps the count
+                    // aligned — so a positive post-flap report can sit
+                    // over a half-current mirror, and if the
+                    // reannouncement trickles below the attested quiet
+                    // rate the gate would release and diff against it
+                    // (review finding, refuting the timestamp test that
+                    // stood here). `InitiationComplete`'s GC is the one
+                    // event that destroys prior-session state, and
+                    // `reconciled` is stamped for the epoch it ran in.
+                    if demoted && liveness.is_some_and(|l| l.reconciled) {
+                        epoch = current_epoch;
+                        demoted = false;
+                    }
+                    // Consequence, accepted deliberately: on a feed
+                    // whose churn never yields the initiation-complete
+                    // silence, a flap mid-deferral holds the deferral in
+                    // the unattested posture indefinitely. That is the
+                    // safe direction and a visible one — VPP keeps
+                    // forwarding the FIB it was adopted with, health
+                    // reports the deferral — and it is the same bargain
+                    // FALLBACK_FLOOR_DIVISOR already makes: refuse
+                    // visibly rather than release on evidence that does
+                    // not mean what it appears to.
+                    let flapped = demoted;
+                    let attested = c.completeness.is_some() && !flapped;
+                    let view = gate.observe(
+                        now,
+                        SourceSample {
+                            have,
+                            seq,
+                            pulses,
+                            live,
+                        },
+                        if attested {
+                            source_quiet_rate_per_sec(have)
+                        } else {
+                            UNATTESTED_QUIET_RATE_PER_SEC
+                        },
+                        if attested {
+                            SOURCE_QUIET_FOR
+                        } else {
+                            UNATTESTED_QUIET_FOR
+                        },
+                    );
                     let want = gate.floor;
                     // Three ways the fallback proves itself ready,
                     // because the floor alone cannot: capacity is an
@@ -986,14 +1201,13 @@ impl Observe for ObserveView {
                     //    tables within 16x of their sizing (the fleet);
                     //  - the completeness authority, where a bird
                     //    exists — the exact signal, and the same one
-                    //    `Effects::steer` gates on;
-                    //  - a non-empty mirror whose feed SESSION is up,
-                    //    quiet longer than the BGP hold time: the
-                    //    session handle is the liveness authority no
-                    //    mirror-side count could be (see
-                    //    SMALL_TABLE_QUIET_FOR), and the hold-length
-                    //    quiet is what bounds a hung session going
-                    //    stale at "up".
+                    //    `Effects::steer` gates on.
+                    // TWO releases, deliberately not three: a
+                    // below-floor table with no authority defers
+                    // forever, visibly, because nothing honest can say
+                    // it is complete — see FALLBACK_FLOOR_DIVISOR for
+                    // the contract and for what happened to the
+                    // heuristic that used to guess.
                     // The authority's CURRENT word gates every path:
                     // the cached verdict alone let a stale Converged
                     // carry a since-shrunken mirror through the floor
@@ -1004,16 +1218,18 @@ impl Observe for ObserveView {
                     // stand on their own.
                     let authority = authority_current(&c.completeness, have);
                     let veto = authority == Some(false);
+                    // `!flapped` here too: a positive authority word is
+                    // epoch-blind — the report may predate the
+                    // reconnect entirely, and stale prior-session
+                    // routes keep its counts aligned (review finding:
+                    // round twelve demoted only the floor door). A
+                    // NEGATIVE word still vetoes regardless of epoch;
+                    // caution does not expire.
                     let complete = live
+                        && !flapped
                         && view.rate_quiet_for.is_some_and(|q| q >= SOURCE_QUIET_FOR)
                         && authority == Some(true);
-                    let small_table_loaded = have > 0
-                        && live
-                        && view
-                            .rate_quiet_for
-                            .is_some_and(|q| q >= SMALL_TABLE_QUIET_FOR);
-                    let released =
-                        !veto && ((view.released && live) || complete || small_table_loaded);
+                    let released = !veto && ((view.released && live) || complete);
                     let unsteered = c.steering.installed().is_empty();
                     if !released {
                         // Revocation AFTER the unsteer was acknowledged
@@ -1052,6 +1268,8 @@ impl Observe for ObserveView {
                             gate,
                             last_request,
                             restoring,
+                            epoch,
+                            demoted,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1077,6 +1295,8 @@ impl Observe for ObserveView {
                             gate,
                             last_request,
                             restoring,
+                            epoch,
+                            demoted,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -1115,9 +1335,13 @@ impl Observe for ObserveView {
                         // populated ledger), the revocation path
                         // re-steers, and a later release diffs against
                         // a recovered source.
-                        let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
+                        // One observation for liveness and epoch, as at
+                        // the deferral site above.
+                        let liveness_now = feed_session.as_ref().map(|f| f.liveness());
+                        let live_now = liveness_now.is_some_and(|l| l.up);
                         let have_now = source.route_count();
                         let seq_now = source.change_seq();
+                        let pulses_now = feed_session.as_ref().map_or(0, |f| f.pulse_count());
                         // An ABSOLUTE budget for the whole dump, never
                         // a dump-wide average: dividing by the dump's
                         // duration let a withdrawal burst early in a
@@ -1129,9 +1353,27 @@ impl Observe for ObserveView {
                         // at most what a legitimately quiet source
                         // produces in one SOURCE_QUIET_FOR window,
                         // scaled by the mirror being protected.
-                        let churn_budget =
-                            source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs();
-                        let dump_churn = seq_now.saturating_sub(seq);
+                        // The same authority split as the release that
+                        // authorized this dump: an unattested budget of
+                        // zero, because a reconnect trickle running
+                        // through the dump window is a reload the gate
+                        // just promised was not happening — accepting
+                        // ~2k elements of it here undid the zero-rate
+                        // release one step later (review finding).
+                        let flapped_now = matches!(
+                            (epoch, liveness_now.map(|l| l.epoch)),
+                            (Some(e), Some(c_)) if c_ != e
+                        );
+                        let churn_budget = if completeness.is_some() && !flapped_now {
+                            source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs()
+                        } else {
+                            UNATTESTED_QUIET_RATE_PER_SEC * UNATTESTED_QUIET_FOR.as_secs()
+                        };
+                        // Max, not sum, for the same double-count
+                        // reason as the gate's rate.
+                        let dump_churn = seq_now
+                            .saturating_sub(seq)
+                            .max(pulses_now.saturating_sub(pulses));
                         // Both bounds, because each covers the other's
                         // small end: the absolute budget is 128
                         // mutations at the 64/s floor, which is noise
@@ -1154,11 +1396,13 @@ impl Observe for ObserveView {
                                  the diff — the adopted routes stay in the ledger and the \
                                  reconciliation resumes when the source is ready again"
                             );
-                            gate.rebaseline(seq_now);
+                            gate.rebaseline(seq_now, pulses_now);
                             c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                                 gate,
                                 last_request,
                                 restoring: true,
+                                epoch,
+                                demoted,
                             });
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
@@ -1182,7 +1426,17 @@ impl Observe for ObserveView {
                     // nothing at this stage is steered), so quiet needs
                     // no liveness conditioning: pass live.
                     let released = gate
-                        .observe(now, have, seq, true, source_quiet_rate_per_sec(adopted))
+                        .observe(
+                            now,
+                            SourceSample {
+                                have,
+                                seq,
+                                pulses,
+                                live: true,
+                            },
+                            source_quiet_rate_per_sec(adopted),
+                            SOURCE_QUIET_FOR,
+                        )
                         .released;
                     if !released {
                         let want = gate.floor;
@@ -1406,7 +1660,8 @@ impl Effects for EffectsView {
         if !c.steering.installed().is_empty() {
             let capacity = c.engine.route_capacity();
             let floor = (capacity / FALLBACK_FLOOR_DIVISOR).max(1);
-            let seq = c.source.change_seq();
+            let seq =
+                c.source.change_seq() + c.feed_session.as_ref().map_or(0, |f| f.pulse_count());
             tracing::info!(
                 floor,
                 "adopted VPP is steered, so reading its FIB waits: the dump freezes \
@@ -1419,6 +1674,8 @@ impl Effects for EffectsView {
                 gate: SourceGate::new(floor, seq),
                 last_request: None,
                 restoring: false,
+                epoch: None,
+                demoted: false,
             });
             return Ok(());
         }
@@ -1549,6 +1806,55 @@ mod tests {
     // Only the Linux-gated process tests need these.
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+
+    /// Activity cannot divide away, however slowly the tick ran.
+    ///
+    /// The unattested posture sets `quiet_rate` to ZERO precisely to
+    /// demand literal silence, so a rate that truncates to zero is not
+    /// a rounding detail — it is the difference between "the stream
+    /// stopped" and "the stream is running and we divided it away".
+    /// Ticks are not pinned to one second, so the interval is the
+    /// attacker here, not the volume.
+    #[test]
+    fn one_pulse_over_a_slow_tick_is_not_silence() {
+        let sample = |pulses| SourceSample {
+            have: 1_000,
+            seq: 0,
+            pulses,
+            live: true,
+        };
+        let mut gate = SourceGate::new(0, 0);
+        let t0 = std::time::Instant::now();
+        // First observation only baselines.
+        gate.observe(t0, sample(0), 0, UNATTESTED_QUIET_FOR);
+
+        // One pulse two seconds later: 1 * 1000 / 2000 truncates to 0,
+        // and 0 <= 0 read as quiet.
+        let v = gate.observe(
+            t0 + Duration::from_secs(2),
+            sample(1),
+            0,
+            UNATTESTED_QUIET_FOR,
+        );
+        assert!(
+            v.rate_quiet_for.is_none(),
+            "a pulse is activity at any tick spacing; the zero-rate \
+             posture must see it"
+        );
+
+        // And genuine silence across the same slow tick still reads
+        // quiet — the fix must not make the gate unsatisfiable.
+        let v = gate.observe(
+            t0 + Duration::from_secs(4),
+            sample(1),
+            0,
+            UNATTESTED_QUIET_FOR,
+        );
+        assert!(
+            v.rate_quiet_for.is_some(),
+            "no new pulses is silence, whatever the interval"
+        );
+    }
 
     struct EmptySource;
     impl RouteSource for EmptySource {

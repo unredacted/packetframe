@@ -1455,6 +1455,12 @@ fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
     // still works, so this withholds rather than latches.
     svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
         .expect("the lever still turns");
+    // NOT polled, deliberately: the loop publishes before it answers
+    // the caller, so a returned `apply_steering` means the window
+    // already shows the change. Polling here would pass just as well
+    // against a loop that answered first and published a tick later,
+    // which is precisely the regression an operator's
+    // reconfigure-then-status sequence would hit.
     assert_eq!(svc.status().expect("published").state, State::Steered);
 
     svc.stop();

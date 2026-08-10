@@ -1002,6 +1002,7 @@ fn run_loop(
             driver.api_health(now),
             fib,
             rs.resync_deferred,
+            rs.authority,
             rs.port_links,
             rs.store_error.clone(),
             rs.drain_error.clone(),
@@ -1061,13 +1062,37 @@ fn run_loop(
                 // as a refused automatic steer.
                 remember_failures(&mut last_failures, vec![format!("Reconfigure: {e}")]);
             }
-            *shared.steering_result.lock().expect("steering lock") = Some((req.seq, outcome));
             // The engine's socket deadline keys on whether packets are
             // on VPP, and that may have just changed. Synced here rather
             // than left to the post-tick call for the same reason
             // `adopt_process` takes `steered` as a parameter: the work
             // in between runs under the wrong budget otherwise.
             runtime.set_steered(driver.supervisor().is_steered());
+            // PUBLISHED BEFORE THE CALLER IS ANSWERED, so `packetframe
+            // reconfigure` returning OK means `packetframe status`
+            // already shows the new state.
+            //
+            // Answering first left the window holding the PREVIOUS
+            // state until the tick below republished it, so an operator
+            // — or a rollout script — reading status immediately after
+            // a lever flip could see the state it just changed away
+            // from, and a canary ladder that checks its own step is
+            // exactly the caller that does this. A real race, not a
+            // theoretical one: two tests asserted the synchronous
+            // contract and won it almost always, until CI lost the
+            // toss. One extra publish per `reconfigure` costs nothing;
+            // this runs once per operator action, not once per tick.
+            publish(
+                &driver,
+                &runtime,
+                &last_verify,
+                &last_verify_at,
+                &terminal,
+                &[],
+                false,
+                &last_failures,
+            );
+            *shared.steering_result.lock().expect("steering lock") = Some((req.seq, outcome));
         }
 
         let now = Instant::now();
