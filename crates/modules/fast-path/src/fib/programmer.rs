@@ -549,17 +549,31 @@ pub struct FibProgrammer {
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
 
-    /// Prefixes whose GC recompute failed and has not since succeeded.
+    /// Prefixes whose recompute failed and has not since succeeded.
     ///
-    /// `gc_unseen` drains the unseen advertisements before recomputing,
-    /// so a failure there is not retryable by re-running the sweep: the
-    /// victims are gone, the next GC collects none, and it would report
-    /// a vacuous `Ok` over a prefix still installed with the withdrawn
-    /// stream's nexthops — which a second tier reads as "the GC
-    /// finished, the mirror is current" (review finding). Retried at
-    /// the next GC and cleared by any successful recompute of the
-    /// prefix; while non-empty, the GC is not complete and says so.
-    gc_recompute_owed: HashSet<IpPrefix>,
+    /// Both producers drain the advertisements BEFORE recomputing, so
+    /// neither failure is retryable by re-running the operation that
+    /// caused it:
+    ///
+    /// - `gc_unseen` removes the unseen advertisements first, so the
+    ///   next GC collects no victims and would report a vacuous `Ok`
+    ///   over a prefix still installed with the withdrawn stream's
+    ///   nexthops — which a second tier reads as "the GC finished, the
+    ///   mirror is current".
+    /// - `drop_routes_for_peer` takes the peer's key out of
+    ///   `routes_by_peer` first, so after a failure nothing else
+    ///   records that the prefix may still forward over the departed
+    ///   peer's nexthops — which it does whenever another
+    ///   advertisement (a `local_arp` /32) keeps the record alive and
+    ///   the mirror keeps its pre-failure `nexthop_ips`.
+    ///
+    /// Both are review findings, and they are one shape: the ledger
+    /// says the route source is gone while the installed state says
+    /// otherwise. Retried at the next GC, cleared by any successful
+    /// recompute of the prefix. While non-empty the GC is not complete
+    /// and says so, and [`FibProgrammerHandle::has_session_routes`]
+    /// answers yes.
+    recompute_owed: HashSet<IpPrefix>,
 
     // --- Second tier (Phase 4) ---
     /// Where the resolved FIB is announced, when a second forwarding
@@ -738,7 +752,7 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
-                gc_recompute_owed: HashSet::new(),
+                recompute_owed: HashSet::new(),
                 route_sink: None,
                 cache_cfg,
                 cache_enabled: false,
@@ -824,10 +838,18 @@ impl FibProgrammer {
                 // prefix goes, so a present key means live
                 // advertisements. Local-arp peers are the resolver's
                 // synthetic /32s, not any session's.
-                let any = self
-                    .routes_by_peer
-                    .keys()
-                    .any(|p| p.as_local_arp_ifindex().is_none());
+                // Surviving advertisement owners are not the whole
+                // answer. A recompute that failed leaves the RECORD —
+                // and so the second tier — holding the departed
+                // session's nexthops, while `drop_routes_for_peer` has
+                // already removed that peer's key here (review
+                // finding). Anything owed a repair counts as session
+                // state until the repair lands.
+                let any = !self.recompute_owed.is_empty()
+                    || self
+                        .routes_by_peer
+                        .keys()
+                        .any(|p| p.as_local_arp_ifindex().is_none());
                 let _ = reply.send(any);
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
@@ -1419,6 +1441,14 @@ impl FibProgrammer {
                 continue;
             }
             if let Err(e) = self.recompute_fib_entry(prefix) {
+                // Owed, not merely logged. The peer's key left
+                // `routes_by_peer` before this loop began, so once the
+                // recompute fails nothing else records that this prefix
+                // may still be forwarding over the departed peer's
+                // nexthops — and it does, whenever another advertisement
+                // (a `local_arp` /32) keeps the record alive and the
+                // mirror keeps its pre-failure `nexthop_ips`.
+                self.recompute_owed.insert(prefix);
                 warn!(?peer_id, ?prefix, error = %e, "recompute after PeerDown failed");
             }
         }
@@ -1482,9 +1512,9 @@ impl FibProgrammer {
         }
         let count = victims.len();
         // Carry forward whatever a previous GC left unreconciled — see
-        // `gc_recompute_owed`. Starting from an empty set is what made a
+        // `recompute_owed`. Starting from an empty set is what made a
         // retry report success over work it had not done.
-        let mut touched: HashSet<IpPrefix> = std::mem::take(&mut self.gc_recompute_owed);
+        let mut touched: HashSet<IpPrefix> = std::mem::take(&mut self.recompute_owed);
         for (prefix, (peer_id, path_id)) in victims {
             if self.remove_advertisement(peer_id, &prefix, path_id) {
                 touched.insert(prefix);
@@ -1497,7 +1527,7 @@ impl FibProgrammer {
         let mut first_err: Option<ProgrammerError> = None;
         for prefix in touched {
             if let Err(e) = self.recompute_fib_entry(prefix) {
-                self.gc_recompute_owed.insert(prefix);
+                self.recompute_owed.insert(prefix);
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
@@ -1505,7 +1535,7 @@ impl FibProgrammer {
         }
         if let Some(e) = first_err {
             warn!(
-                owed = self.gc_recompute_owed.len(),
+                owed = self.recompute_owed.len(),
                 error = %e,
                 "GC recompute failed; prefixes retained for the next GC"
             );
@@ -1608,7 +1638,7 @@ impl FibProgrammer {
     /// lookup can land on the prior IDs.
     ///
     /// Success clears any GC debt on `prefix` — see
-    /// [`Self::gc_recompute_owed`]. That is wrapped around every exit
+    /// [`Self::recompute_owed`]. That is wrapped around every exit
     /// rather than written at the one the GC takes, because the
     /// no-change shortcut is also a reconciliation: it can only fire
     /// when the mirror already holds the desired set, and the mirror
@@ -1617,7 +1647,7 @@ impl FibProgrammer {
     fn recompute_fib_entry(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
         let outcome = self.recompute_fib_entry_inner(prefix);
         if outcome.is_ok() {
-            self.gc_recompute_owed.remove(&prefix);
+            self.recompute_owed.remove(&prefix);
         }
         outcome
     }

@@ -478,29 +478,46 @@ Be precise about this when reasoning about an incident.
 |---|---|
 | `detach` < 1 s across N VFs | UNMEASURED — the last shadow item; relaxes to a documented best-effort bound if hardware says so |
 
-### A planned restart looks Unhealthy for ~10 seconds. Do not page on it.
+### A planned restart looks Degraded for 40-80 seconds. Do not page on it.
 
 Restarting packetframe over a **steered** VPP reports:
 
 ```
-vpp-offload: UNHEALTHY
-  fib-synced   UNHEALTHY — traffic steered into an unverified FIB
+vpp-offload: DEGRADED
+  fib-synced   DEGRADED — resync deferred: ... the adopted FIB keeps
+                          forwarding untouched
 ```
 
-for roughly ten seconds, then clears to `fib-synced healthy` on its own.
+for the length of the deferral plus the reconcile, then clears to
+`fib-synced healthy` on its own. Measured 2026-08-09 on the shadow
+(d12): unsteer at +40 s, re-steer at +78 s, worst forwarding gap
+0.109 s.
 
-This is correct and deliberate. An adopted VPP is presumed
-good-until-proven-stale: the module resyncs and verifies but does **not**
-unsteer first, because unsteering a correctly-forwarding VPP would create
-the blackhole the design exists to avoid. So between adoption and the
-first completed verify, traffic genuinely is diverted into a FIB this
-process has not yet checked — and the health surface refuses to call that
-healthy rather than papering over it.
+This is correct and deliberate, and it is DEGRADED rather than
+UNHEALTHY on purpose: the adopted VPP is forwarding a FIB the previous
+daemon verified, so packets are fine — what is unfinished is this
+daemon's reconciliation of it. Overall health tracks whether packets
+are forwarded correctly, not whether the offload has caught up.
+
+The shape changed with the deferred-dump design (#151). Before it, the
+module dumped VPP's FIB immediately at adoption and reported UNHEALTHY
+("traffic steered into an unverified FIB") for ~10 s — and that dump
+froze every VPP worker for 5.4 s, which is the outage the deferral
+exists to remove. If you are reading a runbook copy that describes the
+10 s Unhealthy window, it predates #151.
 
 Consequence for alerting: anything paging on `packetframe_vpp_health`
-will fire on every planned restart. Either alert on a sustained
-Unhealthy (30 s or more) or exclude the window explicitly. Measured
-2026-08-06 on the shadow during drill (d).
+fires on every planned restart. Alert on a sustained NOT-healthy state
+of **two minutes or more** — comfortably past the measured 80 s — or
+exclude the window explicitly. Thirty seconds, the pre-#151 guidance,
+now fires on every restart.
+
+One case where the wait is legitimately unbounded: if the feed session
+flaps DURING the deferral, the completeness authority is demoted until
+the source reports its initiation-complete GC, which needs 5 s without
+updates and which a live DFZ feed may never give. The deferral message
+says so explicitly when that is what is happening — read it before
+concluding the checker is broken. Nothing is dropping meanwhile.
 
 ### A member port needs two things admin-up does not give it
 
