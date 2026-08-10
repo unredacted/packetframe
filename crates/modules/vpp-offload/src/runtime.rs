@@ -328,7 +328,18 @@ struct SourceGate {
     /// activity rate. The COUNTER, not the table size: net size hides
     /// balanced churn and reads a shrinking source as quiet.
     last_seq: u64,
-    /// When `last_seq` was observed. `None` until the first check —
+    /// The session pulse counter at the previous check. Tracked
+    /// SEPARATELY from `last_seq` so the activity rate is the MAX of
+    /// the two deltas, never their sum: a changed route bumps both
+    /// counters (the tee mutates the mirror AND its element pulses),
+    /// and summing recorded two units per route — steady churn at
+    /// half the quiet threshold read as at-threshold and held the
+    /// gate forever (review finding). Max counts a changed element
+    /// once, and still catches what each counter alone misses:
+    /// reannouncements pulse without mutating, local-state churn
+    /// mutates without pulsing.
+    last_pulses: u64,
+    /// When the counters were observed. `None` until the first check —
     /// a rate needs two observations.
     last_check: Option<std::time::Instant>,
     /// Since when the source has stayed below the quiet rate, or `None`
@@ -358,6 +369,7 @@ impl SourceGate {
         Self {
             floor,
             last_seq: seq_baseline,
+            last_pulses: 0,
             last_check: None,
             quiet_since: None,
             rate_quiet_since: None,
@@ -389,8 +401,9 @@ impl SourceGate {
     /// pre-dump `quiet_since`, and re-release immediately: the
     /// rejection undone one tick later (review finding). After this,
     /// the source must establish a fresh sustained quiet interval.
-    fn rebaseline(&mut self, seq_now: u64) {
+    fn rebaseline(&mut self, seq_now: u64, pulses_now: u64) {
         self.last_seq = seq_now;
+        self.last_pulses = pulses_now;
         self.last_check = None;
         self.quiet_since = None;
         self.rate_quiet_since = None;
@@ -409,6 +422,7 @@ impl SourceGate {
         now: std::time::Instant,
         have: u64,
         seq: u64,
+        pulses: u64,
         live: bool,
         quiet_rate: u64,
     ) -> GateView {
@@ -419,7 +433,9 @@ impl SourceGate {
             None => u64::MAX,
             Some(prev) => {
                 let ms = now.duration_since(prev).as_millis().max(1) as u64;
-                seq.saturating_sub(self.last_seq).saturating_mul(1_000) / ms
+                let mirror_delta = seq.saturating_sub(self.last_seq);
+                let pulse_delta = pulses.saturating_sub(self.last_pulses);
+                mirror_delta.max(pulse_delta).saturating_mul(1_000) / ms
             }
         };
         let rate_quiet = live && activity_per_sec <= quiet_rate;
@@ -438,6 +454,7 @@ impl SourceGate {
             .quiet_since
             .is_some_and(|since| now.duration_since(since) >= SOURCE_QUIET_FOR);
         self.last_seq = seq;
+        self.last_pulses = pulses;
         self.last_check = Some(now);
         GateView {
             released,
@@ -952,15 +969,16 @@ impl Observe for ObserveView {
         // hazard being deferred.
         if let Some(d) = c.deferred_resync {
             let have = c.source.route_count();
-            // Mirror mutations PLUS stream pulses: a reconnect dump
-            // reannounces an unchanged table, the mirror never moves,
-            // and quiet must mean the STREAM went quiet (review
-            // finding). Both counters are monotone, so their sum is a
-            // single honest activity counter. The gate baselines
-            // overwrite themselves on first observation, so a
-            // mirror-only baseline elsewhere cannot skew the rate.
-            let seq =
-                c.source.change_seq() + c.feed_session.as_ref().map_or(0, |f| f.pulse_count());
+            // Two counters, tracked separately: the gate takes the MAX
+            // of their deltas, never the sum — a changed route bumps
+            // both (its element pulses AND the tee mutates the mirror),
+            // and summing double-counted steady churn until half the
+            // quiet threshold read as at-threshold (review finding).
+            // Max still catches what each alone misses: reannouncement
+            // dumps pulse without mutating, local-state churn mutates
+            // without pulsing.
+            let seq = c.source.change_seq();
+            let pulses = c.feed_session.as_ref().map_or(0, |f| f.pulse_count());
             match d {
                 DeferredResync::AwaitingFallback {
                     mut gate,
@@ -970,7 +988,14 @@ impl Observe for ObserveView {
                     let live = c.feed_session.as_ref().is_some_and(|f| f.is_up());
                     // Rate scaled to the mirror as observed — never
                     // to capacity, which is a ceiling, not a table.
-                    let view = gate.observe(now, have, seq, live, source_quiet_rate_per_sec(have));
+                    let view = gate.observe(
+                        now,
+                        have,
+                        seq,
+                        pulses,
+                        live,
+                        source_quiet_rate_per_sec(have),
+                    );
                     let want = gate.floor;
                     // Three ways the fallback proves itself ready,
                     // because the floor alone cannot: capacity is an
@@ -1105,8 +1130,8 @@ impl Observe for ObserveView {
                         // a recovered source.
                         let live_now = feed_session.as_ref().is_some_and(|f| f.is_up());
                         let have_now = source.route_count();
-                        let seq_now = source.change_seq()
-                            + feed_session.as_ref().map_or(0, |f| f.pulse_count());
+                        let seq_now = source.change_seq();
+                        let pulses_now = feed_session.as_ref().map_or(0, |f| f.pulse_count());
                         // An ABSOLUTE budget for the whole dump, never
                         // a dump-wide average: dividing by the dump's
                         // duration let a withdrawal burst early in a
@@ -1120,7 +1145,11 @@ impl Observe for ObserveView {
                         // scaled by the mirror being protected.
                         let churn_budget =
                             source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs();
-                        let dump_churn = seq_now.saturating_sub(seq);
+                        // Max, not sum, for the same double-count
+                        // reason as the gate's rate.
+                        let dump_churn = seq_now
+                            .saturating_sub(seq)
+                            .max(pulses_now.saturating_sub(pulses));
                         // Both bounds, because each covers the other's
                         // small end: the absolute budget is 128
                         // mutations at the 64/s floor, which is noise
@@ -1143,7 +1172,7 @@ impl Observe for ObserveView {
                                  the diff — the adopted routes stay in the ledger and the \
                                  reconciliation resumes when the source is ready again"
                             );
-                            gate.rebaseline(seq_now);
+                            gate.rebaseline(seq_now, pulses_now);
                             c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                                 gate,
                                 last_request,
@@ -1171,7 +1200,14 @@ impl Observe for ObserveView {
                     // nothing at this stage is steered), so quiet needs
                     // no liveness conditioning: pass live.
                     let released = gate
-                        .observe(now, have, seq, true, source_quiet_rate_per_sec(adopted))
+                        .observe(
+                            now,
+                            have,
+                            seq,
+                            pulses,
+                            true,
+                            source_quiet_rate_per_sec(adopted),
+                        )
                         .released;
                     if !released {
                         let want = gate.floor;
