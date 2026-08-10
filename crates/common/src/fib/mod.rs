@@ -121,6 +121,19 @@ impl PeerId {
     /// from RouteSource-derived hashes. See the type-level docs.
     const LOCAL_ARP_MARKER: u64 = 1u64 << 63;
 
+    /// The 31 bits between the marker and the ifindex, which
+    /// [`Self::local_arp`] leaves zero.
+    ///
+    /// Requiring them is what makes this a NAMESPACE rather than "any
+    /// value with the top bit set", and the type-level claim that
+    /// collision with a hashed PeerId is negligible is a claim about
+    /// the whole 32-bit layout — half of all hashes have the top bit
+    /// set, so the marker alone separates nothing. The predicate below
+    /// checked only the marker while this doc described all three
+    /// parts; the first consumer to depend on it inherited a coin flip
+    /// (review finding).
+    const LOCAL_ARP_RESERVED: u64 = 0x7FFF_FFFF_0000_0000;
+
     /// Synthesize a per-iface PeerId for the v0.2.1 connected
     /// fast-path source. `ifindex` is the kernel ifindex; PeerDown
     /// for this PeerId withdraws every /32 the resolver registered
@@ -131,8 +144,11 @@ impl PeerId {
 
     /// `Some(ifindex)` when this PeerId came from
     /// [`Self::local_arp`]; `None` otherwise.
+    ///
+    /// Tests the FULL layout — marker set, reserved field clear — not
+    /// the marker alone. See [`Self::LOCAL_ARP_RESERVED`].
     pub fn as_local_arp_ifindex(self) -> Option<u32> {
-        if self.0 & Self::LOCAL_ARP_MARKER != 0 {
+        if self.0 & Self::LOCAL_ARP_MARKER != 0 && self.0 & Self::LOCAL_ARP_RESERVED == 0 {
             Some((self.0 & 0xFFFF_FFFF) as u32)
         } else {
             None
@@ -492,6 +508,32 @@ mod peer_id_tests {
         // present as local-arp.
         assert_eq!(PeerId(0xdead_beef).as_local_arp_ifindex(), None);
         assert_eq!(PeerId(0).as_local_arp_ifindex(), None);
+        // ...and neither must a hash that merely HAPPENS to set the
+        // high bit, which is half of them. This is the case the
+        // original test could not fail on, because every value it
+        // tried had the high bit clear (review finding): the first
+        // consumer of this predicate then read ~50% of route-source
+        // peers as the resolver's synthetic ones.
+        assert_eq!(PeerId(0x8000_0001_dead_beef).as_local_arp_ifindex(), None);
+        assert_eq!(PeerId(u64::MAX).as_local_arp_ifindex(), None);
+    }
+
+    /// The invariant, rather than the cases I happened to think of:
+    /// setting ANY reserved bit takes a value out of the local-ARP
+    /// namespace, whatever the marker and ifindex say. A one-off mask
+    /// error passes a case list and fails this.
+    #[test]
+    fn any_reserved_bit_leaves_the_local_arp_namespace() {
+        let base = PeerId::local_arp(33);
+        assert_eq!(base.as_local_arp_ifindex(), Some(33));
+        for bit in 32..63 {
+            let intruder = PeerId(base.0 | (1u64 << bit));
+            assert_eq!(
+                intruder.as_local_arp_ifindex(),
+                None,
+                "bit {bit} is reserved; a value carrying it is not a local-ARP id"
+            );
+        }
     }
 
     #[test]
