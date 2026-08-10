@@ -158,6 +158,21 @@ pub struct BmpStation {
     /// findings, kept from the epoch era because they are about
     /// SEMANTICS, not settling).
     saw_peer_up: std::sync::atomic::AtomicBool,
+    /// Connections accepted over this station's lifetime. The FIRST
+    /// connection may raise liveness on its first RouteMonitoring
+    /// frame — the mirror is empty by construction, so there is no
+    /// stale floor-credit to release against, and the load's own
+    /// pulses keep the gate loud until the dump ends. A RECONNECT may
+    /// not: the mirror still counts the prior session's unseen routes
+    /// until InitiationComplete's GC removes them, so one frame plus a
+    /// stall would hand the gate a live, quiet, above-floor mirror
+    /// whose credit is stale — and the GC would then empty the
+    /// fallback after the unsteer (review finding). Reconnects raise
+    /// at InitiationComplete instead, which is by definition after the
+    /// GC. If continuous churn keeps InitiationComplete from firing,
+    /// the stale routes also never leave — deferring is correct for
+    /// exactly as long as releasing would be wrong.
+    connections: std::sync::atomic::AtomicU64,
 }
 
 /// Re-export for callers building the station.
@@ -190,6 +205,7 @@ impl BmpStation {
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
+            connections: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -289,6 +305,8 @@ impl BmpStation {
                                 continue;
                             }
                             info!(%addr, "BMP client connected");
+                            self.connections
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
                             }
@@ -373,18 +391,22 @@ impl BmpStation {
                                     // gate must read them as loud.
                                     sess.pulse();
                                 }
-                                // The stream has started — see the
-                                // saw_rm field for why that, and not
-                                // any settle heuristic, is the raise.
-                                // The peer-set arbitration stands: on a
+                                // First connection only — see the
+                                // `connections` field for why a
+                                // reconnect must wait for the GC. The
+                                // peer-set arbitration stands: on a
                                 // peer-speaking connection a straggler
                                 // frame after the last PeerDown raises
                                 // nothing.
+                                let first_conn = self
+                                    .connections
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    <= 1;
                                 let peers_speak =
                                     self.saw_peer_up.load(Ordering::Relaxed);
                                 let peers_up =
                                     !self.up_peers.lock().expect("up_peers lock").is_empty();
-                                if !peers_speak || peers_up {
+                                if first_conn && (!peers_speak || peers_up) {
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
                                     }
@@ -437,6 +459,25 @@ impl BmpStation {
                                     "InitiationComplete fired"
                                 );
                                 init_complete_fired = true;
+                                // A reconnect's raise happens HERE — by
+                                // definition after the GC that removed
+                                // the prior session's floor-credit (see
+                                // the `connections` field). Same
+                                // peer-set guard as the first-frame
+                                // raise.
+                                let peers_speak = self
+                                    .saw_peer_up
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let peers_up = !self
+                                    .up_peers
+                                    .lock()
+                                    .expect("up_peers lock")
+                                    .is_empty();
+                                if !peers_speak || peers_up {
+                                    if let Some(sess) = &self.session {
+                                        sess.set_up(true);
+                                    }
+                                }
                             }
                         }
                     }
