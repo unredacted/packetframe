@@ -1455,7 +1455,21 @@ fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
     // still works, so this withholds rather than latches.
     svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
         .expect("the lever still turns");
-    assert_eq!(svc.status().expect("published").state, State::Steered);
+    // POLLED, like the Ready wait above. `apply_steering` returns on the
+    // supervision loop's verdict, but `status()` reads the snapshot the
+    // loop PUBLISHES, which is a later step in the same iteration — so
+    // an immediate read raced the publication and failed roughly one run
+    // in eight. The operator-visible contract is the verdict this call
+    // already returned; the snapshot catching up is what we wait for.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = svc.status().expect("published").state;
+        if s == State::Steered {
+            break;
+        }
+        assert!(Instant::now() < deadline, "did not reach Steered: {s:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     svc.stop();
 }

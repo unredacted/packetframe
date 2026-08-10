@@ -486,6 +486,13 @@ impl BmpStation {
                                 if first_stream && (!peers_speak || peers_up) {
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
+                                        // Reconciled by the same fact
+                                        // that permitted the raise:
+                                        // `first_stream` IS "no older
+                                        // stream's routes remain". Marked
+                                        // after the raise so it stamps
+                                        // the epoch that raise opened.
+                                        sess.mark_reconciled();
                                     }
                                 }
                             }
@@ -514,10 +521,6 @@ impl BmpStation {
                     if !quiesced {
                         continue;
                     }
-                    // Whether THIS pass ran the GC. The second tier is
-                    // told after the raise below, never before — see
-                    // the mark site for why the order is load-bearing.
-                    let mut gc_just_ran = false;
                     // The EVENT is one-shot per connection — the
                     // programmer's GC semantics. The RAISE below is
                     // deliberately not: a one-shot raise left the
@@ -544,9 +547,6 @@ impl BmpStation {
                         // was possible is now gone.
                         self.stale_state_possible
                             .store(false, std::sync::atomic::Ordering::Relaxed);
-                        // Reported to the second tier BELOW, after the
-                        // raise — not here. See the mark site.
-                        gc_just_ran = true;
                     }
                     // Re-armable raise: quiescence counts only when the
                     // stream it followed is NEWER than the last
@@ -572,22 +572,27 @@ impl BmpStation {
                         if fresh_stream && (!peers_speak || peers_up) {
                             sess.set_up(true);
                         }
-                        // AFTER the raise, never inside the GC block
-                        // above. On a reconnect the first frame
-                        // deliberately does not raise — prior-stream
-                        // routes are still in the mirror — so the
-                        // session is still DOWN at the old epoch when
-                        // the GC runs, and the raise immediately below
-                        // it opens a new one. Marking before the raise
-                        // therefore stamped the epoch that was ending,
-                        // and `set_up` cleared it a line later; with
-                        // the event one-shot per connection nothing
-                        // ever marked again, so an ordinary BMP
-                        // reconnect left the second tier's deferral
-                        // permanently demoted (review finding). The
-                        // epoch this GC belongs to is whichever one is
-                        // current once the raise has had its say.
-                        if gc_just_ran {
+                        // AFTER the raise, and keyed on the same
+                        // variable the raise is: `stale_state_possible`
+                        // false means the mirror carries nothing from a
+                        // stream older than the current epoch — set by
+                        // the GC, and equally by a last-peer PeerDown
+                        // whose wipe left nothing behind.
+                        //
+                        // Not keyed on the GC HAVING JUST RUN, which is
+                        // one-shot per connection: a later peer epoch on
+                        // the same connection (last peer down, new peer
+                        // streams) opens an epoch the GC will never fire
+                        // for again, and could then never be marked —
+                        // the same permanent demotion one layer in
+                        // (review finding). Marking is idempotent and
+                        // this pass is once a second, so re-asserting it
+                        // costs nothing and cannot go stale: every
+                        // epoch that clears the variable gets stamped.
+                        if !self
+                            .stale_state_possible
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
                             sess.mark_reconciled();
                         }
                     }
