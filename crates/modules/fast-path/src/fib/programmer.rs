@@ -1568,7 +1568,10 @@ impl FibProgrammer {
 
         // 2. Empty desired set: tear the prefix down.
         if desired_nhs.is_empty() {
-            let rec = match self.remove_mirror_direct(&prefix) {
+            // Removal and withdrawal are one step — see
+            // `withdraw_from_mirror`. In particular the `?` below can
+            // no longer strand the second tier.
+            let rec = match self.withdraw_from_mirror(&prefix) {
                 Some(r) => r,
                 None => return Ok(()),
             };
@@ -1586,14 +1589,11 @@ impl FibProgrammer {
             // The only place a prefix leaves the mirror — `desired_nhs`
             // empty covers an explicit Withdraw, the last advertisement
             // going away, and PeerDown, because all three arrive here by
-            // recomputing the union. `remove_mirror_direct` has exactly
+            // recomputing the union. `withdraw_from_mirror` has exactly
             // one caller (this one), which is what makes that claim
             // checkable rather than hopeful: a second removal path would
             // be a route the second tier keeps forwarding after this one
             // stopped.
-            if let Some(sink) = self.route_sink.as_deref() {
-                sink.route_withdrawn(prefix);
-            }
             return Ok(());
         }
 
@@ -1743,6 +1743,29 @@ impl FibProgrammer {
                     nexthop_ips: Vec::new(),
                 }),
         }
+    }
+
+    /// Drop `prefix` from the mirror AND tell the second tier, as one
+    /// step. Nothing else may call [`Self::remove_mirror_direct`].
+    ///
+    /// The two used to be separate statements with a `?` between them
+    /// — the LPM delete — and that gap was a real divergence: a failed
+    /// `delete_fib_entry` returned before the notification, so the
+    /// prefix left this tier's mirror while the second tier kept
+    /// forwarding it, with no retry and nothing to notice (review
+    /// finding). A withdrawal is not conditional on our own map write
+    /// succeeding: the route is gone upstream either way, and the
+    /// consumer's question is only "may I still forward this". Leaving
+    /// the STEERED tier forwarding a withdrawn prefix because the
+    /// FALLBACK tier's delete failed inverts which tier the failure
+    /// hurts. The stuck LPM entry stays this tier's problem, and it
+    /// already reports it.
+    fn withdraw_from_mirror(&mut self, prefix: &IpPrefix) -> Option<RouteRecord> {
+        let rec = self.remove_mirror_direct(prefix)?;
+        if let Some(sink) = self.route_sink.as_deref() {
+            sink.route_withdrawn(*prefix);
+        }
+        Some(rec)
     }
 
     fn remove_mirror_direct(&mut self, prefix: &IpPrefix) -> Option<RouteRecord> {

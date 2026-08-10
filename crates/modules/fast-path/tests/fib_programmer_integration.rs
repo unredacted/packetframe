@@ -1738,6 +1738,75 @@ fn every_way_a_prefix_stops_forwarding_reaches_the_sink() {
     assert!(install < withdraw, "install must precede withdrawal");
 }
 
+/// A withdrawal reaches the sink even when this tier's own LPM delete
+/// fails.
+///
+/// The two tiers diverge in the direction that matters here: the prefix
+/// leaves this mirror (the removal happens first) while the second tier
+/// — the STEERED one — keeps forwarding a route BGP withdrew, with no
+/// retry and nothing upstream that would notice, because every counter
+/// and every readback verify samples the mirror that already forgot it.
+/// The fallback tier's stuck LPM entry is the lesser failure and it is
+/// already reported.
+///
+/// The failure is injected by deleting the LPM entry behind the
+/// programmer's back through a second handle to the same pin (see the
+/// module docstring), which makes its own delete return ENOENT. The
+/// `is_err` assertion is load-bearing, not decoration: without it a
+/// change that stopped the delete from failing would leave this test
+/// passing while testing nothing.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_withdrawal_reaches_the_sink_even_when_the_local_delete_fails() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let prefix = IpPrefix::V4 {
+        addr: [198, 18, 9, 0],
+        prefix_len: 24,
+    };
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let peer = PeerId(0x4444);
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: peer,
+                prefix,
+                nexthops: vec![nh],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("apply Add");
+    });
+
+    let mut fib_v4 = open_lpm_v4(&h.pins.path("FIB_V4"));
+    fib_v4
+        .remove(&LpmKey::new(24, [198, 18, 9, 0]))
+        .expect("out-of-band delete of the entry the programmer installed");
+
+    let del = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix,
+                path_id: None,
+            })
+            .await
+    });
+
+    assert!(
+        del.is_err(),
+        "the local delete was supposed to fail — without that this test \
+         exercises the ordinary path and proves nothing"
+    );
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&SinkCall::Withdrawn(prefix)),
+        "the second tier must hear the withdrawal even though this tier's \
+         delete failed, or it forwards a withdrawn prefix forever: {calls:?}"
+    );
+}
+
 /// Re-advertising an identical nexthop set announces nothing.
 ///
 /// Not an optimisation: under a peering flap the same prefix is

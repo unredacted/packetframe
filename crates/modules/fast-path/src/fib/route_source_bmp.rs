@@ -244,10 +244,18 @@ impl BmpStation {
     /// dispatch at these sites is awaited, so a count sent afterwards
     /// observes the wipe — including a wipe that only PARTIALLY
     /// succeeded. `drop_routes_for_peer` logs and swallows map and
-    /// recompute failures, and the second tier hears a withdrawal only
-    /// after a successful FIB delete, so "we dispatched PeerDown" is
-    /// not evidence the routes are gone (review finding). Counting
-    /// them is.
+    /// recompute failures, so "we dispatched PeerDown" is not evidence
+    /// the routes are gone (review finding). Counting them is.
+    ///
+    /// Reading THIS mirror answers for the second tier's because
+    /// `FibProgrammer::withdraw_from_mirror` makes removal and
+    /// withdrawal one step, and `route_resolved` fires only after the
+    /// mirror commit: the second tier's set is a subset of this one,
+    /// so empty here means empty there. Before that was true a failed
+    /// LPM delete trimmed this mirror while the second tier kept the
+    /// route — a count of zero over a stale above-floor table, which
+    /// is the exact evidence this function exists to refuse (review
+    /// finding).
     ///
     /// Both families count. Only v4 reaches VPP today
     /// (`FamilyPolicy::V4Only`), so a v6-only remnant carries no floor
