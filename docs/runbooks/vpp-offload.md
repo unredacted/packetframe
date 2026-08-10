@@ -303,14 +303,21 @@ freezes every VPP worker — `ip_route_dump` is not mp-safe — so it only
 runs against an unsteered VPP). The deferral releases through exactly
 **two** doors, both requiring the feed session up (raised when the
 stream STARTS — with one deliberate exception. For BGP it is the first
-UPDATE of the session. For BMP it is the first RouteMonitoring frame of
-the daemon's FIRST connection only; on a BMP RECONNECT the session
-stays down until InitiationComplete (~5 s of stream quiet after the
-dump), because until its GC runs the mirror still counts the previous
-session's routes and would credit the release floor with stale
-evidence. So during a reconnect an operator will see RouteMonitoring
-traffic flowing while the gate still reads the feed as down — that is
-correct, not stuck. PeerUp is bookkeeping and never raises. "Quiet"
+UPDATE of the session. For BMP it is the first RouteMonitoring frame,
+but only while **no earlier stream's routes are still in the mirror** —
+the station counts the mirror at each stream boundary rather than
+guessing from what the connection did. In practice that means the
+daemon's first connection raises on its first frame, and an ordinary
+RECONNECT (which leaves a full table behind) stays down until
+InitiationComplete (~5 s of stream quiet after the dump), because until
+its GC runs the mirror still counts the previous session's routes and
+would credit the release floor with stale evidence. Two corollaries
+worth knowing at 3 a.m.: a predecessor that withdrew everything leaves
+nothing, so the next stream raises immediately; and a peer-down wipe
+whose FIB deletes partially FAILED leaves routes behind, so the next
+stream does NOT — the count, not the intent, decides. So during a
+reconnect an operator will see RouteMonitoring traffic flowing while
+the gate still reads the feed as down — that is correct, not stuck. PeerUp is bookkeeping and never raises. "Quiet"
 means the STREAM went quiet: every frame counts toward the activity
 rate whether or not it changed the mirror, so a reannouncement dump
 holds the gate loud until it actually ends:

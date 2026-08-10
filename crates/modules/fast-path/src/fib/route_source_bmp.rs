@@ -160,25 +160,23 @@ pub struct BmpStation {
     saw_peer_up: std::sync::atomic::AtomicBool,
     /// Whether a PREVIOUS stream's advertisements may still be in the
     /// mirror — the actual variable every earlier proxy (connection
-    /// counts, contributing-stream counts) was reaching for (review
-    /// findings, four refinements). Set when a connection that applied
-    /// announcements ends; cleared by the only two events that destroy
-    /// prior-stream state: InitiationComplete's GC, and a last-peer
-    /// PeerDown wipe. While false, a stream's first frame may raise
-    /// liveness — there is no stale floor-credit to release against.
-    /// While true, the raise waits for InitiationComplete, which
-    /// clears this by definition. A stream that announced and then
-    /// withdrew everything (or was wiped by PeerDown) leaves nothing,
-    /// and the next stream rightly starts fresh.
+    /// counts, contributing-stream counts, an ever-announced latch)
+    /// was reaching for (review findings, five refinements). It is now
+    /// answered by ASKING THE MIRROR at each boundary
+    /// ([`Self::mirror_holds_state`]) rather than by tracking what
+    /// this connection did: every latch was wrong in one direction or
+    /// the other, because what survives a connection is a property of
+    /// the mirror, not of the stream that wrote it. A stream that
+    /// announced and then withdrew everything leaves nothing, so the
+    /// next stream rightly starts fresh; a PeerDown wipe whose FIB
+    /// deletes partially FAILED leaves routes the programmer never
+    /// retracted from the second tier, so it rightly does not.
+    /// While false, a stream's first frame may raise liveness — there
+    /// is no stale floor-credit to release against. While true, the
+    /// raise waits for InitiationComplete (whose GC destroys exactly
+    /// this state, and which therefore clears it by definition) or for
+    /// the re-armable quiesced raise.
     stale_state_possible: std::sync::atomic::AtomicBool,
-    /// Whether THIS connection has been counted as a contributor —
-    /// set when a validated, non-empty RouteMonitoring frame is
-    /// applied, cleared with the connection. Counting anywhere earlier
-    /// counted frames that cannot leave mirror state (empty
-    /// End-of-RIB, loc-rib-rejected, oversized), flipping the next
-    /// real stream into reconnect mode over a mirror nothing touched
-    /// (review finding).
-    contributed_this_conn: std::sync::atomic::AtomicBool,
     /// The session pulse count at the last liveness BOUNDARY — a
     /// lowering, or an epoch-opening PeerUp (which consumes any
     /// peerless straggler pulses that preceded it; review finding).
@@ -221,7 +219,6 @@ impl BmpStation {
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
             stale_state_possible: std::sync::atomic::AtomicBool::new(false),
-            contributed_this_conn: std::sync::atomic::AtomicBool::new(false),
             pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -233,6 +230,38 @@ impl BmpStation {
             self.pulses_at_lower
                 .store(sess.pulse_count(), std::sync::atomic::Ordering::Relaxed);
             sess.set_up(false);
+        }
+    }
+
+    /// Whether the programmer's mirror still holds routes — the direct
+    /// answer to what [`Self::stale_state_possible`] must record at a
+    /// stream boundary. The mirror is the second tier's own source
+    /// (`ResolvedRouteSink` fires on mirror commits), so a non-empty
+    /// mirror is precisely "floor credit the next stream would inherit
+    /// without having earned it".
+    ///
+    /// Ordering is free: commands share one channel and every route
+    /// dispatch at these sites is awaited, so a count sent afterwards
+    /// observes the wipe — including a wipe that only PARTIALLY
+    /// succeeded. `drop_routes_for_peer` logs and swallows map and
+    /// recompute failures, and the second tier hears a withdrawal only
+    /// after a successful FIB delete, so "we dispatched PeerDown" is
+    /// not evidence the routes are gone (review finding). Counting
+    /// them is.
+    ///
+    /// Both families count. Only v4 reaches VPP today
+    /// (`FamilyPolicy::V4Only`), so a v6-only remnant carries no floor
+    /// credit and this over-defers — but the station has no business
+    /// knowing the second tier's family policy, and over-deferring is
+    /// the safe direction. An unavailable count reads as "possible"
+    /// for the same reason.
+    async fn mirror_holds_state(&self) -> bool {
+        match self.prog_handle.mirror_counts().await {
+            Ok((v4, v6)) => v4 + v6 > 0,
+            Err(e) => {
+                warn!(error = %e, "mirror count unavailable; assuming prior-stream state remains");
+                true
+            }
         }
     }
 
@@ -345,16 +374,14 @@ impl BmpStation {
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
-                            // A contributing stream's state outlives its
-                            // connection — until the GC or a wipe says
-                            // otherwise.
-                            if self
-                                .contributed_this_conn
-                                .swap(false, std::sync::atomic::Ordering::Relaxed)
-                            {
-                                self.stale_state_possible
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            // Whatever this stream left in the mirror
+                            // outlives its connection — until the GC or
+                            // a wipe says otherwise. Ask the mirror; a
+                            // stream that withdrew everything leaves the
+                            // next one nothing to inherit.
+                            let stale = self.mirror_holds_state().await;
+                            self.stale_state_possible
+                                .store(stale, std::sync::atomic::Ordering::Relaxed);
                             self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
@@ -552,13 +579,9 @@ impl BmpStation {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                if self
-                    .contributed_this_conn
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.stale_state_possible
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                let stale = self.mirror_holds_state().await;
+                self.stale_state_possible
+                    .store(stale, std::sync::atomic::Ordering::Relaxed);
                 self.lower_session();
             }
             BmpMessageBody::PeerUpNotification(_) => {
@@ -629,25 +652,25 @@ impl BmpStation {
                 {
                     warn!(?peer_id, error = %e, "PeerDown dispatch failed");
                 }
-                let mut up = self.up_peers.lock().expect("up_peers lock");
-                up.remove(&peer_id);
-                // Peer-lifecycle emitters get peer-set semantics: last
-                // peer down = feed down, RM history notwithstanding.
-                // Only a connection that never spoke PeerUp may lean on
-                // its RM stream (the Loc-RIB case).
                 // Peer-set semantics: the last monitored peer going
                 // down means the feed is down, whatever was streamed
                 // before. A connection that never spoke PeerUp (the
                 // Loc-RIB shape) never lowers here — its liveness
                 // lives and dies with the connection itself.
-                if up.is_empty() && self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Every monitored peer's routes have been dropped by
-                    // the successive PeerDown dispatches: nothing of any
-                    // stream — prior or current — remains in the mirror.
+                // Scoped so the guard is not held across the await.
+                let last_peer_down = {
+                    let mut up = self.up_peers.lock().expect("up_peers lock");
+                    up.remove(&peer_id);
+                    up.is_empty() && self.saw_peer_up.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                if last_peer_down {
+                    // The successive PeerDown dispatches were SUPPOSED
+                    // to drop every monitored peer's routes; whether
+                    // they did is a question for the mirror, not for
+                    // the dispatch that swallowed its own failures.
+                    let stale = self.mirror_holds_state().await;
                     self.stale_state_possible
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    self.contributed_this_conn
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                        .store(stale, std::sync::atomic::Ordering::Relaxed);
                     self.lower_session();
                 }
             }
@@ -732,18 +755,8 @@ impl BmpStation {
                             path_id: None,
                         },
                     };
-                    let is_add = matches!(event, RouteEvent::Add { .. });
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
                         warn!(?peer_id, error = %e, "route event dispatch failed");
-                    } else if is_add {
-                        // A dispatched ANNOUNCEMENT is what creates
-                        // mirror state — withdrawal-only streams and
-                        // skipped announcements leave nothing (review
-                        // findings, successive refinements). The flag
-                        // transfers to `stale_state_possible` when the
-                        // connection ends with it still set.
-                        self.contributed_this_conn
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
