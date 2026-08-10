@@ -158,21 +158,24 @@ pub struct BmpStation {
     /// findings, kept from the epoch era because they are about
     /// SEMANTICS, not settling).
     saw_peer_up: std::sync::atomic::AtomicBool,
-    /// Connections accepted over this station's lifetime. The FIRST
-    /// connection may raise liveness on its first RouteMonitoring
+    /// Streams that DELIVERED FRAMES over this station's lifetime —
+    /// counted at each connection's first RouteMonitoring frame, not
+    /// at accept, because the hazard this guards is stale MIRROR
+    /// content and a connection that streamed nothing left none
+    /// (counting accepts let an early aborted client flip the next
+    /// real stream into reconnect mode and wedge it behind a
+    /// quiescence a continuous feed never provides; review finding).
+    /// The FIRST contributing stream may raise liveness on its first
     /// frame — the mirror is empty by construction, so there is no
-    /// stale floor-credit to release against, and the load's own
-    /// pulses keep the gate loud until the dump ends. A RECONNECT may
-    /// not: the mirror still counts the prior session's unseen routes
-    /// until InitiationComplete's GC removes them, so one frame plus a
-    /// stall would hand the gate a live, quiet, above-floor mirror
-    /// whose credit is stale — and the GC would then empty the
-    /// fallback after the unsteer (review finding). Reconnects raise
-    /// at InitiationComplete instead, which is by definition after the
-    /// GC. If continuous churn keeps InitiationComplete from firing,
-    /// the stale routes also never leave — deferring is correct for
+    /// stale floor-credit, and the load's own pulses keep the gate
+    /// loud until the dump ends. A LATER stream may not: the mirror
+    /// still counts the prior stream's unseen routes until
+    /// InitiationComplete's GC removes them, so it raises at
+    /// InitiationComplete instead — by definition after the GC. If
+    /// continuous churn keeps InitiationComplete from firing, the
+    /// stale routes also never leave: deferring is correct for
     /// exactly as long as releasing would be wrong.
-    connections: std::sync::atomic::AtomicU64,
+    contributing_streams: std::sync::atomic::AtomicU64,
     /// The session pulse count at the last liveness BOUNDARY — a
     /// lowering, or an epoch-opening PeerUp (which consumes any
     /// peerless straggler pulses that preceded it; review finding).
@@ -214,7 +217,7 @@ impl BmpStation {
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
-            connections: std::sync::atomic::AtomicU64::new(0),
+            contributing_streams: std::sync::atomic::AtomicU64::new(0),
             pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -325,8 +328,6 @@ impl BmpStation {
                                 continue;
                             }
                             info!(%addr, "BMP client connected");
-                            self.connections
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
                             } else {
@@ -401,27 +402,35 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
-                                self.saw_rm.store(true, Ordering::Relaxed);
+                                // First frame of THIS connection: the
+                                // stream becomes a contributor — the
+                                // earliest moment it could have left
+                                // mirror state, which is the noun the
+                                // reconnect guard counts.
+                                if !self.saw_rm.swap(true, Ordering::Relaxed) {
+                                    self.contributing_streams
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 // Pulses are counted in process_msg, in
                                 // ROUTE-ELEMENT units — see the pulse
                                 // site there for why frames are the
                                 // wrong unit.
-                                // First connection only — see the
-                                // `connections` field for why a
-                                // reconnect must wait for the GC. The
+                                // First contributing stream only — see
+                                // `contributing_streams` for why a
+                                // later stream must wait for the GC. The
                                 // peer-set arbitration stands: on a
                                 // peer-speaking connection a straggler
                                 // frame after the last PeerDown raises
                                 // nothing.
-                                let first_conn = self
-                                    .connections
+                                let first_stream = self
+                                    .contributing_streams
                                     .load(std::sync::atomic::Ordering::Relaxed)
                                     <= 1;
                                 let peers_speak =
                                     self.saw_peer_up.load(Ordering::Relaxed);
                                 let peers_up =
                                     !self.up_peers.lock().expect("up_peers lock").is_empty();
-                                if first_conn && (!peers_speak || peers_up) {
+                                if first_stream && (!peers_speak || peers_up) {
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
                                     }
