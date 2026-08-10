@@ -54,7 +54,7 @@ use aya::maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, Map, MapData};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 
@@ -111,42 +111,6 @@ pub type NexthopId = u32;
 /// N prefixes sharing the same nexthop set + hash mode all point
 /// at one group.
 pub type EcmpGroupId = u32;
-
-/// Outcome of removing a FIB entry.
-///
-/// `AlreadyAbsent` is a success: see [`FibProgrammer::delete_fib_entry`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FibRemoval {
-    Removed,
-    AlreadyAbsent,
-}
-
-/// A withdrawal whose map delete failed, awaiting retry.
-///
-/// Carries the reclaim payload because the failure path skipped
-/// `reclaim_prior`: the nexthop and ECMP slots must not be freed while
-/// the LPM entry can still resolve through them.
-#[derive(Debug)]
-struct PendingDelete {
-    attempts: u32,
-    fib_value: FibValue,
-    nexthop_ips: Vec<IpAddr>,
-    /// Whether the prefix ever carried a route-source advertisement.
-    /// A stuck `local_arp` /32 is a real fault but it is not a previous
-    /// STREAM's state, and reporting it as such would deny every future
-    /// BMP stream its first-frame liveness raise (review finding).
-    from_session: bool,
-}
-
-/// Consecutive failed delete attempts before the log escalates to an
-/// alarm. At [`RECLAIM_TICK`] this is about a second — long enough that
-/// a transient does not page anyone, short enough to be present before
-/// an operator finishes reading the first warning.
-const DELETE_ATTEMPTS_BEFORE_ALARM: u32 = 20;
-
-/// How often to re-log a delete that keeps failing, in attempts.
-/// ~10 s at [`RECLAIM_TICK`].
-const DELETE_RELOG_EVERY: u32 = 200;
 
 /// Errors surfaced through the programmer's command replies.
 #[derive(Debug, thiserror::Error)]
@@ -458,23 +422,6 @@ struct RouteRecord {
     /// Mirrors what `fib_value` points at. Used to release refcounts
     /// when the union changes or the prefix is torn down.
     nexthop_ips: Vec<IpAddr>,
-    /// Whether the CURRENTLY INSTALLED value is backed by a
-    /// route-source advertisement, as opposed to only the resolver's
-    /// synthetic `local_arp` /32s.
-    ///
-    /// Recomputed from the live advertisements on every install, not
-    /// latched on first sight: a prefix whose session advertisement is
-    /// withdrawn while a `local_arp` route remains becomes purely
-    /// local, and an ever-set latch went on reporting a later stuck
-    /// LOCAL entry as previous-session state — withholding a BMP
-    /// stream's first-frame liveness raise over something no session
-    /// owns (review finding).
-    ///
-    /// Stored on the record rather than derived at teardown because by
-    /// then the advertisements are drained — the withdrawal happens
-    /// precisely BECAUSE the map emptied — so only a value captured
-    /// while they existed can answer for what is in the trie.
-    session_derived: bool,
 }
 
 /// A single advertisement contributing to a prefix's FIB entry.
@@ -601,10 +548,6 @@ pub struct FibProgrammer {
 
     // --- Default-route reclaim queue (Phase 3) ---
     reclaim_queue: VecDeque<PendingReclaim>,
-
-    /// Withdrawals whose map delete failed, retried on the reclaim
-    /// tick. See [`FibProgrammer::retry_pending_deletes`].
-    pending_deletes: HashMap<IpPrefix, PendingDelete>,
 
     /// Prefixes whose recompute failed and has not since succeeded.
     ///
@@ -809,7 +752,6 @@ impl FibProgrammer {
                 free_ecmp_ids: Vec::new(),
                 next_ecmp_id: 0,
                 reclaim_queue: VecDeque::new(),
-                pending_deletes: HashMap::new(),
                 recompute_owed: HashSet::new(),
                 route_sink: None,
                 cache_cfg,
@@ -871,7 +813,6 @@ impl FibProgrammer {
                     }
                 }
                 _ = reclaim_tick.tick() => {
-                    self.retry_pending_deletes();
                     self.drain_reclaim_queue();
                 }
             }
@@ -904,12 +845,7 @@ impl FibProgrammer {
                 // already removed that peer's key here (review
                 // finding). Anything owed a repair counts as session
                 // state until the repair lands.
-                // A queued delete is a prefix this tier is still
-                // forwarding after the source withdrew it — session
-                // state by any reading, and the reason the review
-                // finding that prompted this work pointed here.
-                let any = self.pending_deletes.values().any(|p| p.from_session)
-                    || !self.recompute_owed.is_empty()
+                let any = !self.recompute_owed.is_empty()
                     || self
                         .routes_by_peer
                         .keys()
@@ -1755,37 +1691,7 @@ impl FibProgrammer {
                 Some(r) => r,
                 None => return Ok(()),
             };
-            if let Err(e) = self.delete_fib_entry(&prefix) {
-                // RECORDED, not just reported. The mirror record is
-                // already gone — `withdraw_from_mirror` above — so
-                // nothing downstream would ever revisit this prefix,
-                // and the entry would forward a withdrawn route until
-                // the next full resync. `retry_pending_deletes` owns it
-                // from here, including the reclaim this `return` skips.
-                //
-                // The reclaim is deliberately NOT done now: the LPM
-                // entry still resolves through these IDs, so freeing
-                // them for reuse is a misroute rather than a leak.
-                // `entry`, never `insert`: an existing pending entry
-                // holds the value that is STILL in the trie, because a
-                // successful reinstall would have cancelled it at the
-                // mirror commit. Overwriting it dropped that payload
-                // without reclaiming it, leaking a nexthop or ECMP
-                // refcount on every failed withdraw/reannounce/withdraw
-                // cycle (review finding) — and would have replaced the
-                // live value with one the map never took.
-                self.pending_deletes
-                    .entry(prefix)
-                    .and_modify(|p| p.attempts += 1)
-                    .or_insert(PendingDelete {
-                        attempts: 1,
-                        fib_value: rec.fib_value,
-                        nexthop_ips: rec.nexthop_ips,
-                        from_session: rec.session_derived,
-                    });
-                warn!(?prefix, error = %e, "FIB delete failed; queued for retry");
-                return Err(e);
-            }
+            self.delete_fib_entry(&prefix)?;
             // Grace-deferred even though the LPM entry is gone: with
             // the destination cache, an in-flight invocation that
             // passed its generation check microseconds before the
@@ -1805,21 +1711,6 @@ impl FibProgrammer {
             // be a route the second tier keeps forwarding after this one
             // stopped.
             return Ok(());
-        }
-
-        // Provenance of the value that is about to be, or already is,
-        // installed. Placed after the withdrawal branch on purpose: up
-        // there the advertisements are already gone, and what a queued
-        // delete needs is who backed the value still in the trie. Placed
-        // before the no-change shortcut for the same reason it exists —
-        // dropping a session advertisement can leave the nexthop set
-        // identical while changing whose it is.
-        if let Some(rec) = self.lookup_mirror_mut(&prefix) {
-            let session = rec
-                .advertisements
-                .keys()
-                .any(|(peer, _)| peer.as_local_arp_ifindex().is_none());
-            rec.session_derived = session;
         }
 
         // 3. No-change shortcut: identical NH set already installed.
@@ -1891,28 +1782,6 @@ impl FibProgrammer {
             rec.nexthop_ips = allocated_ips;
         }
         self.reclaim_prior(prior_fib, prior_nh_ips);
-        // A queued delete for this prefix is now SUPERSEDED — and this
-        // is the only place that may say so. `write_fib_entry` above
-        // succeeded and the mirror commit has just landed, so the stale
-        // entry the delete was chasing has been overwritten; retrying it
-        // would remove the route this call installed, and the mirror's
-        // no-change shortcut would then keep every identical
-        // re-announcement from writing it back (review finding).
-        //
-        // Deciding this at the RETRY instead — "a mirror record exists,
-        // so it must have been reinstalled" — was wrong, because
-        // `upsert_advertisement` creates the record BEFORE the map
-        // write. A reannouncement whose write FAILED leaves a record
-        // behind with the old value still in the trie, and cancelling
-        // there released IDs the dataplane could still reach (review
-        // finding). Presence of a record proves an attempt; only this
-        // line proves an outcome.
-        if let Some(p) = self.pending_deletes.remove(&prefix) {
-            // Its payload was never reclaimed — the failure path skips
-            // that deliberately, since the entry could still resolve
-            // through those IDs. The overwrite has now retired it.
-            self.reclaim_prior(Some(p.fib_value), p.nexthop_ips);
-        }
         // After the mirror commit, never before. The second tier is told
         // what this one *installed*, so the announcement has to follow
         // the write it describes — announcing the intent would republish
@@ -1980,7 +1849,6 @@ impl FibProgrammer {
                     advertisements: BTreeMap::new(),
                     fib_value: FibValue::single(0),
                     nexthop_ips: Vec::new(),
-                    session_derived: false,
                 }),
             IpPrefix::V6 { addr, prefix_len } => self
                 .routes_v6
@@ -1989,7 +1857,6 @@ impl FibProgrammer {
                     advertisements: BTreeMap::new(),
                     fib_value: FibValue::single(0),
                     nexthop_ips: Vec::new(),
-                    session_derived: false,
                 }),
         }
     }
@@ -2083,7 +1950,35 @@ impl FibProgrammer {
         result
     }
 
-    fn delete_fib_entry(&mut self, prefix: &IpPrefix) -> Result<FibRemoval, ProgrammerError> {
+    /// Remove `prefix` from the FIB trie.
+    ///
+    /// **ENOENT is success.** The goal of a delete is "no such entry",
+    /// so reaching it by another route — a mirror and map that
+    /// disagree, a removal from outside this process — is the outcome,
+    /// not a fault. Reporting it as a map failure made that
+    /// disagreement look like a broken map, and left the caller
+    /// propagating an error over a prefix that was already gone. Same
+    /// rule and reasoning as [`crate::steer`]'s `Removal::AlreadyAbsent`.
+    /// ENOENT only: EPERM, EINVAL and the rest keep failing loudly,
+    /// because they say nothing about whether the entry survived.
+    ///
+    /// **Known gap, deliberately not closed here.** A failure that is
+    /// NOT ENOENT leaves a stale entry that nothing retries: the
+    /// withdrawal branch removes the mirror record before this call (so
+    /// the second tier hears the withdrawal even when our own map write
+    /// fails — see `withdraw_from_mirror`), which leaves nothing to
+    /// drive a repair, and this tier forwards a withdrawn prefix until
+    /// the next full resync. A retry mechanism for it was written and
+    /// removed: it needs state that survives the record, and every
+    /// version of that state was itself a source of blackholes,
+    /// misroutes and refcount leaks under reannouncement races — worse
+    /// faults, and more reachable ones, than the condition it repaired.
+    /// The residual is genuinely rare (on an LPM trie, a non-ENOENT
+    /// delete failure means EPERM or a kernel fault, not load), it is
+    /// logged by the caller, and a resync corrects it. Closing it wants
+    /// a design that can be tested, which this harness cannot do: the
+    /// only injectable delete failure is ENOENT.
+    fn delete_fib_entry(&mut self, prefix: &IpPrefix) -> Result<(), ProgrammerError> {
         let raw = match prefix {
             IpPrefix::V4 { addr, prefix_len } => {
                 let key = LpmKey::new(u32::from(*prefix_len), *addr);
@@ -2097,101 +1992,28 @@ impl FibProgrammer {
         match raw {
             Ok(()) => {
                 self.bump_cache_generation();
-                Ok(FibRemoval::Removed)
+                Ok(())
             }
-            // ENOENT is the OUTCOME WE WANTED, reached by another
-            // route: the key is not in the trie, which is what a delete
-            // is for. Reporting it as a failure is what made the mirror
-            // and the map disagreeing look like a map fault, and — once
-            // `has_session_routes` learned to count unrepaired
-            // deletions — would have held a deferral open over nothing.
-            // Same reasoning and same shape as `ntuple::Removal`.
-            //
-            // ENOENT only. EPERM, EINVAL and the rest keep failing
-            // loudly: they say nothing about whether the entry is still
-            // there, and it probably is.
             Err((map, aya::maps::MapError::SyscallError(e)))
                 if e.io_error.raw_os_error() == Some(libc::ENOENT) =>
             {
-                // BUMPED HERE TOO, and this is not bookkeeping: the
-                // caller reclaims the prefix's nexthop and ECMP slots
-                // once this returns Ok, and the grace queue that makes
-                // that safe assumes a generation bump has already
-                // invalidated every cached `FibValue`. Without one, a
-                // destination-cache entry stamped before the entry
-                // vanished stays valid indefinitely — the 100 ms grace
-                // buys nothing against a cache that was never told —
-                // and packets dereference freed or reused slots
-                // (review finding). The trie no longer holds this
-                // prefix; that is a change the cache has to see,
-                // whoever made it.
+                // BUMPED HERE TOO, and not as bookkeeping: the caller
+                // reclaims this prefix's nexthop and ECMP slots once
+                // this returns Ok, and the grace queue that makes that
+                // safe assumes a generation bump has invalidated every
+                // cached `FibValue` first. Without one, a cache entry
+                // stamped before the trie lost the prefix stays valid
+                // indefinitely — 100 ms of grace buys nothing against a
+                // cache that was never told — and packets dereference
+                // freed or reused slots.
                 self.bump_cache_generation();
                 debug!(
                     ?prefix,
                     map, "FIB delete found no entry; the mirror and the map disagreed"
                 );
-                Ok(FibRemoval::AlreadyAbsent)
+                Ok(())
             }
             Err((map, e)) => Err(ProgrammerError::MapWrite(format!("{map} remove: {e}"))),
-        }
-    }
-
-    /// Re-attempt the deletions that failed, on the reclaim tick.
-    ///
-    /// Without this a failed delete was permanent: the withdrawal
-    /// branch removes the mirror record before the delete (so the
-    /// second tier hears it even when our own map write fails — see
-    /// `withdraw_from_mirror`), which leaves nothing to drive a repair
-    /// afterwards. The eBPF tier went on forwarding a prefix BGP had
-    /// withdrawn, over nexthops that may since have been reclaimed,
-    /// until the next full resync.
-    ///
-    /// The reclaim payload rides along because the `?` that reported
-    /// the failure also skipped `reclaim_prior` — deliberately, since
-    /// freeing nexthop slots while the LPM entry still resolves through
-    /// them is a misroute. So the IDs are held here and released when
-    /// the delete finally lands.
-    fn retry_pending_deletes(&mut self) {
-        if self.pending_deletes.is_empty() {
-            return;
-        }
-        let due: Vec<IpPrefix> = self.pending_deletes.keys().copied().collect();
-        for prefix in due {
-            match self.delete_fib_entry(&prefix) {
-                Ok(_) => {
-                    if let Some(p) = self.pending_deletes.remove(&prefix) {
-                        info!(
-                            ?prefix,
-                            attempts = p.attempts,
-                            "FIB delete succeeded on retry; the stale entry is gone"
-                        );
-                        self.reclaim_prior(Some(p.fib_value), p.nexthop_ips);
-                    }
-                }
-                Err(e) => {
-                    let p = self
-                        .pending_deletes
-                        .get_mut(&prefix)
-                        .expect("key came from this map");
-                    p.attempts += 1;
-                    // Loud on a schedule rather than every 50 ms: the
-                    // first escalation names it, then once every
-                    // DELETE_RELOG_EVERY so it cannot scroll away and
-                    // cannot drown the log either.
-                    if p.attempts == DELETE_ATTEMPTS_BEFORE_ALARM
-                        || p.attempts % DELETE_RELOG_EVERY == 0
-                    {
-                        error!(
-                            ?prefix,
-                            attempts = p.attempts,
-                            error = %e,
-                            "FIB delete still failing: this tier is forwarding a WITHDRAWN \
-                             prefix. The second tier withdrew it correctly; the two are \
-                             diverged until this clears"
-                        );
-                    }
-                }
-            }
         }
     }
 
