@@ -491,12 +491,17 @@ impl BmpStation {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut up = self.up_peers.lock().expect("up_peers lock");
                 up.insert(peer_id);
-                // A peer up on a peer-speaking connection is the feed
-                // being up; the release gate's floor and authority own
-                // the has-it-loaded question (see saw_rm).
-                if let Some(sess) = &self.session {
-                    sess.set_up(true);
-                }
+                // Bookkeeping only — no raise. PeerUp precedes the
+                // dump, and across a reconnect the mirror still holds
+                // the PRIOR session's unseen routes (Resync marks them,
+                // InitiationComplete GCs them), so raising here let a
+                // stale above-floor mirror pass the gate on fake quiet:
+                // quiet because the new dump had not STARTED, not
+                // because it finished (review finding). Only the
+                // stream itself raises — the first RouteMonitoring
+                // frame, exactly the BGP rule (#152) — and the load's
+                // own rate then keeps the gate loud until it is
+                // genuinely done.
             }
             BmpMessageBody::PeerDownNotification(_) => {
                 let pph = match &msg.per_peer_header {

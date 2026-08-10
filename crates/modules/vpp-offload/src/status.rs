@@ -596,19 +596,20 @@ impl StatusSnapshot {
                 // and only quiescence says "done".
                 let msg = if have < want {
                     format!(
-                        "resync deferred: the route source is still loading ({have} of the \
-                         {want} required); the adopted FIB keeps forwarding untouched until \
-                         it catches up"
+                        "resync deferred: the route source holds {have} routes, below the \
+                         release floor of {want}; the adopted FIB keeps forwarding \
+                         untouched. If the source is still loading this clears itself — \
+                         but if {have} IS the whole table, the gate will never release: \
+                         it refuses to guess completeness below the floor, by design. \
+                         Size `expected-routes` within 16x of the real table, or give \
+                         this box a bird and enable `require-table-complete`"
                     )
                 } else {
                     format!(
                         "resync deferred: the route source holds {have} routes (release \
-                         floor {want}); the diff runs once the source is live and quiet, \
-                         and the adopted FIB keeps forwarding untouched until then. If \
-                         this persists with a fully loaded table, the gate has no honest \
-                         authority to release on: size `expected-routes` within 16x of \
-                         the real table, or give this box a bird and enable \
-                         `require-table-complete`"
+                         floor {want} met); the diff runs once the source is live and has \
+                         gone quiet, and the adopted FIB keeps forwarding untouched until \
+                         then"
                     )
                 };
                 (HealthState::Degraded, Some(msg))
