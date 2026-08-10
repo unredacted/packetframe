@@ -591,6 +591,19 @@ const UNSTEER_REQUEST_EVERY: Duration = Duration::from_secs(5);
 ///   the growth rate can.
 pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
 
+/// The activity rate an UNATTESTED release tolerates: the flat noise
+/// floor, never the mirror-scaled rate. Scaling quiet to the mirror is
+/// churn tolerance for a settled session — but across a reconnect the
+/// mirror still counts the prior session's routes, so a million-route
+/// stale mirror bought a ~976 element/s allowance and a reconnect dump
+/// trickling at 200/s read as quiet mid-reload (review finding). With
+/// no authority to veto a partial table, quiet must mean NOISE:
+/// steady-state churn passes under this, a reload of any pace does
+/// not. Attested releases keep the scaled rate — their authority
+/// carries the completion truth and its current-mirror drift vetoes
+/// partial tables regardless.
+pub const UNATTESTED_QUIET_RATE_PER_SEC: u64 = 64;
+
 /// The quiet a release must show when NO completeness authority is
 /// configured. Five seconds, deliberately equal to both listeners'
 /// INIT_COMPLETE_QUIESCENCE: that is each protocol's own definition of
@@ -1035,7 +1048,11 @@ impl Observe for ObserveView {
                             pulses,
                             live,
                         },
-                        source_quiet_rate_per_sec(have),
+                        if authority_present {
+                            source_quiet_rate_per_sec(have)
+                        } else {
+                            UNATTESTED_QUIET_RATE_PER_SEC
+                        },
                         if authority_present {
                             SOURCE_QUIET_FOR
                         } else {

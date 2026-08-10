@@ -176,6 +176,14 @@ pub struct BmpStation {
     /// stale routes also never leave: deferring is correct for
     /// exactly as long as releasing would be wrong.
     contributing_streams: std::sync::atomic::AtomicU64,
+    /// Whether THIS connection has been counted as a contributor —
+    /// set when a validated, non-empty RouteMonitoring frame is
+    /// applied, cleared with the connection. Counting anywhere earlier
+    /// counted frames that cannot leave mirror state (empty
+    /// End-of-RIB, loc-rib-rejected, oversized), flipping the next
+    /// real stream into reconnect mode over a mirror nothing touched
+    /// (review finding).
+    contributed_this_conn: std::sync::atomic::AtomicBool,
     /// The session pulse count at the last liveness BOUNDARY — a
     /// lowering, or an epoch-opening PeerUp (which consumes any
     /// peerless straggler pulses that preceded it; review finding).
@@ -218,6 +226,7 @@ impl BmpStation {
             saw_rm: std::sync::atomic::AtomicBool::new(false),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
             contributing_streams: std::sync::atomic::AtomicU64::new(0),
+            contributed_this_conn: std::sync::atomic::AtomicBool::new(false),
             pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -341,6 +350,8 @@ impl BmpStation {
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.saw_peer_up
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
+                            self.contributed_this_conn
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
@@ -402,15 +413,7 @@ impl BmpStation {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 self.last_rm_unix.store(unix, Ordering::Relaxed);
-                                // First frame of THIS connection: the
-                                // stream becomes a contributor — the
-                                // earliest moment it could have left
-                                // mirror state, which is the noun the
-                                // reconnect guard counts.
-                                if !self.saw_rm.swap(true, Ordering::Relaxed) {
-                                    self.contributing_streams
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
+                                self.saw_rm.store(true, Ordering::Relaxed);
                                 // Pulses are counted in process_msg, in
                                 // ROUTE-ELEMENT units — see the pulse
                                 // site there for why frames are the
@@ -422,10 +425,14 @@ impl BmpStation {
                                 // peer-speaking connection a straggler
                                 // frame after the last PeerDown raises
                                 // nothing.
+                                // == 0, not <= 1: the counter excludes
+                                // the current stream until its first
+                                // applied frame, which lands AFTER this
+                                // raise decision for the same frame.
                                 let first_stream = self
                                     .contributing_streams
                                     .load(std::sync::atomic::Ordering::Relaxed)
-                                    <= 1;
+                                    == 0;
                                 let peers_speak =
                                     self.saw_peer_up.load(Ordering::Relaxed);
                                 let peers_up =
@@ -542,6 +549,8 @@ impl BmpStation {
                 self.saw_rm
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.saw_peer_up
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.contributed_this_conn
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.lower_session();
             }
@@ -674,6 +683,20 @@ impl BmpStation {
                     // the GC (review finding) — one unit against
                     // route-scaled rates is noise.
                     sess.pulse_n((elems.len() as u64).max(1));
+                }
+                // Contribution is counted HERE — a validated, non-empty
+                // frame, past the loc-rib and size checks — because the
+                // reconnect guard's noun is mirror state, and only
+                // frames that reach the apply loop can leave any (review
+                // finding: counting at the frame edge counted rejected
+                // and empty frames).
+                if !elems.is_empty()
+                    && !self
+                        .contributed_this_conn
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.contributing_streams
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 for elem in elems {
                     let prefix = match network_prefix_to_ip_prefix(&elem.prefix) {
