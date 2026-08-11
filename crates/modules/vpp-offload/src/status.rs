@@ -766,9 +766,26 @@ impl StatusSnapshot {
         // reconcile.
         let remedy = if self.state.accepts_steering_changes() {
             "`packetframe reconfigure` reconciles either way"
+        } else if matches!(self.state, State::Stopped) {
+            // Nothing is running and nothing is trying to, so there is
+            // no convergence coming to fix this. Reachable and nasty:
+            // `StopRequested` assigns `Stopped` before knowing whether
+            // `Unsteer` succeeded, a refused removal keeps the rules in
+            // the ledger, and the final status is published either way
+            // — so this is precisely the snapshot that reports rules
+            // still diverting traffic into a VF whose VPP has just been
+            // killed. Telling that operator to wait would be the worst
+            // of the three answers (review finding).
+            "supervision has stopped, so nothing will reconcile this on its own: \
+             `packetframe detach --all` retries the teardown, and `ethtool -N <iface> \
+             delete <loc>` removes a rule by hand"
         } else {
-            "steering is reconciled automatically when this resync finishes and the FIB \
-             verifies; `packetframe reconfigure` is refused until then, and says so"
+            // A convergence is in flight or is coming (`Backoff` has no
+            // resync running yet, which is why this does not say "this
+            // resync").
+            "steering is reconciled automatically once the module converges again — the \
+             verify that ends a resync re-emits the steer; `packetframe reconfigure` is \
+             refused until then, and says so"
         };
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
@@ -1389,18 +1406,29 @@ mod tests {
                 .find(|s| s.name == SUBSYS_STEERING)
                 .expect("steering row");
             let msg = steering.message.as_deref().unwrap_or_default();
-            assert_eq!(
-                msg.contains("`packetframe reconfigure` reconciles"),
-                state.accepts_steering_changes(),
-                "state {state:?}: the line may name `reconfigure` as the fix only where \
-                 that command is accepted. Everywhere else it is refused, and an operator \
-                 following the health text gets 'not converged': {msg}"
-            );
-            if !state.accepts_steering_changes() {
-                assert!(
-                    msg.contains("reconciled automatically"),
-                    "state {state:?}: where the command is refused the line must say what \
-                     DOES happen — the verify that ends the resync re-emits the steer: {msg}"
+            // Three remedies, and exactly one may appear: run the
+            // command, wait for the convergence, or clean up by hand.
+            // Asserting the other two ABSENT is what makes this a
+            // classification rather than three independent contains().
+            let expected = if state.accepts_steering_changes() {
+                "`packetframe reconfigure` reconciles"
+            } else if matches!(state, State::Stopped) {
+                "supervision has stopped"
+            } else {
+                "reconciled automatically"
+            };
+            for marker in [
+                "`packetframe reconfigure` reconciles",
+                "supervision has stopped",
+                "reconciled automatically",
+            ] {
+                assert_eq!(
+                    msg.contains(marker),
+                    marker == expected,
+                    "state {state:?} must offer exactly the remedy that state admits, \
+                     and no other. `reconfigure` is refused outside Ready/Steered; a \
+                     convergence is coming everywhere except Stopped, where nothing \
+                     will ever reconcile this and the operator has to clean up: {msg}"
                 );
             }
         }

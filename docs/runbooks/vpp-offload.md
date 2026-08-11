@@ -395,9 +395,24 @@ steering  DEGRADED — 1 steering rule(s) ... steering is reconciled
                      then, and says so
 ```
 
-Which is true: the verify that ends the resync re-emits the steer, and
+Which is true: the verify that ends a resync re-emits the steer, and
 `steer` is a reconcile. Nothing is dropping meanwhile — the affected
 prefix is on the eBPF tier, which is where it belongs.
+
+**The exception is a stopped daemon, and it is the one that matters.**
+If supervision has stopped — a teardown whose `unsteer` was refused,
+say — the rules are still in the NIC, the VF is withheld, and *no
+convergence is coming*. The line says so and points at cleanup:
+
+```text
+steering  DEGRADED — ... supervision has stopped, so nothing will
+                     reconcile this on its own: `packetframe detach
+                     --all` retries the teardown, and `ethtool -N
+                     <iface> delete <loc>` removes a rule by hand
+```
+
+Take that one seriously: rules pointing at a VF whose VPP has been
+killed are a blackhole, not a lost optimisation.
 
 **Two directions, one count.** The rules the ledger names are read back
 and compared field by field, so a deleted, replaced or narrowed rule is
