@@ -155,6 +155,35 @@ pub trait RouteSource {
         SourceChanges::default()
     }
 
+    /// Take back the part of a [`Self::drain_changes`] batch that could
+    /// not be applied, so it is retried intact.
+    ///
+    /// Handed **everything still owed**, routes included — that is the
+    /// whole point. `drain_changes` is destructive on the live feed, so
+    /// a batch whose neighbours failed partway used to lose its route
+    /// half outright: out of the source's queue, never into the engine's,
+    /// and nothing retried it. VPP then forwarded a stale FIB — a
+    /// withdrawn prefix still forwarded, a changed nexthop still on the
+    /// old adjacency — with `installed`/`installing`/`withheld`/
+    /// `unresolvable` all unaffected, and readback verification blind to
+    /// it, since verify samples prefixes the LEDGER believes installed
+    /// and the ledger never learned these existed.
+    ///
+    /// Implementations must treat this as **fill-if-absent**. An entry
+    /// already queued for the same prefix or nexthop was written after
+    /// this batch was drained, so it is the newer intent and has to win;
+    /// re-inserting the batch's older value would resurrect a state the
+    /// source has already replaced.
+    ///
+    /// **No default body**, and not because a no-op would be wrong for
+    /// the static sources — they hand nothing over, so this is never
+    /// called with work to lose. It is the delegating wrapper:
+    /// `route_count` had a default, the production loader's
+    /// `Arc<RouteFeed>` inherited it while forwarding every other
+    /// method, and a `requeue` that silently does not delegate is
+    /// exactly the bug above, back again.
+    fn requeue(&self, changes: SourceChanges);
+
     /// How many changes are queued but not yet handed over.
     ///
     /// Reported so a source that is filling faster than the engine drains
@@ -262,7 +291,12 @@ pub struct ResyncPlan {
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub outcome: VerifyOutcome,
-    /// False when the ledger holds routes it could not install.
+    /// False when the ledger holds routes it could not install, or when
+    /// route intent is outstanding somewhere the ledger cannot see it —
+    /// the runtime narrows it for the second case, which the counts
+    /// cannot express (a delta batch handed back to the source after a
+    /// failed neighbour send is not `installing`, not `withheld` and not
+    /// `unresolvable`; it is simply not there yet).
     pub may_steer: bool,
 }
 
@@ -1038,63 +1072,39 @@ impl ConvergenceEngine {
     /// unresolvable, so a new nexthop arriving in the same batch as the
     /// routes that use it would black-hole them for a full resync cycle
     /// if applied the other way round.
+    ///
+    /// A neighbour that fails hands the **whole remainder** back to the
+    /// source — the neighbour that failed, the ones not tried, and every
+    /// route in the batch — and only then returns the error.
+    /// `drain_changes` is destructive, so returning early with the route
+    /// loop unreached dropped that batch's deltas: out of the feed's
+    /// pending map, never into ours, retried by nothing. An already-
+    /// steered VPP went on forwarding a withdrawn prefix and resolving a
+    /// changed nexthop to its old adjacency, with every count clean and
+    /// verify unable to see it (verify samples what the ledger believes
+    /// installed, and the ledger never learned these existed).
+    ///
+    /// Handing the routes BACK rather than queueing them here is what
+    /// keeps the ordering intact. Queued now, they would install through
+    /// an adjacency VPP has just refused — #115's worst finding arriving
+    /// through the delta door, which is the trap the note in
+    /// [`Self::apply_neighbour`] describes.
     pub fn apply_changes(&mut self, src: &dyn RouteSource, max: usize) -> Result<u64, EngineError> {
-        let changes = src.drain_changes(max);
+        let mut changes = src.drain_changes(max);
         if changes.is_empty() {
             return Ok(0);
         }
         let n = changes.len() as u64;
-        for (nh, state) in changes.neighbours {
-            match state {
-                Some((dev, mac)) => {
-                    self.nexthops.set_device(nh, dev);
-                    // And PROGRAM it, which is the whole point.
-                    //
-                    // `set_device` alone makes `resolve` return `Some`, so
-                    // routes through this nexthop classify as resolvable
-                    // and install — while VPP, which runs without
-                    // linux-cp and can never ARP for the adjacency, has
-                    // nothing to send them to. Verification would not
-                    // catch it either: it checks a route exists on an
-                    // interface we own, deliberately not that its
-                    // adjacency resolves. That is #115's worst finding
-                    // exactly, arriving through the delta door instead of
-                    // the resync one.
-                    if let Some(idx) = self
-                        .nexthops
-                        .resolve(&nh)
-                        .and_then(|t| self.port_index.get(&t))
-                    {
-                        // Identical to what VPP acknowledged: nothing to
-                        // send. The delta path re-learning a neighbour at
-                        // daemon start is routine — the resolver re-reads
-                        // the kernel table — and re-adding it walks every
-                        // dependent route (the second door of the 5.5 s
-                        // adoption blackhole; the first was
-                        // `program_neighbours`).
-                        if self.neighbours_installed.get(&(idx, nh)) != Some(&mac) {
-                            self.send_neighbour(nh, idx, mac, true)?;
-                        }
-                    }
-                }
-                // Forgotten rather than left at its last known device —
-                // see `NexthopMap::forget_device`. The routes through it
-                // become unresolvable, which is the honest answer and the
-                // one health reports.
-                //
-                // The adjacency is withdrawn from VPP first, while the
-                // mapping that names its interface is still there to
-                // withdraw it *with*.
-                None => {
-                    if let Some(idx) = self
-                        .nexthops
-                        .resolve(&nh)
-                        .and_then(|t| self.port_index.get(&t))
-                    {
-                        self.send_neighbour(nh, idx, [0; 6], false)?;
-                    }
-                    self.nexthops.forget_device(&nh);
-                }
+        // Popped from the back, which reorders nothing that has an order:
+        // the feed holds neighbour deltas in a `HashMap`, so the batch
+        // arrives in an arbitrary order already, and each entry names a
+        // distinct nexthop. What matters is that whatever has not been
+        // applied is still in the vec when a failure hands it back.
+        while let Some((nh, state)) = changes.neighbours.pop() {
+            if let Err(e) = self.apply_neighbour(nh, state.clone()) {
+                changes.neighbours.push((nh, state));
+                src.requeue(changes);
+                return Err(e);
             }
         }
         for (prefix, nhs) in changes.routes {
@@ -1104,6 +1114,80 @@ impl ConvergenceEngine {
             }
         }
         Ok(n)
+    }
+
+    /// Apply one neighbour delta: program the adjacency in VPP, then
+    /// record the mapping that makes routes through it resolvable.
+    fn apply_neighbour(
+        &mut self,
+        nh: IpAddr,
+        state: Option<(String, [u8; 6])>,
+    ) -> Result<(), EngineError> {
+        match state {
+            Some((dev, mac)) => {
+                // Resolved through the device the delta names, WITHOUT
+                // recording it yet — the send comes first and the mapping
+                // second.
+                //
+                // `set_device` alone makes `resolve` return `Some`, so
+                // routes through this nexthop classify as resolvable and
+                // install — while VPP, which runs without linux-cp and
+                // can never ARP for the adjacency, has nothing to send
+                // them to. Verification would not catch it either: it
+                // checks a route exists on an interface we own,
+                // deliberately not that its adjacency resolves. That is
+                // #115's worst finding exactly, arriving through the
+                // delta door instead of the resync one.
+                //
+                // Recording it before the send left that door open even
+                // when the send FAILED: the mapping survived the error,
+                // so the next drain resolved every pending route through
+                // an adjacency VPP had refused and installed them clean.
+                if let Some(idx) = self
+                    .nexthops
+                    .target_for_device(&dev)
+                    .and_then(|t| self.port_index.get(&t))
+                {
+                    // Identical to what VPP acknowledged: nothing to
+                    // send. The delta path re-learning a neighbour at
+                    // daemon start is routine — the resolver re-reads
+                    // the kernel table — and re-adding it walks every
+                    // dependent route (the second door of the 5.5 s
+                    // adoption blackhole; the first was
+                    // `program_neighbours`).
+                    if self.neighbours_installed.get(&(idx, nh)) != Some(&mac) {
+                        self.send_neighbour(nh, idx, mac, true)?;
+                    }
+                }
+                // Recorded even for a device VPP does not own, where the
+                // send above never happened: `resolve` answers `None` for
+                // an excluded device either way, so the entry cannot make
+                // such a route installable, and leaving it out would make
+                // a later loss for the same nexthop look like a mapping
+                // that was never learned.
+                self.nexthops.set_device(nh, dev);
+                Ok(())
+            }
+            // Forgotten rather than left at its last known device —
+            // see `NexthopMap::forget_device`. The routes through it
+            // become unresolvable, which is the honest answer and the
+            // one health reports.
+            //
+            // The adjacency is withdrawn from VPP first, while the
+            // mapping that names its interface is still there to
+            // withdraw it *with*.
+            None => {
+                if let Some(idx) = self
+                    .nexthops
+                    .resolve(&nh)
+                    .and_then(|t| self.port_index.get(&t))
+                {
+                    self.send_neighbour(nh, idx, [0; 6], false)?;
+                }
+                self.nexthops.forget_device(&nh);
+                Ok(())
+            }
+        }
     }
 
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
@@ -1351,6 +1435,9 @@ mod tests {
     }
 
     impl RouteSource for Mirror {
+        fn requeue(&self, _: SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);

@@ -120,6 +120,13 @@ pub struct Behaviour {
     /// Reject this many *deletes* with a non-zero retval before
     /// accepting them.
     pub reject_deletes: usize,
+    /// Reject this many neighbour **adds** with a non-zero retval before
+    /// accepting them, WITHOUT closing the connection.
+    ///
+    /// The shape a hangup cannot model: the stream is fine, so the engine
+    /// keeps its transport, and the failure is one message refused in the
+    /// middle of a delta batch whose route half has not been applied yet.
+    pub reject_neighbour_adds: usize,
     /// Advertise garbage CRCs in the handshake's message table — the
     /// version-skew shape the transport must refuse loudly.
     pub garbage_crcs: bool,
@@ -351,10 +358,16 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
                     mac: n.neighbor.mac_address,
                     flags: n.neighbor.flags,
                 });
+                let retval = if n.is_add && behaviour.reject_neighbour_adds > 0 {
+                    behaviour.reject_neighbour_adds -= 1;
+                    -1
+                } else {
+                    0
+                };
                 out = reply_head("ip_neighbor_add_del_reply");
                 IpNeighborAddDelReply {
                     context: ctx,
-                    retval: 0,
+                    retval,
                     stats_index: 0,
                 }
                 .encode(&mut out);

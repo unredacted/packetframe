@@ -27,6 +27,9 @@ use packetframe_vpp_offload::supervisor::{Event, State};
 
 struct Mirror(Vec<IpPrefix>);
 impl RouteSource for Mirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);

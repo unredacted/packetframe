@@ -34,6 +34,9 @@ struct Mirror {
 }
 
 impl RouteSource for Mirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);
@@ -267,6 +270,9 @@ struct OrphanedMirror {
 }
 
 impl RouteSource for OrphanedMirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);
@@ -463,6 +469,9 @@ fn static_neighbours_are_programmed_before_the_routes_that_need_them() {
 fn neighbours_on_foreign_devices_are_skipped() {
     struct MixedMirror;
     impl RouteSource for MixedMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
@@ -661,6 +670,9 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
 
     struct ThreeNeighbours;
     impl RouteSource for ThreeNeighbours {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
             visit(nh(), "eth4", MAC); // identical in VPP: keep
@@ -726,6 +738,230 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
     );
 }
 
+/// The nexthop the delta path is about to program, and the MAC it
+/// carries. Shared by the two refused-neighbour tests below.
+const DELTA_NH: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 22));
+const DELTA_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xfe];
+
+/// A source whose delta batches the test queues by hand, and which
+/// **models the feed on a requeue**: an undelivered batch goes back on the
+/// queue, so the next drain re-serves it intact.
+#[derive(Default)]
+struct QueuedSource {
+    queue: std::sync::Mutex<Vec<packetframe_vpp_offload::engine::SourceChanges>>,
+}
+
+impl QueuedSource {
+    fn with(changes: packetframe_vpp_offload::engine::SourceChanges) -> Self {
+        Self {
+            queue: std::sync::Mutex::new(vec![changes]),
+        }
+    }
+
+    fn queued(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+}
+
+impl RouteSource for QueuedSource {
+    fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+        self.queue.lock().unwrap().insert(0, changes);
+    }
+    fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+        self.queue.lock().unwrap().pop().unwrap_or_default()
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for i in 0..4u8 {
+            visit(v4(0, i), &[nh()]);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(nh(), "eth4", MAC);
+    }
+    fn route_count(&self) -> u64 {
+        4
+    }
+    fn change_seq(&self) -> u64 {
+        4
+    }
+}
+
+/// A converged engine against a VPP that will refuse the next `n`
+/// neighbour adds. Its own resync neighbour is already in VPP, so the
+/// refusal lands on the DELTA's nexthop instead of being spent on setup.
+fn refusing_engine(tag: &str, fake: &Fake) -> ConvergenceEngine {
+    let mut e = engine_for(fake);
+    assert!(e.api_ready(), "handshake for {tag}");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = QueuedSource::default();
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("programming");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 4, "the base table converges");
+    let _ = fake.drain_events();
+    e
+}
+
+/// VPP already holds the resync's own neighbour, correct and static.
+const RESYNC_NEIGHBOUR: &[([u8; 4], u32, [u8; 6], u8)] =
+    &[([192, 0, 2, 1], ASSIGNED_INDEX, MAC, 1)];
+
+/// A refused neighbour hands the WHOLE delta batch back, routes included,
+/// and the retry lands them.
+///
+/// `drain_changes` is destructive: the feed removes what it returns. So
+/// returning early on the neighbour send left the batch's route half
+/// applied nowhere — out of the feed's pending map, never into the
+/// engine's, retried by nothing. An already-steered VPP went on
+/// forwarding a withdrawn prefix and resolving a changed nexthop to its
+/// old adjacency, with `installed`/`installing`/`withheld`/
+/// `unresolvable` all unaffected, so health read fine and verify could
+/// not see it: verify samples prefixes the LEDGER believes installed, and
+/// the ledger never learned these existed. Only a full resync recovered.
+///
+/// Handing the routes BACK rather than queueing them is the load-bearing
+/// half. Queued here they would install through the adjacency VPP just
+/// refused, which is #115's worst finding — see the sibling test.
+#[test]
+fn a_refused_neighbour_hands_the_whole_delta_batch_back() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    // Withdrawn while steered: the delta that used to vanish.
+    let withdrawn = v4(0, 3);
+    // Learned through the nexthop VPP is refusing.
+    let learned = v4(0, 200);
+
+    let fake = Fake::start_behaving(
+        "delta-refused",
+        Behaviour {
+            reject_neighbour_adds: 1,
+            existing_neighbours: RESYNC_NEIGHBOUR,
+            ..Default::default()
+        },
+    );
+    let mut e = refusing_engine("delta-refused", &fake);
+
+    let src = QueuedSource::with(SourceChanges {
+        neighbours: vec![(DELTA_NH, Some(("eth4".into(), DELTA_MAC)))],
+        routes: vec![(withdrawn, None), (learned, Some(vec![DELTA_NH]))],
+    });
+
+    let err = e
+        .apply_changes(&src, 64)
+        .expect_err("VPP refused the neighbour add");
+    assert!(
+        format!("{err:?}").contains("NeighbourRefused"),
+        "the refusal must surface as itself: {err:?}"
+    );
+    assert!(
+        e.pending().is_empty(),
+        "the routes must NOT be queued behind a refused adjacency"
+    );
+    assert_eq!(
+        src.queued(),
+        1,
+        "the batch must be back at the source, not dropped on the floor"
+    );
+
+    // The fake's refusal was count-based and is spent. The retry lands
+    // the adjacency and, with it, the deltas that used to be lost.
+    e.apply_changes(&src, 64)
+        .expect("the retried batch applies");
+    drain_to_empty(&mut e);
+    assert_eq!(src.queued(), 0, "nothing owed once it lands");
+
+    let events = fake.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Event::Neighbour { mac, .. } if *mac == DELTA_MAC)),
+        "the adjacency is programmed on the retry: {events:?}"
+    );
+    let routes: Vec<&WireRoute> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        routes.iter().any(|r| !r.is_add && r.addr == [10, 0, 3, 0]),
+        "the withdrawal the batch carried must finally reach VPP: {routes:?}"
+    );
+    assert!(
+        routes.iter().any(|r| r.is_add && r.addr == [10, 0, 200, 0]),
+        "and so must the route learned through the new nexthop: {routes:?}"
+    );
+    assert_eq!(
+        e.counts().unresolvable,
+        0,
+        "and the table is complete again"
+    );
+}
+
+/// A nexthop VPP refused must not become resolvable.
+///
+/// This is why the fix cannot simply queue the batch's routes and return
+/// the error. `set_device` alone makes `resolve` answer `Some`, so every
+/// route through the nexthop classifies installable and installs — while
+/// VPP, which runs without linux-cp and can never ARP for the adjacency,
+/// has nothing to send them to. Readback verification checks that a route
+/// exists on an interface we own, deliberately not that its adjacency
+/// resolves, so it passes. That is #115's worst finding: "a route through
+/// an unprogrammed adjacency installs cleanly, verifies cleanly, and drops
+/// every packet".
+///
+/// Recording the mapping before the send left that door open even on
+/// failure — the entry survived the error, so the next drain resolved
+/// through an adjacency VPP had refused. `unresolvable` is the honest
+/// answer, and it is loud: it blocks the first steer and fails verify.
+#[test]
+fn a_refused_adjacency_never_becomes_resolvable() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = Fake::start_behaving(
+        "delta-unresolvable",
+        Behaviour {
+            reject_neighbour_adds: 1,
+            existing_neighbours: RESYNC_NEIGHBOUR,
+            ..Default::default()
+        },
+    );
+    let mut e = refusing_engine("delta-unresolvable", &fake);
+
+    let refused = QueuedSource::with(SourceChanges {
+        neighbours: vec![(DELTA_NH, Some(("eth4".into(), DELTA_MAC)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&refused, 64).expect_err("refused");
+    let _ = fake.drain_events();
+
+    // A later batch — routes only, so nothing re-attempts the adjacency.
+    let after = QueuedSource::with(SourceChanges {
+        neighbours: Vec::new(),
+        routes: vec![(v4(0, 201), Some(vec![DELTA_NH]))],
+    });
+    e.apply_changes(&after, 64).expect("routes alone apply");
+    drain_to_empty(&mut e);
+
+    assert_eq!(
+        e.counts().unresolvable,
+        1,
+        "a route through an unacknowledged adjacency must read unresolvable"
+    );
+    assert!(
+        !fake
+            .drain_events()
+            .iter()
+            .any(|ev| matches!(ev, Event::Route(WireRoute { is_add: true, .. }))),
+        "and nothing may reach VPP's FIB for it"
+    );
+    assert!(
+        e.counts().blocks_first_steer(),
+        "which is loud: the hole blocks a first steer rather than hiding"
+    );
+}
+
 /// The delta path consults the same acknowledged-neighbour ledger as
 /// the resync path — pinned against the second door of the 5.5 s
 /// adoption blackhole (shadow, 2026-08-08).
@@ -749,6 +985,11 @@ fn the_delta_path_does_not_re_add_an_acknowledged_neighbour() {
         changes: Mutex<Vec<SourceChanges>>,
     }
     impl RouteSource for ScriptedSource {
+        fn requeue(&self, changes: SourceChanges) {
+            // Back on the stack, so the next drain re-serves it — which
+            // is what `RouteFeed` does, refilling its pending maps.
+            self.changes.lock().unwrap().push(changes);
+        }
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
             visit(nh(), "eth4", MAC);
