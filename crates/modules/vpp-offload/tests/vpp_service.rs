@@ -1189,6 +1189,147 @@ impl packetframe_vpp_offload::runtime::Steering for SpySteering {
     }
 }
 
+/// Fails the first steer, then succeeds — the shape a refusal leaves
+/// behind (the completeness gate declining `Action::Steer`).
+struct FailFirstSteer {
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    failed: bool,
+}
+
+impl packetframe_vpp_offload::runtime::Steering for FailFirstSteer {
+    fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
+        Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
+    }
+    fn configured_ports(&self) -> usize {
+        1
+    }
+    fn steer(&mut self) -> Result<(), String> {
+        if !self.failed {
+            self.failed = true;
+            self.log.lock().unwrap().push("steer-refused".into());
+            return Err("refusing to steer: the route mirror holds 3 of 10 routes".into());
+        }
+        self.log.lock().unwrap().push("steer".into());
+        Ok(())
+    }
+    fn unsteer(&mut self) -> Result<(), String> {
+        self.log.lock().unwrap().push("unsteer".into());
+        Ok(())
+    }
+    fn installed(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+    fn retarget(
+        &mut self,
+        _ports: Vec<(String, u32)>,
+        _plan: packetframe_vpp_offload::steer::RuleSet,
+    ) {
+    }
+}
+
+/// `reconfigure` must RETRY a steer that failed, not report success and
+/// do nothing.
+///
+/// A refused steer (the completeness gate, most often) leaves the
+/// supervisor in `Ready` with `steered == false` and the want
+/// remembered. The guard read `is_steered()`, so an unchanged-config
+/// `reconfigure` — which computes `lever_moved == false` — took the
+/// staging early-return and answered `Ok` without injecting anything.
+/// The retry the health line advertises reported success and left the
+/// offload down (review finding).
+///
+/// `steer_intended()` is the predicate that separates "never steered,
+/// waiting for the operator's canary" from "asked for and broken".
+#[test]
+fn a_reconfigure_retries_a_steer_that_was_refused() {
+    let fake = Fake::start("svc-retry-refused");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(FailFirstSteer {
+                    log: std::sync::Arc::clone(&spy),
+                    failed: false,
+                }),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if svc.status().expect("published").state == State::Ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "did not reach Ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The operator turns the lever; the steer is refused.
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
+        .expect_err("the refusal is the operator's answer");
+    assert_eq!(
+        svc.status().expect("published").state,
+        State::Ready,
+        "a refused steer leaves traffic on the fallback tier"
+    );
+
+    // The blocker clears, and they re-run the SAME config — no lever
+    // movement, because there is nothing to move.
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, false)
+        .expect("the retry is accepted");
+
+    assert_eq!(
+        svc.status().expect("published").state,
+        State::Steered,
+        "the retry must actually steer — reporting Ok while doing nothing is worse \
+         than refusing, because the operator has no way to tell"
+    );
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec!["steer-refused".to_string(), "steer".to_string()],
+        "exactly one refusal and one successful retry: {seen:?}"
+    );
+}
+
 fn plan_for(count: u8) -> packetframe_vpp_offload::steer::RuleSet {
     let allow: Vec<IpPrefix> = (0..count).map(|i| fake_vpp::v4(0, i)).collect();
     packetframe_vpp_offload::steer::RuleSet::plan(
