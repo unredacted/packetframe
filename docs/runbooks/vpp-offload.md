@@ -538,12 +538,19 @@ deletion verifies nothing, which is why the identification table below
 exists.
 
 The ownership test removal applies is **narrower than the audit's, on
-purpose**: the cookie only, not the whole spec. The two answer different
-questions. The audit asks *is this our rule*, and a wrong answer costs a
-health line. Removal asks *will this still be steering into the VF we
-are about to release*, and a wrong answer there is a blackhole — so a
-rule pointing at our VF comes out even when nothing can prove we
-installed it. What is protected is the rule pointing somewhere else.
+purpose**: the VF the rule targets, not the whole spec. The two answer
+different questions. The audit asks *is this our rule*, and a wrong
+answer costs a health line. Removal asks *will this still be steering
+into the VF we are about to release*, and a wrong answer there is a
+blackhole — so a rule pointing at our VF comes out even when nothing can
+prove we installed it. What is protected is the rule pointing somewhere
+else.
+
+Note "the VF", not "the cookie": a `ring_cookie` is a VF *and* a queue
+index within it, so `Direct to VF 0` and `Direct to VF 0 queue 3` are
+different cookies naming the same VF. Both come out. If you are reading
+a `warn` line, the cookie it prints is the raw value — the VF is its
+bits 32-39, and `0` there means the PF rather than any VF of ours.
 
 Two consequences worth knowing before you read a log:
 
