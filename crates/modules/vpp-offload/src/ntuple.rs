@@ -921,25 +921,30 @@ impl crate::runtime::Steering for NtupleSteering {
         for (iface, loc) in &self.installed {
             let vf = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v);
             let rule = self.plan.rules.iter().find(|r| r.location == *loc);
-            let (vf, rule) = match (vf, rule) {
-                (Some(v), Some(r)) => (v, r),
-                // No expected spec to compare against — an adopted
-                // location from a previous config, or a port no longer
-                // in the target. Unverifiable is not the same as
-                // missing, and reporting it would degrade health over
-                // the transient window between adoption and the first
-                // reconcile.
-                _ => continue,
+            let Some(vf) = vf else {
+                // A port that is no longer a member. Its rules are
+                // still adopted (they are in the NIC and this object is
+                // the only thing that will remove them), but nothing
+                // here can say what they should look like.
+                continue;
             };
-            // OCCUPANCY IS NOT ENOUGH. An insert at an occupied
-            // location REPLACES what is there, so a provisioning push
-            // or a stray `ethtool -N` can leave our slot full of
-            // somebody else's rule — still listed by GRXCLSRLALL,
-            // matching traffic we never asked for, while the ledger
-            // says ours is installed (review finding). Read the
-            // location back and compare the flow spec, exactly as
-            // `insert` does after every write and for the same reason.
-            let asked = flow_spec(rule, vf);
+            // ADOPTED LOCATIONS DO NOT APPEAR IN THE PLAN, so keying on
+            // the location alone audited nothing after a restart.
+            // `McamBudget::from_table` excludes every occupied slot when
+            // planning, and on an adopted start the occupants are our
+            // own rules — so the plan lands elsewhere and `bring_up`
+            // then restores the real locations from the state file. The
+            // first version skipped all of them, and the window it
+            // skipped is the adopted-resync deferral, which can hold
+            // indefinitely (review finding).
+            //
+            // The location is only a slot; what makes a rule ours is
+            // its spec. So try the rule planned AT this location first,
+            // and otherwise accept a match against ANY planned rule.
+            let expected: Vec<RxFlowSpec> = match rule {
+                Some(r) => vec![flow_spec(r, vf)],
+                None => self.plan.rules.iter().map(|r| flow_spec(r, vf)).collect(),
+            };
             let mut check = Rxnfc {
                 cmd: ETHTOOL_GRXCLSRULE,
                 fs: RxFlowSpec {
@@ -949,9 +954,30 @@ impl crate::runtime::Steering for NtupleSteering {
                 ..Rxnfc::default()
             };
             match sys::ethtool(iface, &mut check) {
-                Ok(()) if audit_matches(&asked, &check.fs) => {}
-                // Present but not ours.
-                Ok(()) => missing.push((iface.clone(), *loc)),
+                Ok(()) => {
+                    let ours = if rule.is_some() {
+                        // We know exactly what should be here, so
+                        // nothing weaker will do. In particular the
+                        // ownership fallback below must NOT apply: a
+                        // rule narrowed behind our back keeps our ring
+                        // cookie, and accepting it on that basis put
+                        // the narrowing hole straight back (caught by
+                        // `a_rule_narrowed_behind_our_back_is_reported_missing`
+                        // while making adopted rules auditable).
+                        expected.iter().any(|e| audit_matches(e, &check.fs))
+                    } else {
+                        // Adopted: no expectation at this location.
+                        // Any rule we currently plan is a strong match;
+                        // failing that, a rule pointing at our VF is
+                        // one of ours from a previous config, present
+                        // and awaiting the next reconcile — not missing.
+                        expected.iter().any(|e| audit_matches(e, &check.fs))
+                            || check.fs.ring_cookie == ring_cookie(vf)
+                    };
+                    if !ours {
+                        missing.push((iface.clone(), *loc));
+                    }
+                }
                 // Empty: ENOENT is how the driver answers for a
                 // location holding nothing.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1284,6 +1310,67 @@ mod tests {
             vec![(iface, loc)],
             "a rule carrying a constraint we never asked for is not ours — some \
              of the traffic we believe is steered no longer is"
+        );
+    }
+
+    /// An ADOPTED rule is audited, even though its location is absent
+    /// from the startup plan.
+    ///
+    /// This is the production path and it defeated the first version
+    /// entirely. `McamBudget::from_table` excludes every occupied slot
+    /// when planning, so on an adopted start the plan avoids our own
+    /// rules and lands elsewhere; `bring_up` then restores the real
+    /// locations from the state file. Keying the audit on "is there a
+    /// planned rule AT this location" therefore skipped every inherited
+    /// rule — for the whole adopted-resync deferral, which can hold
+    /// indefinitely on a box with no completeness authority (review
+    /// finding, and exactly the state the shadow sat in on
+    /// 2026-08-11).
+    #[test]
+    fn an_adopted_rule_is_audited_though_the_plan_never_named_its_slot() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+
+        // The previous daemon: installs at the top of the table.
+        let mut before =
+            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("first run installs");
+        let inherited = before.installed();
+        assert!(!inherited.is_empty());
+
+        // The new daemon plans against a table those rules occupy, so
+        // it necessarily chooses different slots — then adopts.
+        let budget = crate::steer::McamBudget::from_table(&rule_table("eth0").expect("table"));
+        let allow = vec![IpPrefix::V4 {
+            addr: [198, 18, 0, 0],
+            prefix_len: 24,
+        }];
+        let fresh_plan = RuleSet::plan(&allow, budget).expect("fits");
+        for r in &fresh_plan.rules {
+            assert!(
+                !inherited.iter().any(|(_, l)| *l == r.location),
+                "the fixture must reproduce the real path: planned slot {} \
+                 collides with an inherited one",
+                r.location
+            );
+        }
+        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], fresh_plan);
+        after.adopt_installed(inherited.clone());
+
+        assert_eq!(
+            after.missing_from_nic().expect("read the NIC"),
+            Vec::new(),
+            "inherited rules are present and ours; nothing is missing"
+        );
+
+        // And the thing the audit exists for still fires on them.
+        let (iface, loc) = inherited[0].clone();
+        sys::remove_behind_back(&iface, loc);
+        assert_eq!(
+            after.missing_from_nic().expect("read the NIC"),
+            vec![(iface, loc)],
+            "an inherited rule deleted out of band must be reported, or the \
+             audit is blind for the entire adopted deferral"
         );
     }
 
