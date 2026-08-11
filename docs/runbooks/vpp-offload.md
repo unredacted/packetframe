@@ -392,18 +392,29 @@ from `Ready` or `Steered`; during an adopted resync it is refused with
 *"vpp-offload is AdoptedResyncing, not converged"*. That is not a rare
 corner — a held deferral is exactly when this audit earns its keep, and
 on a box with no completeness authority it can hold indefinitely. So in
-that state the line says the repair happens on its own instead:
+that state the line points at the convergence instead:
 
 ```text
-steering  DEGRADED — 1 steering rule(s) ... steering is reconciled
-                     automatically when this resync finishes and the FIB
-                     verifies; `packetframe reconfigure` is refused until
-                     then, and says so
+steering  DEGRADED — 1 steering rule(s) ... steering is re-applied by the
+                     next convergence — the verify that ends it emits the
+                     steer. That steer passes the completeness gate too
+                     and can be refused there, and nothing retries
+                     afterwards, so if this line outlives the
+                     convergence, `packetframe reconfigure` is the retry
 ```
 
-Which is true: the verify that ends a resync re-emits the steer, and
-`steer` is a reconcile. Nothing is dropping meanwhile — the affected
-prefix is on the eBPF tier, which is where it belongs.
+**Read that second sentence.** The verify that ends a resync does emit
+the steer, but that steer meets the completeness gate like any other,
+and a stale or negative verdict refuses it. After that the supervisor
+settles in `Ready` with the want remembered and **nothing emits another
+steer** — verify does not recur in steady state. So this is not a
+promise that the drift clears itself; it is a statement about where the
+next attempt comes from. If the line is still there once the module
+reaches `Ready`, restore completeness (watch `fib-synced`) and run
+`packetframe reconfigure`.
+
+Nothing is dropping meanwhile — the affected prefix is on the eBPF
+tier, which is where it belongs.
 
 **The exception is a stopped daemon, and it is the one that matters.**
 If supervision has stopped — a teardown whose `unsteer` was refused,
