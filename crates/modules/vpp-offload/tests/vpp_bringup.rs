@@ -50,6 +50,9 @@ const ALLOW: [IpPrefix; 1] = [IpPrefix::V4 {
 /// route source; convergence itself is `vpp_service.rs`'s job.
 struct Mirror;
 impl RouteSource for Mirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);

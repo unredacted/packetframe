@@ -1003,6 +1003,9 @@ mod tests {
 
     struct NoRoutes;
     impl engine::RouteSource for NoRoutes {
+        fn requeue(&self, _: engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn for_each_route(
             &self,
             _: &mut dyn FnMut(packetframe_common::fib::IpPrefix, &[std::net::IpAddr]),
