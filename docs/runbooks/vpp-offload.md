@@ -514,12 +514,19 @@ anyway — and after a restart the audit reports an occupied slot without
 being able to prove it still holds *our* rule (`installed_as` is set
 only by a successful steer in this process).
 
-**Try `packetframe reconfigure` first.** It clears stray rules *by
-ledger entry* — `steer` removes what the ledger holds and the target no
-longer wants — so it needs no identification at all and cannot delete
-somebody else's rule. Hand-deletion is the fallback for the two cases
-where it will not run: a stopped daemon, or no port configured to steer
-(the health line says which). It reports its own reason otherwise.
+**Try `packetframe reconfigure` first.** `steer` removes what the
+ledger holds and the target no longer wants, so it takes out exactly
+the recorded locations and you identify nothing by eye. Hand-deletion
+is the fallback for the two cases where it will not run: a stopped
+daemon, or no port configured to steer (the health line says which).
+
+It is *not* ownership-safe, and the distinction matters. The delete
+ioctl addresses a **location**, not a rule — neither `reconfigure` nor
+your own `ethtool -N` verifies what is sitting there first. What
+`reconfigure` buys is that the locations come from the record rather
+than from a judgement call, so it cannot touch a slot the ledger never
+claimed. If something replaced our rule at a claimed slot, both routes
+delete it.
 
 If you must identify by hand, a rule is this module's when **all** of
 these hold, not any one:

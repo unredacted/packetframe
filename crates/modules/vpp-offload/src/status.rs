@@ -853,15 +853,15 @@ impl StatusSnapshot {
                 "{} location(s) the ledger names are still occupied by rules this config \
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
-                 not be. The rules outlived the request to remove them; `ethtool -n \
-                 reconfigure` clears them BY LEDGER ENTRY and needs no identification, \
-                 so try it first; it reports its own reason if it will not run. Do not \
-                 wait for a convergence — while VPP is not forwarding, that traffic is \
-                 going to a VF nothing is servicing. Removing by hand (`ethtool -n \
-                 <iface>`, then `ethtool -N <iface> delete <loc>`) is the fallback where \
-                 reconfigure cannot run, and needs care: a rule for a prefix just removed \
-                 from the allowlist no longer matches this config, so the config is not \
-                 the test. The runbook has the field table",
+                 not be. The rules outlived the request to remove them. `packetframe \
+                 reconfigure` removes exactly the locations the ledger names, so nothing \
+                 has to be identified by eye — but it deletes BY LOCATION, so it can no \
+                 more prove they still hold OUR rules than this audit can. Do not wait \
+                 for a convergence: while VPP is not forwarding, that traffic is going to \
+                 a VF nothing is servicing. Where reconfigure will not run, remove by \
+                 hand (`ethtool -n <iface>`, then `ethtool -N <iface> delete <loc>`); the \
+                 current allowlist is not the test, since the commonest stray is a prefix \
+                 just removed from it. The runbook has the field table",
                 self.steer_stray
             ));
         }
@@ -1522,6 +1522,93 @@ mod tests {
         }
     }
 
+    /// Every backticked command in a health message is well-formed.
+    ///
+    /// Twice in one PR a scripted edit shipped a broken operator
+    /// command — first a literal with thirty spaces in it, then
+    /// `` `ethtool -n reconfigure` `` where `` `packetframe
+    /// reconfigure` `` was meant — and both times every assertion
+    /// passed, because they all match short fragments and none spans
+    /// the damage. Matching fragments cannot show a command is intact.
+    ///
+    /// So: collect every backticked span these messages render and
+    /// require it to be one this module means to print. A new one has
+    /// to be added here deliberately, which is the point.
+    #[test]
+    fn every_backticked_command_is_one_we_meant_to_print() {
+        const ALLOWED: &[&str] = &[
+            "packetframe reconfigure",
+            "packetframe detach --all",
+            "ethtool -n <iface>",
+            "ethtool -N <iface> delete <loc>",
+            "steer",
+            "require-table-complete off",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for state in [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            for steer_configured in [true, false] {
+                for (missing, stray, unreadable) in [
+                    (1usize, 0usize, None),
+                    (0, 1, None),
+                    (1, 1, Some("EIO: readback failed".to_string())),
+                    (0, 0, Some("EIO: readback failed".to_string())),
+                    (0, 0, None),
+                ] {
+                    let led = ledger_with(10, 0, 0);
+                    let mut snap = snap_of(
+                        &steered_supervisor(),
+                        &led,
+                        ApiHealth::Answering {
+                            silent_for: Duration::from_millis(200),
+                        },
+                        verified(3),
+                        ports_up(),
+                    );
+                    snap.state = state;
+                    snap.steer_configured = steer_configured;
+                    snap.steer_missing = missing;
+                    snap.steer_stray = stray;
+                    snap.steer_audit_unreadable = unreadable.clone();
+
+                    for sub in snap.report().subsystems {
+                        let Some(msg) = sub.message else { continue };
+                        let mut rest = msg.as_str();
+                        while let Some(open) = rest.find('`') {
+                            rest = &rest[open + 1..];
+                            let Some(close) = rest.find('`') else { break };
+                            let span = &rest[..close];
+                            rest = &rest[close + 1..];
+                            if !seen.iter().any(|s| s == span) {
+                                seen.push(span.to_string());
+                            }
+                            assert!(
+                                ALLOWED.contains(&span),
+                                "{} in {state:?} prints `{span}`, which is not a command \
+                                 this module means to emit. Either it is mangled — the \
+                                 way `ethtool -n reconfigure` was — or it is new and \
+                                 belongs in ALLOWED. Full line: {msg}",
+                                sub.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.len() >= 4,
+            "the matrix must actually render commands, or this proves nothing: {seen:?}"
+        );
+    }
+
     /// No health message contains a run of whitespace.
     ///
     /// Cheap guard for a class rather than an instance: `dfdc9b8`
@@ -1633,8 +1720,8 @@ mod tests {
                      dropping that prefix, not merely losing the offload: {msg}"
                 );
                 assert!(
-                    msg.contains("BY LEDGER ENTRY")
-                        && msg.contains("no longer matches this config"),
+                    msg.contains("removes exactly the locations the ledger names")
+                        && msg.contains("current allowlist is not the test"),
                     "state {state:?}: lead with the repair that needs no identification, \
                      and warn about the trap in the one that does — a rule for a prefix \
                      just removed from the allowlist cannot match the current config, \
