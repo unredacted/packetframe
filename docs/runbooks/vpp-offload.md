@@ -635,14 +635,20 @@ mirror is short of the table and steering into it would blackhole
 whatever has not arrived — and a steered miss is dropped, where an
 unsteered one falls through to the kernel path.
 
-Nothing to do: it retries on its own. The refusal leaves the *want* set,
-so the next verify attempts the steer again, and by then the dump has
-usually finished. Watch the two counts converge:
+**It does not retry on its own** — a belief three operator-facing texts
+carried until 2026-08-11. The refusal leaves the *want* set, but the
+only two things that emit a steer are the verify at the end of a
+convergence and an explicit `packetframe reconfigure`; verify does not
+recur in steady state. So during a first convergence the dump usually
+finishes in time and the steer lands, and outside that you have to
+re-run it. Watch the two counts converge:
 
 ```bash
 birdc show route count
 packetframe status | grep -A6 'module health'
 ```
+
+Once they agree, `packetframe reconfigure` re-applies the steer.
 
 If it persists, the mirror is genuinely not keeping up and that is a
 fast-path problem, not a steering one — check the integrity checker's

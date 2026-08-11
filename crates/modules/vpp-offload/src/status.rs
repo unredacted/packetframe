@@ -812,9 +812,10 @@ impl StatusSnapshot {
             // resync running yet, which is why this does not say "this
             // resync"), and the target it will reconcile to is non-empty,
             // so its stale-rule removal covers whatever is left over.
-            "steering is reconciled automatically once the module converges again — the \
-             verify that ends a resync re-emits the steer; `packetframe reconfigure` is \
-             refused until then, and says so"
+            "steering is re-applied by the next convergence — the verify that ends it \
+             emits the steer. That steer passes the completeness gate too and can be \
+             refused there, and nothing retries afterwards, so if this line outlives the \
+             convergence, `packetframe reconfigure` is the retry"
                 .to_string()
         };
         let mut clauses: Vec<String> = Vec::new();
@@ -1453,13 +1454,13 @@ mod tests {
                 } else if !steer_configured {
                     "no port is configured to steer"
                 } else {
-                    "reconciled automatically"
+                    "re-applied by the next convergence"
                 };
                 for marker in [
                     "`packetframe reconfigure` re-applies steering",
                     "supervision has stopped",
                     "no port is configured to steer",
-                    "reconciled automatically",
+                    "re-applied by the next convergence",
                 ] {
                     assert_eq!(
                         msg.contains(marker),
