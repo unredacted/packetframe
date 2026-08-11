@@ -1339,6 +1339,18 @@ impl Core {
     /// between what bird advertises and what VPP holds" (review
     /// finding, PR #160).
     ///
+    /// **This is only a complete proof while an undelivered batch goes
+    /// BACK to the source.** The backlog can only report work the source
+    /// still holds, so anything that takes a batch out of the feed and
+    /// then drops it is invisible here — and to the ledger, and to
+    /// completeness. `Engine::apply_changes` did exactly that until
+    /// #161: `drain_changes` is destructive, and a failed
+    /// `send_neighbour` returned before the loop that queues the batch's
+    /// routes, so those deltas existed nowhere and no count moved. The
+    /// requeue is what makes this predicate cover them. Anything added
+    /// later that drains the source and can fail must hand the batch
+    /// back for the same reason, or this silently stops covering it.
+    ///
     /// Carries the empty-target exception like the other two, and the
     /// history is the argument for keeping it that way: this predicate
     /// was added AFTER the exception was pushed down into each gate, on
