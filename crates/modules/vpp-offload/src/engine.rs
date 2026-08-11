@@ -404,6 +404,32 @@ pub struct ConvergenceEngine {
     /// from VPP's own dump (in `program_neighbours`); cleared with the
     /// process, because it describes a table that died with it.
     neighbours_installed: std::collections::HashMap<(u32, IpAddr), [u8; 6]>,
+    /// Neighbours whose last message reached the socket but whose reply
+    /// never came back, so `neighbours_installed` cannot be trusted for
+    /// them until VPP is asked again.
+    ///
+    /// A transport error after the write is genuinely ambiguous — VPP may
+    /// have applied the change — and the ledger records only
+    /// acknowledgements, so both directions are left describing the wrong
+    /// table. They fail in opposite ways and the second is the dangerous
+    /// one:
+    ///
+    /// - An unacknowledged **add** VPP did apply gets sent again on the
+    ///   retry, and re-adding an existing static neighbour walks every
+    ///   dependent FIB entry: ~1M routes hang off one adjacency here, for
+    ///   a measured 5.51 s blackhole (shadow, 2026-08-08).
+    /// - An unacknowledged **remove** VPP did apply leaves the ledger
+    ///   claiming an adjacency VPP no longer has, and the delta path's
+    ///   skip then absorbs the next add of that exact MAC — silently,
+    ///   permanently, with every route through it black-holed. Strictly
+    ///   worse than a redundant walk.
+    ///
+    /// Both are settled by asking VPP, so these keys are reconciled
+    /// against a fresh `ip_neighbor_dump` before either send path
+    /// consults the ledger again. Keyed, not a flag, so the dump corrects
+    /// exactly what is in doubt — a wholesale rebuild would drop what the
+    /// v4-only dump cannot see.
+    neighbours_unacked: std::collections::HashSet<(u32, IpAddr)>,
     drainer: Drainer,
 
     /// Whether MCAM rules are diverting traffic right now.
@@ -459,6 +485,7 @@ impl ConvergenceEngine {
             ledger: RouteLedger::new(Capacity::new(high_water_routes)),
             nexthops: NexthopMap::new(members),
             neighbours_installed: std::collections::HashMap::new(),
+            neighbours_unacked: std::collections::HashSet::new(),
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
             steered: false,
             last_api_error: None,
@@ -810,40 +837,19 @@ impl ConvergenceEngine {
         // that walk is the price of correctness — and a dynamic entry
         // must be replaced with a static one, because VPP can never
         // refresh it here (MCAM cannot steer ARP).
-        let mut existing: HashSet<(u32, IpAddr, [u8; 6])> = HashSet::new();
-        {
-            let t = self.transport.as_mut().expect("checked just above");
-            let details: Vec<IpNeighborDetails> = match t.dump(IpNeighborDump {
-                context: 0,
-                sw_if_index: u32::MAX,
-                af: ADDRESS_IP4,
-            }) {
-                Ok(d) => d,
-                Err(e) => {
-                    self.disconnect();
-                    return Err(EngineError::Transport(e));
-                }
-            };
-            for d in details {
-                // EXACT flags, not a bit test: `send_neighbour` programs
-                // precisely IP_NEIGHBOR_STATIC, so an entry carrying any
-                // extra flag (STATIC|NO_FIB_ENTRY, say) is not the entry
-                // we would create, and skipping it would silently
-                // preserve the difference forever (review finding).
-                if d.neighbor.flags != IP_NEIGHBOR_STATIC {
-                    continue;
-                }
-                if let Some(ip) = crate::fib_sync::from_address(&d.neighbor.ip_address) {
-                    existing.insert((d.neighbor.sw_if_index, ip, d.neighbor.mac_address));
-                }
-            }
-        }
+        let existing = self.dump_static_neighbours()?;
         // Seed the acknowledged ledger from VPP's own answer, so the
         // DELTA path's skip covers adopted entries too — not only ones
         // this process sent.
         for &(idx, ip, mac) in &existing {
             self.neighbours_installed.insert((idx, ip), mac);
         }
+        // Insert-only above, so a key VPP no longer holds keeps its stale
+        // entry — harmless for the general case (the walk below re-sends
+        // anything whose MAC differs) but not for one left in doubt,
+        // where a stale "installed" is what makes the skip permanent.
+        // Those are corrected against the same dump.
+        self.settle_unacked(&existing);
 
         // Collect first: the visitor borrows `src` while the sends need
         // `&mut self`.
@@ -881,6 +887,95 @@ impl ConvergenceEngine {
         Ok(programmed)
     }
 
+    /// Every static neighbour VPP currently holds, as
+    /// `(sw_if_index, address, MAC)`.
+    ///
+    /// One dump, two consumers — the resync walk's skip and
+    /// [`Self::reconcile_unacked_neighbours`] — because a second
+    /// hand-written copy of the flag filter is how the two would come to
+    /// disagree about what "an entry we would have created" means.
+    fn dump_static_neighbours(&mut self) -> Result<HashSet<(u32, IpAddr, [u8; 6])>, EngineError> {
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        let details: Vec<IpNeighborDetails> = match t.dump(IpNeighborDump {
+            context: 0,
+            sw_if_index: u32::MAX,
+            af: ADDRESS_IP4,
+        }) {
+            Ok(d) => d,
+            Err(e) => {
+                self.disconnect();
+                return Err(EngineError::Transport(e));
+            }
+        };
+        let mut out = HashSet::new();
+        for d in details {
+            // EXACT flags, not a bit test: `send_neighbour` programs
+            // precisely IP_NEIGHBOR_STATIC, so an entry carrying any
+            // extra flag (STATIC|NO_FIB_ENTRY, say) is not the entry
+            // we would create, and skipping it would silently
+            // preserve the difference forever (review finding).
+            if d.neighbor.flags != IP_NEIGHBOR_STATIC {
+                continue;
+            }
+            if let Some(ip) = crate::fib_sync::from_address(&d.neighbor.ip_address) {
+                out.insert((d.neighbor.sw_if_index, ip, d.neighbor.mac_address));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ask VPP what became of the neighbours whose replies never arrived,
+    /// and make the ledger say that.
+    ///
+    /// Called before either send path consults `neighbours_installed`, so
+    /// the skip decides against what VPP holds rather than against what we
+    /// last managed to hear. See [`Self::neighbours_unacked`] for why both
+    /// directions need it and why the remove case is the dangerous one.
+    ///
+    /// A no-op with nothing in doubt, which is every ordinary tick — the
+    /// dump only happens after a transport error mid-neighbour.
+    fn reconcile_unacked_neighbours(&mut self) -> Result<(), EngineError> {
+        if self.neighbours_unacked.is_empty() {
+            return Ok(());
+        }
+        let existing = self.dump_static_neighbours()?;
+        self.settle_unacked(&existing);
+        Ok(())
+    }
+
+    /// Apply a dump's answer to the in-doubt keys, then consider them
+    /// settled. Split from the dump so the resync walk, which has already
+    /// paid for one, does not issue a second.
+    fn settle_unacked(&mut self, existing: &HashSet<(u32, IpAddr, [u8; 6])>) {
+        if self.neighbours_unacked.is_empty() {
+            return;
+        }
+        for (idx, ip) in std::mem::take(&mut self.neighbours_unacked) {
+            match existing
+                .iter()
+                .find(|(i, a, _)| *i == idx && *a == ip)
+                .map(|(_, _, mac)| *mac)
+            {
+                // VPP has it: record the MAC it actually holds, which is
+                // what stops the retry re-adding it and walking ~1M
+                // dependent routes. Not necessarily the MAC we sent —
+                // if the add never landed, this is the older entry, and
+                // recording it truthfully is what makes the delta path
+                // re-send.
+                Some(mac) => {
+                    self.neighbours_installed.insert((idx, ip), mac);
+                }
+                // VPP does not: drop the claim. An unacknowledged remove
+                // that did land would otherwise leave the ledger
+                // asserting an adjacency that is gone, and the skip would
+                // swallow every later add of that MAC.
+                None => {
+                    self.neighbours_installed.remove(&(idx, ip));
+                }
+            }
+        }
+    }
+
     /// One `ip_neighbor_add_del`, the single place this message is built.
     ///
     /// Extracted because there are now two callers — the resync walk and
@@ -908,6 +1003,12 @@ impl ConvergenceEngine {
         }) {
             Ok(r) => r,
             Err(e) => {
+                // The message was written; the answer never came. VPP may
+                // have applied it, so the ledger is not entitled to an
+                // opinion about this neighbour until VPP is asked again.
+                // See `neighbours_unacked` — both directions fail here,
+                // and silently.
+                self.neighbours_unacked.insert((sw_if_index, ip));
                 self.disconnect();
                 return Err(EngineError::Transport(e));
             }
@@ -1090,6 +1191,14 @@ impl ConvergenceEngine {
     /// through the delta door, which is the trap the note in
     /// [`Self::apply_neighbour`] describes.
     pub fn apply_changes(&mut self, src: &dyn RouteSource, max: usize) -> Result<u64, EngineError> {
+        // Before the drain, so a failure here costs nothing: nothing has
+        // been taken from the source yet. The skip below consults
+        // `neighbours_installed`, and after a transport error mid-neighbour
+        // that ledger describes a table VPP may not have — so VPP is asked
+        // first. Ordinary ticks have nothing in doubt and this is free.
+        if self.transport.is_some() {
+            self.reconcile_unacked_neighbours()?;
+        }
         let mut changes = src.drain_changes(max);
         if changes.is_empty() {
             return Ok(0);
@@ -1366,6 +1475,11 @@ impl ConvergenceEngine {
         self.loop_index = None;
         // The neighbour ledger describes the dead instance's table.
         self.neighbours_installed.clear();
+        // And so does the doubt about it: whatever the dead VPP did or did
+        // not apply is moot, and carrying the keys over would make the
+        // replacement's first delta pay for a dump that can only confirm
+        // an empty table.
+        self.neighbours_unacked.clear();
         self.pending = PendingMap::new();
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;

@@ -430,6 +430,7 @@ fn static_neighbours_are_programmed_before_the_routes_that_need_them() {
                 sw_if_index,
                 mac,
                 flags,
+                ..
             } => Some((*sw_if_index, *mac, *flags)),
             _ => None,
         })
@@ -959,6 +960,139 @@ fn a_refused_adjacency_never_becomes_resolvable() {
     assert!(
         e.counts().blocks_first_steer(),
         "which is loud: the hole blocks a first steer rather than hiding"
+    );
+}
+
+/// A converged engine against a VPP that applies the next neighbour op and
+/// then goes silent, leaving its outcome unknowable to the client.
+fn silent_after_neighbour(tag: &str, fake: &Fake) -> ConvergenceEngine {
+    let mut e = engine_for(fake);
+    assert!(e.api_ready(), "handshake for {tag}");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let base = QueuedSource::default();
+    e.begin_resync(&base);
+    // VPP already holds the neighbour, so nothing is sent here and the
+    // swallow stays armed for the delta under test.
+    assert_eq!(e.program_neighbours(&base).expect("programming"), 0);
+    drain_to_empty(&mut e);
+    let _ = fake.drain_events();
+    e
+}
+
+fn silent_fake(tag: &str) -> Fake {
+    Fake::start_behaving(
+        tag,
+        Behaviour {
+            swallow_neighbour_reply: true,
+            existing_neighbours: RESYNC_NEIGHBOUR,
+            ..Default::default()
+        },
+    )
+}
+
+/// An unacknowledged neighbour ADD is not blindly re-sent.
+///
+/// A transport error after the write is genuinely ambiguous: VPP may have
+/// applied the change. `neighbours_installed` records only
+/// acknowledgements, so it comes out of this describing a table VPP may not
+/// have — and re-adding an existing static neighbour is not a no-op. VPP
+/// replaces the entry and walks every dependent FIB entry: ~1M routes hang
+/// off one adjacency here, for a measured 5.51 s of null-node (shadow,
+/// 2026-08-08). Requeueing the batch made that retry certain rather than
+/// incidental, so the ledger has to be reconciled against VPP first.
+///
+/// The fake applies the op and then goes silent, which is the only faithful
+/// model of the ambiguity: a refused retval is VPP telling us, and a hangup
+/// *before* the op is unambiguous the other way.
+///
+/// See [`an_unacknowledged_neighbour_removal_does_not_strand_the_ledger`]
+/// for the opposite direction, which fails worse.
+#[test]
+fn an_unacknowledged_neighbour_add_is_not_blindly_re_added() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = silent_fake("neigh-unacked-add");
+    let mut e = silent_after_neighbour("neigh-unacked-add", &fake);
+
+    // A MAC change on the adjacency every route resolves through — the
+    // expensive one to re-add. VPP applies it and never answers.
+    const MAC_CHANGED: [u8; 6] = [0x02, 0, 0, 0, 0, 0x77];
+    let src = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), Some(("eth4".into(), MAC_CHANGED)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&src, 64)
+        .expect_err("the reply never comes");
+    assert_eq!(src.queued(), 1, "the batch is owed, as ever");
+    let sent = fake.drain_events();
+    assert!(
+        sent.iter()
+            .any(|ev| matches!(ev, Event::Neighbour { mac, .. } if *mac == MAC_CHANGED)),
+        "the add did reach VPP: {sent:?}"
+    );
+
+    // Reconnect and retry. The reconciling dump must find VPP already
+    // holding the new MAC and absorb the re-add.
+    assert!(e.api_ready(), "reconnects");
+    e.apply_changes(&src, 64).expect("the retry applies");
+    let after = fake.drain_events();
+    assert!(
+        after
+            .iter()
+            .any(|ev| matches!(ev, Event::Msg(m) if m == "ip_neighbor_dump")),
+        "the only way to know what VPP holds is to have asked: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|ev| matches!(ev, Event::Neighbour { mac, .. } if *mac == MAC_CHANGED)),
+        "an adjacency VPP already holds must not be re-added — that walk is \
+         ~1M dependent routes and 5.5 s of blackhole: {after:?}"
+    );
+}
+
+/// An unacknowledged neighbour REMOVAL must not leave the ledger claiming
+/// an adjacency VPP no longer has.
+///
+/// The dangerous direction, and the one a "don't retransmit adds" fix would
+/// miss entirely. `send_neighbour` clears `neighbours_installed` only on an
+/// acknowledgement, so a removal VPP applied but never confirmed leaves the
+/// ledger asserting the adjacency is installed. The delta path's skip —
+/// `neighbours_installed.get(..) != Some(&mac)` — then swallows the next
+/// add of that exact MAC, permanently, and every route through it
+/// black-holes with the counts clean. Worse than a redundant walk, and in
+/// the same silent-hole family as the delta loss this PR fixes.
+#[test]
+fn an_unacknowledged_neighbour_removal_does_not_strand_the_ledger() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = silent_fake("neigh-unacked-remove");
+    let mut e = silent_after_neighbour("neigh-unacked-remove", &fake);
+
+    // VPP applies the removal and goes silent.
+    let lost = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), None)],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&lost, 64)
+        .expect_err("the removal's reply never comes");
+    let _ = fake.drain_events();
+
+    // The nexthop comes back, with the very MAC the ledger still remembers.
+    assert!(e.api_ready(), "reconnects");
+    let back = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), Some(("eth4".into(), MAC)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&back, 64).expect("the re-add applies");
+    let readded = fake.drain_events();
+    assert!(
+        readded.iter().any(|ev| matches!(
+            ev,
+            Event::Neighbour { mac, is_add: true, .. } if *mac == MAC
+        )),
+        "VPP applied the removal, so the adjacency must be programmed again — \
+         a ledger that still claims it makes this a silent blackhole: {readded:?}"
     );
 }
 
