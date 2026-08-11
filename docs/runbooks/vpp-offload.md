@@ -371,7 +371,9 @@ steering  DEGRADED — 1 steering rule(s) this target asks for are missing
                      tier. Something changed them out of band (a UniFi
                      provisioning push does this), or the allowlist grew
                      while the inherited rules stayed as they were;
-                     `packetframe reconfigure` reconciles either way
+                     `packetframe reconfigure` re-applies steering, and
+                     reports its own reason if it refuses — a table too
+                     incomplete to steer into is the usual one
 ```
 
 It found the drift by asking the NIC, not by inferring it. **Measured on
@@ -380,8 +382,12 @@ adopted daemon was reported as `steering DEGRADED` within 20 s. Before
 the audit existed the same deletion went unnoticed for two minutes with
 `steering healthy` and no log line.
 
-**The remedy depends on the lifecycle state, and the line tells you
-which one applies.** `packetframe reconfigure` reconciles steering only
+**The line names the remedy that fits the situation, and there are
+four.** Note it never promises the command will succeed: steering
+passes two gates — the lifecycle state, and whether the table is
+complete enough to steer into — and `reconfigure` reports which one
+stopped it. What the line is for is telling you when the command is the
+wrong move entirely. `packetframe reconfigure` reconciles steering only
 from `Ready` or `Steered`; during an adopted resync it is refused with
 *"vpp-offload is AdoptedResyncing, not converged"*. That is not a rare
 corner — a held deferral is exactly when this audit earns its keep, and

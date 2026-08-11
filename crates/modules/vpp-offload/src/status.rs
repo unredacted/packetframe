@@ -769,7 +769,18 @@ impl StatusSnapshot {
         let cleanup = "`packetframe detach --all` retries the teardown, and `ethtool -N \
                        <iface> delete <loc>` removes a rule by hand";
         let remedy = if self.state.accepts_steering_changes() {
-            "`packetframe reconfigure` reconciles either way".to_string()
+            // NAMES the repair; does not promise it will succeed. The
+            // state gate this arm reads is not the only one — the steer
+            // path refuses again if the table is not complete enough to
+            // steer into — and predicting a command's outcome by
+            // re-deriving its preconditions here is a copy that drifts.
+            // It found a new precondition on each of four review rounds.
+            // What is always true, and all an operator needs: this is
+            // the command, and it reports its own reason when it
+            // refuses (review finding).
+            "`packetframe reconfigure` re-applies steering, and reports its own reason if \
+             it refuses — a table too incomplete to steer into is the usual one"
+                .to_string()
         } else if matches!(self.state, State::Stopped) {
             // Nothing is running and nothing is trying to. Reachable and
             // nasty: `StopRequested` assigns `Stopped` before knowing
@@ -1436,7 +1447,7 @@ mod tests {
                 // classification rather than four independent
                 // contains() that could all drift true.
                 let expected = if state.accepts_steering_changes() {
-                    "`packetframe reconfigure` reconciles"
+                    "`packetframe reconfigure` re-applies steering"
                 } else if matches!(state, State::Stopped) {
                     "supervision has stopped"
                 } else if !steer_configured {
@@ -1445,7 +1456,7 @@ mod tests {
                     "reconciled automatically"
                 };
                 for marker in [
-                    "`packetframe reconfigure` reconciles",
+                    "`packetframe reconfigure` re-applies steering",
                     "supervision has stopped",
                     "no port is configured to steer",
                     "reconciled automatically",
