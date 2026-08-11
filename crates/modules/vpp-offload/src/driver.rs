@@ -540,6 +540,27 @@ impl Driver {
             // attempt, so the tick that does prove it acts immediately.
             return Vec::new();
         }
+        // And VPP has to be answering. `Drain::Idle` does not say so: an
+        // empty pending map sends nothing at all, so in steady state
+        // that `Ok` is reached without touching the socket. The two
+        // proofs are about different things — one that the FIB is
+        // current, one that there is a VPP behind it — and steering
+        // needs both.
+        //
+        // `answered_last_probe`, not `is_wedged`: the silence budget
+        // tolerates two missed pings so jitter cannot cost a restart,
+        // and that tolerance is exactly the window this would otherwise
+        // steer into. `Wedged` has not fired yet, so nothing takes the
+        // rules back off until it does (review finding, PR #160). It is
+        // read after `poll_liveness` has run this tick, so a ping that
+        // failed a moment ago already counts.
+        if !self
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.answered_last_probe())
+        {
+            return Vec::new();
+        }
         if self
             .last_steer_retry
             .is_some_and(|t| now.duration_since(t) < STEER_RETRY_EVERY)
@@ -1597,6 +1618,76 @@ mod tests {
             "a proven-idle drain releases it immediately: {:?}",
             t.events
         );
+        assert_eq!(d.state(), State::Steered);
+    }
+
+    /// Nor may it steer into a VPP that has stopped answering.
+    ///
+    /// The gap this closes is between the first unanswered ping and
+    /// `Wedged`: the budget deliberately tolerates two missed pings so
+    /// jitter cannot cost a restart, and in steady state `Drain::Idle`
+    /// is reached without touching the socket — an empty pending map
+    /// sends nothing — so neither the drain proof nor the wedge
+    /// detector objects. Rules installed in that window put packets on
+    /// a VF whose VPP is already gone, and nothing takes them off until
+    /// the budget expires (review finding, PR #160).
+    #[test]
+    fn a_silent_api_holds_the_retry_until_it_answers_again() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+        w.steer_permitted = true;
+        fx.steer_fails = false;
+
+        // VPP stops answering, and the FIRST tick after the refusal is
+        // one where a ping is due — otherwise the retry fires on the
+        // last pong, which is at most one ping interval old and is
+        // exactly as fresh as this loop can ever be.
+        //
+        // From there, stay INSIDE the silence budget measured from that
+        // pong at ~t0. That tolerated window is the whole premise: no
+        // `Wedged`, nothing torn down, and the drain still reports idle
+        // because there is nothing to send.
+        w.ping_fails = true;
+        fx.calls.clear();
+        let mut ms = PING_INTERVAL.as_millis() as u64;
+        while Duration::from_millis(ms) < PING_BUDGET {
+            let t = d.tick(at(t0, ms), &mut w, &mut fx);
+            assert!(
+                !t.events.contains(&Event::Wedged),
+                "the premise is the tolerated window, before any teardown: {:?}",
+                t.events
+            );
+            ms += 100;
+        }
+        assert!(w.pings > 0, "a ping must actually have gone unanswered");
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "steering into an API that is not answering puts packets on a VF whose \
+             VPP is already gone: {:?}",
+            fx.calls
+        );
+        assert!(d.supervisor().steer_retry_pending(), "still wanted");
+
+        // It answers again. The pong lands before the wedge check on the
+        // same tick, so a recovery at the moment the next ping is due
+        // both clears the silence and releases the retry.
+        w.ping_fails = false;
+        let mut steered = false;
+        for step in 0..8 {
+            let t = d.tick(at(t0, ms + step * 100), &mut w, &mut fx);
+            if t.events.contains(&Event::SteerUnblocked) {
+                steered = true;
+                break;
+            }
+        }
+        assert!(steered, "a recovered API must release it: {:?}", fx.calls);
         assert_eq!(d.state(), State::Steered);
     }
 
