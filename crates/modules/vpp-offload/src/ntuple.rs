@@ -1060,7 +1060,7 @@ impl crate::runtime::Steering for NtupleSteering {
         // this target wants go", and what is left over once every
         // homeless rule has an answer is surplus.
         let mut empty: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
-        let mut occupied: std::collections::HashMap<&str, Vec<u32>> =
+        let mut occupied: std::collections::HashMap<&str, Vec<(u32, RxFlowSpec)>> =
             std::collections::HashMap::new();
         let mut unreadable: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
@@ -1172,7 +1172,10 @@ impl crate::runtime::Steering for NtupleSteering {
                                      neither this target's nor the last one's"
                                 );
                             } else {
-                                occupied.entry(iface.as_str()).or_default().push(*loc);
+                                occupied
+                                    .entry(iface.as_str())
+                                    .or_default()
+                                    .push((*loc, check.fs));
                             }
                         }
                     }
@@ -1219,31 +1222,56 @@ impl crate::runtime::Steering for NtupleSteering {
         // Only reachable with a non-empty ledger — the caller skips the
         // audit otherwise — so this cannot fire on a port that has simply
         // never steered.
-        for (iface, _) in &self.ports {
+        for (iface, vf) in &self.ports {
             let taken = consumed.get(iface.as_str());
-            let homeless: Vec<u32> = self
+            let homeless: Vec<&SteerRule> = self
                 .plan
                 .rules
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| taken.is_none_or(|t| !t[*i]))
-                .map(|(_, r)| r.location)
+                .map(|(_, r)| r)
                 .collect();
             let mut slots = empty.remove(iface.as_str()).unwrap_or_default();
             let mut occupants = occupied.remove(iface.as_str()).unwrap_or_default();
             let mut unread = unreadable.get(iface.as_str()).copied().unwrap_or(0);
 
             // Give every homeless rule an answer to "where should you
-            // have been", cheapest evidence first: an EMPTY ledger slot
-            // says it plainly, an occupied one says the slot was taken
-            // over, and an unreadable one says we cannot tell. Each
-            // answer is consumed, so one deleted rule cannot count
-            // twice — once as the slot and once as the plan entry that
-            // slot was holding.
-            for planned in homeless {
-                if let Some(loc) = slots.pop() {
+            // have been". Each answer is consumed, so one damaged rule
+            // cannot count twice — once as the slot and once as the plan
+            // entry that slot was holding.
+            for rule in homeless {
+                // A DAMAGED VERSION OF THIS RULE, first: same addresses,
+                // same direction, same slot, but not what was asked for
+                // — narrowed, or overwritten by a copy of its sibling.
+                // That is one defect, and the useful location to name is
+                // the one the damage is at.
+                //
+                // Identity is what makes this pairing legitimate, and
+                // requiring it is the fix: popping ANY occupant let an
+                // unrelated surplus rule stand in as the explanation. A
+                // target moving from {A,B} to {B,C} then reported C
+                // missing and said nothing about A still diverting
+                // traffic the allowlist no longer covers — two
+                // independent facts, one of them silently consumed by
+                // the other (review finding).
+                let damaged = occupants.iter().position(|(loc, got)| {
+                    matches(
+                        &RxFlowSpec {
+                            location: *loc,
+                            ..flow_spec(rule, *vf)
+                        },
+                        got,
+                    )
+                });
+                if let Some(k) = damaged {
+                    let (loc, _) = occupants.remove(k);
                     missing.push((iface.clone(), loc));
-                } else if let Some(loc) = occupants.pop() {
+                } else if let Some(loc) = slots.pop() {
+                    // An empty ledger slot says it plainly: something
+                    // was installed here and is gone. No identity to
+                    // check — an empty slot has no contents — so this
+                    // stays a positional pairing.
                     missing.push((iface.clone(), loc));
                 } else if unread > 0 {
                     // Explained by a read that failed: not established,
@@ -1255,15 +1283,15 @@ impl crate::runtime::Steering for NtupleSteering {
                     // produces when the allowlist GREW while the daemon
                     // was down. Named by its planned slot, the only
                     // location it has.
-                    missing.push((iface.clone(), planned));
+                    missing.push((iface.clone(), rule.location));
                 }
             }
-            // Occupants left over: every rule this target asks for is
-            // accounted for, so these are not absences — they are rules
-            // the NIC still holds that the target no longer asks for.
-            // The allowlist shrinking is what produces them, and the
-            // remedy points the other way: remove, not install.
-            for loc in occupants {
+            // Occupants left over: rules the NIC still holds that this
+            // target does not ask for, and that are not a damaged copy
+            // of anything it does. The allowlist shrinking is what
+            // produces them, and the remedy points the other way:
+            // remove, not install.
+            for (loc, _) in occupants {
                 stray.push((iface.clone(), loc));
             }
         }
@@ -1895,6 +1923,72 @@ mod tests {
         let a = live.missing_from_nic().expect("read the NIC");
         assert_eq!(a.missing, Vec::new(), "{:?}", a.missing);
         assert_eq!(a.stray.len(), owed, "{:?}", a.stray);
+    }
+
+    /// Swapping one prefix for another is TWO facts, not one.
+    ///
+    /// The pairing that stops a single damaged rule being counted twice
+    /// was positional — any occupant could stand in as the explanation
+    /// for any homeless rule — so a target moving from `{A,B}` to
+    /// `{B,C}` reported C missing and silently consumed the independent
+    /// fact that A's rules still divert traffic the allowlist no longer
+    /// covers. One reconfigure fixes both, but an operator reading only
+    /// half of it does not know the rollback side happened at all
+    /// (review finding).
+    ///
+    /// Pairing now requires IDENTITY: an occupant explains a homeless
+    /// rule only when it is a damaged copy of that same rule — same
+    /// addresses, same direction, same slot.
+    #[test]
+    fn a_prefix_swapped_for_another_reports_both_sides() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        const A: [u8; 4] = [198, 18, 0, 0];
+        const B: [u8; 4] = [203, 0, 113, 0];
+        const C: [u8; 4] = [192, 0, 2, 0];
+
+        let mut before = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[A, B]));
+        before.steer().expect("installs A and B");
+        let inherited = before.installed();
+        let per_prefix = inherited.len() / 2;
+        assert!(per_prefix > 0);
+
+        // THE RESTART: config now says {B, C}; the NIC holds {A, B}.
+        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[B, C]));
+        after.adopt_installed(inherited.clone());
+
+        let a = after.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            a.missing.len(),
+            per_prefix,
+            "C is not installed — that traffic is on the eBPF tier: {:?}",
+            a.missing
+        );
+        assert_eq!(
+            a.stray.len(),
+            per_prefix,
+            "AND A is still installed — that traffic is still going into VPP \
+             though the allowlist no longer covers it. Reporting only the first \
+             hides the rollback side entirely: {:?}",
+            a.stray
+        );
+        // The two must not name the same slots: they are different
+        // rules, in different places, needing opposite remedies.
+        assert!(
+            a.missing.iter().all(|m| !a.stray.contains(m)),
+            "missing {:?} and stray {:?} describe distinct locations",
+            a.missing,
+            a.stray
+        );
+
+        // THE LIVE RECONFIGURE: same swap through retarget, so the
+        // outgoing target is known. Same two facts.
+        let mut live = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[A, B]));
+        live.adopt_installed(inherited);
+        live.retarget(vec![("eth0".into(), 0)], plan_for(&[B, C]));
+        let a = live.missing_from_nic().expect("read the NIC");
+        assert_eq!(a.missing.len(), per_prefix, "{:?}", a.missing);
+        assert_eq!(a.stray.len(), per_prefix, "{:?}", a.stray);
     }
 
     /// An UNRELATED rule at a dropped port's slot is not our steering.
