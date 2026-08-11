@@ -440,12 +440,18 @@ killed are a blackhole, not a lost optimisation.
 as of the `SteerOutcome::NothingToSteer` fix it does repair itself:
 
 ```text
-steering  DEGRADED — ... no port is configured to steer, so the next
-                     convergence reconciles the NIC to an empty target and
-                     removes these. Do not wait for it if VPP is not
-                     forwarding: `ethtool -N <iface> delete <loc>` removes
-                     a rule now, and `packetframe detach --all` retries the
-                     whole teardown once this daemon has exited
+steering  DEGRADED — ... no port is configured to steer, so a convergence
+                     that verifies without withheld or unresolvable routes
+                     reconciles the NIC to an empty target and removes
+                     these. One that ends incomplete parks in the staging
+                     state and emits no steer at all, so nothing reconciles
+                     and this line outlives the convergence — `packetframe
+                     reconfigure` is then the retry, and with no port asking
+                     to steer it removes the rules rather than reinstalling
+                     any. Do not wait for either if VPP is not forwarding:
+                     `ethtool -N <iface> delete <loc>` removes a rule now,
+                     and `packetframe detach --all` retries the whole
+                     teardown once this daemon has exited
 ```
 
 `steer` is a reconcile, and a target with no port is a legitimate thing
@@ -453,6 +459,15 @@ to reconcile to: the stale-rule removal runs, the rules come out, and the
 outcome lands as `Event::NothingToSteer` — which clears `steered` *and*
 retires the want, so the module settles in `Ready` with `steer off
 (staging state)`.
+
+**Read the second sentence here too.** `Action::Steer` is what carries
+that reconcile, and only `VerifyPassed` emits it. A convergence ending
+`VerifyIncomplete` parks in `Ready` with no action at all, so the
+leftover rules stay. That is not a stuck state — `Ready` accepts
+`packetframe reconfigure`, and with no port configured to steer the
+reconcile removes the rules rather than reinstalling any — but it does
+mean "wait for the convergence" is the wrong instinct if the health line
+is still there once the module reaches `Ready`.
 
 It did not always. `steer` used to refuse an empty target outright,
 before reaching that removal, because `Ok` had no way to say "nothing is

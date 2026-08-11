@@ -799,8 +799,8 @@ impl StatusSnapshot {
              -N <iface> delete <loc>` removes a rule by hand"
                 .to_string()
         } else if !self.steer_configured {
-            // A convergence DOES clear these, and for a while it did
-            // not. `VerifyPassed` re-steers while `steered ||
+            // A convergence CAN clear these now, and for a while none
+            // could. `VerifyPassed` re-steers while `steered ||
             // steer_wanted`, and a refused `unsteer` deliberately keeps
             // `steered` true — so a `steer off` whose removal the NIC
             // declined re-emitted `Action::Steer` on every convergence.
@@ -809,19 +809,33 @@ impl StatusSnapshot {
             // to say "nothing is steered" and would have become
             // `Event::Steered`. The refusal repeated forever while the
             // rules kept diverting. `SteerOutcome::NothingToSteer` is
-            // the vocabulary that was missing; the reconcile now removes
-            // them and the module retires the want.
+            // the vocabulary that was missing.
+            //
+            // CAN, not will, and the qualifier is the same one the arm
+            // below carries: only `VerifyPassed` emits the steer that
+            // carries the reconcile. `VerifyIncomplete` parks in `Ready`
+            // with no action at all, so a convergence that ends with
+            // routes withheld or unresolvable leaves these exactly where
+            // they are — and the promise this line made in its first
+            // draft was the very thing #157 was written to stop it
+            // doing (review finding). The state is not stuck: `Ready`
+            // takes the `reconfigure` arm above, and with no port asking
+            // to steer that reconcile removes rather than reinstalls.
             //
             // The manual removals stay named anyway. This arm is also
             // reached from `Backoff`, where the next convergence is
             // however long the exponential schedule says, and a stray
             // rule is diverting traffic into a VF whose VPP is not
             // running — that is not something to wait out.
-            "no port is configured to steer, so the next convergence reconciles the NIC to \
-             an empty target and removes these. Do not wait for it if VPP is not \
-             forwarding: `ethtool -N <iface> delete <loc>` removes a rule now, and \
-             `packetframe detach --all` retries the whole teardown once this daemon has \
-             exited"
+            "no port is configured to steer, so a convergence that verifies without \
+             withheld or unresolvable routes reconciles the NIC to an empty target and \
+             removes these. One that ends incomplete parks in the staging state and \
+             emits no steer at all, so nothing reconciles and this line outlives the \
+             convergence — `packetframe reconfigure` is then the retry, and with no port \
+             asking to steer it removes the rules rather than reinstalling any. Do not \
+             wait for either if VPP is not forwarding: `ethtool -N <iface> delete <loc>` \
+             removes a rule now, and `packetframe detach --all` retries the whole \
+             teardown once this daemon has exited"
                 .to_string()
         } else {
             // A convergence is in flight or is coming (`Backoff` has no

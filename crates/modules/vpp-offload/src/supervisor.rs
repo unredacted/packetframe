@@ -1729,6 +1729,55 @@ mod tests {
         );
     }
 
+    /// The limit of that repair: only `VerifyPassed` carries it.
+    ///
+    /// `Action::Steer` is what runs the reconcile, and
+    /// `VerifyIncomplete` deliberately emits none — diverting traffic
+    /// into a FIB with known holes is the thing that arm exists to
+    /// prevent. So a convergence that ends with routes withheld or
+    /// unresolvable leaves the leftover rules exactly where they are.
+    ///
+    /// Pinned rather than fixed. Closing it would mean emitting
+    /// `Action::Steer` here, and nothing the supervisor can see
+    /// separates "leftover rules under a config that asks for nothing"
+    /// from "rules we want and are about to re-assert": `steer_wanted`
+    /// is re-armed by the very death that precedes the restart. The
+    /// emptiness is only knowable in `steer` itself, which is why the
+    /// outcome lives there — so for a CONFIGURED target this arm would
+    /// divert traffic into the incomplete FIB, which is the regression
+    /// it was written to stop. The escape is the operator's:
+    /// `VerifyIncomplete` parks in `Ready`, where `reconfigure` is
+    /// accepted and removes the rules, and the health line says so
+    /// rather than promising a convergence that may not come.
+    #[test]
+    fn an_incomplete_verify_does_not_reconcile_an_empty_target() {
+        let mut s = running_and_steered();
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::UnsteerFailed);
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+
+        assert_eq!(
+            s.on(Event::VerifyIncomplete),
+            Vec::new(),
+            "no steer, so no reconcile — the rules stay in the NIC"
+        );
+        assert!(
+            s.is_steered(),
+            "and the module still believes them installed, which is what keeps the VF \
+             withheld"
+        );
+        assert_eq!(
+            s.state(),
+            State::Ready,
+            "the way out is `reconfigure`, which this state accepts"
+        );
+        assert!(s.state().accepts_steering_changes());
+    }
+
     /// `Unsteered` must NOT retire the want — the difference that makes
     /// `NothingToSteer` a separate event rather than a second call site.
     ///
