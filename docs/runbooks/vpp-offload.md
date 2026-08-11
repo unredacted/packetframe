@@ -426,11 +426,15 @@ killed are a blackhole, not a lost optimisation.
 ```text
 steering  DEGRADED — ... no port is configured to steer, so convergence
                      cannot clear these — `steer` refuses an empty target
-                     rather than report an offload it never installed:
-                     `packetframe detach --all` retries the teardown, and
-                     `ethtool -N <iface> delete <loc>` removes a rule by
-                     hand
+                     rather than report an offload it never installed.
+                     Remove them with `ethtool -N <iface> delete <loc>`;
+                     `packetframe detach --all` also retries the teardown,
+                     but refuses while this daemon is running
 ```
+
+Note the order: `detach` refuses outright while a `packetframe run`
+daemon exists (it holds the bpf_link FDs), so under a live module the
+`ethtool` deletion is the one that works.
 
 The module cannot repair this one on its own: it re-steers because a
 refused `unsteer` leaves it believing traffic is diverted, and then

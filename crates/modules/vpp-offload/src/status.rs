@@ -766,8 +766,13 @@ impl StatusSnapshot {
         // reconcile.
         // Four answers, because there are four situations and giving
         // the wrong one sends an operator somewhere useless.
-        let cleanup = "`packetframe detach --all` retries the teardown, and `ethtool -N \
-                       <iface> delete <loc>` removes a rule by hand";
+        // No shared cleanup string: the two arms below differ in
+        // whether the daemon is still running, and that is exactly what
+        // decides which command works. `loader::detach` refuses outright
+        // while a `packetframe run` pid exists — the daemon holds the
+        // bpf_link FDs — so telling a live module to run it is a second
+        // refusal (review finding). Factoring these together was a DRY
+        // move that erased the distinguishing fact.
         let remedy = if self.state.accepts_steering_changes() {
             // NAMES the repair; does not promise it will succeed. The
             // state gate this arm reads is not the only one — the steer
@@ -789,7 +794,10 @@ impl StatusSnapshot {
             // either way — so this is precisely the snapshot reporting
             // rules that still divert traffic into a VF whose VPP has
             // just been killed (review finding).
-            format!("supervision has stopped, so nothing will reconcile this on its own: {cleanup}")
+            "supervision has stopped, so nothing will reconcile this on its own: with the \
+             daemon exited, `packetframe detach --all` retries the teardown, and `ethtool \
+             -N <iface> delete <loc>` removes a rule by hand"
+                .to_string()
         } else if !self.steer_configured {
             // A convergence is coming and it will NOT clear these.
             // `VerifyPassed` re-steers while `steered || steer_wanted`,
@@ -802,11 +810,11 @@ impl StatusSnapshot {
             // while the rules keep diverting traffic. The product gap is
             // filed; what this line must not do is promise a repair that
             // cannot happen (review finding).
-            format!(
-                "no port is configured to steer, so convergence cannot clear these — \
-                 `steer` refuses an empty target rather than report an offload it never \
-                 installed: {cleanup}"
-            )
+            "no port is configured to steer, so convergence cannot clear these — `steer` \
+             refuses an empty target rather than report an offload it never installed. \
+             Remove them with `ethtool -N <iface> delete <loc>`; `packetframe detach \
+             --all` also retries the teardown, but refuses while this daemon is running"
+                .to_string()
         } else {
             // A convergence is in flight or is coming (`Backoff` has no
             // resync running yet, which is why this does not say "this
@@ -1471,6 +1479,19 @@ mod tests {
                          daemon reconciles nothing; and with no port configured to \
                          steer, `steer` refuses the empty target before it would clear \
                          the leftovers, so convergence cannot fix it either: {msg}"
+                    );
+                }
+                // The two cannot-self-repair arms must name a command
+                // that works from where they are. `loader::detach`
+                // refuses while a `packetframe run` daemon is live, and
+                // this arm is only reachable with the module running —
+                // so it has to lead with the deletion that works.
+                if expected == "no port is configured to steer" {
+                    assert!(
+                        msg.contains("refuses while this daemon is running")
+                            && msg.contains("ethtool -N"),
+                        "state {state:?}: reachable only under a live daemon, where \
+                         `detach` is refused outright: {msg}"
                     );
                 }
             }
