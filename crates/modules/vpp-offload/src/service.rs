@@ -99,6 +99,18 @@ const MAX_EPISODE_REASONS: usize = 8;
 /// `STOP_PATIENCE` to outlast an undead VPP, and the caller must not be
 /// blocked for it. What the caller gets instead is a snapshot that says
 /// the teardown is unfinished.
+///
+/// **The contract this is sized against is not met on hardware, and this
+/// constant is not what misses it.** `detach --all` measured **2.814 s**
+/// on the shadow (2026-08-11, ONE VF, live VPP holding 1.05M routes):
+/// pins came out in 1 ms, then ~2.80 s went on terminating VPP and
+/// rebinding the VF and restoring hugepages — work that happens after
+/// `stop()` has already returned within this budget. So `stop()` keeps
+/// its 900 ms promise while the operator-visible command takes about
+/// three times the published figure. Raising this would not help; the
+/// cost is in VPP's exit and the resource release, and the honest
+/// number is recorded in the runbook's measured table rather than
+/// papered over here.
 const DETACH_BUDGET: Duration = Duration::from_millis(900);
 
 /// How long [`SupervisionService::apply_steering`] waits for the loop to

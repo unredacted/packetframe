@@ -11,12 +11,14 @@ running badly.
 
 > ## Read this before the first bring-up
 >
-> **No part of this module has ever run against a real VPP process.**
-> Every layer is unit-tested, `Module::attach` runs end to end against a
-> fixture sysfs and a fake VPP on a unix socket, and the convergence
-> budget was measured by a bench driving the same engine — but the
-> composition has never executed on hardware. Neither has any of the
-> three published failover numbers.
+> **This module has run against real VPP on the shadow, repeatedly.**
+> First bring-up 2026-08-05; first forwarded packet 2026-08-07; the five
+> acceptance drills and a restart-over-steered-VPP cycle through
+> 2026-08-09; `detach --all`, a cold bring-up and the steering-reconcile
+> checks on 2026-08-11. What has NOT happened is any of it on the
+> primary, or on more than one VF, or with real customer traffic — the
+> shadow's only wired port carries the interconnect, so every packet
+> that has ever traversed VPP here was one we generated.
 >
 > **The MCAM ioctl path has now met a NIC, and it took several rounds.**
 > First contact on 2026-08-05 found one real defect — the `loc` space
@@ -354,6 +356,93 @@ count against the floor in the health text.
 
 ## Triage by symptom
 
+### Steering silently went partial — fewer rules in the NIC than the ledger thinks
+
+**Nothing detects this. Health stays green.** Measured 2026-08-11: a
+rule deleted out of band (`ethtool -N eth1 delete 12`) was still missing
+two minutes later, `steering healthy` throughout, not one line in the
+log. The ledger and the state file went on naming four rules while the
+NIC held three.
+
+Why: nothing polls the NIC. The only thing that re-emits `Action::Steer`
+is `VerifyPassed`, and verify does not re-run in steady state — so a
+provisioning push, a firmware event, or anything else that clears MCAM
+entries leaves the offload **partially steered indefinitely**.
+
+What it costs: less than it sounds. Traffic for the stripped rule falls
+back to the **eBPF tier**, which is exactly where it belongs — this is a
+lost optimisation, not a lost packet. What you lose is the knowledge
+that it happened.
+
+**Detect** by comparing the two directly; they should match:
+
+```bash
+ethtool -n eth1 | grep -c '^Filter:'
+grep -o '"steer_rules".*' /var/lib/packetframe/state/vpp-offload.json
+```
+
+**Repair** with a plain reconfigure — no config change, no lever
+movement, no restart, no traffic impact:
+
+```bash
+packetframe reconfigure
+```
+
+That works because `steer` is a reconcile rather than an append: on a
+port that is already steered it re-installs whatever the target says is
+missing. (A reconfigure will *not* start steering a port that is
+unsteered — that still needs the lever.) Verified 2026-08-11: 3 rules →
+4, exit 0.
+
+**Run it after every UniFi provisioning push while a port is steered**,
+and check the count afterwards. A push on 2026-08-11 did not disturb the
+VF, hugepages or VPP — but it reconfigured a different interface, so it
+never tested this path.
+
+### A verified FIB is not a complete one
+
+`fib-synced healthy — N routes installed; verified on 64 probes` means
+the probes matched the mirror. It does **not** mean the table is whole.
+
+Measured 2026-08-11 on a cold bring-up: `healthy` at **11.4 s with
+110,724 routes** — about 10% of the table — with 64 probes passing,
+because verify samples the ledger and the ledger was small. The full
+table arrived by 61 s.
+
+That is safe on its own, because a first attach never steers itself:
+`steer on` in the config is a staging state until an operator moves the
+lever. The exposure is the operator who moves it early.
+
+**`require-table-complete on` is what closes it**, and it is not
+optional on a box with a bird:
+
+```
+module vpp-offload
+  require-table-complete on
+```
+
+With it, `steer` refuses while the mirror disagrees with bird's count,
+reports why, and retries itself once the mirror converges. Without it
+there is no gate at all — the refusal path is compiled out — and the
+canary ladder is the only thing between an early lever-move and traffic
+diverted into a 10%-loaded FIB. `off` is the documented opt-out for
+boxes with no bird to compare against (the shadow), not a default to
+leave alone.
+
+### `packetframe status` disagrees with what you just did
+
+`status` reads `module-health.json`, which the loader rewrites every
+**5 s**. `packetframe reconfigure` returning `OK` therefore does not
+mean `status` has caught up — for up to five seconds it will show the
+previous state. Measured 2026-08-11: reconfigure returned OK and logged
+`steering UP`, `ethtool` showed four rules, and `status` still read
+`steer off (staging state)`.
+
+The snapshot is honest about it — the header says `(pid N, Ms old)` —
+so read that age before believing a status line that contradicts an
+action you just took. `ethtool -n <iface>` is the ground truth for
+steering; the log line `steering UP:` is the ground truth for when.
+
 ### `packetframe status` says STALE
 
 The daemon is gone; VPP is not being supervised. Check whether VPP is
@@ -471,12 +560,19 @@ Be precise about this when reasoning about an incident.
 | PMTUD through a steered path | **PASS** | frag-needed, mtu 1300, sourced from 169.254.254.3, ×5. Gate 0b item 7 closed. |
 | Steered packets reaching VPP | **PASS** | gate 0b item 1 closed 2026-08-07: allowlisted frames counted on octeon0/0, non-allowlisted stayed on the kernel path. |
 | Restart health window | Degraded ~40–80 s | see the note below — the deferral and reconcile are visible by design. |
+| `detach --all` | **2.814 s** | 2026-08-11 shadow, ONE VF with a live VPP holding 1.05M routes. Misses the published <1 s; see below. Breakdown: pins removed in 1 ms, then 2.80 s terminating VPP + rebinding the VF + restoring hugepages. |
+| Interconnect blip during `detach --all` | **none** | same run, 5 Hz ping from the primary across the teardown: zero gaps >0.5 s, one 30 ms spike. Writing `sriov_numvfs=0` does not disturb the PF link. |
+| `ip_route_dump` at adoption | **7.04 s** for 1,054,548 routes | 2026-08-11, timed directly rather than inferred from a traffic gap. This is the barrier-sync freeze §the deferral exists to keep away from steered traffic. |
+| Adopted restart, UNSTEERED | ~53 s start→verified | 2026-08-11. Dump at +7 s, deferral held 32.8 s waiting for the mirror, diff+verify after. No traffic impact — nothing was steered. |
+| Cold bring-up (nothing running) | **11.4 s to `healthy`, ≤61 s to full table** | 2026-08-11. Read the caveat: `healthy` at 11.4 s meant **110,724 routes** — 10% of the table, verified clean. See "A verified FIB is not a complete one". |
+| `reconfigure` (lever move) | **0.215 s** | 2026-08-11, exit 0, writes `OK <ns>` to `last-reconfigure.timestamp`. |
+| Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**
 
 | number | status |
 |---|---|
-| `detach` < 1 s across N VFs | UNMEASURED — the last shadow item; relaxes to a documented best-effort bound if hardware says so |
+| `detach` across **more than one** VF | UNMEASURED — the single-VF case is measured above at 2.814 s. Nothing has torn down N>1 VFs, and the per-VF cost is unknown. |
 
 ### A planned restart looks Degraded for 40-80 seconds. Do not page on it.
 

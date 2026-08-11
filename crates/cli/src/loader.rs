@@ -670,13 +670,18 @@ fn drive_signal_loop(
     loop {
         for sig in signals.pending() {
             match sig {
-                SIGHUP => reconfigure_from_signal(
-                    config_path,
-                    state_dir,
-                    modules,
-                    #[cfg(feature = "vpp-offload")]
-                    allowlist,
-                ),
+                SIGHUP => {
+                    reconfigure_from_signal(
+                        config_path,
+                        state_dir,
+                        modules,
+                        module_gauges,
+                        #[cfg(feature = "vpp-offload")]
+                        allowlist,
+                    );
+                    // It just published; do not immediately publish again.
+                    next_poll = Instant::now() + MODULE_POLL_INTERVAL;
+                }
                 SIGTERM | SIGINT => {
                     tracing::info!(signal = sig, "termination requested");
                     return Ok(Termination::ExitPreserveAttach);
@@ -710,6 +715,7 @@ fn reconfigure_from_signal(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    module_gauges: &std::sync::Mutex<String>,
     #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) {
     use packetframe_common::module::ModuleConfig;
@@ -777,6 +783,22 @@ fn reconfigure_from_signal(
             failures.push(format!("{name}: {e}"));
         }
     }
+
+    // Refresh the health file BEFORE the marker, because the marker is
+    // what `packetframe reconfigure` is waiting on — so by the time it
+    // returns, `packetframe status` already reflects what just changed.
+    //
+    // Without this the two surfaces disagreed for up to
+    // MODULE_POLL_INTERVAL: on the shadow (2026-08-11) a reconfigure
+    // returned OK and logged `steering UP`, `ethtool` showed the rules
+    // in the NIC, and `status` still read `steer off (staging state)`
+    // from a five-second-old snapshot. An operator stepping a canary
+    // ladder reads `status` immediately after `reconfigure`; a rollout
+    // script does it faster than a human can.
+    //
+    // Same shape as the service's publish-before-answer rule, one layer
+    // up: publish the observation, then answer the caller.
+    crate::health::poll(state_dir, modules, module_gauges);
 
     if failures.is_empty() {
         write_reconfigure_marker(&marker_path, "OK");
