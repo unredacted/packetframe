@@ -2485,12 +2485,24 @@ fn a_steer_refused_by_completeness_retries_when_the_mirror_catches_up() {
 /// want, so a version that consulted only the completeness verdict
 /// would undo that arm on the next tick — the gate is on the route
 /// ledger, not on bird.
+/// Run for BOTH rollback outcomes, because the discriminator between
+/// them was where this gate first went wrong. A steer rolls back
+/// all-or-nothing, but the rollback itself can fail to delete — so a
+/// FIRST steer can leave debris, and "some rules are in the NIC" then
+/// stops meaning "this port was steering happily". Reading a non-empty
+/// ledger as a reconcile therefore exempted exactly the case that most
+/// needs the gate: the retry would install the REST of the allowlist
+/// into a holey table and widen the blackhole the debris started
+/// (review finding, PR #160).
 #[test]
 fn the_retry_does_not_steer_into_a_table_with_known_holes() {
     /// Refuses every steer and counts the asking. The count is the
     /// assertion: the gate must stop the retry BEFORE the NIC.
-    #[derive(Default)]
-    struct CountingRefusal(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    /// `debris` is what the rollback could not delete.
+    struct CountingRefusal {
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        debris: Vec<(String, u32)>,
+    }
     impl packetframe_vpp_offload::runtime::Steering for CountingRefusal {
         fn missing_from_nic(
             &self,
@@ -2501,14 +2513,22 @@ fn the_retry_does_not_steer_into_a_table_with_known_holes() {
             1
         }
         fn steer(&mut self) -> Result<(), String> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err("the NIC would not take it".into())
         }
         fn unsteer(&mut self) -> Result<(), String> {
             Ok(())
         }
         fn installed(&self) -> Vec<(String, u32)> {
-            Vec::new()
+            // Empty until a steer has been attempted: debris is what a
+            // rollback COULD NOT DELETE, so it cannot predate the
+            // attempt. Reporting it from the start would make the
+            // attach look like a steered adoption and defer the resync
+            // instead.
+            if self.asked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Vec::new();
+            }
+            self.debris.clone()
         }
         fn retarget(
             &mut self,
@@ -2518,65 +2538,81 @@ fn the_retry_does_not_steer_into_a_table_with_known_holes() {
         }
     }
 
-    let fake = Fake::start("steer-retry-holes");
-    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // Five routes into a two-route heap: three are withheld, which is
-    // what makes the verify incomplete rather than failed.
-    let rt = runtime_custom(
-        &fake,
-        Box::new(Mirror {
-            routes: (0..5).map(|i| fake_vpp::v4(0, i)).collect(),
-        }),
-        Box::new(CountingRefusal(std::sync::Arc::clone(&asked))),
-        2,
-    );
-    let mut d = Driver::new();
-    let t0 = Instant::now();
-    {
-        let (mut obs, _) = rt.views();
-        use packetframe_vpp_offload::driver::Observe as _;
-        assert!(obs.api_ready());
-    }
-    {
-        let (_, mut fx) = rt.views();
-        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
-    }
-    let (mut now, events) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
-    assert!(
-        events.contains(&Event::VerifyIncomplete),
-        "the table must not fit, or this test is about nothing: {events:?}"
-    );
-    assert!(rt.status().counts.withheld > 0);
-
-    // The operator turns the lever anyway and the NIC refuses, leaving
-    // a want outstanding over an incomplete table.
-    {
-        let (_, mut fx) = rt.views();
-        d.inject(now, Event::SteerRequested, &mut fx);
-    }
-    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(
-        d.supervisor().steer_retry_pending(),
-        "the want is outstanding — only the FIB gate may be holding it"
-    );
-
-    {
-        let (mut obs, mut fx) = rt.views();
-        for _ in 0..2_000 {
-            let t = d.tick(now, &mut obs, &mut fx);
-            for e in rt.take_pending() {
-                d.inject(now, e, &mut fx);
-            }
-            now += t
-                .sleep
-                .unwrap_or(Duration::from_millis(100))
-                .max(Duration::from_millis(1));
+    for (name, debris) in [
+        ("steer-retry-holes-clean", Vec::new()),
+        ("steer-retry-holes-debris", vec![("eth4".to_string(), 1u32)]),
+    ] {
+        let left_behind = !debris.is_empty();
+        let fake = Fake::start(name);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Five routes into a two-route heap: three are withheld, which
+        // is what makes the verify incomplete rather than failed.
+        let rt = runtime_custom(
+            &fake,
+            Box::new(Mirror {
+                routes: (0..5).map(|i| fake_vpp::v4(0, i)).collect(),
+            }),
+            Box::new(CountingRefusal {
+                asked: std::sync::Arc::clone(&asked),
+                debris,
+            }),
+            2,
+        );
+        let mut d = Driver::new();
+        let t0 = Instant::now();
+        {
+            let (mut obs, _) = rt.views();
+            use packetframe_vpp_offload::driver::Observe as _;
+            assert!(obs.api_ready());
         }
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        }
+        let (mut now, events) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+        assert!(
+            events.contains(&Event::VerifyIncomplete),
+            "{name}: the table must not fit, or this test is about nothing: {events:?}"
+        );
+        assert!(rt.status().counts.withheld > 0, "{name}");
+
+        // The operator turns the lever anyway and the NIC refuses,
+        // leaving a want outstanding over an incomplete table.
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(now, Event::SteerRequested, &mut fx);
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "{name}");
+        assert_eq!(
+            d.supervisor().is_steered(),
+            left_behind,
+            "{name}: the ledger is what says whether anything is diverted"
+        );
+        assert!(
+            d.supervisor().steer_retry_pending(),
+            "{name}: the want is outstanding — only the FIB gate may be holding it"
+        );
+
+        {
+            let (mut obs, mut fx) = rt.views();
+            for _ in 0..2_000 {
+                let t = d.tick(now, &mut obs, &mut fx);
+                for e in rt.take_pending() {
+                    d.inject(now, e, &mut fx);
+                }
+                rt.set_steered(d.supervisor().is_steered());
+                now += t
+                    .sleep
+                    .unwrap_or(Duration::from_millis(100))
+                    .max(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{name}: the retry must not re-ask while routes are withheld — that is the \
+             arm VerifyIncomplete exists to hold, and rules left by a failed rollback \
+             are not a licence to add more"
+        );
     }
-    assert_eq!(
-        asked.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the retry must not re-ask while routes are withheld — that is the arm \
-         VerifyIncomplete exists to hold"
-    );
 }

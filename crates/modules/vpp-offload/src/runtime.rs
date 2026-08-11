@@ -1272,8 +1272,7 @@ impl Core {
         self.completeness.as_ref().map(|h| h.verdict())
     }
 
-    /// Whether the FIB itself is fit to take traffic, on the same terms
-    /// the operator's first steer is held to.
+    /// Whether the FIB itself is fit to take traffic.
     ///
     /// The second gate, and the one that is easy to forget: `steer` does
     /// not apply it — `apply_steering` and `Verdict::may_steer` do — so
@@ -1283,15 +1282,26 @@ impl Core {
     /// or unresolvable; re-attempting there would divert traffic into
     /// the FIB with known holes that the arm exists to protect.
     ///
-    /// Discriminated on the NIC LEDGER rather than the supervisor's
-    /// belief, as `start_resync` does, and for the same reason: rules in
-    /// the NIC are what puts packets on VPP. Where some are already
-    /// installed this is a reconcile, not a first steer, and gating it
-    /// on `installing` — nonzero whenever routes are in flight, routine
-    /// under a live feed — would hold off the repair of a partly
-    /// installed target indefinitely.
+    /// Applied UNCONDITIONALLY, unlike `apply_steering`, which exempts
+    /// an already-steering port. That exemption exists because
+    /// `blocks_first_steer` counts `installing`, nonzero whenever routes
+    /// are in flight and so routine under a live feed that gating an
+    /// operator's reconcile on it would fail at random. The retry does
+    /// not need it: it runs only on a tick whose drain reported
+    /// `Drain::Idle`, which is that exemption's whole subject matter
+    /// already excluded.
+    ///
+    /// An earlier version exempted a non-empty NIC ledger on the same
+    /// reasoning, and that was wrong in a case the ledger cannot
+    /// distinguish: a FIRST steer whose rollback could not delete leaves
+    /// debris, so "some rules are installed" stops meaning "this port
+    /// was steering happily". If the table then developed holes, the
+    /// retry would install the REST of the allowlist into it and widen
+    /// the blackhole the debris had started (review finding, PR #160).
+    /// Nothing is lost by dropping it: a partly-installed target over a
+    /// whole FIB still repairs, because that FIB does not block.
     fn fib_fit_to_steer(&self) -> bool {
-        !self.steering.installed().is_empty() || !self.engine.counts().blocks_first_steer()
+        !self.engine.counts().blocks_first_steer()
     }
 }
 
