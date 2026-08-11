@@ -11,12 +11,14 @@ running badly.
 
 > ## Read this before the first bring-up
 >
-> **No part of this module has ever run against a real VPP process.**
-> Every layer is unit-tested, `Module::attach` runs end to end against a
-> fixture sysfs and a fake VPP on a unix socket, and the convergence
-> budget was measured by a bench driving the same engine — but the
-> composition has never executed on hardware. Neither has any of the
-> three published failover numbers.
+> **This module has run against real VPP on the shadow, repeatedly.**
+> First bring-up 2026-08-05; first forwarded packet 2026-08-07; the five
+> acceptance drills and a restart-over-steered-VPP cycle through
+> 2026-08-09; `detach --all`, a cold bring-up and the steering-reconcile
+> checks on 2026-08-11. What has NOT happened is any of it on the
+> primary, or on more than one VF, or with real customer traffic — the
+> shadow's only wired port carries the interconnect, so every packet
+> that has ever traversed VPP here was one we generated.
 >
 > **The MCAM ioctl path has now met a NIC, and it took several rounds.**
 > First contact on 2026-08-05 found one real defect — the `loc` space
@@ -25,16 +27,20 @@ running badly.
 > rules than existed, and a mask "correction" that inverted a field
 > which had been right all along. Every one of them failed loudly, as
 > designed: nothing was installed, and the all-or-nothing unwind left the
-> port with zero rules each time. What is *still*
-> unproven is everything past installation: no steered packet has ever
-> reached VPP, because the only port available to test on carries
-> nothing the allowlist matches. Every rule
+> port with zero rules each time. Everything past installation is now
+> proven too, on the shadow: steered frames counted on `octeon0/0`
+> (2026-08-07), forwarded end to end through VPP's graph the same day,
+> and PMTUD answered correctly through a steered path. What remains
+> unproven is scale and reality — one VF, one wired port, and traffic we
+> generated ourselves. Every rule
 > insert is followed by an `ETHTOOL_GRXCLSRULE` readback and compared
 > field by field, precisely so a wrong `ethtool_rx_flow_spec` offset
 > fails loudly on first contact instead of installing a rule that
 > matches the wrong traffic while both tiers report healthy. Expect that
 > check to be the thing that fires first, and treat it as the module
-> working, not failing.
+> working, not failing. The same readback now runs every 30 s against
+> the ledger, so a rule removed or altered out of band shows up as
+> `steering DEGRADED` rather than as nothing at all.
 >
 > **Native XDP attach panics this vendor kernel.** Not a queue-leak
 > question, not something to re-test on an idle port. The version gate
@@ -354,6 +360,189 @@ count against the floor in the health text.
 
 ## Triage by symptom
 
+### Steering silently went partial — the NIC holds less than the config asks for
+
+**The module now detects this within 30 s and says so:**
+
+```text
+steering  DEGRADED — 1 steering rule(s) this target asks for are missing
+                     from the NIC, no longer match what was asked for, or
+                     were never installed — that traffic is on the eBPF
+                     tier. Something changed them out of band (a UniFi
+                     provisioning push does this), or the allowlist grew
+                     while the inherited rules stayed as they were;
+                     `packetframe reconfigure` reconciles either way
+```
+
+It found the drift by asking the NIC, not by inferring it.
+
+**Two directions, one count.** The rules the ledger names are read back
+and compared field by field, so a deleted, replaced or narrowed rule is
+drift. And the rules the *current* target asks for are checked for a
+counterpart, so a rule that was never installed counts too — the shape a
+restart produces when the allowlist grew while the daemon was down: the
+state file names the old rules, they all read back clean, and the new
+prefix has no rule anywhere. One-directional, that read Healthy for as
+long as the adopted resync stayed deferred.
+
+If the NIC will not answer the readback at all, that is reported too and
+is NOT the same line:
+
+```text
+steering  DEGRADED — cannot verify steering: the NIC would not answer a
+                     rule readback (EIO: ...). Rules may have been removed
+                     or altered without this being visible; `ethtool -n
+                     <iface>` is the ground truth until it clears
+```
+
+An audit that cannot read keeps its previous count — an unreadable NIC
+is not a wrong one — but it must not present that count as current.
+"Cannot check" and "checked, fine" are different answers.
+
+The audit also reports the opposite complaint, and names it first:
+
+```text
+steering  DEGRADED — 2 location(s) the ledger names are still occupied by
+                     rules this config does not ask for — a port it leaves
+                     unsteered, or prefixes dropped from the allowlist — so
+                     traffic may still be diverted into VPP that should not
+                     be. The rules outlived the request to remove them;
+                     `ethtool -n <iface>` shows what is there and
+                     `packetframe reconfigure` clears them
+```
+
+Two ways to arrive here, and they read the same because the remedy is
+the same: a port turned `steer off` whose reconcile has not run, or an
+allowlist that lost a prefix while its rules stayed installed. Both mean
+traffic is being diverted that nobody asked for — the opposite complaint
+to the drift line above, and worth reading carefully, because the fix
+points the other way: these rules need REMOVING, not reinstalling.
+
+"May", not "is", and the wording is deliberate. Where the port was
+turned off by a live `reconfigure` the audit still holds the outgoing
+target and proves ownership field by field. After a *restart* that
+dropped the port there is nothing left to check the readback against —
+the state file records locations, not what they should contain — so all
+that can be established is that the slot is occupied. `ethtool -n
+<iface>` settles it.
+
+That is the rollback lever not taking. A `steer off` whose reconcile was
+refused (the completeness gate) or whose deletes failed leaves the ledger
+naming rules on a port you asked to go quiet — and traffic keeps entering
+VPP there. It is a different remedy from the drift line above: those
+rules need REMOVING, not reinstalling.
+
+And when both hold — drift was proven, then the NIC stopped answering —
+the line says so, because a count read as current sends you to fix that
+many rules and stop looking:
+
+```text
+steering  DEGRADED — 1 steering rule(s) ... reconfigure reconciles either
+                     way. That count is the last answer the NIC gave, not
+                     a current one: the NIC would not answer a rule
+                     readback (EIO: ...), so rules may be removed or
+                     altered without this being visible
+```
+
+**Detection only — it does not repair**, deliberately: re-asserting rules from a
+background audit would put a second, unsupervised installation path
+beside `Action::Steer`, and the repair is one operator command.
+
+Before that audit existed this went entirely unnoticed. Measured
+2026-08-11: a rule deleted out of band (`ethtool -N eth1 delete 12`) was
+still missing two minutes later, `steering healthy` throughout, not one
+line in the log — nothing polled the NIC, and the only thing that
+re-emits `Action::Steer` is `VerifyPassed`, which does not recur in
+steady state.
+
+What it costs: less than it sounds. Traffic for the stripped rule falls
+back to the **eBPF tier**, which is exactly where it belongs — this is a
+lost optimisation, not a lost packet. What you lose is the knowledge
+that it happened.
+
+**Detect** by comparing the two directly; they should match:
+
+```bash
+ethtool -n eth1 | grep -c '^Filter:'
+grep -o '"steer_rules".*' /var/lib/packetframe/state/vpp-offload.json
+```
+
+**Repair** with a plain reconfigure — no config change, no lever
+movement, no restart, no traffic impact:
+
+```bash
+packetframe reconfigure
+```
+
+That works because `steer` is a reconcile rather than an append: on a
+port that is already steered it re-installs whatever the target says is
+missing. (A reconfigure will *not* start steering a port that is
+unsteered — that still needs the lever.) Verified 2026-08-11: 3 rules →
+4, exit 0.
+
+**Run it after every UniFi provisioning push while a port is steered**,
+and check the count afterwards. A push on 2026-08-11 did not disturb the
+VF, hugepages or VPP — but it reconfigured a different interface, so it
+never tested this path.
+
+### A verified FIB is not a complete one
+
+`fib-synced healthy — N routes installed; verified on 64 probes` means
+the probes matched the mirror. It does **not** mean the table is whole.
+
+Measured 2026-08-11 on a cold bring-up: `healthy` at **11.4 s with
+110,724 routes** — about 10% of the table — with 64 probes passing,
+because verify samples the ledger and the ledger was small. The full
+table arrived by 61 s.
+
+That is safe on its own, because a first attach never steers itself:
+`steer on` in the config is a staging state until an operator moves the
+lever. The exposure is the operator who moves it early.
+
+**`require-table-complete on` is what closes it**, and it is not
+optional on a box with a bird:
+
+```
+module vpp-offload
+  require-table-complete on
+```
+
+With it, `steer` refuses while the mirror disagrees with bird's count,
+reports why, and retries itself once the mirror converges. Without it
+there is no gate at all — the refusal path is compiled out — and the
+canary ladder is the only thing between an early lever-move and traffic
+diverted into a 10%-loaded FIB. `off` is the documented opt-out for
+boxes with no bird to compare against (the shadow), not a default to
+leave alone.
+
+### `packetframe status` disagrees with what you just did
+
+`status` reads `module-health.json`, which the loader rewrites every
+**5 s** — so it is a snapshot, and the header says how old:
+`(pid N, Ms old)`. Read that age before believing a line that
+contradicts something you just did.
+
+**After a `reconfigure` it is not stale.** The SIGHUP handler refreshes
+the health file *before* writing the acknowledgement marker the CLI
+waits on, so by the time `packetframe reconfigure` returns, `status`
+already reflects the change. That was not true before 2026-08-11: a
+reconfigure returned OK and logged `steering UP`, `ethtool` showed the
+rules installed, and `status` still read `steer off (staging state)`
+from a five-second-old snapshot.
+
+Two cases where the age still matters:
+
+- **A rejected reload publishes nothing.** A config that fails to parse
+  or validate returns without refreshing, so `status` keeps whatever it
+  had until the next scheduled poll.
+- **Changes the module makes on its own** — a verify completing, a
+  process dying, steering torn down by trouble — land on the ordinary
+  5 s cadence, because nothing is waiting on them.
+
+Ground truth, when you need it rather than a snapshot: `ethtool -n
+<iface>` for what the NIC holds, and the `steering UP:` / `steering
+DOWN:` log lines for when it changed.
+
 ### `packetframe status` says STALE
 
 The daemon is gone; VPP is not being supervised. Check whether VPP is
@@ -471,12 +660,19 @@ Be precise about this when reasoning about an incident.
 | PMTUD through a steered path | **PASS** | frag-needed, mtu 1300, sourced from 169.254.254.3, ×5. Gate 0b item 7 closed. |
 | Steered packets reaching VPP | **PASS** | gate 0b item 1 closed 2026-08-07: allowlisted frames counted on octeon0/0, non-allowlisted stayed on the kernel path. |
 | Restart health window | Degraded ~40–80 s | see the note below — the deferral and reconcile are visible by design. |
+| `detach --all` | **2.814 s** | 2026-08-11 shadow, ONE VF with a live VPP holding 1.05M routes. Misses the published <1 s; see below. Breakdown: pins removed in 1 ms, then 2.80 s terminating VPP + rebinding the VF + restoring hugepages. |
+| Interconnect blip during `detach --all` | **none** | same run, 5 Hz ping from the primary across the teardown: zero gaps >0.5 s, one 30 ms spike. Writing `sriov_numvfs=0` does not disturb the PF link. |
+| `ip_route_dump` at adoption | **7.04 s** for 1,054,548 routes | 2026-08-11, timed directly rather than inferred from a traffic gap. This is the barrier-sync freeze §the deferral exists to keep away from steered traffic. |
+| Adopted restart, UNSTEERED | ~53 s start→verified | 2026-08-11. Dump at +7 s, deferral held 32.8 s waiting for the mirror, diff+verify after. No traffic impact — nothing was steered. |
+| Cold bring-up (nothing running) | **11.4 s to `healthy`, ≤61 s to full table** | 2026-08-11. Read the caveat: `healthy` at 11.4 s meant **110,724 routes** — 10% of the table, verified clean. See "A verified FIB is not a complete one". |
+| `reconfigure` (lever move) | **0.215 s** | 2026-08-11, exit 0, writes `OK <ns>` to `last-reconfigure.timestamp`. |
+| Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**
 
 | number | status |
 |---|---|
-| `detach` < 1 s across N VFs | UNMEASURED — the last shadow item; relaxes to a documented best-effort bound if hardware says so |
+| `detach` across **more than one** VF | UNMEASURED — the single-VF case is measured above at 2.814 s. Nothing has torn down N>1 VFs, and the per-VF cost is unknown. |
 
 ### A planned restart looks Degraded for 40-80 seconds. Do not page on it.
 

@@ -172,6 +172,42 @@ impl ResourceRelease for NoResources {
     }
 }
 
+/// What one pass of the steering audit established.
+///
+/// Two facts rather than one, because they are independent: a pass can
+/// prove drift AND fail to read some of what it was asked about.
+/// Returning only the first published a partial answer as a complete
+/// one — the caller cleared its "cannot verify" state on any `Ok` — so
+/// health reported the confirmed count as current while more drift
+/// could have been sitting behind an unreadable location (review
+/// finding, the third instance of this shape in this audit).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SteeringAudit {
+    /// Rules the current target needs in the NIC that are not there.
+    pub missing: Vec<(String, u32)>,
+    /// Rules the ledger still names on a port the current target does
+    /// **not** steer, confirmed still occupying their slot.
+    ///
+    /// The opposite complaint to `missing`, and the more urgent one: an
+    /// operator asked for a port to stop diverting and it has not. The
+    /// two are separate counts because they point opposite ways — one
+    /// says install, the other says remove — and a single number would
+    /// have to pick one story to tell.
+    pub stray: Vec<(String, u32)>,
+    /// Why the pass was incomplete, if it was. The locations behind it
+    /// were neither confirmed present nor confirmed missing, so
+    /// `missing` is a floor rather than a count.
+    pub unreadable: Option<String>,
+}
+
+impl SteeringAudit {
+    /// Everything the target asks for is present and correct, and the
+    /// whole of it was read.
+    pub fn clean() -> Self {
+        Self::default()
+    }
+}
+
 /// The MCAM steering seam ([`crate::ntuple::NtupleSteering`] is the
 /// real one: ETHTOOL_SRXCLSRLINS, ring_cookie `(vf+1)<<32`, loc
 /// budgeting).
@@ -196,6 +232,31 @@ pub trait Steering {
     /// persisted — see [`IdentityStore::steering_changed`]. A rule that
     /// would not come out is still diverting traffic, so the failure
     /// path is the one that most needs this recorded.
+    /// Rules the NIC should be holding for the current target and is
+    /// not — both directions: ones the ledger names that are gone or
+    /// altered, and ones the target asks for that were never installed
+    /// (a restart after the allowlist grew inherits only the old set).
+    ///
+    /// DETECTION ONLY — it must not repair, and it must not touch the
+    /// ledger. A rule can leave the NIC without us: a UniFi
+    /// provisioning push, a firmware event, an operator with `ethtool
+    /// -N`. Nothing re-emits `Action::Steer` in steady state (only
+    /// `VerifyPassed` does, and verify does not recur), so the offload
+    /// goes silently partial with health green — measured on the shadow
+    /// 2026-08-11, still missing two minutes later with no log line.
+    ///
+    /// Kept observational on purpose. The traffic is not lost — it falls
+    /// back to the eBPF tier, which is where it belongs — so the cost of
+    /// a wrong answer here is a misleading health line, not a forwarding
+    /// decision. Repair stays the operator's `packetframe reconfigure`,
+    /// which reinstalls what is missing because `steer` is a reconcile.
+    ///
+    /// `Err` means the pass established **nothing** — no count to adopt,
+    /// so the caller keeps its previous one. A pass that established
+    /// something while failing to read the rest is `Ok` with
+    /// [`SteeringAudit::unreadable`] set.
+    fn missing_from_nic(&self) -> Result<SteeringAudit, String>;
+
     fn installed(&self) -> Vec<(String, u32)>;
     /// Change what steering *should* be, without touching the NIC.
     ///
@@ -246,6 +307,9 @@ impl Steering for SteeringUnavailable {
     }
     fn unsteer(&mut self) -> Result<(), String> {
         Err("MCAM steering is unavailable in this runtime; cannot confirm rules removed".into())
+    }
+    fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+        Ok(SteeringAudit::clean())
     }
     fn installed(&self) -> Vec<(String, u32)> {
         Vec::new()
@@ -315,6 +379,22 @@ struct Core {
     /// itself freezes VPP's workers (drill (d10), 2026-08-09). See
     /// [`DeferredResync`] for the two stages.
     deferred_resync: Option<DeferredResync>,
+    /// When the NIC was last audited against the steering ledger, and
+    /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
+    last_steer_audit: Option<std::time::Instant>,
+    steer_missing: usize,
+    /// Rules still steering a port the config asks to leave unsteered,
+    /// as of the last audit. Its own count because it points the other
+    /// way: `steer_missing` says install, this says remove.
+    steer_stray: usize,
+    /// Why the last audit could not read the NIC, if it could not.
+    ///
+    /// Kept apart from `steer_missing` because they answer different
+    /// questions: that one is "how many are gone", this one is "the
+    /// answer is not known". Collapsing them let a NIC that stopped
+    /// answering keep publishing the last clean count, so steering read
+    /// Healthy while drift had become undetectable (review finding).
+    steer_audit_error: Option<String>,
 }
 
 /// The loaded-and-quiet release gate, shared by both deferral stages.
@@ -762,6 +842,10 @@ impl Runtime {
                 last_store_error: None,
                 last_drain_error: None,
                 deferred_resync: None,
+                last_steer_audit: None,
+                steer_missing: 0,
+                steer_stray: 0,
+                steer_audit_error: None,
             })),
         }
     }
@@ -821,7 +905,7 @@ impl Runtime {
     /// the supervision loop is the only caller precisely so that the two
     /// cannot be separated.
     pub fn retarget(&self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
-        self.core.borrow_mut().steering.retarget(ports, plan);
+        self.core.borrow_mut().retarget(ports, plan);
     }
 
     /// The two trait views the driver's tick takes.
@@ -860,6 +944,85 @@ impl Runtime {
     /// last API error, and any store failure from a path that could not
     /// refuse.
     pub fn status(&self) -> RuntimeStatus {
+        // Ask the NIC whether it still holds what the ledger claims,
+        // at most once per STEER_AUDIT_EVERY. Rate-limited on the REAL
+        // clock rather than the driven one: this is a hardware poll,
+        // not a supervision deadline, and pacing it off a clock a test
+        // can fast-forward would turn every driven tick into an ioctl.
+        //
+        // Detection only. Nothing here re-asserts, and the ledger is
+        // never touched — a wrong answer costs a health line, not a
+        // forwarding decision. Repair is the operator's `reconfigure`.
+        {
+            let mut c = self.core.borrow_mut();
+            let now = std::time::Instant::now();
+            // An EMPTY ledger claims nothing, so nothing can be
+            // missing from it. Clearing here rather than skipping is
+            // the fix for the obvious version of this: guarding the
+            // whole audit on a non-empty ledger meant an unsteer after
+            // a drift reading froze `steer_missing` at its last value
+            // and blocked every future audit, so status reported
+            // missing rules forever on a port that was deliberately
+            // off (review finding).
+            if c.steering.installed().is_empty() {
+                c.steer_missing = 0;
+                c.steer_stray = 0;
+                c.steer_audit_error = None;
+                c.last_steer_audit = None;
+            }
+            let due = c
+                .last_steer_audit
+                .is_none_or(|t| now.duration_since(t) >= STEER_AUDIT_EVERY);
+            if due && !c.steering.installed().is_empty() {
+                c.last_steer_audit = Some(now);
+                match c.steering.missing_from_nic() {
+                    Ok(audit) => {
+                        if !audit.missing.is_empty() && c.steer_missing != audit.missing.len() {
+                            tracing::warn!(
+                                missing = ?audit.missing,
+                                "steering rules this target needs are not in the NIC; \
+                                 traffic for them is on the eBPF tier. `packetframe \
+                                 reconfigure` reinstalls them"
+                            );
+                        }
+                        c.steer_missing = audit.missing.len();
+                        if !audit.stray.is_empty() && c.steer_stray != audit.stray.len() {
+                            tracing::warn!(
+                                stray = ?audit.stray,
+                                "rules are still steering a port this config asks to leave \
+                                 unsteered; `packetframe reconfigure` removes them"
+                            );
+                        }
+                        c.steer_stray = audit.stray.len();
+                        // Taken from the audit rather than cleared: a
+                        // pass that proved drift AND could not read the
+                        // rest is an incomplete answer, and clearing
+                        // here published it as a complete one (review
+                        // finding). `None` is the only thing that says
+                        // the whole target was checked.
+                        if let Some(why) = &audit.unreadable {
+                            tracing::warn!(
+                                error = %why,
+                                confirmed = audit.missing.len(),
+                                "steering audit was incomplete; the count is a floor"
+                            );
+                        }
+                        c.steer_audit_error = audit.unreadable;
+                    }
+                    // A NIC we cannot read is not a NIC we can call
+                    // wrong — the last count stands. But it is not a
+                    // NIC we can call RIGHT either, and publishing the
+                    // stale count alone let a persistently unreadable
+                    // NIC keep reporting the last clean answer forever
+                    // (review finding). Record the failure so health
+                    // can say the answer is unknown.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "steering audit could not read the NIC");
+                        c.steer_audit_error = Some(e);
+                    }
+                }
+            }
+        }
         let c = self.core.borrow();
         RuntimeStatus {
             counts: c.engine.counts(),
@@ -875,6 +1038,9 @@ impl Runtime {
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
+            steer_missing: c.steer_missing,
+            steer_stray: c.steer_stray,
+            steer_audit_error: c.steer_audit_error.clone(),
             authority: if c.completeness.is_none() {
                 AuthorityPosture::Absent
             } else if matches!(
@@ -888,6 +1054,16 @@ impl Runtime {
         }
     }
 }
+
+/// How often to ask the NIC whether it still holds the rules the ledger
+/// names.
+///
+/// Two ioctls per steered interface per interval, so 30 s is free even
+/// on a fully steered box. Sized against how long a silently-partial
+/// offload should be allowed to go unnoticed rather than against any
+/// hardware limit — on the shadow it went two minutes and would have
+/// gone indefinitely.
+const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -940,6 +1116,14 @@ pub struct RuntimeStatus {
     /// recommends the thing it already has, while a demoted one is
     /// waiting on something else entirely.
     pub authority: AuthorityPosture,
+    /// How many rules the ledger names that the NIC no longer holds, as
+    /// of the last audit. See [`STEER_AUDIT_EVERY`].
+    pub steer_missing: usize,
+    /// Rules still steering a port the config leaves unsteered. See
+    /// [`SteeringAudit::stray`].
+    pub steer_stray: usize,
+    /// Why the last steering audit could not read the NIC, if so.
+    pub steer_audit_error: Option<String>,
 }
 
 impl Core {
@@ -1044,9 +1228,33 @@ impl Core {
     /// the NIC either way, and reporting the steer as failed would make
     /// the supervisor believe traffic is not diverted when it is.
     fn record_steering(&mut self) {
+        // The ledger just moved, so the cached audit describes a NIC
+        // that no longer exists. Invalidate rather than wait out the
+        // interval: a successful re-steer would otherwise keep
+        // reporting the drift it just repaired for up to
+        // STEER_AUDIT_EVERY, which is exactly the window an operator
+        // stepping a canary ladder is watching (review finding).
+        self.last_steer_audit = None;
         let rules = self.steering.installed();
         let r = self.store.steering_changed(&rules);
         let _ = self.note_persist(r);
+    }
+
+    /// Point steering at a new target, and invalidate the cached audit.
+    ///
+    /// The audit answers "does the NIC hold what THIS target asks for",
+    /// so it is a function of two things — the ledger and the target —
+    /// and both have to invalidate it. Only the ledger did, and the
+    /// target can move on its own: `retarget` runs before the
+    /// reconciling steer, which can refuse at the completeness gate and
+    /// return without ever reaching `record_steering`. The answer to
+    /// the OLD question then stood for up to STEER_AUDIT_EVERY, and
+    /// `reconfigure` republishes status the moment it returns — so an
+    /// operator who had just been told the steer was refused could read
+    /// `steering healthy` in the same breath (review finding).
+    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
+        self.steering.retarget(ports, plan);
+        self.last_steer_audit = None;
     }
 }
 
@@ -1909,6 +2117,9 @@ mod tests {
     }
 
     impl Steering for LedgerSteering {
+        fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+            Ok(SteeringAudit::clean())
+        }
         fn configured_ports(&self) -> usize {
             self.configured
         }
@@ -2049,6 +2260,136 @@ mod tests {
         assert!(
             rt.status().store_error.is_some(),
             "but the operator has to learn the record is stale — the next start cannot adopt"
+        );
+    }
+
+    /// An INCOMPLETE audit reaches status as both of its facts.
+    ///
+    /// The audit can prove drift and still fail to read the rest, and
+    /// the caller used to treat any `Ok` as a complete pass: it cleared
+    /// `steer_audit_error` and published the confirmed count as current,
+    /// so health said "1 rule missing" while more could have been
+    /// sitting behind the unreadable location and nothing said so
+    /// (review finding). The count is a floor whenever the pass was
+    /// partial, and the two travel together for that reason.
+    #[test]
+    fn an_incomplete_audit_publishes_its_count_and_its_gap() {
+        struct PartialAudit;
+        impl Steering for PartialAudit {
+            fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+                Ok(SteeringAudit {
+                    missing: vec![("eth4".into(), 1024)],
+                    unreadable: Some("loc 1025 on eth4: EIO".into()),
+                    ..SteeringAudit::clean()
+                })
+            }
+            fn configured_ports(&self) -> usize {
+                1
+            }
+            fn steer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn unsteer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            // Non-empty: the caller skips the audit on an empty ledger.
+            fn installed(&self) -> Vec<(String, u32)> {
+                vec![("eth4".into(), 1024), ("eth4".into(), 1025)]
+            }
+            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+        }
+
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(PartialAudit),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let st = rt.status();
+        assert_eq!(
+            st.steer_missing, 1,
+            "the drift the pass DID prove must be published"
+        );
+        assert_eq!(
+            st.steer_audit_error.as_deref(),
+            Some("loc 1025 on eth4: EIO"),
+            "and so must the fact that the pass was incomplete — without it the \
+             floor is published as a current count and further drift is invisible"
+        );
+    }
+
+    /// Retargeting invalidates the cached audit, like a ledger change.
+    ///
+    /// The audit answers "does the NIC hold what THIS target asks for",
+    /// so both inputs must invalidate it — and only the ledger did.
+    /// `retarget` runs before the reconciling steer, which can refuse at
+    /// the completeness gate and return without reaching
+    /// `record_steering`, so the answer to the old question stood for up
+    /// to STEER_AUDIT_EVERY while `reconfigure` republished status
+    /// immediately (review finding).
+    ///
+    /// The rate limiter is the discriminator: a second `status()` must
+    /// NOT re-audit, and the one after the retarget must.
+    #[test]
+    fn retargeting_invalidates_the_cached_audit() {
+        /// Clean on the first pass, drifting on every one after — so a
+        /// re-audit is visible in the published count.
+        struct DriftsAfterFirstPass(std::cell::Cell<usize>);
+        impl Steering for DriftsAfterFirstPass {
+            fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                Ok(if n == 0 {
+                    SteeringAudit::clean()
+                } else {
+                    SteeringAudit {
+                        missing: vec![("eth4".into(), 1024)],
+                        ..SteeringAudit::clean()
+                    }
+                })
+            }
+            fn configured_ports(&self) -> usize {
+                1
+            }
+            fn steer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn unsteer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            // Non-empty: the caller skips the audit on an empty ledger.
+            fn installed(&self) -> Vec<(String, u32)> {
+                vec![("eth4".into(), 1024)]
+            }
+            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+        }
+
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(DriftsAfterFirstPass(std::cell::Cell::new(0))),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        assert_eq!(rt.status().steer_missing, 0, "the first pass reads clean");
+        assert_eq!(
+            rt.status().steer_missing,
+            0,
+            "and the second is served from the cache — without this the test \
+             would pass whether or not retarget invalidates anything"
+        );
+
+        rt.retarget(vec![("eth4".into(), 0)], crate::steer::RuleSet::default());
+        assert_eq!(
+            rt.status().steer_missing,
+            1,
+            "a new target must be asked about, not answered from the old \
+             question's cache"
         );
     }
 

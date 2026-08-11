@@ -257,6 +257,17 @@ pub struct StatusSnapshot {
     /// had just written `steer on` could not tell the config had been
     /// read at all.
     pub steer_configured: bool,
+    /// Rules the ledger names that the NIC no longer holds. See
+    /// [`crate::runtime::RuntimeStatus::steer_missing`].
+    pub steer_missing: usize,
+    /// Rules still steering a port the config leaves unsteered. See
+    /// [`crate::runtime::SteeringAudit::stray`]. Its own count because
+    /// it points the other way: `steer_missing` says install, this says
+    /// remove.
+    pub steer_stray: usize,
+    /// Why the last steering audit could not read the NIC, if so. See
+    /// [`crate::runtime::RuntimeStatus::steer_audit_error`].
+    pub steer_audit_unreadable: Option<String>,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -303,6 +314,19 @@ pub struct StatusSnapshot {
     pub source_backlog: u64,
 }
 
+/// The steering audit, as the health surface consumes it.
+///
+/// One parameter rather than three, because two of them are `usize`
+/// that point OPPOSITE ways — install versus remove — and adjacent
+/// positional counts of the same type are a transposition nothing would
+/// catch.
+#[derive(Debug, Default, Clone)]
+pub struct SteerAudit {
+    pub missing: usize,
+    pub stray: usize,
+    pub unreadable: Option<String>,
+}
+
 impl StatusSnapshot {
     /// Observe live state.
     ///
@@ -334,6 +358,11 @@ impl StatusSnapshot {
             None,
             0,
             steer_configured,
+            // The shorthand has no NIC audit behind it; claiming zero
+            // drift would be a claim. Zero here means "not observed",
+            // and every caller of this form is a path with no steering
+            // ledger to audit against.
+            SteerAudit::default(),
         )
     }
 
@@ -357,12 +386,16 @@ impl StatusSnapshot {
         drain_error: Option<String>,
         source_backlog: u64,
         steer_configured: bool,
+        audit: SteerAudit,
     ) -> Self {
         Self {
             state: sup.state(),
             steered: sup.is_steered(),
             steer_intended: sup.steer_intended(),
             steer_configured,
+            steer_missing: audit.missing,
+            steer_stray: audit.stray,
+            steer_audit_unreadable: audit.unreadable,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -691,6 +724,88 @@ impl StatusSnapshot {
     }
 
     fn steering_health(&self) -> SubsystemHealth {
+        // Checked before the steered arm: "steered" is a fact about
+        // what we asked for, and this is a fact about what the NIC
+        // actually holds. A provisioning push can strip rules with
+        // nothing else noticing — measured on the shadow 2026-08-11,
+        // still missing two minutes later with `steering healthy` —
+        // and the answer an operator needs is not "steered" but "part
+        // of it is gone, and here is the one command that fixes it".
+        //
+        // DEGRADED, not Unhealthy: the stripped traffic falls back to
+        // the eBPF tier, which is where it belongs. Nothing is
+        // dropping; the offload is smaller than it claims.
+        //
+        // A NIC that will not answer is not healthy either, and the two
+        // facts are INDEPENDENT: `Runtime::status` retains the last count
+        // when a readback fails, so a nonzero count and an unreadable
+        // audit can both hold. Ordering them could not fix that —
+        // whichever arm ran first hid the other, and the first version
+        // published the retained count as though it were current while
+        // further drift had become invisible (review finding). So one
+        // arm, and the message carries whichever facts are true.
+        //
+        // Three facts now, composed rather than matched. The third
+        // points the OTHER way: rules still steering a port the config
+        // asks to leave unsteered. It is named first when present,
+        // because that is the rollback lever failing — an operator
+        // pulling traffic OFF a port is the one case where "steering
+        // healthy" is the most expensive possible answer (review
+        // finding).
+        let mut clauses: Vec<String> = Vec::new();
+        if self.steer_stray > 0 {
+            // "Still occupied", not "still ours". Where the outgoing
+            // target is known the audit proves ownership field by
+            // field; after a restart that dropped the port there is
+            // nothing to check against, and claiming the traffic is
+            // ours would be the ownership guess this audit keeps
+            // getting wrong. `ethtool -n` settles it either way.
+            clauses.push(format!(
+                "{} location(s) the ledger names are still occupied by rules this config \
+                 does not ask for — a port it leaves unsteered, or prefixes dropped from \
+                 the allowlist — so traffic may still be diverted into VPP that should \
+                 not be. The rules outlived the request to remove them; `ethtool -n \
+                 <iface>` shows what is there and `packetframe reconfigure` clears them",
+                self.steer_stray
+            ));
+        }
+        if self.steer_missing > 0 {
+            clauses.push(format!(
+                "{} steering rule(s) this target asks for are missing from the NIC, no \
+                 longer match what was asked for, or were never installed — that traffic \
+                 is on the eBPF tier. Something changed them out of band (a UniFi \
+                 provisioning push does this), or the allowlist grew while the inherited \
+                 rules stayed as they were; `packetframe reconfigure` reconciles either way",
+                self.steer_missing
+            ));
+        }
+        if let Some(why) = &self.steer_audit_unreadable {
+            let unverifiable = format!(
+                "the NIC would not answer a rule readback ({why}), so rules may be \
+                 removed or altered without this being visible; `ethtool -n <iface>` is \
+                 the ground truth until it clears"
+            );
+            clauses.push(if clauses.is_empty() {
+                format!("cannot verify steering: {unverifiable}")
+            } else {
+                // The counts above are real but STALE, and saying so is
+                // the whole point — an operator reading a count as
+                // current will fix that many rules and stop looking.
+                format!(
+                    "and the count(s) above are the last answer the NIC gave, not current \
+                     ones: {unverifiable}"
+                )
+            });
+        }
+        let message = (!clauses.is_empty()).then(|| clauses.join(". "));
+        if let Some(message) = message {
+            return SubsystemHealth {
+                name: SUBSYS_STEERING.into(),
+                state: HealthState::Degraded,
+                message: Some(message),
+                last_success_age_seconds: None,
+            };
+        }
         let (state, message) = match (self.steered, self.steer_intended) {
             (true, _) => (HealthState::Healthy, None),
             // Intended but absent: a failed steer, or steering torn down
@@ -1135,6 +1250,195 @@ mod tests {
             ports,
             false,
         )
+    }
+
+    /// Rules missing from the NIC degrade steering, even while steered.
+    ///
+    /// The arm is checked BEFORE `steered`, because "steered" says what
+    /// we asked for and this says what the NIC actually holds. On the
+    /// shadow (2026-08-11) a rule deleted out of band left `steering
+    /// healthy` for two minutes with three of four rules installed; an
+    /// operator reading that line had no way to know.
+    ///
+    /// Degraded rather than Unhealthy on purpose: the stripped traffic
+    /// falls back to the eBPF tier, so nothing is dropping — the offload
+    /// is just smaller than it claims.
+    /// A NIC that will not answer is not a healthy NIC.
+    ///
+    /// The audit keeps its previous count when a readback fails, which
+    /// is right — an unreadable NIC is not a wrong one. But publishing
+    /// only that count meant a persistently unreadable NIC kept
+    /// reporting the last clean answer forever, so steering read
+    /// Healthy while drift had become undetectable (review finding).
+    /// "Cannot check" and "checked, fine" must not print the same line.
+    #[test]
+    fn an_unreadable_steering_audit_is_not_healthy() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        // Zero missing — the last audit that SUCCEEDED found nothing.
+        snap.steer_missing = 0;
+        snap.steer_audit_unreadable = Some("EIO: readback failed".into());
+
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(
+            steering.state,
+            HealthState::Degraded,
+            "an audit that could not read the NIC must not present the previous \
+             clean count as current: {steering:?}"
+        );
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("cannot verify") && msg.contains("EIO"),
+            "the line must say it could not check, and why: {msg}"
+        );
+    }
+
+    /// Rules still steering a port the config turned OFF degrade it.
+    ///
+    /// The opposite complaint to drift, and the one an operator is
+    /// least able to afford being wrong about: it means the rollback
+    /// lever did not take. Named first in the message for that reason,
+    /// and counted separately because a single number would have to
+    /// pick one story — install or remove — and this one says remove.
+    #[test]
+    fn rules_left_on_a_port_the_config_unsteered_degrade_it() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        snap.steer_missing = 0;
+        snap.steer_stray = 2;
+
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(
+            steering.state,
+            HealthState::Degraded,
+            "a port the config leaves unsteered that is still steering is not \
+             healthy, whatever the drift count says: {steering:?}"
+        );
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains('2') && msg.contains("may still be diverted"),
+            "and the line must say which way the problem points — these rules \
+             need REMOVING, not reinstalling: {msg}"
+        );
+        assert!(
+            !msg.contains("are still diverting"),
+            "without claiming ownership it cannot always prove: after a restart \
+             that dropped the port there is nothing left to check the readback \
+             against, and `ethtool -n` is what settles it: {msg}"
+        );
+    }
+
+    /// A RETAINED drift count must say it can no longer be checked.
+    ///
+    /// The two facts are independent — `Runtime::status` keeps the last
+    /// count when a readback fails — so this combination is reachable and
+    /// was the one the previous fix left behind: proven drift returned
+    /// first and the unreadable audit went unmentioned, so an operator
+    /// read "1 rule missing, reconfigure fixes it", fixed one rule, and
+    /// had no way to know the audit had stopped being able to find the
+    /// rest. Ordering cannot fix it; whichever arm runs first hides the
+    /// other (review finding).
+    #[test]
+    fn a_retained_drift_count_says_it_is_no_longer_current() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        // Drift was proven by an earlier audit; the NIC has since stopped
+        // answering, so the count stands but nothing can add to it.
+        snap.steer_missing = 1;
+        snap.steer_audit_unreadable = Some("EIO: readback failed".into());
+
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(steering.state, HealthState::Degraded);
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains('1') && msg.contains("eBPF tier"),
+            "the proven drift must still be reported: {msg}"
+        );
+        assert!(
+            msg.contains("EIO") && msg.contains("not current ones"),
+            "and so must the fact that the count is stale and further drift is \
+             invisible — reporting only the count sends an operator to fix that \
+             many rules and stop looking: {msg}"
+        );
+    }
+
+    #[test]
+    fn steering_rules_missing_from_the_nic_degrade_it() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        // Baseline: a NIC that agrees is healthy.
+        let base = snap.report();
+        let steering = base
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(steering.state, HealthState::Healthy, "{steering:?}");
+
+        snap.steer_missing = 1;
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(
+            steering.state,
+            HealthState::Degraded,
+            "a NIC missing a rule the ledger names must not read healthy"
+        );
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("reconfigure"),
+            "the line has to name the one command that fixes it: {msg}"
+        );
     }
 
     #[test]

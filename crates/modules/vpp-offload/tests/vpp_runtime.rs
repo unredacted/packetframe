@@ -1418,6 +1418,12 @@ mod steered {
         pub log: Arc<Mutex<Vec<&'static str>>>,
     }
     impl packetframe_vpp_offload::runtime::Steering for RecordingSteering {
+        fn missing_from_nic(
+            &self,
+        ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
+            // No NIC behind this double, so nothing can be missing from one.
+            Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
+        }
         fn configured_ports(&self) -> usize {
             1
         }
