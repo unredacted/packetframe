@@ -247,7 +247,19 @@ pub fn bring_up(
         .filter(|(_, _, steer)| *steer)
         .map(|(iface, _, _)| (iface.clone(), 0u32))
         .collect();
-    let steering = NtupleSteering::new(steer_ports, steer_plan);
+    // Every member port, unfiltered, so removal can attribute a
+    // location's occupant on a port this config leaves unsteered. That
+    // is not a hypothetical: a restart whose config turned a port off
+    // adopts that port's rules from the state file, and the filtered
+    // list above cannot say which VF they would have to name to be ours
+    // — so removal would delete whatever sat there, on the rollback
+    // path, where getting traffic off the port is the entire point.
+    let member_ports: Vec<(String, u32)> = cfg
+        .ports
+        .iter()
+        .map(|(iface, _, _)| (iface.clone(), 0u32))
+        .collect();
+    let steering = NtupleSteering::new(member_ports, steer_ports, steer_plan);
 
     let workers = cfg.total_workers();
     let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;

@@ -302,6 +302,13 @@ teardown is about to unbind, so it stops rather than blackholing. The
 state file names exactly which rules remain; clear them by hand
 (`ethtool -N <iface> delete <loc>`) and re-run.
 
+It reads each recorded location back before deleting it, and a location
+the NIC will not describe counts as a refusal — the same message, and
+the same remedy. That is deliberate: a slot the record names can hold
+somebody else's rule by now, and on a NIC that will not answer, "do not
+delete a stranger's rule" and "do not unbind a VF that may still be
+steered into" point the same way.
+
 ## The adopted-reconciliation release gate: what it needs, and when it refuses
 
 A restart over a steered VPP defers its reconciliation (the FIB dump
@@ -515,18 +522,53 @@ being able to prove it still holds *our* rule (`installed_as` is set
 only by a successful steer in this process).
 
 **Try `packetframe reconfigure` first.** `steer` removes what the
-ledger holds and the target no longer wants, so it takes out exactly
-the recorded locations and you identify nothing by eye. Hand-deletion
-is the fallback for the two cases where it will not run: a stopped
-daemon, or no port configured to steer (the health line says which).
+ledger holds and the target no longer wants, so it works from the
+recorded locations rather than from your reading of `ethtool -n`, and
+you identify nothing by eye. Hand-deletion is the fallback for the two
+cases where it will not run: a stopped daemon, or no port configured to
+steer (the health line says which).
 
-It is *not* ownership-safe, and the distinction matters. The delete
-ioctl addresses a **location**, not a rule — neither `reconfigure` nor
-your own `ethtool -N` verifies what is sitting there first. What
-`reconfigure` buys is that the locations come from the record rather
-than from a judgement call, so it cannot touch a slot the ledger never
-claimed. If something replaced our rule at a claimed slot, both routes
-delete it.
+**`reconfigure` will not delete a rule that is not ours; your own
+`ethtool -N` will.** The delete ioctl addresses a **location**, not a
+rule, so the module reads each location back first and deletes it only
+when its `Action` names the VF this module owns. A slot that has been
+taken over by an unrelated classifier rule is left alone, logged, and
+dropped from the record — its traffic is not ours to break. Hand
+deletion verifies nothing, which is why the identification table below
+exists.
+
+The ownership test removal applies is **narrower than the audit's, on
+purpose**: the VF the rule targets, not the whole spec. The two answer
+different questions. The audit asks *is this our rule*, and a wrong
+answer costs a health line. Removal asks *will this still be steering
+into the VF we are about to release*, and a wrong answer there is a
+blackhole — so a rule pointing at our VF comes out even when nothing can
+prove we installed it. What is protected is the rule pointing somewhere
+else.
+
+Note "the VF", not "the cookie": a `ring_cookie` is a VF *and* a queue
+index within it, so `Direct to VF 0` and `Direct to VF 0 queue 3` are
+different cookies naming the same VF. Both come out. If you are reading
+a `warn` line, the cookie it prints is the raw value — the VF is its
+bits 32-39, and `0` there means the PF rather than any VF of ours.
+
+It is a check, not a lock. The read and the delete are two ioctls and
+the ntuple table has no userspace-holdable lock — `ethtool -N` takes
+none either — so a rule written into a slot in the gap between them can
+still be deleted. Nothing available closes that: `ETHTOOL_SRXCLSRLDEL`
+takes a location and no expected value. If you are pushing controller
+config at a box while it tears steering down, expect to reconcile
+afterwards rather than expecting the module to have won the race.
+
+Two consequences worth knowing before you read a log:
+
+- `unsteer` can return OK with rules still in the table. That is not
+  the old "removal was skipped" bug — it means the locations the ledger
+  claimed hold nothing of ours, so the VF is safe to hand back. The
+  `warn` line names each location and the cookie it found.
+- A location the NIC will not answer for (EIO, or a port that has gone
+  admin-down) is a **failure**, not a removal. It stays on the record
+  and the VF is withheld. Nothing is deleted on a guess.
 
 If you must identify by hand, a rule is this module's when **all** of
 these hold, not any one:
@@ -546,7 +588,10 @@ the prefix that was there an hour ago.
 The action alone is not proof either: another rule can target the same
 VF while matching different traffic, and a *narrowed* copy of one of
 ours keeps the cookie. That is why the audit compares the whole spec
-rather than the cookie, and why you should.
+rather than the cookie, and why you should — you are answering "is this
+ours", which is the audit's question, not removal's. Removal is content
+to delete a rule aimed at our VF that it cannot otherwise identify;
+you, deleting by hand while the VF stays bound, have no such excuse.
 
 **A cleaner route for a removed prefix**, if the module is live and
 accepting: put the prefix back, `reconfigure` so the module owns those

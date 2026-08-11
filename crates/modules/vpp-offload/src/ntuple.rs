@@ -29,6 +29,23 @@
 //! configured and no counter names. Refusing whole is the same rule
 //! [`crate::steer::RuleSet::plan`] applies to the budget, enforced here
 //! against the NIC rather than against arithmetic.
+//!
+//! ## Removal reads first, too
+//!
+//! `ETHTOOL_SRXCLSRLDEL` names a **location**, not a rule, and the
+//! ledger's claim on a location can go stale in exactly the way the
+//! audit already documents: an insert at an occupied slot replaces
+//! rather than fails, so a slot this module recorded can hold somebody
+//! else's classifier rule. Deleting by location alone therefore let a
+//! reconfigure or a teardown break traffic belonging to a rule nobody
+//! here installed (review finding).
+//!
+//! So [`NtupleSteering::remove_all`] reads each location back before
+//! it deletes — and the test it applies is deliberately **not** the
+//! audit's. See its doc comment: the audit asks "is this our rule", the
+//! removal asks "will this keep steering into the VF we are about to
+//! release", and the second question has to be answered `yes` for
+//! rules the first would disown.
 
 use crate::steer::{RuleSet, Side, SteerRule};
 
@@ -157,6 +174,34 @@ impl Default for FlowUnion {
 /// which is also why the readback here is not paranoia.
 pub fn ring_cookie(vf_index: u32) -> u64 {
     (u64::from(vf_index) + 1) << 32
+}
+
+/// `ETHTOOL_RX_FLOW_SPEC_RING_VF`, the VF field of a `ring_cookie`.
+const RING_VF_MASK: u64 = 0x0000_00FF_0000_0000;
+/// `ETHTOOL_RX_FLOW_SPEC_RING_VF_OFF`.
+const RING_VF_SHIFT: u32 = 32;
+
+/// The VF a `ring_cookie` names — `ethtool_get_flow_spec_ring_vf()`.
+///
+/// The cookie is two fields, not one number: the VF in bits 32..40 and a
+/// **queue index within that VF** in bits 0..32
+/// (`ETHTOOL_RX_FLOW_SPEC_RING`). Everything this module installs leaves
+/// the queue at zero, so [`ring_cookie`] and the whole cookie agree for
+/// our own rules and comparing the raw `u64` looks right.
+///
+/// It is not right for the question [`NtupleSteering::remove_all`] asks.
+/// A rule steering to *queue 3 of our VF* carries `(vf + 1) << 32 | 3`,
+/// which is not equal to anything we would write — so whole-cookie
+/// equality classified it as somebody else's, left it in place, and let
+/// `unsteer` report the VF safe to release with MCAM still pointing
+/// into it (review finding on this PR). That is the blackhole the
+/// readback was added to prevent, reintroduced by the comparison meant
+/// to prevent it.
+///
+/// Returns the field, so `0` means the PF: VF indices are offset by one
+/// in the cookie, which is what [`ring_cookie`]'s `+ 1` is.
+fn ring_cookie_vf(cookie: u64) -> u64 {
+    (cookie & RING_VF_MASK) >> RING_VF_SHIFT
 }
 
 /// Netmask for a prefix length.
@@ -597,15 +642,27 @@ pub(super) mod sys {
     /// from outside this process does — inserts at an occupied location
     /// replace rather than fail, so the slot stays listed while our
     /// rule is gone.
+    ///
+    /// The cookie is a target that is not ours, which is what makes this
+    /// a stranger's rule to the removal path as well as to the audit.
     pub(crate) fn replace_behind_back(iface: &str, loc: u32) {
+        replace_behind_back_targeting(iface, loc, 0xDEAD_BEEF);
+    }
+
+    /// The same overwrite, with the ring cookie chosen by the caller.
+    ///
+    /// Separate from the audit's concerns entirely: removal keys on the
+    /// cookie, so a foreign rule that happens to steer into the VF this
+    /// module owns is a different case from one that does not, and only
+    /// this can build it.
+    pub(crate) fn replace_behind_back_targeting(iface: &str, loc: u32, cookie: u64) {
         NIC.with(|n| {
             let mut nic = n.borrow_mut();
-            let mut foreign = super::RxFlowSpec {
+            let foreign = super::RxFlowSpec {
                 location: loc,
+                ring_cookie: cookie,
                 ..super::RxFlowSpec::default()
             };
-            // Anything that will not compare equal to ours.
-            foreign.ring_cookie = 0xDEAD_BEEF;
             nic.rules.insert((iface.to_string(), loc), foreign);
         });
     }
@@ -719,6 +776,50 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Read back whatever the NIC holds at `location`.
+///
+/// `Ok(None)` is ENOENT — the driver's answer for a location holding
+/// nothing. Every other error is returned: a read that failed says
+/// nothing about what is there, and the callers must not read it as
+/// "empty".
+fn read_rule(iface: &str, location: u32) -> Result<Option<RxFlowSpec>, String> {
+    let mut req = Rxnfc {
+        cmd: ETHTOOL_GRXCLSRULE,
+        fs: RxFlowSpec {
+            location,
+            ..RxFlowSpec::default()
+        },
+        ..Rxnfc::default()
+    };
+    match sys::ethtool(iface, &mut req) {
+        Ok(()) => Ok(Some(req.fs)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("reading ntuple rule at loc {location}: {e}")),
+    }
+}
+
+/// What a ledger location holds, as far as **removal** is concerned.
+///
+/// Not the same question the audit asks, and the difference is the
+/// point — see [`NtupleSteering::remove_all`].
+enum Occupant {
+    /// Nothing. The removal's postcondition already holds; see
+    /// [`Removal::AlreadyAbsent`], which is the same fact arriving one
+    /// ioctl later.
+    Absent,
+    /// A rule whose `ring_cookie` names the VF this module owns on this
+    /// interface. Ours, or one we cannot recognise that points into our
+    /// VF anyway — and both must come out before the VF is released.
+    IntoOurVf,
+    /// A rule steering somewhere else, on an interface whose VF we know.
+    /// Positive evidence the slot is not ours: our own rule is already
+    /// gone, and this one is a stranger's to keep.
+    Elsewhere(u64),
+    /// Occupied, and nothing here can say by whom — no VF is known for
+    /// this interface, so there is no cookie to compare against.
+    Unattributable,
+}
+
 /// What removing one rule actually did.
 enum Removal {
     Removed,
@@ -731,6 +832,12 @@ enum Removal {
     /// the ledger populated forever — unsteer refused, the VF was
     /// withheld, and the deferred adopted reconciliation waited on an
     /// unsteer that could never be acknowledged (review finding).
+    ///
+    /// [`NtupleSteering::remove_all`] now reads the location first, so
+    /// the wipe usually arrives as [`Occupant::Absent`] instead and this
+    /// is what is left: the rule went away between the two ioctls. Kept
+    /// because `delete` is the only thing that can observe that, and
+    /// because the verdict is the same on both routes.
     ///
     /// ENOENT only. EBUSY, EINVAL and the rest keep failing loudly:
     /// they say nothing about whether a rule is still matching.
@@ -756,6 +863,25 @@ fn delete(iface: &str, location: u32) -> Result<Removal, String> {
 
 /// The real [`crate::runtime::Steering`], replacing the placeholder.
 pub struct NtupleSteering {
+    /// `(PF iface, VF index)` for every PF this module holds a VF on —
+    /// **whatever the steering target says**.
+    ///
+    /// An acquisition fact, not a steering one, and that is the whole
+    /// reason it is separate from `ports`. Removal needs to know which
+    /// VF a location's occupant would have to name to be ours, and it
+    /// needs that most on the port the target has *stopped* steering:
+    /// `bring_up` builds `ports` from the `steer on` ports only, so
+    /// after a restart that turned a port off, `ports` cannot say, and
+    /// `installed_as` — set only by a successful steer in this process —
+    /// is `None`. Removal fell through to deleting by location there,
+    /// which is the blind delete this module just stopped doing,
+    /// surviving in exactly the case the ledger's claim is oldest and
+    /// the rollback path cares most about (review finding on this PR).
+    ///
+    /// Fixed at attach. `reconfigure` accepts only the `steer` flag, so
+    /// the set of PFs and their VFs cannot move under a running module,
+    /// and `retarget` must not touch this.
+    members: Vec<(String, u32)>,
     /// `(PF iface, VF index)` for every port configured `steer on`.
     ///
     /// A list because steering is per-port — it is the canary lever, and
@@ -796,12 +922,58 @@ pub struct NtupleSteering {
 }
 
 impl NtupleSteering {
-    pub fn new(ports: Vec<(String, u32)>, plan: RuleSet) -> Self {
+    /// `members` is every PF this module holds a VF on; `ports` is the
+    /// subset the target steers. A constructor parameter rather than a
+    /// setter because the two production callers are the only things
+    /// that know the acquisition, and a `steering.set_members(..)` one
+    /// of them forgets is precisely how `adopt_installed` shipped with
+    /// no caller at all (#127).
+    pub fn new(members: Vec<(String, u32)>, ports: Vec<(String, u32)>, plan: RuleSet) -> Self {
         Self {
+            members,
             ports,
             plan,
             installed: Vec::new(),
             installed_as: None,
+        }
+    }
+
+    /// The VF this module owns on `iface`, if anything knows.
+    ///
+    /// `members` answers for every acquired port including the ones the
+    /// target does not steer, so it is asked first and is normally the
+    /// only leg that fires. The other two are kept for callers holding
+    /// less than the full acquisition: the steering target, then the
+    /// last successful install. `None` only where nothing knows the
+    /// interface at all.
+    fn vf_for(&self, iface: &str) -> Option<u32> {
+        let found = self
+            .members
+            .iter()
+            .chain(self.ports.iter())
+            .find(|(i, _)| i == iface);
+        if let Some((_, vf)) = found {
+            return Some(*vf);
+        }
+        let (ports, _) = self.installed_as.as_ref()?;
+        ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v)
+    }
+
+    /// Read a ledger location and decide what removal owes it.
+    ///
+    /// The VF **field** of the cookie, not the whole cookie: its low 32
+    /// bits are a queue index within the VF, so a rule aimed at another
+    /// queue of our own VF still has to come out. See [`ring_cookie_vf`].
+    fn occupant(&self, iface: &str, loc: u32) -> Result<Occupant, String> {
+        let Some(got) = read_rule(iface, loc)? else {
+            return Ok(Occupant::Absent);
+        };
+        match self.vf_for(iface) {
+            Some(vf) if ring_cookie_vf(got.ring_cookie) == ring_cookie_vf(ring_cookie(vf)) => {
+                Ok(Occupant::IntoOurVf)
+            }
+            Some(_) => Ok(Occupant::Elsewhere(got.ring_cookie)),
+            None => Ok(Occupant::Unattributable),
         }
     }
 
@@ -815,18 +987,136 @@ impl NtupleSteering {
     /// a later `unsteer` find nothing, and hand back a VF with a live
     /// rule pointing into it.
     ///
+    /// ## Which rules this is entitled to delete
+    ///
+    /// The delete ioctl names a location, and a location the ledger
+    /// names may hold somebody else's rule — an insert at an occupied
+    /// slot replaces rather than fails, which is the same fact
+    /// `missing_from_nic` is careful about. Deleting blind therefore
+    /// broke unrelated traffic on a reconfigure or a teardown, and
+    /// unlike a wrong health line that is not recoverable by reading
+    /// (review finding).
+    ///
+    /// So each location is read back first, and the test is the **VF
+    /// field of the `ring_cookie`** ([`ring_cookie_vf`]), not the whole
+    /// flow spec and not the whole cookie:
+    ///
+    /// - it names our VF → delete. Ours, or a rule we cannot recognise
+    ///   that steers into our VF regardless — and `Ok` from `unsteer`
+    ///   is what releases that VF, so leaving it is the blackhole this
+    ///   routine's contract exists to prevent.
+    /// - it names something else → leave it, and drop the entry. Our
+    ///   rule at that slot is already gone, which is the removal's
+    ///   postcondition; the occupant is a stranger's and its traffic is
+    ///   not ours to break.
+    /// - nothing there → already removed, as before.
+    /// - the read failed for any other reason → a failure, so the entry
+    ///   stays recorded and `unsteer` refuses. Unverifiable is not
+    ///   unconstrained; on a NIC that will not answer, both the "do not
+    ///   delete a stranger's rule" and the "do not release a steered VF"
+    ///   halves point the same way, at the operator.
+    ///
+    /// The cookie rather than [`audit_matches`] because the two answer
+    /// different questions. The audit asks *is this our rule*, and a
+    /// false positive there costs a Degraded line. This asks *will this
+    /// still be steering into the VF we are about to hand back*, and a
+    /// false negative here blackholes traffic — so it must delete
+    /// rules the audit would disown, and refuse only where the cookie
+    /// proves the rule points elsewhere.
+    ///
+    /// ## The window this does not close
+    ///
+    /// The readback and the delete are two ioctls and nothing holds the
+    /// table between them, so a writer that replaces a slot in that gap
+    /// gets its rule deleted on the strength of a check that passed
+    /// against the previous occupant (review finding). There is no fix
+    /// available here, and it is worth writing down why rather than
+    /// leaving the readback looking like a guarantee:
+    /// `ETHTOOL_SRXCLSRLDEL` names a location and carries no expected
+    /// value, so the uapi has no compare-and-delete; `rtnl_lock` makes
+    /// each ioctl atomic but cannot be held across a pair from
+    /// userspace; and the other writers — a UniFi provisioning push, a
+    /// firmware event, an operator's `ethtool -N` — share no lock with
+    /// this process at all.
+    ///
+    /// What it does is shrink that window from *every removal this
+    /// module ever issued* to the microseconds between two syscalls.
+    ///
+    /// The symmetric worry — a rule aimed at our VF appearing at a
+    /// disowned slot just before `unsteer` returns — is not a
+    /// synchronisation problem in here at all. The same writer can
+    /// install the same rule immediately AFTER the last delete, when the
+    /// ledger is empty and the answer has already been given; that
+    /// window is unbounded and no amount of checking inside this routine
+    /// shortens it. What covers it is the teardown ORDERING — steering
+    /// down, VPP killed, VF unbound last — and `detach --all` being
+    /// re-runnable against whatever the NIC holds next.
+    ///
+    /// Where no VF is known for the interface — nothing in `members`,
+    /// the target, or the last install names it — nothing can be proven
+    /// and the location is deleted as this module always has. The
+    /// tradeoff is documented in `docs/runbooks/vpp-offload.md`. Neither
+    /// production caller lands there: both pass every acquired port, so
+    /// a location's occupant is attributable even on a port the target
+    /// has stopped steering, which is the case that most needs it.
+    ///
     /// Returns the failures, formatted for the caller's message.
     fn remove_all(&mut self, victims: Vec<(String, u32)>) -> Vec<String> {
         let mut failed = Vec::new();
         for (iface, loc) in victims {
+            match self.occupant(&iface, loc) {
+                Ok(Occupant::IntoOurVf) => {}
+                Ok(Occupant::Absent) => {
+                    tracing::info!(
+                        iface,
+                        loc,
+                        "ntuple rule was already gone — the controller wipes classifier \
+                         state on provisioning — and absent is what a removal is for, so \
+                         it counts as removed"
+                    );
+                    continue;
+                }
+                Ok(Occupant::Elsewhere(cookie)) => {
+                    // Dropped from the ledger, not merely skipped: it is
+                    // not ours, so it must not go back into the state
+                    // file for a later `detach --all` to find and delete.
+                    tracing::warn!(
+                        iface,
+                        loc,
+                        cookie = format!("{cookie:#x}"),
+                        "a location this ledger names holds a rule steering somewhere \
+                         other than our VF; ours is already gone, so it is left alone \
+                         rather than deleted — removing it would break traffic this \
+                         module never claimed"
+                    );
+                    continue;
+                }
+                Ok(Occupant::Unattributable) => tracing::debug!(
+                    iface,
+                    loc,
+                    "no VF is known for this interface, so the occupant cannot be \
+                     attributed; removing by location, as the ledger recorded it"
+                ),
+                Err(e) => {
+                    // The NIC would not say what is there. Deleting on
+                    // that basis is the blind delete this readback
+                    // exists to end, and reporting success would release
+                    // a VF that may still be steered into.
+                    failed.push(format!("{iface} loc {loc}: {e}"));
+                    self.installed.push((iface, loc));
+                    continue;
+                }
+            }
             match delete(&iface, loc) {
                 Ok(Removal::Removed) => {}
+                // The readback said something was there, so this is the
+                // race rather than the provisioning wipe — but absent is
+                // absent either way.
                 Ok(Removal::AlreadyAbsent) => tracing::info!(
                     iface,
                     loc,
-                    "ntuple rule was already gone — the controller wipes classifier \
-                     state on provisioning — and absent is what a removal is for, so \
-                     it counts as removed"
+                    "ntuple rule went away between the readback and the delete; \
+                     absent is what a removal is for, so it counts as removed"
                 ),
                 Err(e) => {
                     failed.push(format!("{iface} loc {loc}: {e}"));
@@ -1519,7 +1809,7 @@ mod tests {
         // Rules already in the table are excluded, not overwritten —
         // including ones this module did not install.
         sys::set_table_size(FALLBACK_TABLE_SIZE);
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
         s.steer().expect("installs at 15 and 14");
         let after = McamBudget::for_ifaces(["eth0"]).expect("fake NIC answers");
         assert!(
@@ -1539,7 +1829,7 @@ mod tests {
     #[test]
     fn steering_an_empty_plan_is_refused() {
         use crate::runtime::Steering as _;
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
+        let mut s = steering(vec![("eth0".into(), 0)], RuleSet::default());
         let e = s.steer().expect_err("must refuse");
         assert!(e.contains("nothing to steer"), "{e}");
         assert!(s.installed().is_empty());
@@ -1563,7 +1853,7 @@ mod tests {
     fn a_rule_deleted_behind_our_back_is_reported_missing() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("steer installs");
         let installed = s.installed();
         assert!(!installed.is_empty(), "the fixture must install something");
@@ -1604,7 +1894,7 @@ mod tests {
     fn a_location_taken_over_by_another_rule_is_reported_missing() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("steer installs");
         let installed = s.installed();
         assert_eq!(
@@ -1635,7 +1925,7 @@ mod tests {
     fn a_rule_narrowed_behind_our_back_is_reported_missing() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("steer installs");
         let installed = s.installed();
         let (iface, loc) = installed[0].clone();
@@ -1669,8 +1959,7 @@ mod tests {
         sys::reset();
 
         // The previous daemon: installs at the top of the table.
-        let mut before =
-            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         before.steer().expect("first run installs");
         let inherited = before.installed();
         assert!(!inherited.is_empty());
@@ -1691,7 +1980,7 @@ mod tests {
                 r.location
             );
         }
-        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], fresh_plan);
+        let mut after = steering(vec![("eth0".into(), 0)], fresh_plan);
         after.adopt_installed(inherited.clone());
 
         assert_eq!(
@@ -1737,7 +2026,7 @@ mod tests {
     fn one_planned_rule_cannot_account_for_two_locations() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("steer installs");
         let installed = s.installed();
         assert!(
@@ -1779,7 +2068,7 @@ mod tests {
     fn audit_keeps_confirmed_drift_when_a_later_read_fails() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("steer installs");
         let installed = s.installed();
         assert!(installed.len() >= 2);
@@ -1814,7 +2103,7 @@ mod tests {
         // But an audit that proved NOTHING and could not read must fail
         // rather than report a clean NIC it never established.
         sys::reset();
-        let mut s2 = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s2 = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s2.steer().expect("installs");
         let all: Vec<u32> = s2.installed().iter().map(|(_, l)| *l).collect();
         sys::wedge_read(&all);
@@ -1839,7 +2128,7 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
         let plan = plan_for(&[[198, 18, 0, 0]]);
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0), ("eth1".into(), 1)], plan.clone());
+        let mut s = steering(vec![("eth0".into(), 0), ("eth1".into(), 1)], plan.clone());
         s.steer().expect("steer installs on both ports");
         let a = s.missing_from_nic().expect("read the NIC");
         assert_eq!(a.missing, Vec::new());
@@ -1897,7 +2186,7 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
         let both = plan_for(&[[198, 18, 0, 0], [203, 0, 113, 0]]);
-        let mut before = NtupleSteering::new(vec![("eth0".into(), 0)], both);
+        let mut before = steering(vec![("eth0".into(), 0)], both);
         before.steer().expect("installs both prefixes");
         let inherited = before.installed();
 
@@ -1907,7 +2196,7 @@ mod tests {
         let one = plan_for(&[[198, 18, 0, 0]]);
         let owed = inherited.len() - one.rules.len();
         assert!(owed > 0, "the fixture must shrink the target");
-        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], one.clone());
+        let mut after = steering(vec![("eth0".into(), 0)], one.clone());
         after.adopt_installed(inherited.clone());
 
         let a = after.missing_from_nic().expect("read the NIC");
@@ -1928,7 +2217,7 @@ mod tests {
 
         // THE LIVE RECONFIGURE: same shrink, reached by retarget, so the
         // outgoing target is still known. Same verdict.
-        let mut live = NtupleSteering::new(
+        let mut live = steering(
             vec![("eth0".into(), 0)],
             plan_for(&[[198, 18, 0, 0], [203, 0, 113, 0]]),
         );
@@ -1961,14 +2250,14 @@ mod tests {
         const B: [u8; 4] = [203, 0, 113, 0];
         const C: [u8; 4] = [192, 0, 2, 0];
 
-        let mut before = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[A, B]));
+        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[A, B]));
         before.steer().expect("installs A and B");
         let inherited = before.installed();
         let per_prefix = inherited.len() / 2;
         assert!(per_prefix > 0);
 
         // THE RESTART: config now says {B, C}; the NIC holds {A, B}.
-        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[B, C]));
+        let mut after = steering(vec![("eth0".into(), 0)], plan_for(&[B, C]));
         after.adopt_installed(inherited.clone());
 
         let a = after.missing_from_nic().expect("read the NIC");
@@ -1997,7 +2286,7 @@ mod tests {
 
         // THE LIVE RECONFIGURE: same swap through retarget, so the
         // outgoing target is known. Same two facts.
-        let mut live = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[A, B]));
+        let mut live = steering(vec![("eth0".into(), 0)], plan_for(&[A, B]));
         live.adopt_installed(inherited);
         live.retarget(vec![("eth0".into(), 0)], plan_for(&[B, C]));
         let a = live.missing_from_nic().expect("read the NIC");
@@ -2024,7 +2313,7 @@ mod tests {
         const B: [u8; 4] = [203, 0, 113, 0];
         const C: [u8; 4] = [192, 0, 2, 0];
 
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[A]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[A]));
         s.steer()
             .expect("A is installed, and confirmed by readback");
         let installed = s.installed().len();
@@ -2071,7 +2360,7 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
         let plan = plan_for(&[[198, 18, 0, 0]]);
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0), ("eth1".into(), 1)], plan.clone());
+        let mut s = steering(vec![("eth0".into(), 0), ("eth1".into(), 1)], plan.clone());
         s.steer().expect("steer installs on both ports");
         let eth1: Vec<(String, u32)> = s
             .installed()
@@ -2124,8 +2413,7 @@ mod tests {
     fn a_ledger_naming_one_rule_twice_is_read_as_naming_it_once() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut before =
-            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         before.steer().expect("first run installs");
         let inherited = before.installed();
         assert!(inherited.len() >= 2);
@@ -2136,7 +2424,7 @@ mod tests {
         let mut doubled = inherited.clone();
         doubled.extend(inherited.iter().cloned());
 
-        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut after = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         after.adopt_installed(doubled);
         assert_eq!(
             after.installed(),
@@ -2178,8 +2466,7 @@ mod tests {
         sys::reset();
 
         // The previous daemon steered one prefix.
-        let mut before =
-            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         before.steer().expect("first run installs");
         let inherited = before.installed();
         assert!(!inherited.is_empty());
@@ -2192,7 +2479,7 @@ mod tests {
             owed > 0,
             "the fixture must ask for more rules than were inherited"
         );
-        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], grown);
+        let mut after = steering(vec![("eth0".into(), 0)], grown);
         after.adopt_installed(inherited.clone());
 
         let m = audit(&after);
@@ -2236,7 +2523,7 @@ mod tests {
     fn a_wedged_read_is_not_reported_as_an_uninstalled_rule() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("steer installs");
         let installed = s.installed();
         assert!(installed.len() >= 2);
@@ -2264,13 +2551,19 @@ mod tests {
     /// a VF with a live rule still steering traffic into it.
     ///
     /// Both paths now share `remove_all`, so they cannot disagree.
+    ///
+    /// The rules are installed for real rather than adopted onto an
+    /// empty NIC: removal reads each location back first, and a slot
+    /// holding nothing never reaches the delete at all.
     #[test]
     fn a_rule_that_will_not_delete_stays_recorded() {
         use crate::runtime::Steering as _;
         sys::reset();
-        sys::wedge_delete(&[1024, 1025]);
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
-        s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.steer().expect("installs");
+        let locs: Vec<u32> = s.installed().iter().map(|(_, l)| *l).collect();
+        assert_eq!(locs.len(), 2, "the fixture needs two rules");
+        sys::wedge_delete(&locs);
 
         let victims = std::mem::take(&mut s.installed);
         let failed = s.remove_all(victims);
@@ -2289,6 +2582,332 @@ mod tests {
         assert_eq!(s.installed().len(), 2, "still recorded after the refusal");
     }
 
+    /// A stranger's rule at a claimed slot is NOT deleted by `unsteer`.
+    ///
+    /// The removal path addressed a location and asked the NIC nothing,
+    /// while the audit thirty lines away was careful about exactly this:
+    /// an insert at an occupied slot replaces rather than fails, so a
+    /// location the ledger names can hold somebody else's classifier
+    /// rule. Teardown then removed it and broke its traffic — and unlike
+    /// a wrong health line, that is not recoverable by reading (review
+    /// finding).
+    ///
+    /// `unsteer` still returns `Ok`, and that is the point rather than a
+    /// concession: `Ok` releases the VF, and what makes the release safe
+    /// is that nothing at that location steers into the VF. The
+    /// stranger's rule does not.
+    #[test]
+    fn a_stranger_at_a_claimed_slot_survives_unsteer() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let installed = s.installed();
+        assert!(installed.len() >= 2, "the fixture needs two rules");
+
+        let (iface, taken) = installed[0].clone();
+        sys::replace_behind_back(&iface, taken);
+
+        s.unsteer()
+            .expect("nothing of ours is left steering into the VF");
+        assert_eq!(
+            sys::rules(),
+            vec![(iface.clone(), taken)],
+            "the rule that is not ours must still be in the NIC — deleting it \
+             breaks traffic this module never claimed"
+        );
+        assert!(
+            s.installed().is_empty(),
+            "and the ledger must stop claiming a slot that is not ours, or a \
+             later `detach --all` reads the record and deletes it after all"
+        );
+    }
+
+    /// The same protection on `steer`'s stale removal — the reconfigure
+    /// path, which is what the runbook sends an operator to first.
+    #[test]
+    fn a_stranger_at_a_stale_slot_survives_a_reconfigure() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = steering(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
+        );
+        s.steer().expect("installs four");
+        assert_eq!(sys::rules().len(), 4);
+
+        // Down to one prefix: 13 and 12 are stale. Somebody else takes 13
+        // while the daemon is not looking.
+        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        sys::replace_behind_back("eth0", 13);
+        s.steer().expect("reconciles");
+
+        assert!(
+            sys::rules().contains(&("eth0".to_string(), 13)),
+            "the stale slot held a rule that was not ours, and a reconfigure \
+             must not remove it: {:?}",
+            sys::rules()
+        );
+        assert!(
+            !sys::rules().contains(&("eth0".to_string(), 12)),
+            "while the stale rule that really was ours still comes out: {:?}",
+            sys::rules()
+        );
+        let mut ledger = s.installed();
+        ledger.sort();
+        assert_eq!(
+            ledger,
+            vec![("eth0".to_string(), 14), ("eth0".to_string(), 15)],
+            "and the ledger names the new target only"
+        );
+    }
+
+    /// A rule we do NOT recognise that steers into our VF still comes out.
+    ///
+    /// This is why removal keys on the ring cookie rather than on
+    /// `audit_matches`: the audit would disown this rule, and disowning
+    /// it here would hand back a VF with MCAM still pointing into it —
+    /// the blackhole `remove_all`'s contract exists to prevent, reached
+    /// through the ownership check meant to make removal safer.
+    #[test]
+    fn a_rule_into_our_vf_comes_out_even_when_it_is_not_recognisable() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let (iface, taken) = s.installed()[0].clone();
+
+        // Our slot, our VF, a match nothing here would have asked for.
+        sys::replace_behind_back_targeting(&iface, taken, ring_cookie(0));
+
+        s.unsteer().expect("removes");
+        assert!(
+            sys::rules().is_empty(),
+            "a rule steering into the VF must not survive the VF's release, \
+             whether or not we can prove we installed it: {:?}",
+            sys::rules()
+        );
+        assert!(s.installed().is_empty());
+    }
+
+    /// A restart keeps the protection: the reference removal needs is the
+    /// VF, and that comes from the config rather than from the state file.
+    ///
+    /// The state file records locations and nothing about what they hold,
+    /// so `installed_as` is `None` here and no content comparison is
+    /// available — which is precisely the case where the ledger's claim
+    /// is least trustworthy, because it has survived a window in which
+    /// this module was not running.
+    #[test]
+    fn an_adopted_ledger_still_leaves_a_stranger_alone() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("the previous process installs");
+        let inherited = before.installed();
+        assert!(!inherited.is_empty());
+
+        let mut after = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        after.adopt_installed(inherited.clone());
+        assert!(
+            after.installed_as.is_none(),
+            "the fixture must reproduce the restart: nothing to compare a \
+             readback against"
+        );
+
+        let (iface, taken) = inherited[0].clone();
+        sys::replace_behind_back(&iface, taken);
+
+        after
+            .unsteer()
+            .expect("ours are gone; the VF is safe to release");
+        assert_eq!(
+            sys::rules(),
+            vec![(iface, taken)],
+            "the stranger's rule survives an adopted teardown too: {:?}",
+            sys::rules()
+        );
+    }
+
+    /// A location the NIC will not describe is not deleted on a guess.
+    ///
+    /// Both halves of the removal contract point the same way here — do
+    /// not delete a rule that may not be ours, and do not report a VF
+    /// safe to release — so this fails loudly and the entry stays
+    /// recorded. The cost is a teardown that needs an operator; the
+    /// alternative is the blind delete the readback exists to end.
+    #[test]
+    fn a_location_that_cannot_be_read_is_not_deleted_blind() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let installed = s.installed();
+        assert!(installed.len() >= 2);
+        let (iface, wedged) = installed[0].clone();
+
+        sys::wedge_read(&[wedged]);
+
+        let e = s
+            .unsteer()
+            .expect_err("an unreadable location is not a removed one");
+        assert!(
+            e.contains(&wedged.to_string()),
+            "the refusal must name the location an operator has to settle: {e}"
+        );
+        assert_eq!(
+            sys::rules(),
+            vec![(iface.clone(), wedged)],
+            "the unreadable rule is untouched, and every readable one came out"
+        );
+        assert_eq!(
+            s.installed(),
+            vec![(iface, wedged)],
+            "and it stays on the record, or nothing can ever remove it"
+        );
+    }
+
+    /// A rule aimed at another QUEUE of our VF still comes out.
+    ///
+    /// The cookie is two fields — VF in bits 32..40, queue index in bits
+    /// 0..32 — and everything this module installs leaves the queue at
+    /// zero, so comparing the whole `u64` agrees with the VF field for
+    /// our own rules and looks correct. It is not: `vf 0 queue 3` reads
+    /// as somebody else's target, so the rule was left in place and
+    /// `unsteer` reported the VF safe to release with MCAM still
+    /// pointing into it — the blackhole the readback was added to
+    /// prevent, arriving through the ownership check that prevents it
+    /// (review finding on this PR).
+    #[test]
+    fn a_rule_on_another_queue_of_our_vf_still_comes_out() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let (iface, taken) = s.installed()[0].clone();
+
+        // Our VF, queue 3 — a cookie nothing here would ever write.
+        let other_queue = ring_cookie(0) | 3;
+        assert_ne!(
+            other_queue,
+            ring_cookie(0),
+            "the fixture must differ from ours"
+        );
+        assert_eq!(
+            ring_cookie_vf(other_queue),
+            ring_cookie_vf(ring_cookie(0)),
+            "and must still name our VF, or it tests nothing"
+        );
+        sys::replace_behind_back_targeting(&iface, taken, other_queue);
+
+        s.unsteer().expect("removes");
+        assert!(
+            sys::rules().is_empty(),
+            "anything steering into the VF must be gone before the VF is \
+             released, whichever of its queues it names: {:?}",
+            sys::rules()
+        );
+    }
+
+    /// The VF field is what identifies the target, and `0` is the PF.
+    #[test]
+    fn the_cookie_splits_into_a_vf_and_a_queue() {
+        assert_eq!(ring_cookie_vf(ring_cookie(0)), 1, "VF 0 is field 1");
+        assert_eq!(ring_cookie_vf(ring_cookie(1)), 2);
+        // A queue index in the low half does not change the VF.
+        assert_eq!(ring_cookie_vf(ring_cookie(0) | 0xFFFF_FFFF), 1);
+        // The PF's own queues carry VF field 0, which is no VF of ours.
+        assert_eq!(ring_cookie_vf(0), 0);
+        assert_eq!(ring_cookie_vf(7), 0);
+    }
+
+    /// A port turned `steer off` ACROSS A RESTART still knows its VF.
+    ///
+    /// The hardest case for ownership and the one the rollback path
+    /// depends on: `bring_up` builds the steering target from the
+    /// `steer on` ports only, and `installed_as` is set solely by a
+    /// successful steer in this process — so after a restart that turned
+    /// a port off, neither can say which VF the port's inherited rules
+    /// would have to name. Removal fell through to deleting by location,
+    /// which is the blind delete this all exists to end, surviving in
+    /// the case where the ledger's claim has been unattended longest
+    /// (review finding on this PR).
+    ///
+    /// `members` answers it, because it is an acquisition fact rather
+    /// than a steering one.
+    #[test]
+    fn a_steer_off_port_after_a_restart_can_still_attribute_its_slots() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_for(&[[198, 18, 0, 0]]);
+        let mut before = steering(vec![("eth0".into(), 0), ("eth1".into(), 0)], plan.clone());
+        before
+            .steer()
+            .expect("the previous process steers both ports");
+        let inherited = before.installed();
+        let eth1: Vec<(String, u32)> = inherited
+            .iter()
+            .filter(|(i, _)| i == "eth1")
+            .cloned()
+            .collect();
+        assert!(eth1.len() >= 2, "the fixture needs two rules on eth1");
+
+        // The restart: eth1 is now `steer off`, so it is a member but
+        // not a steering target, and nothing was installed this process.
+        let mut after = NtupleSteering::new(
+            vec![("eth0".into(), 0), ("eth1".into(), 0)],
+            vec![("eth0".into(), 0)],
+            plan,
+        );
+        after.adopt_installed(inherited);
+        assert!(
+            after.installed_as.is_none(),
+            "the fixture must be a restart"
+        );
+
+        // Somebody took one of eth1's slots while the daemon was down.
+        let (iface, taken) = eth1[0].clone();
+        sys::replace_behind_back(&iface, taken);
+        let (_, ours) = eth1[1].clone();
+
+        after.unsteer().expect("ours come out");
+        assert!(
+            sys::rules().contains(&(iface.clone(), taken)),
+            "the rule that is not ours must survive a rollback teardown on a \
+             port we no longer steer: {:?}",
+            sys::rules()
+        );
+        assert!(
+            !sys::rules().contains(&(iface, ours)),
+            "while the inherited rule that IS ours still comes out: {:?}",
+            sys::rules()
+        );
+    }
+
+    /// With no VF known for the interface, removal is by location, as it
+    /// always was.
+    ///
+    /// Nothing can attribute the occupant — there is no cookie to compare
+    /// against — and the entry is in the ledger because this module put
+    /// it there. `packetframe detach --all` used to arrive here; it now
+    /// passes the state file's ports, so this is the residual case and
+    /// the tradeoff is documented rather than silent.
+    #[test]
+    fn a_ledger_entry_with_no_known_vf_is_removed_by_location() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("installs");
+        let inherited = before.installed();
+
+        // No ports at all: the shape a caller with only a location list has.
+        let mut blind = NtupleSteering::new(Vec::new(), Vec::new(), RuleSet::default());
+        blind.adopt_installed(inherited);
+        blind.unsteer().expect("removes what the ledger names");
+        assert!(sys::rules().is_empty());
+        assert!(blind.installed().is_empty());
+    }
+
     /// Rules the controller wiped behind the ledger's back are already
     /// unsteered — `unsteer` must say so, not fail. The failing version
     /// wedged the whole adopted pipeline: the ledger stayed populated,
@@ -2299,7 +2918,7 @@ mod tests {
     fn vanished_rules_count_as_removed_not_as_failures() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
+        let mut s = steering(vec![("eth0".into(), 0)], RuleSet::default());
         // The state file remembers two rules; the NIC holds neither.
         s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
 
@@ -2325,7 +2944,7 @@ mod tests {
             prefix_len: 24,
         }];
         let plan = RuleSet::plan(&allow, McamBudget::default()).expect("fits");
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan);
+        let mut s = steering(vec![("eth0".into(), 0)], plan);
         assert!(
             s.installed().is_empty(),
             "a fresh object has installed nothing"
@@ -2356,6 +2975,15 @@ mod tests {
         a.missing
     }
 
+    /// A steering object whose members and steering target are the same
+    /// set — the ordinary case, where every acquired port is steered.
+    ///
+    /// The cases that differ pass the two lists explicitly, because that
+    /// difference is the thing under test.
+    fn steering(ports: Vec<(String, u32)>, plan: RuleSet) -> NtupleSteering {
+        NtupleSteering::new(ports.clone(), ports, plan)
+    }
+
     fn plan_for(prefixes: &[[u8; 4]]) -> RuleSet {
         let allow: Vec<IpPrefix> = prefixes
             .iter()
@@ -2377,7 +3005,7 @@ mod tests {
     fn a_steer_installs_the_plan_and_an_unsteer_removes_all_of_it() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
 
         s.steer().expect("installs");
         assert_eq!(
@@ -2416,7 +3044,7 @@ mod tests {
     fn re_asserting_steering_records_each_slot_once() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
 
         s.steer().expect("first");
         s.steer()
@@ -2442,7 +3070,7 @@ mod tests {
     fn a_retarget_leaves_only_the_new_rules() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(
+        let mut s = steering(
             vec![("eth0".into(), 0)],
             plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
         );
@@ -2474,7 +3102,7 @@ mod tests {
     fn a_retarget_that_cannot_clear_the_old_rules_installs_nothing() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let mut s = NtupleSteering::new(
+        let mut s = steering(
             vec![("eth0".into(), 0)],
             plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
         );
@@ -2507,7 +3135,7 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
         sys::wedge_insert(&[12]);
-        let mut s = NtupleSteering::new(
+        let mut s = steering(
             vec![("eth0".into(), 0)],
             plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
         );
