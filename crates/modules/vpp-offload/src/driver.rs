@@ -123,7 +123,8 @@ pub trait Observe {
     /// Send a ping and read its reply.
     fn ping(&mut self) -> Result<(), String>;
 
-    /// Whether a steer would get past the module's own gates right now.
+    /// Whether the module has any reason of its own to refuse or defer
+    /// a steer right now.
     ///
     /// Read only when a wanted steer is missing (see
     /// [`Supervisor::steer_retry_pending`]) and only as often as
@@ -131,12 +132,20 @@ pub trait Observe {
     /// but not an ioctl.
     ///
     /// It must answer for **every** gate the steer path applies, or the
-    /// retry becomes a way around one of them. Both refuse for the same
+    /// retry becomes a way around one of them. Two refuse for the same
     /// reason from opposite ends: the completeness verdict says the
     /// route mirror is not yet the table, and the ledger's counts say
     /// what we hold has not all reached VPP. Diverting traffic on either
     /// blackholes exactly the prefixes that are missing, and a steered
     /// miss is dropped rather than falling through to the eBPF tier.
+    ///
+    /// And one thing that is not a gate at all but disqualifies the
+    /// moment just as thoroughly: a source backlog. Neither gate can
+    /// see changes the engine has not pulled yet — the ledger has not
+    /// classified them and the mirror already counts them — so the
+    /// implementation owes that check too. The driver's own
+    /// `Drain::Idle` proof does not cover it either; see
+    /// `Driver::poll_steer_retry`.
     fn steer_permitted(&mut self) -> bool;
 
     /// Drain **one bounded batch** of pending routes.

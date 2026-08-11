@@ -1319,6 +1319,36 @@ impl Core {
             .map(|h| h.verdict())
     }
 
+    /// Whether the source has handed over everything it holds.
+    ///
+    /// Not a gate the steer path applies — it is the thing neither gate
+    /// can see. `Drain::Idle` is the ENGINE's pending map going empty,
+    /// which is weaker than it looks: `drain_batch` pulls at most
+    /// `DELTA_BATCH` and sends at most `DRAIN_BATCH`, and the two are
+    /// the same number, so one tick can pull 4096, send all 4096, and
+    /// report idle with the feed still holding the rest of a burst. A
+    /// reload is hundreds of thousands.
+    ///
+    /// The ledger has not classified those changes, so nothing is
+    /// `installing`; completeness compares bird against the MIRROR,
+    /// which the tee already updated, so a burst of route UPDATES keeps
+    /// the count identical and the verdict converged. Everything reads
+    /// healthy while VPP is tens of thousands of changes behind, and
+    /// steering there blackholes every prefix in the gap —
+    /// `RouteSource::backlog`'s own doc calls it "an unexplained gap
+    /// between what bird advertises and what VPP holds" (review
+    /// finding, PR #160).
+    ///
+    /// Carries the empty-target exception like the other two, and the
+    /// history is the argument for keeping it that way: this predicate
+    /// was added AFTER the exception was pushed down into each gate, on
+    /// the reasoning that a later one could otherwise land on the wrong
+    /// side of a shared early return. It did exactly that on the first
+    /// attempt — a backlog held back a reconcile that only removes.
+    fn source_current(&self) -> bool {
+        !self.steer_diverts_traffic() || self.source.backlog() == 0
+    }
+
     /// Whether the FIB itself is fit to take traffic.
     ///
     /// The second gate, and the one that is easy to forget: `steer` does
@@ -1398,7 +1428,9 @@ impl Observe for ObserveView {
         // a `steer off`'s reconcile-to-empty from `Ready`, and asking a
         // stricter question here than the one `steer` answers is how a
         // retry ends up either refusing forever or asking forever.
-        c.steer_verdict().is_none_or(|v| v.permits_steering()) && c.fib_fit_to_steer()
+        c.source_current()
+            && c.steer_verdict().is_none_or(|v| v.permits_steering())
+            && c.fib_fit_to_steer()
     }
 
     fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, String> {
@@ -2819,6 +2851,84 @@ mod tests {
         assert!(
             obs.steer_permitted(),
             "the retry asked a stricter question than the steer it drives"
+        );
+    }
+
+    /// A source still holding changes disqualifies the moment, however
+    /// clean everything else looks.
+    ///
+    /// The engine's pending map going empty is not the same statement:
+    /// `drain_batch` pulls at most `DELTA_BATCH` and sends at most
+    /// `DRAIN_BATCH`, and they are the same number, so one tick can pull
+    /// 4096, send all 4096, and report `Drain::Idle` with the feed still
+    /// holding the rest of a reload. Neither gate sees it — the ledger
+    /// has not classified those changes, and completeness compares bird
+    /// against the mirror the tee already updated, so a burst of route
+    /// UPDATES keeps the count identical and the verdict converged.
+    /// Everything reads healthy while VPP is tens of thousands of
+    /// changes behind (review finding, PR #160).
+    #[test]
+    fn a_source_backlog_defers_the_retry() {
+        struct Backlogged(std::cell::Cell<u64>);
+        impl RouteSource for Backlogged {
+            fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+            fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+            fn route_count(&self) -> u64 {
+                0
+            }
+            fn change_seq(&self) -> u64 {
+                0
+            }
+            fn backlog(&self) -> u64 {
+                self.0.get()
+            }
+        }
+
+        // Everything else is as permissive as it gets: no completeness
+        // handle, an empty ledger, a target that asks for a port.
+        let rt = Runtime::new(
+            engine(),
+            Box::new(Backlogged(std::cell::Cell::new(4_096))),
+            Box::new(LedgerSteering {
+                configured: 1,
+                ..Default::default()
+            }),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        {
+            let (mut obs, _) = rt.views();
+            assert!(
+                !obs.steer_permitted(),
+                "changes the engine has not pulled are invisible to both gates, and \
+                 steering over them blackholes every prefix in the backlog"
+            );
+        }
+        // Drained: the same moment is fine.
+        rt.core.borrow_mut().source = Box::new(Backlogged(std::cell::Cell::new(0)));
+        {
+            let (mut obs, _) = rt.views();
+            assert!(obs.steer_permitted());
+        }
+
+        // ...but a backlog must NOT hold back a reconcile to an empty
+        // target, for the same reason neither gate does: that steer only
+        // removes rules, and changes still queued for a table it is
+        // taking traffic OFF are no argument for leaving it steered.
+        // This predicate was added after the exception was pushed down
+        // into each gate, and got this wrong on the first attempt.
+        rt.core.borrow_mut().source = Box::new(Backlogged(std::cell::Cell::new(4_096)));
+        rt.core.borrow_mut().steering = Box::new(LedgerSteering {
+            configured: 0,
+            ..Default::default()
+        });
+        let (mut obs, _) = rt.views();
+        assert!(
+            obs.steer_permitted(),
+            "a backlog is a reason not to divert traffic INTO VPP, not a reason to \
+             leave a rollback unfinished"
         );
     }
 
