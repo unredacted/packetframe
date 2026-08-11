@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use crate::process::Disposition;
+use crate::runtime::SteerOutcome;
 use crate::supervisor::{Action, Event};
 
 /// Everything the executor does to the world outside itself.
@@ -43,13 +44,15 @@ pub trait Effects {
     /// Remove MCAM steering rules. First in any teardown.
     fn unsteer(&mut self) -> Result<(), String>;
 
-    /// Install MCAM steering rules.
-    fn steer(&mut self) -> Result<(), String>;
+    /// Reconcile MCAM steering rules to the current target. `Ok` says
+    /// which side of the tier boundary that left the traffic on — see
+    /// [`SteerOutcome`].
+    fn steer(&mut self) -> Result<SteerOutcome, String>;
 
     /// Re-install steering for the intact adoptee, bypassing the
     /// completeness gate — see [`Action::RestoreSteer`] for why the
     /// gate inverts on this one path.
-    fn restore_steer(&mut self) -> Result<(), String>;
+    fn restore_steer(&mut self) -> Result<SteerOutcome, String>;
 
     /// Whether the steering ledger currently names any rule in the NIC.
     ///
@@ -192,12 +195,24 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                 }
             }
             Action::RestoreSteer => out.events.push(match fx.restore_steer() {
-                Ok(()) => {
+                Ok(SteerOutcome::Steered) => {
                     tracing::info!(
                         "steering RESTORED: the adopted VPP's intact FIB takes the traffic \
                          back while the fallback is not ready"
                     );
                     Event::Steered
+                }
+                // The config stopped asking for this port between the
+                // adoption and the revocation. Nothing to restore, and
+                // the reconcile has cleared the adoptee's inherited
+                // rules — which is the outcome, not a failure to
+                // produce the other one.
+                Ok(SteerOutcome::NothingToSteer) => {
+                    tracing::info!(
+                        "steering DOWN: no port is configured to steer, so the restore \
+                         removed the adopted rules instead of re-installing them"
+                    );
+                    Event::NothingToSteer
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -212,7 +227,7 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                 }
             }),
             Action::Steer => out.events.push(match fx.steer() {
-                Ok(()) => {
+                Ok(SteerOutcome::Steered) => {
                     // The one action that moves customer traffic between
                     // forwarding tiers. It had no log line at all until
                     // a shadow run came up steered with nothing in the
@@ -224,6 +239,21 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                          tier remains the failover)"
                     );
                     Event::Steered
+                }
+                // A reconcile whose target asks for nothing. It is a
+                // SUCCESS and it moves traffic the other way, so it
+                // gets the acknowledgement that says so rather than
+                // `Event::Steered` — which would report an offload
+                // carrying traffic it had just stopped carrying — or an
+                // error, which is what left a refused `steer off`
+                // retrying a no-op while its rules kept diverting.
+                Ok(SteerOutcome::NothingToSteer) => {
+                    tracing::info!(
+                        "steering DOWN: no port is configured to steer, so the reconcile \
+                         removed what was left and installed nothing; traffic is on the \
+                         eBPF fast-path tier"
+                    );
+                    Event::NothingToSteer
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -279,6 +309,23 @@ mod tests {
         kill_disposition: Option<Disposition>,
         /// What the steering ledger reports after a failed steer.
         rules_remain: bool,
+        /// The target asks for no port, so a reconcile installs nothing
+        /// and removes whatever is left. Separate from `fail_steer`
+        /// because it is a SUCCESS that moves traffic the other way.
+        empty_target: bool,
+    }
+
+    impl Recorder {
+        fn steer_result(&self) -> Result<SteerOutcome, String> {
+            if self.fail_steer {
+                return Err("no free MCAM loc".into());
+            }
+            Ok(if self.empty_target {
+                SteerOutcome::NothingToSteer
+            } else {
+                SteerOutcome::Steered
+            })
+        }
     }
 
     impl Effects for Recorder {
@@ -294,13 +341,13 @@ mod tests {
             self.calls.push("unsteer");
             err_if(self.fail_unsteer, "ioctl refused")
         }
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
-            err_if(self.fail_steer, "no free MCAM loc")
+            self.steer_result()
         }
-        fn restore_steer(&mut self) -> Result<(), String> {
+        fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
-            err_if(self.fail_steer, "no free MCAM loc")
+            self.steer_result()
         }
         fn kill(&mut self) -> Disposition {
             self.calls.push("kill");
@@ -500,6 +547,35 @@ mod tests {
         let mut r = Recorder::default();
         let out = execute(&[Action::Steer], &mut r);
         assert_eq!(out.events, vec![Event::Steered]);
+    }
+
+    /// A reconcile against a target that asks for nothing is a success
+    /// that moves traffic the OTHER way, and the acknowledgement has to
+    /// say which way.
+    ///
+    /// `Event::Steered` here would report an offload carrying traffic
+    /// the reconcile had just stopped carrying — and would set
+    /// `steered`, withholding the VF for rules that are no longer
+    /// there. The seam is the only place the distinction can be made:
+    /// by the time the supervisor sees an event, the outcome is a word.
+    #[test]
+    fn a_reconcile_to_an_empty_target_reports_nothing_to_steer() {
+        for action in [Action::Steer, Action::RestoreSteer] {
+            let mut r = Recorder {
+                empty_target: true,
+                ..Default::default()
+            };
+            let out = execute(&[action], &mut r);
+            assert_eq!(out.events, vec![Event::NothingToSteer], "{action:?}");
+            assert!(
+                !out.events.contains(&Event::Steered),
+                "{action:?}: nothing was steered"
+            );
+            assert!(
+                out.ok(),
+                "{action:?}: a reconcile that succeeded is not a failure"
+            );
+        }
     }
 
     /// A deterministic pipeline failure must not be left for the phase

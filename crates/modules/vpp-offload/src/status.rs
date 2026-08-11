@@ -799,21 +799,29 @@ impl StatusSnapshot {
              -N <iface> delete <loc>` removes a rule by hand"
                 .to_string()
         } else if !self.steer_configured {
-            // A convergence is coming and it will NOT clear these.
-            // `VerifyPassed` re-steers while `steered || steer_wanted`,
-            // and a refused `unsteer` deliberately keeps `steered` true
-            // — but `steer` refuses an empty target before reaching its
-            // stale-rule removal, also deliberately, because `Ok` there
-            // becomes `Event::Steered` and would report an offload
-            // carrying traffic it never saw. So a `steer off` whose
-            // removal failed retries that refusal on every convergence
-            // while the rules keep diverting traffic. The product gap is
-            // filed; what this line must not do is promise a repair that
-            // cannot happen (review finding).
-            "no port is configured to steer, so convergence cannot clear these — `steer` \
-             refuses an empty target rather than report an offload it never installed. \
-             Remove them with `ethtool -N <iface> delete <loc>`; `packetframe detach \
-             --all` also retries the teardown, but refuses while this daemon is running"
+            // A convergence DOES clear these, and for a while it did
+            // not. `VerifyPassed` re-steers while `steered ||
+            // steer_wanted`, and a refused `unsteer` deliberately keeps
+            // `steered` true — so a `steer off` whose removal the NIC
+            // declined re-emitted `Action::Steer` on every convergence.
+            // `steer` used to refuse an empty target outright, before
+            // reaching its stale-rule removal, because `Ok` had no way
+            // to say "nothing is steered" and would have become
+            // `Event::Steered`. The refusal repeated forever while the
+            // rules kept diverting. `SteerOutcome::NothingToSteer` is
+            // the vocabulary that was missing; the reconcile now removes
+            // them and the module retires the want.
+            //
+            // The manual removals stay named anyway. This arm is also
+            // reached from `Backoff`, where the next convergence is
+            // however long the exponential schedule says, and a stray
+            // rule is diverting traffic into a VF whose VPP is not
+            // running — that is not something to wait out.
+            "no port is configured to steer, so the next convergence reconciles the NIC to \
+             an empty target and removes these. Do not wait for it if VPP is not \
+             forwarding: `ethtool -N <iface> delete <loc>` removes a rule now, and \
+             `packetframe detach --all` retries the whole teardown once this daemon has \
+             exited"
                 .to_string()
         } else {
             // A convergence is in flight or is coming (`Backoff` has no
@@ -1501,21 +1509,23 @@ mod tests {
                          must offer exactly the remedy this situation admits. \
                          `reconfigure` is refused outside Ready/Steered; a stopped \
                          daemon reconciles nothing; and with no port configured to \
-                         steer, `steer` refuses the empty target before it would clear \
-                         the leftovers, so convergence cannot fix it either: {msg}"
+                         steer, the convergence reconciles to an empty target, which \
+                         is a different promise from the one the general arm makes: \
+                         {msg}"
                     );
                 }
-                // The two cannot-self-repair arms must name a command
-                // that works from where they are. `loader::detach`
-                // refuses while a `packetframe run` daemon is live, and
-                // this arm is only reachable with the module running —
-                // so it has to lead with the deletion that works.
+                // This arm names a convergence, but it is reached from
+                // `Backoff` too — where the next one is however long
+                // the exponential schedule says, and VPP is not
+                // forwarding meanwhile. So it must ALSO name a removal
+                // that works right now, and must not point at `detach`
+                // without saying that a live daemon refuses it.
                 if expected == "no port is configured to steer" {
                     assert!(
-                        msg.contains("refuses while this daemon is running")
-                            && msg.contains("ethtool -N"),
-                        "state {state:?}: reachable only under a live daemon, where \
-                         `detach` is refused outright: {msg}"
+                        msg.contains("ethtool -N") && msg.contains("once this daemon has exited"),
+                        "state {state:?}: waiting out a convergence is not always an \
+                         option here, and `loader::detach` is refused while this \
+                         daemon holds the bpf_link FDs: {msg}"
                     );
                 }
             }

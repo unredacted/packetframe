@@ -30,6 +30,7 @@
 //! [`crate::steer::RuleSet::plan`] applies to the budget, enforced here
 //! against the NIC rather than against arithmetic.
 
+use crate::runtime::SteerOutcome;
 use crate::steer::{RuleSet, Side, SteerRule};
 
 /// `ETHTOOL_SRXCLSRLINS` — insert a classifier rule.
@@ -947,8 +948,27 @@ impl crate::runtime::Steering for NtupleSteering {
         self.ports.len()
     }
 
-    fn steer(&mut self) -> Result<(), String> {
-        if self.plan.rules.is_empty() {
+    fn steer(&mut self) -> Result<SteerOutcome, String> {
+        // Two ways to have nothing to install, and they are opposite
+        // events.
+        //
+        // No PORT is the operator's answer: every port is `steer off`,
+        // so the reconcile below removes whatever the previous target
+        // left and reports `NothingToSteer` — the NIC holds nothing and
+        // nothing is wanted. Refusing instead is what made the rollback
+        // unrecoverable: an `unsteer` the NIC declines leaves rules in
+        // `installed` and `steered` true, every later convergence
+        // re-emits `Action::Steer`, and a refusal here returns before
+        // the stale-rule removal that is the only thing that could
+        // clear them.
+        //
+        // Ports but no RULES is a fault, and still refuses. Somebody
+        // asked for a port to divert traffic and the allowlist or the
+        // MCAM budget produced nothing to divert it with; reporting
+        // that as a clean "nothing steered" would retire the want and
+        // hide a broken allowlist behind the same line a deliberate
+        // `steer off` prints.
+        if !self.ports.is_empty() && self.plan.rules.is_empty() {
             return Err(
                 "nothing to steer: the allowlist produced no rules for this NIC (see \
                  `packetframe feasibility`, capability `vpp.steering.budget`)"
@@ -1032,7 +1052,19 @@ impl crate::runtime::Steering for NtupleSteering {
         // that is what made a second refused reconfigure disown rules
         // that were really there.
         self.installed_as = Some((self.ports.clone(), self.plan.clone()));
-        Ok(())
+        // From the LEDGER, not from `ports.is_empty()`. The ledger is
+        // the postcondition the caller acts on — it is what
+        // `steering_in_place` reads and what the state file records —
+        // and every path that could leave it holding a rule under an
+        // empty target has already returned `Err` above. Saying
+        // "nothing is steered" while a location this object installed
+        // is still in the NIC is the one lie the release rules cannot
+        // survive.
+        Ok(if self.installed.is_empty() {
+            SteerOutcome::NothingToSteer
+        } else {
+            SteerOutcome::Steered
+        })
     }
 
     fn unsteer(&mut self) -> Result<(), String> {
@@ -1530,19 +1562,100 @@ mod tests {
         assert_eq!(after.free.first(), Some(&13), "the next free one is next");
     }
 
-    /// A plan with no rules refuses rather than reporting success.
+    /// A CONFIGURED port with no rules to install refuses rather than
+    /// reporting success.
     ///
-    /// `Ok` from `steer` becomes `Event::Steered`, which is what tells
-    /// the supervisor traffic is diverted — so a no-op that returned
-    /// `Ok` would put the module in `Steered` with nothing steered, and
-    /// health would report the offload carrying traffic it never saw.
+    /// Somebody asked for this port to divert traffic and the allowlist
+    /// or the MCAM budget produced nothing to divert it with. Neither
+    /// `Ok` answers that: `SteerOutcome::Steered` becomes
+    /// `Event::Steered` and puts the module in `Steered` with nothing
+    /// steered, so health reports the offload carrying traffic it never
+    /// saw; `SteerOutcome::NothingToSteer` retires the want and prints
+    /// the line a deliberate `steer off` prints, hiding a broken
+    /// allowlist behind it.
+    ///
+    /// The port list is what makes this the fault case — see
+    /// [`a_reconcile_to_an_empty_target_clears_the_nic_and_says_so`] for
+    /// the other emptiness, which is the operator's answer and not a
+    /// fault.
     #[test]
-    fn steering_an_empty_plan_is_refused() {
+    fn steering_a_configured_port_with_no_rules_is_refused() {
         use crate::runtime::Steering as _;
         let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
         let e = s.steer().expect_err("must refuse");
         assert!(e.contains("nothing to steer"), "{e}");
         assert!(s.installed().is_empty());
+    }
+
+    /// The other emptiness: no port asks to steer, so the reconcile
+    /// removes what a previous target left and reports that it holds
+    /// nothing.
+    ///
+    /// `steer` is a reconcile, and an empty target is a legitimate
+    /// thing to reconcile to — it is where `steer off` lands. Refusing
+    /// it returned before the stale-rule removal, which is the only
+    /// thing that could clear the leftovers, so the rules a refused
+    /// `unsteer` had left in the NIC could never come out on their own.
+    #[test]
+    fn a_reconcile_to_an_empty_target_clears_the_nic_and_says_so() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        assert_eq!(
+            s.steer().expect("installs"),
+            SteerOutcome::Steered,
+            "rules in the NIC is the other outcome, and the two must not be confusable"
+        );
+        assert!(
+            !s.installed().is_empty(),
+            "the fixture must install something"
+        );
+
+        // Every port `steer off`.
+        s.retarget(Vec::new(), RuleSet::default());
+        assert_eq!(
+            s.steer()
+                .expect("an empty target is reconcilable, not a fault"),
+            SteerOutcome::NothingToSteer
+        );
+        assert!(s.installed().is_empty(), "the ledger must be empty too");
+        assert!(
+            sys::rule_table("eth0")
+                .expect("the fake answers")
+                .occupied
+                .is_empty(),
+            "the rules must be gone from the NIC, not merely forgotten by the ledger"
+        );
+    }
+
+    /// A rule the NIC will not delete still refuses, even under an
+    /// empty target.
+    ///
+    /// `NothingToSteer` is what releases the VF and retires the want, so
+    /// it may only be said when the NIC really holds nothing. This is
+    /// the half that must not be traded away to make the empty target
+    /// reconcilable.
+    #[test]
+    fn an_empty_target_still_refuses_while_a_rule_will_not_come_out() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let stuck: Vec<u32> = s.installed().iter().map(|(_, loc)| *loc).collect();
+        sys::wedge_delete(&stuck);
+
+        s.retarget(Vec::new(), RuleSet::default());
+        let e = s
+            .steer()
+            .expect_err("a rule that would not come out is still steering");
+        assert!(e.contains("could not be removed"), "{e}");
+        assert_eq!(
+            s.installed().len(),
+            stuck.len(),
+            "what would not come out stays in the ledger, or the VF is released under it"
+        );
     }
 
     /// A rule removed from the NIC behind our back is reported missing.
@@ -2523,5 +2636,182 @@ mod tests {
              a forwarding policy nobody chose"
         );
         assert!(s.installed().is_empty());
+    }
+    /// The rollback that could not finish: `steer off`, a removal the
+    /// NIC refuses, a crash, and a restart — and the module clears it
+    /// on the next convergence instead of retrying a no-op forever.
+    ///
+    /// Every step of this is deliberate behaviour somewhere else in the
+    /// subsystem, which is what made it a trap rather than a bug in any
+    /// one place:
+    ///
+    /// - a refused `unsteer` keeps its rules in `installed` and
+    ///   `steered` true, so the VF stays withheld while MCAM may still
+    ///   point at it ([`NtupleSteering::remove_all`]);
+    /// - a death while `steered` re-arms `steer_wanted`, so a restart
+    ///   nobody watched does not silently leave the offload off;
+    /// - `VerifyPassed` therefore re-steers, because
+    ///   `steer_intended()` is true.
+    ///
+    /// Composed, they used to meet a `steer` that refused an empty
+    /// target *before* its stale-rule removal — so the one action that
+    /// could have cleared the rules returned an error instead, on every
+    /// convergence, while the rules went on diverting traffic for a
+    /// port the operator had asked to stop steering.
+    ///
+    /// Drives the real supervisor and the real executor, because that
+    /// composition IS the defect: each half is correct alone.
+    #[test]
+    fn a_refused_unsteer_is_cleared_by_the_next_convergence() {
+        use crate::executor::{execute, Effects};
+        use crate::process::Disposition;
+        use crate::runtime::Steering as _;
+        use crate::supervisor::{Event, State, Supervisor};
+
+        /// The steering half of [`Effects`] over a real
+        /// `NtupleSteering`. Everything else succeeds silently: this
+        /// test is about which rules are in the NIC, and a process
+        /// double that could fail would only add ways to not reach the
+        /// convergence.
+        struct SteeringOnly(NtupleSteering);
+
+        impl Effects for SteeringOnly {
+            fn steer(&mut self) -> Result<SteerOutcome, String> {
+                self.0.steer()
+            }
+            fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
+                self.0.steer()
+            }
+            fn unsteer(&mut self) -> Result<(), String> {
+                self.0.unsteer()
+            }
+            fn steering_in_place(&self) -> bool {
+                !self.0.installed().is_empty()
+            }
+            fn spawn(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn kill(&mut self) -> Disposition {
+                Disposition::SafeToRelease
+            }
+            fn attach_devices(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn start_resync(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn start_verify(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn abort_convergence(&mut self) {}
+            fn arm_backoff(&mut self, _d: std::time::Duration) {}
+            fn release_resources(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        /// Apply one event and feed the executor's events back until
+        /// the two settle, exactly as the driver's tick does.
+        fn settle(sup: &mut Supervisor, fx: &mut SteeringOnly, event: Event) {
+            let mut pending = vec![event];
+            for _ in 0..16 {
+                if pending.is_empty() {
+                    return;
+                }
+                let mut next = Vec::new();
+                for e in pending.drain(..) {
+                    let actions = sup.on(e);
+                    next.extend(execute(&actions, fx).events);
+                }
+                pending = next;
+            }
+            panic!("the supervisor/executor seam did not settle");
+        }
+
+        fn nic_holds(iface: &str) -> Vec<u32> {
+            sys::rule_table(iface).expect("the fake answers").occupied
+        }
+
+        sys::reset();
+        let mut fx = SteeringOnly(NtupleSteering::new(
+            vec![("eth4".into(), 0)],
+            plan_for(&[[198, 18, 0, 0]]),
+        ));
+        let mut sup = Supervisor::new();
+
+        // 1. Converge, then the operator moves the canary lever. The
+        //    machine never steers a first attach on its own.
+        settle(&mut sup, &mut fx, Event::StartRequested);
+        settle(&mut sup, &mut fx, Event::Spawned);
+        settle(&mut sup, &mut fx, Event::ApiUp);
+        settle(&mut sup, &mut fx, Event::SyncComplete);
+        settle(&mut sup, &mut fx, Event::VerifyPassed);
+        settle(&mut sup, &mut fx, Event::SteerRequested);
+        assert_eq!(sup.state(), State::Steered);
+        let steered_locs = nic_holds("eth4");
+        assert!(!steered_locs.is_empty(), "the fixture must steer something");
+
+        // 2. `steer off` on every port, `packetframe reconfigure` — and
+        //    the NIC refuses to delete what it holds.
+        sys::wedge_delete(&steered_locs);
+        fx.0.retarget(Vec::new(), RuleSet::default());
+        settle(&mut sup, &mut fx, Event::UnsteerRequested);
+        assert!(
+            sup.is_steered(),
+            "a removal the NIC refused must keep `steered` true, or the VF is released \
+             under live rules"
+        );
+        assert_eq!(
+            nic_holds("eth4"),
+            steered_locs,
+            "the rules are still there — that is the premise of the rest of this test"
+        );
+
+        // 3. VPP dies. The teardown unsteers first, is refused again,
+        //    and the death re-arms the want because rules remain.
+        settle(&mut sup, &mut fx, Event::ProcessExited { status: None });
+        assert_eq!(sup.state(), State::Backoff);
+        assert!(sup.is_steered() && sup.steer_intended());
+
+        // 4. The NIC stops refusing. Nothing about the module changed —
+        //    a UniFi provisioning push or a firmware event clears
+        //    classifier state underneath us, and by design the module
+        //    is supposed to reconcile whatever it finds.
+        sys::wedge_delete(&[]);
+
+        // 5. The replacement comes up and verifies. THIS is where the
+        //    module used to re-enter its refusal: `steer_intended()` is
+        //    true, so `VerifyPassed` emits `Action::Steer`, and the
+        //    target is empty.
+        settle(&mut sup, &mut fx, Event::BackoffElapsed);
+        settle(&mut sup, &mut fx, Event::Spawned);
+        settle(&mut sup, &mut fx, Event::ApiUp);
+        settle(&mut sup, &mut fx, Event::SyncComplete);
+        settle(&mut sup, &mut fx, Event::VerifyPassed);
+
+        assert!(
+            nic_holds("eth4").is_empty(),
+            "the leftover rules must be GONE from the NIC: they divert traffic for a \
+             port the operator turned off, and no convergence after this one will look \
+             again. Still holding {:?}",
+            nic_holds("eth4")
+        );
+        assert!(
+            fx.0.installed().is_empty(),
+            "and gone from the ledger, which is what the state file persists and what \
+             releasing the VF is gated on"
+        );
+        assert!(
+            !sup.is_steered(),
+            "`steered` must clear, or every later teardown keeps withholding the VF for \
+             rules that are not there"
+        );
+        assert!(
+            !sup.steer_intended(),
+            "the want must retire too. `Unsteered` alone leaves it set — correct on the \
+             adopted path, wrong here — and the module would sit Degraded on `steering \
+             intended but not in place` with an empty config and nothing left to do"
+        );
+        assert_eq!(sup.state(), State::Ready, "membership without steering");
     }
 }
