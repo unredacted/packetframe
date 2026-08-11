@@ -1256,6 +1256,43 @@ impl Core {
         self.steering.retarget(ports, plan);
         self.last_steer_audit = None;
     }
+
+    /// The completeness verdict steering is judged against, or `None`
+    /// when the deployment configured no authority.
+    ///
+    /// One accessor because it has two readers that must not disagree:
+    /// [`Effects::steer`], which refuses on it, and
+    /// [`Observe::steer_permitted`], which decides whether re-attempting
+    /// a refused steer is worth anything. A retry keyed to a different
+    /// question than the refusal is either a loop that never stops
+    /// asking or one that never asks again. The polarity is
+    /// [`packetframe_common::fib::Completeness::permits_steering`]'s, on
+    /// the type, so only the verdict travels.
+    fn steer_verdict(&self) -> Option<packetframe_common::fib::Completeness> {
+        self.completeness.as_ref().map(|h| h.verdict())
+    }
+
+    /// Whether the FIB itself is fit to take traffic, on the same terms
+    /// the operator's first steer is held to.
+    ///
+    /// The second gate, and the one that is easy to forget: `steer` does
+    /// not apply it — `apply_steering` and `Verdict::may_steer` do — so
+    /// a retry that consulted completeness alone would walk straight
+    /// past `VerifyIncomplete`. That arm reaches `Ready` with the want
+    /// intact and emits no steer precisely because routes are withheld
+    /// or unresolvable; re-attempting there would divert traffic into
+    /// the FIB with known holes that the arm exists to protect.
+    ///
+    /// Discriminated on the NIC LEDGER rather than the supervisor's
+    /// belief, as `start_resync` does, and for the same reason: rules in
+    /// the NIC are what puts packets on VPP. Where some are already
+    /// installed this is a reconcile, not a first steer, and gating it
+    /// on `installing` — nonzero whenever routes are in flight, routine
+    /// under a live feed — would hold off the repair of a partly
+    /// installed target indefinitely.
+    fn fib_fit_to_steer(&self) -> bool {
+        !self.steering.installed().is_empty() || !self.engine.counts().blocks_first_steer()
+    }
 }
 
 impl Observe for ObserveView {
@@ -1288,6 +1325,14 @@ impl Observe for ObserveView {
             .engine
             .ping()
             .map_err(|e| e.to_string())
+    }
+
+    fn steer_permitted(&mut self) -> bool {
+        let c = self.core.borrow();
+        // Both gates, through the same accessors the steer path and the
+        // verify verdict use. Neither is re-derived here: this asks the
+        // question, it does not answer it a second time.
+        c.steer_verdict().is_none_or(|v| v.permits_steering()) && c.fib_fit_to_steer()
     }
 
     fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, String> {
@@ -1788,21 +1833,22 @@ impl Effects for EffectsView {
         // the check sits at the single point both go through.
         //
         // Refusing is cheap and self-correcting: it becomes
-        // `SteerFailed`, which leaves `steer_wanted` set, so the next
-        // verify retries — and by then the dump has usually finished. No
-        // rules are installed, so `rules_remain` is unaffected.
-        if let Some(handle) = &c.completeness {
-            let verdict = handle.verdict();
+        // `SteerFailed`, which leaves `steer_wanted` set, and the driver
+        // re-attempts the steer once this verdict permits one — see
+        // `Event::SteerUnblocked`. No rules are installed, so
+        // `rules_remain` is unaffected.
+        if let Some(verdict) = c.steer_verdict() {
             if !verdict.permits_steering() {
                 return Err(format!(
                     "refusing to steer: {}. Traffic would be diverted into a table that \
                      cannot forward it, and a steered miss is dropped rather than falling \
-                     back to the kernel path. NOTHING RETRIES THIS: the want is \
-                     remembered, but only a convergence or `packetframe reconfigure` \
-                     emits another steer, so re-run it once the mirror has caught up. \
+                     back to the kernel path. The want is remembered and re-attempted on \
+                     its own, at most every {}s, once the verdict permits — \
+                     `packetframe reconfigure` asks immediately rather than waiting. \
                      `require-table-complete off` opts out where there is no bird to \
                      compare against",
-                    verdict.describe()
+                    verdict.describe(),
+                    crate::driver::STEER_RETRY_EVERY.as_secs()
                 ));
             }
         }

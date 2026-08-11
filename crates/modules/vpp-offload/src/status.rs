@@ -823,8 +823,10 @@ impl StatusSnapshot {
             "a convergence re-applies steering only if it verifies clean — one that ends \
              with routes withheld or unresolvable parks in the staging state and emits no \
              steer at all, and a steer that IS emitted can still be refused by the \
-             completeness gate. Nothing retries after either, so if this line outlives \
-             the convergence, `packetframe reconfigure` is the retry"
+             completeness gate. Both settle in the staging state with the want \
+             remembered, and from there the module re-attempts the steer by itself once \
+             both gates permit. `packetframe reconfigure` asks immediately rather than \
+             waiting"
                 .to_string()
         };
         // Stray rules do NOT share that remedy, and sharing it was a
@@ -906,9 +908,27 @@ impl StatusSnapshot {
             (true, _) => (HealthState::Healthy, None),
             // Intended but absent: a failed steer, or steering torn down
             // by trouble and not yet restored.
+            //
+            // The self-repair is named only from `Ready`, which is where
+            // it is actually armed: a refused steer settles there and
+            // the module re-attempts it (`Event::SteerUnblocked`).
+            // Everywhere else the repair is the convergence, on its own
+            // schedule — and predicting a paced retry that is not
+            // running is exactly how the lines in this file have gone
+            // wrong before.
             (false, true) => (
                 HealthState::Degraded,
-                Some("steering intended but not in place — traffic is on the eBPF tier".into()),
+                Some(if matches!(self.state, State::Ready) {
+                    format!(
+                        "steering intended but not in place — traffic is on the eBPF tier. \
+                         The module re-attempts it on its own, at most every {}s, once \
+                         nothing is refusing it; `packetframe reconfigure` asks immediately \
+                         and reports the reason if it is refused again",
+                        crate::driver::STEER_RETRY_EVERY.as_secs()
+                    )
+                } else {
+                    "steering intended but not in place — traffic is on the eBPF tier".to_string()
+                }),
             ),
             // The deliberate staging state: all members up, FIB synced
             // and verified, nothing diverted. Every canary's waypoint
@@ -921,8 +941,18 @@ impl StatusSnapshot {
             // for me" must not print the same line.
             (false, false) if self.steer_configured => (
                 HealthState::Healthy,
+                // The continuations are load-bearing: without the
+                // trailing `\` the source indentation is part of the
+                // string, and this arm shipped two twenty-space runs in
+                // an operator's line for exactly that reason. It went
+                // unnoticed because the guard test rendered only the
+                // arms an already-steering port reaches; it covers
+                // these now.
                 Some(
-                    "configured `steer on`, awaiting an operator lever move; traffic is on                      the eBPF tier. A first attach never steers by itself — set the port                      `steer off`, `packetframe reconfigure`, then back to `steer on` and                      reconfigure again (canary ladder, docs/runbooks/vpp-offload.md)"
+                    "configured `steer on`, awaiting an operator lever move; traffic is on \
+                     the eBPF tier. A first attach never steers by itself — set the port \
+                     `steer off`, `packetframe reconfigure`, then back to `steer on` and \
+                     reconfigure again (canary ladder, docs/runbooks/vpp-offload.md)"
                         .into(),
                 ),
             ),
@@ -1330,6 +1360,17 @@ mod tests {
         sup
     }
 
+    /// Every `(steered, steer_intended)` a snapshot can carry.
+    ///
+    /// The steering health match has four arms and a `steered` snapshot
+    /// reaches exactly one of them, so a matrix built from
+    /// `steered_supervisor()` alone renders a quarter of the lines it
+    /// looks like it renders — which is how a twenty-space run shipped
+    /// in the awaiting-a-lever line under two class guards.
+    fn steering_postures() -> [(bool, bool); 4] {
+        [(true, true), (false, true), (false, false), (true, false)]
+    }
+
     fn snap_of(
         sup: &Supervisor,
         led: &RouteLedger,
@@ -1543,6 +1584,14 @@ mod tests {
             "ethtool -N <iface> delete <loc>",
             "steer",
             "require-table-complete off",
+            // Config directives rather than commands, but they go
+            // through the same check for the same reason: an operator
+            // types what the line prints, and a mangled one sends them
+            // to edit something that does not exist. Rendered by the
+            // awaiting-a-lever arm, which nothing exercised until the
+            // matrix covered the unsteered postures.
+            "steer on",
+            "steer off",
         ];
         let mut seen: Vec<String> = Vec::new();
         for state in [
@@ -1556,48 +1605,56 @@ mod tests {
             State::AdoptedResyncing,
         ] {
             for steer_configured in [true, false] {
-                for (missing, stray, unreadable) in [
-                    (1usize, 0usize, None),
-                    (0, 1, None),
-                    (1, 1, Some("EIO: readback failed".to_string())),
-                    (0, 0, Some("EIO: readback failed".to_string())),
-                    (0, 0, None),
-                ] {
-                    let led = ledger_with(10, 0, 0);
-                    let mut snap = snap_of(
-                        &steered_supervisor(),
-                        &led,
-                        ApiHealth::Answering {
-                            silent_for: Duration::from_millis(200),
-                        },
-                        verified(3),
-                        ports_up(),
-                    );
-                    snap.state = state;
-                    snap.steer_configured = steer_configured;
-                    snap.steer_missing = missing;
-                    snap.steer_stray = stray;
-                    snap.steer_audit_unreadable = unreadable.clone();
+                // Both sides of the steering match, not just the arms an
+                // already-steering port reaches. A `steered` snapshot
+                // returns None from three of the four, so the matrix was
+                // silently rendering one of them — and the awaiting-a-
+                // lever line sat mangled underneath.
+                for steering in steering_postures() {
+                    for (missing, stray, unreadable) in [
+                        (1usize, 0usize, None),
+                        (0, 1, None),
+                        (1, 1, Some("EIO: readback failed".to_string())),
+                        (0, 0, Some("EIO: readback failed".to_string())),
+                        (0, 0, None),
+                    ] {
+                        let led = ledger_with(10, 0, 0);
+                        let mut snap = snap_of(
+                            &steered_supervisor(),
+                            &led,
+                            ApiHealth::Answering {
+                                silent_for: Duration::from_millis(200),
+                            },
+                            verified(3),
+                            ports_up(),
+                        );
+                        snap.state = state;
+                        snap.steer_configured = steer_configured;
+                        (snap.steered, snap.steer_intended) = steering;
+                        snap.steer_missing = missing;
+                        snap.steer_stray = stray;
+                        snap.steer_audit_unreadable = unreadable.clone();
 
-                    for sub in snap.report().subsystems {
-                        let Some(msg) = sub.message else { continue };
-                        let mut rest = msg.as_str();
-                        while let Some(open) = rest.find('`') {
-                            rest = &rest[open + 1..];
-                            let Some(close) = rest.find('`') else { break };
-                            let span = &rest[..close];
-                            rest = &rest[close + 1..];
-                            if !seen.iter().any(|s| s == span) {
-                                seen.push(span.to_string());
+                        for sub in snap.report().subsystems {
+                            let Some(msg) = sub.message else { continue };
+                            let mut rest = msg.as_str();
+                            while let Some(open) = rest.find('`') {
+                                rest = &rest[open + 1..];
+                                let Some(close) = rest.find('`') else { break };
+                                let span = &rest[..close];
+                                rest = &rest[close + 1..];
+                                if !seen.iter().any(|s| s == span) {
+                                    seen.push(span.to_string());
+                                }
+                                assert!(
+                                    ALLOWED.contains(&span),
+                                    "{} in {state:?} prints `{span}`, which is not a \
+                                     command this module means to emit. Either it is \
+                                     mangled — the way `ethtool -n reconfigure` was — or \
+                                     it is new and belongs in ALLOWED. Full line: {msg}",
+                                    sub.name
+                                );
                             }
-                            assert!(
-                                ALLOWED.contains(&span),
-                                "{} in {state:?} prints `{span}`, which is not a command \
-                                 this module means to emit. Either it is mangled — the \
-                                 way `ethtool -n reconfigure` was — or it is new and \
-                                 belongs in ALLOWED. Full line: {msg}",
-                                sub.name
-                            );
                         }
                     }
                 }
@@ -1626,35 +1683,48 @@ mod tests {
             State::Steered,
             State::AdoptedResyncing,
         ] {
-            for (missing, stray, unreadable) in [
-                (1usize, 0usize, None),
-                (0, 1, None),
-                (1, 1, Some("EIO: readback failed".to_string())),
-                (0, 0, Some("EIO: readback failed".to_string())),
-            ] {
-                let led = ledger_with(10, 0, 0);
-                let mut snap = snap_of(
-                    &steered_supervisor(),
-                    &led,
-                    ApiHealth::Answering {
-                        silent_for: Duration::from_millis(200),
-                    },
-                    verified(3),
-                    ports_up(),
-                );
-                snap.state = state;
-                snap.steer_missing = missing;
-                snap.steer_stray = stray;
-                snap.steer_audit_unreadable = unreadable.clone();
+            // Both values of `steer_configured` and every steering
+            // posture, because the arms a steered snapshot never reaches
+            // are exactly where the second instance of this defect was
+            // sitting — the awaiting-a-lever line, unrendered by this
+            // guard and by the backtick one.
+            for steer_configured in [true, false] {
+                for steering in steering_postures() {
+                    for (missing, stray, unreadable) in [
+                        (1usize, 0usize, None),
+                        (0, 1, None),
+                        (1, 1, Some("EIO: readback failed".to_string())),
+                        (0, 0, Some("EIO: readback failed".to_string())),
+                        (0, 0, None),
+                    ] {
+                        let led = ledger_with(10, 0, 0);
+                        let mut snap = snap_of(
+                            &steered_supervisor(),
+                            &led,
+                            ApiHealth::Answering {
+                                silent_for: Duration::from_millis(200),
+                            },
+                            verified(3),
+                            ports_up(),
+                        );
+                        snap.state = state;
+                        snap.steer_configured = steer_configured;
+                        (snap.steered, snap.steer_intended) = steering;
+                        snap.steer_missing = missing;
+                        snap.steer_stray = stray;
+                        snap.steer_audit_unreadable = unreadable.clone();
 
-                for sub in snap.report().subsystems {
-                    let Some(msg) = sub.message else { continue };
-                    assert!(
-                        !msg.contains("   "),
-                        "{} in {state:?} renders a whitespace run — a line an operator \
-                         reads at 3am, mangled by a source-formatting artefact: {msg:?}",
-                        sub.name
-                    );
+                        for sub in snap.report().subsystems {
+                            let Some(msg) = sub.message else { continue };
+                            assert!(
+                                !msg.contains("   "),
+                                "{} in {state:?} renders a whitespace run — a line an \
+                                 operator reads at 3am, mangled by a source-formatting \
+                                 artefact: {msg:?}",
+                                sub.name
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2093,6 +2163,64 @@ mod tests {
             .find(|x| x.name == SUBSYS_STEERING)
             .unwrap();
         assert_eq!(steer.state, HealthState::Degraded);
+    }
+
+    /// The intended-but-absent line names the module's own retry only
+    /// where that retry is armed.
+    ///
+    /// From `Ready` a refused steer is re-attempted on the driver's
+    /// interval, so telling the operator to run `reconfigure` is telling
+    /// them to do by hand what is already happening. From anywhere else
+    /// nothing is armed and the repair rides the next convergence —
+    /// promising a paced retry there would be the same overclaim this
+    /// file has now made four times.
+    #[test]
+    fn the_retry_is_named_only_where_it_is_armed() {
+        let mut sup = ready_supervisor();
+        sup.on(Event::SteerFailed {
+            rules_remain: false,
+        });
+        assert!(sup.steer_retry_pending());
+
+        let line = |state: State| {
+            let mut snap = snap_of(
+                &sup,
+                &ledger_with(10, 0, 0),
+                ApiHealth::Answering {
+                    silent_for: Duration::ZERO,
+                },
+                verified(1),
+                ports_up(),
+            );
+            snap.state = state;
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_STEERING)
+                .and_then(|x| x.message)
+                .unwrap_or_default()
+        };
+
+        let ready = line(State::Ready);
+        assert!(
+            ready.contains("re-attempts it on its own"),
+            "from Ready the module is already retrying, and the line must say so: {ready}"
+        );
+        assert!(
+            ready.contains(&format!("{}s", crate::driver::STEER_RETRY_EVERY.as_secs())),
+            "and name the interval from the constant that governs it: {ready}"
+        );
+        for state in [State::Backoff, State::Syncing, State::AdoptedResyncing] {
+            let msg = line(state);
+            assert!(
+                msg.contains("intended but not in place"),
+                "{state:?}: still the same complaint: {msg}"
+            );
+            assert!(
+                !msg.contains("re-attempts it on its own"),
+                "{state:?}: nothing is armed here — the repair is the convergence: {msg}"
+            );
+        }
     }
 
     /// The two ways to be unsteered must not print the same line.

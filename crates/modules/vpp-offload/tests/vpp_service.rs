@@ -1189,14 +1189,20 @@ impl packetframe_vpp_offload::runtime::Steering for SpySteering {
     }
 }
 
-/// Fails the first steer, then succeeds — the shape a refusal leaves
-/// behind (the completeness gate declining `Action::Steer`).
-struct FailFirstSteer {
+/// Refuses every steer until `allow` is set — the shape a completeness
+/// refusal leaves behind, held open under the test's control.
+///
+/// Held open rather than clearing after one call, because the module
+/// now re-attempts a refused steer by itself
+/// (`Event::SteerUnblocked`), and a double that succeeded on the second
+/// call would be steered by that retry before this test could ask —
+/// which is the module working, but not what this test is about.
+struct GatedSteer {
     log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    failed: bool,
+    allow: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl packetframe_vpp_offload::runtime::Steering for FailFirstSteer {
+impl packetframe_vpp_offload::runtime::Steering for GatedSteer {
     fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
         Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
     }
@@ -1204,8 +1210,7 @@ impl packetframe_vpp_offload::runtime::Steering for FailFirstSteer {
         1
     }
     fn steer(&mut self) -> Result<(), String> {
-        if !self.failed {
-            self.failed = true;
+        if !self.allow.load(std::sync::atomic::Ordering::SeqCst) {
             self.log.lock().unwrap().push("steer-refused".into());
             return Err("refusing to steer: the route mirror holds 3 of 10 routes".into());
         }
@@ -1240,12 +1245,20 @@ impl packetframe_vpp_offload::runtime::Steering for FailFirstSteer {
 ///
 /// `steer_intended()` is the predicate that separates "never steered,
 /// waiting for the operator's canary" from "asked for and broken".
+///
+/// The module also re-attempts a refused steer on its own now, which is
+/// a different mechanism on a different clock — so the guard here is
+/// the ANSWER rather than the eventual outcome: with the refusal held
+/// open, a `reconfigure` that injected must come back with the steer's
+/// own reason, and one that took the early return cannot.
 #[test]
 fn a_reconfigure_retries_a_steer_that_was_refused() {
     let fake = Fake::start("svc-retry-refused");
     let sock = fake.path.clone();
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let spy = std::sync::Arc::clone(&log);
+    let allow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = std::sync::Arc::clone(&allow);
 
     let svc = SupervisionService::start(
         "vpp-offload",
@@ -1270,9 +1283,9 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
             let runtime = Runtime::new(
                 engine,
                 Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
-                Box::new(FailFirstSteer {
+                Box::new(GatedSteer {
                     log: std::sync::Arc::clone(&spy),
-                    failed: false,
+                    allow: std::sync::Arc::clone(&gate),
                 }),
                 Box::new(NullStore),
                 Box::new(NoResources),
@@ -1311,23 +1324,39 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
         "a refused steer leaves traffic on the fallback tier"
     );
 
-    // The blocker clears, and they re-run the SAME config — no lever
-    // movement, because there is nothing to move.
+    // They re-run the SAME config — no lever movement, because there is
+    // nothing to move. With the refusal still held open, the answer is
+    // the proof: a `reconfigure` that injected comes back carrying the
+    // steer's own reason, and one that took the staging early return
+    // answers Ok having done nothing at all.
+    let again = svc
+        .apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, false)
+        .expect_err(
+            "an unchanged-config reconfigure over a refused steer must re-attempt it; \
+             reporting Ok while doing nothing is worse than refusing, because the \
+             operator has no way to tell",
+        );
+    assert!(
+        again.contains("refusing to steer"),
+        "the answer must be the steer's own, not a staging no-op: {again}"
+    );
+
+    // And with the blocker gone it lands, without waiting out the
+    // module's own retry interval.
+    allow.store(true, std::sync::atomic::Ordering::SeqCst);
     svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, false)
         .expect("the retry is accepted");
-
     assert_eq!(
         svc.status().expect("published").state,
         State::Steered,
-        "the retry must actually steer — reporting Ok while doing nothing is worse \
-         than refusing, because the operator has no way to tell"
+        "the retry must actually steer"
     );
     let seen = log.lock().unwrap().clone();
-    assert_eq!(
-        seen,
-        vec!["steer-refused".to_string(), "steer".to_string()],
-        "exactly one refusal and one successful retry: {seen:?}"
+    assert!(
+        seen.iter().filter(|s| *s == "steer-refused").count() >= 2,
+        "both reconfigures must have reached the steer: {seen:?}"
     );
+    assert_eq!(seen.last().map(String::as_str), Some("steer"), "{seen:?}");
 }
 
 fn plan_for(count: u8) -> packetframe_vpp_offload::steer::RuleSet {
