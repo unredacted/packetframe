@@ -1286,6 +1286,117 @@ impl Core {
         self.steering.retarget(ports, plan);
         self.last_steer_audit = None;
     }
+
+    /// Whether a steer against the current target would divert traffic
+    /// at all, as opposed to only removing rules.
+    ///
+    /// The discriminator both gates hang off, named once because both
+    /// have to make the same exception and one of them is easy to
+    /// forget. A target with no port installs nothing — it is a
+    /// reconcile to empty, the shape `steer off` takes — so there is no
+    /// traffic for either gate to protect, and refusing it blocks the
+    /// one steer whose job is to take traffic OFF VPP.
+    fn steer_diverts_traffic(&self) -> bool {
+        self.steering.configured_ports() > 0
+    }
+
+    /// The completeness verdict a steer would be judged against, or
+    /// `None` when nothing would judge it: no authority configured, or
+    /// a target that diverts no traffic.
+    ///
+    /// One accessor because it has two readers that must not disagree:
+    /// [`Effects::steer`], which refuses on it, and
+    /// [`Observe::steer_permitted`], which decides whether re-attempting
+    /// a refused steer is worth anything. A retry keyed to a different
+    /// question than the refusal is either a loop that never stops
+    /// asking or one that never asks again. The polarity is
+    /// [`packetframe_common::fib::Completeness::permits_steering`]'s, on
+    /// the type, so only the verdict travels.
+    fn steer_verdict(&self) -> Option<packetframe_common::fib::Completeness> {
+        self.completeness
+            .as_ref()
+            .filter(|_| self.steer_diverts_traffic())
+            .map(|h| h.verdict())
+    }
+
+    /// Whether the source has handed over everything it holds.
+    ///
+    /// Not a gate the steer path applies — it is the thing neither gate
+    /// can see. `Drain::Idle` is the ENGINE's pending map going empty,
+    /// which is weaker than it looks: `drain_batch` pulls at most
+    /// `DELTA_BATCH` and sends at most `DRAIN_BATCH`, and the two are
+    /// the same number, so one tick can pull 4096, send all 4096, and
+    /// report idle with the feed still holding the rest of a burst. A
+    /// reload is hundreds of thousands.
+    ///
+    /// The ledger has not classified those changes, so nothing is
+    /// `installing`; completeness compares bird against the MIRROR,
+    /// which the tee already updated, so a burst of route UPDATES keeps
+    /// the count identical and the verdict converged. Everything reads
+    /// healthy while VPP is tens of thousands of changes behind, and
+    /// steering there blackholes every prefix in the gap —
+    /// `RouteSource::backlog`'s own doc calls it "an unexplained gap
+    /// between what bird advertises and what VPP holds" (review
+    /// finding, PR #160).
+    ///
+    /// **This is only a complete proof while an undelivered batch goes
+    /// BACK to the source.** The backlog can only report work the source
+    /// still holds, so anything that takes a batch out of the feed and
+    /// then drops it is invisible here — and to the ledger, and to
+    /// completeness. `Engine::apply_changes` did exactly that until
+    /// #161: `drain_changes` is destructive, and a failed
+    /// `send_neighbour` returned before the loop that queues the batch's
+    /// routes, so those deltas existed nowhere and no count moved. The
+    /// requeue is what makes this predicate cover them. Anything added
+    /// later that drains the source and can fail must hand the batch
+    /// back for the same reason, or this silently stops covering it.
+    ///
+    /// Carries the empty-target exception like the other two, and the
+    /// history is the argument for keeping it that way: this predicate
+    /// was added AFTER the exception was pushed down into each gate, on
+    /// the reasoning that a later one could otherwise land on the wrong
+    /// side of a shared early return. It did exactly that on the first
+    /// attempt — a backlog held back a reconcile that only removes.
+    fn source_current(&self) -> bool {
+        !self.steer_diverts_traffic() || self.source.backlog() == 0
+    }
+
+    /// Whether the FIB itself is fit to take traffic.
+    ///
+    /// The second gate, and the one that is easy to forget: `steer` does
+    /// not apply it — `apply_steering` and `Verdict::may_steer` do — so
+    /// a retry that consulted completeness alone would walk straight
+    /// past `VerifyIncomplete`. That arm reaches `Ready` with the want
+    /// intact and emits no steer precisely because routes are withheld
+    /// or unresolvable; re-attempting there would divert traffic into
+    /// the FIB with known holes that the arm exists to protect.
+    ///
+    /// Carries the empty-target exception itself, next to the gate it
+    /// exempts, exactly as `steer_verdict` does — rather than both
+    /// sharing an early return in the caller, where a third gate added
+    /// later can quietly land on the wrong side of it.
+    ///
+    /// Applied UNCONDITIONALLY otherwise, unlike `apply_steering`, which exempts
+    /// an already-steering port. That exemption exists because
+    /// `blocks_first_steer` counts `installing`, nonzero whenever routes
+    /// are in flight and so routine under a live feed that gating an
+    /// operator's reconcile on it would fail at random. The retry does
+    /// not need it: it runs only on a tick whose drain reported
+    /// `Drain::Idle`, which is that exemption's whole subject matter
+    /// already excluded.
+    ///
+    /// An earlier version exempted a non-empty NIC ledger on the same
+    /// reasoning, and that was wrong in a case the ledger cannot
+    /// distinguish: a FIRST steer whose rollback could not delete leaves
+    /// debris, so "some rules are installed" stops meaning "this port
+    /// was steering happily". If the table then developed holes, the
+    /// retry would install the REST of the allowlist into it and widen
+    /// the blackhole the debris had started (review finding, PR #160).
+    /// Nothing is lost by dropping it: a partly-installed target over a
+    /// whole FIB still repairs, because that FIB does not block.
+    fn fib_fit_to_steer(&self) -> bool {
+        !self.steer_diverts_traffic() || !self.engine.counts().blocks_first_steer()
+    }
 }
 
 impl Observe for ObserveView {
@@ -1318,6 +1429,20 @@ impl Observe for ObserveView {
             .engine
             .ping()
             .map_err(|e| e.to_string())
+    }
+
+    fn steer_permitted(&mut self) -> bool {
+        let c = self.core.borrow();
+        // Both gates, through the same accessors the steer path and the
+        // verify verdict use. Neither is re-derived here — including
+        // their shared exception for a target that diverts nothing,
+        // which each accessor carries itself: the retry is what drives
+        // a `steer off`'s reconcile-to-empty from `Ready`, and asking a
+        // stricter question here than the one `steer` answers is how a
+        // retry ends up either refusing forever or asking forever.
+        c.source_current()
+            && c.steer_verdict().is_none_or(|v| v.permits_steering())
+            && c.fib_fit_to_steer()
     }
 
     fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, String> {
@@ -1818,9 +1943,10 @@ impl Effects for EffectsView {
         // the check sits at the single point both go through.
         //
         // Refusing is cheap and self-correcting: it becomes
-        // `SteerFailed`, which leaves `steer_wanted` set, so the next
-        // verify retries — and by then the dump has usually finished. No
-        // rules are installed, so `rules_remain` is unaffected.
+        // `SteerFailed`, which leaves `steer_wanted` set, and the driver
+        // re-attempts the steer once this verdict permits one — see
+        // `Event::SteerUnblocked`. No rules are installed, so
+        // `rules_remain` is unaffected.
         //
         // Not applied to an EMPTY target, and that exception is the
         // whole of the gate's own logic turned round: it exists to stop
@@ -1829,20 +1955,21 @@ impl Effects for EffectsView {
         // nothing — it only removes. Gating it refuses the one steer
         // whose entire job is to take traffic OFF VPP, and does so
         // precisely when the mirror is unhealthy, which is when the
-        // operator is most likely to be rolling back.
-        let diverts_traffic = c.steering.configured_ports() > 0;
-        if let Some(handle) = c.completeness.as_ref().filter(|_| diverts_traffic) {
-            let verdict = handle.verdict();
+        // operator is most likely to be rolling back. The exception
+        // lives in `steer_verdict` so the retry's own gate cannot
+        // forget it.
+        if let Some(verdict) = c.steer_verdict() {
             if !verdict.permits_steering() {
                 return Err(format!(
                     "refusing to steer: {}. Traffic would be diverted into a table that \
                      cannot forward it, and a steered miss is dropped rather than falling \
-                     back to the kernel path. NOTHING RETRIES THIS: the want is \
-                     remembered, but only a convergence or `packetframe reconfigure` \
-                     emits another steer, so re-run it once the mirror has caught up. \
+                     back to the kernel path. The want is remembered and re-attempted on \
+                     its own, at most every {}s, once the verdict permits — \
+                     `packetframe reconfigure` asks immediately rather than waiting. \
                      `require-table-complete off` opts out where there is no bird to \
                      compare against",
-                    verdict.describe()
+                    verdict.describe(),
+                    crate::driver::STEER_RETRY_EVERY.as_secs()
                 ));
             }
         }
@@ -2756,6 +2883,104 @@ mod tests {
         let (_, mut fx) = rt.views();
         fx.steer()
             .expect("a reconcile that installs nothing has no traffic to protect");
+
+        // And the RETRY's gate must make the same exception, or it
+        // becomes the thing that holds a `steer off` unfinished: it is
+        // what drives this reconcile from `Ready` without waiting for a
+        // convergence, and a condemning verdict is exactly the weather
+        // a rollback happens in.
+        let (mut obs, _) = rt.views();
+        assert!(
+            obs.steer_permitted(),
+            "the retry asked a stricter question than the steer it drives"
+        );
+    }
+
+    /// A source still holding changes disqualifies the moment, however
+    /// clean everything else looks.
+    ///
+    /// The engine's pending map going empty is not the same statement:
+    /// `drain_batch` pulls at most `DELTA_BATCH` and sends at most
+    /// `DRAIN_BATCH`, and they are the same number, so one tick can pull
+    /// 4096, send all 4096, and report `Drain::Idle` with the feed still
+    /// holding the rest of a reload. Neither gate sees it — the ledger
+    /// has not classified those changes, and completeness compares bird
+    /// against the mirror the tee already updated, so a burst of route
+    /// UPDATES keeps the count identical and the verdict converged.
+    /// Everything reads healthy while VPP is tens of thousands of
+    /// changes behind (review finding, PR #160).
+    #[test]
+    fn a_source_backlog_defers_the_retry() {
+        struct Backlogged(std::cell::Cell<u64>);
+        impl RouteSource for Backlogged {
+            fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+            fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+            fn route_count(&self) -> u64 {
+                0
+            }
+            fn change_seq(&self) -> u64 {
+                0
+            }
+            fn backlog(&self) -> u64 {
+                self.0.get()
+            }
+            // Never drained here, so nothing can be handed back.
+            // `unreachable!` rather than a no-op: #161 removed this
+            // method's default body precisely because a `requeue` that
+            // silently does not deliver is the delta-loss bug again,
+            // and if this test ever grows a drain the failure must be
+            // loud rather than quiet.
+            fn requeue(&self, _: crate::engine::SourceChanges) {
+                unreachable!("this source hands nothing over, so nothing can be requeued");
+            }
+        }
+
+        // Everything else is as permissive as it gets: no completeness
+        // handle, an empty ledger, a target that asks for a port.
+        let rt = Runtime::new(
+            engine(),
+            Box::new(Backlogged(std::cell::Cell::new(4_096))),
+            Box::new(LedgerSteering {
+                configured: 1,
+                ..Default::default()
+            }),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        {
+            let (mut obs, _) = rt.views();
+            assert!(
+                !obs.steer_permitted(),
+                "changes the engine has not pulled are invisible to both gates, and \
+                 steering over them blackholes every prefix in the backlog"
+            );
+        }
+        // Drained: the same moment is fine.
+        rt.core.borrow_mut().source = Box::new(Backlogged(std::cell::Cell::new(0)));
+        {
+            let (mut obs, _) = rt.views();
+            assert!(obs.steer_permitted());
+        }
+
+        // ...but a backlog must NOT hold back a reconcile to an empty
+        // target, for the same reason neither gate does: that steer only
+        // removes rules, and changes still queued for a table it is
+        // taking traffic OFF are no argument for leaving it steered.
+        // This predicate was added after the exception was pushed down
+        // into each gate, and got this wrong on the first attempt.
+        rt.core.borrow_mut().source = Box::new(Backlogged(std::cell::Cell::new(4_096)));
+        rt.core.borrow_mut().steering = Box::new(LedgerSteering {
+            configured: 0,
+            ..Default::default()
+        });
+        let (mut obs, _) = rt.views();
+        assert!(
+            obs.steer_permitted(),
+            "a backlog is a reason not to divert traffic INTO VPP, not a reason to \
+             leave a rollback unfinished"
+        );
     }
 
     /// Without the handle the gate does not exist at all.

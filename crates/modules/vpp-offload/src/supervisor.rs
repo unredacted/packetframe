@@ -344,6 +344,51 @@ pub enum Event {
     /// [`crate::runtime::Steering::retarget`] first; `Action::Steer`
     /// reconciles the NIC to whatever the target now is.
     SteerRequested,
+    /// The operator asked to steer and the caller declined **before
+    /// attempting it** — the FIB gate in
+    /// [`crate::service`]`::apply_steering`, which refuses a first steer
+    /// while routes are withheld, unresolvable or still installing.
+    ///
+    /// Records the want and does nothing else. Deliberately NOT
+    /// [`Self::SteerFailed`], which asserts an attempt that this path
+    /// never made: `rules_remain` is documented as read from the
+    /// steering ledger after a rollback, and an operator reading
+    /// `SteerFailed` in a log goes looking for a NIC that refused an
+    /// insert. This module has spent several rounds separating "asked
+    /// for and broken" from "never attempted"; a second event is
+    /// cheaper than blurring that again.
+    ///
+    /// Without it the same operator action retried or not depending on
+    /// which gate caught it. A steer refused by the completeness gate
+    /// goes through `Action::Steer`, so the refusal becomes
+    /// `SteerFailed` and the want survives to be retried; one refused by
+    /// the FIB gate returned before the request ever entered the
+    /// machine, so nothing was recorded and the offload stayed down
+    /// until a human asked a second time (review finding, PR #160).
+    SteerDeferred,
+    /// The gates that refused a wanted steer now permit one.
+    ///
+    /// The caller owns both the observation and its pacing, the same
+    /// division as [`Self::FallbackSettled`]: the supervisor holds no
+    /// clock and cannot read a completeness verdict or a route ledger,
+    /// so it cannot notice this itself. See
+    /// [`crate::driver::STEER_RETRY_EVERY`] for the pacing, which is
+    /// what keeps a permanently-refusing gate from becoming a hot loop.
+    ///
+    /// Exists because a refused steer was otherwise never retried at
+    /// all. The refusal leaves `steer_wanted` set and settles in
+    /// `Ready`, and the only two things that emit [`Action::Steer`] are
+    /// the verify at the end of a convergence — which does not recur in
+    /// steady state — and an explicit `packetframe reconfigure`. So an
+    /// operator turning the canary lever while bird's dump was behind
+    /// got a refusal, the mirror caught up a minute later, and the
+    /// module sat in `Ready` knowing it wanted to steer and saying so in
+    /// its health line until a human asked again (found reviewing #157).
+    ///
+    /// Deliberately NOT a want in itself: it acts only where one is
+    /// already recorded, so it can never steer a first attach on its
+    /// own. [`Supervisor::steer_intended`] holds that distinction.
+    SteerUnblocked,
     /// The operator turned the canary lever OFF — the rollback landing
     /// zone. Membership stays, the FIB stays synced, traffic goes back
     /// to the fallback tier.
@@ -487,6 +532,23 @@ impl Supervisor {
     /// designed staging state, the other is a rollout that broke.
     pub fn steer_intended(&self) -> bool {
         self.steered || self.steer_wanted
+    }
+
+    /// Whether a wanted steer is outstanding and could be retried from
+    /// here — the caller's half of [`Event::SteerUnblocked`].
+    ///
+    /// The caller decides *when* to look at the gates; this says whether
+    /// looking is worth anything. It lives here, next to the arm that
+    /// acts on the event, for the same reason
+    /// [`State::accepts_steering_changes`] does: a predicate the caller
+    /// re-derives is a copy, and copies drift apart — twice already in
+    /// this file.
+    ///
+    /// **Not** [`Self::steer_intended`], which is the health surface's
+    /// question and answers yes for a port that is steering perfectly
+    /// well. This one is only true where something is missing.
+    pub fn steer_retry_pending(&self) -> bool {
+        matches!(self.state, State::Ready) && self.steer_wanted
     }
 
     pub fn failures(&self) -> u32 {
@@ -731,6 +793,36 @@ impl Supervisor {
                 self.steer_wanted = true;
                 vec![Action::Steer]
             }
+            // The ask, recorded without being acted on. Same states as
+            // `SteerRequested`, because it IS that request — declined by
+            // a gate that sits before the injection rather than inside
+            // the effect. No action: the caller has already decided not
+            // to steer, and the want is the whole point.
+            (Ready | State::Steered, SteerDeferred) => {
+                self.steer_wanted = true;
+                vec![]
+            }
+            // The same lever, re-pulled by the module rather than by a
+            // human, once whatever refused it has cleared.
+            //
+            // `Ready` only. That is where a refused steer settles, and
+            // from `State::Steered` there is nothing to retry — the rules
+            // are in and acknowledged — so re-asserting them on a timer
+            // would put an ethtool round trip on the steady-state path
+            // for no fault. Drift *while* steered is the audit's
+            // business, and its remedy is deliberately the operator's.
+            //
+            // The want is READ, never set: a port that has never asked to
+            // steer stays in the staging state however complete its table
+            // becomes, because the first steer is the operator's canary.
+            // That is the whole reason this is not simply "steer whenever
+            // the config says to".
+            //
+            // `steered` is deliberately not consulted. A reconcile whose
+            // rollback could not delete lands here too — `Ready` with
+            // `steered == true` and the want set — and that is a steer
+            // that did not fully happen, so it wants the same retry.
+            (Ready, SteerUnblocked) if self.steer_wanted => vec![Action::Steer],
             // Believed down only on `Unsteered`, exactly as everywhere
             // else. The state returns to `Ready` because that is what
             // membership-without-steering is — the designed staging
@@ -1646,6 +1738,211 @@ mod tests {
             s.steer_intended(),
             "a rollout that broke must be distinguishable from the designed staging state"
         );
+    }
+
+    /// ...and the retry is what turns that remembered want back into a
+    /// steer, without an operator asking a second time.
+    ///
+    /// The gap this arm closes: `steer_wanted` was read by exactly two
+    /// things — the health text and `(Verifying, VerifyPassed)` — and a
+    /// verify does not recur in steady state. So a canary step refused
+    /// by the completeness gate sat in `Ready`, correctly reporting
+    /// `steering intended but not in place`, until a human ran
+    /// `reconfigure`.
+    #[test]
+    fn a_refused_steer_is_retried_when_its_blocker_clears() {
+        let mut s = ready_unsteered();
+        s.on(Event::SteerRequested);
+        s.on(Event::SteerFailed {
+            rules_remain: false,
+        });
+        assert!(s.steer_retry_pending(), "wanted, and not in place");
+
+        assert_eq!(
+            s.on(Event::SteerUnblocked),
+            vec![Action::Steer],
+            "the module must ask again itself once the gate permits"
+        );
+        // Still only an attempt: `Steered` is the acknowledgement here
+        // exactly as on every other path.
+        assert_eq!(s.state(), State::Ready);
+        assert!(!s.is_steered());
+
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::Steered);
+        assert!(
+            !s.steer_retry_pending(),
+            "nothing is outstanding once the rules are acknowledged"
+        );
+        assert!(
+            s.on(Event::SteerUnblocked).is_empty(),
+            "and a live steered port must not be re-asserted on a timer"
+        );
+    }
+
+    /// The retry also carries the reconcile-to-empty, and
+    /// `NothingToSteer` is what stops it repeating.
+    ///
+    /// A `steer off` whose `unsteer` the NIC refused keeps its rules,
+    /// and a death while steered re-arms the want — so it arrives in
+    /// `Ready` looking like any other outstanding steer, and the retry
+    /// picks it up without waiting for a convergence that exponential
+    /// backoff can postpone. It must also STOP: the want is retired by
+    /// the outcome, so a second `SteerUnblocked` asks for nothing.
+    #[test]
+    fn the_retry_finishes_a_steer_off_and_then_stops() {
+        let mut s = running_and_steered();
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::UnsteerFailed);
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        // The convergence ends INCOMPLETE, so it emits no steer at all —
+        // the case where the rules used to sit there until a human came.
+        assert!(!s.on(Event::VerifyIncomplete).contains(&Action::Steer));
+        assert_eq!(s.state(), State::Ready);
+        assert!(s.steer_retry_pending(), "the want survived the death");
+
+        assert_eq!(
+            s.on(Event::SteerUnblocked),
+            vec![Action::Steer],
+            "and the retry is what carries the removal now"
+        );
+        s.on(Event::NothingToSteer);
+        assert!(!s.is_steered(), "the rules are out");
+        assert!(
+            !s.steer_retry_pending(),
+            "and the outcome retired the want, or this would re-ask every interval \
+             against a config that asks for nothing"
+        );
+        assert!(s.on(Event::SteerUnblocked).is_empty());
+    }
+
+    /// A refusal raised BEFORE the attempt records the want just the
+    /// same, so the retry covers it.
+    ///
+    /// Which gate catches an operator's lever move is an implementation
+    /// seam: the completeness gate refuses inside the effect and leaves
+    /// a `SteerFailed` behind, the FIB gate refuses in the service
+    /// before injecting anything. Only the second needed an event to
+    /// say the ask happened, and without it the same action retried or
+    /// did not depending on which one fired.
+    #[test]
+    fn a_steer_declined_before_it_was_attempted_is_still_wanted() {
+        let mut s = ready_unsteered();
+        assert!(
+            s.on(Event::SteerDeferred).is_empty(),
+            "the caller has already decided not to steer; this only records"
+        );
+        assert!(!s.is_steered(), "and nothing was diverted");
+        assert!(
+            s.steer_retry_pending(),
+            "but the ask stands, so the retry owns it from here"
+        );
+        assert_eq!(s.on(Event::SteerUnblocked), vec![Action::Steer]);
+    }
+
+    /// It is a record of a REQUEST, so it is refused where a request
+    /// would be: config intent cannot reach it, and neither can a state
+    /// with no verified FIB to steer into.
+    #[test]
+    fn a_deferred_steer_is_ignored_outside_the_converged_states() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        assert_eq!(s.state(), State::Syncing);
+        assert!(s.on(Event::SteerDeferred).is_empty());
+        assert!(
+            !s.steer_intended(),
+            "a request refused outside the converged states leaves no want, exactly \
+             as SteerRequested does"
+        );
+    }
+
+    /// A reconcile whose rollback could not delete lands in `Ready` with
+    /// rules still in the NIC — a steer that half happened. It wants the
+    /// same retry, which is why the arm reads the want rather than
+    /// `steered`.
+    #[test]
+    fn a_partly_installed_steer_is_retried_too() {
+        let mut s = running_and_steered();
+        s.on(Event::SteerRequested);
+        s.on(Event::SteerFailed { rules_remain: true });
+        assert_eq!(s.state(), State::Ready);
+        assert!(s.is_steered(), "rules are still diverting traffic");
+        assert_eq!(s.on(Event::SteerUnblocked), vec![Action::Steer]);
+    }
+
+    /// The canary constraint, from the other side: an open gate is not a
+    /// request. A port that has never asked to steer must stay in the
+    /// staging state however complete its table becomes — otherwise this
+    /// mechanism is just "steer whenever the config says to", which is
+    /// the decision the module is not allowed to make.
+    #[test]
+    fn an_unblocked_steer_does_not_steer_a_first_attach() {
+        let mut s = ready_unsteered();
+        assert!(!s.steer_intended());
+        assert!(!s.steer_retry_pending());
+        assert!(s.on(Event::SteerUnblocked).is_empty());
+        assert!(!s.steer_intended(), "and it must leave no want behind");
+    }
+
+    /// Nor may it undo a deliberate `steer off` — including the one
+    /// whose removal the NIC refused, where rules are still installed
+    /// and the want is deliberately clear. Reconciling THAT needs a
+    /// teardown outcome meaning "reconciled to nothing steered", which
+    /// is a different change.
+    #[test]
+    fn an_unblocked_steer_does_not_reverse_a_rollback() {
+        let mut s = running_and_steered();
+        s.on(Event::UnsteerRequested);
+        s.on(Event::Unsteered);
+        assert!(s.on(Event::SteerUnblocked).is_empty());
+
+        let mut refused = running_and_steered();
+        refused.on(Event::UnsteerRequested);
+        refused.on(Event::UnsteerFailed);
+        assert!(refused.is_steered(), "the rules outlived the request");
+        assert!(
+            refused.on(Event::SteerUnblocked).is_empty(),
+            "an operator pulling traffic OFF must not have it put back"
+        );
+    }
+
+    /// Outside `Ready` it is stale, like every other steering request:
+    /// there is either no verified FIB to divert into or a teardown in
+    /// progress. The want survives regardless, and the convergence that
+    /// ends those states emits the steer itself.
+    #[test]
+    fn an_unblocked_steer_is_ignored_outside_the_staging_state() {
+        for (label, mut s) in [
+            ("converging", {
+                let mut s = Supervisor::new();
+                s.on(Event::StartRequested);
+                s.on(Event::ApiUp);
+                s
+            }),
+            ("adopted resync", {
+                let mut s = Supervisor::new();
+                s.on(Event::Adopted { steered: true });
+                s
+            }),
+            ("backoff", {
+                let mut s = running_and_steered();
+                s.on(Event::ProcessExited { status: None });
+                s
+            }),
+            ("stopped", Supervisor::new()),
+        ] {
+            let before = s.state();
+            assert!(
+                s.on(Event::SteerUnblocked).is_empty(),
+                "{label}: a steer from {before:?} is not what anybody asked for"
+            );
+            assert_eq!(s.state(), before, "{label}: and it must not move the state");
+        }
     }
 
     /// Turning it off is the rollback landing zone: membership stays,

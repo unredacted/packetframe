@@ -134,7 +134,11 @@ members up, FIB synced and verified, nothing diverted: that is every
 canary's waypoint and every rollback's landing zone. Distinguish it from
 `steering DEGRADED — steering intended but not in place — traffic is on
 the eBPF tier`, which means a steer was attempted and failed, or was torn
-down by trouble and not yet restored.
+down by trouble and not yet restored. From `Ready` that line also names
+the module's own retry — a refused steer is re-attempted at most every
+30 s once nothing is refusing it — so it is worth reading twice before
+reaching for `reconfigure`: if it is still there a minute later, the
+refusal is still standing and the reason is what to chase.
 
 And the overall verdict is deliberately **not** the maximum of the
 subsystems. Health tracks whether packets are forwarded correctly, not
@@ -255,9 +259,18 @@ packetframe status | grep -A6 'module health'
 ```
 
 `packetframe reconfigure` reports the outcome synchronously. If it says
-the change was refused or withdrawn, **it did not happen** — that is
-deliberate, so "the rollout step succeeded" and "the rollout step was
-queued" cannot look the same.
+the change was refused or withdrawn, **it is not in effect** — that is
+deliberate, so "the rollout step succeeded" and "the rollout step is
+pending" cannot look the same.
+
+Not in effect is not the same as forgotten. A steer refused by either
+gate — the completeness verdict, or a FIB still holding withheld,
+unresolvable or in-flight routes — leaves the *ask* recorded, and the
+module re-attempts it on its own once the refusal clears, at most every
+30 s. The refusal message says so when that is what will happen. What
+it never does is report success for something that has not taken
+effect, which is the property this rung depends on: read the answer,
+then confirm with `ethtool -n` before moving to the next rung.
 
 Then watch actual traffic, not counters: PMTUD in particular. A DF
 packet larger than the MTU through a steered path must come back as a
@@ -407,9 +420,11 @@ steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
                      with routes withheld or unresolvable parks in the
                      staging state and emits no steer at all, and a steer
                      that IS emitted can still be refused by the
-                     completeness gate. Nothing retries after either, so
-                     if this line outlives the convergence, `packetframe
-                     reconfigure` is the retry
+                     completeness gate. Both settle in the staging state
+                     with the want remembered, and from there the module
+                     re-attempts the steer by itself once both gates
+                     permit. `packetframe reconfigure` asks immediately
+                     rather than waiting
 ```
 
 **Read that second sentence.** There are two ways the automatic path
@@ -417,13 +432,23 @@ declines. A verify that ends `VerifyIncomplete` — routes withheld or
 unresolvable — parks in the staging state and emits no steer at all,
 deliberately: diverting traffic into a FIB with known holes is what
 that arm exists to prevent. And a steer that *is* emitted still meets
-the completeness gate, which a stale or negative verdict refuses. After that the supervisor
-settles in `Ready` with the want remembered and **nothing emits another
-steer** — verify does not recur in steady state. So this is not a
-promise that the drift clears itself; it is a statement about where the
-next attempt comes from. If the line is still there once the module
-reaches `Ready`, restore completeness (watch `fib-synced`) and run
-`packetframe reconfigure`.
+the completeness gate, which a stale or negative verdict refuses.
+
+Either way the supervisor settles in `Ready` with the want remembered,
+and **that is where the retry lives**: from `Ready`, and only where a
+want was actually recorded, the module re-attempts the steer at most
+every 30 s for as long as either gate refuses. So the drift does clear
+itself once the blocker does — what the line will not promise is that
+the blocker clears. If it is still there minutes later, read the
+refusal: restore completeness (watch `fib-synced`), or find the
+withheld and unresolvable counts in `packetframe status`. Running
+`packetframe reconfigure` asks immediately instead of waiting out the
+interval, and reports the reason if it is refused again.
+
+The retry is **not** a way around the canary. It acts only where a want
+was already recorded — a steer that was asked for and failed, an adopted
+VPP that came with rules, a death while steered — never on `steer on`
+alone, so a first attach still waits for a human.
 
 Nothing is dropping meanwhile — the affected prefix is on the eBPF
 tier, which is where it belongs.
@@ -468,13 +493,25 @@ retires the want, so the module settles in `Ready` with `steer off
 (staging state)`.
 
 **Read the second sentence here too.** `Action::Steer` is what carries
-that reconcile, and only `VerifyPassed` emits it. A convergence ending
-`VerifyIncomplete` parks in `Ready` with no action at all, so the
-leftover rules stay. That is not a stuck state — `Ready` accepts
-`packetframe reconfigure`, and with no port configured to steer the
-reconcile removes the rules rather than reinstalling any — but it does
-mean "wait for the convergence" is the wrong instinct if the health line
-is still there once the module reaches `Ready`.
+that reconcile, and a convergence ending `VerifyIncomplete` parks in
+`Ready` and emits none, so the leftover rules stay.
+
+Whether anything then clears them by itself turns on one thing: whether
+a *want* is still recorded. A death or wedge while those rules were
+installed re-arms one, and from `Ready` the module's own retry
+re-attempts the steer — which against a target with no port is exactly
+this reconcile, so the rules come out within 30 s and
+`NothingToSteer` retires the want. Neither gate holds it up, because
+both describe a table traffic would be diverted *into* and this steer
+diverts nothing. With no want recorded — a plain `steer off` whose
+`unsteer` was refused and nothing since — there is nothing for the retry
+to act on, and the repair waits for a convergence or for you.
+
+Either way it is not a stuck state: `Ready` accepts `packetframe
+reconfigure`, and with no port configured to steer that reconcile
+removes the rules rather than reinstalling any. "Wait for the
+convergence" is still the wrong instinct if the line is there once the
+module reaches `Ready`.
 
 It did not always. `steer` used to refuse an empty target outright,
 before reaching that removal, because `Ok` had no way to say "nothing is
@@ -728,12 +765,16 @@ module vpp-offload
 ```
 
 With it, `steer` refuses while the mirror disagrees with bird's count,
-reports why, and retries itself once the mirror converges. Without it
-there is no gate at all — the refusal path is compiled out — and the
-canary ladder is the only thing between an early lever-move and traffic
-diverted into a 10%-loaded FIB. `off` is the documented opt-out for
-boxes with no bird to compare against (the shadow), not a default to
-leave alone.
+reports why, and re-attempts itself — at most every 30 s — once the
+mirror converges, so an early lever-move costs a wait rather than a lost
+offload. Without it there is no gate at all — the refusal path is
+compiled out — and the canary ladder is the only thing between an early
+lever-move and traffic diverted into a 10%-loaded FIB. (The retry
+itself does not depend on the gate — a steer the NIC refused is
+re-attempted either way — but with no verdict to wait on, an early
+lever-move steers into whatever is loaded at that instant.) `off` is
+the documented opt-out for boxes with no bird to compare against (the
+shadow), not a default to leave alone.
 
 ### `packetframe status` disagrees with what you just did
 
@@ -793,20 +834,31 @@ mirror is short of the table and steering into it would blackhole
 whatever has not arrived — and a steered miss is dropped, where an
 unsteered one falls through to the kernel path.
 
-**It does not retry on its own** — a belief three operator-facing texts
-carried until 2026-08-11. The refusal leaves the *want* set, but the
-only two things that emit a steer are the verify at the end of a
-convergence and an explicit `packetframe reconfigure`; verify does not
-recur in steady state. So during a first convergence the dump usually
-finishes in time and the steer lands, and outside that you have to
-re-run it. Watch the two counts converge:
+**It retries on its own** — from `Ready`, at most every 30 s, for as
+long as the want stands. The refusal leaves the want set and the module
+re-asks the gate on its own tick, so the ordinary outcome is that the
+dump finishes and the steer lands a few tens of seconds later with
+nobody doing anything.
+
+Read that as a bounded wait, not a guarantee. Until 2026-08-11 it was
+not true at all: the only two things that emitted a steer were the
+verify at the end of a convergence — which does not recur in steady
+state — and an explicit `packetframe reconfigure`, so a lever move that
+raced bird's dump left the offload down until a human asked again.
+Three operator-facing texts said otherwise, and the retry that made
+them true landed afterwards. On a daemon older than that date, the
+manual path below is the only one.
+
+Watch the two counts converge:
 
 ```bash
 birdc show route count
 packetframe status | grep -A6 'module health'
 ```
 
-Once they agree, `packetframe reconfigure` re-applies the steer.
+Once they agree the steer lands by itself within the interval;
+`packetframe reconfigure` asks immediately if you would rather not wait
+(and it reports the reason if the gate refuses again).
 
 If it persists, the mirror is genuinely not keeping up and that is a
 fast-path problem, not a steering one — check the integrity checker's
@@ -826,6 +878,9 @@ device appeared in the table or a member port is missing. Check the
 
 This also **blocks the first steer** on an unsteered port, by design:
 if the table cannot be installed, traffic must not be diverted into it.
+A lever move refused on those grounds is remembered, and the steer goes
+in on its own once the count reaches zero — so fix the mapping and
+watch, rather than re-running `reconfigure` on a timer.
 
 ### `packetframe_vpp_routes{state="withheld"} > 0`
 

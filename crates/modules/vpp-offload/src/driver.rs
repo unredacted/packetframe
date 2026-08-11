@@ -57,6 +57,25 @@ use std::time::{Duration, Instant};
 /// here, so the cadence lives in the driver, not in every caller.
 pub const API_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How often a wanted-but-absent steer may be re-attempted.
+///
+/// The pacing half of [`Event::SteerUnblocked`]. The trigger is the
+/// gates opening, not this timer — but "the gates are open" is a level,
+/// not an edge, and a steer can also fail for reasons no gate knows
+/// about (the NIC refusing an insert). Without a floor between
+/// attempts, a steer that keeps failing under an open gate would be
+/// retried on every tick, which in steady state is every ping interval.
+///
+/// 30 s, matching `runtime::STEER_AUDIT_EVERY`, which paces the
+/// other periodic ethtool traffic on this path for the same reason: a
+/// handful of ioctls per steered interface is free at that cadence, and
+/// the number is sized against how long a silently-unsteered offload
+/// should be allowed to persist rather than against any hardware limit.
+/// It bounds the wait only for a RE-attempt — entering the
+/// wanted-but-absent state arms nothing, so the first look happens on
+/// the next tick.
+pub const STEER_RETRY_EVERY: Duration = Duration::from_secs(30);
+
 use crate::executor::{execute, Effects, Outcome};
 use crate::liveness::{budget_for, WedgeDetector};
 use crate::schedule::Schedule;
@@ -104,6 +123,31 @@ pub trait Observe {
     /// Send a ping and read its reply.
     fn ping(&mut self) -> Result<(), String>;
 
+    /// Whether the module has any reason of its own to refuse or defer
+    /// a steer right now.
+    ///
+    /// Read only when a wanted steer is missing (see
+    /// [`Supervisor::steer_retry_pending`]) and only as often as
+    /// [`STEER_RETRY_EVERY`] allows, so it may cost a lock and a count —
+    /// but not an ioctl.
+    ///
+    /// It must answer for **every** gate the steer path applies, or the
+    /// retry becomes a way around one of them. Two refuse for the same
+    /// reason from opposite ends: the completeness verdict says the
+    /// route mirror is not yet the table, and the ledger's counts say
+    /// what we hold has not all reached VPP. Diverting traffic on either
+    /// blackholes exactly the prefixes that are missing, and a steered
+    /// miss is dropped rather than falling through to the eBPF tier.
+    ///
+    /// And one thing that is not a gate at all but disqualifies the
+    /// moment just as thoroughly: a source backlog. Neither gate can
+    /// see changes the engine has not pulled yet — the ledger has not
+    /// classified them and the mirror already counts them — so the
+    /// implementation owes that check too. The driver's own
+    /// `Drain::Idle` proof does not cover it either; see
+    /// `Driver::poll_steer_retry`.
+    fn steer_permitted(&mut self) -> bool;
+
     /// Drain **one bounded batch** of pending routes.
     ///
     /// Bounded is the contract, not an implementation detail. A blocking
@@ -150,6 +194,13 @@ pub struct Driver {
     /// once: counting VPP's startup as silence would declare a wedge
     /// before it ever had a chance to reply.
     detector: Option<WedgeDetector>,
+    /// When the last wanted-but-absent steer was re-attempted.
+    ///
+    /// Cleared the moment nothing is outstanding, so the interval bounds
+    /// re-attempts *within* one outstanding steer rather than punishing
+    /// the next one: a refusal that arrives a minute after the last
+    /// success is looked at on the very next tick.
+    last_steer_retry: Option<Instant>,
 }
 
 impl Default for Driver {
@@ -165,6 +216,7 @@ impl Driver {
             sched: Schedule::new(),
             reconnect_wanted: false,
             detector: None,
+            last_steer_retry: None,
         }
     }
 
@@ -210,6 +262,11 @@ impl Driver {
         let before = self.sup.state();
         let mut events = Vec::new();
         let mut more_to_drain = false;
+        // Whether THIS tick's drain proved the engine has nothing left to
+        // send. The steer retry's precondition — see `poll_steer_retry`.
+        // False until a drain says so, so a tick that did not drain at
+        // all, or whose drain failed, cannot be read as proof.
+        let mut drain_proved_idle = false;
         // Whether the API was already up **at entry**. Captured here
         // because the block below may arm the detector during this very
         // tick, and every observation in this loop reads the state as it
@@ -294,7 +351,7 @@ impl Driver {
                     // drain can say so, which is why this is observed
                     // rather than assumed after issuing StartResync.
                     Ok(Drain::Idle) if resyncing => events.push(Event::SyncComplete),
-                    Ok(Drain::Idle) => {}
+                    Ok(Drain::Idle) => drain_proved_idle = true,
                     Ok(Drain::More) => more_to_drain = true,
                     // Deliberate waiting, not progress and not
                     // completion. The phase deadline is pushed forward
@@ -338,6 +395,7 @@ impl Driver {
             }
 
             events.extend(self.poll_liveness(now, obs));
+            events.extend(self.poll_steer_retry(now, drain_proved_idle, obs));
         }
 
         let mut tick = self.apply(now, events, fx);
@@ -427,6 +485,111 @@ impl Driver {
         } else {
             Vec::new()
         }
+    }
+
+    /// Re-attempt a steer the module wants and does not have, once the
+    /// gates that refused it permit one.
+    ///
+    /// The driver owns this because the supervisor owns neither a clock
+    /// nor a view of the world, and the alternative — an operator
+    /// re-running `packetframe reconfigure` — is not a mechanism, it is
+    /// a person. The failure it closes: bird's dump is behind, the
+    /// canary lever is turned, the completeness gate refuses, the mirror
+    /// converges a minute later, and nothing steers.
+    ///
+    /// Level-triggered rather than edge-triggered, deliberately. An edge
+    /// needs the driver to have observed the gate closed at the moment
+    /// of the refusal, and it never does: the refusal happens inside an
+    /// `Action::Steer` during `apply`, and the gate may already read open
+    /// by the next tick. So the condition is the state of the world —
+    /// something is wanted, nothing forbids it — and
+    /// [`STEER_RETRY_EVERY`] is what stops a steer that keeps failing
+    /// for its own reasons from being re-attempted every tick.
+    ///
+    /// `drained_idle` is this tick's proof that the ENGINE has nothing
+    /// left to send, and it is a PRECONDITION, not a nicety. It is only
+    /// half the currency question — the source can still be holding
+    /// changes the engine has not pulled, which `steer_permitted`'s
+    /// backlog check covers — and neither half sees work that was
+    /// drained out of the source and then dropped rather than handed
+    /// back. See `Core::source_current` for why that last part is an
+    /// invariant other code has to keep, not something checkable here. The
+    /// ledger's counts are the other gate's evidence and they can be
+    /// clean over deltas VPP never received: `RouteFeed::drain_changes`
+    /// removes the batch from the mirror, and `Engine::apply_changes`
+    /// returns on a failed `send_neighbour` **before** queuing that
+    /// batch's routes — so nothing is left `installing`,
+    /// `blocks_first_steer()` says fine, and a steer here would divert
+    /// traffic into a FIB missing exactly those prefixes (review
+    /// finding, PR #160). A drain that did not run, or ran and failed,
+    /// proves nothing, so neither may pass for proof.
+    ///
+    /// It also subsumes the ordinary in-flight case — `Drain::More`
+    /// means routes are on the wire — which the counts already covered.
+    /// The error case is the one they get wrong.
+    ///
+    /// It also carries the reconcile-to-empty repair, which is not an
+    /// accident of scope but the same mechanism: a `steer off` whose
+    /// `unsteer` the NIC refused keeps its rules and, after a death
+    /// while steered, its want — so it lands here like any other
+    /// outstanding steer. `Action::Steer` reconciles to the empty
+    /// target, removes the stale rules, and answers
+    /// [`crate::runtime::SteerOutcome::NothingToSteer`], which retires
+    /// the want and ends the retries. Before that outcome existed the
+    /// same state was unrecoverable and this comment said so; now the
+    /// repair does not have to wait for a convergence that exponential
+    /// backoff can postpone indefinitely, which is when those rules are
+    /// pointing at a VF whose VPP is down.
+    fn poll_steer_retry(
+        &mut self,
+        now: Instant,
+        drained_idle: bool,
+        obs: &mut dyn Observe,
+    ) -> Vec<Event> {
+        if !self.sup.steer_retry_pending() {
+            self.last_steer_retry = None;
+            return Vec::new();
+        }
+        if !drained_idle {
+            // Nothing recorded: this is a missing proof, not a spent
+            // attempt, so the tick that does prove it acts immediately.
+            return Vec::new();
+        }
+        // And VPP has to be answering. `Drain::Idle` does not say so: an
+        // empty pending map sends nothing at all, so in steady state
+        // that `Ok` is reached without touching the socket. The two
+        // proofs are about different things — one that the FIB is
+        // current, one that there is a VPP behind it — and steering
+        // needs both.
+        //
+        // `answered_last_probe`, not `is_wedged`: the silence budget
+        // tolerates two missed pings so jitter cannot cost a restart,
+        // and that tolerance is exactly the window this would otherwise
+        // steer into. `Wedged` has not fired yet, so nothing takes the
+        // rules back off until it does (review finding, PR #160). It is
+        // read after `poll_liveness` has run this tick, so a ping that
+        // failed a moment ago already counts.
+        if !self
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.answered_last_probe())
+        {
+            return Vec::new();
+        }
+        if self
+            .last_steer_retry
+            .is_some_and(|t| now.duration_since(t) < STEER_RETRY_EVERY)
+        {
+            return Vec::new();
+        }
+        if !obs.steer_permitted() {
+            // Still refused. Nothing is recorded, so the moment the gate
+            // opens the next tick acts — the interval paces attempts,
+            // not the waiting.
+            return Vec::new();
+        }
+        self.last_steer_retry = Some(now);
+        vec![Event::SteerUnblocked]
     }
 
     /// Apply events through the supervisor, execute what they ask for,
@@ -523,6 +686,12 @@ mod tests {
         pings: usize,
         drains: usize,
         api_readies: usize,
+        /// What the gates say about a steer. Default `false` — the
+        /// interesting case is a gate that refuses, and a double that
+        /// permits by omission would let a retry test pass without the
+        /// gate ever being consulted.
+        steer_permitted: bool,
+        steer_gate_reads: usize,
     }
 
     impl Observe for World {
@@ -540,6 +709,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        fn steer_permitted(&mut self) -> bool {
+            self.steer_gate_reads += 1;
+            self.steer_permitted
         }
         fn drain_batch(&mut self, _now: Instant) -> Result<Drain, String> {
             self.drains += 1;
@@ -563,6 +736,9 @@ mod tests {
     struct Fx {
         calls: Vec<&'static str>,
         kill_disposition: Option<Disposition>,
+        /// The steer path refusing on its own terms — the completeness
+        /// gate, or a NIC that will not take the insert.
+        steer_fails: bool,
     }
 
     impl Effects for Fx {
@@ -581,6 +757,9 @@ mod tests {
         }
         fn steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
+            if self.steer_fails {
+                return Err("refusing to steer: the mirror is still loading".into());
+            }
             Ok(SteerOutcome::Steered)
         }
         fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
@@ -1291,6 +1470,308 @@ mod tests {
             "the canary is the operator's lever: {:?}",
             fx.calls
         );
+    }
+
+    // ---- The refused steer, retried ----
+
+    /// Drive to `Ready`, turn the canary lever, and have the steer
+    /// refused — the state an operator lands in when bird's dump is
+    /// behind their lever move.
+    fn refused_canary(t0: Instant, d: &mut Driver, w: &mut World, fx: &mut Fx) {
+        d.inject(t0, Event::StartRequested, fx);
+        settle(d, t0, w, fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, fx);
+        assert_eq!(d.state(), State::Ready);
+        fx.steer_fails = true;
+        d.inject(at(t0, 21), Event::SteerRequested, fx);
+        assert!(fx.calls.contains(&"steer"), "{:?}", fx.calls);
+        assert_eq!(d.state(), State::Ready, "refused, so still unsteered");
+        assert!(
+            d.supervisor().steer_retry_pending(),
+            "the want must outlive the refusal"
+        );
+    }
+
+    /// The gap this whole mechanism exists for: the refusal clears and
+    /// the module steers, with no operator in the loop.
+    ///
+    /// Before it, `steer_wanted` was read by exactly two things — the
+    /// health text and `(Verifying, VerifyPassed)` — and verify does not
+    /// recur in steady state. So the module knew it wanted to steer,
+    /// said so in `steering DEGRADED`, and waited for a human.
+    #[test]
+    fn a_refused_steer_is_re_attempted_once_the_gate_opens() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+
+        // While the gate refuses, nothing is attempted — but it IS asked.
+        fx.calls.clear();
+        for ms in (100..30_000).step_by(500) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "a closed gate must not be walked past: {:?}",
+            fx.calls
+        );
+        assert!(
+            w.steer_gate_reads > 0,
+            "and it must actually be consulted, or the test proves nothing"
+        );
+
+        // The mirror catches up. No reconfigure, no restart.
+        fx.steer_fails = false;
+        w.steer_permitted = true;
+        let t = d.tick(at(t0, 30_100), &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::SteerUnblocked),
+            "the open gate must produce the retry: {:?}",
+            t.events
+        );
+        assert!(fx.calls.contains(&"steer"), "{:?}", fx.calls);
+        assert_eq!(d.state(), State::Steered);
+        assert!(!d.supervisor().steer_retry_pending(), "nothing outstanding");
+    }
+
+    /// A steer that keeps failing under an open gate must not be
+    /// re-attempted every tick.
+    ///
+    /// The completeness verdict is a level, not an edge, and the steer
+    /// can fail for reasons no gate knows about — a NIC refusing the
+    /// insert. In steady state a tick happens every ping interval, so
+    /// without the interval this would be two ethtool round trips a
+    /// second, forever, on a fault that is not going to clear.
+    #[test]
+    fn a_steer_that_keeps_failing_is_paced_not_hot_looped() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+
+        // The gate opens, but the NIC keeps refusing.
+        w.steer_permitted = true;
+        fx.calls.clear();
+        let window = Duration::from_secs(90);
+        for ms in (100..window.as_millis() as u64).step_by(100) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        let attempts = fx.calls.iter().filter(|c| **c == "steer").count();
+        let ceiling = (window.as_secs() / STEER_RETRY_EVERY.as_secs()) as usize + 1;
+        assert!(
+            attempts >= 2,
+            "a repeatedly failing steer must still keep trying: {attempts}"
+        );
+        assert!(
+            attempts <= ceiling,
+            "{attempts} attempts in {window:?} — the interval is not pacing anything"
+        );
+        assert!(d.supervisor().steer_retry_pending(), "still outstanding");
+    }
+
+    /// A tick whose drain failed is not proof of anything, and must not
+    /// be steered over.
+    ///
+    /// The completeness verdict and the ledger's counts are the two
+    /// gates, and a failed drain can leave BOTH looking clean over
+    /// deltas VPP never received: `drain_changes` takes the batch out of
+    /// the mirror, and `apply_changes` returns on a failed
+    /// `send_neighbour` before queuing that batch's routes, so nothing
+    /// is left `installing` to notice. Steering there diverts traffic
+    /// into a FIB missing exactly those prefixes — and unlike the
+    /// unsteered case, a steered miss is dropped (review finding, PR
+    /// #160).
+    #[test]
+    fn a_failed_drain_holds_the_retry_until_one_succeeds() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+
+        // Both gates now say yes — and the drain says it could not talk
+        // to VPP, which is the fact that outranks them.
+        w.steer_permitted = true;
+        w.drain_fails = true;
+        fx.steer_fails = false;
+        fx.calls.clear();
+        for ms in (100..10_000).step_by(250) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "a drain that failed cannot show the FIB is current: {:?}",
+            fx.calls
+        );
+        assert!(
+            d.supervisor().steer_retry_pending(),
+            "and the want is still outstanding, not discarded"
+        );
+
+        // The transport comes back and a drain reports the queue empty.
+        // That is the proof, and it is acted on at once — the withheld
+        // ticks must not have counted as attempts.
+        w.drain_fails = false;
+        let t = d.tick(at(t0, 10_100), &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::SteerUnblocked),
+            "a proven-idle drain releases it immediately: {:?}",
+            t.events
+        );
+        assert_eq!(d.state(), State::Steered);
+    }
+
+    /// Nor may it steer into a VPP that has stopped answering.
+    ///
+    /// The gap this closes is between the first unanswered ping and
+    /// `Wedged`: the budget deliberately tolerates two missed pings so
+    /// jitter cannot cost a restart, and in steady state `Drain::Idle`
+    /// is reached without touching the socket — an empty pending map
+    /// sends nothing — so neither the drain proof nor the wedge
+    /// detector objects. Rules installed in that window put packets on
+    /// a VF whose VPP is already gone, and nothing takes them off until
+    /// the budget expires (review finding, PR #160).
+    #[test]
+    fn a_silent_api_holds_the_retry_until_it_answers_again() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+        w.steer_permitted = true;
+        fx.steer_fails = false;
+
+        // VPP stops answering, and the FIRST tick after the refusal is
+        // one where a ping is due — otherwise the retry fires on the
+        // last pong, which is at most one ping interval old and is
+        // exactly as fresh as this loop can ever be.
+        //
+        // From there, stay INSIDE the silence budget measured from that
+        // pong at ~t0. That tolerated window is the whole premise: no
+        // `Wedged`, nothing torn down, and the drain still reports idle
+        // because there is nothing to send.
+        w.ping_fails = true;
+        fx.calls.clear();
+        let mut ms = PING_INTERVAL.as_millis() as u64;
+        while Duration::from_millis(ms) < PING_BUDGET {
+            let t = d.tick(at(t0, ms), &mut w, &mut fx);
+            assert!(
+                !t.events.contains(&Event::Wedged),
+                "the premise is the tolerated window, before any teardown: {:?}",
+                t.events
+            );
+            ms += 100;
+        }
+        assert!(w.pings > 0, "a ping must actually have gone unanswered");
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "steering into an API that is not answering puts packets on a VF whose \
+             VPP is already gone: {:?}",
+            fx.calls
+        );
+        assert!(d.supervisor().steer_retry_pending(), "still wanted");
+
+        // It answers again. The pong lands before the wedge check on the
+        // same tick, so a recovery at the moment the next ping is due
+        // both clears the silence and releases the retry.
+        w.ping_fails = false;
+        let mut steered = false;
+        for step in 0..8 {
+            let t = d.tick(at(t0, ms + step * 100), &mut w, &mut fx);
+            if t.events.contains(&Event::SteerUnblocked) {
+                steered = true;
+                break;
+            }
+        }
+        assert!(steered, "a recovered API must release it: {:?}", fx.calls);
+        assert_eq!(d.state(), State::Steered);
+    }
+
+    /// A port that never asked to steer is not steered by a gate that
+    /// happens to be open. The first steer is the operator's canary, and
+    /// this mechanism must not become a way around it.
+    #[test]
+    fn an_open_gate_does_not_steer_a_first_attach() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            steer_permitted: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        assert_eq!(d.state(), State::Ready);
+
+        fx.calls.clear();
+        for ms in (100..120_000).step_by(1_000) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "the canary is the operator's lever: {:?}",
+            fx.calls
+        );
+        assert_eq!(
+            w.steer_gate_reads, 0,
+            "with nothing wanted there is nothing to ask the gate about"
+        );
+    }
+
+    /// And a port that IS steering is left alone: the retry is for a
+    /// steer that is missing, not a periodic re-assert of one that is
+    /// not. Drift under live steering is the audit's business, and its
+    /// remedy is deliberately the operator's.
+    #[test]
+    fn a_steered_port_is_not_re_steered_on_the_interval() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            steer_permitted: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        d.inject(at(t0, 21), Event::SteerRequested, &mut fx);
+        assert_eq!(d.state(), State::Steered);
+
+        fx.calls.clear();
+        w.steer_gate_reads = 0;
+        for ms in (100..120_000).step_by(1_000) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "steady state must not carry an ethtool round trip: {:?}",
+            fx.calls
+        );
+        assert_eq!(w.steer_gate_reads, 0);
     }
 
     /// An event the supervisor ignores must not produce actions.

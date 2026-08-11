@@ -151,6 +151,23 @@ impl WedgeDetector {
     pub fn is_wedged(&self, now: Instant, budget: Duration) -> bool {
         self.silent_for(now) > budget
     }
+
+    /// Did the most recent probe get an answer?
+    ///
+    /// A **different question** from [`Self::is_wedged`], and the gap
+    /// between them is the point. The budget exists so ordinary jitter
+    /// does not cost a restart, so two unanswered pings are deliberately
+    /// tolerated — which is right for deciding whether to TEAR DOWN a
+    /// dataplane carrying traffic, and wrong for deciding to start
+    /// diverting traffic INTO one. Steering into that tolerated window
+    /// puts packets on a VF whose VPP has already stopped answering,
+    /// and nothing takes them off again until the budget expires.
+    ///
+    /// So: no clock, no constant, no tolerance. The API answered the
+    /// last thing we asked it, or it did not.
+    pub fn answered_last_probe(&self) -> bool {
+        self.last_ok >= self.last_attempt
+    }
 }
 
 #[cfg(test)]
