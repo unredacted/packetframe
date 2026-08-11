@@ -754,11 +754,17 @@ impl StatusSnapshot {
         // finding).
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
+            // "Still occupied", not "still ours". Where the outgoing
+            // target is known the audit proves ownership field by
+            // field; after a restart that dropped the port there is
+            // nothing to check against, and claiming the traffic is
+            // ours would be the ownership guess this audit keeps
+            // getting wrong. `ethtool -n` settles it either way.
             clauses.push(format!(
-                "{} steering rule(s) are still diverting traffic on a port this config \
-                 leaves unsteered — the rules outlived the request to remove them, so \
-                 that port is still in VPP; `packetframe reconfigure` clears them, and \
-                 `ethtool -n <iface>` shows them",
+                "{} location(s) the ledger names on a port this config leaves unsteered \
+                 are still occupied, so that port may still be diverting traffic into \
+                 VPP — the rules outlived the request to remove them; `ethtool -n \
+                 <iface>` shows what is there and `packetframe reconfigure` clears them",
                 self.steer_stray
             ));
         }
@@ -1335,9 +1341,15 @@ mod tests {
         );
         let msg = steering.message.as_deref().unwrap_or_default();
         assert!(
-            msg.contains('2') && msg.contains("still diverting"),
+            msg.contains('2') && msg.contains("may still be diverting"),
             "and the line must say which way the problem points — these rules \
              need REMOVING, not reinstalling: {msg}"
+        );
+        assert!(
+            !msg.contains("are still diverting"),
+            "without claiming ownership it cannot always prove: after a restart \
+             that dropped the port there is nothing left to check the readback \
+             against, and `ethtool -n` is what settles it: {msg}"
         );
     }
 

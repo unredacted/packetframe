@@ -769,6 +769,21 @@ pub struct NtupleSteering {
     /// the rule gone. The state file's mirror of this is what lets a
     /// later `detach --all` remove rules this process did not install.
     installed: Vec<(String, u32)>,
+    /// The target this object steered BEFORE the last `retarget`.
+    ///
+    /// Kept for one purpose: a port the config just turned off leaves
+    /// `ports`, and its ledger entries then have no expectation to be
+    /// checked against — so "is this slot still ours" degenerated into
+    /// "is this slot occupied", which is the ownership guess this audit
+    /// has already been burned by twice. With the outgoing target in
+    /// hand a dropped port's rules get the same field-by-field
+    /// comparison as everything else.
+    ///
+    /// Only the LAST target, deliberately: a second retarget drops it,
+    /// and a port dropped two targets ago falls back to occupancy. That
+    /// is stated rather than fixed because the alternative is
+    /// accumulating every target this process ever held.
+    former: Option<(Vec<(String, u32)>, RuleSet)>,
 }
 
 impl NtupleSteering {
@@ -777,6 +792,7 @@ impl NtupleSteering {
             ports,
             plan,
             installed: Vec::new(),
+            former: None,
         }
     }
 
@@ -856,6 +872,52 @@ impl NtupleSteering {
                 "the state file named the same steering rule more than once; a \
                  location exists once on the NIC, so the ledger keeps it once"
             );
+        }
+    }
+
+    /// Can the outgoing target prove this slot is **not** ours?
+    ///
+    /// `true` only when the former target covered this interface AND
+    /// nothing it asked for matches what the NIC returned — that is
+    /// positive evidence the rule at this location belongs to somebody
+    /// else, so our own is already gone. `false` covers both "it is
+    /// ours" and "there is nothing to check against", which is why the
+    /// caller's message claims occupancy rather than ownership.
+    ///
+    /// One-to-one, like the member path: two locations holding a copy
+    /// of the same former rule cannot both be accounted for by it.
+    fn former_disowns(
+        &self,
+        iface: &str,
+        loc: u32,
+        got: &RxFlowSpec,
+        consumed: &mut std::collections::HashMap<String, Vec<bool>>,
+    ) -> bool {
+        let Some((ports, plan)) = &self.former else {
+            return false;
+        };
+        let Some(vf) = ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v) else {
+            return false;
+        };
+        let taken = consumed
+            .entry(iface.to_string())
+            .or_insert_with(|| vec![false; plan.rules.len()]);
+        let found = plan.rules.iter().enumerate().position(|(i, r)| {
+            !taken[i]
+                && audit_matches(
+                    &RxFlowSpec {
+                        location: loc,
+                        ..flow_spec(r, vf)
+                    },
+                    got,
+                )
+        });
+        match found {
+            Some(i) => {
+                taken[i] = true;
+                false
+            }
+            None => true,
         }
     }
 
@@ -1005,6 +1067,10 @@ impl crate::runtime::Steering for NtupleSteering {
         // them (review finding). That is the rollback path, where the
         // whole point is getting traffic OFF a port.
         let mut stray = Vec::new();
+        // One-to-one accounting for the outgoing target, same rule as
+        // `consumed` above and for the same reason.
+        let mut former_consumed: std::collections::HashMap<String, Vec<bool>> =
+            std::collections::HashMap::new();
 
         for (iface, loc) in &self.installed {
             // `None` = the current target does not steer this port.
@@ -1018,14 +1084,38 @@ impl crate::runtime::Steering for NtupleSteering {
                 ..Rxnfc::default()
             };
             match sys::ethtool(iface, &mut check) {
-                // Occupied on a port the target does not steer. Nothing
-                // here can say what the rule ought to look like — there
-                // is no VF index to build an expectation from — but the
-                // ledger names it and the slot is not empty, which is
-                // all "still steering a port that should be quiet"
-                // needs. Read rather than assumed, so a rule the
-                // controller already wiped is not reported as live.
-                Ok(()) if member.is_none() => stray.push((iface.clone(), *loc)),
+                // Occupied on a port the target does not steer.
+                //
+                // Occupancy alone is NOT ownership — the same mistake
+                // this audit made on the member path, where an insert
+                // at an occupied slot replaces rather than fails, so a
+                // location can be full of somebody else's rule. Where
+                // the outgoing target is still known, the readback gets
+                // the same field-by-field comparison as everything
+                // else, and a slot holding an unrelated rule is not
+                // reported: our rule is gone, which is what `steer off`
+                // asked for, and alarming on it would send an operator
+                // to `reconfigure` — which would delete the occupant
+                // (review finding).
+                //
+                // Where it is NOT known — a restart whose config
+                // dropped the port, so the state file is the only
+                // record — ownership cannot be established either way.
+                // Reported on occupancy there, and the health line says
+                // "occupied" rather than claiming the traffic is ours:
+                // silence is the worse error on the rollback path.
+                Ok(()) if member.is_none() => {
+                    if self.former_disowns(iface, *loc, &check.fs, &mut former_consumed) {
+                        tracing::debug!(
+                            iface,
+                            loc,
+                            "a location this ledger names on an unsteered port holds a \
+                             rule that is not ours; our rule is already gone"
+                        );
+                    } else {
+                        stray.push((iface.clone(), *loc));
+                    }
+                }
                 Ok(()) => {
                     let vf = member.expect("the arm above takes the non-member case");
                     let taken = consumed
@@ -1148,8 +1238,10 @@ impl crate::runtime::Steering for NtupleSteering {
     }
 
     fn retarget(&mut self, ports: Vec<(String, u32)>, plan: RuleSet) {
-        self.ports = ports;
-        self.plan = plan;
+        self.former = Some((
+            std::mem::replace(&mut self.ports, ports),
+            std::mem::replace(&mut self.plan, plan),
+        ));
     }
 }
 
@@ -1688,6 +1780,62 @@ mod tests {
              alarming on them would cry wolf on every successful unsteer"
         );
         assert_eq!(a.missing, Vec::new(), "and eth0 is still untouched");
+    }
+
+    /// An UNRELATED rule at a dropped port's slot is not our steering.
+    ///
+    /// Occupancy is not ownership — the mistake the member path was
+    /// burned by twice, reintroduced on the non-member path the moment
+    /// it was added: an insert at an occupied location replaces rather
+    /// than fails, so a slot the ledger names can hold somebody else's
+    /// rule while ours is already gone. Reporting that raises a rollback
+    /// alarm that is not happening, and sends an operator to
+    /// `reconfigure`, which would delete the occupant (review finding).
+    ///
+    /// Checkable here because the outgoing target is still known: the
+    /// readback gets the same field-by-field comparison as everything
+    /// else.
+    #[test]
+    fn an_unrelated_rule_on_a_dropped_port_is_not_our_steering() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_for(&[[198, 18, 0, 0]]);
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0), ("eth1".into(), 1)], plan.clone());
+        s.steer().expect("steer installs on both ports");
+        let eth1: Vec<(String, u32)> = s
+            .installed()
+            .into_iter()
+            .filter(|(i, _)| i == "eth1")
+            .collect();
+        assert!(eth1.len() >= 2, "the fixture needs two rules on eth1");
+
+        // `steer off` on eth1, reconcile refused — the round-13 state.
+        s.retarget(vec![("eth0".into(), 0)], plan);
+        assert_eq!(
+            s.missing_from_nic().expect("read").stray.len(),
+            eth1.len(),
+            "our own rules on the dropped port are still ours, and still there"
+        );
+
+        // Now somebody else takes one of those slots. Our rule at it is
+        // gone, which is what `steer off` asked for.
+        let (iface, taken) = eth1[0].clone();
+        sys::replace_behind_back(&iface, taken);
+
+        let a = s.missing_from_nic().expect("read");
+        assert!(
+            !a.stray.contains(&(iface.clone(), taken)),
+            "a slot holding a rule that is not ours is not our steering — \
+             reporting it would raise a rollback alarm for traffic nobody is \
+             diverting, and point `reconfigure` at somebody else's rule: {:?}",
+            a.stray
+        );
+        assert_eq!(
+            a.stray.len(),
+            eth1.len() - 1,
+            "and the rules that ARE still ours must still be reported: {:?}",
+            a.stray
+        );
     }
 
     /// A ledger naming one rule twice does not make a correct NIC drift.

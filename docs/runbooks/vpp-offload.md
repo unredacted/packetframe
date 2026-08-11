@@ -402,11 +402,21 @@ is not a wrong one — but it must not present that count as current.
 The audit also reports the opposite complaint, and names it first:
 
 ```text
-steering  DEGRADED — 2 steering rule(s) are still diverting traffic on a
-                     port this config leaves unsteered — the rules outlived
-                     the request to remove them, so that port is still in
-                     VPP; `packetframe reconfigure` clears them
+steering  DEGRADED — 2 location(s) the ledger names on a port this config
+                     leaves unsteered are still occupied, so that port may
+                     still be diverting traffic into VPP — the rules
+                     outlived the request to remove them; `ethtool -n
+                     <iface>` shows what is there and `packetframe
+                     reconfigure` clears them
 ```
+
+"May", not "is", and the wording is deliberate. Where the port was
+turned off by a live `reconfigure` the audit still holds the outgoing
+target and proves ownership field by field. After a *restart* that
+dropped the port there is nothing left to check the readback against —
+the state file records locations, not what they should contain — so all
+that can be established is that the slot is occupied. `ethtool -n
+<iface>` settles it.
 
 That is the rollback lever not taking. A `steer off` whose reconcile was
 refused (the completeness gate) or whose deletes failed leaves the ledger
