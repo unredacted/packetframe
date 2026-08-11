@@ -1891,7 +1891,7 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
 
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         assert_eq!(
             s.steer().expect("installs"),
             SteerOutcome::Steered,
@@ -1931,7 +1931,7 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
 
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
         s.steer().expect("installs");
         let stuck: Vec<u32> = s.installed().iter().map(|(_, loc)| *loc).collect();
         sys::wedge_delete(&stuck);
@@ -3361,7 +3361,7 @@ mod tests {
         }
 
         sys::reset();
-        let mut fx = SteeringOnly(NtupleSteering::new(
+        let mut fx = SteeringOnly(steering(
             vec![("eth4".into(), 0)],
             plan_for(&[[198, 18, 0, 0]]),
         ));
