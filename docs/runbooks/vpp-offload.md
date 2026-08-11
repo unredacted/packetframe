@@ -27,16 +27,20 @@ running badly.
 > rules than existed, and a mask "correction" that inverted a field
 > which had been right all along. Every one of them failed loudly, as
 > designed: nothing was installed, and the all-or-nothing unwind left the
-> port with zero rules each time. What is *still*
-> unproven is everything past installation: no steered packet has ever
-> reached VPP, because the only port available to test on carries
-> nothing the allowlist matches. Every rule
+> port with zero rules each time. Everything past installation is now
+> proven too, on the shadow: steered frames counted on `octeon0/0`
+> (2026-08-07), forwarded end to end through VPP's graph the same day,
+> and PMTUD answered correctly through a steered path. What remains
+> unproven is scale and reality — one VF, one wired port, and traffic we
+> generated ourselves. Every rule
 > insert is followed by an `ETHTOOL_GRXCLSRULE` readback and compared
 > field by field, precisely so a wrong `ethtool_rx_flow_spec` offset
 > fails loudly on first contact instead of installing a rule that
 > matches the wrong traffic while both tiers report healthy. Expect that
 > check to be the thing that fires first, and treat it as the module
-> working, not failing.
+> working, not failing. The same readback now runs every 30 s against
+> the ledger, so a rule removed or altered out of band shows up as
+> `steering DEGRADED` rather than as nothing at all.
 >
 > **Native XDP attach panics this vendor kernel.** Not a queue-leak
 > question, not something to re-test on an idle port. The version gate

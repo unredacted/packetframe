@@ -941,9 +941,25 @@ impl crate::runtime::Steering for NtupleSteering {
             // The location is only a slot; what makes a rule ours is
             // its spec. So try the rule planned AT this location first,
             // and otherwise accept a match against ANY planned rule.
+            // Stamped with the location being CHECKED, not the one the
+            // rule was planned for. `matches` compares `location`, so an
+            // expectation built straight from a planned rule can never
+            // match an adopted slot — the planner chose a different one
+            // by construction. Without this the whole "any planned rule"
+            // arm was dead code for exactly the rules it was added to
+            // cover, and every adopted rule fell through to an ownership
+            // guess (review finding).
             let expected: Vec<RxFlowSpec> = match rule {
                 Some(r) => vec![flow_spec(r, vf)],
-                None => self.plan.rules.iter().map(|r| flow_spec(r, vf)).collect(),
+                None => self
+                    .plan
+                    .rules
+                    .iter()
+                    .map(|r| RxFlowSpec {
+                        location: *loc,
+                        ..flow_spec(r, vf)
+                    })
+                    .collect(),
             };
             let mut check = Rxnfc {
                 cmd: ETHTOOL_GRXCLSRULE,
@@ -955,26 +971,26 @@ impl crate::runtime::Steering for NtupleSteering {
             };
             match sys::ethtool(iface, &mut check) {
                 Ok(()) => {
-                    let ours = if rule.is_some() {
-                        // We know exactly what should be here, so
-                        // nothing weaker will do. In particular the
-                        // ownership fallback below must NOT apply: a
-                        // rule narrowed behind our back keeps our ring
-                        // cookie, and accepting it on that basis put
-                        // the narrowing hole straight back (caught by
-                        // `a_rule_narrowed_behind_our_back_is_reported_missing`
-                        // while making adopted rules auditable).
-                        expected.iter().any(|e| audit_matches(e, &check.fs))
-                    } else {
-                        // Adopted: no expectation at this location.
-                        // Any rule we currently plan is a strong match;
-                        // failing that, a rule pointing at our VF is
-                        // one of ours from a previous config, present
-                        // and awaiting the next reconcile — not missing.
-                        expected.iter().any(|e| audit_matches(e, &check.fs))
-                            || check.fs.ring_cookie == ring_cookie(vf)
-                    };
-                    if !ours {
+                    // ONE rule, both cases: does the NIC hold something
+                    // this target asked for?
+                    //
+                    // There used to be an ownership fallback here —
+                    // accept anything pointing at our VF when no
+                    // expectation matched — and it was a guess dressed
+                    // as a check. A rule narrowed or replaced behind our
+                    // back keeps the ring cookie, so it proved nothing
+                    // about the rule and swallowed the drift it existed
+                    // to catch (review finding).
+                    //
+                    // Its purpose was to spare an adopted rule from a
+                    // PREVIOUS config, which matches nothing planned
+                    // now. Those are reported too, deliberately: the NIC
+                    // is not holding what the current target says it
+                    // should, the remedy is the same `reconfigure`, and
+                    // it retires them. The health text says "missing or
+                    // no longer what we asked for" rather than "gone"
+                    // for exactly that reason.
+                    if !expected.iter().any(|e| audit_matches(e, &check.fs)) {
                         missing.push((iface.clone(), *loc));
                     }
                 }
@@ -1363,8 +1379,22 @@ mod tests {
             "inherited rules are present and ours; nothing is missing"
         );
 
-        // And the thing the audit exists for still fires on them.
+        // NARROWED, not deleted — the case an ownership check cannot
+        // see. A narrowed rule keeps our ring cookie, so accepting
+        // adopted rules on the strength of the cookie reported this as
+        // fine; the audit has to compare the spec against what the
+        // current target asks for, at the location being checked.
         let (iface, loc) = inherited[0].clone();
+        sys::narrow_behind_back(&iface, loc);
+        assert_eq!(
+            after.missing_from_nic().expect("read the NIC"),
+            vec![(iface.clone(), loc)],
+            "an inherited rule narrowed out of band must be reported — some of \
+             the traffic we believe is offloaded no longer is"
+        );
+
+        // And outright deletion of an inherited rule, which is what the
+        // hardware actually did on 2026-08-11.
         sys::remove_behind_back(&iface, loc);
         assert_eq!(
             after.missing_from_nic().expect("read the NIC"),

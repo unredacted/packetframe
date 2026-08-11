@@ -717,10 +717,11 @@ impl StatusSnapshot {
                 name: SUBSYS_STEERING.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "{} steering rule(s) the ledger names are gone from the NIC — that \
-                     traffic is on the eBPF tier. Something removed them out of band (a \
-                     UniFi provisioning push does this); `packetframe reconfigure` \
-                     reinstalls them",
+                    "{} steering rule(s) are missing from the NIC or no longer match \
+                     what was asked for — that traffic is on the eBPF tier. Something \
+                     changed them out of band (a UniFi provisioning push does this), or \
+                     they were inherited from an earlier config; `packetframe \
+                     reconfigure` reconciles either way",
                     self.steer_missing
                 )),
                 last_success_age_seconds: None,
