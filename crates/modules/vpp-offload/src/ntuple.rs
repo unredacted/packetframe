@@ -29,6 +29,23 @@
 //! configured and no counter names. Refusing whole is the same rule
 //! [`crate::steer::RuleSet::plan`] applies to the budget, enforced here
 //! against the NIC rather than against arithmetic.
+//!
+//! ## Removal reads first, too
+//!
+//! `ETHTOOL_SRXCLSRLDEL` names a **location**, not a rule, and the
+//! ledger's claim on a location can go stale in exactly the way the
+//! audit already documents: an insert at an occupied slot replaces
+//! rather than fails, so a slot this module recorded can hold somebody
+//! else's classifier rule. Deleting by location alone therefore let a
+//! reconfigure or a teardown break traffic belonging to a rule nobody
+//! here installed (review finding).
+//!
+//! So [`NtupleSteering::remove_all`] reads each location back before
+//! it deletes — and the test it applies is deliberately **not** the
+//! audit's. See its doc comment: the audit asks "is this our rule", the
+//! removal asks "will this keep steering into the VF we are about to
+//! release", and the second question has to be answered `yes` for
+//! rules the first would disown.
 
 use crate::steer::{RuleSet, Side, SteerRule};
 
@@ -597,15 +614,27 @@ pub(super) mod sys {
     /// from outside this process does — inserts at an occupied location
     /// replace rather than fail, so the slot stays listed while our
     /// rule is gone.
+    ///
+    /// The cookie is a target that is not ours, which is what makes this
+    /// a stranger's rule to the removal path as well as to the audit.
     pub(crate) fn replace_behind_back(iface: &str, loc: u32) {
+        replace_behind_back_targeting(iface, loc, 0xDEAD_BEEF);
+    }
+
+    /// The same overwrite, with the ring cookie chosen by the caller.
+    ///
+    /// Separate from the audit's concerns entirely: removal keys on the
+    /// cookie, so a foreign rule that happens to steer into the VF this
+    /// module owns is a different case from one that does not, and only
+    /// this can build it.
+    pub(crate) fn replace_behind_back_targeting(iface: &str, loc: u32, cookie: u64) {
         NIC.with(|n| {
             let mut nic = n.borrow_mut();
-            let mut foreign = super::RxFlowSpec {
+            let foreign = super::RxFlowSpec {
                 location: loc,
+                ring_cookie: cookie,
                 ..super::RxFlowSpec::default()
             };
-            // Anything that will not compare equal to ours.
-            foreign.ring_cookie = 0xDEAD_BEEF;
             nic.rules.insert((iface.to_string(), loc), foreign);
         });
     }
@@ -719,6 +748,50 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Read back whatever the NIC holds at `location`.
+///
+/// `Ok(None)` is ENOENT — the driver's answer for a location holding
+/// nothing. Every other error is returned: a read that failed says
+/// nothing about what is there, and the callers must not read it as
+/// "empty".
+fn read_rule(iface: &str, location: u32) -> Result<Option<RxFlowSpec>, String> {
+    let mut req = Rxnfc {
+        cmd: ETHTOOL_GRXCLSRULE,
+        fs: RxFlowSpec {
+            location,
+            ..RxFlowSpec::default()
+        },
+        ..Rxnfc::default()
+    };
+    match sys::ethtool(iface, &mut req) {
+        Ok(()) => Ok(Some(req.fs)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("reading ntuple rule at loc {location}: {e}")),
+    }
+}
+
+/// What a ledger location holds, as far as **removal** is concerned.
+///
+/// Not the same question the audit asks, and the difference is the
+/// point — see [`NtupleSteering::remove_all`].
+enum Occupant {
+    /// Nothing. The removal's postcondition already holds; see
+    /// [`Removal::AlreadyAbsent`], which is the same fact arriving one
+    /// ioctl later.
+    Absent,
+    /// A rule whose `ring_cookie` names the VF this module owns on this
+    /// interface. Ours, or one we cannot recognise that points into our
+    /// VF anyway — and both must come out before the VF is released.
+    IntoOurVf,
+    /// A rule steering somewhere else, on an interface whose VF we know.
+    /// Positive evidence the slot is not ours: our own rule is already
+    /// gone, and this one is a stranger's to keep.
+    Elsewhere(u64),
+    /// Occupied, and nothing here can say by whom — no VF is known for
+    /// this interface, so there is no cookie to compare against.
+    Unattributable,
+}
+
 /// What removing one rule actually did.
 enum Removal {
     Removed,
@@ -731,6 +804,12 @@ enum Removal {
     /// the ledger populated forever — unsteer refused, the VF was
     /// withheld, and the deferred adopted reconciliation waited on an
     /// unsteer that could never be acknowledged (review finding).
+    ///
+    /// [`NtupleSteering::remove_all`] now reads the location first, so
+    /// the wipe usually arrives as [`Occupant::Absent`] instead and this
+    /// is what is left: the rule went away between the two ioctls. Kept
+    /// because `delete` is the only thing that can observe that, and
+    /// because the verdict is the same on both routes.
     ///
     /// ENOENT only. EBUSY, EINVAL and the rest keep failing loudly:
     /// they say nothing about whether a rule is still matching.
@@ -805,6 +884,32 @@ impl NtupleSteering {
         }
     }
 
+    /// The VF this module steers into on `iface`, if anything knows.
+    ///
+    /// The current target first, then the last successful install — so a
+    /// port the config has just set `steer off` still has an answer, which
+    /// is the case `installed_as` exists for. `None` only where neither
+    /// knows the interface at all.
+    fn vf_for(&self, iface: &str) -> Option<u32> {
+        if let Some((_, vf)) = self.ports.iter().find(|(i, _)| i == iface) {
+            return Some(*vf);
+        }
+        let (ports, _) = self.installed_as.as_ref()?;
+        ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v)
+    }
+
+    /// Read a ledger location and decide what removal owes it.
+    fn occupant(&self, iface: &str, loc: u32) -> Result<Occupant, String> {
+        let Some(got) = read_rule(iface, loc)? else {
+            return Ok(Occupant::Absent);
+        };
+        match self.vf_for(iface) {
+            Some(vf) if got.ring_cookie == ring_cookie(vf) => Ok(Occupant::IntoOurVf),
+            Some(_) => Ok(Occupant::Elsewhere(got.ring_cookie)),
+            None => Ok(Occupant::Unattributable),
+        }
+    }
+
     /// Remove `victims`, **keeping whatever would not come out**.
     ///
     /// One routine because there are two callers — `steer`'s rollback and
@@ -815,18 +920,106 @@ impl NtupleSteering {
     /// a later `unsteer` find nothing, and hand back a VF with a live
     /// rule pointing into it.
     ///
+    /// ## Which rules this is entitled to delete
+    ///
+    /// The delete ioctl names a location, and a location the ledger
+    /// names may hold somebody else's rule — an insert at an occupied
+    /// slot replaces rather than fails, which is the same fact
+    /// `missing_from_nic` is careful about. Deleting blind therefore
+    /// broke unrelated traffic on a reconfigure or a teardown, and
+    /// unlike a wrong health line that is not recoverable by reading
+    /// (review finding).
+    ///
+    /// So each location is read back first, and the test is the
+    /// **`ring_cookie`**, not the whole flow spec:
+    ///
+    /// - it names our VF → delete. Ours, or a rule we cannot recognise
+    ///   that steers into our VF regardless — and `Ok` from `unsteer`
+    ///   is what releases that VF, so leaving it is the blackhole this
+    ///   routine's contract exists to prevent.
+    /// - it names something else → leave it, and drop the entry. Our
+    ///   rule at that slot is already gone, which is the removal's
+    ///   postcondition; the occupant is a stranger's and its traffic is
+    ///   not ours to break.
+    /// - nothing there → already removed, as before.
+    /// - the read failed for any other reason → a failure, so the entry
+    ///   stays recorded and `unsteer` refuses. Unverifiable is not
+    ///   unconstrained; on a NIC that will not answer, both the "do not
+    ///   delete a stranger's rule" and the "do not release a steered VF"
+    ///   halves point the same way, at the operator.
+    ///
+    /// The cookie rather than [`audit_matches`] because the two answer
+    /// different questions. The audit asks *is this our rule*, and a
+    /// false positive there costs a Degraded line. This asks *will this
+    /// still be steering into the VF we are about to hand back*, and a
+    /// false negative here blackholes traffic — so it must delete
+    /// rules the audit would disown, and refuse only where the cookie
+    /// proves the rule points elsewhere.
+    ///
+    /// Where no VF is known for the interface — neither the current
+    /// target nor the last install names it — nothing can be proven and
+    /// the location is deleted as this module always has. The tradeoff
+    /// is documented in `docs/runbooks/vpp-offload.md`; the production
+    /// path that used to land here, `packetframe detach --all`, now
+    /// passes the state file's ports so it does not.
+    ///
     /// Returns the failures, formatted for the caller's message.
     fn remove_all(&mut self, victims: Vec<(String, u32)>) -> Vec<String> {
         let mut failed = Vec::new();
         for (iface, loc) in victims {
+            match self.occupant(&iface, loc) {
+                Ok(Occupant::IntoOurVf) => {}
+                Ok(Occupant::Absent) => {
+                    tracing::info!(
+                        iface,
+                        loc,
+                        "ntuple rule was already gone — the controller wipes classifier \
+                         state on provisioning — and absent is what a removal is for, so \
+                         it counts as removed"
+                    );
+                    continue;
+                }
+                Ok(Occupant::Elsewhere(cookie)) => {
+                    // Dropped from the ledger, not merely skipped: it is
+                    // not ours, so it must not go back into the state
+                    // file for a later `detach --all` to find and delete.
+                    tracing::warn!(
+                        iface,
+                        loc,
+                        cookie = format!("{cookie:#x}"),
+                        "a location this ledger names holds a rule steering somewhere \
+                         other than our VF; ours is already gone, so it is left alone \
+                         rather than deleted — removing it would break traffic this \
+                         module never claimed"
+                    );
+                    continue;
+                }
+                Ok(Occupant::Unattributable) => tracing::debug!(
+                    iface,
+                    loc,
+                    "no VF is known for this interface, so the occupant cannot be \
+                     attributed; removing by location, as the ledger recorded it"
+                ),
+                Err(e) => {
+                    // The NIC would not say what is there. Deleting on
+                    // that basis is the blind delete this readback
+                    // exists to end, and reporting success would release
+                    // a VF that may still be steered into.
+                    failed.push(format!("{iface} loc {loc}: {e}"));
+                    self.installed.push((iface, loc));
+                    continue;
+                }
+            }
             match delete(&iface, loc) {
                 Ok(Removal::Removed) => {}
+                // The readback said something was there, so this is the
+                // race rather than the provisioning wipe — but absent is
+                // absent either way.
                 Ok(Removal::AlreadyAbsent) => tracing::info!(
                     iface,
                     loc,
-                    "ntuple rule was already gone — the controller wipes classifier \
-                     state on provisioning — and absent is what a removal is for, so \
-                     it counts as removed"
+                    "ntuple rule went away between the readback and the delete; \
+                     absent is what a removal is for, so it counts as removed"
                 ),
                 Err(e) => {
                     failed.push(format!("{iface} loc {loc}: {e}"));
@@ -2264,13 +2457,19 @@ mod tests {
     /// a VF with a live rule still steering traffic into it.
     ///
     /// Both paths now share `remove_all`, so they cannot disagree.
+    ///
+    /// The rules are installed for real rather than adopted onto an
+    /// empty NIC: removal reads each location back first, and a slot
+    /// holding nothing never reaches the delete at all.
     #[test]
     fn a_rule_that_will_not_delete_stays_recorded() {
         use crate::runtime::Steering as _;
         sys::reset();
-        sys::wedge_delete(&[1024, 1025]);
-        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], RuleSet::default());
-        s.adopt_installed(vec![("eth0".into(), 1024), ("eth0".into(), 1025)]);
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.steer().expect("installs");
+        let locs: Vec<u32> = s.installed().iter().map(|(_, l)| *l).collect();
+        assert_eq!(locs.len(), 2, "the fixture needs two rules");
+        sys::wedge_delete(&locs);
 
         let victims = std::mem::take(&mut s.installed);
         let failed = s.remove_all(victims);
@@ -2287,6 +2486,217 @@ mod tests {
         let e = s.unsteer().expect_err("must refuse while rules remain");
         assert!(e.contains("must not be released"), "{e}");
         assert_eq!(s.installed().len(), 2, "still recorded after the refusal");
+    }
+
+    /// A stranger's rule at a claimed slot is NOT deleted by `unsteer`.
+    ///
+    /// The removal path addressed a location and asked the NIC nothing,
+    /// while the audit thirty lines away was careful about exactly this:
+    /// an insert at an occupied slot replaces rather than fails, so a
+    /// location the ledger names can hold somebody else's classifier
+    /// rule. Teardown then removed it and broke its traffic — and unlike
+    /// a wrong health line, that is not recoverable by reading (review
+    /// finding).
+    ///
+    /// `unsteer` still returns `Ok`, and that is the point rather than a
+    /// concession: `Ok` releases the VF, and what makes the release safe
+    /// is that nothing at that location steers into the VF. The
+    /// stranger's rule does not.
+    #[test]
+    fn a_stranger_at_a_claimed_slot_survives_unsteer() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let installed = s.installed();
+        assert!(installed.len() >= 2, "the fixture needs two rules");
+
+        let (iface, taken) = installed[0].clone();
+        sys::replace_behind_back(&iface, taken);
+
+        s.unsteer()
+            .expect("nothing of ours is left steering into the VF");
+        assert_eq!(
+            sys::rules(),
+            vec![(iface.clone(), taken)],
+            "the rule that is not ours must still be in the NIC — deleting it \
+             breaks traffic this module never claimed"
+        );
+        assert!(
+            s.installed().is_empty(),
+            "and the ledger must stop claiming a slot that is not ours, or a \
+             later `detach --all` reads the record and deletes it after all"
+        );
+    }
+
+    /// The same protection on `steer`'s stale removal — the reconfigure
+    /// path, which is what the runbook sends an operator to first.
+    #[test]
+    fn a_stranger_at_a_stale_slot_survives_a_reconfigure() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0], [10, 1, 0, 0]]),
+        );
+        s.steer().expect("installs four");
+        assert_eq!(sys::rules().len(), 4);
+
+        // Down to one prefix: 13 and 12 are stale. Somebody else takes 13
+        // while the daemon is not looking.
+        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        sys::replace_behind_back("eth0", 13);
+        s.steer().expect("reconciles");
+
+        assert!(
+            sys::rules().contains(&("eth0".to_string(), 13)),
+            "the stale slot held a rule that was not ours, and a reconfigure \
+             must not remove it: {:?}",
+            sys::rules()
+        );
+        assert!(
+            !sys::rules().contains(&("eth0".to_string(), 12)),
+            "while the stale rule that really was ours still comes out: {:?}",
+            sys::rules()
+        );
+        let mut ledger = s.installed();
+        ledger.sort();
+        assert_eq!(
+            ledger,
+            vec![("eth0".to_string(), 14), ("eth0".to_string(), 15)],
+            "and the ledger names the new target only"
+        );
+    }
+
+    /// A rule we do NOT recognise that steers into our VF still comes out.
+    ///
+    /// This is why removal keys on the ring cookie rather than on
+    /// `audit_matches`: the audit would disown this rule, and disowning
+    /// it here would hand back a VF with MCAM still pointing into it —
+    /// the blackhole `remove_all`'s contract exists to prevent, reached
+    /// through the ownership check meant to make removal safer.
+    #[test]
+    fn a_rule_into_our_vf_comes_out_even_when_it_is_not_recognisable() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let (iface, taken) = s.installed()[0].clone();
+
+        // Our slot, our VF, a match nothing here would have asked for.
+        sys::replace_behind_back_targeting(&iface, taken, ring_cookie(0));
+
+        s.unsteer().expect("removes");
+        assert!(
+            sys::rules().is_empty(),
+            "a rule steering into the VF must not survive the VF's release, \
+             whether or not we can prove we installed it: {:?}",
+            sys::rules()
+        );
+        assert!(s.installed().is_empty());
+    }
+
+    /// A restart keeps the protection: the reference removal needs is the
+    /// VF, and that comes from the config rather than from the state file.
+    ///
+    /// The state file records locations and nothing about what they hold,
+    /// so `installed_as` is `None` here and no content comparison is
+    /// available — which is precisely the case where the ledger's claim
+    /// is least trustworthy, because it has survived a window in which
+    /// this module was not running.
+    #[test]
+    fn an_adopted_ledger_still_leaves_a_stranger_alone() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut before =
+            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("the previous process installs");
+        let inherited = before.installed();
+        assert!(!inherited.is_empty());
+
+        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        after.adopt_installed(inherited.clone());
+        assert!(
+            after.installed_as.is_none(),
+            "the fixture must reproduce the restart: nothing to compare a \
+             readback against"
+        );
+
+        let (iface, taken) = inherited[0].clone();
+        sys::replace_behind_back(&iface, taken);
+
+        after
+            .unsteer()
+            .expect("ours are gone; the VF is safe to release");
+        assert_eq!(
+            sys::rules(),
+            vec![(iface, taken)],
+            "the stranger's rule survives an adopted teardown too: {:?}",
+            sys::rules()
+        );
+    }
+
+    /// A location the NIC will not describe is not deleted on a guess.
+    ///
+    /// Both halves of the removal contract point the same way here — do
+    /// not delete a rule that may not be ours, and do not report a VF
+    /// safe to release — so this fails loudly and the entry stays
+    /// recorded. The cost is a teardown that needs an operator; the
+    /// alternative is the blind delete the readback exists to end.
+    #[test]
+    fn a_location_that_cannot_be_read_is_not_deleted_blind() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("installs");
+        let installed = s.installed();
+        assert!(installed.len() >= 2);
+        let (iface, wedged) = installed[0].clone();
+
+        sys::wedge_read(&[wedged]);
+
+        let e = s
+            .unsteer()
+            .expect_err("an unreadable location is not a removed one");
+        assert!(
+            e.contains(&wedged.to_string()),
+            "the refusal must name the location an operator has to settle: {e}"
+        );
+        assert_eq!(
+            sys::rules(),
+            vec![(iface.clone(), wedged)],
+            "the unreadable rule is untouched, and every readable one came out"
+        );
+        assert_eq!(
+            s.installed(),
+            vec![(iface, wedged)],
+            "and it stays on the record, or nothing can ever remove it"
+        );
+    }
+
+    /// With no VF known for the interface, removal is by location, as it
+    /// always was.
+    ///
+    /// Nothing can attribute the occupant — there is no cookie to compare
+    /// against — and the entry is in the ledger because this module put
+    /// it there. `packetframe detach --all` used to arrive here; it now
+    /// passes the state file's ports, so this is the residual case and
+    /// the tradeoff is documented rather than silent.
+    #[test]
+    fn a_ledger_entry_with_no_known_vf_is_removed_by_location() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut before =
+            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("installs");
+        let inherited = before.installed();
+
+        // No ports at all: the shape a caller with only a location list has.
+        let mut blind = NtupleSteering::new(Vec::new(), RuleSet::default());
+        blind.adopt_installed(inherited);
+        blind.unsteer().expect("removes what the ledger names");
+        assert!(sys::rules().is_empty());
+        assert!(blind.installed().is_empty());
     }
 
     /// Rules the controller wiped behind the ledger's back are already

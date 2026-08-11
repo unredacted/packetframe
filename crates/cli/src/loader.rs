@@ -1291,7 +1291,21 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     // produced the release-a-steered-VF bug twice already.
     if !state.steer_rules.is_empty() {
         let recorded = flatten_steer_rules(&state.steer_rules);
-        let mut steering = NtupleSteering::new(Vec::new(), RuleSet::default());
+        // The ports are handed over even though there is no plan to
+        // install, because removal needs them: `remove_all` reads each
+        // location back and deletes only what steers into the VF this
+        // module owns, and without a port list it cannot tell — it would
+        // fall back to deleting by location, which is how a teardown
+        // removes somebody else's classifier rule and breaks its traffic.
+        //
+        // VF 0 for the same reason `bring_up` uses it: `acquire` creates
+        // exactly one per PF and reads it back through `virtfn0`.
+        let ports: Vec<(String, u32)> = state
+            .ports
+            .iter()
+            .map(|p| (p.iface.clone(), 0u32))
+            .collect();
+        let mut steering = NtupleSteering::new(ports, RuleSet::default());
         steering.adopt_installed(recorded);
         if let Err(e) = steering.unsteer() {
             // Write back what is STILL in the NIC before refusing. The rules
