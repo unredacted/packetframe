@@ -891,7 +891,7 @@ impl Runtime {
     /// the supervision loop is the only caller precisely so that the two
     /// cannot be separated.
     pub fn retarget(&self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
-        self.core.borrow_mut().steering.retarget(ports, plan);
+        self.core.borrow_mut().retarget(ports, plan);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1211,6 +1211,23 @@ impl Core {
         let rules = self.steering.installed();
         let r = self.store.steering_changed(&rules);
         let _ = self.note_persist(r);
+    }
+
+    /// Point steering at a new target, and invalidate the cached audit.
+    ///
+    /// The audit answers "does the NIC hold what THIS target asks for",
+    /// so it is a function of two things — the ledger and the target —
+    /// and both have to invalidate it. Only the ledger did, and the
+    /// target can move on its own: `retarget` runs before the
+    /// reconciling steer, which can refuse at the completeness gate and
+    /// return without ever reaching `record_steering`. The answer to
+    /// the OLD question then stood for up to STEER_AUDIT_EVERY, and
+    /// `reconfigure` republishes status the moment it returns — so an
+    /// operator who had just been told the steer was refused could read
+    /// `steering healthy` in the same breath (review finding).
+    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
+        self.steering.retarget(ports, plan);
+        self.last_steer_audit = None;
     }
 }
 
@@ -2273,6 +2290,78 @@ mod tests {
             Some("loc 1025 on eth4: EIO"),
             "and so must the fact that the pass was incomplete — without it the \
              floor is published as a current count and further drift is invisible"
+        );
+    }
+
+    /// Retargeting invalidates the cached audit, like a ledger change.
+    ///
+    /// The audit answers "does the NIC hold what THIS target asks for",
+    /// so both inputs must invalidate it — and only the ledger did.
+    /// `retarget` runs before the reconciling steer, which can refuse at
+    /// the completeness gate and return without reaching
+    /// `record_steering`, so the answer to the old question stood for up
+    /// to STEER_AUDIT_EVERY while `reconfigure` republished status
+    /// immediately (review finding).
+    ///
+    /// The rate limiter is the discriminator: a second `status()` must
+    /// NOT re-audit, and the one after the retarget must.
+    #[test]
+    fn retargeting_invalidates_the_cached_audit() {
+        /// Clean on the first pass, drifting on every one after — so a
+        /// re-audit is visible in the published count.
+        struct DriftsAfterFirstPass(std::cell::Cell<usize>);
+        impl Steering for DriftsAfterFirstPass {
+            fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                Ok(if n == 0 {
+                    SteeringAudit::clean()
+                } else {
+                    SteeringAudit {
+                        missing: vec![("eth4".into(), 1024)],
+                        unreadable: None,
+                    }
+                })
+            }
+            fn configured_ports(&self) -> usize {
+                1
+            }
+            fn steer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn unsteer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            // Non-empty: the caller skips the audit on an empty ledger.
+            fn installed(&self) -> Vec<(String, u32)> {
+                vec![("eth4".into(), 1024)]
+            }
+            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+        }
+
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(DriftsAfterFirstPass(std::cell::Cell::new(0))),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        assert_eq!(rt.status().steer_missing, 0, "the first pass reads clean");
+        assert_eq!(
+            rt.status().steer_missing,
+            0,
+            "and the second is served from the cache — without this the test \
+             would pass whether or not retarget invalidates anything"
+        );
+
+        rt.retarget(vec![("eth4".into(), 0)], crate::steer::RuleSet::default());
+        assert_eq!(
+            rt.status().steer_missing,
+            1,
+            "a new target must be asked about, not answered from the old \
+             question's cache"
         );
     }
 
