@@ -764,28 +764,47 @@ impl StatusSnapshot {
         // 2026-08-11). The repair does arrive on its own: the verify
         // that ends the resync re-emits the steer, and `steer` is a
         // reconcile.
+        // Four answers, because there are four situations and giving
+        // the wrong one sends an operator somewhere useless.
+        let cleanup = "`packetframe detach --all` retries the teardown, and `ethtool -N \
+                       <iface> delete <loc>` removes a rule by hand";
         let remedy = if self.state.accepts_steering_changes() {
-            "`packetframe reconfigure` reconciles either way"
+            "`packetframe reconfigure` reconciles either way".to_string()
         } else if matches!(self.state, State::Stopped) {
-            // Nothing is running and nothing is trying to, so there is
-            // no convergence coming to fix this. Reachable and nasty:
-            // `StopRequested` assigns `Stopped` before knowing whether
-            // `Unsteer` succeeded, a refused removal keeps the rules in
-            // the ledger, and the final status is published either way
-            // — so this is precisely the snapshot that reports rules
-            // still diverting traffic into a VF whose VPP has just been
-            // killed. Telling that operator to wait would be the worst
-            // of the three answers (review finding).
-            "supervision has stopped, so nothing will reconcile this on its own: \
-             `packetframe detach --all` retries the teardown, and `ethtool -N <iface> \
-             delete <loc>` removes a rule by hand"
+            // Nothing is running and nothing is trying to. Reachable and
+            // nasty: `StopRequested` assigns `Stopped` before knowing
+            // whether `Unsteer` succeeded, a refused removal keeps the
+            // rules in the ledger, and the final status is published
+            // either way — so this is precisely the snapshot reporting
+            // rules that still divert traffic into a VF whose VPP has
+            // just been killed (review finding).
+            format!("supervision has stopped, so nothing will reconcile this on its own: {cleanup}")
+        } else if !self.steer_configured {
+            // A convergence is coming and it will NOT clear these.
+            // `VerifyPassed` re-steers while `steered || steer_wanted`,
+            // and a refused `unsteer` deliberately keeps `steered` true
+            // — but `steer` refuses an empty target before reaching its
+            // stale-rule removal, also deliberately, because `Ok` there
+            // becomes `Event::Steered` and would report an offload
+            // carrying traffic it never saw. So a `steer off` whose
+            // removal failed retries that refusal on every convergence
+            // while the rules keep diverting traffic. The product gap is
+            // filed; what this line must not do is promise a repair that
+            // cannot happen (review finding).
+            format!(
+                "no port is configured to steer, so convergence cannot clear these — \
+                 `steer` refuses an empty target rather than report an offload it never \
+                 installed: {cleanup}"
+            )
         } else {
             // A convergence is in flight or is coming (`Backoff` has no
             // resync running yet, which is why this does not say "this
-            // resync").
+            // resync"), and the target it will reconcile to is non-empty,
+            // so its stale-rule removal covers whatever is left over.
             "steering is reconciled automatically once the module converges again — the \
              verify that ends a resync re-emits the steer; `packetframe reconfigure` is \
              refused until then, and says so"
+                .to_string()
         };
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
@@ -1386,50 +1405,62 @@ mod tests {
         }
 
         for state in states {
-            let led = ledger_with(10, 0, 0);
-            let mut snap = snap_of(
-                &steered_supervisor(),
-                &led,
-                ApiHealth::Answering {
-                    silent_for: Duration::from_millis(200),
-                },
-                verified(3),
-                ports_up(),
-            );
-            snap.state = state;
-            snap.steer_missing = 1;
-
-            let rep = snap.report();
-            let steering = rep
-                .subsystems
-                .iter()
-                .find(|s| s.name == SUBSYS_STEERING)
-                .expect("steering row");
-            let msg = steering.message.as_deref().unwrap_or_default();
-            // Three remedies, and exactly one may appear: run the
-            // command, wait for the convergence, or clean up by hand.
-            // Asserting the other two ABSENT is what makes this a
-            // classification rather than three independent contains().
-            let expected = if state.accepts_steering_changes() {
-                "`packetframe reconfigure` reconciles"
-            } else if matches!(state, State::Stopped) {
-                "supervision has stopped"
-            } else {
-                "reconciled automatically"
-            };
-            for marker in [
-                "`packetframe reconfigure` reconciles",
-                "supervision has stopped",
-                "reconciled automatically",
-            ] {
-                assert_eq!(
-                    msg.contains(marker),
-                    marker == expected,
-                    "state {state:?} must offer exactly the remedy that state admits, \
-                     and no other. `reconfigure` is refused outside Ready/Steered; a \
-                     convergence is coming everywhere except Stopped, where nothing \
-                     will ever reconcile this and the operator has to clean up: {msg}"
+            for steer_configured in [true, false] {
+                let led = ledger_with(10, 0, 0);
+                let mut snap = snap_of(
+                    &steered_supervisor(),
+                    &led,
+                    ApiHealth::Answering {
+                        silent_for: Duration::from_millis(200),
+                    },
+                    verified(3),
+                    ports_up(),
                 );
+                snap.state = state;
+                snap.steer_configured = steer_configured;
+                // Both clauses share the remedy, so set both and assert
+                // on the remedy alone.
+                snap.steer_missing = 1;
+                snap.steer_stray = 1;
+
+                let rep = snap.report();
+                let steering = rep
+                    .subsystems
+                    .iter()
+                    .find(|s| s.name == SUBSYS_STEERING)
+                    .expect("steering row");
+                let msg = steering.message.as_deref().unwrap_or_default();
+
+                // Exactly one of the four may appear. Asserting the
+                // other three ABSENT is what makes this a
+                // classification rather than four independent
+                // contains() that could all drift true.
+                let expected = if state.accepts_steering_changes() {
+                    "`packetframe reconfigure` reconciles"
+                } else if matches!(state, State::Stopped) {
+                    "supervision has stopped"
+                } else if !steer_configured {
+                    "no port is configured to steer"
+                } else {
+                    "reconciled automatically"
+                };
+                for marker in [
+                    "`packetframe reconfigure` reconciles",
+                    "supervision has stopped",
+                    "no port is configured to steer",
+                    "reconciled automatically",
+                ] {
+                    assert_eq!(
+                        msg.contains(marker),
+                        marker == expected,
+                        "state {state:?}, steer_configured={steer_configured}: the line \
+                         must offer exactly the remedy this situation admits. \
+                         `reconfigure` is refused outside Ready/Steered; a stopped \
+                         daemon reconciles nothing; and with no port configured to \
+                         steer, `steer` refuses the empty target before it would clear \
+                         the leftovers, so convergence cannot fix it either: {msg}"
+                    );
+                }
             }
         }
     }

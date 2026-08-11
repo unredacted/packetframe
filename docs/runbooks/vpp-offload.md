@@ -414,6 +414,24 @@ steering  DEGRADED — ... supervision has stopped, so nothing will
 Take that one seriously: rules pointing at a VF whose VPP has been
 killed are a blackhole, not a lost optimisation.
 
+**The same applies when no port is configured to steer** — a full
+`steer off` whose removal was refused:
+
+```text
+steering  DEGRADED — ... no port is configured to steer, so convergence
+                     cannot clear these — `steer` refuses an empty target
+                     rather than report an offload it never installed:
+                     `packetframe detach --all` retries the teardown, and
+                     `ethtool -N <iface> delete <loc>` removes a rule by
+                     hand
+```
+
+The module cannot repair this one on its own: it re-steers because a
+refused `unsteer` leaves it believing traffic is diverted, and then
+refuses the empty target. Clean up by hand. (Tracked as a product gap;
+the module should reconcile an empty target through `unsteer` rather
+than retry a refusal.)
+
 **Two directions, one count.** The rules the ledger names are read back
 and compared field by field, so a deleted, replaced or narrowed rule is
 drift. And the rules the *current* target asks for are checked for a
