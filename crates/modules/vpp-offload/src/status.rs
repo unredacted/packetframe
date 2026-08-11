@@ -840,7 +840,6 @@ impl StatusSnapshot {
         //
         // So it names the removal that works from anywhere, always,
         // and never defers to a convergence.
-        let stray_remedy = "remove them with `ethtool -N <iface> delete <loc>` rather than                             wait — while VPP is not forwarding, that traffic is going to a                             VF nothing is servicing. `packetframe reconfigure` also clears                             them wherever it is accepted";
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
             // "Still occupied", not "still ours". Where the outgoing
@@ -854,7 +853,13 @@ impl StatusSnapshot {
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
                  not be. The rules outlived the request to remove them; `ethtool -n \
-                 <iface>` shows what is there. {stray_remedy}",
+                 <iface>` lists them, and ours are the ones whose action targets VPP's \
+                 VF. Delete those (`ethtool -N <iface> delete <loc>`) rather than waiting \
+                 — while VPP is not forwarding, that traffic is going to a VF nothing is \
+                 servicing. Check before removing: after a restart this audit cannot \
+                 always prove a location still holds OUR rule, and deleting another \
+                 breaks its traffic. `packetframe reconfigure` also clears them wherever \
+                 it is accepted",
                 self.steer_stray
             ));
         }
@@ -1515,6 +1520,57 @@ mod tests {
         }
     }
 
+    /// No health message contains a run of whitespace.
+    ///
+    /// Cheap guard for a class rather than an instance: `dfdc9b8`
+    /// shipped a remedy bound as `let x = "... \` + continuation`,
+    /// which rustfmt joined onto one line while KEEPING the source
+    /// indentation inside the literal — so the operator's line read
+    /// "rather than" followed by thirty spaces. Every assertion in
+    /// these tests matches a short fragment, and no fragment spanned
+    /// the gap, so all of them passed over it.
+    #[test]
+    fn no_health_message_carries_mangled_whitespace() {
+        for state in [
+            State::Backoff,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            for (missing, stray, unreadable) in [
+                (1usize, 0usize, None),
+                (0, 1, None),
+                (1, 1, Some("EIO: readback failed".to_string())),
+                (0, 0, Some("EIO: readback failed".to_string())),
+            ] {
+                let led = ledger_with(10, 0, 0);
+                let mut snap = snap_of(
+                    &steered_supervisor(),
+                    &led,
+                    ApiHealth::Answering {
+                        silent_for: Duration::from_millis(200),
+                    },
+                    verified(3),
+                    ports_up(),
+                );
+                snap.state = state;
+                snap.steer_missing = missing;
+                snap.steer_stray = stray;
+                snap.steer_audit_unreadable = unreadable.clone();
+
+                for sub in snap.report().subsystems {
+                    let Some(msg) = sub.message else { continue };
+                    assert!(
+                        !msg.contains("   "),
+                        "{} in {state:?} renders a whitespace run — a line an operator \
+                         reads at 3am, mangled by a source-formatting artefact: {msg:?}",
+                        sub.name
+                    );
+                }
+            }
+        }
+    }
+
     /// A stray rule never gets told to wait, in any state.
     ///
     /// The two complaints differ in what waiting costs. A MISSING rule
@@ -1573,6 +1629,13 @@ mod tests {
                     "state {state:?}: and must never defer to a convergence — with a \
                      refused unsteer the rules outlive the process, so waiting means \
                      dropping that prefix, not merely losing the offload: {msg}"
+                );
+                assert!(
+                    msg.contains("targets VPP's VF") && msg.contains("Check before removing"),
+                    "state {state:?}: and must not send them deleting blind — after a \
+                     restart the audit reports an occupied slot without proving it is \
+                     ours, and `ethtool -N ... delete` is destructive to whatever is \
+                     actually there: {msg}"
                 );
             }
         }

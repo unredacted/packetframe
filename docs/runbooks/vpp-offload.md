@@ -501,12 +501,22 @@ before it kills for exactly this reason ("until the MCAM rules are
 gone, every steered packet is going to a VF nothing is servicing"), so
 when that unsteer is refused the rules outlive the process and the
 affected prefixes are **dropped**, not merely deoptimised. Exponential
-backoff can postpone the next convergence indefinitely. Remove them:
+backoff can postpone the next convergence indefinitely.
+
+**Look before deleting.** The line gives a count, never the locations,
+so `ethtool -n` is on the path anyway — and after a restart the audit
+reports an occupied slot without being able to prove it still holds
+*our* rule (`installed_as` is only set by a successful steer in this
+process). Ours are the ones whose action targets VPP's VF:
 
 ```bash
-ethtool -n eth1            # what is actually installed
-ethtool -N eth1 delete 12  # per location
+ethtool -n eth1            # look: `Action: Direct to VF 0 queue 0` is ours
+ethtool -N eth1 delete 12  # then delete those locations, one at a time
 ```
+
+Deleting a location that turned out to hold somebody else's classifier
+rule breaks its traffic, and unlike a wrong health line that is not
+recoverable by reading.
 
 "May", not "is", and the wording is deliberate. Where the port was
 turned off by a live `reconfigure` the audit still holds the outgoing
