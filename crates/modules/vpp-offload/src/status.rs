@@ -854,13 +854,13 @@ impl StatusSnapshot {
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
                  not be. The rules outlived the request to remove them; `ethtool -n \
-                 <iface>` lists them, and ours are the ones whose action targets VPP's \
-                 VF. Delete those (`ethtool -N <iface> delete <loc>`) rather than waiting \
-                 — while VPP is not forwarding, that traffic is going to a VF nothing is \
-                 servicing. Check before removing: after a restart this audit cannot \
-                 always prove a location still holds OUR rule, and deleting another \
-                 breaks its traffic. `packetframe reconfigure` also clears them wherever \
-                 it is accepted",
+                 <iface>` lists what is installed. Act rather than wait — while VPP is \
+                 not forwarding, that traffic is going to a VF nothing is servicing — but \
+                 remove only rules you can match to an `allow-prefix` from this config \
+                 steered at VPP's VF (`ethtool -N <iface> delete <loc>`). Targeting the \
+                 VF is not proof on its own, and after a restart this audit cannot prove \
+                 a slot still holds ours; deleting another rule breaks its traffic. \
+                 `packetframe reconfigure` also clears them wherever it is accepted",
                 self.steer_stray
             ));
         }
@@ -1632,11 +1632,12 @@ mod tests {
                      dropping that prefix, not merely losing the offload: {msg}"
                 );
                 assert!(
-                    msg.contains("targets VPP's VF") && msg.contains("Check before removing"),
-                    "state {state:?}: and must not send them deleting blind — after a \
-                     restart the audit reports an occupied slot without proving it is \
-                     ours, and `ethtool -N ... delete` is destructive to whatever is \
-                     actually there: {msg}"
+                    msg.contains("`allow-prefix` from this config")
+                        && msg.contains("not proof on its own"),
+                    "state {state:?}: and must not hand them a categorical test the \
+                     audit itself does not have. The ring cookie names the VF, not the \
+                     owner — this module already learned that twice — so the line has \
+                     to name the conjunction and say it is not proof: {msg}"
                 );
             }
         }

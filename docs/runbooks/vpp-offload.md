@@ -508,20 +508,35 @@ when that unsteer is refused the rules outlive the process and the
 affected prefixes are **dropped**, not merely deoptimised. Exponential
 backoff can postpone the next convergence indefinitely.
 
-**Look before deleting.** The line gives a count, never the locations,
-so `ethtool -n` is on the path anyway — and after a restart the audit
-reports an occupied slot without being able to prove it still holds
-*our* rule (`installed_as` is only set by a successful steer in this
-process). Ours are the ones whose action targets VPP's VF:
+**Identify before deleting, and the VF alone will not identify.** The
+line gives a count, never the locations, so `ethtool -n` is on the path
+anyway — and after a restart the audit reports an occupied slot without
+being able to prove it still holds *our* rule (`installed_as` is set
+only by a successful steer in this process).
+
+A rule is this module's when **all** of these hold, not any one:
+
+| field | what ours looks like |
+|---|---|
+| `Dest IP addr` / `Src IP addr` | one of the `allow-prefix` lines in the config, with the other side `0.0.0.0 mask 255.255.255.255` |
+| `Action` | `Direct to VF <n>`, the VF this module owns |
+| `TOS` / `Protocol` / `L4 bytes` masks | all `0xff` / `0xffffffff` — ours constrain nothing else |
+
+The action alone is not proof: another rule can target the same VF
+while matching different traffic, and a *narrowed* copy of one of ours
+keeps the cookie too. That is why the audit compares the whole spec
+rather than the cookie, and why you should.
 
 ```bash
-ethtool -n eth1            # look: `Action: Direct to VF 0 queue 0` is ours
-ethtool -N eth1 delete 12  # then delete those locations, one at a time
+ethtool -n eth1            # read the fields, compare against the table
+ethtool -N eth1 delete 12  # only for locations you recognised
 ```
 
 Deleting a location that turned out to hold somebody else's classifier
 rule breaks its traffic, and unlike a wrong health line that is not
-recoverable by reading.
+recoverable by reading. If you cannot recognise it, leave it and say so
+in the incident notes — a stray rule that is not ours is not ours to
+remove.
 
 "May", not "is", and the wording is deliberate. Where the port was
 turned off by a live `reconfigure` the audit still holds the outgoing
