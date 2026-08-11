@@ -374,7 +374,30 @@ steering  DEGRADED — 1 steering rule(s) this target asks for are missing
                      `packetframe reconfigure` reconciles either way
 ```
 
-It found the drift by asking the NIC, not by inferring it.
+It found the drift by asking the NIC, not by inferring it. **Measured on
+the shadow 2026-08-11**: `ethtool -N eth1 delete 12` against a steered,
+adopted daemon was reported as `steering DEGRADED` within 20 s. Before
+the audit existed the same deletion went unnoticed for two minutes with
+`steering healthy` and no log line.
+
+**The remedy depends on the lifecycle state, and the line tells you
+which one applies.** `packetframe reconfigure` reconciles steering only
+from `Ready` or `Steered`; during an adopted resync it is refused with
+*"vpp-offload is AdoptedResyncing, not converged"*. That is not a rare
+corner — a held deferral is exactly when this audit earns its keep, and
+on a box with no completeness authority it can hold indefinitely. So in
+that state the line says the repair happens on its own instead:
+
+```text
+steering  DEGRADED — 1 steering rule(s) ... steering is reconciled
+                     automatically when this resync finishes and the FIB
+                     verifies; `packetframe reconfigure` is refused until
+                     then, and says so
+```
+
+Which is true: the verify that ends the resync re-emits the steer, and
+`steer` is a reconcile. Nothing is dropping meanwhile — the affected
+prefix is on the eBPF tier, which is where it belongs.
 
 **Two directions, one count.** The rules the ledger names are read back
 and compared field by field, so a deleted, replaced or narrowed rule is
@@ -407,8 +430,8 @@ steering  DEGRADED — 2 location(s) the ledger names are still occupied by
                      unsteered, or prefixes dropped from the allowlist — so
                      traffic may still be diverted into VPP that should not
                      be. The rules outlived the request to remove them;
-                     `ethtool -n <iface>` shows what is there and
-                     `packetframe reconfigure` clears them
+                     `ethtool -n <iface>` shows what is there, and
+                     <the remedy for the current state, as above>
 ```
 
 Two ways to arrive here, and they read the same because the remedy is

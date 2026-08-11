@@ -855,7 +855,7 @@ fn apply_steering(
     req: &SteeringRequest,
 ) -> Result<(), String> {
     let state = driver.state();
-    if !matches!(state, State::Ready | State::Steered) {
+    if !state.accepts_steering_changes() {
         // Deliberately refused rather than queued. A steer request that
         // outlives a crash and fires against the replacement is not what
         // the operator asked for, and the replacement re-steers on its

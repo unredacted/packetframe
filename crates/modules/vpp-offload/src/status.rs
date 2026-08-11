@@ -752,6 +752,24 @@ impl StatusSnapshot {
         // pulling traffic OFF a port is the one case where "steering
         // healthy" is the most expensive possible answer (review
         // finding).
+        //
+        // The remedy depends on the lifecycle state, and saying so is
+        // the point. `packetframe reconfigure` reconciles steering only
+        // from a state that accepts steering changes; during an adopted
+        // resync it is refused. That is not a corner — a held deferral
+        // is the state this audit was written for, and on a box with no
+        // completeness authority it can hold indefinitely, so the line
+        // shipped promising a command that answers "not converged" in
+        // exactly the case it appears most (measured on the shadow,
+        // 2026-08-11). The repair does arrive on its own: the verify
+        // that ends the resync re-emits the steer, and `steer` is a
+        // reconcile.
+        let remedy = if self.state.accepts_steering_changes() {
+            "`packetframe reconfigure` reconciles either way"
+        } else {
+            "steering is reconciled automatically when this resync finishes and the FIB \
+             verifies; `packetframe reconfigure` is refused until then, and says so"
+        };
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
             // "Still occupied", not "still ours". Where the outgoing
@@ -765,7 +783,7 @@ impl StatusSnapshot {
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
                  not be. The rules outlived the request to remove them; `ethtool -n \
-                 <iface>` shows what is there and `packetframe reconfigure` clears them",
+                 <iface>` shows what is there, and {remedy}",
                 self.steer_stray
             ));
         }
@@ -775,7 +793,7 @@ impl StatusSnapshot {
                  longer match what was asked for, or were never installed — that traffic \
                  is on the eBPF tier. Something changed them out of band (a UniFi \
                  provisioning push does this), or the allowlist grew while the inherited \
-                 rules stayed as they were; `packetframe reconfigure` reconciles either way",
+                 rules stayed as they were; {remedy}",
                 self.steer_missing
             ));
         }
@@ -1304,6 +1322,88 @@ mod tests {
             msg.contains("cannot verify") && msg.contains("EIO"),
             "the line must say it could not check, and why: {msg}"
         );
+    }
+
+    /// The remedy the drift line names must be one the module accepts.
+    ///
+    /// Measured on the shadow 2026-08-11: an out-of-band `ethtool -N
+    /// eth1 delete 12` was detected in under 20 s and reported
+    /// `steering DEGRADED ... packetframe reconfigure reconciles either
+    /// way`. Running that command answered *"vpp-offload is
+    /// AdoptedResyncing, not converged — steering changes apply only
+    /// from Ready or Steered"*. The line pointed an operator at a wall,
+    /// in the very state the audit exists to report: an adopted
+    /// deferral, which on a box with no completeness authority holds
+    /// indefinitely.
+    ///
+    /// Asserted as an INVARIANT over every state rather than for the one
+    /// that bit us. The message and `apply_steering`'s gate now read the
+    /// same predicate, and this is what keeps them from drifting apart
+    /// again.
+    #[test]
+    fn the_drift_remedy_matches_the_gate_that_governs_it() {
+        let states = [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ];
+        // Tripwire: a new variant makes this match non-exhaustive, so it
+        // cannot be added without deciding what its drift line should
+        // tell an operator to do.
+        for s in states {
+            match s {
+                State::Stopped
+                | State::Backoff
+                | State::Starting
+                | State::Syncing
+                | State::Verifying
+                | State::Ready
+                | State::Steered
+                | State::AdoptedResyncing => {}
+            }
+        }
+
+        for state in states {
+            let led = ledger_with(10, 0, 0);
+            let mut snap = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(200),
+                },
+                verified(3),
+                ports_up(),
+            );
+            snap.state = state;
+            snap.steer_missing = 1;
+
+            let rep = snap.report();
+            let steering = rep
+                .subsystems
+                .iter()
+                .find(|s| s.name == SUBSYS_STEERING)
+                .expect("steering row");
+            let msg = steering.message.as_deref().unwrap_or_default();
+            assert_eq!(
+                msg.contains("`packetframe reconfigure` reconciles"),
+                state.accepts_steering_changes(),
+                "state {state:?}: the line may name `reconfigure` as the fix only where \
+                 that command is accepted. Everywhere else it is refused, and an operator \
+                 following the health text gets 'not converged': {msg}"
+            );
+            if !state.accepts_steering_changes() {
+                assert!(
+                    msg.contains("reconciled automatically"),
+                    "state {state:?}: where the command is refused the line must say what \
+                     DOES happen — the verify that ends the resync re-emits the steer: {msg}"
+                );
+            }
+        }
     }
 
     /// Rules still steering a port the config turned OFF degrade it.
