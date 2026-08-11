@@ -260,6 +260,9 @@ pub struct StatusSnapshot {
     /// Rules the ledger names that the NIC no longer holds. See
     /// [`crate::runtime::RuntimeStatus::steer_missing`].
     pub steer_missing: usize,
+    /// Why the last steering audit could not read the NIC, if so. See
+    /// [`crate::runtime::RuntimeStatus::steer_audit_error`].
+    pub steer_audit_unreadable: Option<String>,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -342,6 +345,7 @@ impl StatusSnapshot {
             // and every caller of this form is a path with no steering
             // ledger to audit against.
             0,
+            None,
         )
     }
 
@@ -366,6 +370,7 @@ impl StatusSnapshot {
         source_backlog: u64,
         steer_configured: bool,
         steer_missing: usize,
+        steer_audit_unreadable: Option<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -373,6 +378,7 @@ impl StatusSnapshot {
             steer_intended: sup.steer_intended(),
             steer_configured,
             steer_missing,
+            steer_audit_unreadable,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -723,6 +729,23 @@ impl StatusSnapshot {
                      they were inherited from an earlier config; `packetframe \
                      reconfigure` reconciles either way",
                     self.steer_missing
+                )),
+                last_success_age_seconds: None,
+            };
+        }
+        // Checked after proven drift and before everything else: a NIC
+        // that will not answer is not a NIC we can call healthy. The
+        // count alone kept publishing the last clean answer forever
+        // while drift had become undetectable — "cannot check" reported
+        // as "checked, fine" (review finding).
+        if let Some(why) = &self.steer_audit_unreadable {
+            return SubsystemHealth {
+                name: SUBSYS_STEERING.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "cannot verify steering: the NIC would not answer a rule readback \
+                     ({why}). Rules may have been removed or altered without this being \
+                     visible; `ethtool -n <iface>` is the ground truth until it clears"
                 )),
                 last_success_age_seconds: None,
             };
@@ -1184,6 +1207,49 @@ mod tests {
     /// Degraded rather than Unhealthy on purpose: the stripped traffic
     /// falls back to the eBPF tier, so nothing is dropping — the offload
     /// is just smaller than it claims.
+    /// A NIC that will not answer is not a healthy NIC.
+    ///
+    /// The audit keeps its previous count when a readback fails, which
+    /// is right — an unreadable NIC is not a wrong one. But publishing
+    /// only that count meant a persistently unreadable NIC kept
+    /// reporting the last clean answer forever, so steering read
+    /// Healthy while drift had become undetectable (review finding).
+    /// "Cannot check" and "checked, fine" must not print the same line.
+    #[test]
+    fn an_unreadable_steering_audit_is_not_healthy() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        // Zero missing — the last audit that SUCCEEDED found nothing.
+        snap.steer_missing = 0;
+        snap.steer_audit_unreadable = Some("EIO: readback failed".into());
+
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(
+            steering.state,
+            HealthState::Degraded,
+            "an audit that could not read the NIC must not present the previous \
+             clean count as current: {steering:?}"
+        );
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("cannot verify") && msg.contains("EIO"),
+            "the line must say it could not check, and why: {msg}"
+        );
+    }
+
     #[test]
     fn steering_rules_missing_from_the_nic_degrade_it() {
         let led = ledger_with(10, 0, 0);

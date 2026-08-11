@@ -1021,6 +1021,7 @@ fn run_loop(
             rs.source_backlog,
             rs.steer_configured_ports > 0,
             rs.steer_missing,
+            rs.steer_audit_error.clone(),
         );
         let report = snap.report();
         let overall = report.overall;

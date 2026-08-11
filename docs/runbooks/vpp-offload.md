@@ -371,8 +371,23 @@ steering  DEGRADED — 1 steering rule(s) the ledger names are gone from the
                      does this); `packetframe reconfigure` reinstalls them
 ```
 
-It found the drift by asking the NIC, not by inferring it. **Detection
-only — it does not repair**, deliberately: re-asserting rules from a
+It found the drift by asking the NIC, not by inferring it.
+
+If the NIC will not answer the readback at all, that is reported too and
+is NOT the same line:
+
+```text
+steering  DEGRADED — cannot verify steering: the NIC would not answer a
+                     rule readback (EIO: ...). Rules may have been removed
+                     or altered without this being visible; `ethtool -n
+                     <iface>` is the ground truth until it clears
+```
+
+An audit that cannot read keeps its previous count — an unreadable NIC
+is not a wrong one — but it must not present that count as current.
+"Cannot check" and "checked, fine" are different answers.
+
+**Detection only — it does not repair**, deliberately: re-asserting rules from a
 background audit would put a second, unsupervised installation path
 beside `Action::Steer`, and the repair is one operator command.
 

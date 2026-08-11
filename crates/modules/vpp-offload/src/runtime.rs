@@ -339,6 +339,14 @@ struct Core {
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
     steer_missing: usize,
+    /// Why the last audit could not read the NIC, if it could not.
+    ///
+    /// Kept apart from `steer_missing` because they answer different
+    /// questions: that one is "how many are gone", this one is "the
+    /// answer is not known". Collapsing them let a NIC that stopped
+    /// answering keep publishing the last clean count, so steering read
+    /// Healthy while drift had become undetectable (review finding).
+    steer_audit_error: Option<String>,
 }
 
 /// The loaded-and-quiet release gate, shared by both deferral stages.
@@ -788,6 +796,7 @@ impl Runtime {
                 deferred_resync: None,
                 last_steer_audit: None,
                 steer_missing: 0,
+                steer_audit_error: None,
             })),
         }
     }
@@ -908,6 +917,7 @@ impl Runtime {
             // off (review finding).
             if c.steering.installed().is_empty() {
                 c.steer_missing = 0;
+                c.steer_audit_error = None;
                 c.last_steer_audit = None;
             }
             let due = c
@@ -917,6 +927,7 @@ impl Runtime {
                 c.last_steer_audit = Some(now);
                 match c.steering.missing_from_nic() {
                     Ok(missing) => {
+                        c.steer_audit_error = None;
                         if !missing.is_empty() && c.steer_missing != missing.len() {
                             tracing::warn!(
                                 missing = ?missing,
@@ -928,9 +939,16 @@ impl Runtime {
                         c.steer_missing = missing.len();
                     }
                     // A NIC we cannot read is not a NIC we can call
-                    // wrong. Keep the last answer rather than inventing
-                    // a clean one.
-                    Err(e) => tracing::debug!(error = %e, "steering audit could not read the NIC"),
+                    // wrong — the last count stands. But it is not a
+                    // NIC we can call RIGHT either, and publishing the
+                    // stale count alone let a persistently unreadable
+                    // NIC keep reporting the last clean answer forever
+                    // (review finding). Record the failure so health
+                    // can say the answer is unknown.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "steering audit could not read the NIC");
+                        c.steer_audit_error = Some(e);
+                    }
                 }
             }
         }
@@ -950,6 +968,7 @@ impl Runtime {
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
             steer_missing: c.steer_missing,
+            steer_audit_error: c.steer_audit_error.clone(),
             authority: if c.completeness.is_none() {
                 AuthorityPosture::Absent
             } else if matches!(
@@ -1028,6 +1047,8 @@ pub struct RuntimeStatus {
     /// How many rules the ledger names that the NIC no longer holds, as
     /// of the last audit. See [`STEER_AUDIT_EVERY`].
     pub steer_missing: usize,
+    /// Why the last steering audit could not read the NIC, if so.
+    pub steer_audit_error: Option<String>,
 }
 
 impl Core {
