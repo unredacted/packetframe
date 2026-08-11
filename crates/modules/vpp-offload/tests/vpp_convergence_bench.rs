@@ -93,6 +93,9 @@ struct FileSource {
 }
 
 impl RouteSource for FileSource {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         for (p, nhs) in &self.routes {
             visit(*p, nhs);

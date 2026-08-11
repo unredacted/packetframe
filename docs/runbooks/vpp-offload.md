@@ -837,6 +837,46 @@ on the old segments. That refusal is not pedantry: applying it anyway is
 the mid-resync OOM abort gate 0b found. Raise `expected-routes`, then
 restart.
 
+### `route-feed DEGRADED` / `packetframe_vpp_drain_failing 1`
+
+The last attempt to push route updates into VPP did not land. The work is
+**not lost** and is retried every tick — the offload is forwarding a table
+that is behind bird, not a wrong one.
+
+**Which queue holds it depends on where it failed, and the two are
+different metrics.** The row itself prints both counts; do not read one of
+them as the whole answer:
+
+- Work that never reached VPP's FIB because the *drain* broke mid-batch is
+  requeued in the engine's pending map → `packetframe_vpp_pending_ops`.
+  `source_backlog` can sit at zero throughout.
+- Work handed back to the route feed because a *neighbour* send failed
+  before its batch's routes were applied → `packetframe_vpp_source_backlog`.
+
+Read the reason on the row. Two shapes matter:
+
+- **A transport error** (`socket closed`, `context mismatch`). The engine
+  drops its connection and reconnects on the next tick; one of these in
+  isolation is noise. Sustained, it is VPP not answering, and the wedge
+  detector owns that. This is the `pending_ops` shape above — unless the
+  socket broke on a neighbour message, in which case the batch went back
+  to the feed *and* the affected adjacency is reconciled against a fresh
+  `ip_neighbor_dump` before anything is re-sent, because a write whose
+  reply never arrived may or may not have been applied.
+- **`VPP refused the static neighbour for <nexthop> (retval …)`** — VPP
+  rejected an adjacency. This one blocks the whole delta stream: routes
+  through an unprogrammed adjacency install cleanly, verify cleanly and
+  drop every packet, so nothing in the batch is applied until the
+  adjacency is. Check that the nexthop's egress device is a configured
+  `port` (or a declared VLAN over one) and that `ip neigh` still shows
+  the nexthop with a real MAC.
+
+While this is set on an **unsteered** port, the first steer is refused —
+the missing prefixes are in none of the `unresolvable`/`withheld`/
+`installing` counts, so those reading zero is not enough on its own. It
+clears as soon as one update lands; look again rather than reconfiguring
+anything.
+
 ### The offload restarts repeatedly
 
 `packetframe status` carries the reason on the failing subsystem, and it
@@ -1092,4 +1132,6 @@ refused rather than adopted.
   `require-table-complete off` hands the judgement back to you, and rung
   0's soak is what discharges it: the `unresolvable`, `withheld` and
   `installing` counts must all read zero before you turn the first
-  lever.
+  lever — **and no `route-feed` row may be present**. Those three counts
+  cannot describe an update that never reached VPP at all, which is why
+  that row is a separate condition on the same gate.

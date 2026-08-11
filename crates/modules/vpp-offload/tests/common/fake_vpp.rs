@@ -32,7 +32,7 @@ use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, ControlPingReply, CreateLoopbackReply, DevAttachReply,
     DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
-    IpNeighborDetails, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
+    IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
     IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
     SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
     SwInterfaceSetMacAddressReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
@@ -103,6 +103,11 @@ pub enum Event {
         sw_if_index: u32,
         mac: [u8; 6],
         flags: u8,
+        /// Add or remove. A removal carries a zero MAC, so without this
+        /// the two are only distinguishable by a convention the assertion
+        /// has to know — and "the adjacency was programmed again" is
+        /// exactly the claim one test needs to make precisely.
+        is_add: bool,
     },
 }
 
@@ -120,6 +125,25 @@ pub struct Behaviour {
     /// Reject this many *deletes* with a non-zero retval before
     /// accepting them.
     pub reject_deletes: usize,
+    /// Reject this many neighbour **adds** with a non-zero retval before
+    /// accepting them, WITHOUT closing the connection.
+    ///
+    /// The shape a hangup cannot model: the stream is fine, so the engine
+    /// keeps its transport, and the failure is one message refused in the
+    /// middle of a delta batch whose route half has not been applied yet.
+    pub reject_neighbour_adds: usize,
+    /// Apply the next neighbour op and then drop the connection **without
+    /// replying**, once.
+    ///
+    /// The ambiguous case, and the only one that matters for the
+    /// unacknowledged-neighbour ledger: the write landed, VPP acted on it,
+    /// and the client cannot know. A `reject_*` reply is unambiguous (VPP
+    /// told us) and a hangup *before* the op is unambiguous the other way;
+    /// this is neither, which is why the client has to ask afterwards.
+    ///
+    /// One-shot, so the reconnect can complete the job — the same reason
+    /// `hangup_after` is.
+    pub swallow_neighbour_reply: bool,
     /// Advertise garbage CRCs in the handshake's message table — the
     /// version-skew shape the transport must refuse loudly.
     pub garbage_crcs: bool,
@@ -188,13 +212,20 @@ impl Fake {
 
         thread::spawn(move || {
             let mut b = behaviour;
+            // VPP's neighbour table, OUTSIDE the accept loop, because it
+            // has to survive a reconnect — a socket the client lost is not
+            // a table VPP forgot. That persistence is the whole subject of
+            // the unacknowledged-neighbour tests: the entry is still there
+            // when we come back and ask.
+            let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
             // Accept repeatedly: a disconnect-and-reconnect is part of
             // what these tests exercise.
             while let Ok((mut sock, _)) = listener.accept() {
-                serve(&mut sock, &tx, b);
+                serve(&mut sock, &tx, b, &mut neighbours);
                 // One-shot hangup: the point of that test is that a fresh
                 // connection can finish the job.
                 b.hangup_after = None;
+                b.swallow_neighbour_reply = false;
             }
         });
 
@@ -214,7 +245,12 @@ impl Fake {
     }
 }
 
-fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) -> Option<()> {
+fn serve(
+    sock: &mut UnixStream,
+    tx: &Sender<Event>,
+    mut behaviour: Behaviour,
+    neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
+) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
     // dump reports it, so `attach::set_mac`'s readback has a real answer
     // to compare against rather than a constant that always matches.
@@ -321,7 +357,18 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
             // A DUMP, streamed like the others: details frames, no
             // terminator, ended by the trailing control_ping's reply.
             "ip_neighbor_dump" => {
-                for &(ip, sw_if_index, mac, flags) in behaviour.existing_neighbours {
+                // Honour the requested family. Every entry this fake holds
+                // is v4, so a v6 dump answers empty — which is what a real
+                // v4-only table does, and what makes "one dump per carried
+                // family" observable rather than a coincidence.
+                let mut d = Decoder::new(&req);
+                let want = IpNeighborDump::decode(&mut d)
+                    .expect("decodes as a neighbour dump")
+                    .af;
+                if want != ADDRESS_IP4 {
+                    continue;
+                }
+                for &(ip, sw_if_index, mac, flags) in neighbours.iter() {
                     let mut d = reply_head("ip_neighbor_details");
                     let mut un = [0u8; 16];
                     un[..4].copy_from_slice(&ip);
@@ -350,11 +397,39 @@ fn serve(sock: &mut UnixStream, tx: &Sender<Event>, mut behaviour: Behaviour) ->
                     sw_if_index: n.neighbor.sw_if_index,
                     mac: n.neighbor.mac_address,
                     flags: n.neighbor.flags,
+                    is_add: n.is_add,
                 });
+                let retval = if n.is_add && behaviour.reject_neighbour_adds > 0 {
+                    behaviour.reject_neighbour_adds -= 1;
+                    -1
+                } else {
+                    0
+                };
+                // A real VPP applies the op before it answers, so the
+                // table moves even when the answer never arrives.
+                if retval == 0 {
+                    let mut key = [0u8; 4];
+                    key.copy_from_slice(&n.neighbor.ip_address.un.0[..4]);
+                    neighbours
+                        .retain(|(ip, idx, _, _)| !(*ip == key && *idx == n.neighbor.sw_if_index));
+                    if n.is_add {
+                        neighbours.push((
+                            key,
+                            n.neighbor.sw_if_index,
+                            n.neighbor.mac_address,
+                            n.neighbor.flags,
+                        ));
+                    }
+                }
+                // Applied, then silence: the client cannot tell whether we
+                // acted. This is the case `neighbours_unacked` exists for.
+                if behaviour.swallow_neighbour_reply {
+                    return None;
+                }
                 out = reply_head("ip_neighbor_add_del_reply");
                 IpNeighborAddDelReply {
                     context: ctx,
-                    retval: 0,
+                    retval,
                     stats_index: 0,
                 }
                 .encode(&mut out);
