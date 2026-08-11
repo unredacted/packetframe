@@ -358,16 +358,26 @@ count against the floor in the health text.
 
 ### Steering silently went partial — fewer rules in the NIC than the ledger thinks
 
-**Nothing detects this. Health stays green.** Measured 2026-08-11: a
-rule deleted out of band (`ethtool -N eth1 delete 12`) was still missing
-two minutes later, `steering healthy` throughout, not one line in the
-log. The ledger and the state file went on naming four rules while the
-NIC held three.
+**The module now detects this within 30 s and says so:**
 
-Why: nothing polls the NIC. The only thing that re-emits `Action::Steer`
-is `VerifyPassed`, and verify does not re-run in steady state — so a
-provisioning push, a firmware event, or anything else that clears MCAM
-entries leaves the offload **partially steered indefinitely**.
+```text
+steering  DEGRADED — 1 steering rule(s) the ledger names are gone from the
+                     NIC — that traffic is on the eBPF tier. Something
+                     removed them out of band (a UniFi provisioning push
+                     does this); `packetframe reconfigure` reinstalls them
+```
+
+It found the drift by asking the NIC, not by inferring it. **Detection
+only — it does not repair**, deliberately: re-asserting rules from a
+background audit would put a second, unsupervised installation path
+beside `Action::Steer`, and the repair is one operator command.
+
+Before that audit existed this went entirely unnoticed. Measured
+2026-08-11: a rule deleted out of band (`ethtool -N eth1 delete 12`) was
+still missing two minutes later, `steering healthy` throughout, not one
+line in the log — nothing polled the NIC, and the only thing that
+re-emits `Action::Steer` is `VerifyPassed`, which does not recur in
+steady state.
 
 What it costs: less than it sounds. Traffic for the stripped rule falls
 back to the **eBPF tier**, which is exactly where it belongs — this is a

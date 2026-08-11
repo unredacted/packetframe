@@ -257,6 +257,9 @@ pub struct StatusSnapshot {
     /// had just written `steer on` could not tell the config had been
     /// read at all.
     pub steer_configured: bool,
+    /// Rules the ledger names that the NIC no longer holds. See
+    /// [`crate::runtime::RuntimeStatus::steer_missing`].
+    pub steer_missing: usize,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -334,6 +337,11 @@ impl StatusSnapshot {
             None,
             0,
             steer_configured,
+            // The shorthand has no NIC audit behind it; claiming zero
+            // drift would be a claim. Zero here means "not observed",
+            // and every caller of this form is a path with no steering
+            // ledger to audit against.
+            0,
         )
     }
 
@@ -357,12 +365,14 @@ impl StatusSnapshot {
         drain_error: Option<String>,
         source_backlog: u64,
         steer_configured: bool,
+        steer_missing: usize,
     ) -> Self {
         Self {
             state: sup.state(),
             steered: sup.is_steered(),
             steer_intended: sup.steer_intended(),
             steer_configured,
+            steer_missing,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -691,6 +701,31 @@ impl StatusSnapshot {
     }
 
     fn steering_health(&self) -> SubsystemHealth {
+        // Checked before the steered arm: "steered" is a fact about
+        // what we asked for, and this is a fact about what the NIC
+        // actually holds. A provisioning push can strip rules with
+        // nothing else noticing — measured on the shadow 2026-08-11,
+        // still missing two minutes later with `steering healthy` —
+        // and the answer an operator needs is not "steered" but "part
+        // of it is gone, and here is the one command that fixes it".
+        //
+        // DEGRADED, not Unhealthy: the stripped traffic falls back to
+        // the eBPF tier, which is where it belongs. Nothing is
+        // dropping; the offload is smaller than it claims.
+        if self.steer_missing > 0 {
+            return SubsystemHealth {
+                name: SUBSYS_STEERING.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "{} steering rule(s) the ledger names are gone from the NIC — that \
+                     traffic is on the eBPF tier. Something removed them out of band (a \
+                     UniFi provisioning push does this); `packetframe reconfigure` \
+                     reinstalls them",
+                    self.steer_missing
+                )),
+                last_success_age_seconds: None,
+            };
+        }
         let (state, message) = match (self.steered, self.steer_intended) {
             (true, _) => (HealthState::Healthy, None),
             // Intended but absent: a failed steer, or steering torn down
@@ -1135,6 +1170,57 @@ mod tests {
             ports,
             false,
         )
+    }
+
+    /// Rules missing from the NIC degrade steering, even while steered.
+    ///
+    /// The arm is checked BEFORE `steered`, because "steered" says what
+    /// we asked for and this says what the NIC actually holds. On the
+    /// shadow (2026-08-11) a rule deleted out of band left `steering
+    /// healthy` for two minutes with three of four rules installed; an
+    /// operator reading that line had no way to know.
+    ///
+    /// Degraded rather than Unhealthy on purpose: the stripped traffic
+    /// falls back to the eBPF tier, so nothing is dropping — the offload
+    /// is just smaller than it claims.
+    #[test]
+    fn steering_rules_missing_from_the_nic_degrade_it() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        // Baseline: a NIC that agrees is healthy.
+        let base = snap.report();
+        let steering = base
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(steering.state, HealthState::Healthy, "{steering:?}");
+
+        snap.steer_missing = 1;
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(
+            steering.state,
+            HealthState::Degraded,
+            "a NIC missing a rule the ledger names must not read healthy"
+        );
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("reconfigure"),
+            "the line has to name the one command that fixes it: {msg}"
+        );
     }
 
     #[test]

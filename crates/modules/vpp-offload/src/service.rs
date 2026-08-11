@@ -1020,6 +1020,7 @@ fn run_loop(
             rs.drain_error.clone(),
             rs.source_backlog,
             rs.steer_configured_ports > 0,
+            rs.steer_missing,
         );
         let report = snap.report();
         let overall = report.overall;

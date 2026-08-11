@@ -519,6 +519,15 @@ pub(super) mod sys {
         })
     }
 
+    /// Drop a rule WITHOUT going through `delete` — what a UniFi
+    /// provisioning push, a firmware event, or an operator with
+    /// `ethtool -N <if> delete <loc>` does. Nothing tells the module.
+    pub(crate) fn remove_behind_back(iface: &str, loc: u32) {
+        NIC.with(|n| {
+            n.borrow_mut().rules.remove(&(iface.to_string(), loc));
+        });
+    }
+
     /// Every `(iface, loc)` the NIC currently holds, sorted — the
     /// ground truth a test compares the ledger against.
     pub(crate) fn rules() -> Vec<(String, u32)> {
@@ -841,6 +850,31 @@ impl crate::runtime::Steering for NtupleSteering {
         }
     }
 
+    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
+        // One NIC read per INTERFACE, not per rule: `rule_table` is an
+        // ioctl pair (count, then enumerate), and the ledger holds two
+        // rules per allowlisted prefix on every steered port.
+        let mut seen: Vec<(String, Vec<u32>)> = Vec::new();
+        let mut missing = Vec::new();
+        for (iface, loc) in &self.installed {
+            let occupied = match seen.iter().find(|(i, _)| i == iface) {
+                Some((_, occ)) => occ,
+                None => {
+                    let table = rule_table(iface)?;
+                    seen.push((iface.clone(), table.occupied));
+                    &seen.last().expect("just pushed").1
+                }
+            };
+            // Only OUR locations are checked. `occupied` lists whatever
+            // the NIC holds, anyone's — a rule we did not install is not
+            // our business and must not read as drift.
+            if !occupied.contains(loc) {
+                missing.push((iface.clone(), *loc));
+            }
+        }
+        Ok(missing)
+    }
+
     fn installed(&self) -> Vec<(String, u32)> {
         self.installed.clone()
     }
@@ -1052,6 +1086,52 @@ mod tests {
         let e = s.steer().expect_err("must refuse");
         assert!(e.contains("nothing to steer"), "{e}");
         assert!(s.installed().is_empty());
+    }
+
+    /// A rule removed from the NIC behind our back is reported missing.
+    ///
+    /// Measured on the shadow 2026-08-11: `ethtool -N eth1 delete 12`
+    /// while steered left the NIC holding three of four rules, and two
+    /// minutes later `steering healthy` was still the answer — nothing
+    /// polls the NIC, and only `VerifyPassed` re-emits `Action::Steer`,
+    /// which does not recur in steady state. The traffic was fine (it
+    /// falls back to the eBPF tier, which is where it belongs); what was
+    /// lost was knowing.
+    ///
+    /// This is the detection half only. Repair stays manual — a plain
+    /// `reconfigure` reinstalls the missing rule, because `steer` is a
+    /// reconcile — so nothing here re-asserts anything, and a wrong
+    /// answer costs a health line rather than a forwarding decision.
+    #[test]
+    fn a_rule_deleted_behind_our_back_is_reported_missing() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("steer installs");
+        let installed = s.installed();
+        assert!(!installed.is_empty(), "the fixture must install something");
+        assert_eq!(
+            s.missing_from_nic().expect("read the NIC"),
+            Vec::new(),
+            "a NIC that agrees with the ledger reports nothing missing"
+        );
+
+        // Exactly what the provisioning push did.
+        let (iface, loc) = installed[0].clone();
+        sys::remove_behind_back(&iface, loc);
+
+        assert_eq!(
+            s.missing_from_nic().expect("read the NIC"),
+            vec![(iface, loc)],
+            "a rule the NIC no longer holds must be reported, or the offload \
+             goes silently partial with health green"
+        );
+        assert_eq!(
+            s.installed().len(),
+            installed.len(),
+            "detection must not mutate the ledger — repair is a separate, \
+             operator-triggered step"
+        );
     }
 
     /// A rule that would not delete STAYS recorded.

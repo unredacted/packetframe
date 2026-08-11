@@ -196,6 +196,23 @@ pub trait Steering {
     /// persisted — see [`IdentityStore::steering_changed`]. A rule that
     /// would not come out is still diverting traffic, so the failure
     /// path is the one that most needs this recorded.
+    /// Rules the ledger names that the NIC no longer holds.
+    ///
+    /// DETECTION ONLY — it must not repair, and it must not touch the
+    /// ledger. A rule can leave the NIC without us: a UniFi
+    /// provisioning push, a firmware event, an operator with `ethtool
+    /// -N`. Nothing re-emits `Action::Steer` in steady state (only
+    /// `VerifyPassed` does, and verify does not recur), so the offload
+    /// goes silently partial with health green — measured on the shadow
+    /// 2026-08-11, still missing two minutes later with no log line.
+    ///
+    /// Kept observational on purpose. The traffic is not lost — it falls
+    /// back to the eBPF tier, which is where it belongs — so the cost of
+    /// a wrong answer here is a misleading health line, not a forwarding
+    /// decision. Repair stays the operator's `packetframe reconfigure`,
+    /// which reinstalls what is missing because `steer` is a reconcile.
+    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String>;
+
     fn installed(&self) -> Vec<(String, u32)>;
     /// Change what steering *should* be, without touching the NIC.
     ///
@@ -246,6 +263,9 @@ impl Steering for SteeringUnavailable {
     }
     fn unsteer(&mut self) -> Result<(), String> {
         Err("MCAM steering is unavailable in this runtime; cannot confirm rules removed".into())
+    }
+    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
+        Ok(Vec::new())
     }
     fn installed(&self) -> Vec<(String, u32)> {
         Vec::new()
@@ -315,6 +335,10 @@ struct Core {
     /// itself freezes VPP's workers (drill (d10), 2026-08-09). See
     /// [`DeferredResync`] for the two stages.
     deferred_resync: Option<DeferredResync>,
+    /// When the NIC was last audited against the steering ledger, and
+    /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
+    last_steer_audit: Option<std::time::Instant>,
+    steer_missing: usize,
 }
 
 /// The loaded-and-quiet release gate, shared by both deferral stages.
@@ -762,6 +786,8 @@ impl Runtime {
                 last_store_error: None,
                 last_drain_error: None,
                 deferred_resync: None,
+                last_steer_audit: None,
+                steer_missing: 0,
             })),
         }
     }
@@ -860,6 +886,42 @@ impl Runtime {
     /// last API error, and any store failure from a path that could not
     /// refuse.
     pub fn status(&self) -> RuntimeStatus {
+        // Ask the NIC whether it still holds what the ledger claims,
+        // at most once per STEER_AUDIT_EVERY. Rate-limited on the REAL
+        // clock rather than the driven one: this is a hardware poll,
+        // not a supervision deadline, and pacing it off a clock a test
+        // can fast-forward would turn every driven tick into an ioctl.
+        //
+        // Detection only. Nothing here re-asserts, and the ledger is
+        // never touched — a wrong answer costs a health line, not a
+        // forwarding decision. Repair is the operator's `reconfigure`.
+        {
+            let mut c = self.core.borrow_mut();
+            let now = std::time::Instant::now();
+            let due = c
+                .last_steer_audit
+                .is_none_or(|t| now.duration_since(t) >= STEER_AUDIT_EVERY);
+            if due && !c.steering.installed().is_empty() {
+                c.last_steer_audit = Some(now);
+                match c.steering.missing_from_nic() {
+                    Ok(missing) => {
+                        if !missing.is_empty() && c.steer_missing != missing.len() {
+                            tracing::warn!(
+                                missing = ?missing,
+                                "steering rules the ledger names are gone from the NIC; \
+                                 traffic for them is on the eBPF tier. `packetframe \
+                                 reconfigure` reinstalls them"
+                            );
+                        }
+                        c.steer_missing = missing.len();
+                    }
+                    // A NIC we cannot read is not a NIC we can call
+                    // wrong. Keep the last answer rather than inventing
+                    // a clean one.
+                    Err(e) => tracing::debug!(error = %e, "steering audit could not read the NIC"),
+                }
+            }
+        }
         let c = self.core.borrow();
         RuntimeStatus {
             counts: c.engine.counts(),
@@ -875,6 +937,7 @@ impl Runtime {
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
+            steer_missing: c.steer_missing,
             authority: if c.completeness.is_none() {
                 AuthorityPosture::Absent
             } else if matches!(
@@ -888,6 +951,16 @@ impl Runtime {
         }
     }
 }
+
+/// How often to ask the NIC whether it still holds the rules the ledger
+/// names.
+///
+/// Two ioctls per steered interface per interval, so 30 s is free even
+/// on a fully steered box. Sized against how long a silently-partial
+/// offload should be allowed to go unnoticed rather than against any
+/// hardware limit — on the shadow it went two minutes and would have
+/// gone indefinitely.
+const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -940,6 +1013,9 @@ pub struct RuntimeStatus {
     /// recommends the thing it already has, while a demoted one is
     /// waiting on something else entirely.
     pub authority: AuthorityPosture,
+    /// How many rules the ledger names that the NIC no longer holds, as
+    /// of the last audit. See [`STEER_AUDIT_EVERY`].
+    pub steer_missing: usize,
 }
 
 impl Core {
@@ -1909,6 +1985,9 @@ mod tests {
     }
 
     impl Steering for LedgerSteering {
+        fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
+            Ok(Vec::new())
+        }
         fn configured_ports(&self) -> usize {
             self.configured
         }
