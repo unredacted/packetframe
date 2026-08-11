@@ -399,6 +399,18 @@ An audit that cannot read keeps its previous count — an unreadable NIC
 is not a wrong one — but it must not present that count as current.
 "Cannot check" and "checked, fine" are different answers.
 
+And when both hold — drift was proven, then the NIC stopped answering —
+the line says so, because a count read as current sends you to fix that
+many rules and stop looking:
+
+```text
+steering  DEGRADED — 1 steering rule(s) ... reconfigure reconciles either
+                     way. That count is the last answer the NIC gave, not
+                     a current one: the NIC would not answer a rule
+                     readback (EIO: ...), so rules may be removed or
+                     altered without this being visible
+```
+
 **Detection only — it does not repair**, deliberately: re-asserting rules from a
 background audit would put a second, unsupervised installation path
 beside `Action::Steer`, and the repair is one operator command.

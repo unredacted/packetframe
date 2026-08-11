@@ -718,36 +718,49 @@ impl StatusSnapshot {
         // DEGRADED, not Unhealthy: the stripped traffic falls back to
         // the eBPF tier, which is where it belongs. Nothing is
         // dropping; the offload is smaller than it claims.
-        if self.steer_missing > 0 {
+        //
+        // A NIC that will not answer is not healthy either, and the two
+        // facts are INDEPENDENT: `Runtime::status` retains the last count
+        // when a readback fails, so a nonzero count and an unreadable
+        // audit can both hold. Ordering them could not fix that —
+        // whichever arm ran first hid the other, and the first version
+        // published the retained count as though it were current while
+        // further drift had become invisible (review finding). So one
+        // arm, and the message carries whichever facts are true.
+        let drift = (self.steer_missing > 0).then(|| {
+            format!(
+                "{} steering rule(s) this target asks for are missing from the NIC, no \
+                 longer match what was asked for, or were never installed — that traffic \
+                 is on the eBPF tier. Something changed them out of band (a UniFi \
+                 provisioning push does this), or the allowlist grew while the inherited \
+                 rules stayed as they were; `packetframe reconfigure` reconciles either way",
+                self.steer_missing
+            )
+        });
+        let unverifiable = |why: &str| {
+            format!(
+                "the NIC would not answer a rule readback ({why}), so rules may be \
+                 removed or altered without this being visible; `ethtool -n <iface>` is \
+                 the ground truth until it clears"
+            )
+        };
+        let message = match (drift, self.steer_audit_unreadable.as_deref()) {
+            (Some(drift), None) => Some(drift),
+            // Both: the count is real but STALE, and saying so is the
+            // whole point — an operator reading a count as current will
+            // fix that many rules and stop looking.
+            (Some(drift), Some(why)) => Some(format!(
+                "{drift}. That count is the last answer the NIC gave, not a current one: {}",
+                unverifiable(why)
+            )),
+            (None, Some(why)) => Some(format!("cannot verify steering: {}", unverifiable(why))),
+            (None, None) => None,
+        };
+        if let Some(message) = message {
             return SubsystemHealth {
                 name: SUBSYS_STEERING.into(),
                 state: HealthState::Degraded,
-                message: Some(format!(
-                    "{} steering rule(s) this target asks for are missing from the NIC, \
-                     no longer match what was asked for, or were never installed — that \
-                     traffic is on the eBPF tier. Something changed them out of band (a \
-                     UniFi provisioning push does this), or the allowlist grew while the \
-                     inherited rules stayed as they were; `packetframe reconfigure` \
-                     reconciles either way",
-                    self.steer_missing
-                )),
-                last_success_age_seconds: None,
-            };
-        }
-        // Checked after proven drift and before everything else: a NIC
-        // that will not answer is not a NIC we can call healthy. The
-        // count alone kept publishing the last clean answer forever
-        // while drift had become undetectable — "cannot check" reported
-        // as "checked, fine" (review finding).
-        if let Some(why) = &self.steer_audit_unreadable {
-            return SubsystemHealth {
-                name: SUBSYS_STEERING.into(),
-                state: HealthState::Degraded,
-                message: Some(format!(
-                    "cannot verify steering: the NIC would not answer a rule readback \
-                     ({why}). Rules may have been removed or altered without this being \
-                     visible; `ethtool -n <iface>` is the ground truth until it clears"
-                )),
+                message: Some(message),
                 last_success_age_seconds: None,
             };
         }
@@ -1248,6 +1261,53 @@ mod tests {
         assert!(
             msg.contains("cannot verify") && msg.contains("EIO"),
             "the line must say it could not check, and why: {msg}"
+        );
+    }
+
+    /// A RETAINED drift count must say it can no longer be checked.
+    ///
+    /// The two facts are independent — `Runtime::status` keeps the last
+    /// count when a readback fails — so this combination is reachable and
+    /// was the one the previous fix left behind: proven drift returned
+    /// first and the unreadable audit went unmentioned, so an operator
+    /// read "1 rule missing, reconfigure fixes it", fixed one rule, and
+    /// had no way to know the audit had stopped being able to find the
+    /// rest. Ordering cannot fix it; whichever arm runs first hides the
+    /// other (review finding).
+    #[test]
+    fn a_retained_drift_count_says_it_is_no_longer_current() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        // Drift was proven by an earlier audit; the NIC has since stopped
+        // answering, so the count stands but nothing can add to it.
+        snap.steer_missing = 1;
+        snap.steer_audit_unreadable = Some("EIO: readback failed".into());
+
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(steering.state, HealthState::Degraded);
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains('1') && msg.contains("eBPF tier"),
+            "the proven drift must still be reported: {msg}"
+        );
+        assert!(
+            msg.contains("EIO") && msg.contains("not a current one"),
+            "and so must the fact that the count is stale and further drift is \
+             invisible — reporting only the count sends an operator to fix that \
+             many rules and stop looking: {msg}"
         );
     }
 
