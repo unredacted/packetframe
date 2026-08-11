@@ -196,7 +196,10 @@ pub trait Steering {
     /// persisted — see [`IdentityStore::steering_changed`]. A rule that
     /// would not come out is still diverting traffic, so the failure
     /// path is the one that most needs this recorded.
-    /// Rules the ledger names that the NIC no longer holds.
+    /// Rules the NIC should be holding for the current target and is
+    /// not — both directions: ones the ledger names that are gone or
+    /// altered, and ones the target asks for that were never installed
+    /// (a restart after the allowlist grew inherits only the old set).
     ///
     /// DETECTION ONLY — it must not repair, and it must not touch the
     /// ledger. A rule can leave the NIC without us: a UniFi

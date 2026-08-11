@@ -360,18 +360,30 @@ count against the floor in the health text.
 
 ## Triage by symptom
 
-### Steering silently went partial — fewer rules in the NIC than the ledger thinks
+### Steering silently went partial — the NIC holds less than the config asks for
 
 **The module now detects this within 30 s and says so:**
 
 ```text
-steering  DEGRADED — 1 steering rule(s) the ledger names are gone from the
-                     NIC — that traffic is on the eBPF tier. Something
-                     removed them out of band (a UniFi provisioning push
-                     does this); `packetframe reconfigure` reinstalls them
+steering  DEGRADED — 1 steering rule(s) this target asks for are missing
+                     from the NIC, no longer match what was asked for, or
+                     were never installed — that traffic is on the eBPF
+                     tier. Something changed them out of band (a UniFi
+                     provisioning push does this), or the allowlist grew
+                     while the inherited rules stayed as they were;
+                     `packetframe reconfigure` reconciles either way
 ```
 
 It found the drift by asking the NIC, not by inferring it.
+
+**Two directions, one count.** The rules the ledger names are read back
+and compared field by field, so a deleted, replaced or narrowed rule is
+drift. And the rules the *current* target asks for are checked for a
+counterpart, so a rule that was never installed counts too — the shape a
+restart produces when the allowlist grew while the daemon was down: the
+state file names the old rules, they all read back clean, and the new
+prefix has no rule anywhere. One-directional, that read Healthy for as
+long as the adopted resync stayed deferred.
 
 If the NIC will not answer the readback at all, that is reported too and
 is NOT the same line:

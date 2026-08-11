@@ -723,11 +723,12 @@ impl StatusSnapshot {
                 name: SUBSYS_STEERING.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "{} steering rule(s) are missing from the NIC or no longer match \
-                     what was asked for — that traffic is on the eBPF tier. Something \
-                     changed them out of band (a UniFi provisioning push does this), or \
-                     they were inherited from an earlier config; `packetframe \
-                     reconfigure` reconciles either way",
+                    "{} steering rule(s) this target asks for are missing from the NIC, \
+                     no longer match what was asked for, or were never installed — that \
+                     traffic is on the eBPF tier. Something changed them out of band (a \
+                     UniFi provisioning push does this), or the allowlist grew while the \
+                     inherited rules stayed as they were; `packetframe reconfigure` \
+                     reconciles either way",
                     self.steer_missing
                 )),
                 last_success_age_seconds: None,

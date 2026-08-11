@@ -956,6 +956,14 @@ impl crate::runtime::Steering for NtupleSteering {
         // source traffic had quietly lost its offload (review finding).
         let mut consumed: std::collections::HashMap<&str, Vec<bool>> =
             std::collections::HashMap::new();
+        // Per-interface tallies for the second direction below: how many
+        // of this interface's locations already reported drift, and how
+        // many could not be read at all. Both consume nothing from the
+        // plan, so both would otherwise read as "a planned rule with no
+        // rule on the NIC" and be counted a second time.
+        let mut reported: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut unreadable: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
 
         for (iface, loc) in &self.installed {
             let Some(vf) = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v) else {
@@ -1000,13 +1008,17 @@ impl crate::runtime::Steering for NtupleSteering {
                         // excused: an ownership check by ring cookie
                         // was tried and is worthless, since a narrowed
                         // or duplicated rule keeps the cookie.
-                        None => missing.push((iface.clone(), *loc)),
+                        None => {
+                            missing.push((iface.clone(), *loc));
+                            *reported.entry(iface.as_str()).or_default() += 1;
+                        }
                     }
                 }
                 // Empty: ENOENT is how the driver answers for a location
                 // holding nothing.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    missing.push((iface.clone(), *loc))
+                    missing.push((iface.clone(), *loc));
+                    *reported.entry(iface.as_str()).or_default() += 1;
                 }
                 // A read that failed says nothing about THIS rule, but
                 // it must not erase what the other reads proved. The
@@ -1014,7 +1026,45 @@ impl crate::runtime::Steering for NtupleSteering {
                 // entry, and the caller keeps its previous count on
                 // `Err` — so an EIO on the last rule hid drift already
                 // established on the first (review finding).
-                Err(e) => read_errors.push(format!("loc {loc} on {iface}: {e}")),
+                Err(e) => {
+                    read_errors.push(format!("loc {loc} on {iface}: {e}"));
+                    *unreadable.entry(iface.as_str()).or_default() += 1;
+                }
+            }
+        }
+
+        // The other direction. Everything above walks the LEDGER and asks
+        // whether the NIC still holds it, which cannot see a rule this
+        // target asks for that was never installed at all — the shape a
+        // restart produces whenever the allowlist grew while the daemon
+        // was down: the state file names the old rules, the plan names
+        // old and new, every old rule reads back clean, and the audit
+        // reports nothing while the new prefix has no NIC rule anywhere.
+        // That lasts as long as the adopted resync is deferred, which on
+        // a box with no completeness authority is indefinitely (review
+        // finding).
+        //
+        // Only reachable with a non-empty ledger — the caller skips the
+        // audit otherwise — so this cannot fire on a port that has simply
+        // never steered.
+        for (iface, _) in &self.ports {
+            let taken = consumed.get(iface.as_str());
+            // A location that reported drift, and one that could not be
+            // read, each leave a planned rule unaccounted without meaning
+            // a second rule is absent. Subtract them, or one deleted rule
+            // counts twice: once as the empty slot, once as the plan
+            // entry that slot was holding.
+            let explained = reported.get(iface.as_str()).copied().unwrap_or(0)
+                + unreadable.get(iface.as_str()).copied().unwrap_or(0);
+            let unaccounted = self
+                .plan
+                .rules
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| taken.is_none_or(|t| !t[*i]))
+                .map(|(_, r)| r.location);
+            for location in unaccounted.skip(explained) {
+                missing.push((iface.clone(), location));
             }
         }
 
@@ -1510,6 +1560,98 @@ mod tests {
             s2.missing_from_nic().is_err(),
             "a wholly unreadable NIC must not read as clean — the caller keeps \
              its previous verdict on Err"
+        );
+    }
+
+    /// A rule the target ASKS FOR that the NIC never got is missing too.
+    ///
+    /// The audit walked the ledger and asked the NIC about each entry,
+    /// which cannot see the other direction: restart a steered daemon
+    /// after the allowlist gained a prefix and the state file names only
+    /// the old rules. Every one of them reads back clean, so the audit
+    /// reported nothing while the new prefix had no NIC rule anywhere —
+    /// steering Healthy over an offload the config says is bigger than
+    /// it is, for as long as the adopted resync stays deferred (review
+    /// finding).
+    #[test]
+    fn a_rule_the_target_asks_for_that_was_never_installed_is_reported_missing() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+
+        // The previous daemon steered one prefix.
+        let mut before =
+            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("first run installs");
+        let inherited = before.installed();
+        assert!(!inherited.is_empty());
+
+        // This one starts with a grown allowlist and adopts what the
+        // state file names — the old rules only.
+        let grown = plan_for(&[[198, 18, 0, 0], [203, 0, 113, 0]]);
+        let owed = grown.rules.len() - inherited.len();
+        assert!(
+            owed > 0,
+            "the fixture must ask for more rules than were inherited"
+        );
+        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], grown);
+        after.adopt_installed(inherited.clone());
+
+        let m = after.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            m.len(),
+            owed,
+            "every planned rule with no rule on the NIC must be reported, or the \
+             newly allowlisted prefix is unsteered with health green: {m:?}"
+        );
+        assert!(
+            m.iter().all(|e| !inherited.contains(e)),
+            "the inherited rules ARE on the NIC — reporting them would be \
+             counting the same absence twice: {m:?}"
+        );
+
+        // And a deleted inherited rule is one more absence, not a
+        // replacement for one already counted.
+        let (iface, loc) = inherited[0].clone();
+        sys::remove_behind_back(&iface, loc);
+        let m = after.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            m.len(),
+            owed + 1,
+            "drift and an uninstalled rule are separate absences: {m:?}"
+        );
+        assert!(
+            m.contains(&(iface, loc)),
+            "including the slot the NIC no longer holds: {m:?}"
+        );
+    }
+
+    /// A read that FAILS must not be turned into an uninstalled rule.
+    ///
+    /// The second direction counts planned rules that no readback
+    /// accounted for — and a location the NIC would not answer for
+    /// accounts for nothing. Subtracting them is what keeps a wedged
+    /// read from manufacturing drift the audit never established, which
+    /// is the same "unverifiable treated as unconstrained" mistake this
+    /// audit has now made twice.
+    #[test]
+    fn a_wedged_read_is_not_reported_as_an_uninstalled_rule() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("steer installs");
+        let installed = s.installed();
+        assert!(installed.len() >= 2);
+        let (_, wedged) = installed[1].clone();
+
+        sys::wedge_read(&[wedged]);
+
+        let e = s
+            .missing_from_nic()
+            .expect_err("nothing was proven and a location could not be read");
+        assert!(
+            e.contains(&wedged.to_string()),
+            "the answer must be 'cannot verify', naming the location, rather than \
+             a fabricated missing rule: {e}"
         );
     }
 
