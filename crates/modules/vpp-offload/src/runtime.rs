@@ -208,6 +208,34 @@ impl SteeringAudit {
     }
 }
 
+/// Which side of the tier boundary a successful reconcile left the
+/// traffic on.
+///
+/// Two answers rather than a bare `Ok(())`, because a reconcile against
+/// an EMPTY target succeeds by removing everything, and "it worked" is
+/// the same word for both outcomes while the consequences are
+/// opposites. The executor turns this into the supervisor's
+/// acknowledgement, and the supervisor releases VFs and paints health
+/// on that acknowledgement — so collapsing the two reported an offload
+/// carrying traffic it had just stopped carrying.
+///
+/// The alternative — `Err` for the empty target, which is what shipped
+/// — is what wedged the rollback: a `steer off` whose `unsteer` the NIC
+/// refused leaves rules installed and `steered` true, every later
+/// convergence re-emits `Action::Steer`, and a `steer` that refuses
+/// before reaching its stale-rule removal can never clear them. The
+/// module retried a no-op error forever while the rules kept diverting
+/// traffic the operator had asked it to stop diverting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// Rules are confirmed in the NIC; allowlisted traffic is diverted.
+    Steered,
+    /// The target asks for no port, and the NIC now holds nothing —
+    /// including anything a previous target left behind. Traffic is on
+    /// the eBPF tier, and nothing is wanted.
+    NothingToSteer,
+}
+
 /// The MCAM steering seam ([`crate::ntuple::NtupleSteering`] is the
 /// real one: ETHTOOL_SRXCLSRLINS, ring_cookie `(vf+1)<<32`, loc
 /// budgeting).
@@ -220,8 +248,10 @@ impl SteeringAudit {
 /// lets [`Self::retarget`] change the target under a live port without
 /// a second code path.
 pub trait Steering {
-    /// Install the rules. `Ok` means they are confirmed in the NIC.
-    fn steer(&mut self) -> Result<(), String>;
+    /// Reconcile the NIC to the current target. `Ok` means the NIC now
+    /// holds exactly what the target asks for — which, for a target
+    /// that asks for nothing, means it holds nothing.
+    fn steer(&mut self) -> Result<SteerOutcome, String>;
     /// Remove the rules. `Ok` means they are confirmed gone — and only
     /// then, because the supervisor releases VFs on the strength of it.
     fn unsteer(&mut self) -> Result<(), String>;
@@ -302,7 +332,7 @@ impl Steering for SteeringUnavailable {
         0
     }
 
-    fn steer(&mut self) -> Result<(), String> {
+    fn steer(&mut self) -> Result<SteerOutcome, String> {
         Err("MCAM steering is unavailable in this runtime; port stays unsteered".into())
     }
     fn unsteer(&mut self) -> Result<(), String> {
@@ -1257,8 +1287,22 @@ impl Core {
         self.last_steer_audit = None;
     }
 
-    /// The completeness verdict steering is judged against, or `None`
-    /// when the deployment configured no authority.
+    /// Whether a steer against the current target would divert traffic
+    /// at all, as opposed to only removing rules.
+    ///
+    /// The discriminator both gates hang off, named once because both
+    /// have to make the same exception and one of them is easy to
+    /// forget. A target with no port installs nothing — it is a
+    /// reconcile to empty, the shape `steer off` takes — so there is no
+    /// traffic for either gate to protect, and refusing it blocks the
+    /// one steer whose job is to take traffic OFF VPP.
+    fn steer_diverts_traffic(&self) -> bool {
+        self.steering.configured_ports() > 0
+    }
+
+    /// The completeness verdict a steer would be judged against, or
+    /// `None` when nothing would judge it: no authority configured, or
+    /// a target that diverts no traffic.
     ///
     /// One accessor because it has two readers that must not disagree:
     /// [`Effects::steer`], which refuses on it, and
@@ -1269,7 +1313,10 @@ impl Core {
     /// [`packetframe_common::fib::Completeness::permits_steering`]'s, on
     /// the type, so only the verdict travels.
     fn steer_verdict(&self) -> Option<packetframe_common::fib::Completeness> {
-        self.completeness.as_ref().map(|h| h.verdict())
+        self.completeness
+            .as_ref()
+            .filter(|_| self.steer_diverts_traffic())
+            .map(|h| h.verdict())
     }
 
     /// Whether the FIB itself is fit to take traffic.
@@ -1282,7 +1329,12 @@ impl Core {
     /// or unresolvable; re-attempting there would divert traffic into
     /// the FIB with known holes that the arm exists to protect.
     ///
-    /// Applied UNCONDITIONALLY, unlike `apply_steering`, which exempts
+    /// Carries the empty-target exception itself, next to the gate it
+    /// exempts, exactly as `steer_verdict` does — rather than both
+    /// sharing an early return in the caller, where a third gate added
+    /// later can quietly land on the wrong side of it.
+    ///
+    /// Applied UNCONDITIONALLY otherwise, unlike `apply_steering`, which exempts
     /// an already-steering port. That exemption exists because
     /// `blocks_first_steer` counts `installing`, nonzero whenever routes
     /// are in flight and so routine under a live feed that gating an
@@ -1301,7 +1353,7 @@ impl Core {
     /// Nothing is lost by dropping it: a partly-installed target over a
     /// whole FIB still repairs, because that FIB does not block.
     fn fib_fit_to_steer(&self) -> bool {
-        !self.engine.counts().blocks_first_steer()
+        !self.steer_diverts_traffic() || !self.engine.counts().blocks_first_steer()
     }
 }
 
@@ -1340,8 +1392,12 @@ impl Observe for ObserveView {
     fn steer_permitted(&mut self) -> bool {
         let c = self.core.borrow();
         // Both gates, through the same accessors the steer path and the
-        // verify verdict use. Neither is re-derived here: this asks the
-        // question, it does not answer it a second time.
+        // verify verdict use. Neither is re-derived here — including
+        // their shared exception for a target that diverts nothing,
+        // which each accessor carries itself: the retry is what drives
+        // a `steer off`'s reconcile-to-empty from `Ready`, and asking a
+        // stricter question here than the one `steer` answers is how a
+        // retry ends up either refusing forever or asking forever.
         c.steer_verdict().is_none_or(|v| v.permits_steering()) && c.fib_fit_to_steer()
     }
 
@@ -1812,7 +1868,7 @@ impl Effects for EffectsView {
         outcome
     }
 
-    fn restore_steer(&mut self) -> Result<(), String> {
+    fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
         // NO completeness gate, deliberately — the one divergence from
         // `steer`, and the whole reason this method exists. The gate
         // protects traffic from a VPP synced off an incomplete MIRROR;
@@ -1829,7 +1885,7 @@ impl Effects for EffectsView {
         outcome
     }
 
-    fn steer(&mut self) -> Result<(), String> {
+    fn steer(&mut self) -> Result<SteerOutcome, String> {
         let mut c = self.core.borrow_mut();
         // The completeness gate, HERE rather than at either caller.
         //
@@ -1847,6 +1903,17 @@ impl Effects for EffectsView {
         // re-attempts the steer once this verdict permits one — see
         // `Event::SteerUnblocked`. No rules are installed, so
         // `rules_remain` is unaffected.
+        //
+        // Not applied to an EMPTY target, and that exception is the
+        // whole of the gate's own logic turned round: it exists to stop
+        // traffic being diverted into a table that cannot forward it,
+        // and a reconcile against a target with no port diverts
+        // nothing — it only removes. Gating it refuses the one steer
+        // whose entire job is to take traffic OFF VPP, and does so
+        // precisely when the mirror is unhealthy, which is when the
+        // operator is most likely to be rolling back. The exception
+        // lives in `steer_verdict` so the retry's own gate cannot
+        // forget it.
         if let Some(verdict) = c.steer_verdict() {
             if !verdict.permits_steering() {
                 return Err(format!(
@@ -2182,11 +2249,11 @@ mod tests {
             self.configured
         }
 
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<SteerOutcome, String> {
             let (rules, ok) = self.next.take().unwrap_or_default();
             self.rules = rules;
             if ok {
-                Ok(())
+                Ok(SteerOutcome::Steered)
             } else {
                 Err("MCAM refused".into())
             }
@@ -2344,8 +2411,8 @@ mod tests {
             fn configured_ports(&self) -> usize {
                 1
             }
-            fn steer(&mut self) -> Result<(), String> {
-                Ok(())
+            fn steer(&mut self) -> Result<SteerOutcome, String> {
+                Ok(SteerOutcome::Steered)
             }
             fn unsteer(&mut self) -> Result<(), String> {
                 Ok(())
@@ -2412,8 +2479,8 @@ mod tests {
             fn configured_ports(&self) -> usize {
                 1
             }
-            fn steer(&mut self) -> Result<(), String> {
-                Ok(())
+            fn steer(&mut self) -> Result<SteerOutcome, String> {
+                Ok(SteerOutcome::Steered)
             }
             fn unsteer(&mut self) -> Result<(), String> {
                 Ok(())
@@ -2647,6 +2714,12 @@ mod tests {
 
         let steering = LedgerSteering {
             next: Some((vec![("eth4".into(), 1024)], true)),
+            // The gate applies to a target that ASKS for a port —
+            // that is the traffic it protects. A double that installs a
+            // rule while reporting nothing configured would exercise
+            // the empty-target bypass instead, and pass for the wrong
+            // reason.
+            configured: 1,
             ..Default::default()
         };
         let rt = Runtime::new(
@@ -2696,6 +2769,59 @@ mod tests {
         assert_eq!(rt.core.borrow().steering.installed().len(), 1);
     }
 
+    /// The gate does not block a reconcile that diverts nothing.
+    ///
+    /// It exists to keep traffic out of a table that cannot forward it.
+    /// A target with no port installs nothing and only removes, so
+    /// gating it refuses the one steer whose job is to take traffic OFF
+    /// VPP — and refuses it precisely when the mirror is unhealthy,
+    /// which is when an operator is most likely to be rolling back. The
+    /// rollback would then be unable to complete for the same reason it
+    /// was started.
+    #[test]
+    fn the_completeness_gate_does_not_block_an_empty_target() {
+        use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+        let steering = LedgerSteering {
+            // Reconciled to nothing, successfully: no port configured.
+            next: Some((Vec::new(), true)),
+            configured: 0,
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        rt.require_table_complete(handle.clone());
+        // The most condemning verdict there is.
+        handle.publish(CompletenessReport {
+            authority_routes: 1_000_000,
+            mirror_routes: 1,
+            at: std::time::Instant::now(),
+        });
+
+        let (_, mut fx) = rt.views();
+        fx.steer()
+            .expect("a reconcile that installs nothing has no traffic to protect");
+
+        // And the RETRY's gate must make the same exception, or it
+        // becomes the thing that holds a `steer off` unfinished: it is
+        // what drives this reconcile from `Ready` without waiting for a
+        // convergence, and a condemning verdict is exactly the weather
+        // a rollback happens in.
+        let (mut obs, _) = rt.views();
+        assert!(
+            obs.steer_permitted(),
+            "the retry asked a stricter question than the steer it drives"
+        );
+    }
+
     /// Without the handle the gate does not exist at all.
     ///
     /// `require-table-complete off` is a deployment with no authority to
@@ -2707,6 +2833,12 @@ mod tests {
     fn an_unset_gate_does_not_block_steering() {
         let steering = LedgerSteering {
             next: Some((vec![("eth4".into(), 1024)], true)),
+            // The gate applies to a target that ASKS for a port —
+            // that is the traffic it protects. A double that installs a
+            // rule while reporting nothing configured would exercise
+            // the empty-target bypass instead, and pass for the wrong
+            // reason.
+            configured: 1,
             ..Default::default()
         };
         let rt = Runtime::new(

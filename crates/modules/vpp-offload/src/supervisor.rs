@@ -218,6 +218,28 @@ pub enum Event {
     ConvergenceFailed,
     /// Steering rules installed.
     Steered,
+    /// A reconcile ran against a target that asks for **no port**: the
+    /// NIC now holds nothing, and nothing is wanted.
+    ///
+    /// The third outcome of `Action::Steer`, and the one whose absence
+    /// made `steer off` unrecoverable. `steer` reconciles, so a target
+    /// with no port is a legitimate thing to reconcile to — but with
+    /// only `Steered` and `SteerFailed` to report it in, it had to
+    /// refuse, and it refused *before* the stale-rule removal. So an
+    /// `unsteer` the NIC declined (rules stay in the ledger, `steered`
+    /// stays true, the VF stays withheld — by design) left every later
+    /// convergence re-emitting `Action::Steer` into that same refusal,
+    /// with the rules still diverting traffic the operator had asked it
+    /// to stop diverting. Reported, but unfixable by the module.
+    ///
+    /// Distinct from [`Self::Unsteered`] in exactly one respect, and it
+    /// is the load-bearing one: this retires the WANT as well. An
+    /// `Unsteered` on the adopted path must leave `steer_wanted` set so
+    /// the next `VerifyPassed` re-steers; this one arrives from a
+    /// config that asks for nothing, so leaving the want set parks the
+    /// module in `steering intended but not in place` forever — the
+    /// same permanent-Degraded shape the shadow hit on 2026-08-07.
+    NothingToSteer,
     /// The process exited — from pidfd, not SIGCHLD, because adoption
     /// reparents the child and SIGCHLD would never arrive.
     ProcessExited {
@@ -878,6 +900,28 @@ impl Supervisor {
             // --- steering acknowledgements ---
             (_, Unsteered) => {
                 self.steered = false;
+                vec![]
+            }
+            // The reconcile found a target with no port, so the NIC
+            // holds nothing — and unlike `Unsteered`, this also says
+            // the CONFIG asks for nothing, which is the only thing
+            // entitled to retire the want.
+            //
+            // Retiring it is not cosmetic. `steer_wanted` is resurrected
+            // by every death or wedge that happens while `steered` is
+            // true (`if self.steered { self.steer_wanted = true }`),
+            // which is exactly the path a rollback takes when the NIC
+            // refuses the removal — so without this the module would
+            // clear the rules here and still read `steering intended
+            // but not in place`, Degraded, with nothing left to do
+            // about it.
+            //
+            // A catch-all like the other two acknowledgements: it
+            // describes what the NIC now holds, and that is true from
+            // whichever state asked.
+            (_, NothingToSteer) => {
+                self.steered = false;
+                self.steer_wanted = false;
                 vec![]
             }
             // Traffic is still diverted. `steered` stays true so the
@@ -1736,6 +1780,46 @@ mod tests {
         );
     }
 
+    /// The retry also carries the reconcile-to-empty, and
+    /// `NothingToSteer` is what stops it repeating.
+    ///
+    /// A `steer off` whose `unsteer` the NIC refused keeps its rules,
+    /// and a death while steered re-arms the want — so it arrives in
+    /// `Ready` looking like any other outstanding steer, and the retry
+    /// picks it up without waiting for a convergence that exponential
+    /// backoff can postpone. It must also STOP: the want is retired by
+    /// the outcome, so a second `SteerUnblocked` asks for nothing.
+    #[test]
+    fn the_retry_finishes_a_steer_off_and_then_stops() {
+        let mut s = running_and_steered();
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::UnsteerFailed);
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        // The convergence ends INCOMPLETE, so it emits no steer at all —
+        // the case where the rules used to sit there until a human came.
+        assert!(!s.on(Event::VerifyIncomplete).contains(&Action::Steer));
+        assert_eq!(s.state(), State::Ready);
+        assert!(s.steer_retry_pending(), "the want survived the death");
+
+        assert_eq!(
+            s.on(Event::SteerUnblocked),
+            vec![Action::Steer],
+            "and the retry is what carries the removal now"
+        );
+        s.on(Event::NothingToSteer);
+        assert!(!s.is_steered(), "the rules are out");
+        assert!(
+            !s.steer_retry_pending(),
+            "and the outcome retired the want, or this would re-ask every interval \
+             against a config that asks for nothing"
+        );
+        assert!(s.on(Event::SteerUnblocked).is_empty());
+    }
+
     /// A refusal raised BEFORE the attempt records the want just the
     /// same, so the retry covers it.
     ///
@@ -1892,6 +1976,122 @@ mod tests {
         assert!(
             s.on(Event::StopRequested).contains(&Action::Unsteer),
             "every later teardown must keep trying, and keep withholding the VF"
+        );
+    }
+
+    /// The acknowledgement that gets a refused `steer off` unstuck —
+    /// and the one respect in which it differs from `Unsteered`.
+    ///
+    /// Both clear `steered`. Only this one clears the WANT, and it must:
+    /// a death or wedge while `steered` re-arms `steer_wanted`, which is
+    /// exactly the path a rollback takes when the NIC refuses the
+    /// removal. Leave the want set and the module has cleared the rules
+    /// and still reads `steering intended but not in place` — Degraded
+    /// forever against a config that asks for nothing, which is the
+    /// shape the shadow hit on 2026-08-07.
+    #[test]
+    fn a_reconcile_to_an_empty_target_retires_the_want_as_well() {
+        let mut s = running_and_steered();
+        // `steer off`, and the NIC refuses the removal.
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        // VPP dies with rules still installed, which re-arms the want.
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::UnsteerFailed);
+        assert!(
+            s.steer_intended(),
+            "the premise: a death while steered re-arms the want, so the next verify \
+             re-steers"
+        );
+
+        // The replacement verifies, and the reconcile finds no port.
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert_eq!(
+            s.on(Event::VerifyPassed),
+            vec![Action::Steer],
+            "this is the steer that used to hit the refusal"
+        );
+
+        s.on(Event::NothingToSteer);
+        assert!(!s.is_steered());
+        assert!(
+            !s.steer_intended(),
+            "a config that asks for no port is the one thing entitled to retire the want"
+        );
+        assert!(
+            s.on(Event::VerifyPassed).is_empty(),
+            "and no later convergence re-enters the loop"
+        );
+    }
+
+    /// The limit of that repair: only `VerifyPassed` carries it.
+    ///
+    /// `Action::Steer` is what runs the reconcile, and
+    /// `VerifyIncomplete` deliberately emits none — diverting traffic
+    /// into a FIB with known holes is the thing that arm exists to
+    /// prevent. So a convergence that ends with routes withheld or
+    /// unresolvable leaves the leftover rules exactly where they are.
+    ///
+    /// Pinned rather than fixed. Closing it would mean emitting
+    /// `Action::Steer` here, and nothing the supervisor can see
+    /// separates "leftover rules under a config that asks for nothing"
+    /// from "rules we want and are about to re-assert": `steer_wanted`
+    /// is re-armed by the very death that precedes the restart. The
+    /// emptiness is only knowable in `steer` itself, which is why the
+    /// outcome lives there — so for a CONFIGURED target this arm would
+    /// divert traffic into the incomplete FIB, which is the regression
+    /// it was written to stop. The escape is the operator's:
+    /// `VerifyIncomplete` parks in `Ready`, where `reconfigure` is
+    /// accepted and removes the rules, and the health line says so
+    /// rather than promising a convergence that may not come.
+    #[test]
+    fn an_incomplete_verify_does_not_reconcile_an_empty_target() {
+        let mut s = running_and_steered();
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        s.on(Event::ProcessExited { status: None });
+        s.on(Event::UnsteerFailed);
+        s.on(Event::BackoffElapsed);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+
+        assert_eq!(
+            s.on(Event::VerifyIncomplete),
+            Vec::new(),
+            "no steer, so no reconcile — the rules stay in the NIC"
+        );
+        assert!(
+            s.is_steered(),
+            "and the module still believes them installed, which is what keeps the VF \
+             withheld"
+        );
+        assert_eq!(
+            s.state(),
+            State::Ready,
+            "the way out is `reconfigure`, which this state accepts"
+        );
+        assert!(s.state().accepts_steering_changes());
+    }
+
+    /// `Unsteered` must NOT retire the want — the difference that makes
+    /// `NothingToSteer` a separate event rather than a second call site.
+    ///
+    /// The adopted path unsteers deliberately, to read the adoptee's FIB
+    /// without holding VPP's worker barrier for seconds. `steer_wanted`
+    /// is what puts traffic back afterwards.
+    #[test]
+    fn a_plain_unsteer_leaves_the_want_for_the_re_steer() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::FallbackSettled);
+        s.on(Event::Unsteered);
+        assert!(!s.is_steered());
+        assert!(
+            s.steer_intended(),
+            "the adopted resync unsteers to read the FIB, and the want is what re-steers \
+             it once the verify passes"
         );
     }
 

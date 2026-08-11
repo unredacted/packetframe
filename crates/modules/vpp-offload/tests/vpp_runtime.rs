@@ -1427,10 +1427,10 @@ mod steered {
         fn configured_ports(&self) -> usize {
             1
         }
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
             self.log.lock().unwrap().push("steer");
             self.rules = vec![("eth4".into(), 1)];
-            Ok(())
+            Ok(packetframe_vpp_offload::runtime::SteerOutcome::Steered)
         }
         fn unsteer(&mut self) -> Result<(), String> {
             self.log.lock().unwrap().push("unsteer");
@@ -2512,7 +2512,7 @@ fn the_retry_does_not_steer_into_a_table_with_known_holes() {
         fn configured_ports(&self) -> usize {
             1
         }
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err("the NIC would not take it".into())
         }
@@ -2615,4 +2615,105 @@ fn the_retry_does_not_steer_into_a_table_with_known_holes() {
              are not a licence to add more"
         );
     }
+}
+
+/// The mirror image, and the reason both gates carry an exception
+/// rather than being absolute: over the SAME holey table, a target with
+/// no port must be permitted — because that "steer" only removes.
+///
+/// This is the state a `steer off` whose `unsteer` the NIC refused
+/// lands in. The rules are diverting traffic for a port the operator
+/// turned off; the table having holes is no reason to leave them there,
+/// since the reconcile takes traffic OFF VPP rather than putting it on.
+/// Held back, the retry would be the thing keeping the rollback
+/// unfinished — and a convergence ending `VerifyIncomplete` emits no
+/// steer of its own, so nothing else was coming.
+///
+/// Asserted at the gate, with counts a real engine produced. The unit
+/// test beside `steer` cannot: its ledger is empty, so
+/// `blocks_first_steer()` is false there and the exception it looks
+/// like it exercises is never reached. The sequence that arrives here —
+/// refused unsteer, death, re-armed want, reconcile, retired want — is
+/// `the_retry_finishes_a_steer_off_and_then_stops` in the supervisor.
+#[test]
+fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
+    /// `configured_ports() == 0`: `steer off`, with rules a refused
+    /// `unsteer` left in the NIC.
+    struct EmptyTarget(Vec<(String, u32)>);
+    impl packetframe_vpp_offload::runtime::Steering for EmptyTarget {
+        fn missing_from_nic(
+            &self,
+        ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
+            Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
+        }
+        fn configured_ports(&self) -> usize {
+            0
+        }
+        fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
+            self.0.clear();
+            Ok(packetframe_vpp_offload::runtime::SteerOutcome::NothingToSteer)
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            Err("a rule would not come out".into())
+        }
+        fn installed(&self) -> Vec<(String, u32)> {
+            self.0.clone()
+        }
+        fn retarget(
+            &mut self,
+            _ports: Vec<(String, u32)>,
+            _plan: packetframe_vpp_offload::steer::RuleSet,
+        ) {
+        }
+    }
+
+    let fake = Fake::start("steer-retry-empty-holes");
+    let rt = runtime_custom(
+        &fake,
+        Box::new(Mirror {
+            routes: (0..5).map(|i| fake_vpp::v4(0, i)).collect(),
+        }),
+        // Five routes into a two-route heap: three withheld.
+        Box::new(EmptyTarget(Vec::new())),
+        2,
+    );
+    // A condemning verdict on top, because a rollback happens in
+    // exactly this weather and neither gate may hold it.
+    let handle = std::sync::Arc::new(packetframe_common::fib::TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    handle.publish(packetframe_common::fib::CompletenessReport {
+        authority_routes: 1_000,
+        mirror_routes: 5,
+        at: std::time::Instant::now(),
+    });
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (_, events) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    assert!(
+        events.contains(&Event::VerifyIncomplete),
+        "the holey table is the premise: {events:?}"
+    );
+    let counts = rt.status().counts;
+    assert!(
+        counts.blocks_first_steer() && counts.withheld > 0,
+        "and the FIB gate must really be closed, or this proves nothing: {counts:?}"
+    );
+
+    let (mut obs, _) = rt.views();
+    use packetframe_vpp_offload::driver::Observe as _;
+    assert!(
+        obs.steer_permitted(),
+        "a reconcile that only removes must not be held by gates describing a table \
+         traffic would be diverted INTO — that is what leaves a rollback unfinished"
+    );
 }

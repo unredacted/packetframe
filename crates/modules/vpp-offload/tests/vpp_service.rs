@@ -726,7 +726,7 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
             1
         }
 
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
             panic!("supervision loop panic, on purpose");
         }
         fn unsteer(&mut self) -> Result<(), String> {
@@ -1165,9 +1165,9 @@ impl packetframe_vpp_offload::runtime::Steering for SpySteering {
         1
     }
 
-    fn steer(&mut self) -> Result<(), String> {
+    fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
         self.0.lock().unwrap().push("steer".into());
-        Ok(())
+        Ok(packetframe_vpp_offload::runtime::SteerOutcome::Steered)
     }
     fn unsteer(&mut self) -> Result<(), String> {
         self.0.lock().unwrap().push("unsteer".into());
@@ -1209,13 +1209,13 @@ impl packetframe_vpp_offload::runtime::Steering for GatedSteer {
     fn configured_ports(&self) -> usize {
         1
     }
-    fn steer(&mut self) -> Result<(), String> {
+    fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
         if !self.allow.load(std::sync::atomic::Ordering::SeqCst) {
             self.log.lock().unwrap().push("steer-refused".into());
             return Err("refusing to steer: the route mirror holds 3 of 10 routes".into());
         }
         self.log.lock().unwrap().push("steer".into());
-        Ok(())
+        Ok(packetframe_vpp_offload::runtime::SteerOutcome::Steered)
     }
     fn unsteer(&mut self) -> Result<(), String> {
         self.log.lock().unwrap().push("unsteer".into());

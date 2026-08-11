@@ -513,13 +513,18 @@ impl Driver {
     /// means routes are on the wire — which the counts already covered.
     /// The error case is the one they get wrong.
     ///
-    /// One thing this deliberately does NOT do: rescue a want whose
-    /// target is empty. `steer` refuses that before it reaches its
-    /// stale-rule removal, so such a retry could only fail — but every
-    /// supported path that empties the target also clears the want, and
-    /// the case where it does not (a `steer off` whose unsteer was
-    /// refused) needs a teardown outcome meaning "reconciled to nothing
-    /// steered", which is filed separately rather than smuggled in here.
+    /// It also carries the reconcile-to-empty repair, which is not an
+    /// accident of scope but the same mechanism: a `steer off` whose
+    /// `unsteer` the NIC refused keeps its rules and, after a death
+    /// while steered, its want — so it lands here like any other
+    /// outstanding steer. `Action::Steer` reconciles to the empty
+    /// target, removes the stale rules, and answers
+    /// [`crate::runtime::SteerOutcome::NothingToSteer`], which retires
+    /// the want and ends the retries. Before that outcome existed the
+    /// same state was unrecoverable and this comment said so; now the
+    /// repair does not have to wait for a convergence that exponential
+    /// backoff can postpone indefinitely, which is when those rules are
+    /// pointing at a VF whose VPP is down.
     fn poll_steer_retry(
         &mut self,
         now: Instant,
@@ -605,6 +610,7 @@ mod tests {
     use super::*;
     use crate::liveness::{PING_BUDGET, PING_INTERVAL, SYNC_PING_BUDGET};
     use crate::process::Disposition;
+    use crate::runtime::SteerOutcome;
     use crate::supervisor::Action;
 
     fn at(base: Instant, ms: u64) -> Instant {
@@ -713,16 +719,16 @@ mod tests {
             self.calls.push("unsteer");
             Ok(())
         }
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
             if self.steer_fails {
                 return Err("refusing to steer: the mirror is still loading".into());
             }
-            Ok(())
+            Ok(SteerOutcome::Steered)
         }
-        fn restore_steer(&mut self) -> Result<(), String> {
+        fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
-            Ok(())
+            Ok(SteerOutcome::Steered)
         }
         fn kill(&mut self) -> Disposition {
             self.calls.push("kill");
@@ -1735,11 +1741,11 @@ mod tests {
             fn unsteer(&mut self) -> Result<(), String> {
                 Ok(())
             }
-            fn steer(&mut self) -> Result<(), String> {
-                Ok(())
+            fn steer(&mut self) -> Result<SteerOutcome, String> {
+                Ok(SteerOutcome::Steered)
             }
-            fn restore_steer(&mut self) -> Result<(), String> {
-                Ok(())
+            fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
+                Ok(SteerOutcome::Steered)
             }
             fn kill(&mut self) -> Disposition {
                 Disposition::SafeToRelease
