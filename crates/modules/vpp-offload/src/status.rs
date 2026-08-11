@@ -260,6 +260,11 @@ pub struct StatusSnapshot {
     /// Rules the ledger names that the NIC no longer holds. See
     /// [`crate::runtime::RuntimeStatus::steer_missing`].
     pub steer_missing: usize,
+    /// Rules still steering a port the config leaves unsteered. See
+    /// [`crate::runtime::SteeringAudit::stray`]. Its own count because
+    /// it points the other way: `steer_missing` says install, this says
+    /// remove.
+    pub steer_stray: usize,
     /// Why the last steering audit could not read the NIC, if so. See
     /// [`crate::runtime::RuntimeStatus::steer_audit_error`].
     pub steer_audit_unreadable: Option<String>,
@@ -309,6 +314,19 @@ pub struct StatusSnapshot {
     pub source_backlog: u64,
 }
 
+/// The steering audit, as the health surface consumes it.
+///
+/// One parameter rather than three, because two of them are `usize`
+/// that point OPPOSITE ways — install versus remove — and adjacent
+/// positional counts of the same type are a transposition nothing would
+/// catch.
+#[derive(Debug, Default, Clone)]
+pub struct SteerAudit {
+    pub missing: usize,
+    pub stray: usize,
+    pub unreadable: Option<String>,
+}
+
 impl StatusSnapshot {
     /// Observe live state.
     ///
@@ -344,8 +362,7 @@ impl StatusSnapshot {
             // drift would be a claim. Zero here means "not observed",
             // and every caller of this form is a path with no steering
             // ledger to audit against.
-            0,
-            None,
+            SteerAudit::default(),
         )
     }
 
@@ -369,16 +386,16 @@ impl StatusSnapshot {
         drain_error: Option<String>,
         source_backlog: u64,
         steer_configured: bool,
-        steer_missing: usize,
-        steer_audit_unreadable: Option<String>,
+        audit: SteerAudit,
     ) -> Self {
         Self {
             state: sup.state(),
             steered: sup.is_steered(),
             steer_intended: sup.steer_intended(),
             steer_configured,
-            steer_missing,
-            steer_audit_unreadable,
+            steer_missing: audit.missing,
+            steer_stray: audit.stray,
+            steer_audit_unreadable: audit.unreadable,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -727,35 +744,53 @@ impl StatusSnapshot {
         // published the retained count as though it were current while
         // further drift had become invisible (review finding). So one
         // arm, and the message carries whichever facts are true.
-        let drift = (self.steer_missing > 0).then(|| {
-            format!(
+        //
+        // Three facts now, composed rather than matched. The third
+        // points the OTHER way: rules still steering a port the config
+        // asks to leave unsteered. It is named first when present,
+        // because that is the rollback lever failing — an operator
+        // pulling traffic OFF a port is the one case where "steering
+        // healthy" is the most expensive possible answer (review
+        // finding).
+        let mut clauses: Vec<String> = Vec::new();
+        if self.steer_stray > 0 {
+            clauses.push(format!(
+                "{} steering rule(s) are still diverting traffic on a port this config \
+                 leaves unsteered — the rules outlived the request to remove them, so \
+                 that port is still in VPP; `packetframe reconfigure` clears them, and \
+                 `ethtool -n <iface>` shows them",
+                self.steer_stray
+            ));
+        }
+        if self.steer_missing > 0 {
+            clauses.push(format!(
                 "{} steering rule(s) this target asks for are missing from the NIC, no \
                  longer match what was asked for, or were never installed — that traffic \
                  is on the eBPF tier. Something changed them out of band (a UniFi \
                  provisioning push does this), or the allowlist grew while the inherited \
                  rules stayed as they were; `packetframe reconfigure` reconciles either way",
                 self.steer_missing
-            )
-        });
-        let unverifiable = |why: &str| {
-            format!(
+            ));
+        }
+        if let Some(why) = &self.steer_audit_unreadable {
+            let unverifiable = format!(
                 "the NIC would not answer a rule readback ({why}), so rules may be \
                  removed or altered without this being visible; `ethtool -n <iface>` is \
                  the ground truth until it clears"
-            )
-        };
-        let message = match (drift, self.steer_audit_unreadable.as_deref()) {
-            (Some(drift), None) => Some(drift),
-            // Both: the count is real but STALE, and saying so is the
-            // whole point — an operator reading a count as current will
-            // fix that many rules and stop looking.
-            (Some(drift), Some(why)) => Some(format!(
-                "{drift}. That count is the last answer the NIC gave, not a current one: {}",
-                unverifiable(why)
-            )),
-            (None, Some(why)) => Some(format!("cannot verify steering: {}", unverifiable(why))),
-            (None, None) => None,
-        };
+            );
+            clauses.push(if clauses.is_empty() {
+                format!("cannot verify steering: {unverifiable}")
+            } else {
+                // The counts above are real but STALE, and saying so is
+                // the whole point — an operator reading a count as
+                // current will fix that many rules and stop looking.
+                format!(
+                    "and the count(s) above are the last answer the NIC gave, not current \
+                     ones: {unverifiable}"
+                )
+            });
+        }
+        let message = (!clauses.is_empty()).then(|| clauses.join(". "));
         if let Some(message) = message {
             return SubsystemHealth {
                 name: SUBSYS_STEERING.into(),
@@ -1264,6 +1299,48 @@ mod tests {
         );
     }
 
+    /// Rules still steering a port the config turned OFF degrade it.
+    ///
+    /// The opposite complaint to drift, and the one an operator is
+    /// least able to afford being wrong about: it means the rollback
+    /// lever did not take. Named first in the message for that reason,
+    /// and counted separately because a single number would have to
+    /// pick one story — install or remove — and this one says remove.
+    #[test]
+    fn rules_left_on_a_port_the_config_unsteered_degrade_it() {
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(3),
+            ports_up(),
+        );
+        snap.steer_missing = 0;
+        snap.steer_stray = 2;
+
+        let rep = snap.report();
+        let steering = rep
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_STEERING)
+            .expect("steering row");
+        assert_eq!(
+            steering.state,
+            HealthState::Degraded,
+            "a port the config leaves unsteered that is still steering is not \
+             healthy, whatever the drift count says: {steering:?}"
+        );
+        let msg = steering.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains('2') && msg.contains("still diverting"),
+            "and the line must say which way the problem points — these rules \
+             need REMOVING, not reinstalling: {msg}"
+        );
+    }
+
     /// A RETAINED drift count must say it can no longer be checked.
     ///
     /// The two facts are independent — `Runtime::status` keeps the last
@@ -1304,7 +1381,7 @@ mod tests {
             "the proven drift must still be reported: {msg}"
         );
         assert!(
-            msg.contains("EIO") && msg.contains("not a current one"),
+            msg.contains("EIO") && msg.contains("not current ones"),
             "and so must the fact that the count is stale and further drift is \
              invisible — reporting only the count sends an operator to fix that \
              many rules and stop looking: {msg}"

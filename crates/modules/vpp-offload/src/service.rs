@@ -1020,8 +1020,11 @@ fn run_loop(
             rs.drain_error.clone(),
             rs.source_backlog,
             rs.steer_configured_ports > 0,
-            rs.steer_missing,
-            rs.steer_audit_error.clone(),
+            crate::status::SteerAudit {
+                missing: rs.steer_missing,
+                stray: rs.steer_stray,
+                unreadable: rs.steer_audit_error.clone(),
+            },
         );
         let report = snap.report();
         let overall = report.overall;

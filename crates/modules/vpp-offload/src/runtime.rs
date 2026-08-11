@@ -185,6 +185,15 @@ impl ResourceRelease for NoResources {
 pub struct SteeringAudit {
     /// Rules the current target needs in the NIC that are not there.
     pub missing: Vec<(String, u32)>,
+    /// Rules the ledger still names on a port the current target does
+    /// **not** steer, confirmed still occupying their slot.
+    ///
+    /// The opposite complaint to `missing`, and the more urgent one: an
+    /// operator asked for a port to stop diverting and it has not. The
+    /// two are separate counts because they point opposite ways — one
+    /// says install, the other says remove — and a single number would
+    /// have to pick one story to tell.
+    pub stray: Vec<(String, u32)>,
     /// Why the pass was incomplete, if it was. The locations behind it
     /// were neither confirmed present nor confirmed missing, so
     /// `missing` is a floor rather than a count.
@@ -374,6 +383,10 @@ struct Core {
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
     steer_missing: usize,
+    /// Rules still steering a port the config asks to leave unsteered,
+    /// as of the last audit. Its own count because it points the other
+    /// way: `steer_missing` says install, this says remove.
+    steer_stray: usize,
     /// Why the last audit could not read the NIC, if it could not.
     ///
     /// Kept apart from `steer_missing` because they answer different
@@ -831,6 +844,7 @@ impl Runtime {
                 deferred_resync: None,
                 last_steer_audit: None,
                 steer_missing: 0,
+                steer_stray: 0,
                 steer_audit_error: None,
             })),
         }
@@ -952,6 +966,7 @@ impl Runtime {
             // off (review finding).
             if c.steering.installed().is_empty() {
                 c.steer_missing = 0;
+                c.steer_stray = 0;
                 c.steer_audit_error = None;
                 c.last_steer_audit = None;
             }
@@ -971,6 +986,14 @@ impl Runtime {
                             );
                         }
                         c.steer_missing = audit.missing.len();
+                        if !audit.stray.is_empty() && c.steer_stray != audit.stray.len() {
+                            tracing::warn!(
+                                stray = ?audit.stray,
+                                "rules are still steering a port this config asks to leave \
+                                 unsteered; `packetframe reconfigure` removes them"
+                            );
+                        }
+                        c.steer_stray = audit.stray.len();
                         // Taken from the audit rather than cleared: a
                         // pass that proved drift AND could not read the
                         // rest is an incomplete answer, and clearing
@@ -1016,6 +1039,7 @@ impl Runtime {
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
             steer_missing: c.steer_missing,
+            steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
             authority: if c.completeness.is_none() {
                 AuthorityPosture::Absent
@@ -1095,6 +1119,9 @@ pub struct RuntimeStatus {
     /// How many rules the ledger names that the NIC no longer holds, as
     /// of the last audit. See [`STEER_AUDIT_EVERY`].
     pub steer_missing: usize,
+    /// Rules still steering a port the config leaves unsteered. See
+    /// [`SteeringAudit::stray`].
+    pub steer_stray: usize,
     /// Why the last steering audit could not read the NIC, if so.
     pub steer_audit_error: Option<String>,
 }
@@ -2253,6 +2280,7 @@ mod tests {
                 Ok(SteeringAudit {
                     missing: vec![("eth4".into(), 1024)],
                     unreadable: Some("loc 1025 on eth4: EIO".into()),
+                    ..SteeringAudit::clean()
                 })
             }
             fn configured_ports(&self) -> usize {
@@ -2319,7 +2347,7 @@ mod tests {
                 } else {
                     SteeringAudit {
                         missing: vec![("eth4".into(), 1024)],
-                        unreadable: None,
+                        ..SteeringAudit::clean()
                     }
                 })
             }

@@ -996,14 +996,19 @@ impl crate::runtime::Steering for NtupleSteering {
         let mut unreadable: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
 
+        // Rules on a port the target no longer steers. Skipping them
+        // entirely was the bug: `retarget` drops a port the config just
+        // set `steer off`, and the reconcile that would clear its rules
+        // can refuse at the completeness gate and never run — so the
+        // ledger goes on naming rules that divert traffic on a port an
+        // operator asked to be quiet, and the audit looked straight past
+        // them (review finding). That is the rollback path, where the
+        // whole point is getting traffic OFF a port.
+        let mut stray = Vec::new();
+
         for (iface, loc) in &self.installed {
-            let Some(vf) = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v) else {
-                // A port that is no longer a member. Its rules are still
-                // adopted — they are in the NIC and this object is the
-                // only thing that will remove them — but nothing here
-                // can say what they should look like.
-                continue;
-            };
+            // `None` = the current target does not steer this port.
+            let member = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v);
             let mut check = Rxnfc {
                 cmd: ETHTOOL_GRXCLSRULE,
                 fs: RxFlowSpec {
@@ -1013,7 +1018,16 @@ impl crate::runtime::Steering for NtupleSteering {
                 ..Rxnfc::default()
             };
             match sys::ethtool(iface, &mut check) {
+                // Occupied on a port the target does not steer. Nothing
+                // here can say what the rule ought to look like — there
+                // is no VF index to build an expectation from — but the
+                // ledger names it and the slot is not empty, which is
+                // all "still steering a port that should be quiet"
+                // needs. Read rather than assumed, so a rule the
+                // controller already wiped is not reported as live.
+                Ok(()) if member.is_none() => stray.push((iface.clone(), *loc)),
                 Ok(()) => {
+                    let vf = member.expect("the arm above takes the non-member case");
                     let taken = consumed
                         .entry(iface.as_str())
                         .or_insert_with(|| vec![false; self.plan.rules.len()]);
@@ -1046,10 +1060,14 @@ impl crate::runtime::Steering for NtupleSteering {
                     }
                 }
                 // Empty: ENOENT is how the driver answers for a location
-                // holding nothing.
+                // holding nothing. Drift on a port the target steers;
+                // on one it does not, it is the desired outcome — the
+                // rule the ledger names is already gone.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    missing.push((iface.clone(), *loc));
-                    *reported.entry(iface.as_str()).or_default() += 1;
+                    if member.is_some() {
+                        missing.push((iface.clone(), *loc));
+                        *reported.entry(iface.as_str()).or_default() += 1;
+                    }
                 }
                 // A read that failed says nothing about THIS rule, but
                 // it must not erase what the other reads proved. The
@@ -1059,7 +1077,13 @@ impl crate::runtime::Steering for NtupleSteering {
                 // established on the first (review finding).
                 Err(e) => {
                     read_errors.push(format!("loc {loc} on {iface}: {e}"));
-                    *unreadable.entry(iface.as_str()).or_default() += 1;
+                    // Tallied only for ports the target steers: the
+                    // subtraction below is against THIS port's planned
+                    // rules, and a port the target does not steer has
+                    // none.
+                    if member.is_some() {
+                        *unreadable.entry(iface.as_str()).or_default() += 1;
+                    }
                 }
             }
         }
@@ -1099,7 +1123,7 @@ impl crate::runtime::Steering for NtupleSteering {
             }
         }
 
-        if missing.is_empty() && !read_errors.is_empty() {
+        if missing.is_empty() && stray.is_empty() && !read_errors.is_empty() {
             // Nothing proven and the NIC would not answer: report the
             // failure so the caller keeps its previous verdict rather
             // than adopting a clean one this audit never established.
@@ -1114,6 +1138,7 @@ impl crate::runtime::Steering for NtupleSteering {
         // whenever this is `Some`.
         Ok(crate::runtime::SteeringAudit {
             missing,
+            stray,
             unreadable: (!read_errors.is_empty()).then(|| read_errors.join("; ")),
         })
     }
@@ -1609,6 +1634,60 @@ mod tests {
             "a wholly unreadable NIC must not read as clean — the caller keeps \
              its previous verdict on Err"
         );
+    }
+
+    /// A port dropped from the target is still audited, not ignored.
+    ///
+    /// `retarget` removes a port the config just set `steer off`, and
+    /// the reconcile that would clear its rules can refuse at the
+    /// completeness gate and never run. The audit skipped every ledger
+    /// entry whose interface was no longer a member, so rules kept
+    /// diverting traffic on a port an operator had asked to go quiet
+    /// while steering read Healthy — on the rollback path, where getting
+    /// traffic OFF a port is the entire point (review finding).
+    #[test]
+    fn a_port_the_target_no_longer_steers_is_still_audited() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_for(&[[198, 18, 0, 0]]);
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0), ("eth1".into(), 1)], plan.clone());
+        s.steer().expect("steer installs on both ports");
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(a.missing, Vec::new());
+        assert_eq!(a.stray, Vec::new(), "both ports are in the target");
+
+        // `steer off` on eth1, and the reconciling steer never runs.
+        s.retarget(vec![("eth0".into(), 0)], plan);
+
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            a.missing,
+            Vec::new(),
+            "eth0 still holds everything the target asks for"
+        );
+        let stray_ifaces: Vec<&str> = a.stray.iter().map(|(i, _)| i.as_str()).collect();
+        assert!(
+            !a.stray.is_empty() && stray_ifaces.iter().all(|i| *i == "eth1"),
+            "the rules still steering the port that was turned off must be \
+             reported — that is the rollback failing: {:?}",
+            a.stray
+        );
+
+        // But a rule that is already GONE from a dropped port is the
+        // desired outcome, not something to alarm about.
+        for (iface, loc) in s.installed() {
+            if iface == "eth1" {
+                sys::remove_behind_back(&iface, loc);
+            }
+        }
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            a.stray,
+            Vec::new(),
+            "rules the NIC no longer holds are not still steering anything; \
+             alarming on them would cry wolf on every successful unsteer"
+        );
+        assert_eq!(a.missing, Vec::new(), "and eth0 is still untouched");
     }
 
     /// A ledger naming one rule twice does not make a correct NIC drift.

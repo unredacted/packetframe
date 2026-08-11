@@ -399,6 +399,21 @@ An audit that cannot read keeps its previous count — an unreadable NIC
 is not a wrong one — but it must not present that count as current.
 "Cannot check" and "checked, fine" are different answers.
 
+The audit also reports the opposite complaint, and names it first:
+
+```text
+steering  DEGRADED — 2 steering rule(s) are still diverting traffic on a
+                     port this config leaves unsteered — the rules outlived
+                     the request to remove them, so that port is still in
+                     VPP; `packetframe reconfigure` clears them
+```
+
+That is the rollback lever not taking. A `steer off` whose reconcile was
+refused (the completeness gate) or whose deletes failed leaves the ledger
+naming rules on a port you asked to go quiet — and traffic keeps entering
+VPP there. It is a different remedy from the drift line above: those
+rules need REMOVING, not reinstalling.
+
 And when both hold — drift was proven, then the NIC stopped answering —
 the line says so, because a count read as current sends you to fix that
 many rules and stop looking:
