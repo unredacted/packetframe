@@ -488,12 +488,25 @@ steering  DEGRADED — 2 location(s) the ledger names are still occupied by
                      <the remedy for the current state, as above>
 ```
 
-Two ways to arrive here, and they read the same because the remedy is
-the same: a port turned `steer off` whose reconcile has not run, or an
-allowlist that lost a prefix while its rules stayed installed. Both mean
-traffic is being diverted that nobody asked for — the opposite complaint
-to the drift line above, and worth reading carefully, because the fix
-points the other way: these rules need REMOVING, not reinstalling.
+Two ways to arrive here: a port turned `steer off` whose reconcile has
+not run, or an allowlist that lost a prefix while its rules stayed
+installed. Both mean traffic is being diverted that nobody asked for —
+the opposite complaint to the drift line above, and the fix points the
+other way: these rules need REMOVING, not reinstalling.
+
+**Do not wait this one out.** A missing rule is a lost optimisation —
+its prefix is on the eBPF tier, which forwards. A stray rule is the
+reverse: it is pushing traffic *into* VPP. `Supervisor::fail` unsteers
+before it kills for exactly this reason ("until the MCAM rules are
+gone, every steered packet is going to a VF nothing is servicing"), so
+when that unsteer is refused the rules outlive the process and the
+affected prefixes are **dropped**, not merely deoptimised. Exponential
+backoff can postpone the next convergence indefinitely. Remove them:
+
+```bash
+ethtool -n eth1            # what is actually installed
+ethtool -N eth1 delete 12  # per location
+```
 
 "May", not "is", and the wording is deliberate. Where the port was
 turned off by a live `reconfigure` the audit still holds the outgoing

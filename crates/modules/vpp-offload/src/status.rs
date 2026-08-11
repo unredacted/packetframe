@@ -826,6 +826,21 @@ impl StatusSnapshot {
              convergence, `packetframe reconfigure` is the retry"
                 .to_string()
         };
+        // Stray rules do NOT share that remedy, and sharing it was a
+        // P1. The two complaints differ in what waiting costs: a
+        // MISSING rule means its prefix is on the eBPF tier, which
+        // forwards, so waiting out a convergence is free. A STRAY rule
+        // is diverting traffic INTO VPP — and `fail()` unsteers before
+        // it kills, precisely because "until the MCAM rules are gone,
+        // every steered packet is going to a VF nothing is servicing".
+        // When that unsteer is refused the rules stay and VPP dies
+        // anyway, so in `Backoff` the affected prefixes are being
+        // dropped while this line says to wait for a convergence that
+        // exponential backoff can push out indefinitely.
+        //
+        // So it names the removal that works from anywhere, always,
+        // and never defers to a convergence.
+        let stray_remedy = "remove them with `ethtool -N <iface> delete <loc>` rather than                             wait — while VPP is not forwarding, that traffic is going to a                             VF nothing is servicing. `packetframe reconfigure` also clears                             them wherever it is accepted";
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
             // "Still occupied", not "still ours". Where the outgoing
@@ -839,7 +854,7 @@ impl StatusSnapshot {
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
                  not be. The rules outlived the request to remove them; `ethtool -n \
-                 <iface>` shows what is there, and {remedy}",
+                 <iface>` shows what is there. {stray_remedy}",
                 self.steer_stray
             ));
         }
@@ -1438,10 +1453,12 @@ mod tests {
                 );
                 snap.state = state;
                 snap.steer_configured = steer_configured;
-                // Both clauses share the remedy, so set both and assert
-                // on the remedy alone.
+                // MISSING only. Stray carries its own remedy now — a
+                // stray rule can be dropping traffic, so it never defers
+                // to a convergence — and mixing the two here would let
+                // either string satisfy the assertions below.
                 snap.steer_missing = 1;
-                snap.steer_stray = 1;
+                snap.steer_stray = 0;
 
                 let rep = snap.report();
                 let steering = rep
@@ -1494,6 +1511,69 @@ mod tests {
                          `detach` is refused outright: {msg}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A stray rule never gets told to wait, in any state.
+    ///
+    /// The two complaints differ in what waiting costs. A MISSING rule
+    /// means its prefix is on the eBPF tier, which forwards — waiting
+    /// out a convergence is free. A STRAY rule is diverting traffic
+    /// INTO VPP, and `Supervisor::fail` unsteers before it kills for
+    /// exactly that reason: "until the MCAM rules are gone, every
+    /// steered packet is going to a VF nothing is servicing". A refused
+    /// unsteer leaves them installed and VPP dies anyway, so in
+    /// `Backoff` those prefixes are being dropped — while the shared
+    /// remedy told the operator to wait for a convergence that
+    /// exponential backoff can postpone indefinitely (review finding,
+    /// P1).
+    #[test]
+    fn a_stray_rule_is_never_told_to_wait() {
+        for state in [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            for steer_configured in [true, false] {
+                let led = ledger_with(10, 0, 0);
+                let mut snap = snap_of(
+                    &steered_supervisor(),
+                    &led,
+                    ApiHealth::Answering {
+                        silent_for: Duration::from_millis(200),
+                    },
+                    verified(3),
+                    ports_up(),
+                );
+                snap.state = state;
+                snap.steer_configured = steer_configured;
+                snap.steer_stray = 1;
+                snap.steer_missing = 0;
+
+                let rep = snap.report();
+                let steering = rep
+                    .subsystems
+                    .iter()
+                    .find(|s| s.name == SUBSYS_STEERING)
+                    .expect("steering row");
+                let msg = steering.message.as_deref().unwrap_or_default();
+                assert!(
+                    msg.contains("ethtool -N <iface> delete <loc>"),
+                    "state {state:?}: a rule that is diverting traffic must always name \
+                     the removal that works from here: {msg}"
+                );
+                assert!(
+                    !msg.contains("re-applied by the next convergence"),
+                    "state {state:?}: and must never defer to a convergence — with a \
+                     refused unsteer the rules outlive the process, so waiting means \
+                     dropping that prefix, not merely losing the offload: {msg}"
+                );
             }
         }
     }
