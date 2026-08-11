@@ -854,13 +854,14 @@ impl StatusSnapshot {
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
                  not be. The rules outlived the request to remove them; `ethtool -n \
-                 <iface>` lists what is installed. Act rather than wait — while VPP is \
-                 not forwarding, that traffic is going to a VF nothing is servicing — but \
-                 remove only rules you can match to an `allow-prefix` from this config \
-                 steered at VPP's VF (`ethtool -N <iface> delete <loc>`). Targeting the \
-                 VF is not proof on its own, and after a restart this audit cannot prove \
-                 a slot still holds ours; deleting another rule breaks its traffic. \
-                 `packetframe reconfigure` also clears them wherever it is accepted",
+                 reconfigure` clears them BY LEDGER ENTRY and needs no identification, \
+                 so try it first; it reports its own reason if it will not run. Do not \
+                 wait for a convergence — while VPP is not forwarding, that traffic is \
+                 going to a VF nothing is servicing. Removing by hand (`ethtool -n \
+                 <iface>`, then `ethtool -N <iface> delete <loc>`) is the fallback where \
+                 reconfigure cannot run, and needs care: a rule for a prefix just removed \
+                 from the allowlist no longer matches this config, so the config is not \
+                 the test. The runbook has the field table",
                 self.steer_stray
             ));
         }
@@ -1622,8 +1623,8 @@ mod tests {
                 let msg = steering.message.as_deref().unwrap_or_default();
                 assert!(
                     msg.contains("ethtool -N <iface> delete <loc>"),
-                    "state {state:?}: a rule that is diverting traffic must always name \
-                     the removal that works from here: {msg}"
+                    "state {state:?}: the hand removal must still be named — it is the \
+                     fallback wherever `reconfigure` cannot run: {msg}"
                 );
                 assert!(
                     !msg.contains("only if it verifies clean"),
@@ -1632,12 +1633,12 @@ mod tests {
                      dropping that prefix, not merely losing the offload: {msg}"
                 );
                 assert!(
-                    msg.contains("`allow-prefix` from this config")
-                        && msg.contains("not proof on its own"),
-                    "state {state:?}: and must not hand them a categorical test the \
-                     audit itself does not have. The ring cookie names the VF, not the \
-                     owner — this module already learned that twice — so the line has \
-                     to name the conjunction and say it is not proof: {msg}"
+                    msg.contains("BY LEDGER ENTRY")
+                        && msg.contains("no longer matches this config"),
+                    "state {state:?}: lead with the repair that needs no identification, \
+                     and warn about the trap in the one that does — a rule for a prefix \
+                     just removed from the allowlist cannot match the current config, \
+                     which is exactly the stray an allowlist shrink produces: {msg}"
                 );
             }
         }

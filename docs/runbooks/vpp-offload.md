@@ -514,18 +514,38 @@ anyway — and after a restart the audit reports an occupied slot without
 being able to prove it still holds *our* rule (`installed_as` is set
 only by a successful steer in this process).
 
-A rule is this module's when **all** of these hold, not any one:
+**Try `packetframe reconfigure` first.** It clears stray rules *by
+ledger entry* — `steer` removes what the ledger holds and the target no
+longer wants — so it needs no identification at all and cannot delete
+somebody else's rule. Hand-deletion is the fallback for the two cases
+where it will not run: a stopped daemon, or no port configured to steer
+(the health line says which). It reports its own reason otherwise.
+
+If you must identify by hand, a rule is this module's when **all** of
+these hold, not any one:
 
 | field | what ours looks like |
 |---|---|
-| `Dest IP addr` / `Src IP addr` | one of the `allow-prefix` lines in the config, with the other side `0.0.0.0 mask 255.255.255.255` |
+| `Dest IP addr` / `Src IP addr` | a /24-ish prefix on one side, the other side `0.0.0.0 mask 255.255.255.255` |
 | `Action` | `Direct to VF <n>`, the VF this module owns |
 | `TOS` / `Protocol` / `L4 bytes` masks | all `0xff` / `0xffffffff` — ours constrain nothing else |
 
-The action alone is not proof: another rule can target the same VF
-while matching different traffic, and a *narrowed* copy of one of ours
-keeps the cookie too. That is why the audit compares the whole spec
+**The current `allow-prefix` list is NOT the test**, and this is the
+trap: the commonest stray is a prefix you just *removed* from the
+allowlist, whose rules are by definition absent from the config you are
+holding. Check the config's previous revision (or your change diff) for
+the prefix that was there an hour ago.
+
+The action alone is not proof either: another rule can target the same
+VF while matching different traffic, and a *narrowed* copy of one of
+ours keeps the cookie. That is why the audit compares the whole spec
 rather than the cookie, and why you should.
+
+**A cleaner route for a removed prefix**, if the module is live and
+accepting: put the prefix back, `reconfigure` so the module owns those
+rules again, then remove it and `reconfigure` a second time. The stale
+removal in `steer` takes them out properly, and nothing is identified
+by eye.
 
 ```bash
 ethtool -n eth1            # read the fields, compare against the table
