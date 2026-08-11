@@ -944,7 +944,7 @@ impl crate::runtime::Steering for NtupleSteering {
         }
     }
 
-    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
+    fn missing_from_nic(&self) -> Result<crate::runtime::SteeringAudit, String> {
         let mut missing = Vec::new();
         let mut read_errors: Vec<String> = Vec::new();
         // Which planned rule each interface has already accounted for.
@@ -1074,14 +1074,17 @@ impl crate::runtime::Steering for NtupleSteering {
             // than adopting a clean one this audit never established.
             return Err(read_errors.join("; "));
         }
-        if !read_errors.is_empty() {
-            tracing::debug!(
-                errors = ?read_errors,
-                confirmed = missing.len(),
-                "steering audit was incomplete; reporting what it could read"
-            );
-        }
-        Ok(missing)
+        // Both facts travel together. Confirmed drift used to be
+        // returned alone with the read failures logged at debug, and the
+        // caller reads any `Ok` as a complete pass — so it cleared its
+        // "cannot verify" state and published the confirmed count as
+        // current, while whatever sat behind the unreadable locations
+        // stayed invisible (review finding). The count is a FLOOR
+        // whenever this is `Some`.
+        Ok(crate::runtime::SteeringAudit {
+            missing,
+            unreadable: (!read_errors.is_empty()).then(|| read_errors.join("; ")),
+        })
     }
 
     fn installed(&self) -> Vec<(String, u32)> {
@@ -1320,7 +1323,7 @@ mod tests {
         let installed = s.installed();
         assert!(!installed.is_empty(), "the fixture must install something");
         assert_eq!(
-            s.missing_from_nic().expect("read the NIC"),
+            audit(&s),
             Vec::new(),
             "a NIC that agrees with the ledger reports nothing missing"
         );
@@ -1330,7 +1333,7 @@ mod tests {
         sys::remove_behind_back(&iface, loc);
 
         assert_eq!(
-            s.missing_from_nic().expect("read the NIC"),
+            audit(&s),
             vec![(iface, loc)],
             "a rule the NIC no longer holds must be reported, or the offload \
              goes silently partial with health green"
@@ -1360,7 +1363,7 @@ mod tests {
         s.steer().expect("steer installs");
         let installed = s.installed();
         assert_eq!(
-            s.missing_from_nic().expect("read the NIC"),
+            audit(&s),
             Vec::new(),
             "our own rules must not read as drift"
         );
@@ -1369,7 +1372,7 @@ mod tests {
         sys::replace_behind_back(&iface, loc);
 
         assert_eq!(
-            s.missing_from_nic().expect("read the NIC"),
+            audit(&s),
             vec![(iface, loc)],
             "a location still OCCUPIED but holding a different rule is not ours, \
              and occupancy alone cannot tell the difference"
@@ -1395,7 +1398,7 @@ mod tests {
         sys::narrow_behind_back(&iface, loc);
 
         assert_eq!(
-            s.missing_from_nic().expect("read the NIC"),
+            audit(&s),
             vec![(iface, loc)],
             "a rule carrying a constraint we never asked for is not ours — some \
              of the traffic we believe is steered no longer is"
@@ -1447,7 +1450,7 @@ mod tests {
         after.adopt_installed(inherited.clone());
 
         assert_eq!(
-            after.missing_from_nic().expect("read the NIC"),
+            audit(&after),
             Vec::new(),
             "inherited rules are present and ours; nothing is missing"
         );
@@ -1460,7 +1463,7 @@ mod tests {
         let (iface, loc) = inherited[0].clone();
         sys::narrow_behind_back(&iface, loc);
         assert_eq!(
-            after.missing_from_nic().expect("read the NIC"),
+            audit(&after),
             vec![(iface.clone(), loc)],
             "an inherited rule narrowed out of band must be reported — some of \
              the traffic we believe is offloaded no longer is"
@@ -1470,7 +1473,7 @@ mod tests {
         // hardware actually did on 2026-08-11.
         sys::remove_behind_back(&iface, loc);
         assert_eq!(
-            after.missing_from_nic().expect("read the NIC"),
+            audit(&after),
             vec![(iface, loc)],
             "an inherited rule deleted out of band must be reported, or the \
              audit is blind for the entire adopted deferral"
@@ -1496,7 +1499,7 @@ mod tests {
             installed.len() >= 2,
             "the fixture needs at least two rules (src and dst) to duplicate one"
         );
-        assert_eq!(s.missing_from_nic().expect("read"), Vec::new());
+        assert_eq!(audit(&s), Vec::new());
 
         // Overwrite the first slot with a copy of the second's rule.
         let (iface, victim) = installed[0].clone();
@@ -1508,7 +1511,7 @@ mod tests {
         // which of the two greedy matching leaves unaccounted is an
         // artifact of iteration order — pinning it would be asserting
         // the implementation rather than the property.
-        let m = s.missing_from_nic().expect("read");
+        let m = audit(&s);
         assert_eq!(
             m.len(),
             1,
@@ -1541,12 +1544,26 @@ mod tests {
         sys::remove_behind_back(&iface, gone);
         sys::wedge_read(&[unreadable]);
 
+        let a = s
+            .missing_from_nic()
+            .expect("proven drift survives an unreadable peer");
         assert_eq!(
-            s.missing_from_nic()
-                .expect("proven drift survives an unreadable peer"),
+            a.missing,
             vec![(iface.clone(), gone)],
             "the confirmed missing rule must be reported even though another \
              location could not be read"
+        );
+        // And the pass must say it was INCOMPLETE. Reporting the drift
+        // alone made the caller clear its "cannot verify" state, so
+        // health published a floor as a current count while whatever
+        // sat behind the wedged location stayed invisible — the same
+        // stale-answer-as-fresh mistake one level down (review finding).
+        let why = a
+            .unreadable
+            .expect("a pass that could not read a location is not a complete one");
+        assert!(
+            why.contains(&unreadable.to_string()),
+            "and it must name what it could not read: {why}"
         );
 
         // But an audit that proved NOTHING and could not read must fail
@@ -1596,7 +1613,7 @@ mod tests {
         let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], grown);
         after.adopt_installed(inherited.clone());
 
-        let m = after.missing_from_nic().expect("read the NIC");
+        let m = audit(&after);
         assert_eq!(
             m.len(),
             owed,
@@ -1613,7 +1630,7 @@ mod tests {
         // replacement for one already counted.
         let (iface, loc) = inherited[0].clone();
         sys::remove_behind_back(&iface, loc);
-        let m = after.missing_from_nic().expect("read the NIC");
+        let m = audit(&after);
         assert_eq!(
             m.len(),
             owed + 1,
@@ -1738,6 +1755,23 @@ mod tests {
             vec![("eth0".to_string(), 1024), ("eth0".to_string(), 1025)],
             "the previous process's rules are now this one's to remove"
         );
+    }
+
+    /// The audit's findings, asserting the pass read everything it was
+    /// asked about.
+    ///
+    /// Every fixture below drives a NIC that answers, so an incomplete
+    /// pass means the fixture broke — and `missing` alone cannot say so,
+    /// which is the whole reason the audit reports both facts.
+    fn audit(s: &NtupleSteering) -> Vec<(String, u32)> {
+        use crate::runtime::Steering as _;
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            a.unreadable, None,
+            "this fixture answers every readback; an incomplete pass here is a \
+             broken test, not a finding"
+        );
+        a.missing
     }
 
     fn plan_for(prefixes: &[[u8; 4]]) -> RuleSet {

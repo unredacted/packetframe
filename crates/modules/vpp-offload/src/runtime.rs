@@ -172,6 +172,33 @@ impl ResourceRelease for NoResources {
     }
 }
 
+/// What one pass of the steering audit established.
+///
+/// Two facts rather than one, because they are independent: a pass can
+/// prove drift AND fail to read some of what it was asked about.
+/// Returning only the first published a partial answer as a complete
+/// one — the caller cleared its "cannot verify" state on any `Ok` — so
+/// health reported the confirmed count as current while more drift
+/// could have been sitting behind an unreadable location (review
+/// finding, the third instance of this shape in this audit).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SteeringAudit {
+    /// Rules the current target needs in the NIC that are not there.
+    pub missing: Vec<(String, u32)>,
+    /// Why the pass was incomplete, if it was. The locations behind it
+    /// were neither confirmed present nor confirmed missing, so
+    /// `missing` is a floor rather than a count.
+    pub unreadable: Option<String>,
+}
+
+impl SteeringAudit {
+    /// Everything the target asks for is present and correct, and the
+    /// whole of it was read.
+    pub fn clean() -> Self {
+        Self::default()
+    }
+}
+
 /// The MCAM steering seam ([`crate::ntuple::NtupleSteering`] is the
 /// real one: ETHTOOL_SRXCLSRLINS, ring_cookie `(vf+1)<<32`, loc
 /// budgeting).
@@ -214,7 +241,12 @@ pub trait Steering {
     /// a wrong answer here is a misleading health line, not a forwarding
     /// decision. Repair stays the operator's `packetframe reconfigure`,
     /// which reinstalls what is missing because `steer` is a reconcile.
-    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String>;
+    ///
+    /// `Err` means the pass established **nothing** — no count to adopt,
+    /// so the caller keeps its previous one. A pass that established
+    /// something while failing to read the rest is `Ok` with
+    /// [`SteeringAudit::unreadable`] set.
+    fn missing_from_nic(&self) -> Result<SteeringAudit, String>;
 
     fn installed(&self) -> Vec<(String, u32)>;
     /// Change what steering *should* be, without touching the NIC.
@@ -267,8 +299,8 @@ impl Steering for SteeringUnavailable {
     fn unsteer(&mut self) -> Result<(), String> {
         Err("MCAM steering is unavailable in this runtime; cannot confirm rules removed".into())
     }
-    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
-        Ok(Vec::new())
+    fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+        Ok(SteeringAudit::clean())
     }
     fn installed(&self) -> Vec<(String, u32)> {
         Vec::new()
@@ -929,17 +961,30 @@ impl Runtime {
             if due && !c.steering.installed().is_empty() {
                 c.last_steer_audit = Some(now);
                 match c.steering.missing_from_nic() {
-                    Ok(missing) => {
-                        c.steer_audit_error = None;
-                        if !missing.is_empty() && c.steer_missing != missing.len() {
+                    Ok(audit) => {
+                        if !audit.missing.is_empty() && c.steer_missing != audit.missing.len() {
                             tracing::warn!(
-                                missing = ?missing,
-                                "steering rules the ledger names are gone from the NIC; \
+                                missing = ?audit.missing,
+                                "steering rules this target needs are not in the NIC; \
                                  traffic for them is on the eBPF tier. `packetframe \
                                  reconfigure` reinstalls them"
                             );
                         }
-                        c.steer_missing = missing.len();
+                        c.steer_missing = audit.missing.len();
+                        // Taken from the audit rather than cleared: a
+                        // pass that proved drift AND could not read the
+                        // rest is an incomplete answer, and clearing
+                        // here published it as a complete one (review
+                        // finding). `None` is the only thing that says
+                        // the whole target was checked.
+                        if let Some(why) = &audit.unreadable {
+                            tracing::warn!(
+                                error = %why,
+                                confirmed = audit.missing.len(),
+                                "steering audit was incomplete; the count is a floor"
+                            );
+                        }
+                        c.steer_audit_error = audit.unreadable;
                     }
                     // A NIC we cannot read is not a NIC we can call
                     // wrong — the last count stands. But it is not a
@@ -2028,8 +2073,8 @@ mod tests {
     }
 
     impl Steering for LedgerSteering {
-        fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
-            Ok(Vec::new())
+        fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+            Ok(SteeringAudit::clean())
         }
         fn configured_ports(&self) -> usize {
             self.configured
@@ -2171,6 +2216,63 @@ mod tests {
         assert!(
             rt.status().store_error.is_some(),
             "but the operator has to learn the record is stale — the next start cannot adopt"
+        );
+    }
+
+    /// An INCOMPLETE audit reaches status as both of its facts.
+    ///
+    /// The audit can prove drift and still fail to read the rest, and
+    /// the caller used to treat any `Ok` as a complete pass: it cleared
+    /// `steer_audit_error` and published the confirmed count as current,
+    /// so health said "1 rule missing" while more could have been
+    /// sitting behind the unreadable location and nothing said so
+    /// (review finding). The count is a floor whenever the pass was
+    /// partial, and the two travel together for that reason.
+    #[test]
+    fn an_incomplete_audit_publishes_its_count_and_its_gap() {
+        struct PartialAudit;
+        impl Steering for PartialAudit {
+            fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
+                Ok(SteeringAudit {
+                    missing: vec![("eth4".into(), 1024)],
+                    unreadable: Some("loc 1025 on eth4: EIO".into()),
+                })
+            }
+            fn configured_ports(&self) -> usize {
+                1
+            }
+            fn steer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn unsteer(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            // Non-empty: the caller skips the audit on an empty ledger.
+            fn installed(&self) -> Vec<(String, u32)> {
+                vec![("eth4".into(), 1024), ("eth4".into(), 1025)]
+            }
+            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+        }
+
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(PartialAudit),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let st = rt.status();
+        assert_eq!(
+            st.steer_missing, 1,
+            "the drift the pass DID prove must be published"
+        );
+        assert_eq!(
+            st.steer_audit_error.as_deref(),
+            Some("loc 1025 on eth4: EIO"),
+            "and so must the fact that the pass was incomplete — without it the \
+             floor is published as a current count and further drift is invisible"
         );
     }
 

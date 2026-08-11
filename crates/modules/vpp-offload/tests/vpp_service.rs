@@ -716,9 +716,11 @@ fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
 fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
     struct PanicOnSteer;
     impl packetframe_vpp_offload::runtime::Steering for PanicOnSteer {
-        fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
+        fn missing_from_nic(
+            &self,
+        ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
             // No NIC behind this double, so nothing can be missing from one.
-            Ok(Vec::new())
+            Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
         }
         fn configured_ports(&self) -> usize {
             1
@@ -1155,9 +1157,9 @@ fn the_timeout_correction_survives_the_in_flight_tick() {
 struct SpySteering(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
 impl packetframe_vpp_offload::runtime::Steering for SpySteering {
-    fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
+    fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
         // No NIC behind this double, so nothing can be missing from one.
-        Ok(Vec::new())
+        Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
     }
     fn configured_ports(&self) -> usize {
         1
