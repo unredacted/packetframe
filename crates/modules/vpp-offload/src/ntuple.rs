@@ -769,21 +769,30 @@ pub struct NtupleSteering {
     /// the rule gone. The state file's mirror of this is what lets a
     /// later `detach --all` remove rules this process did not install.
     installed: Vec<(String, u32)>,
-    /// The target this object steered BEFORE the last `retarget`.
+    /// The target the LEDGER was last installed under.
     ///
     /// Kept for one purpose: a port the config just turned off leaves
     /// `ports`, and its ledger entries then have no expectation to be
     /// checked against — so "is this slot still ours" degenerated into
     /// "is this slot occupied", which is the ownership guess this audit
-    /// has already been burned by twice. With the outgoing target in
-    /// hand a dropped port's rules get the same field-by-field
-    /// comparison as everything else.
+    /// has already been burned by twice. With the installed target in
+    /// hand those rules get the same field-by-field comparison as
+    /// everything else.
     ///
-    /// Only the LAST target, deliberately: a second retarget drops it,
-    /// and a port dropped two targets ago falls back to occupancy. That
-    /// is stated rather than fixed because the alternative is
-    /// accumulating every target this process ever held.
-    former: Option<(Vec<(String, u32)>, RuleSet)>,
+    /// Written by a SUCCESSFUL `steer` and by nothing else. The first
+    /// version recorded the outgoing target on every `retarget`, which
+    /// is the last thing *intended* rather than the last thing
+    /// installed — so two reconfigures whose reconcile was refused (the
+    /// completeness gate permits a second request from `Ready`) left it
+    /// describing a target that had never reached the NIC. The rules
+    /// actually there then matched nothing, were disowned as foreign,
+    /// and vanished from the audit entirely: not missing, not surplus,
+    /// not mentioned (review finding).
+    ///
+    /// `None` after a restart: the state file records locations, not
+    /// what they were installed to hold, so ownership falls back to
+    /// occupancy — see the non-member arm of `missing_from_nic`.
+    installed_as: Option<(Vec<(String, u32)>, RuleSet)>,
 }
 
 impl NtupleSteering {
@@ -792,7 +801,7 @@ impl NtupleSteering {
             ports,
             plan,
             installed: Vec::new(),
-            former: None,
+            installed_as: None,
         }
     }
 
@@ -877,7 +886,7 @@ impl NtupleSteering {
 
     /// Can the outgoing target prove this slot is **not** ours?
     ///
-    /// `true` only when the former target covered this interface AND
+    /// `true` only when the last install covered this interface AND
     /// nothing it asked for matches what the NIC returned — that is
     /// positive evidence the rule at this location belongs to somebody
     /// else, so our own is already gone. `false` covers both "it is
@@ -885,15 +894,15 @@ impl NtupleSteering {
     /// caller's message claims occupancy rather than ownership.
     ///
     /// One-to-one, like the member path: two locations holding a copy
-    /// of the same former rule cannot both be accounted for by it.
-    fn former_disowns(
+    /// of the same installed rule cannot both be accounted for by it.
+    fn install_disowns(
         &self,
         iface: &str,
         loc: u32,
         got: &RxFlowSpec,
         consumed: &mut std::collections::HashMap<String, Vec<bool>>,
     ) -> bool {
-        let Some((ports, plan)) = &self.former else {
+        let Some((ports, plan)) = &self.installed_as else {
             return false;
         };
         let Some(vf) = ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v) else {
@@ -1017,6 +1026,12 @@ impl crate::runtime::Steering for NtupleSteering {
                 }
             }
         }
+        // Here and nowhere else: the ledger now holds this target,
+        // confirmed rule by rule by the readback inside `insert`. An
+        // intent that never reached the NIC must not overwrite this —
+        // that is what made a second refused reconfigure disown rules
+        // that were really there.
+        self.installed_as = Some((self.ports.clone(), self.plan.clone()));
         Ok(())
     }
 
@@ -1076,7 +1091,7 @@ impl crate::runtime::Steering for NtupleSteering {
         let mut stray = Vec::new();
         // One-to-one accounting for the outgoing target, same rule as
         // `consumed` above and for the same reason.
-        let mut former_consumed: std::collections::HashMap<String, Vec<bool>> =
+        let mut installed_consumed: std::collections::HashMap<String, Vec<bool>> =
             std::collections::HashMap::new();
 
         for (iface, loc) in &self.installed {
@@ -1112,7 +1127,7 @@ impl crate::runtime::Steering for NtupleSteering {
                 // "occupied" rather than claiming the traffic is ours:
                 // silence is the worse error on the rollback path.
                 Ok(()) if member.is_none() => {
-                    if self.former_disowns(iface, *loc, &check.fs, &mut former_consumed) {
+                    if self.install_disowns(iface, *loc, &check.fs, &mut installed_consumed) {
                         tracing::debug!(
                             iface,
                             loc,
@@ -1164,7 +1179,8 @@ impl crate::runtime::Steering for NtupleSteering {
                         // outright, in which case it is not ours at
                         // all and neither complaint applies.
                         None => {
-                            if self.former_disowns(iface, *loc, &check.fs, &mut former_consumed) {
+                            if self.install_disowns(iface, *loc, &check.fs, &mut installed_consumed)
+                            {
                                 tracing::debug!(
                                     iface,
                                     loc,
@@ -1321,10 +1337,8 @@ impl crate::runtime::Steering for NtupleSteering {
     }
 
     fn retarget(&mut self, ports: Vec<(String, u32)>, plan: RuleSet) {
-        self.former = Some((
-            std::mem::replace(&mut self.ports, ports),
-            std::mem::replace(&mut self.plan, plan),
-        ));
+        self.ports = ports;
+        self.plan = plan;
     }
 }
 
@@ -1989,6 +2003,54 @@ mod tests {
         let a = live.missing_from_nic().expect("read the NIC");
         assert_eq!(a.missing.len(), per_prefix, "{:?}", a.missing);
         assert_eq!(a.stray.len(), per_prefix, "{:?}", a.stray);
+    }
+
+    /// A SECOND refused reconfigure must not disown what is really there.
+    ///
+    /// The reference for "is this rule ours" was the outgoing target,
+    /// recorded on every `retarget` — the last thing *intended*, not the
+    /// last thing installed. `apply_steering` accepts another request
+    /// from `Ready` after the completeness gate refuses one, so two
+    /// reconfigures in a row left that reference describing a target
+    /// which had never reached the NIC. The rules actually installed
+    /// then matched nothing, were disowned as foreign, and left the
+    /// audit altogether: not missing, not surplus, not mentioned
+    /// (review finding).
+    #[test]
+    fn rules_survive_two_reconfigures_whose_reconcile_never_ran() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        const A: [u8; 4] = [198, 18, 0, 0];
+        const B: [u8; 4] = [203, 0, 113, 0];
+        const C: [u8; 4] = [192, 0, 2, 0];
+
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[A]));
+        s.steer()
+            .expect("A is installed, and confirmed by readback");
+        let installed = s.installed().len();
+        assert!(installed > 0);
+
+        // Two reconfigures, neither reconciled — the supervisor refused
+        // both at the completeness gate, so `steer` never ran again and
+        // the NIC still holds A.
+        s.retarget(vec![("eth0".into(), 0)], plan_for(&[B]));
+        s.retarget(vec![("eth0".into(), 0)], plan_for(&[C]));
+
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            a.stray.len(),
+            installed,
+            "A's rules are still on the NIC and the allowlist no longer covers \
+             them — disowning them as foreign because an intermediate target \
+             never matched loses the fact entirely: {:?}",
+            a.stray
+        );
+        assert_eq!(
+            a.missing.len(),
+            s.plan.rules.len(),
+            "and C, which was never installed, is still absent: {:?}",
+            a.missing
+        );
     }
 
     /// An UNRELATED rule at a dropped port's slot is not our steering.
