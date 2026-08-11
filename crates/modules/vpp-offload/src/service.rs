@@ -920,12 +920,33 @@ fn apply_steering(
         if !steered {
             let counts = runtime.status().counts;
             if counts.blocks_first_steer() {
+                // The ask is RECORDED before the refusal is returned.
+                //
+                // This gate sits before the injection while the
+                // completeness gate sits inside the effect, and that
+                // difference is an accident of where each check landed —
+                // not something an operator can see or should care
+                // about. Without this line the same lever move retried
+                // itself or did not depending on which one caught it:
+                // the completeness refusal becomes `SteerFailed` and
+                // keeps the want, this one returned with the machine
+                // never having heard of the request (review finding).
+                //
+                // Safe against the canary rule because of the early
+                // return above: reaching here means the operator moved
+                // the lever, or a want already existed. Config intent
+                // alone never gets this far.
+                driver.inject(Instant::now(), Event::SteerDeferred, fx);
                 return Err(format!(
                     "refusing the first steer: the FIB is incomplete ({} unresolvable, {} \
                      withheld, {} still installing). Diverting traffic into it would \
                      blackhole exactly the prefixes that are missing. `packetframe status` \
-                     reports all three; they must be zero",
-                    counts.unresolvable, counts.withheld, counts.installing
+                     reports all three; they must be zero. The request is remembered: the \
+                     module steers on its own once they are, at most {}s later",
+                    counts.unresolvable,
+                    counts.withheld,
+                    counts.installing,
+                    crate::driver::STEER_RETRY_EVERY.as_secs()
                 ));
             }
         }

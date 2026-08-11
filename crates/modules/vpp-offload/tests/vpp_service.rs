@@ -1734,3 +1734,129 @@ fn an_allowlist_change_under_live_steering_is_always_reconciled() {
 
     svc.stop();
 }
+
+/// A first steer the FIB gate refuses must leave the ask on the record,
+/// so the module's own retry owns it from there.
+///
+/// Which gate catches an operator's lever move is an implementation
+/// seam. The completeness gate refuses inside `Effects::steer`, so the
+/// refusal becomes `SteerFailed` and the want survives; the FIB gate
+/// refuses in `apply_steering` before anything is injected, so the
+/// machine never heard of the request — same operator action, same
+/// visible outcome, and one of them retried while the other waited for
+/// a human (review finding, PR #160).
+///
+/// Asserted through the published health surface rather than by peeking
+/// at the supervisor, because that is where the difference shows: the
+/// designed staging state and a rollout that stalled must not print the
+/// same line.
+#[test]
+fn a_first_steer_refused_by_the_fib_gate_is_still_remembered() {
+    let fake = Fake::start("svc-fib-gate-want");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            // Six routes into a two-route heap: four are withheld, so
+            // `blocks_first_steer()` holds and the verify is incomplete.
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                }],
+                vec!["eth4".into()],
+                2,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SpySteering(spy)),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if svc.status().expect("published").state == State::Ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "did not reach Ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Before the lever, this is the designed staging state.
+    let steering_line = |s: &packetframe_vpp_offload::service::Published| {
+        s.report
+            .subsystems
+            .iter()
+            .find(|x| x.name == "steering")
+            .and_then(|x| x.message.clone())
+            .unwrap_or_default()
+    };
+    let before = svc.status().expect("published");
+    assert!(
+        !steering_line(&before).contains("intended but not in place"),
+        "nothing has been asked for yet: {}",
+        steering_line(&before)
+    );
+
+    // The operator turns the lever into an incomplete table.
+    let err = svc
+        .apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
+        .expect_err("an incomplete FIB is not one to divert traffic into");
+    assert!(err.contains("refusing the first steer"), "{err}");
+    assert!(
+        err.contains("remembered"),
+        "and the answer must say the ask survives, or an operator re-runs it \
+         needlessly: {err}"
+    );
+
+    // The record is what matters: `steer_intended` is the predicate the
+    // retry reads, and the health line is where an operator sees it.
+    let after = svc.status().expect("published");
+    assert!(
+        steering_line(&after).contains("intended but not in place"),
+        "a refused lever move must not read as the staging state — that is the \
+         distinction the retry keys on: {}",
+        steering_line(&after)
+    );
+    assert!(
+        after
+            .metrics
+            .contains("packetframe_vpp_steer_intended{module=\"vpp-offload\"} 1"),
+        "{}",
+        after.metrics
+    );
+    assert!(
+        log.lock().unwrap().iter().all(|c| c != "steer"),
+        "and nothing may have been installed: {:?}",
+        log.lock().unwrap()
+    );
+}

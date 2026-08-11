@@ -322,6 +322,28 @@ pub enum Event {
     /// [`crate::runtime::Steering::retarget`] first; `Action::Steer`
     /// reconciles the NIC to whatever the target now is.
     SteerRequested,
+    /// The operator asked to steer and the caller declined **before
+    /// attempting it** — the FIB gate in
+    /// [`crate::service`]`::apply_steering`, which refuses a first steer
+    /// while routes are withheld, unresolvable or still installing.
+    ///
+    /// Records the want and does nothing else. Deliberately NOT
+    /// [`Self::SteerFailed`], which asserts an attempt that this path
+    /// never made: `rules_remain` is documented as read from the
+    /// steering ledger after a rollback, and an operator reading
+    /// `SteerFailed` in a log goes looking for a NIC that refused an
+    /// insert. This module has spent several rounds separating "asked
+    /// for and broken" from "never attempted"; a second event is
+    /// cheaper than blurring that again.
+    ///
+    /// Without it the same operator action retried or not depending on
+    /// which gate caught it. A steer refused by the completeness gate
+    /// goes through `Action::Steer`, so the refusal becomes
+    /// `SteerFailed` and the want survives to be retried; one refused by
+    /// the FIB gate returned before the request ever entered the
+    /// machine, so nothing was recorded and the offload stayed down
+    /// until a human asked a second time (review finding, PR #160).
+    SteerDeferred,
     /// The gates that refused a wanted steer now permit one.
     ///
     /// The caller owns both the observation and its pacing, the same
@@ -748,6 +770,15 @@ impl Supervisor {
             (Ready | State::Steered, SteerRequested) => {
                 self.steer_wanted = true;
                 vec![Action::Steer]
+            }
+            // The ask, recorded without being acted on. Same states as
+            // `SteerRequested`, because it IS that request — declined by
+            // a gate that sits before the injection rather than inside
+            // the effect. No action: the caller has already decided not
+            // to steer, and the want is the whole point.
+            (Ready | State::Steered, SteerDeferred) => {
+                self.steer_wanted = true;
+                vec![]
             }
             // The same lever, re-pulled by the module rather than by a
             // human, once whatever refused it has cleared.
@@ -1702,6 +1733,47 @@ mod tests {
         assert!(
             s.on(Event::SteerUnblocked).is_empty(),
             "and a live steered port must not be re-asserted on a timer"
+        );
+    }
+
+    /// A refusal raised BEFORE the attempt records the want just the
+    /// same, so the retry covers it.
+    ///
+    /// Which gate catches an operator's lever move is an implementation
+    /// seam: the completeness gate refuses inside the effect and leaves
+    /// a `SteerFailed` behind, the FIB gate refuses in the service
+    /// before injecting anything. Only the second needed an event to
+    /// say the ask happened, and without it the same action retried or
+    /// did not depending on which one fired.
+    #[test]
+    fn a_steer_declined_before_it_was_attempted_is_still_wanted() {
+        let mut s = ready_unsteered();
+        assert!(
+            s.on(Event::SteerDeferred).is_empty(),
+            "the caller has already decided not to steer; this only records"
+        );
+        assert!(!s.is_steered(), "and nothing was diverted");
+        assert!(
+            s.steer_retry_pending(),
+            "but the ask stands, so the retry owns it from here"
+        );
+        assert_eq!(s.on(Event::SteerUnblocked), vec![Action::Steer]);
+    }
+
+    /// It is a record of a REQUEST, so it is refused where a request
+    /// would be: config intent cannot reach it, and neither can a state
+    /// with no verified FIB to steer into.
+    #[test]
+    fn a_deferred_steer_is_ignored_outside_the_converged_states() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        assert_eq!(s.state(), State::Syncing);
+        assert!(s.on(Event::SteerDeferred).is_empty());
+        assert!(
+            !s.steer_intended(),
+            "a request refused outside the converged states leaves no want, exactly \
+             as SteerRequested does"
         );
     }
 

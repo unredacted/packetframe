@@ -259,9 +259,18 @@ packetframe status | grep -A6 'module health'
 ```
 
 `packetframe reconfigure` reports the outcome synchronously. If it says
-the change was refused or withdrawn, **it did not happen** — that is
-deliberate, so "the rollout step succeeded" and "the rollout step was
-queued" cannot look the same.
+the change was refused or withdrawn, **it is not in effect** — that is
+deliberate, so "the rollout step succeeded" and "the rollout step is
+pending" cannot look the same.
+
+Not in effect is not the same as forgotten. A steer refused by either
+gate — the completeness verdict, or a FIB still holding withheld,
+unresolvable or in-flight routes — leaves the *ask* recorded, and the
+module re-attempts it on its own once the refusal clears, at most every
+30 s. The refusal message says so when that is what will happen. What
+it never does is report success for something that has not taken
+effect, which is the property this rung depends on: read the answer,
+then confirm with `ethtool -n` before moving to the next rung.
 
 Then watch actual traffic, not counters: PMTUD in particular. A DF
 packet larger than the MTU through a steered path must come back as a
@@ -784,6 +793,9 @@ device appeared in the table or a member port is missing. Check the
 
 This also **blocks the first steer** on an unsteered port, by design:
 if the table cannot be installed, traffic must not be diverted into it.
+A lever move refused on those grounds is remembered, and the steer goes
+in on its own once the count reaches zero — so fix the mapping and
+watch, rather than re-running `reconfigure` on a timer.
 
 ### `packetframe_vpp_routes{state="withheld"} > 0`
 
