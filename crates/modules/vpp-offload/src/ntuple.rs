@@ -230,6 +230,38 @@ fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
     fs
 }
 
+/// Whether a rule read back from the NIC is still ours in the sense the
+/// AUDIT cares about: same match, and no narrower.
+///
+/// [`matches`] deliberately compares only the bytes we set, because a
+/// driver may normalise fields we left zero and refusing a correctly
+/// installed rule would be worse than tolerating a cosmetic difference.
+/// That tolerance has a hole the audit cannot afford: a foreign rule
+/// that keeps our addresses and ring cookie while ADDING a protocol,
+/// TOS or L4 constraint compares equal, and quietly stops offloading
+/// some of the traffic we think is steered (review finding).
+///
+/// So this adds the whole MASK. The mask is what decides breadth — a
+/// value with no mask bits behind it constrains nothing, which is
+/// exactly why `matches` can ignore values — so comparing every mask
+/// byte catches a narrowing without inheriting the false-refusal risk.
+///
+/// Safe to be this strict because the NIC was asked. Reading our own
+/// four rules back on the shadow (2026-08-11) returned stored masks of
+/// zero for TOS, protocol and L4 bytes, on rules installed with those
+/// left zero — the driver invents nothing there. Note `ethtool -n`
+/// PRINTS masks complemented, so those read as `0xff`/`0xffffffff` on
+/// screen; the stored bytes are zero. Mistaking the display for the
+/// wire cost a merged PR once already (#134).
+///
+/// Separate from `matches` on purpose, and used only by the audit: a
+/// false positive here costs a Degraded health line, while the same
+/// false positive in `insert` refuses to steer traffic. Those are not
+/// worth the same and must not share a predicate.
+fn audit_matches(asked: &RxFlowSpec, got: &RxFlowSpec) -> bool {
+    matches(asked, got) && asked.m_u.hdata == got.m_u.hdata
+}
+
 /// Whether a rule read back from the NIC is the one we asked it to hold.
 ///
 /// Compares only what was set: a driver may normalise fields we left
@@ -517,6 +549,23 @@ pub(super) mod sys {
                 occupied,
             })
         })
+    }
+
+    /// Narrow the rule at `loc` — same addresses, same ring cookie, but
+    /// an added protocol constraint. What an out-of-band writer does
+    /// when it reuses our slot for something more specific: the slot
+    /// stays occupied and the addresses still match, so anything
+    /// comparing only those reports it as ours.
+    pub(crate) fn narrow_behind_back(iface: &str, loc: u32) {
+        NIC.with(|n| {
+            let mut nic = n.borrow_mut();
+            if let Some(fs) = nic.rules.get_mut(&(iface.to_string(), loc)) {
+                // `proto` lives at offset 14 of `ethtool_usrip4_spec`;
+                // a mask byte there is what makes the rule narrower.
+                fs.m_u.hdata[14] = 0xff;
+                fs.h_u.hdata[14] = 6; // TCP only
+            }
+        });
     }
 
     /// Overwrite a location with a DIFFERENT rule, the way an insert
@@ -900,7 +949,7 @@ impl crate::runtime::Steering for NtupleSteering {
                 ..Rxnfc::default()
             };
             match sys::ethtool(iface, &mut check) {
-                Ok(()) if matches(&asked, &check.fs) => {}
+                Ok(()) if audit_matches(&asked, &check.fs) => {}
                 // Present but not ours.
                 Ok(()) => missing.push((iface.clone(), *loc)),
                 // Empty: ENOENT is how the driver answers for a
@@ -1209,6 +1258,32 @@ mod tests {
             vec![(iface, loc)],
             "a location still OCCUPIED but holding a different rule is not ours, \
              and occupancy alone cannot tell the difference"
+        );
+    }
+
+    /// A rule NARROWED behind our back is drift, not a match.
+    ///
+    /// The subtle half of the same problem: the slot is occupied, the
+    /// addresses are ours, the cookie is ours — but an added protocol
+    /// mask means part of the traffic we believe is offloaded is not.
+    /// Comparing only the address bytes (what `insert`'s tolerance
+    /// permits, for good reasons of its own) reports this as fine.
+    #[test]
+    fn a_rule_narrowed_behind_our_back_is_reported_missing() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("steer installs");
+        let installed = s.installed();
+        let (iface, loc) = installed[0].clone();
+
+        sys::narrow_behind_back(&iface, loc);
+
+        assert_eq!(
+            s.missing_from_nic().expect("read the NIC"),
+            vec![(iface, loc)],
+            "a rule carrying a constraint we never asked for is not ours — some \
+             of the traffic we believe is steered no longer is"
         );
     }
 
