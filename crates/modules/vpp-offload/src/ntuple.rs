@@ -824,8 +824,39 @@ impl NtupleSteering {
     /// [`crate::resources::ResourceState::steer_rules`], written by
     /// [`crate::runtime::IdentityStore::steering_changed`] after every
     /// change. Both halves shipped in #127 with nothing between them.
+    ///
+    /// **Deduplicated on the way in.** The ledger is a set — a location
+    /// exists once on a NIC — and `steer` maintains that, but this
+    /// arrives from a JSON file on disk, which is a boundary: an older
+    /// build's unconditional append, or an edited file, can name a rule
+    /// twice. The audit matches one planned rule to one location, so the
+    /// second copy would find nothing left to match and report drift on
+    /// a NIC that is perfectly correct — Degraded forever, and
+    /// `reconfigure` would not clear it, since a duplicate is not stale
+    /// (it IS in the desired set) and the insert loop's set-check only
+    /// declines to add a THIRD copy. A false alarm with no remedy is
+    /// worse than no alarm: it is what teaches an operator to stop
+    /// reading the line.
+    ///
+    /// Fixed here rather than in the audit, deliberately. One planned
+    /// rule accounting for one location is the property that catches a
+    /// duplicated rule on the NIC itself; relaxing it to tolerate a
+    /// malformed ledger would trade a real check for a cosmetic one.
     pub fn adopt_installed(&mut self, installed: Vec<(String, u32)>) {
-        self.installed = installed;
+        let found = installed.len();
+        let mut seen = std::collections::HashSet::new();
+        self.installed = installed
+            .into_iter()
+            .filter(|e| seen.insert(e.clone()))
+            .collect();
+        if self.installed.len() < found {
+            tracing::info!(
+                dropped = found - self.installed.len(),
+                kept = self.installed.len(),
+                "the state file named the same steering rule more than once; a \
+                 location exists once on the NIC, so the ledger keeps it once"
+            );
+        }
     }
 
     /// What the NIC should hold, from the current ports and plan.
@@ -1577,6 +1608,59 @@ mod tests {
             s2.missing_from_nic().is_err(),
             "a wholly unreadable NIC must not read as clean — the caller keeps \
              its previous verdict on Err"
+        );
+    }
+
+    /// A ledger naming one rule twice does not make a correct NIC drift.
+    ///
+    /// The state file is JSON on disk, so what comes back is not
+    /// necessarily what this code wrote — an older build appended to the
+    /// ledger unconditionally (fixed in #128, see `steer`), and a file
+    /// can be edited. The audit gives one planned rule to one location,
+    /// so a second copy of an entry found nothing left to match and
+    /// reported drift against a NIC holding exactly what was asked for.
+    /// Degraded forever, too: `reconfigure` cannot clear it, because a
+    /// duplicate is not stale — it is in the desired set — and the
+    /// insert loop's set-check only declines to add a third copy.
+    #[test]
+    fn a_ledger_naming_one_rule_twice_is_read_as_naming_it_once() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut before =
+            NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        before.steer().expect("first run installs");
+        let inherited = before.installed();
+        assert!(inherited.len() >= 2);
+
+        // What an older build's ledger looks like: the supervisor
+        // re-asserts steering on a VPP it believes steered, and every
+        // re-assert appended the same slots again.
+        let mut doubled = inherited.clone();
+        doubled.extend(inherited.iter().cloned());
+
+        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        after.adopt_installed(doubled);
+        assert_eq!(
+            after.installed(),
+            inherited,
+            "a location exists once on the NIC, so the ledger holds it once — and \
+             this is also what gets persisted back"
+        );
+        assert_eq!(
+            audit(&after),
+            Vec::new(),
+            "a NIC holding exactly what was asked for must not read as drift; a \
+             false alarm with no remedy is what teaches an operator to ignore the line"
+        );
+
+        // The dedup must not cost the audit its teeth: real drift behind
+        // a duplicated ledger is still drift.
+        let (iface, loc) = inherited[0].clone();
+        sys::remove_behind_back(&iface, loc);
+        assert_eq!(
+            audit(&after),
+            vec![(iface, loc)],
+            "and a rule that really is gone must still be reported"
         );
     }
 
