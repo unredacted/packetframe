@@ -918,7 +918,8 @@ fn apply_steering(
         // refusing leaves the PREVIOUS rules installed, so a prefix the
         // operator just removed from the allowlist keeps being diverted.
         if !steered {
-            let counts = runtime.status().counts;
+            let rs = runtime.status();
+            let counts = rs.counts;
             if counts.blocks_first_steer() {
                 // The ask is RECORDED before the refusal is returned.
                 //
@@ -947,6 +948,22 @@ fn apply_steering(
                     counts.withheld,
                     counts.installing,
                     crate::driver::STEER_RETRY_EVERY.as_secs()
+                ));
+            }
+            // The counts alone are not the whole gate, because a delta
+            // batch that could not be delivered is in none of them. When
+            // a neighbour send fails, `apply_changes` hands the batch
+            // back to the route source to be retried intact — so its
+            // routes are not installed, not installing, not withheld and
+            // not unresolvable, and this gate read a table with a known
+            // hole as complete. It clears as soon as one update lands, so
+            // the remedy is to look again, not to reconfigure something.
+            if let Some(why) = &rs.drain_error {
+                return Err(format!(
+                    "refusing the first steer: the last route update could not be applied to \
+                     VPP ({why}), so its prefixes are missing from the FIB without appearing \
+                     in any of the counts. It is retried every tick — `packetframe status` \
+                     stops reporting the route-feed subsystem once one lands"
                 ));
             }
         }

@@ -256,6 +256,52 @@ impl RouteSource for RouteFeed {
         SourceChanges { routes, neighbours }
     }
 
+    /// Put an undelivered batch back into the pending maps.
+    ///
+    /// **Fill-if-absent** in both, which is what makes this safe against
+    /// the churn that ran while the batch was out: an entry already
+    /// queued for the same prefix or nexthop was written by the other
+    /// tier AFTER this batch was drained, so it is the newer intent and
+    /// last-write-wins says it must survive. Re-inserting the batch's
+    /// older value would resurrect a withdrawal the source has since
+    /// replaced with a live route.
+    ///
+    /// `seq` is deliberately NOT bumped. It counts mutations of the
+    /// SOURCE, and the adopted-resync gate reads it as "the feed is still
+    /// loading, do not diff against it yet". Our own undelivered work
+    /// coming back is not source activity, and counting it would hold the
+    /// deferral open for as long as VPP kept refusing — an adopted VPP
+    /// left forwarding an unreconciled table by the very mechanism that
+    /// exists to protect it.
+    fn requeue(&self, changes: SourceChanges) {
+        let mut g = self.lock();
+        for (nh, state) in changes.neighbours {
+            if g.neigh_pending.contains_key(&nh) {
+                continue;
+            }
+            // Re-derived from the mirror rather than by converting the
+            // device NAME in the batch back to an ifindex. The mirror is
+            // authoritative and current, so a neighbour that moved links
+            // while the batch was out comes back pointing where it is
+            // now; one the mirror no longer holds comes back as a loss,
+            // which is the honest delta and a no-op in the engine for a
+            // nexthop it never managed to program.
+            let raw = match state {
+                Some(_) => g.neighbours.get(&nh).copied(),
+                None => None,
+            };
+            g.neigh_pending.insert(nh, raw);
+        }
+        for (prefix, nhs) in changes.routes {
+            let key = PrefixKey::from(prefix);
+            if g.pending.contains_key(&key) {
+                continue;
+            }
+            let id = nhs.map(|v| g.intern(&v));
+            g.pending.insert(key, id);
+        }
+    }
+
     fn backlog(&self) -> u64 {
         let g = self.lock();
         (g.pending.len() + g.neigh_pending.len()) as u64
@@ -333,6 +379,9 @@ impl RouteSource for RouteFeed {
 impl RouteSource for std::sync::Arc<RouteFeed> {
     fn drain_changes(&self, max: usize) -> SourceChanges {
         (**self).drain_changes(max)
+    }
+    fn requeue(&self, changes: SourceChanges) {
+        (**self).requeue(changes)
     }
     fn backlog(&self) -> u64 {
         (**self).backlog()
@@ -440,6 +489,124 @@ mod tests {
         let f = RouteFeed::new();
         f.route_withdrawn(v4(203, 0));
         assert_eq!(f.drain_changes(64).routes, vec![(v4(203, 0), None)]);
+    }
+
+    /// An undelivered batch comes back whole, so the engine can retry it.
+    ///
+    /// The engine hands back everything it could not apply — including the
+    /// ROUTE half of a batch whose neighbour programming failed, which is
+    /// the half that used to be dropped. `drain_changes` had already
+    /// removed those prefixes from `pending`, so they were gone from both
+    /// tiers at once: VPP kept forwarding a withdrawn prefix, the counts
+    /// stayed clean, and only a full resync could recover.
+    #[test]
+    fn an_undelivered_batch_comes_back_whole() {
+        let f = RouteFeed::new();
+        let lo = some_real_ifindex();
+        f.route_resolved(v4(198, 51), &[nh(1)]);
+        f.route_withdrawn(v4(203, 0));
+        f.neighbour_resolved(nh(1), [2, 0, 0, 0, 0, 1], lo);
+
+        let batch = f.drain_changes(64);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(f.stats().pending, 0, "the drain emptied both maps");
+        assert_eq!(f.stats().pending_neighbours, 0);
+
+        f.requeue(batch);
+        assert_eq!(f.stats().pending, 2, "both routes are queued again");
+        assert_eq!(f.stats().pending_neighbours, 1);
+
+        let again = f.drain_changes(64);
+        assert_eq!(
+            again.routes,
+            vec![(v4(198, 51), Some(vec![nh(1)])), (v4(203, 0), None)],
+            "the upsert and the withdrawal both survive, unchanged"
+        );
+        assert_eq!(again.neighbours.len(), 1);
+        assert_eq!(again.neighbours[0].0, nh(1));
+        assert_eq!(
+            again.neighbours[0].1.as_ref().map(|(_, mac)| *mac),
+            Some([2, 0, 0, 0, 0, 1]),
+            "with the MAC the engine still owes VPP"
+        );
+    }
+
+    /// A requeue must not overwrite what arrived while the batch was out.
+    ///
+    /// The batch is older than anything queued since it was drained, so
+    /// fill-if-absent is the only correct rule: re-inserting its value
+    /// would resurrect a withdrawal the source has already replaced with
+    /// a live route, and the engine would delete a prefix bird is
+    /// advertising.
+    #[test]
+    fn a_requeue_never_displaces_newer_intent() {
+        let f = RouteFeed::new();
+        let lo = some_real_ifindex();
+        f.route_withdrawn(v4(198, 51));
+        f.neighbour_lost(nh(1));
+        let stale = f.drain_changes(64);
+
+        // The other tier moves on while the batch is undelivered.
+        f.route_resolved(v4(198, 51), &[nh(2)]);
+        f.neighbour_resolved(nh(1), [2, 0, 0, 0, 0, 9], lo);
+
+        f.requeue(stale);
+        let out = f.drain_changes(64);
+        assert_eq!(
+            out.routes,
+            vec![(v4(198, 51), Some(vec![nh(2)]))],
+            "the stale withdrawal must not displace the live route"
+        );
+        assert_eq!(
+            out.neighbours[0].1.as_ref().map(|(_, mac)| *mac),
+            Some([2, 0, 0, 0, 0, 9]),
+            "nor the stale loss displace the re-learned neighbour"
+        );
+    }
+
+    /// A requeue is not source activity, so it must not bump `seq`.
+    ///
+    /// The adopted-resync gate reads `seq` as "the feed is still loading,
+    /// do not diff against it yet". Counting our own undelivered work as
+    /// churn would hold that deferral open for as long as VPP kept
+    /// refusing — leaving an adopted VPP forwarding an unreconciled table
+    /// by way of the mechanism that exists to protect it.
+    #[test]
+    fn a_requeue_does_not_read_as_source_churn() {
+        let f = RouteFeed::new();
+        f.route_resolved(v4(198, 51), &[nh(1)]);
+        let batch = f.drain_changes(64);
+        let before = f.change_seq();
+        f.requeue(batch);
+        assert_eq!(f.change_seq(), before);
+    }
+
+    /// A neighbour comes back pointing where the mirror says it is NOW.
+    ///
+    /// The batch carries a resolved device *name*; the requeue re-derives
+    /// the `(MAC, ifindex)` pair from the mirror instead of converting
+    /// that name back. A neighbour the mirror has since dropped therefore
+    /// comes back as a loss rather than as an add for an adjacency that no
+    /// longer exists.
+    #[test]
+    fn a_requeued_neighbour_the_mirror_dropped_comes_back_as_a_loss() {
+        let f = RouteFeed::new();
+        let lo = some_real_ifindex();
+        f.neighbour_resolved(nh(1), [2, 0, 0, 0, 0, 1], lo);
+        let batch = f.drain_changes(64);
+        assert!(batch.neighbours[0].1.is_some(), "drained as an add");
+
+        // Gone from the mirror, and its own loss delta already drained.
+        f.neighbour_lost(nh(1));
+        let _ = f.drain_changes(64);
+
+        f.requeue(batch);
+        let out = f.drain_changes(64);
+        assert_eq!(
+            out.neighbours,
+            vec![(nh(1), None)],
+            "an add for a neighbour that is gone must come back as a loss"
+        );
     }
 
     /// `drain` is bounded and resumes in key order.

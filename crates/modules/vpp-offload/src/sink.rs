@@ -299,7 +299,18 @@ impl NexthopMap {
 
     /// Resolve one nexthop, or `None` if its device is excluded.
     pub fn resolve(&self, nexthop: &IpAddr) -> Option<NexthopTarget> {
-        let dev = self.device_of.get(nexthop)?;
+        self.target_for_device(self.device_of.get(nexthop)?)
+    }
+
+    /// The same mapping policy, applied to a device name this map has not
+    /// been told about yet.
+    ///
+    /// Exists so the delta path can ask "where would this nexthop land?"
+    /// before committing the nexthop→device pair. Programming the
+    /// adjacency has to happen first, and recording the mapping in order
+    /// to look the interface up would make every route through the
+    /// nexthop installable before VPP had acknowledged anything.
+    pub fn target_for_device(&self, dev: &str) -> Option<NexthopTarget> {
         if let Some((port, vlan)) = self.vlans.get(dev) {
             // A VLAN whose underlying port was never made a member is
             // still excluded: the subif has nothing to sit on.
@@ -315,7 +326,9 @@ impl NexthopMap {
         self.members
             .iter()
             .any(|m| m == dev)
-            .then(|| NexthopTarget::Vf { port: dev.clone() })
+            .then(|| NexthopTarget::Vf {
+                port: dev.to_string(),
+            })
     }
 
     /// Resolve a whole nexthop set. Returns only the resolvable targets;

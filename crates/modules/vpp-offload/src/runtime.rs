@@ -2134,7 +2134,34 @@ impl Effects for EffectsView {
     fn start_verify(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
         match c.engine.run_verify() {
-            Ok(verdict) => {
+            Ok(mut verdict) => {
+                // A failed delivery attempt narrows the verdict, because
+                // the ledger's counts cannot describe one. `apply_changes`
+                // hands an unapplied delta batch back to the source, so
+                // its routes are neither installed nor installing nor
+                // withheld nor unresolvable — they are simply not here,
+                // and `blocks_first_steer` reads a table with a hole in it
+                // as complete. Steering into that diverts traffic into a
+                // FIB that is behind bird by however much the failed batch
+                // held.
+                //
+                // Wider than strictly needed — a transport failure mid-
+                // drain also sets this, and that batch is safe in the
+                // pending map — and deliberately so: every cause is "the
+                // last attempt to push route intent into VPP did not
+                // land", and the conservative direction for a FIRST steer
+                // is to wait one tick for the retry. It clears on the
+                // next clean drain.
+                if let Some(why) = &c.last_drain_error {
+                    if verdict.may_steer {
+                        tracing::warn!(
+                            error = %why,
+                            "verify passed but the last route-update attempt did not; \
+                             withholding the first steer until one lands"
+                        );
+                    }
+                    verdict.may_steer = false;
+                }
                 // The verdict is an observation of what VPP answered.
                 // It reaches the supervisor through the loop's inject,
                 // not from inside this Effects call — the same seam
@@ -2235,6 +2262,9 @@ mod tests {
 
     struct EmptySource;
     impl RouteSource for EmptySource {
+        fn requeue(&self, _: crate::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
         fn route_count(&self) -> u64 {
@@ -2883,6 +2913,13 @@ mod tests {
     fn a_source_backlog_defers_the_retry() {
         struct Backlogged(std::cell::Cell<u64>);
         impl RouteSource for Backlogged {
+            // Never called: this double is asked what it is holding, not
+            // for a batch. `requeue` has no default body on purpose —
+            // one that silently did nothing is the delta loss #161
+            // fixed — so it is spelled out rather than inherited.
+            fn requeue(&self, _: crate::engine::SourceChanges) {
+                unreachable!("this double hands nothing over, so nothing can come back")
+            }
             fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
             fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
             fn route_count(&self) -> u64 {

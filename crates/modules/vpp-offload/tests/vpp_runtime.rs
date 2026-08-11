@@ -19,7 +19,7 @@ mod fake_vpp;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use fake_vpp::{Fake, ASSIGNED_INDEX, MAC};
+use fake_vpp::{Behaviour, Fake, ASSIGNED_INDEX, MAC};
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::attach::PortAttach;
 use packetframe_vpp_offload::driver::Driver;
@@ -33,6 +33,9 @@ struct Mirror {
 }
 
 impl RouteSource for Mirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);
@@ -592,6 +595,164 @@ fn local_interface() -> (u32, String) {
     panic!("no usable interface at index 1..16");
 }
 
+/// A refused neighbour must not cost the batch its route deltas — proved
+/// through the production seam, real `RouteFeed` included.
+///
+/// `RouteFeed::drain_changes` is destructive: it drains `neigh_pending`
+/// and removes each route key from `pending`. So a neighbour send that
+/// failed mid-batch returned before the route loop and those deltas were
+/// gone from both tiers at once — out of the feed's pending map, never
+/// into the engine's, retried by nothing. On a STEERED offload that is a
+/// stale FIB with no signal: the withdrawn prefix keeps being forwarded
+/// and the changed nexthop keeps resolving to its old adjacency, while
+/// `installed`/`installing`/`withheld`/`unresolvable` all stay clean and
+/// verify cannot see it (it samples prefixes the LEDGER believes
+/// installed, and the ledger never learned these existed). Only a full
+/// resync recovered.
+///
+/// Asserted on the wire and on the health surface: the deltas land on the
+/// retry, and while they are owed the backlog says so rather than
+/// reporting a converged table.
+#[test]
+fn a_refused_neighbour_does_not_cost_the_batch_its_routes() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::Arc;
+
+    // VPP already holds the base nexthop, so the one refusal below lands
+    // on the delta's adjacency rather than being spent during the resync.
+    const EXISTING: &[([u8; 4], u32, [u8; 6], u8)] = &[([192, 0, 2, 1], ASSIGNED_INDEX, MAC, 1)];
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start_behaving(
+        "refused-neigh-loop",
+        Behaviour {
+            reject_neighbour_adds: 1,
+            existing_neighbours: EXISTING,
+            ..Default::default()
+        },
+    );
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 1), &[fake_vpp::nh()]);
+
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: dev.clone(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        }],
+        vec![dev],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(feed.clone()),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (mut now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    assert_eq!(rt.status().counts.installed, 1, "the base table converged");
+    let _ = fake.drain_events();
+
+    // One batch: a nexthop VPP will refuse, the withdrawal of the live
+    // prefix, and a route through the new nexthop.
+    let late_nh = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 23));
+    let late_mac = [0x02, 0x00, 0x5e, 0x00, 0x00, 0x17];
+    feed.neighbour_resolved(late_nh, late_mac, ifindex);
+    feed.route_withdrawn(fake_vpp::v4(0, 1));
+    feed.route_resolved(fake_vpp::v4(0, 202), &[late_nh]);
+
+    let mut refusal_seen = false;
+    let mut owed_while_refused = 0;
+    let mut saw_withdraw = false;
+    let mut saw_late_add = false;
+    for _ in 0..64 {
+        let t = {
+            let (mut obs, mut fx) = rt.views();
+            d.tick(now, &mut obs, &mut fx)
+        };
+        for e in rt.take_pending() {
+            let (_, mut fx) = rt.views();
+            d.inject(now, e, &mut fx);
+        }
+        let status = rt.status();
+        if let Some(why) = &status.drain_error {
+            assert!(
+                why.contains("refused the static neighbour for 192.0.2.23"),
+                "the refusal must be reported as itself: {why}"
+            );
+            refusal_seen = true;
+            owed_while_refused = owed_while_refused.max(status.source_backlog);
+        }
+        for e in fake.drain_events() {
+            if let fake_vpp::Event::Route(r) = e {
+                if r.addr == [10, 0, 1, 0] && !r.is_add {
+                    saw_withdraw = true;
+                }
+                if r.addr == [10, 0, 202, 0] && r.is_add {
+                    saw_late_add = true;
+                }
+            }
+        }
+        if saw_withdraw && saw_late_add {
+            break;
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+
+    assert!(refusal_seen, "the test never reached the refusal it models");
+    assert!(
+        owed_while_refused >= 2,
+        "the undelivered routes must be visible as owed while the send is \
+         failing, not silently absent: backlog peaked at {owed_while_refused}"
+    );
+    assert!(
+        saw_withdraw,
+        "the withdrawal the refused batch carried never reached VPP — a \
+         steered offload would still be forwarding that prefix"
+    );
+    assert!(
+        saw_late_add,
+        "nor did the route learned through the new nexthop"
+    );
+    assert_eq!(
+        rt.status().source_backlog,
+        0,
+        "and nothing is left owed once the retry lands"
+    );
+    assert!(
+        rt.status().drain_error.is_none(),
+        "a recovered delta apply must stop being reported"
+    );
+}
+
 /// A nexthop first seen **after** convergence gets its static neighbour
 /// programmed, not just its device mapping.
 ///
@@ -720,6 +881,9 @@ fn an_adopted_resync_waits_for_the_source_instead_of_withdrawing_the_table() {
     /// route feed mid-reload, as a fixture.
     struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
@@ -893,6 +1057,9 @@ fn a_source_still_growing_past_the_floor_keeps_deferring() {
 
     struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
@@ -1058,6 +1225,9 @@ fn quiescence_is_a_rate_not_a_per_check_delta() {
 
     struct SharedMirror(Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
@@ -1274,6 +1444,9 @@ fn balanced_churn_is_not_quiescence() {
         seq: Arc<Mutex<u64>>,
     }
     impl RouteSource for ChurningMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             for p in &self.routes {
                 visit(*p, &[fake_vpp::nh()]);
@@ -1393,6 +1566,9 @@ mod steered {
 
     pub struct SharedMirror(pub Arc<Mutex<Vec<IpPrefix>>>);
     impl RouteSource for SharedMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
@@ -2716,4 +2892,151 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
         "a reconcile that only removes must not be held by gates describing a table \
          traffic would be diverted INTO — that is what leaves a rollback unfinished"
     );
+}
+
+/// The two halves of the currency guarantee, composed: a delta batch
+/// handed back after a refused neighbour must hold the steer retry off
+/// until it lands.
+///
+/// #160 gates the retry on `RouteSource::backlog()`; #161 is what puts
+/// an undelivered batch back into the source so the backlog can report
+/// it. Each was tested alone — the backlog check against a double, the
+/// requeue against the wire — and neither test would notice if the
+/// chain between them came apart. It is the chain that matters: without
+/// the requeue those deltas exist nowhere, no count moves, and the
+/// retry steers over a FIB missing exactly them.
+#[test]
+fn a_handed_back_batch_holds_the_retry_until_it_lands() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::Arc;
+
+    const EXISTING: &[([u8; 4], u32, [u8; 6], u8)] = &[([192, 0, 2, 1], ASSIGNED_INDEX, MAC, 1)];
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start_behaving(
+        "requeue-holds-retry",
+        Behaviour {
+            reject_neighbour_adds: 1,
+            existing_neighbours: EXISTING,
+            ..Default::default()
+        },
+    );
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    feed.route_resolved(fake_vpp::v4(0, 1), &[fake_vpp::nh()]);
+
+    let log: steered::Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: dev.clone(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        }],
+        vec![dev],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    );
+    let rt = Runtime::new(
+        engine,
+        Box::new(feed.clone()),
+        Box::new(steered::RecordingSteering {
+            rules: Vec::new(),
+            log: log.clone(),
+        }),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (mut now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    let _ = fake.drain_events();
+
+    // The operator's ask, refused before it was attempted — the state a
+    // FIB gate refusal leaves, and the one the retry owns from here.
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, Event::SteerDeferred, &mut fx);
+    }
+    assert!(d.supervisor().steer_retry_pending());
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing installed yet: {:?}",
+        log.lock().unwrap()
+    );
+
+    // One batch whose neighbour VPP will refuse, carrying a withdrawal
+    // and a route through the new nexthop.
+    let late_nh = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 23));
+    feed.neighbour_resolved(late_nh, [0x02, 0x00, 0x5e, 0x00, 0x00, 0x17], ifindex);
+    feed.route_withdrawn(fake_vpp::v4(0, 1));
+    feed.route_resolved(fake_vpp::v4(0, 202), &[late_nh]);
+
+    let mut refused_with_work_owed = false;
+    let mut events = Vec::new();
+    for _ in 0..64 {
+        let t = {
+            let (mut obs, mut fx) = rt.views();
+            d.tick(now, &mut obs, &mut fx)
+        };
+        events.extend(t.events.clone());
+        for e in rt.take_pending() {
+            let (_, mut fx) = rt.views();
+            events.extend(d.inject(now, e, &mut fx).events);
+        }
+        // While the batch is owed, the retry must stay shut — checked
+        // at the seam, because the retry's own pacing could otherwise
+        // hide a gate that was open all along.
+        if rt.status().source_backlog > 0 {
+            refused_with_work_owed = true;
+            let (mut obs, _) = rt.views();
+            assert!(
+                !obs.steer_permitted(),
+                "a batch handed back after a refused neighbour is route intent VPP \
+                 has not seen; steering over it blackholes exactly those prefixes"
+            );
+        }
+        if d.state() == State::Steered {
+            break;
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+    assert!(
+        refused_with_work_owed,
+        "the test never reached the refusal it models — with the requeue gone this \
+         is how it fails, because nothing is ever owed"
+    );
+
+    // And the retry landed the moment the source was current again,
+    // with no operator and no convergence.
+    assert!(
+        events.contains(&Event::SteerUnblocked),
+        "the retry never fired once the batch landed: {events:?}"
+    );
+    assert_eq!(log.lock().unwrap().as_slice(), &["steer"]);
+    assert_eq!(d.state(), State::Steered);
+    assert_eq!(rt.status().source_backlog, 0);
+    assert!(rt.status().drain_error.is_none());
 }

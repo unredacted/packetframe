@@ -34,6 +34,9 @@ struct Mirror {
 }
 
 impl RouteSource for Mirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);
@@ -267,6 +270,9 @@ struct OrphanedMirror {
 }
 
 impl RouteSource for OrphanedMirror {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
     fn route_count(&self) -> u64 {
         let mut n = 0u64;
         self.for_each_route(&mut |_, _| n += 1);
@@ -424,6 +430,7 @@ fn static_neighbours_are_programmed_before_the_routes_that_need_them() {
                 sw_if_index,
                 mac,
                 flags,
+                ..
             } => Some((*sw_if_index, *mac, *flags)),
             _ => None,
         })
@@ -463,6 +470,9 @@ fn static_neighbours_are_programmed_before_the_routes_that_need_them() {
 fn neighbours_on_foreign_devices_are_skipped() {
     struct MixedMirror;
     impl RouteSource for MixedMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn route_count(&self) -> u64 {
             let mut n = 0u64;
             self.for_each_route(&mut |_, _| n += 1);
@@ -661,6 +671,9 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
 
     struct ThreeNeighbours;
     impl RouteSource for ThreeNeighbours {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
             visit(nh(), "eth4", MAC); // identical in VPP: keep
@@ -726,6 +739,441 @@ fn adoption_programs_only_missing_or_stale_neighbours() {
     );
 }
 
+/// The nexthop the delta path is about to program, and the MAC it
+/// carries. Shared by the two refused-neighbour tests below.
+const DELTA_NH: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 22));
+const DELTA_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xfe];
+
+/// A source whose delta batches the test queues by hand, and which
+/// **models the feed on a requeue**: an undelivered batch goes back on the
+/// queue, so the next drain re-serves it intact.
+#[derive(Default)]
+struct QueuedSource {
+    queue: std::sync::Mutex<Vec<packetframe_vpp_offload::engine::SourceChanges>>,
+}
+
+impl QueuedSource {
+    fn with(changes: packetframe_vpp_offload::engine::SourceChanges) -> Self {
+        Self {
+            queue: std::sync::Mutex::new(vec![changes]),
+        }
+    }
+
+    fn queued(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+}
+
+impl RouteSource for QueuedSource {
+    fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+        self.queue.lock().unwrap().insert(0, changes);
+    }
+    fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+        self.queue.lock().unwrap().pop().unwrap_or_default()
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for i in 0..4u8 {
+            visit(v4(0, i), &[nh()]);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(nh(), "eth4", MAC);
+    }
+    fn route_count(&self) -> u64 {
+        4
+    }
+    fn change_seq(&self) -> u64 {
+        4
+    }
+}
+
+/// A converged engine against a VPP that will refuse the next `n`
+/// neighbour adds. Its own resync neighbour is already in VPP, so the
+/// refusal lands on the DELTA's nexthop instead of being spent on setup.
+fn refusing_engine(tag: &str, fake: &Fake) -> ConvergenceEngine {
+    let mut e = engine_for(fake);
+    assert!(e.api_ready(), "handshake for {tag}");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = QueuedSource::default();
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("programming");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 4, "the base table converges");
+    let _ = fake.drain_events();
+    e
+}
+
+/// VPP already holds the resync's own neighbour, correct and static.
+const RESYNC_NEIGHBOUR: &[([u8; 4], u32, [u8; 6], u8)] =
+    &[([192, 0, 2, 1], ASSIGNED_INDEX, MAC, 1)];
+
+/// A refused neighbour hands the WHOLE delta batch back, routes included,
+/// and the retry lands them.
+///
+/// `drain_changes` is destructive: the feed removes what it returns. So
+/// returning early on the neighbour send left the batch's route half
+/// applied nowhere — out of the feed's pending map, never into the
+/// engine's, retried by nothing. An already-steered VPP went on
+/// forwarding a withdrawn prefix and resolving a changed nexthop to its
+/// old adjacency, with `installed`/`installing`/`withheld`/
+/// `unresolvable` all unaffected, so health read fine and verify could
+/// not see it: verify samples prefixes the LEDGER believes installed, and
+/// the ledger never learned these existed. Only a full resync recovered.
+///
+/// Handing the routes BACK rather than queueing them is the load-bearing
+/// half. Queued here they would install through the adjacency VPP just
+/// refused, which is #115's worst finding — see the sibling test.
+#[test]
+fn a_refused_neighbour_hands_the_whole_delta_batch_back() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    // Withdrawn while steered: the delta that used to vanish.
+    let withdrawn = v4(0, 3);
+    // Learned through the nexthop VPP is refusing.
+    let learned = v4(0, 200);
+
+    let fake = Fake::start_behaving(
+        "delta-refused",
+        Behaviour {
+            reject_neighbour_adds: 1,
+            existing_neighbours: RESYNC_NEIGHBOUR,
+            ..Default::default()
+        },
+    );
+    let mut e = refusing_engine("delta-refused", &fake);
+
+    let src = QueuedSource::with(SourceChanges {
+        neighbours: vec![(DELTA_NH, Some(("eth4".into(), DELTA_MAC)))],
+        routes: vec![(withdrawn, None), (learned, Some(vec![DELTA_NH]))],
+    });
+
+    let err = e
+        .apply_changes(&src, 64)
+        .expect_err("VPP refused the neighbour add");
+    assert!(
+        format!("{err:?}").contains("NeighbourRefused"),
+        "the refusal must surface as itself: {err:?}"
+    );
+    assert!(
+        e.pending().is_empty(),
+        "the routes must NOT be queued behind a refused adjacency"
+    );
+    assert_eq!(
+        src.queued(),
+        1,
+        "the batch must be back at the source, not dropped on the floor"
+    );
+
+    // The fake's refusal was count-based and is spent. The retry lands
+    // the adjacency and, with it, the deltas that used to be lost.
+    e.apply_changes(&src, 64)
+        .expect("the retried batch applies");
+    drain_to_empty(&mut e);
+    assert_eq!(src.queued(), 0, "nothing owed once it lands");
+
+    let events = fake.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Event::Neighbour { mac, .. } if *mac == DELTA_MAC)),
+        "the adjacency is programmed on the retry: {events:?}"
+    );
+    let routes: Vec<&WireRoute> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        routes.iter().any(|r| !r.is_add && r.addr == [10, 0, 3, 0]),
+        "the withdrawal the batch carried must finally reach VPP: {routes:?}"
+    );
+    assert!(
+        routes.iter().any(|r| r.is_add && r.addr == [10, 0, 200, 0]),
+        "and so must the route learned through the new nexthop: {routes:?}"
+    );
+    assert_eq!(
+        e.counts().unresolvable,
+        0,
+        "and the table is complete again"
+    );
+}
+
+/// A nexthop VPP refused must not become resolvable.
+///
+/// This is why the fix cannot simply queue the batch's routes and return
+/// the error. `set_device` alone makes `resolve` answer `Some`, so every
+/// route through the nexthop classifies installable and installs — while
+/// VPP, which runs without linux-cp and can never ARP for the adjacency,
+/// has nothing to send them to. Readback verification checks that a route
+/// exists on an interface we own, deliberately not that its adjacency
+/// resolves, so it passes. That is #115's worst finding: "a route through
+/// an unprogrammed adjacency installs cleanly, verifies cleanly, and drops
+/// every packet".
+///
+/// Recording the mapping before the send left that door open even on
+/// failure — the entry survived the error, so the next drain resolved
+/// through an adjacency VPP had refused. `unresolvable` is the honest
+/// answer, and it is loud: it blocks the first steer and fails verify.
+#[test]
+fn a_refused_adjacency_never_becomes_resolvable() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = Fake::start_behaving(
+        "delta-unresolvable",
+        Behaviour {
+            reject_neighbour_adds: 1,
+            existing_neighbours: RESYNC_NEIGHBOUR,
+            ..Default::default()
+        },
+    );
+    let mut e = refusing_engine("delta-unresolvable", &fake);
+
+    let refused = QueuedSource::with(SourceChanges {
+        neighbours: vec![(DELTA_NH, Some(("eth4".into(), DELTA_MAC)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&refused, 64).expect_err("refused");
+    let _ = fake.drain_events();
+
+    // A later batch — routes only, so nothing re-attempts the adjacency.
+    let after = QueuedSource::with(SourceChanges {
+        neighbours: Vec::new(),
+        routes: vec![(v4(0, 201), Some(vec![DELTA_NH]))],
+    });
+    e.apply_changes(&after, 64).expect("routes alone apply");
+    drain_to_empty(&mut e);
+
+    assert_eq!(
+        e.counts().unresolvable,
+        1,
+        "a route through an unacknowledged adjacency must read unresolvable"
+    );
+    assert!(
+        !fake
+            .drain_events()
+            .iter()
+            .any(|ev| matches!(ev, Event::Route(WireRoute { is_add: true, .. }))),
+        "and nothing may reach VPP's FIB for it"
+    );
+    assert!(
+        e.counts().blocks_first_steer(),
+        "which is loud: the hole blocks a first steer rather than hiding"
+    );
+}
+
+/// A converged engine against a VPP that applies the next neighbour op and
+/// then goes silent, leaving its outcome unknowable to the client.
+fn silent_after_neighbour(tag: &str, fake: &Fake) -> ConvergenceEngine {
+    let mut e = engine_for(fake);
+    assert!(e.api_ready(), "handshake for {tag}");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let base = QueuedSource::default();
+    e.begin_resync(&base);
+    // VPP already holds the neighbour, so nothing is sent here and the
+    // swallow stays armed for the delta under test.
+    assert_eq!(e.program_neighbours(&base).expect("programming"), 0);
+    drain_to_empty(&mut e);
+    let _ = fake.drain_events();
+    e
+}
+
+fn silent_fake(tag: &str) -> Fake {
+    Fake::start_behaving(
+        tag,
+        Behaviour {
+            swallow_neighbour_reply: true,
+            existing_neighbours: RESYNC_NEIGHBOUR,
+            ..Default::default()
+        },
+    )
+}
+
+/// An unacknowledged neighbour ADD is not blindly re-sent.
+///
+/// A transport error after the write is genuinely ambiguous: VPP may have
+/// applied the change. `neighbours_installed` records only
+/// acknowledgements, so it comes out of this describing a table VPP may not
+/// have — and re-adding an existing static neighbour is not a no-op. VPP
+/// replaces the entry and walks every dependent FIB entry: ~1M routes hang
+/// off one adjacency here, for a measured 5.51 s of null-node (shadow,
+/// 2026-08-08). Requeueing the batch made that retry certain rather than
+/// incidental, so the ledger has to be reconciled against VPP first.
+///
+/// The fake applies the op and then goes silent, which is the only faithful
+/// model of the ambiguity: a refused retval is VPP telling us, and a hangup
+/// *before* the op is unambiguous the other way.
+///
+/// See [`an_unacknowledged_neighbour_removal_does_not_strand_the_ledger`]
+/// for the opposite direction, which fails worse.
+#[test]
+fn an_unacknowledged_neighbour_add_is_not_blindly_re_added() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = silent_fake("neigh-unacked-add");
+    let mut e = silent_after_neighbour("neigh-unacked-add", &fake);
+
+    // A MAC change on the adjacency every route resolves through — the
+    // expensive one to re-add. VPP applies it and never answers.
+    const MAC_CHANGED: [u8; 6] = [0x02, 0, 0, 0, 0, 0x77];
+    let src = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), Some(("eth4".into(), MAC_CHANGED)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&src, 64)
+        .expect_err("the reply never comes");
+    assert_eq!(src.queued(), 1, "the batch is owed, as ever");
+    let sent = fake.drain_events();
+    assert!(
+        sent.iter()
+            .any(|ev| matches!(ev, Event::Neighbour { mac, .. } if *mac == MAC_CHANGED)),
+        "the add did reach VPP: {sent:?}"
+    );
+
+    // Reconnect and retry. The reconciling dump must find VPP already
+    // holding the new MAC and absorb the re-add.
+    assert!(e.api_ready(), "reconnects");
+    e.apply_changes(&src, 64).expect("the retry applies");
+    let after = fake.drain_events();
+    assert!(
+        after
+            .iter()
+            .any(|ev| matches!(ev, Event::Msg(m) if m == "ip_neighbor_dump")),
+        "the only way to know what VPP holds is to have asked: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|ev| matches!(ev, Event::Neighbour { mac, .. } if *mac == MAC_CHANGED)),
+        "an adjacency VPP already holds must not be re-added — that walk is \
+         ~1M dependent routes and 5.5 s of blackhole: {after:?}"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|ev| matches!(ev, Event::Msg(m) if m == "ip_neighbor_dump"))
+            .count(),
+        1,
+        "and `V4Only` asks exactly once — the per-family loop must not cost \
+         a spare round trip on the policy this NIC actually runs: {after:?}"
+    );
+}
+
+/// The reconciling dump covers **every family the policy carries**.
+///
+/// A v4-only dump answers "not present" for a v6 neighbour, and both
+/// consumers of that answer read absence as permission to send: the resync
+/// walk re-adds a v6 adjacency VPP already holds, and `settle_unacked`
+/// drops a v6 claim it could not verify. Either pays the dependent-FIB
+/// walk this ledger exists to avoid, so under `FamilyPolicy::Both` the
+/// question has to be asked twice (review finding).
+///
+/// The count is the assertion because that is the whole of the fix. What
+/// happens to a v6 entry once found is `settle_unacked`, which the two
+/// directional tests above already pin — the fake holds only v4
+/// neighbours, so a v6 dump here answers empty exactly as a real v4-only
+/// table would.
+#[test]
+fn the_reconciling_dump_covers_every_carried_family() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = silent_fake("neigh-unacked-v6");
+    // Same wiring as `engine_for`, with the one difference under test.
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    );
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let base = QueuedSource::default();
+    e.begin_resync(&base);
+    e.program_neighbours(&base).expect("programming");
+    drain_to_empty(&mut e);
+    let _ = fake.drain_events();
+
+    // Leave a neighbour in doubt, then let the retry reconcile.
+    const MAC_CHANGED: [u8; 6] = [0x02, 0, 0, 0, 0, 0x78];
+    let src = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), Some(("eth4".into(), MAC_CHANGED)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&src, 64)
+        .expect_err("the reply never comes");
+    let _ = fake.drain_events();
+    assert!(e.api_ready(), "reconnects");
+    e.apply_changes(&src, 64).expect("the retry applies");
+
+    let dumps = fake
+        .drain_events()
+        .into_iter()
+        .filter(|ev| matches!(ev, Event::Msg(m) if m == "ip_neighbor_dump"))
+        .count();
+    assert_eq!(
+        dumps, 2,
+        "both families must be asked about; a v4-only dump reads every v6 \
+         adjacency as absent and re-adds it"
+    );
+}
+
+/// An unacknowledged neighbour REMOVAL must not leave the ledger claiming
+/// an adjacency VPP no longer has.
+///
+/// The dangerous direction, and the one a "don't retransmit adds" fix would
+/// miss entirely. `send_neighbour` clears `neighbours_installed` only on an
+/// acknowledgement, so a removal VPP applied but never confirmed leaves the
+/// ledger asserting the adjacency is installed. The delta path's skip —
+/// `neighbours_installed.get(..) != Some(&mac)` — then swallows the next
+/// add of that exact MAC, permanently, and every route through it
+/// black-holes with the counts clean. Worse than a redundant walk, and in
+/// the same silent-hole family as the delta loss this PR fixes.
+#[test]
+fn an_unacknowledged_neighbour_removal_does_not_strand_the_ledger() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = silent_fake("neigh-unacked-remove");
+    let mut e = silent_after_neighbour("neigh-unacked-remove", &fake);
+
+    // VPP applies the removal and goes silent.
+    let lost = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), None)],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&lost, 64)
+        .expect_err("the removal's reply never comes");
+    let _ = fake.drain_events();
+
+    // The nexthop comes back, with the very MAC the ledger still remembers.
+    assert!(e.api_ready(), "reconnects");
+    let back = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), Some(("eth4".into(), MAC)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&back, 64).expect("the re-add applies");
+    let readded = fake.drain_events();
+    assert!(
+        readded.iter().any(|ev| matches!(
+            ev,
+            Event::Neighbour { mac, is_add: true, .. } if *mac == MAC
+        )),
+        "VPP applied the removal, so the adjacency must be programmed again — \
+         a ledger that still claims it makes this a silent blackhole: {readded:?}"
+    );
+}
+
 /// The delta path consults the same acknowledged-neighbour ledger as
 /// the resync path — pinned against the second door of the 5.5 s
 /// adoption blackhole (shadow, 2026-08-08).
@@ -749,6 +1197,11 @@ fn the_delta_path_does_not_re_add_an_acknowledged_neighbour() {
         changes: Mutex<Vec<SourceChanges>>,
     }
     impl RouteSource for ScriptedSource {
+        fn requeue(&self, changes: SourceChanges) {
+            // Back on the stack, so the next drain re-serves it — which
+            // is what `RouteFeed` does, refilling its pending maps.
+            self.changes.lock().unwrap().push(changes);
+        }
         fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
             visit(nh(), "eth4", MAC);
