@@ -1049,6 +1049,84 @@ fn an_unacknowledged_neighbour_add_is_not_blindly_re_added() {
         "an adjacency VPP already holds must not be re-added — that walk is \
          ~1M dependent routes and 5.5 s of blackhole: {after:?}"
     );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|ev| matches!(ev, Event::Msg(m) if m == "ip_neighbor_dump"))
+            .count(),
+        1,
+        "and `V4Only` asks exactly once — the per-family loop must not cost \
+         a spare round trip on the policy this NIC actually runs: {after:?}"
+    );
+}
+
+/// The reconciling dump covers **every family the policy carries**.
+///
+/// A v4-only dump answers "not present" for a v6 neighbour, and both
+/// consumers of that answer read absence as permission to send: the resync
+/// walk re-adds a v6 adjacency VPP already holds, and `settle_unacked`
+/// drops a v6 claim it could not verify. Either pays the dependent-FIB
+/// walk this ledger exists to avoid, so under `FamilyPolicy::Both` the
+/// question has to be asked twice (review finding).
+///
+/// The count is the assertion because that is the whole of the fix. What
+/// happens to a v6 entry once found is `settle_unacked`, which the two
+/// directional tests above already pin — the fake holds only v4
+/// neighbours, so a v6 dump here answers empty exactly as a real v4-only
+/// table would.
+#[test]
+fn the_reconciling_dump_covers_every_carried_family() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = silent_fake("neigh-unacked-v6");
+    // Same wiring as `engine_for`, with the one difference under test.
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    );
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let base = QueuedSource::default();
+    e.begin_resync(&base);
+    e.program_neighbours(&base).expect("programming");
+    drain_to_empty(&mut e);
+    let _ = fake.drain_events();
+
+    // Leave a neighbour in doubt, then let the retry reconcile.
+    const MAC_CHANGED: [u8; 6] = [0x02, 0, 0, 0, 0, 0x78];
+    let src = QueuedSource::with(SourceChanges {
+        neighbours: vec![(nh(), Some(("eth4".into(), MAC_CHANGED)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&src, 64)
+        .expect_err("the reply never comes");
+    let _ = fake.drain_events();
+    assert!(e.api_ready(), "reconnects");
+    e.apply_changes(&src, 64).expect("the retry applies");
+
+    let dumps = fake
+        .drain_events()
+        .into_iter()
+        .filter(|ev| matches!(ev, Event::Msg(m) if m == "ip_neighbor_dump"))
+        .count();
+    assert_eq!(
+        dumps, 2,
+        "both families must be asked about; a v4-only dump reads every v6 \
+         adjacency as absent and re-adds it"
+    );
 }
 
 /// An unacknowledged neighbour REMOVAL must not leave the ledger claiming

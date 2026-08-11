@@ -48,7 +48,8 @@ use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
 use crate::vpp_api::generated::{
     IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump,
-    IpRoute, IpRouteDetails, IpRouteDump, IpTable, ADDRESS_IP4, FIB_API_PATH_TYPE_NORMAL,
+    IpRoute, IpRouteDetails, IpRouteDump, IpTable, ADDRESS_IP4, ADDRESS_IP6,
+    FIB_API_PATH_TYPE_NORMAL,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -894,31 +895,43 @@ impl ConvergenceEngine {
     /// [`Self::reconcile_unacked_neighbours`] — because a second
     /// hand-written copy of the flag filter is how the two would come to
     /// disagree about what "an entry we would have created" means.
+    ///
+    /// Asked **once per family the policy carries**, from the same
+    /// `dump_families` the FIB readback uses. A v4-only dump answers "not
+    /// present" for every v6 neighbour, and both consumers read absence as
+    /// permission to send: the resync walk re-adds a v6 adjacency VPP
+    /// already holds, and `settle_unacked` drops a v6 claim it cannot
+    /// verify — each paying the dependent-FIB walk this ledger exists to
+    /// avoid (review finding). Under `V4Only` this is exactly the single
+    /// dump it was before.
     fn dump_static_neighbours(&mut self) -> Result<HashSet<(u32, IpAddr, [u8; 6])>, EngineError> {
-        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
-        let details: Vec<IpNeighborDetails> = match t.dump(IpNeighborDump {
-            context: 0,
-            sw_if_index: u32::MAX,
-            af: ADDRESS_IP4,
-        }) {
-            Ok(d) => d,
-            Err(e) => {
-                self.disconnect();
-                return Err(EngineError::Transport(e));
-            }
-        };
         let mut out = HashSet::new();
-        for d in details {
-            // EXACT flags, not a bit test: `send_neighbour` programs
-            // precisely IP_NEIGHBOR_STATIC, so an entry carrying any
-            // extra flag (STATIC|NO_FIB_ENTRY, say) is not the entry
-            // we would create, and skipping it would silently
-            // preserve the difference forever (review finding).
-            if d.neighbor.flags != IP_NEIGHBOR_STATIC {
-                continue;
-            }
-            if let Some(ip) = crate::fib_sync::from_address(&d.neighbor.ip_address) {
-                out.insert((d.neighbor.sw_if_index, ip, d.neighbor.mac_address));
+        for &is_ip6 in self.drainer.families().dump_families() {
+            let af = if is_ip6 { ADDRESS_IP6 } else { ADDRESS_IP4 };
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            let details: Vec<IpNeighborDetails> = match t.dump(IpNeighborDump {
+                context: 0,
+                sw_if_index: u32::MAX,
+                af,
+            }) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.disconnect();
+                    return Err(EngineError::Transport(e));
+                }
+            };
+            for d in details {
+                // EXACT flags, not a bit test: `send_neighbour` programs
+                // precisely IP_NEIGHBOR_STATIC, so an entry carrying any
+                // extra flag (STATIC|NO_FIB_ENTRY, say) is not the entry
+                // we would create, and skipping it would silently
+                // preserve the difference forever (review finding).
+                if d.neighbor.flags != IP_NEIGHBOR_STATIC {
+                    continue;
+                }
+                if let Some(ip) = crate::fib_sync::from_address(&d.neighbor.ip_address) {
+                    out.insert((d.neighbor.sw_if_index, ip, d.neighbor.mac_address));
+                }
             }
         }
         Ok(out)

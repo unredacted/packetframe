@@ -32,7 +32,7 @@ use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, ControlPingReply, CreateLoopbackReply, DevAttachReply,
     DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
-    IpNeighborDetails, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
+    IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
     IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
     SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
     SwInterfaceSetMacAddressReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
@@ -357,6 +357,17 @@ fn serve(
             // A DUMP, streamed like the others: details frames, no
             // terminator, ended by the trailing control_ping's reply.
             "ip_neighbor_dump" => {
+                // Honour the requested family. Every entry this fake holds
+                // is v4, so a v6 dump answers empty — which is what a real
+                // v4-only table does, and what makes "one dump per carried
+                // family" observable rather than a coincidence.
+                let mut d = Decoder::new(&req);
+                let want = IpNeighborDump::decode(&mut d)
+                    .expect("decodes as a neighbour dump")
+                    .af;
+                if want != ADDRESS_IP4 {
+                    continue;
+                }
                 for &(ip, sw_if_index, mac, flags) in neighbours.iter() {
                     let mut d = reply_head("ip_neighbor_details");
                     let mut un = [0u8; 16];
