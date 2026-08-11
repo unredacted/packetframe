@@ -253,6 +253,11 @@ impl Driver {
         let before = self.sup.state();
         let mut events = Vec::new();
         let mut more_to_drain = false;
+        // Whether THIS tick's drain proved the engine has nothing left to
+        // send. The steer retry's precondition — see `poll_steer_retry`.
+        // False until a drain says so, so a tick that did not drain at
+        // all, or whose drain failed, cannot be read as proof.
+        let mut drain_proved_idle = false;
         // Whether the API was already up **at entry**. Captured here
         // because the block below may arm the detector during this very
         // tick, and every observation in this loop reads the state as it
@@ -337,7 +342,7 @@ impl Driver {
                     // drain can say so, which is why this is observed
                     // rather than assumed after issuing StartResync.
                     Ok(Drain::Idle) if resyncing => events.push(Event::SyncComplete),
-                    Ok(Drain::Idle) => {}
+                    Ok(Drain::Idle) => drain_proved_idle = true,
                     Ok(Drain::More) => more_to_drain = true,
                     // Deliberate waiting, not progress and not
                     // completion. The phase deadline is pushed forward
@@ -381,7 +386,7 @@ impl Driver {
             }
 
             events.extend(self.poll_liveness(now, obs));
-            events.extend(self.poll_steer_retry(now, obs));
+            events.extend(self.poll_steer_retry(now, drain_proved_idle, obs));
         }
 
         let mut tick = self.apply(now, events, fx);
@@ -492,16 +497,42 @@ impl Driver {
     /// [`STEER_RETRY_EVERY`] is what stops a steer that keeps failing
     /// for its own reasons from being re-attempted every tick.
     ///
-    /// One thing it deliberately does NOT do: rescue a want whose target
-    /// is empty. `steer` refuses that before it reaches its stale-rule
-    /// removal, so such a retry could only fail — but every supported
-    /// path that empties the target also clears the want, and the case
-    /// where it does not (a `steer off` whose unsteer was refused) needs
-    /// a teardown outcome meaning "reconciled to nothing steered", which
-    /// is filed separately rather than smuggled in here.
-    fn poll_steer_retry(&mut self, now: Instant, obs: &mut dyn Observe) -> Vec<Event> {
+    /// `drained_idle` is this tick's proof that the engine has nothing
+    /// left to send, and it is a PRECONDITION, not a nicety. The
+    /// ledger's counts are the other gate's evidence and they can be
+    /// clean over deltas VPP never received: `RouteFeed::drain_changes`
+    /// removes the batch from the mirror, and `Engine::apply_changes`
+    /// returns on a failed `send_neighbour` **before** queuing that
+    /// batch's routes — so nothing is left `installing`,
+    /// `blocks_first_steer()` says fine, and a steer here would divert
+    /// traffic into a FIB missing exactly those prefixes (review
+    /// finding, PR #160). A drain that did not run, or ran and failed,
+    /// proves nothing, so neither may pass for proof.
+    ///
+    /// It also subsumes the ordinary in-flight case — `Drain::More`
+    /// means routes are on the wire — which the counts already covered.
+    /// The error case is the one they get wrong.
+    ///
+    /// One thing this deliberately does NOT do: rescue a want whose
+    /// target is empty. `steer` refuses that before it reaches its
+    /// stale-rule removal, so such a retry could only fail — but every
+    /// supported path that empties the target also clears the want, and
+    /// the case where it does not (a `steer off` whose unsteer was
+    /// refused) needs a teardown outcome meaning "reconciled to nothing
+    /// steered", which is filed separately rather than smuggled in here.
+    fn poll_steer_retry(
+        &mut self,
+        now: Instant,
+        drained_idle: bool,
+        obs: &mut dyn Observe,
+    ) -> Vec<Event> {
         if !self.sup.steer_retry_pending() {
             self.last_steer_retry = None;
+            return Vec::new();
+        }
+        if !drained_idle {
+            // Nothing recorded: this is a missing proof, not a spent
+            // attempt, so the tick that does prove it acts immediately.
             return Vec::new();
         }
         if self
@@ -1505,6 +1536,62 @@ mod tests {
             "{attempts} attempts in {window:?} — the interval is not pacing anything"
         );
         assert!(d.supervisor().steer_retry_pending(), "still outstanding");
+    }
+
+    /// A tick whose drain failed is not proof of anything, and must not
+    /// be steered over.
+    ///
+    /// The completeness verdict and the ledger's counts are the two
+    /// gates, and a failed drain can leave BOTH looking clean over
+    /// deltas VPP never received: `drain_changes` takes the batch out of
+    /// the mirror, and `apply_changes` returns on a failed
+    /// `send_neighbour` before queuing that batch's routes, so nothing
+    /// is left `installing` to notice. Steering there diverts traffic
+    /// into a FIB missing exactly those prefixes — and unlike the
+    /// unsteered case, a steered miss is dropped (review finding, PR
+    /// #160).
+    #[test]
+    fn a_failed_drain_holds_the_retry_until_one_succeeds() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+
+        // Both gates now say yes — and the drain says it could not talk
+        // to VPP, which is the fact that outranks them.
+        w.steer_permitted = true;
+        w.drain_fails = true;
+        fx.steer_fails = false;
+        fx.calls.clear();
+        for ms in (100..10_000).step_by(250) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !fx.calls.contains(&"steer"),
+            "a drain that failed cannot show the FIB is current: {:?}",
+            fx.calls
+        );
+        assert!(
+            d.supervisor().steer_retry_pending(),
+            "and the want is still outstanding, not discarded"
+        );
+
+        // The transport comes back and a drain reports the queue empty.
+        // That is the proof, and it is acted on at once — the withheld
+        // ticks must not have counted as attempts.
+        w.drain_fails = false;
+        let t = d.tick(at(t0, 10_100), &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::SteerUnblocked),
+            "a proven-idle drain releases it immediately: {:?}",
+            t.events
+        );
+        assert_eq!(d.state(), State::Steered);
     }
 
     /// A port that never asked to steer is not steered by a gate that
