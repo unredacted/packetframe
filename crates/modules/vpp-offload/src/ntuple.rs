@@ -1024,6 +1024,34 @@ impl NtupleSteering {
     /// rules the audit would disown, and refuse only where the cookie
     /// proves the rule points elsewhere.
     ///
+    /// ## The window this does not close
+    ///
+    /// The readback and the delete are two ioctls and nothing holds the
+    /// table between them, so a writer that replaces a slot in that gap
+    /// gets its rule deleted on the strength of a check that passed
+    /// against the previous occupant (review finding). There is no fix
+    /// available here, and it is worth writing down why rather than
+    /// leaving the readback looking like a guarantee:
+    /// `ETHTOOL_SRXCLSRLDEL` names a location and carries no expected
+    /// value, so the uapi has no compare-and-delete; `rtnl_lock` makes
+    /// each ioctl atomic but cannot be held across a pair from
+    /// userspace; and the other writers — a UniFi provisioning push, a
+    /// firmware event, an operator's `ethtool -N` — share no lock with
+    /// this process at all.
+    ///
+    /// What it does is shrink that window from *every removal this
+    /// module ever issued* to the microseconds between two syscalls.
+    ///
+    /// The symmetric worry — a rule aimed at our VF appearing at a
+    /// disowned slot just before `unsteer` returns — is not a
+    /// synchronisation problem in here at all. The same writer can
+    /// install the same rule immediately AFTER the last delete, when the
+    /// ledger is empty and the answer has already been given; that
+    /// window is unbounded and no amount of checking inside this routine
+    /// shortens it. What covers it is the teardown ORDERING — steering
+    /// down, VPP killed, VF unbound last — and `detach --all` being
+    /// re-runnable against whatever the NIC holds next.
+    ///
     /// Where no VF is known for the interface — nothing in `members`,
     /// the target, or the last install names it — nothing can be proven
     /// and the location is deleted as this module always has. The

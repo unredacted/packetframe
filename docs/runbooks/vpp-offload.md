@@ -552,6 +552,14 @@ different cookies naming the same VF. Both come out. If you are reading
 a `warn` line, the cookie it prints is the raw value — the VF is its
 bits 32-39, and `0` there means the PF rather than any VF of ours.
 
+It is a check, not a lock. The read and the delete are two ioctls and
+the ntuple table has no userspace-holdable lock — `ethtool -N` takes
+none either — so a rule written into a slot in the gap between them can
+still be deleted. Nothing available closes that: `ETHTOOL_SRXCLSRLDEL`
+takes a location and no expected value. If you are pushing controller
+config at a box while it tears steering down, expect to reconcile
+afterwards rather than expecting the module to have won the race.
+
 Two consequences worth knowing before you read a log:
 
 - `unsteer` can return OK with rules still in the table. That is not
