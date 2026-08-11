@@ -671,7 +671,7 @@ fn drive_signal_loop(
         for sig in signals.pending() {
             match sig {
                 SIGHUP => {
-                    reconfigure_from_signal(
+                    let published = reconfigure_from_signal(
                         config_path,
                         state_dir,
                         modules,
@@ -679,8 +679,12 @@ fn drive_signal_loop(
                         #[cfg(feature = "vpp-offload")]
                         allowlist,
                     );
-                    // It just published; do not immediately publish again.
-                    next_poll = Instant::now() + MODULE_POLL_INTERVAL;
+                    // Only when it actually published: a rejected
+                    // reload refreshed nothing, and skipping the next
+                    // poll on its behalf ages the health file.
+                    if published == Published::Yes {
+                        next_poll = Instant::now() + MODULE_POLL_INTERVAL;
+                    }
                 }
                 SIGTERM | SIGINT => {
                     tracing::info!(signal = sig, "termination requested");
@@ -717,7 +721,7 @@ fn reconfigure_from_signal(
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
     module_gauges: &std::sync::Mutex<String>,
     #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
-) {
+) -> Published {
     use packetframe_common::module::ModuleConfig;
 
     tracing::info!(config = %config_path.display(), "SIGHUP received; reconfiguring");
@@ -729,7 +733,7 @@ fn reconfigure_from_signal(
         Err(e) => {
             tracing::error!(error = %e, "SIGHUP config parse failed; keeping current config");
             write_reconfigure_marker(&marker_path, &format!("ERR parse: {e}"));
-            return;
+            return Published::No;
         }
     };
 
@@ -752,7 +756,7 @@ fn reconfigure_from_signal(
     if let Err(e) = new_config.validate_vpp_offload() {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
-        return;
+        return Published::No;
     }
 
     // Before the module loop, and for the WHOLE config rather than per
@@ -808,6 +812,21 @@ fn reconfigure_from_signal(
             &format!("ERR module: {}", failures.join("; ")),
         );
     }
+    Published::Yes
+}
+
+/// Whether a reconfigure attempt refreshed the health file.
+///
+/// A rejected reload returns before publishing anything, so the caller
+/// must NOT postpone its own poll on the strength of it — doing that
+/// let a bad config arriving just before a scheduled poll age health by
+/// nearly two intervals, and a config that kept failing suppress
+/// polling for as long as it kept failing (review finding).
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+enum Published {
+    Yes,
+    No,
 }
 
 /// Append a timestamp + status line to the reconfigure marker file.

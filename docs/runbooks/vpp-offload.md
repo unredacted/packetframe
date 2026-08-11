@@ -442,16 +442,30 @@ leave alone.
 ### `packetframe status` disagrees with what you just did
 
 `status` reads `module-health.json`, which the loader rewrites every
-**5 s**. `packetframe reconfigure` returning `OK` therefore does not
-mean `status` has caught up — for up to five seconds it will show the
-previous state. Measured 2026-08-11: reconfigure returned OK and logged
-`steering UP`, `ethtool` showed four rules, and `status` still read
-`steer off (staging state)`.
+**5 s** — so it is a snapshot, and the header says how old:
+`(pid N, Ms old)`. Read that age before believing a line that
+contradicts something you just did.
 
-The snapshot is honest about it — the header says `(pid N, Ms old)` —
-so read that age before believing a status line that contradicts an
-action you just took. `ethtool -n <iface>` is the ground truth for
-steering; the log line `steering UP:` is the ground truth for when.
+**After a `reconfigure` it is not stale.** The SIGHUP handler refreshes
+the health file *before* writing the acknowledgement marker the CLI
+waits on, so by the time `packetframe reconfigure` returns, `status`
+already reflects the change. That was not true before 2026-08-11: a
+reconfigure returned OK and logged `steering UP`, `ethtool` showed the
+rules installed, and `status` still read `steer off (staging state)`
+from a five-second-old snapshot.
+
+Two cases where the age still matters:
+
+- **A rejected reload publishes nothing.** A config that fails to parse
+  or validate returns without refreshing, so `status` keeps whatever it
+  had until the next scheduled poll.
+- **Changes the module makes on its own** — a verify completing, a
+  process dying, steering torn down by trouble — land on the ordinary
+  5 s cadence, because nothing is waiting on them.
+
+Ground truth, when you need it rather than a snapshot: `ethtool -n
+<iface>` for what the NIC holds, and the `steering UP:` / `steering
+DOWN:` log lines for when it changed.
 
 ### `packetframe status` says STALE
 

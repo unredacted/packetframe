@@ -519,6 +519,23 @@ pub(super) mod sys {
         })
     }
 
+    /// Overwrite a location with a DIFFERENT rule, the way an insert
+    /// from outside this process does — inserts at an occupied location
+    /// replace rather than fail, so the slot stays listed while our
+    /// rule is gone.
+    pub(crate) fn replace_behind_back(iface: &str, loc: u32) {
+        NIC.with(|n| {
+            let mut nic = n.borrow_mut();
+            let mut foreign = super::RxFlowSpec {
+                location: loc,
+                ..super::RxFlowSpec::default()
+            };
+            // Anything that will not compare equal to ours.
+            foreign.ring_cookie = 0xDEAD_BEEF;
+            nic.rules.insert((iface.to_string(), loc), foreign);
+        });
+    }
+
     /// Drop a rule WITHOUT going through `delete` — what a UniFi
     /// provisioning push, a firmware event, or an operator with
     /// `ethtool -N <if> delete <loc>` does. Nothing tells the module.
@@ -851,25 +868,53 @@ impl crate::runtime::Steering for NtupleSteering {
     }
 
     fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
-        // One NIC read per INTERFACE, not per rule: `rule_table` is an
-        // ioctl pair (count, then enumerate), and the ledger holds two
-        // rules per allowlisted prefix on every steered port.
-        let mut seen: Vec<(String, Vec<u32>)> = Vec::new();
         let mut missing = Vec::new();
         for (iface, loc) in &self.installed {
-            let occupied = match seen.iter().find(|(i, _)| i == iface) {
-                Some((_, occ)) => occ,
-                None => {
-                    let table = rule_table(iface)?;
-                    seen.push((iface.clone(), table.occupied));
-                    &seen.last().expect("just pushed").1
-                }
+            let vf = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v);
+            let rule = self.plan.rules.iter().find(|r| r.location == *loc);
+            let (vf, rule) = match (vf, rule) {
+                (Some(v), Some(r)) => (v, r),
+                // No expected spec to compare against — an adopted
+                // location from a previous config, or a port no longer
+                // in the target. Unverifiable is not the same as
+                // missing, and reporting it would degrade health over
+                // the transient window between adoption and the first
+                // reconcile.
+                _ => continue,
             };
-            // Only OUR locations are checked. `occupied` lists whatever
-            // the NIC holds, anyone's — a rule we did not install is not
-            // our business and must not read as drift.
-            if !occupied.contains(loc) {
-                missing.push((iface.clone(), *loc));
+            // OCCUPANCY IS NOT ENOUGH. An insert at an occupied
+            // location REPLACES what is there, so a provisioning push
+            // or a stray `ethtool -N` can leave our slot full of
+            // somebody else's rule — still listed by GRXCLSRLALL,
+            // matching traffic we never asked for, while the ledger
+            // says ours is installed (review finding). Read the
+            // location back and compare the flow spec, exactly as
+            // `insert` does after every write and for the same reason.
+            let asked = flow_spec(rule, vf);
+            let mut check = Rxnfc {
+                cmd: ETHTOOL_GRXCLSRULE,
+                fs: RxFlowSpec {
+                    location: *loc,
+                    ..RxFlowSpec::default()
+                },
+                ..Rxnfc::default()
+            };
+            match sys::ethtool(iface, &mut check) {
+                Ok(()) if matches(&asked, &check.fs) => {}
+                // Present but not ours.
+                Ok(()) => missing.push((iface.clone(), *loc)),
+                // Empty: ENOENT is how the driver answers for a
+                // location holding nothing.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push((iface.clone(), *loc))
+                }
+                // Anything else says nothing about the rule, so it must
+                // not be reported as drift.
+                Err(e) => {
+                    return Err(format!(
+                        "reading back ntuple rule at loc {loc} on {iface}: {e}"
+                    ))
+                }
             }
         }
         Ok(missing)
@@ -1131,6 +1176,39 @@ mod tests {
             installed.len(),
             "detection must not mutate the ledger — repair is a separate, \
              operator-triggered step"
+        );
+    }
+
+    /// A location REPLACED by somebody else's rule is drift too.
+    ///
+    /// Occupancy was the first thing I checked, and it is not enough:
+    /// an insert at an occupied location replaces rather than fails, so
+    /// the slot stays in `GRXCLSRLALL` while our rule is gone —
+    /// steering health would have read Healthy over a NIC matching
+    /// traffic nobody asked it to (review finding). The audit compares
+    /// the flow spec, which is the same check `insert` makes after
+    /// every write.
+    #[test]
+    fn a_location_taken_over_by_another_rule_is_reported_missing() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("steer installs");
+        let installed = s.installed();
+        assert_eq!(
+            s.missing_from_nic().expect("read the NIC"),
+            Vec::new(),
+            "our own rules must not read as drift"
+        );
+
+        let (iface, loc) = installed[0].clone();
+        sys::replace_behind_back(&iface, loc);
+
+        assert_eq!(
+            s.missing_from_nic().expect("read the NIC"),
+            vec![(iface, loc)],
+            "a location still OCCUPIED but holding a different rule is not ours, \
+             and occupancy alone cannot tell the difference"
         );
     }
 

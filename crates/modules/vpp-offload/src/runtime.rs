@@ -898,6 +898,18 @@ impl Runtime {
         {
             let mut c = self.core.borrow_mut();
             let now = std::time::Instant::now();
+            // An EMPTY ledger claims nothing, so nothing can be
+            // missing from it. Clearing here rather than skipping is
+            // the fix for the obvious version of this: guarding the
+            // whole audit on a non-empty ledger meant an unsteer after
+            // a drift reading froze `steer_missing` at its last value
+            // and blocked every future audit, so status reported
+            // missing rules forever on a port that was deliberately
+            // off (review finding).
+            if c.steering.installed().is_empty() {
+                c.steer_missing = 0;
+                c.last_steer_audit = None;
+            }
             let due = c
                 .last_steer_audit
                 .is_none_or(|t| now.duration_since(t) >= STEER_AUDIT_EVERY);
@@ -1120,6 +1132,13 @@ impl Core {
     /// the NIC either way, and reporting the steer as failed would make
     /// the supervisor believe traffic is not diverted when it is.
     fn record_steering(&mut self) {
+        // The ledger just moved, so the cached audit describes a NIC
+        // that no longer exists. Invalidate rather than wait out the
+        // interval: a successful re-steer would otherwise keep
+        // reporting the drift it just repaired for up to
+        // STEER_AUDIT_EVERY, which is exactly the window an operator
+        // stepping a canary ladder is watching (review finding).
+        self.last_steer_audit = None;
         let rules = self.steering.installed();
         let r = self.store.steering_changed(&rules);
         let _ = self.note_persist(r);
