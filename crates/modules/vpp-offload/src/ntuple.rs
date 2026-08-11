@@ -1054,7 +1054,14 @@ impl crate::runtime::Steering for NtupleSteering {
         // many could not be read at all. Both consume nothing from the
         // plan, so both would otherwise read as "a planned rule with no
         // rule on the NIC" and be counted a second time.
-        let mut reported: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        // Ledger locations that hold nothing, and ones that hold
+        // something this target did not ask for. Neither is a complaint
+        // by itself: both are candidate ANSWERS to "where did the rule
+        // this target wants go", and what is left over once every
+        // homeless rule has an answer is surplus.
+        let mut empty: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
+        let mut occupied: std::collections::HashMap<&str, Vec<u32>> =
+            std::collections::HashMap::new();
         let mut unreadable: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
 
@@ -1138,14 +1145,35 @@ impl crate::runtime::Steering for NtupleSteering {
                     });
                     match found {
                         Some(i) => taken[i] = true,
-                        // Present, but nothing this target asked for is
-                        // still unaccounted. Reported rather than
-                        // excused: an ownership check by ring cookie
-                        // was tried and is worthless, since a narrowed
-                        // or duplicated rule keeps the cookie.
+                        // Occupied by something this target does not
+                        // ask for. WHICH complaint that is cannot be
+                        // decided here: if a planned rule is left
+                        // homeless, this is the slot where it should
+                        // have been (drift — install it); if every
+                        // planned rule found a home, nothing is absent
+                        // and this is a surplus rule still diverting
+                        // traffic (remove it). The allowlist shrinking
+                        // produces the second, and calling it "missing"
+                        // sent the operator to reinstall a rule that
+                        // was not gone while removed-prefix traffic
+                        // stayed in VPP (review finding). Paired up
+                        // after the loop, when the homeless set is
+                        // known.
+                        //
+                        // Unless the outgoing target can disown it
+                        // outright, in which case it is not ours at
+                        // all and neither complaint applies.
                         None => {
-                            missing.push((iface.clone(), *loc));
-                            *reported.entry(iface.as_str()).or_default() += 1;
+                            if self.former_disowns(iface, *loc, &check.fs, &mut former_consumed) {
+                                tracing::debug!(
+                                    iface,
+                                    loc,
+                                    "a location this ledger names holds a rule that is \
+                                     neither this target's nor the last one's"
+                                );
+                            } else {
+                                occupied.entry(iface.as_str()).or_default().push(*loc);
+                            }
                         }
                     }
                 }
@@ -1155,8 +1183,7 @@ impl crate::runtime::Steering for NtupleSteering {
                 // rule the ledger names is already gone.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if member.is_some() {
-                        missing.push((iface.clone(), *loc));
-                        *reported.entry(iface.as_str()).or_default() += 1;
+                        empty.entry(iface.as_str()).or_default().push(*loc);
                     }
                 }
                 // A read that failed says nothing about THIS rule, but
@@ -1194,22 +1221,50 @@ impl crate::runtime::Steering for NtupleSteering {
         // never steered.
         for (iface, _) in &self.ports {
             let taken = consumed.get(iface.as_str());
-            // A location that reported drift, and one that could not be
-            // read, each leave a planned rule unaccounted without meaning
-            // a second rule is absent. Subtract them, or one deleted rule
-            // counts twice: once as the empty slot, once as the plan
-            // entry that slot was holding.
-            let explained = reported.get(iface.as_str()).copied().unwrap_or(0)
-                + unreadable.get(iface.as_str()).copied().unwrap_or(0);
-            let unaccounted = self
+            let homeless: Vec<u32> = self
                 .plan
                 .rules
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| taken.is_none_or(|t| !t[*i]))
-                .map(|(_, r)| r.location);
-            for location in unaccounted.skip(explained) {
-                missing.push((iface.clone(), location));
+                .map(|(_, r)| r.location)
+                .collect();
+            let mut slots = empty.remove(iface.as_str()).unwrap_or_default();
+            let mut occupants = occupied.remove(iface.as_str()).unwrap_or_default();
+            let mut unread = unreadable.get(iface.as_str()).copied().unwrap_or(0);
+
+            // Give every homeless rule an answer to "where should you
+            // have been", cheapest evidence first: an EMPTY ledger slot
+            // says it plainly, an occupied one says the slot was taken
+            // over, and an unreadable one says we cannot tell. Each
+            // answer is consumed, so one deleted rule cannot count
+            // twice — once as the slot and once as the plan entry that
+            // slot was holding.
+            for planned in homeless {
+                if let Some(loc) = slots.pop() {
+                    missing.push((iface.clone(), loc));
+                } else if let Some(loc) = occupants.pop() {
+                    missing.push((iface.clone(), loc));
+                } else if unread > 0 {
+                    // Explained by a read that failed: not established,
+                    // and `unreadable` on the audit says so.
+                    unread -= 1;
+                } else {
+                    // Nothing on this port can account for it, so it
+                    // was never installed — the shape a restart
+                    // produces when the allowlist GREW while the daemon
+                    // was down. Named by its planned slot, the only
+                    // location it has.
+                    missing.push((iface.clone(), planned));
+                }
+            }
+            // Occupants left over: every rule this target asks for is
+            // accounted for, so these are not absences — they are rules
+            // the NIC still holds that the target no longer asks for.
+            // The allowlist shrinking is what produces them, and the
+            // remedy points the other way: remove, not install.
+            for loc in occupants {
+                stray.push((iface.clone(), loc));
             }
         }
 
@@ -1780,6 +1835,66 @@ mod tests {
              alarming on them would cry wolf on every successful unsteer"
         );
         assert_eq!(a.missing, Vec::new(), "and eth0 is still untouched");
+    }
+
+    /// A prefix dropped from the allowlist leaves SURPLUS, not absence.
+    ///
+    /// The two complaints point opposite ways and the audit collapsed
+    /// them into one: after a shrink, every rule the target asks for is
+    /// on the NIC and the leftovers are rules for prefixes nobody asked
+    /// to steer any more. Calling those "missing" told an operator that
+    /// target traffic had fallen back to the eBPF tier — the opposite of
+    /// what happened, since the real problem is that removed-prefix
+    /// traffic is *still* being diverted into VPP (review finding).
+    ///
+    /// Both routes into the shrink are covered: a restart that adopts a
+    /// larger ledger than its plan (no outgoing target to compare
+    /// against), and a live reconfigure whose reconcile has not run.
+    #[test]
+    fn prefixes_dropped_from_the_allowlist_are_surplus_not_absence() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let both = plan_for(&[[198, 18, 0, 0], [203, 0, 113, 0]]);
+        let mut before = NtupleSteering::new(vec![("eth0".into(), 0)], both);
+        before.steer().expect("installs both prefixes");
+        let inherited = before.installed();
+
+        // THE RESTART: the config now allows one prefix, and the ledger
+        // comes off disk with rules for two. Nothing to compare the
+        // leftovers against but the plan itself.
+        let one = plan_for(&[[198, 18, 0, 0]]);
+        let owed = inherited.len() - one.rules.len();
+        assert!(owed > 0, "the fixture must shrink the target");
+        let mut after = NtupleSteering::new(vec![("eth0".into(), 0)], one.clone());
+        after.adopt_installed(inherited.clone());
+
+        let a = after.missing_from_nic().expect("read the NIC");
+        assert_eq!(
+            a.missing,
+            Vec::new(),
+            "every rule this target asks for IS on the NIC — reporting absence \
+             sends an operator to reinstall what was never gone: {:?}",
+            a.missing
+        );
+        assert_eq!(
+            a.stray.len(),
+            owed,
+            "and the rules for the dropped prefix are still steering traffic \
+             into VPP, which is the complaint that needs making: {:?}",
+            a.stray
+        );
+
+        // THE LIVE RECONFIGURE: same shrink, reached by retarget, so the
+        // outgoing target is still known. Same verdict.
+        let mut live = NtupleSteering::new(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[198, 18, 0, 0], [203, 0, 113, 0]]),
+        );
+        live.adopt_installed(inherited);
+        live.retarget(vec![("eth0".into(), 0)], one);
+        let a = live.missing_from_nic().expect("read the NIC");
+        assert_eq!(a.missing, Vec::new(), "{:?}", a.missing);
+        assert_eq!(a.stray.len(), owed, "{:?}", a.stray);
     }
 
     /// An UNRELATED rule at a dropped port's slot is not our steering.

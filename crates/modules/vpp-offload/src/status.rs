@@ -761,9 +761,10 @@ impl StatusSnapshot {
             // ours would be the ownership guess this audit keeps
             // getting wrong. `ethtool -n` settles it either way.
             clauses.push(format!(
-                "{} location(s) the ledger names on a port this config leaves unsteered \
-                 are still occupied, so that port may still be diverting traffic into \
-                 VPP — the rules outlived the request to remove them; `ethtool -n \
+                "{} location(s) the ledger names are still occupied by rules this config \
+                 does not ask for — a port it leaves unsteered, or prefixes dropped from \
+                 the allowlist — so traffic may still be diverted into VPP that should \
+                 not be. The rules outlived the request to remove them; `ethtool -n \
                  <iface>` shows what is there and `packetframe reconfigure` clears them",
                 self.steer_stray
             ));
@@ -1341,7 +1342,7 @@ mod tests {
         );
         let msg = steering.message.as_deref().unwrap_or_default();
         assert!(
-            msg.contains('2') && msg.contains("may still be diverting"),
+            msg.contains('2') && msg.contains("may still be diverted"),
             "and the line must say which way the problem points — these rules \
              need REMOVING, not reinstalling: {msg}"
         );

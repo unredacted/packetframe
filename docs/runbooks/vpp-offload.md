@@ -402,13 +402,21 @@ is not a wrong one — but it must not present that count as current.
 The audit also reports the opposite complaint, and names it first:
 
 ```text
-steering  DEGRADED — 2 location(s) the ledger names on a port this config
-                     leaves unsteered are still occupied, so that port may
-                     still be diverting traffic into VPP — the rules
-                     outlived the request to remove them; `ethtool -n
-                     <iface>` shows what is there and `packetframe
-                     reconfigure` clears them
+steering  DEGRADED — 2 location(s) the ledger names are still occupied by
+                     rules this config does not ask for — a port it leaves
+                     unsteered, or prefixes dropped from the allowlist — so
+                     traffic may still be diverted into VPP that should not
+                     be. The rules outlived the request to remove them;
+                     `ethtool -n <iface>` shows what is there and
+                     `packetframe reconfigure` clears them
 ```
+
+Two ways to arrive here, and they read the same because the remedy is
+the same: a port turned `steer off` whose reconcile has not run, or an
+allowlist that lost a prefix while its rules stayed installed. Both mean
+traffic is being diverted that nobody asked for — the opposite complaint
+to the drift line above, and worth reading carefully, because the fix
+points the other way: these rules need REMOVING, not reinstalling.
 
 "May", not "is", and the wording is deliberate. Where the port was
 turned off by a live `reconfigure` the audit still holds the outgoing
