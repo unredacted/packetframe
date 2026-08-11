@@ -820,10 +820,11 @@ impl StatusSnapshot {
             // resync running yet, which is why this does not say "this
             // resync"), and the target it will reconcile to is non-empty,
             // so its stale-rule removal covers whatever is left over.
-            "steering is re-applied by the next convergence — the verify that ends it \
-             emits the steer. That steer passes the completeness gate too and can be \
-             refused there, and nothing retries afterwards, so if this line outlives the \
-             convergence, `packetframe reconfigure` is the retry"
+            "a convergence re-applies steering only if it verifies clean — one that ends \
+             with routes withheld or unresolvable parks in the staging state and emits no \
+             steer at all, and a steer that IS emitted can still be refused by the \
+             completeness gate. Nothing retries after either, so if this line outlives \
+             the convergence, `packetframe reconfigure` is the retry"
                 .to_string()
         };
         // Stray rules do NOT share that remedy, and sharing it was a
@@ -1484,13 +1485,13 @@ mod tests {
                 } else if !steer_configured {
                     "no port is configured to steer"
                 } else {
-                    "re-applied by the next convergence"
+                    "only if it verifies clean"
                 };
                 for marker in [
                     "`packetframe reconfigure` re-applies steering",
                     "supervision has stopped",
                     "no port is configured to steer",
-                    "re-applied by the next convergence",
+                    "only if it verifies clean",
                 ] {
                     assert_eq!(
                         msg.contains(marker),
@@ -1625,7 +1626,7 @@ mod tests {
                      the removal that works from here: {msg}"
                 );
                 assert!(
-                    !msg.contains("re-applied by the next convergence"),
+                    !msg.contains("only if it verifies clean"),
                     "state {state:?}: and must never defer to a convergence — with a \
                      refused unsteer the rules outlive the process, so waiting means \
                      dropping that prefix, not merely losing the offload: {msg}"

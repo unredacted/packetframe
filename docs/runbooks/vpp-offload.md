@@ -395,17 +395,22 @@ on a box with no completeness authority it can hold indefinitely. So in
 that state the line points at the convergence instead:
 
 ```text
-steering  DEGRADED — 1 steering rule(s) ... steering is re-applied by the
-                     next convergence — the verify that ends it emits the
-                     steer. That steer passes the completeness gate too
-                     and can be refused there, and nothing retries
-                     afterwards, so if this line outlives the
-                     convergence, `packetframe reconfigure` is the retry
+steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
+                     steering only if it verifies clean — one that ends
+                     with routes withheld or unresolvable parks in the
+                     staging state and emits no steer at all, and a steer
+                     that IS emitted can still be refused by the
+                     completeness gate. Nothing retries after either, so
+                     if this line outlives the convergence, `packetframe
+                     reconfigure` is the retry
 ```
 
-**Read that second sentence.** The verify that ends a resync does emit
-the steer, but that steer meets the completeness gate like any other,
-and a stale or negative verdict refuses it. After that the supervisor
+**Read that second sentence.** There are two ways the automatic path
+declines. A verify that ends `VerifyIncomplete` — routes withheld or
+unresolvable — parks in the staging state and emits no steer at all,
+deliberately: diverting traffic into a FIB with known holes is what
+that arm exists to prevent. And a steer that *is* emitted still meets
+the completeness gate, which a stale or negative verdict refuses. After that the supervisor
 settles in `Ready` with the want remembered and **nothing emits another
 steer** — verify does not recur in steady state. So this is not a
 promise that the drift clears itself; it is a statement about where the
