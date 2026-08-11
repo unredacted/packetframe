@@ -488,6 +488,7 @@ pub(super) mod sys {
         /// Locations whose insert must fail, modelling a full or
         /// otherwise refusing MCAM.
         uninsertable: Vec<u32>,
+        unreadable: Vec<u32>,
         /// How many locations this fake offers. Defaults to the measured
         /// hardware size rather than to zero, so a test that forgets to
         /// set it gets a plausible NIC instead of one with no table.
@@ -500,6 +501,7 @@ pub(super) mod sys {
                 rules: HashMap::new(),
                 undeletable: Vec::new(),
                 uninsertable: Vec::new(),
+                unreadable: Vec::new(),
                 table_size: super::FALLBACK_TABLE_SIZE,
             }
         }
@@ -522,6 +524,13 @@ pub(super) mod sys {
 
     pub(crate) fn wedge_insert(locations: &[u32]) {
         NIC.with(|n| n.borrow_mut().uninsertable = locations.to_vec());
+    }
+
+    /// Make GRXCLSRULE fail at these locations with something that is
+    /// NOT ENOENT — an EIO-shaped fault, which says nothing about
+    /// whether a rule is there.
+    pub(crate) fn wedge_read(locations: &[u32]) {
+        NIC.with(|n| n.borrow_mut().unreadable = locations.to_vec());
     }
 
     pub(crate) fn set_table_size(size: u32) {
@@ -549,6 +558,22 @@ pub(super) mod sys {
                 occupied,
             })
         })
+    }
+
+    /// Copy the rule at `from` over the one at `to`, keeping `to`'s
+    /// location. Both slots then hold the SAME match — which is what an
+    /// out-of-band writer does when it reuses our slot for a rule we
+    /// also happen to want elsewhere, and it leaves whatever `from`
+    /// used to match unoffloaded.
+    pub(crate) fn duplicate_behind_back(iface: &str, from: u32, to: u32) {
+        NIC.with(|n| {
+            let mut nic = n.borrow_mut();
+            if let Some(src) = nic.rules.get(&(iface.to_string(), from)).copied() {
+                let mut copy = src;
+                copy.location = to;
+                nic.rules.insert((iface.to_string(), to), copy);
+            }
+        });
     }
 
     /// Narrow the rule at `loc` — same addresses, same ring cookie, but
@@ -617,6 +642,9 @@ pub(super) mod sys {
                     // which is what makes re-asserting cheap.
                     nic.rules.insert(key, req.fs);
                     Ok(())
+                }
+                ETHTOOL_GRXCLSRULE if nic.unreadable.contains(&req.fs.location) => {
+                    Err(std::io::Error::other("EIO: readback failed"))
                 }
                 ETHTOOL_GRXCLSRULE => match nic.rules.get(&key) {
                     Some(stored) => {
@@ -918,48 +946,24 @@ impl crate::runtime::Steering for NtupleSteering {
 
     fn missing_from_nic(&self) -> Result<Vec<(String, u32)>, String> {
         let mut missing = Vec::new();
+        let mut read_errors: Vec<String> = Vec::new();
+        // Which planned rule each interface has already accounted for.
+        // ONE-TO-ONE: a planned rule satisfies at most one location.
+        // Matching each location against "any planned rule"
+        // independently let a writer replace our source-prefix rule
+        // with a second copy of the destination-prefix one — both
+        // locations then matched something planned, both passed, and
+        // source traffic had quietly lost its offload (review finding).
+        let mut consumed: std::collections::HashMap<&str, Vec<bool>> =
+            std::collections::HashMap::new();
+
         for (iface, loc) in &self.installed {
-            let vf = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v);
-            let rule = self.plan.rules.iter().find(|r| r.location == *loc);
-            let Some(vf) = vf else {
-                // A port that is no longer a member. Its rules are
-                // still adopted (they are in the NIC and this object is
-                // the only thing that will remove them), but nothing
-                // here can say what they should look like.
+            let Some(vf) = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v) else {
+                // A port that is no longer a member. Its rules are still
+                // adopted — they are in the NIC and this object is the
+                // only thing that will remove them — but nothing here
+                // can say what they should look like.
                 continue;
-            };
-            // ADOPTED LOCATIONS DO NOT APPEAR IN THE PLAN, so keying on
-            // the location alone audited nothing after a restart.
-            // `McamBudget::from_table` excludes every occupied slot when
-            // planning, and on an adopted start the occupants are our
-            // own rules — so the plan lands elsewhere and `bring_up`
-            // then restores the real locations from the state file. The
-            // first version skipped all of them, and the window it
-            // skipped is the adopted-resync deferral, which can hold
-            // indefinitely (review finding).
-            //
-            // The location is only a slot; what makes a rule ours is
-            // its spec. So try the rule planned AT this location first,
-            // and otherwise accept a match against ANY planned rule.
-            // Stamped with the location being CHECKED, not the one the
-            // rule was planned for. `matches` compares `location`, so an
-            // expectation built straight from a planned rule can never
-            // match an adopted slot — the planner chose a different one
-            // by construction. Without this the whole "any planned rule"
-            // arm was dead code for exactly the rules it was added to
-            // cover, and every adopted rule fell through to an ownership
-            // guess (review finding).
-            let expected: Vec<RxFlowSpec> = match rule {
-                Some(r) => vec![flow_spec(r, vf)],
-                None => self
-                    .plan
-                    .rules
-                    .iter()
-                    .map(|r| RxFlowSpec {
-                        location: *loc,
-                        ..flow_spec(r, vf)
-                    })
-                    .collect(),
             };
             let mut check = Rxnfc {
                 cmd: ETHTOOL_GRXCLSRULE,
@@ -971,42 +975,61 @@ impl crate::runtime::Steering for NtupleSteering {
             };
             match sys::ethtool(iface, &mut check) {
                 Ok(()) => {
-                    // ONE rule, both cases: does the NIC hold something
-                    // this target asked for?
-                    //
-                    // There used to be an ownership fallback here —
-                    // accept anything pointing at our VF when no
-                    // expectation matched — and it was a guess dressed
-                    // as a check. A rule narrowed or replaced behind our
-                    // back keeps the ring cookie, so it proved nothing
-                    // about the rule and swallowed the drift it existed
-                    // to catch (review finding).
-                    //
-                    // Its purpose was to spare an adopted rule from a
-                    // PREVIOUS config, which matches nothing planned
-                    // now. Those are reported too, deliberately: the NIC
-                    // is not holding what the current target says it
-                    // should, the remedy is the same `reconfigure`, and
-                    // it retires them. The health text says "missing or
-                    // no longer what we asked for" rather than "gone"
-                    // for exactly that reason.
-                    if !expected.iter().any(|e| audit_matches(e, &check.fs)) {
-                        missing.push((iface.clone(), *loc));
+                    let taken = consumed
+                        .entry(iface.as_str())
+                        .or_insert_with(|| vec![false; self.plan.rules.len()]);
+                    // Candidates are stamped with the location being
+                    // CHECKED, not the one planned: `matches` compares
+                    // `location`, and on an adopted start the planner
+                    // chose different slots by construction, so an
+                    // unstamped expectation can never match.
+                    let found = self.plan.rules.iter().enumerate().position(|(i, r)| {
+                        !taken[i]
+                            && audit_matches(
+                                &RxFlowSpec {
+                                    location: *loc,
+                                    ..flow_spec(r, vf)
+                                },
+                                &check.fs,
+                            )
+                    });
+                    match found {
+                        Some(i) => taken[i] = true,
+                        // Present, but nothing this target asked for is
+                        // still unaccounted. Reported rather than
+                        // excused: an ownership check by ring cookie
+                        // was tried and is worthless, since a narrowed
+                        // or duplicated rule keeps the cookie.
+                        None => missing.push((iface.clone(), *loc)),
                     }
                 }
-                // Empty: ENOENT is how the driver answers for a
-                // location holding nothing.
+                // Empty: ENOENT is how the driver answers for a location
+                // holding nothing.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     missing.push((iface.clone(), *loc))
                 }
-                // Anything else says nothing about the rule, so it must
-                // not be reported as drift.
-                Err(e) => {
-                    return Err(format!(
-                        "reading back ntuple rule at loc {loc} on {iface}: {e}"
-                    ))
-                }
+                // A read that failed says nothing about THIS rule, but
+                // it must not erase what the other reads proved. The
+                // early `return Err` here discarded every confirmed
+                // entry, and the caller keeps its previous count on
+                // `Err` — so an EIO on the last rule hid drift already
+                // established on the first (review finding).
+                Err(e) => read_errors.push(format!("loc {loc} on {iface}: {e}")),
             }
+        }
+
+        if missing.is_empty() && !read_errors.is_empty() {
+            // Nothing proven and the NIC would not answer: report the
+            // failure so the caller keeps its previous verdict rather
+            // than adopting a clean one this audit never established.
+            return Err(read_errors.join("; "));
+        }
+        if !read_errors.is_empty() {
+            tracing::debug!(
+                errors = ?read_errors,
+                confirmed = missing.len(),
+                "steering audit was incomplete; reporting what it could read"
+            );
         }
         Ok(missing)
     }
@@ -1401,6 +1424,92 @@ mod tests {
             vec![(iface, loc)],
             "an inherited rule deleted out of band must be reported, or the \
              audit is blind for the entire adopted deferral"
+        );
+    }
+
+    /// Two locations holding the SAME rule is drift, not two matches.
+    ///
+    /// Each location was checked against "any planned rule"
+    /// independently, so replacing our source-prefix rule with a second
+    /// copy of the destination-prefix one passed twice — both slots
+    /// matched something we plan — while source traffic had silently
+    /// lost its offload (review finding). A planned rule can satisfy at
+    /// most one location.
+    #[test]
+    fn one_planned_rule_cannot_account_for_two_locations() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("steer installs");
+        let installed = s.installed();
+        assert!(
+            installed.len() >= 2,
+            "the fixture needs at least two rules (src and dst) to duplicate one"
+        );
+        assert_eq!(s.missing_from_nic().expect("read"), Vec::new());
+
+        // Overwrite the first slot with a copy of the second's rule.
+        let (iface, victim) = installed[0].clone();
+        let (_, survivor) = installed[1].clone();
+        sys::duplicate_behind_back(&iface, survivor, victim);
+
+        // Asserted as an INVARIANT, not as an identity. Once both slots
+        // hold the same match they are indistinguishable by content, so
+        // which of the two greedy matching leaves unaccounted is an
+        // artifact of iteration order — pinning it would be asserting
+        // the implementation rather than the property.
+        let m = s.missing_from_nic().expect("read");
+        assert_eq!(
+            m.len(),
+            1,
+            "exactly one slot must be unaccounted for — the prefix the \
+             overwritten rule used to match is no longer offloaded: {m:?}"
+        );
+        assert!(
+            m[0].0 == iface && (m[0].1 == victim || m[0].1 == survivor),
+            "and it must be one of the two duplicated slots: {m:?}"
+        );
+    }
+
+    /// A read that fails must not erase what the other reads proved.
+    ///
+    /// The audit used to `return Err` on the first unreadable location,
+    /// discarding every confirmed entry — and the caller keeps its
+    /// previous count on `Err`, so an EIO on one rule hid drift already
+    /// established on another, for another 30 s (review finding).
+    #[test]
+    fn audit_keeps_confirmed_drift_when_a_later_read_fails() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s.steer().expect("steer installs");
+        let installed = s.installed();
+        assert!(installed.len() >= 2);
+        let (iface, gone) = installed[0].clone();
+        let (_, unreadable) = installed[1].clone();
+
+        sys::remove_behind_back(&iface, gone);
+        sys::wedge_read(&[unreadable]);
+
+        assert_eq!(
+            s.missing_from_nic()
+                .expect("proven drift survives an unreadable peer"),
+            vec![(iface.clone(), gone)],
+            "the confirmed missing rule must be reported even though another \
+             location could not be read"
+        );
+
+        // But an audit that proved NOTHING and could not read must fail
+        // rather than report a clean NIC it never established.
+        sys::reset();
+        let mut s2 = NtupleSteering::new(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        s2.steer().expect("installs");
+        let all: Vec<u32> = s2.installed().iter().map(|(_, l)| *l).collect();
+        sys::wedge_read(&all);
+        assert!(
+            s2.missing_from_nic().is_err(),
+            "a wholly unreadable NIC must not read as clean — the caller keeps \
+             its previous verdict on Err"
         );
     }
 
