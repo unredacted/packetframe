@@ -1797,9 +1797,11 @@ impl Effects for EffectsView {
                 return Err(format!(
                     "refusing to steer: {}. Traffic would be diverted into a table that \
                      cannot forward it, and a steered miss is dropped rather than falling \
-                     back to the kernel path. This retries on its own once the mirror \
-                     converges; `require-table-complete off` opts out where there is no \
-                     bird to compare against",
+                     back to the kernel path. NOTHING RETRIES THIS: the want is \
+                     remembered, but only a convergence or `packetframe reconfigure` \
+                     emits another steer, so re-run it once the mirror has caught up. \
+                     `require-table-complete off` opts out where there is no bird to \
+                     compare against",
                     verdict.describe()
                 ));
             }

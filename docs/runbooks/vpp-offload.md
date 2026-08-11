@@ -371,10 +371,92 @@ steering  DEGRADED — 1 steering rule(s) this target asks for are missing
                      tier. Something changed them out of band (a UniFi
                      provisioning push does this), or the allowlist grew
                      while the inherited rules stayed as they were;
-                     `packetframe reconfigure` reconciles either way
+                     `packetframe reconfigure` re-applies steering, and
+                     reports its own reason if it refuses — a table too
+                     incomplete to steer into is the usual one
 ```
 
-It found the drift by asking the NIC, not by inferring it.
+It found the drift by asking the NIC, not by inferring it. **Measured on
+the shadow 2026-08-11**: `ethtool -N eth1 delete 12` against a steered,
+adopted daemon was reported as `steering DEGRADED` within 20 s. Before
+the audit existed the same deletion went unnoticed for two minutes with
+`steering healthy` and no log line.
+
+**The line names the remedy that fits the situation, and there are
+four.** Note it never promises the command will succeed: steering
+passes two gates — the lifecycle state, and whether the table is
+complete enough to steer into — and `reconfigure` reports which one
+stopped it. What the line is for is telling you when the command is the
+wrong move entirely. `packetframe reconfigure` reconciles steering only
+from `Ready` or `Steered`; during an adopted resync it is refused with
+*"vpp-offload is AdoptedResyncing, not converged"*. That is not a rare
+corner — a held deferral is exactly when this audit earns its keep, and
+on a box with no completeness authority it can hold indefinitely. So in
+that state the line points at the convergence instead:
+
+```text
+steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
+                     steering only if it verifies clean — one that ends
+                     with routes withheld or unresolvable parks in the
+                     staging state and emits no steer at all, and a steer
+                     that IS emitted can still be refused by the
+                     completeness gate. Nothing retries after either, so
+                     if this line outlives the convergence, `packetframe
+                     reconfigure` is the retry
+```
+
+**Read that second sentence.** There are two ways the automatic path
+declines. A verify that ends `VerifyIncomplete` — routes withheld or
+unresolvable — parks in the staging state and emits no steer at all,
+deliberately: diverting traffic into a FIB with known holes is what
+that arm exists to prevent. And a steer that *is* emitted still meets
+the completeness gate, which a stale or negative verdict refuses. After that the supervisor
+settles in `Ready` with the want remembered and **nothing emits another
+steer** — verify does not recur in steady state. So this is not a
+promise that the drift clears itself; it is a statement about where the
+next attempt comes from. If the line is still there once the module
+reaches `Ready`, restore completeness (watch `fib-synced`) and run
+`packetframe reconfigure`.
+
+Nothing is dropping meanwhile — the affected prefix is on the eBPF
+tier, which is where it belongs.
+
+**The exception is a stopped daemon, and it is the one that matters.**
+If supervision has stopped — a teardown whose `unsteer` was refused,
+say — the rules are still in the NIC, the VF is withheld, and *no
+convergence is coming*. The line says so and points at cleanup:
+
+```text
+steering  DEGRADED — ... supervision has stopped, so nothing will
+                     reconcile this on its own: `packetframe detach
+                     --all` retries the teardown, and `ethtool -N
+                     <iface> delete <loc>` removes a rule by hand
+```
+
+Take that one seriously: rules pointing at a VF whose VPP has been
+killed are a blackhole, not a lost optimisation.
+
+**The same applies when no port is configured to steer** — a full
+`steer off` whose removal was refused:
+
+```text
+steering  DEGRADED — ... no port is configured to steer, so convergence
+                     cannot clear these — `steer` refuses an empty target
+                     rather than report an offload it never installed.
+                     Remove them with `ethtool -N <iface> delete <loc>`;
+                     `packetframe detach --all` also retries the teardown,
+                     but refuses while this daemon is running
+```
+
+Note the order: `detach` refuses outright while a `packetframe run`
+daemon exists (it holds the bpf_link FDs), so under a live module the
+`ethtool` deletion is the one that works.
+
+The module cannot repair this one on its own: it re-steers because a
+refused `unsteer` leaves it believing traffic is diverted, and then
+refuses the empty target. Clean up by hand. (Tracked as a product gap;
+the module should reconcile an empty target through `unsteer` rather
+than retry a refusal.)
 
 **Two directions, one count.** The rules the ledger names are read back
 and compared field by field, so a deleted, replaced or narrowed rule is
@@ -407,16 +489,81 @@ steering  DEGRADED — 2 location(s) the ledger names are still occupied by
                      unsteered, or prefixes dropped from the allowlist — so
                      traffic may still be diverted into VPP that should not
                      be. The rules outlived the request to remove them;
-                     `ethtool -n <iface>` shows what is there and
-                     `packetframe reconfigure` clears them
+                     `ethtool -n <iface>` shows what is there, and
+                     <the remedy for the current state, as above>
 ```
 
-Two ways to arrive here, and they read the same because the remedy is
-the same: a port turned `steer off` whose reconcile has not run, or an
-allowlist that lost a prefix while its rules stayed installed. Both mean
-traffic is being diverted that nobody asked for — the opposite complaint
-to the drift line above, and worth reading carefully, because the fix
-points the other way: these rules need REMOVING, not reinstalling.
+Two ways to arrive here: a port turned `steer off` whose reconcile has
+not run, or an allowlist that lost a prefix while its rules stayed
+installed. Both mean traffic is being diverted that nobody asked for —
+the opposite complaint to the drift line above, and the fix points the
+other way: these rules need REMOVING, not reinstalling.
+
+**Do not wait this one out.** A missing rule is a lost optimisation —
+its prefix is on the eBPF tier, which forwards. A stray rule is the
+reverse: it is pushing traffic *into* VPP. `Supervisor::fail` unsteers
+before it kills for exactly this reason ("until the MCAM rules are
+gone, every steered packet is going to a VF nothing is servicing"), so
+when that unsteer is refused the rules outlive the process and the
+affected prefixes are **dropped**, not merely deoptimised. Exponential
+backoff can postpone the next convergence indefinitely.
+
+**Identify before deleting, and the VF alone will not identify.** The
+line gives a count, never the locations, so `ethtool -n` is on the path
+anyway — and after a restart the audit reports an occupied slot without
+being able to prove it still holds *our* rule (`installed_as` is set
+only by a successful steer in this process).
+
+**Try `packetframe reconfigure` first.** `steer` removes what the
+ledger holds and the target no longer wants, so it takes out exactly
+the recorded locations and you identify nothing by eye. Hand-deletion
+is the fallback for the two cases where it will not run: a stopped
+daemon, or no port configured to steer (the health line says which).
+
+It is *not* ownership-safe, and the distinction matters. The delete
+ioctl addresses a **location**, not a rule — neither `reconfigure` nor
+your own `ethtool -N` verifies what is sitting there first. What
+`reconfigure` buys is that the locations come from the record rather
+than from a judgement call, so it cannot touch a slot the ledger never
+claimed. If something replaced our rule at a claimed slot, both routes
+delete it.
+
+If you must identify by hand, a rule is this module's when **all** of
+these hold, not any one:
+
+| field | what ours looks like |
+|---|---|
+| `Dest IP addr` / `Src IP addr` | a /24-ish prefix on one side, the other side `0.0.0.0 mask 255.255.255.255` |
+| `Action` | `Direct to VF <n>`, the VF this module owns |
+| `TOS` / `Protocol` / `L4 bytes` masks | all `0xff` / `0xffffffff` — ours constrain nothing else |
+
+**The current `allow-prefix` list is NOT the test**, and this is the
+trap: the commonest stray is a prefix you just *removed* from the
+allowlist, whose rules are by definition absent from the config you are
+holding. Check the config's previous revision (or your change diff) for
+the prefix that was there an hour ago.
+
+The action alone is not proof either: another rule can target the same
+VF while matching different traffic, and a *narrowed* copy of one of
+ours keeps the cookie. That is why the audit compares the whole spec
+rather than the cookie, and why you should.
+
+**A cleaner route for a removed prefix**, if the module is live and
+accepting: put the prefix back, `reconfigure` so the module owns those
+rules again, then remove it and `reconfigure` a second time. The stale
+removal in `steer` takes them out properly, and nothing is identified
+by eye.
+
+```bash
+ethtool -n eth1            # read the fields, compare against the table
+ethtool -N eth1 delete 12  # only for locations you recognised
+```
+
+Deleting a location that turned out to hold somebody else's classifier
+rule breaks its traffic, and unlike a wrong health line that is not
+recoverable by reading. If you cannot recognise it, leave it and say so
+in the incident notes — a stray rule that is not ours is not ours to
+remove.
 
 "May", not "is", and the wording is deliberate. Where the port was
 turned off by a live `reconfigure` the audit still holds the outgoing
@@ -573,14 +720,20 @@ mirror is short of the table and steering into it would blackhole
 whatever has not arrived — and a steered miss is dropped, where an
 unsteered one falls through to the kernel path.
 
-Nothing to do: it retries on its own. The refusal leaves the *want* set,
-so the next verify attempts the steer again, and by then the dump has
-usually finished. Watch the two counts converge:
+**It does not retry on its own** — a belief three operator-facing texts
+carried until 2026-08-11. The refusal leaves the *want* set, but the
+only two things that emit a steer are the verify at the end of a
+convergence and an explicit `packetframe reconfigure`; verify does not
+recur in steady state. So during a first convergence the dump usually
+finishes in time and the steer lands, and outside that you have to
+re-run it. Watch the two counts converge:
 
 ```bash
 birdc show route count
 packetframe status | grep -A6 'module health'
 ```
+
+Once they agree, `packetframe reconfigure` re-applies the steer.
 
 If it persists, the mirror is genuinely not keeping up and that is a
 fast-path problem, not a steering one — check the integrity checker's

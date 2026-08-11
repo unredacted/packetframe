@@ -752,6 +752,95 @@ impl StatusSnapshot {
         // pulling traffic OFF a port is the one case where "steering
         // healthy" is the most expensive possible answer (review
         // finding).
+        //
+        // The remedy depends on the lifecycle state, and saying so is
+        // the point. `packetframe reconfigure` reconciles steering only
+        // from a state that accepts steering changes; during an adopted
+        // resync it is refused. That is not a corner — a held deferral
+        // is the state this audit was written for, and on a box with no
+        // completeness authority it can hold indefinitely, so the line
+        // shipped promising a command that answers "not converged" in
+        // exactly the case it appears most (measured on the shadow,
+        // 2026-08-11). The repair does arrive on its own: the verify
+        // that ends the resync re-emits the steer, and `steer` is a
+        // reconcile.
+        // Four answers, because there are four situations and giving
+        // the wrong one sends an operator somewhere useless.
+        // No shared cleanup string: the two arms below differ in
+        // whether the daemon is still running, and that is exactly what
+        // decides which command works. `loader::detach` refuses outright
+        // while a `packetframe run` pid exists — the daemon holds the
+        // bpf_link FDs — so telling a live module to run it is a second
+        // refusal (review finding). Factoring these together was a DRY
+        // move that erased the distinguishing fact.
+        let remedy = if self.state.accepts_steering_changes() {
+            // NAMES the repair; does not promise it will succeed. The
+            // state gate this arm reads is not the only one — the steer
+            // path refuses again if the table is not complete enough to
+            // steer into — and predicting a command's outcome by
+            // re-deriving its preconditions here is a copy that drifts.
+            // It found a new precondition on each of four review rounds.
+            // What is always true, and all an operator needs: this is
+            // the command, and it reports its own reason when it
+            // refuses (review finding).
+            "`packetframe reconfigure` re-applies steering, and reports its own reason if \
+             it refuses — a table too incomplete to steer into is the usual one"
+                .to_string()
+        } else if matches!(self.state, State::Stopped) {
+            // Nothing is running and nothing is trying to. Reachable and
+            // nasty: `StopRequested` assigns `Stopped` before knowing
+            // whether `Unsteer` succeeded, a refused removal keeps the
+            // rules in the ledger, and the final status is published
+            // either way — so this is precisely the snapshot reporting
+            // rules that still divert traffic into a VF whose VPP has
+            // just been killed (review finding).
+            "supervision has stopped, so nothing will reconcile this on its own: with the \
+             daemon exited, `packetframe detach --all` retries the teardown, and `ethtool \
+             -N <iface> delete <loc>` removes a rule by hand"
+                .to_string()
+        } else if !self.steer_configured {
+            // A convergence is coming and it will NOT clear these.
+            // `VerifyPassed` re-steers while `steered || steer_wanted`,
+            // and a refused `unsteer` deliberately keeps `steered` true
+            // — but `steer` refuses an empty target before reaching its
+            // stale-rule removal, also deliberately, because `Ok` there
+            // becomes `Event::Steered` and would report an offload
+            // carrying traffic it never saw. So a `steer off` whose
+            // removal failed retries that refusal on every convergence
+            // while the rules keep diverting traffic. The product gap is
+            // filed; what this line must not do is promise a repair that
+            // cannot happen (review finding).
+            "no port is configured to steer, so convergence cannot clear these — `steer` \
+             refuses an empty target rather than report an offload it never installed. \
+             Remove them with `ethtool -N <iface> delete <loc>`; `packetframe detach \
+             --all` also retries the teardown, but refuses while this daemon is running"
+                .to_string()
+        } else {
+            // A convergence is in flight or is coming (`Backoff` has no
+            // resync running yet, which is why this does not say "this
+            // resync"), and the target it will reconcile to is non-empty,
+            // so its stale-rule removal covers whatever is left over.
+            "a convergence re-applies steering only if it verifies clean — one that ends \
+             with routes withheld or unresolvable parks in the staging state and emits no \
+             steer at all, and a steer that IS emitted can still be refused by the \
+             completeness gate. Nothing retries after either, so if this line outlives \
+             the convergence, `packetframe reconfigure` is the retry"
+                .to_string()
+        };
+        // Stray rules do NOT share that remedy, and sharing it was a
+        // P1. The two complaints differ in what waiting costs: a
+        // MISSING rule means its prefix is on the eBPF tier, which
+        // forwards, so waiting out a convergence is free. A STRAY rule
+        // is diverting traffic INTO VPP — and `fail()` unsteers before
+        // it kills, precisely because "until the MCAM rules are gone,
+        // every steered packet is going to a VF nothing is servicing".
+        // When that unsteer is refused the rules stay and VPP dies
+        // anyway, so in `Backoff` the affected prefixes are being
+        // dropped while this line says to wait for a convergence that
+        // exponential backoff can push out indefinitely.
+        //
+        // So it names the removal that works from anywhere, always,
+        // and never defers to a convergence.
         let mut clauses: Vec<String> = Vec::new();
         if self.steer_stray > 0 {
             // "Still occupied", not "still ours". Where the outgoing
@@ -764,8 +853,15 @@ impl StatusSnapshot {
                 "{} location(s) the ledger names are still occupied by rules this config \
                  does not ask for — a port it leaves unsteered, or prefixes dropped from \
                  the allowlist — so traffic may still be diverted into VPP that should \
-                 not be. The rules outlived the request to remove them; `ethtool -n \
-                 <iface>` shows what is there and `packetframe reconfigure` clears them",
+                 not be. The rules outlived the request to remove them. `packetframe \
+                 reconfigure` removes exactly the locations the ledger names, so nothing \
+                 has to be identified by eye — but it deletes BY LOCATION, so it can no \
+                 more prove they still hold OUR rules than this audit can. Do not wait \
+                 for a convergence: while VPP is not forwarding, that traffic is going to \
+                 a VF nothing is servicing. Where reconfigure will not run, remove by \
+                 hand (`ethtool -n <iface>`, then `ethtool -N <iface> delete <loc>`); the \
+                 current allowlist is not the test, since the commonest stray is a prefix \
+                 just removed from it. The runbook has the field table",
                 self.steer_stray
             ));
         }
@@ -775,7 +871,7 @@ impl StatusSnapshot {
                  longer match what was asked for, or were never installed — that traffic \
                  is on the eBPF tier. Something changed them out of band (a UniFi \
                  provisioning push does this), or the allowlist grew while the inherited \
-                 rules stayed as they were; `packetframe reconfigure` reconciles either way",
+                 rules stayed as they were; {remedy}",
                 self.steer_missing
             ));
         }
@@ -1304,6 +1400,335 @@ mod tests {
             msg.contains("cannot verify") && msg.contains("EIO"),
             "the line must say it could not check, and why: {msg}"
         );
+    }
+
+    /// The remedy the drift line names must be one the module accepts.
+    ///
+    /// Measured on the shadow 2026-08-11: an out-of-band `ethtool -N
+    /// eth1 delete 12` was detected in under 20 s and reported
+    /// `steering DEGRADED ... packetframe reconfigure reconciles either
+    /// way`. Running that command answered *"vpp-offload is
+    /// AdoptedResyncing, not converged — steering changes apply only
+    /// from Ready or Steered"*. The line pointed an operator at a wall,
+    /// in the very state the audit exists to report: an adopted
+    /// deferral, which on a box with no completeness authority holds
+    /// indefinitely.
+    ///
+    /// Asserted as an INVARIANT over every state rather than for the one
+    /// that bit us. The message and `apply_steering`'s gate now read the
+    /// same predicate, and this is what keeps them from drifting apart
+    /// again.
+    #[test]
+    fn the_drift_remedy_matches_the_gate_that_governs_it() {
+        let states = [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ];
+        // Tripwire: a new variant makes this match non-exhaustive, so it
+        // cannot be added without deciding what its drift line should
+        // tell an operator to do.
+        for s in states {
+            match s {
+                State::Stopped
+                | State::Backoff
+                | State::Starting
+                | State::Syncing
+                | State::Verifying
+                | State::Ready
+                | State::Steered
+                | State::AdoptedResyncing => {}
+            }
+        }
+
+        for state in states {
+            for steer_configured in [true, false] {
+                let led = ledger_with(10, 0, 0);
+                let mut snap = snap_of(
+                    &steered_supervisor(),
+                    &led,
+                    ApiHealth::Answering {
+                        silent_for: Duration::from_millis(200),
+                    },
+                    verified(3),
+                    ports_up(),
+                );
+                snap.state = state;
+                snap.steer_configured = steer_configured;
+                // MISSING only. Stray carries its own remedy now — a
+                // stray rule can be dropping traffic, so it never defers
+                // to a convergence — and mixing the two here would let
+                // either string satisfy the assertions below.
+                snap.steer_missing = 1;
+                snap.steer_stray = 0;
+
+                let rep = snap.report();
+                let steering = rep
+                    .subsystems
+                    .iter()
+                    .find(|s| s.name == SUBSYS_STEERING)
+                    .expect("steering row");
+                let msg = steering.message.as_deref().unwrap_or_default();
+
+                // Exactly one of the four may appear. Asserting the
+                // other three ABSENT is what makes this a
+                // classification rather than four independent
+                // contains() that could all drift true.
+                let expected = if state.accepts_steering_changes() {
+                    "`packetframe reconfigure` re-applies steering"
+                } else if matches!(state, State::Stopped) {
+                    "supervision has stopped"
+                } else if !steer_configured {
+                    "no port is configured to steer"
+                } else {
+                    "only if it verifies clean"
+                };
+                for marker in [
+                    "`packetframe reconfigure` re-applies steering",
+                    "supervision has stopped",
+                    "no port is configured to steer",
+                    "only if it verifies clean",
+                ] {
+                    assert_eq!(
+                        msg.contains(marker),
+                        marker == expected,
+                        "state {state:?}, steer_configured={steer_configured}: the line \
+                         must offer exactly the remedy this situation admits. \
+                         `reconfigure` is refused outside Ready/Steered; a stopped \
+                         daemon reconciles nothing; and with no port configured to \
+                         steer, `steer` refuses the empty target before it would clear \
+                         the leftovers, so convergence cannot fix it either: {msg}"
+                    );
+                }
+                // The two cannot-self-repair arms must name a command
+                // that works from where they are. `loader::detach`
+                // refuses while a `packetframe run` daemon is live, and
+                // this arm is only reachable with the module running —
+                // so it has to lead with the deletion that works.
+                if expected == "no port is configured to steer" {
+                    assert!(
+                        msg.contains("refuses while this daemon is running")
+                            && msg.contains("ethtool -N"),
+                        "state {state:?}: reachable only under a live daemon, where \
+                         `detach` is refused outright: {msg}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every backticked command in a health message is well-formed.
+    ///
+    /// Twice in one PR a scripted edit shipped a broken operator
+    /// command — first a literal with thirty spaces in it, then
+    /// `` `ethtool -n reconfigure` `` where `` `packetframe
+    /// reconfigure` `` was meant — and both times every assertion
+    /// passed, because they all match short fragments and none spans
+    /// the damage. Matching fragments cannot show a command is intact.
+    ///
+    /// So: collect every backticked span these messages render and
+    /// require it to be one this module means to print. A new one has
+    /// to be added here deliberately, which is the point.
+    #[test]
+    fn every_backticked_command_is_one_we_meant_to_print() {
+        const ALLOWED: &[&str] = &[
+            "packetframe reconfigure",
+            "packetframe detach --all",
+            "ethtool -n <iface>",
+            "ethtool -N <iface> delete <loc>",
+            "steer",
+            "require-table-complete off",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for state in [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            for steer_configured in [true, false] {
+                for (missing, stray, unreadable) in [
+                    (1usize, 0usize, None),
+                    (0, 1, None),
+                    (1, 1, Some("EIO: readback failed".to_string())),
+                    (0, 0, Some("EIO: readback failed".to_string())),
+                    (0, 0, None),
+                ] {
+                    let led = ledger_with(10, 0, 0);
+                    let mut snap = snap_of(
+                        &steered_supervisor(),
+                        &led,
+                        ApiHealth::Answering {
+                            silent_for: Duration::from_millis(200),
+                        },
+                        verified(3),
+                        ports_up(),
+                    );
+                    snap.state = state;
+                    snap.steer_configured = steer_configured;
+                    snap.steer_missing = missing;
+                    snap.steer_stray = stray;
+                    snap.steer_audit_unreadable = unreadable.clone();
+
+                    for sub in snap.report().subsystems {
+                        let Some(msg) = sub.message else { continue };
+                        let mut rest = msg.as_str();
+                        while let Some(open) = rest.find('`') {
+                            rest = &rest[open + 1..];
+                            let Some(close) = rest.find('`') else { break };
+                            let span = &rest[..close];
+                            rest = &rest[close + 1..];
+                            if !seen.iter().any(|s| s == span) {
+                                seen.push(span.to_string());
+                            }
+                            assert!(
+                                ALLOWED.contains(&span),
+                                "{} in {state:?} prints `{span}`, which is not a command \
+                                 this module means to emit. Either it is mangled — the \
+                                 way `ethtool -n reconfigure` was — or it is new and \
+                                 belongs in ALLOWED. Full line: {msg}",
+                                sub.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.len() >= 4,
+            "the matrix must actually render commands, or this proves nothing: {seen:?}"
+        );
+    }
+
+    /// No health message contains a run of whitespace.
+    ///
+    /// Cheap guard for a class rather than an instance: `dfdc9b8`
+    /// shipped a remedy bound as `let x = "... \` + continuation`,
+    /// which rustfmt joined onto one line while KEEPING the source
+    /// indentation inside the literal — so the operator's line read
+    /// "rather than" followed by thirty spaces. Every assertion in
+    /// these tests matches a short fragment, and no fragment spanned
+    /// the gap, so all of them passed over it.
+    #[test]
+    fn no_health_message_carries_mangled_whitespace() {
+        for state in [
+            State::Backoff,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            for (missing, stray, unreadable) in [
+                (1usize, 0usize, None),
+                (0, 1, None),
+                (1, 1, Some("EIO: readback failed".to_string())),
+                (0, 0, Some("EIO: readback failed".to_string())),
+            ] {
+                let led = ledger_with(10, 0, 0);
+                let mut snap = snap_of(
+                    &steered_supervisor(),
+                    &led,
+                    ApiHealth::Answering {
+                        silent_for: Duration::from_millis(200),
+                    },
+                    verified(3),
+                    ports_up(),
+                );
+                snap.state = state;
+                snap.steer_missing = missing;
+                snap.steer_stray = stray;
+                snap.steer_audit_unreadable = unreadable.clone();
+
+                for sub in snap.report().subsystems {
+                    let Some(msg) = sub.message else { continue };
+                    assert!(
+                        !msg.contains("   "),
+                        "{} in {state:?} renders a whitespace run — a line an operator \
+                         reads at 3am, mangled by a source-formatting artefact: {msg:?}",
+                        sub.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// A stray rule never gets told to wait, in any state.
+    ///
+    /// The two complaints differ in what waiting costs. A MISSING rule
+    /// means its prefix is on the eBPF tier, which forwards — waiting
+    /// out a convergence is free. A STRAY rule is diverting traffic
+    /// INTO VPP, and `Supervisor::fail` unsteers before it kills for
+    /// exactly that reason: "until the MCAM rules are gone, every
+    /// steered packet is going to a VF nothing is servicing". A refused
+    /// unsteer leaves them installed and VPP dies anyway, so in
+    /// `Backoff` those prefixes are being dropped — while the shared
+    /// remedy told the operator to wait for a convergence that
+    /// exponential backoff can postpone indefinitely (review finding,
+    /// P1).
+    #[test]
+    fn a_stray_rule_is_never_told_to_wait() {
+        for state in [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            for steer_configured in [true, false] {
+                let led = ledger_with(10, 0, 0);
+                let mut snap = snap_of(
+                    &steered_supervisor(),
+                    &led,
+                    ApiHealth::Answering {
+                        silent_for: Duration::from_millis(200),
+                    },
+                    verified(3),
+                    ports_up(),
+                );
+                snap.state = state;
+                snap.steer_configured = steer_configured;
+                snap.steer_stray = 1;
+                snap.steer_missing = 0;
+
+                let rep = snap.report();
+                let steering = rep
+                    .subsystems
+                    .iter()
+                    .find(|s| s.name == SUBSYS_STEERING)
+                    .expect("steering row");
+                let msg = steering.message.as_deref().unwrap_or_default();
+                assert!(
+                    msg.contains("ethtool -N <iface> delete <loc>"),
+                    "state {state:?}: the hand removal must still be named — it is the \
+                     fallback wherever `reconfigure` cannot run: {msg}"
+                );
+                assert!(
+                    !msg.contains("only if it verifies clean"),
+                    "state {state:?}: and must never defer to a convergence — with a \
+                     refused unsteer the rules outlive the process, so waiting means \
+                     dropping that prefix, not merely losing the offload: {msg}"
+                );
+                assert!(
+                    msg.contains("removes exactly the locations the ledger names")
+                        && msg.contains("current allowlist is not the test"),
+                    "state {state:?}: lead with the repair that needs no identification, \
+                     and warn about the trap in the one that does — a rule for a prefix \
+                     just removed from the allowlist cannot match the current config, \
+                     which is exactly the stray an allowlist shrink produces: {msg}"
+                );
+            }
+        }
     }
 
     /// Rules still steering a port the config turned OFF degrade it.

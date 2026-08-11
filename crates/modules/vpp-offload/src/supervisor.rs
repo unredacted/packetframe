@@ -114,6 +114,29 @@ impl State {
     pub fn has_process(self) -> bool {
         !matches!(self, State::Stopped | State::Backoff)
     }
+
+    /// Whether a steering change can be applied from here.
+    ///
+    /// This is the state machine's own admission rule, not a fact about
+    /// the world derived from the state — which is what the NOTE below
+    /// forbids. `apply_steering` refuses anywhere else, because a steer
+    /// request that outlives a crash and fires against the replacement
+    /// is not what the operator asked for.
+    ///
+    /// It lives here because the health surface has to say the same
+    /// thing: the drift line names `packetframe reconfigure` as the
+    /// remedy, and during an adopted deferral that command is refused —
+    /// so the message and the gate must not be able to disagree. They
+    /// were two copies for one round and the message was wrong for half
+    /// the states it could appear in (measured on the shadow,
+    /// 2026-08-11).
+    ///
+    /// Deliberately NOT the same predicate as `nominal()`'s
+    /// arrived-check, which happens to test the same two variants today
+    /// for an unrelated reason.
+    pub fn accepts_steering_changes(self) -> bool {
+        matches!(self, State::Ready | State::Steered)
+    }
 }
 // NOTE: there is deliberately no `State::is_converging()`. Deriving
 // "a resync is in flight" from the lifecycle state is what broke rule

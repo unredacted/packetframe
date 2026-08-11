@@ -855,7 +855,7 @@ fn apply_steering(
     req: &SteeringRequest,
 ) -> Result<(), String> {
     let state = driver.state();
-    if !matches!(state, State::Ready | State::Steered) {
+    if !state.accepts_steering_changes() {
         // Deliberately refused rather than queued. A steer request that
         // outlives a crash and fires against the replacement is not what
         // the operator asked for, and the replacement re-steers on its
@@ -870,6 +870,23 @@ fn apply_steering(
     runtime.retarget(req.ports.clone(), req.plan.clone());
 
     let steered = driver.supervisor().is_steered();
+    // INTENDED, not steered. The two differ in exactly the case an
+    // operator hits after a refusal: a steer that was asked for and
+    // failed leaves `steered == false` with the want remembered, so
+    // guarding on `steered` sent an unchanged-config `reconfigure`
+    // down the staging path — returning `Ok` without injecting
+    // anything. The advertised retry reported success and did nothing
+    // (review finding).
+    //
+    // `steer_intended()` is the predicate for this and says so: "a
+    // `steer on` port that has never yet steered and never failed to
+    // reads as not-wanted here. The distinction is real — one is the
+    // designed staging state, the other is a rollout that broke."
+    // `steer_wanted` is set only by adoption-while-steered, an explicit
+    // request, a death or wedge while steered, and a failed steer —
+    // never by config intent alone, so a first attach still waits for
+    // the operator's canary.
+    let intended = driver.supervisor().steer_intended();
     let event = if req.want_steer {
         // The config says steer, but that is not the same as the
         // operator asking for it NOW.
@@ -882,7 +899,7 @@ fn apply_steering(
         // updates the target and stops there. Diverting traffic as a side
         // effect of editing something else is precisely the decision this
         // module is not allowed to make.
-        if !steered && !req.lever_moved {
+        if !intended && !req.lever_moved {
             return Ok(());
         }
         // The same gate the automatic path uses, and applied on the same
