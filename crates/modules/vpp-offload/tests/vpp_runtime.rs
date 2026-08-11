@@ -1427,10 +1427,10 @@ mod steered {
         fn configured_ports(&self) -> usize {
             1
         }
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<packetframe_vpp_offload::runtime::SteerOutcome, String> {
             self.log.lock().unwrap().push("steer");
             self.rules = vec![("eth4".into(), 1)];
-            Ok(())
+            Ok(packetframe_vpp_offload::runtime::SteerOutcome::Steered)
         }
         fn unsteer(&mut self) -> Result<(), String> {
             self.log.lock().unwrap().push("unsteer");

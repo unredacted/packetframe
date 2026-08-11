@@ -483,6 +483,7 @@ mod tests {
     use super::*;
     use crate::liveness::{PING_BUDGET, PING_INTERVAL, SYNC_PING_BUDGET};
     use crate::process::Disposition;
+    use crate::runtime::SteerOutcome;
     use crate::supervisor::Action;
 
     fn at(base: Instant, ms: u64) -> Instant {
@@ -578,13 +579,13 @@ mod tests {
             self.calls.push("unsteer");
             Ok(())
         }
-        fn steer(&mut self) -> Result<(), String> {
+        fn steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
-            Ok(())
+            Ok(SteerOutcome::Steered)
         }
-        fn restore_steer(&mut self) -> Result<(), String> {
+        fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
             self.calls.push("steer");
-            Ok(())
+            Ok(SteerOutcome::Steered)
         }
         fn kill(&mut self) -> Disposition {
             self.calls.push("kill");
@@ -1365,11 +1366,11 @@ mod tests {
             fn unsteer(&mut self) -> Result<(), String> {
                 Ok(())
             }
-            fn steer(&mut self) -> Result<(), String> {
-                Ok(())
+            fn steer(&mut self) -> Result<SteerOutcome, String> {
+                Ok(SteerOutcome::Steered)
             }
-            fn restore_steer(&mut self) -> Result<(), String> {
-                Ok(())
+            fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
+                Ok(SteerOutcome::Steered)
             }
             fn kill(&mut self) -> Disposition {
                 Disposition::SafeToRelease

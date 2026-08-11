@@ -443,27 +443,55 @@ steering  DEGRADED — ... supervision has stopped, so nothing will
 Take that one seriously: rules pointing at a VF whose VPP has been
 killed are a blackhole, not a lost optimisation.
 
-**The same applies when no port is configured to steer** — a full
-`steer off` whose removal was refused:
+**A full `steer off` whose removal was refused reads differently**, and
+as of the `SteerOutcome::NothingToSteer` fix it does repair itself:
 
 ```text
-steering  DEGRADED — ... no port is configured to steer, so convergence
-                     cannot clear these — `steer` refuses an empty target
-                     rather than report an offload it never installed.
-                     Remove them with `ethtool -N <iface> delete <loc>`;
-                     `packetframe detach --all` also retries the teardown,
-                     but refuses while this daemon is running
+steering  DEGRADED — ... no port is configured to steer, so a convergence
+                     that verifies without withheld or unresolvable routes
+                     reconciles the NIC to an empty target and removes
+                     these. One that ends incomplete parks in the staging
+                     state and emits no steer at all, so nothing reconciles
+                     and this line outlives the convergence — `packetframe
+                     reconfigure` is then the retry, and with no port asking
+                     to steer it removes the rules rather than reinstalling
+                     any. Do not wait for either if VPP is not forwarding:
+                     `ethtool -N <iface> delete <loc>` removes a rule now,
+                     and `packetframe detach --all` retries the whole
+                     teardown once this daemon has exited
 ```
 
-Note the order: `detach` refuses outright while a `packetframe run`
-daemon exists (it holds the bpf_link FDs), so under a live module the
-`ethtool` deletion is the one that works.
+`steer` is a reconcile, and a target with no port is a legitimate thing
+to reconcile to: the stale-rule removal runs, the rules come out, and the
+outcome lands as `Event::NothingToSteer` — which clears `steered` *and*
+retires the want, so the module settles in `Ready` with `steer off
+(staging state)`.
 
-The module cannot repair this one on its own: it re-steers because a
-refused `unsteer` leaves it believing traffic is diverted, and then
-refuses the empty target. Clean up by hand. (Tracked as a product gap;
-the module should reconcile an empty target through `unsteer` rather
-than retry a refusal.)
+**Read the second sentence here too.** `Action::Steer` is what carries
+that reconcile, and only `VerifyPassed` emits it. A convergence ending
+`VerifyIncomplete` parks in `Ready` with no action at all, so the
+leftover rules stay. That is not a stuck state — `Ready` accepts
+`packetframe reconfigure`, and with no port configured to steer the
+reconcile removes the rules rather than reinstalling any — but it does
+mean "wait for the convergence" is the wrong instinct if the health line
+is still there once the module reaches `Ready`.
+
+It did not always. `steer` used to refuse an empty target outright,
+before reaching that removal, because `Ok` had no way to say "nothing is
+steered" and would have become `Event::Steered` — an offload reported as
+carrying traffic it never saw. Meanwhile a refused `unsteer` leaves
+`steered` true by design, a death while steered re-arms the want, and
+`VerifyPassed` re-steers on the want: so every convergence re-entered the
+same refusal and the rules diverted traffic forever, for a port the
+operator had turned off.
+
+Do not simply wait for the convergence, though. This line is also
+reachable from `Backoff`, where the next one is however long the
+exponential schedule says and VPP is not forwarding meanwhile — rules
+pointing at a VF whose VPP is down are a blackhole. `detach` refuses
+outright while a `packetframe run` daemon exists (it holds the bpf_link
+FDs), so under a live module the `ethtool` deletion is the one that
+works right now.
 
 **Two directions, one count.** The rules the ledger names are read back
 and compared field by field, so a deleted, replaced or narrowed rule is
