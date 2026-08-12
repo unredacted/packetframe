@@ -1046,6 +1046,133 @@ updates and which a live DFZ feed may never give. The deferral message
 says so explicitly when that is what is happening — read it before
 concluding the checker is broken. Nothing is dropping meanwhile.
 
+**A second unbounded case, and this one takes the rollback lever with
+it: the completeness authority is VETOING.** `authority_current`
+compares the checker's report against the mirror as it is now, and a
+`false` there vetoes the release **outright** — no floor, liveness or
+quiescence gets past it, and unlike a quiet-wait it does not clear on
+its own. It clears when the authority's report agrees with the mirror,
+or never.
+
+Measured on the shadow, 2026-08-11 → 2026-08-12: **23 h deferred and
+still holding**, floor long since met, feed healthy, nothing dropping.
+The cause was mundane once looked at — that box's own bird carries
+**13 routes** in `master4` while the mirror holds 1.30M fed from the
+primary, so the checker could only ever report a mismatch:
+
+```
+$ birdc show route count
+13 of 13 routes for 13 networks in table master4      # <- the authority
+757074 ... in table rpki4                             # <- NOT routes
+```
+
+Two traps in that output, both of which cost time here. The `Total:`
+line counts RPKI tables and means nothing for this comparison — read
+`master4`. And a box can have bird *running* and still be useless as an
+authority, which is not the same as having no bird at all.
+
+What makes it more than cosmetic is what `AdoptedResyncing` refuses:
+**steering changes, which includes `steer off`.** For the length of the
+deferral an operator cannot roll traffic off VPP with `packetframe
+reconfigure` — it answers "not converged". The eBPF tier is not
+carrying that traffic; VPP still is.
+
+- **`fib-synced` now names the veto** rather than pointing at
+  quiescence. Until this was fixed the line read "the diff runs once the
+  source is live and has gone quiet" throughout — sending an operator to
+  watch a feed that could never release it, because `AuthorityPosture`
+  had no variant for a veto and every surface read `Attesting`.
+- **On a box whose bird carries the real table** (the fleet, the
+  primary) this does not arise: the report agrees with the mirror and
+  the authority releases on its own word.
+- **A `birdc` that is temporarily unreachable is NOT this case, and
+  needs no intervention.** The integrity checker retries every interval
+  (300 s) and publishes a fresh report once it recovers, which releases
+  the deferral on its own. Restore bird or the checker and wait one
+  interval. Do **not** reach for a restart here — tearing down a
+  working VPP to fix a transient read is strictly worse than the
+  problem.
+  `fib-synced` tells the two apart, and the wording is the tell: *"the
+  completeness authority has not attested yet ... releases itself once
+  one agrees"* is the self-clearing case (no report yet, one aged out,
+  or a mirror still short — including every startup before the first
+  check lands). Only *"not the authority feeding it ... Waiting will
+  not clear it"* is the persistent one below.
+- **A persistent disagreement is the case that needs a decision**: a
+  local bird that does not carry the mirror's table, a bird carrying no
+  routes at all, or a mirror fed from a different source than the
+  authority measures. Make them agree, or run that box without an
+  authority.
+  **`require-table-complete off` needs a restart, not a reload.** It is
+  read at bring-up, and `reconfigure` never touches the runtime's
+  completeness handle — so editing it and reloading stores the new
+  value and changes nothing, and from a vetoed adopted resync the
+  reload is refused outright anyway. Since a restart is required
+  regardless, the cold sequence below is the same operation: stop the
+  daemon, `packetframe detach --all`, start. It tears VPP down and
+  costs a full resync, the exact trade the deferral exists to avoid, so
+  it is a last resort and not a troubleshooting step.
+- **Before a rollout, check the authority AGREES — not that bird is
+  running.** The two are different, and this box proved it: bird was up
+  the whole time.
+
+  **Do not hand-roll the comparison, and do not read silence as
+  agreement.** The checker compares bird's `master4` **plus** `master6`
+  against the fast-path mirror's v4+v6 count. It logs the successful
+  comparison at **debug**; at the default `log-level info` a healthy
+  check prints *nothing at all*, and its three failure paths
+  (`integrity check: birdc route count failed`, `... birdc protocols
+  failed`, `... mirror_counts failed`) print something different again.
+  So an absent `integrity drift above threshold` line is equally
+  consistent with the checker never having run, `birdc` failing every
+  time, or the log having rotated — which would approve a rollout onto
+  a handle that is `Unknown` and will refuse.
+
+  **The cheapest positive evidence is the canary steer itself.** With
+  `require-table-complete on`, a steer the authority will not support
+  is *refused*, and the refusal names the verdict verbatim — "the route
+  mirror holds N routes but the authority reports only M — that is not
+  the authority feeding this mirror", or "completeness is unknown", or
+  "too old to act on". Nothing is steered when it refuses, so rung 0's
+  first `steer on` doubles as the test, and a refusal costs a message
+  rather than traffic. Read the reason it prints; do not retry past it.
+
+  To know *before* attempting, sample the checker directly. Both counts
+  come from `birdc`, and the comparison is logged — but only at debug,
+  and **`log-level` in the config does not control it**: the filter is
+  built from `RUST_LOG` at process start, so this costs a restart.
+
+  ```bash
+  birdc show route count | grep -E 'in table master(4|6)'
+  systemctl edit packetframe   # [Service] Environment=RUST_LOG=info,packetframe_fast_path::fib::integrity=debug
+  systemctl restart packetframe && sleep 310
+  journalctl -u packetframe --since '-6min' \
+      | grep -E 'integrity check OK|integrity drift above threshold|integrity check:'
+  ```
+
+  `integrity check OK` carrying `bird_routes` and `packetframe_routes`
+  is the evidence the gate acts on. A drift warning, one of the three
+  failure lines, or **no line at all** are each not a pass. Revert the
+  override afterwards.
+
+  > Both awkward parts of this — needing a restart, and reading a log
+  > rather than a command — come from one gap: `IntegrityChecker`'s
+  > snapshot is published and `RouteController::integrity_snapshot()`
+  > has no caller, so the verdict has no `status` surface outside a
+  > refusal message. Worth closing; until it is, prefer the canary
+  > refusal above, which needs neither.
+
+  Two traps that make a hand-rolled check pass a box that will veto.
+  **`master6` counts**: a box whose `master4` matches but whose
+  `master6` is missing or wrong still fails the combined comparison, so
+  checking `master4` alone approves a rollout the gate will refuse.
+  And **`fib-synced`'s installed count is not the number to compare** —
+  that is VPP's table, which is v4-only by policy, against an authority
+  figure that includes v6.
+
+  A box that adopts while steered under a vetoing authority has no fast
+  rollback. Worth knowing before the canary rather than during it.
+
 ### A member port needs two things admin-up does not give it
 
 Both were found by tracing a live VPP on 2026-08-07, each hidden behind

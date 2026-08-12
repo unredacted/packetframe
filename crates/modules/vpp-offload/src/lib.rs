@@ -150,13 +150,26 @@ impl VppOffloadConfig {
 
     /// What in `new` cannot be applied without a restart.
     ///
-    /// `Ok(())` means the only differences are ones `reconfigure` can
-    /// act on: the per-port `steer` flag and `require-table-complete`,
-    /// neither of which VPP knows about. Everything else is fixed at
-    /// VPP's start or at VF acquisition, so the honest answer is to
-    /// refuse and say so — the alternative is a daemon whose running
-    /// configuration silently differs from the file an operator just
-    /// edited, which is how the wrong thing gets debugged for an hour.
+    /// `Ok(())` means the only differences are ones a reload does not
+    /// have to refuse: the per-port `steer` flag and
+    /// `require-table-complete`, neither of which VPP knows about.
+    /// Everything else is fixed at VPP's start or at VF acquisition, so
+    /// the honest answer is to refuse and say so — the alternative is a
+    /// daemon whose running configuration silently differs from the
+    /// file an operator just edited, which is how the wrong thing gets
+    /// debugged for an hour.
+    ///
+    /// **Only the steer flag is actually APPLIED by `reconfigure`.**
+    /// This comment used to say both were, and they are not:
+    /// `require-table-complete` is read at bring-up
+    /// (`Runtime::require_table_complete` installs or withholds the
+    /// completeness handle) and `reconfigure` never touches that
+    /// handle, so a toggled value is stored in `cfg` and takes effect
+    /// only at the next start. The health text says so where it
+    /// recommends the toggle; making the reload apply it is filed
+    /// separately, since installing or removing the authority under a
+    /// deferral that is mid-flight is a release-semantics change and
+    /// not a message fix (review finding).
     ///
     /// A pure function over two configs so the rule is testable without
     /// a VPP, a NIC, or an attachment.

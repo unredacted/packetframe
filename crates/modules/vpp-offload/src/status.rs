@@ -635,7 +635,57 @@ impl StatusSnapshot {
                 // feed passes through every count on its way to full
                 // and only quiescence says "done".
                 use crate::runtime::AuthorityPosture;
-                let msg = if have < want && self.authority == AuthorityPosture::Attesting {
+                // ORDER MATTERS, and every arm names its posture. The
+                // veto arm goes FIRST because it is the one case where
+                // the floor is irrelevant — the authority blocks release
+                // at any table size — and when it sat after the
+                // unconditional below-floor arm, a vetoing box below the
+                // floor was told it had "no authority" and should enable
+                // `require-table-complete`, which was already enabled and
+                // was the thing blocking it (review finding).
+                let msg = if self.authority == AuthorityPosture::Vetoing {
+                    // Persistent by construction: `Vetoing` is only
+                    // `AuthorityMismatch`, the one verdict waiting cannot
+                    // fix.
+                    format!(
+                        "resync deferred: the route source holds {have} routes (release \
+                         floor {want}) and the floor is not what is holding this — the \
+                         completeness authority reports a route count that cannot describe \
+                         this mirror (far fewer than it holds, or none at all), so it is \
+                         not the authority feeding it, and that vetoes release at any \
+                         table size, so waiting for the source to go quiet will not clear \
+                         it — quiescence is never what releases a veto. CONFIRM BEFORE \
+                         ACTING: the checker reads bird and the mirror a few subprocess \
+                         calls apart, so one report can catch a bulk withdrawal mid-flight \
+                         and show a mismatch the next check does not. If the next check \
+                         (within 300 s) still reports one, it is real. Then: check which \
+                         bird `birdc` is talking to on THIS box; where the routes \
+                         legitimately come from elsewhere, `require-table-complete off` is \
+                         the right answer — but it is read at bring-up, so it needs a \
+                         daemon RESTART, and a reload will not do it (from here a reload \
+                         is refused outright). The adopted FIB keeps forwarding untouched \
+                         meanwhile, and every steering change is refused while this holds"
+                    )
+                } else if self.authority == AuthorityPosture::AwaitingAuthority {
+                    // Blocked, but self-clearing: no report yet, one that
+                    // aged out, or a mirror still short. Deliberately
+                    // does NOT tell the operator to go looking — the next
+                    // check releases it, and sending someone after a
+                    // startup transient is how a healthy box gets
+                    // "fixed" into a broken one.
+                    format!(
+                        "resync deferred: the completeness authority has not attested yet \
+                         — no report has arrived, the last one aged out, the mirror is \
+                         still short of it, or the mirror has grown past the count the \
+                         last sample took (the checker measures both every 300 s, and a \
+                         loading DFZ moves further than that in between) — so release is \
+                         blocked for now. It releases itself once a sample agrees; the \
+                         source holds {have} routes against a floor of {want}. If the \
+                         authority really is behind rather than merely unasked, the next \
+                         sample says so and this line changes to name it. Nothing is \
+                         dropping: the adopted FIB keeps forwarding untouched"
+                    )
+                } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
@@ -660,6 +710,10 @@ impl StatusSnapshot {
                          table is loaded so the adoption starts unsteered"
                     )
                 } else if have < want {
+                    // Reachable only with NO authority now: every other
+                    // posture is claimed by an arm above, which is what
+                    // makes this text's "with no authority" accurate
+                    // rather than an assumption.
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
@@ -2483,6 +2537,154 @@ mod tests {
             FibSync::from_outcome(&good, Duration::ZERO),
             FibSync::Verified { sampled: 64, .. }
         ));
+    }
+
+    /// A vetoed deferral must not be described as waiting for quiet.
+    ///
+    /// Measured, not hypothesised: on the shadow (2026-08-12) a box
+    /// whose local bird held 13 routes against a 1.3M-route mirror sat
+    /// deferred for 23 hours printing "the diff runs once the source is
+    /// live and has gone quiet". The source going quiet could never
+    /// have released it — `authority_current` was returning false, which
+    /// vetoes the release outright — and no surface said so, because
+    /// `AuthorityPosture` had no variant for a veto and the snapshot
+    /// therefore read `Attesting`.
+    ///
+    /// The assertion is on the DIFFERENCE the operator acts on: the
+    /// vetoed message must not send them to watch quiescence, and must
+    /// name the authority as the blocker.
+    #[test]
+    fn a_vetoed_deferral_does_not_blame_quiescence() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let deferred = |authority| {
+            let mut snap = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(200),
+                },
+                FibSync::NeverVerified,
+                ports_up(),
+            );
+            // Floor MET — so the only thing that can be holding this is
+            // quiescence or the authority.
+            snap.resync_deferred = Some((1_303_920, 156_734));
+            snap.authority = authority;
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|s| s.name == SUBSYS_FIB)
+                .and_then(|s| s.message)
+                .expect("a deferral always explains itself")
+        };
+
+        let vetoed = deferred(AuthorityPosture::Vetoing);
+        assert!(
+            !vetoed.contains("gone quiet"),
+            "a vetoed deferral must not point at quiescence, which cannot release it: \
+             {vetoed}"
+        );
+        assert!(
+            vetoed.contains("completeness authority") && vetoed.contains("vetoes"),
+            "and it must name the authority as the blocker: {vetoed}"
+        );
+        assert!(
+            vetoed.contains("quiescence is never what releases a veto"),
+            "and say plainly that waiting for quiet is not the remedy: {vetoed}"
+        );
+        // But one sample is not proof of permanence: the checker reads
+        // bird and the mirror a few subprocess calls apart, so a bulk
+        // withdrawal caught mid-flight can produce a mismatch the next
+        // check does not reproduce. The line may say "stop waiting for
+        // quiet"; it may not say "go restart a daemon" on that evidence
+        // alone (review finding).
+        assert!(
+            vetoed.contains("CONFIRM BEFORE ACTING"),
+            "a single sample must not send an operator to restart anything: {vetoed}"
+        );
+        // The opt-out it recommends is read at bring-up, and
+        // `reconfigure` never installs or removes the completeness
+        // handle — so recommending it without saying RESTART sends an
+        // operator to edit a file and reload into no change at all,
+        // from a state where the reload is refused anyway (review
+        // finding).
+        assert!(
+            vetoed.contains("RESTART"),
+            "recommending `require-table-complete off` without saying it needs a restart \
+             is a remedy that silently does nothing: {vetoed}"
+        );
+
+        // The permitting posture keeps the quiescence wording, so this
+        // test cannot pass by making every deferral message identical.
+        let attesting = deferred(AuthorityPosture::Attesting);
+        assert!(
+            attesting.contains("gone quiet"),
+            "a non-vetoed deferral above the floor IS waiting for quiet: {attesting}"
+        );
+
+        // A blocked-but-self-clearing authority must NOT inherit the
+        // veto's "waiting will not clear it" — that fires at every
+        // startup before the first integrity check lands (review
+        // finding).
+        let awaiting = deferred(AuthorityPosture::AwaitingAuthority);
+        assert!(
+            !awaiting.contains("Waiting will not clear it"),
+            "an authority that has merely not reported yet clears itself: {awaiting}"
+        );
+        assert!(
+            awaiting.contains("releases itself"),
+            "and the line must say so, or an operator goes looking for a fault that is a \
+             startup transient: {awaiting}"
+        );
+    }
+
+    /// A vetoing authority below the release floor must not be told it
+    /// has no authority.
+    ///
+    /// The below-floor arm was unconditional, so it consumed the
+    /// snapshot before the veto arm could be reached: a box that HAD
+    /// `require-table-complete` enabled and was being vetoed by it read
+    /// "with no authority ... give this box a bird and enable
+    /// `require-table-complete`" (review finding). Both halves of that
+    /// advice were already true and neither was the problem.
+    #[test]
+    fn a_vetoed_deferral_below_the_floor_is_not_an_absent_authority() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            FibSync::NeverVerified,
+            ports_up(),
+        );
+        // BELOW the floor and vetoing — the ordering trap.
+        snap.resync_deferred = Some((40_000, 156_734));
+        snap.authority = AuthorityPosture::Vetoing;
+        let msg = snap
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|s| s.name == SUBSYS_FIB)
+            .and_then(|s| s.message)
+            .expect("a deferral always explains itself");
+
+        assert!(
+            !msg.contains("with no authority"),
+            "the authority is configured and is the thing blocking release: {msg}"
+        );
+        assert!(
+            !msg.contains("give this box a bird and enable"),
+            "and telling the operator to enable what is already enabled sends them \
+             nowhere: {msg}"
+        );
+        assert!(
+            msg.contains("not the authority feeding it"),
+            "it must name the real blocker instead: {msg}"
+        );
     }
 
     #[test]

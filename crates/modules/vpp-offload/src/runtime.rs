@@ -830,6 +830,108 @@ fn authority_current(
     })
 }
 
+/// What the authority means **for the deferral that is actually
+/// running** — a pure function so the rule can be stated and tested
+/// rather than assembled inline in a struct literal.
+///
+/// Deferral-scoped, exactly like `DemotedByFlap`, and that is the whole
+/// point. The question is not "what does the authority say" but "what
+/// does THIS deferral's release path do with what it says", and the two
+/// stages differ: `AwaitingFallback` consults `authority_current` and a
+/// `false` there vetoes release outright, while `AwaitingDiff` releases
+/// on floor-and-quiet alone and never asks. Reporting a veto on the
+/// diff stage would tell an operator that waiting cannot clear a
+/// deferral that waiting clears perfectly well — the first version of
+/// this did exactly that (review finding), which is the same defect
+/// class as the message it was written to fix.
+fn authority_posture(
+    configured: bool,
+    demoted: bool,
+    gate_consults_authority: bool,
+    current: Option<bool>,
+    verdict: Option<packetframe_common::fib::Completeness>,
+) -> AuthorityPosture {
+    // `authority_is_at_fault` rather than a match on the variant: the
+    // zero-route case arrives as `Unknown` (assess returns it before the
+    // mismatch branch) and is just as permanent, so the classification
+    // has to live next to the variants and their reason strings rather
+    // than being re-derived here (review finding).
+    let vetoing = gate_consults_authority
+        && current == Some(false)
+        && verdict.as_ref().is_some_and(|v| v.authority_is_at_fault());
+    if !configured {
+        AuthorityPosture::Absent
+    } else if vetoing {
+        // BEFORE the demotion, deliberately. `drain_batch` applies the
+        // veto regardless of epoch — "a NEGATIVE word still vetoes
+        // regardless of epoch; caution does not expire" — so when a
+        // flap and a mismatch coincide, clearing the flap only reveals
+        // the veto. Reporting the demotion there sends an operator to
+        // idle the feed for a deferral that the feed cannot release
+        // (review finding). The mismatch is the blocker that has to be
+        // fixed either way; once it is, a surviving demotion reports
+        // itself on the next snapshot.
+        AuthorityPosture::Vetoing
+    } else if demoted {
+        AuthorityPosture::DemotedByFlap
+    } else if !gate_consults_authority || current != Some(false) {
+        AuthorityPosture::Attesting
+    } else {
+        // Blocked, but by a verdict the next check can clear: no report
+        // yet, one that aged out, or a mirror still short of the
+        // authority. Only `AuthorityMismatch` — a mirror holding
+        // substantially MORE than the authority claims — is not a
+        // loading state, and that is `vetoing` above.
+        AuthorityPosture::AwaitingAuthority
+    }
+}
+
+/// The verdict on the sample **as it was taken** — both counts from the
+/// same instant.
+///
+/// This function briefly substituted the LIVE mirror count first, to
+/// match what [`authority_current`] does before deciding the veto. That
+/// was an over-correction, and the two review findings that produced
+/// and then removed it are worth keeping together, because they look
+/// contradictory and are not.
+///
+/// The first was right that the reason and the decision were reading
+/// different mirrors. The wrong conclusion I drew was that the
+/// classification should therefore substitute too — because a live
+/// mirror measured against a STALE authority count manufactures an
+/// `AuthorityMismatch` out of ordinary loading: a sample of 1.0M/1.0M
+/// at T, a mirror at 1.3M by T+200s, and the substitution calls that
+/// "the authority is measuring a different table" when the next 300 s
+/// check simply re-measures both and agrees (review finding).
+///
+/// So the fault question — *is the authority itself wrong* — is asked
+/// of the sample rather than of a live count measured against a stale
+/// one. A mismatch that is real survives into the next sample and is
+/// classified again; one created by the clock does not. What the
+/// substituted view legitimately shows is that release is blocked RIGHT
+/// NOW, and that belongs in the blocked-but-clearing message, which
+/// names it.
+///
+/// **A sample is not an instant, and the message must not pretend it
+/// is.** `IntegrityChecker::run_check` awaits the bird count, then a
+/// second `birdc` for protocols, then the mirror count — three
+/// sequential subprocess-scale steps — so the two numbers in one report
+/// are separated by at least one `birdc` invocation. Under a bulk
+/// withdrawal or reload that gap alone can read bird low and the mirror
+/// high, producing a single `AuthorityMismatch` that the next check
+/// does not reproduce (review finding). One sample is therefore enough
+/// to say quiescence is not the blocker — it never is, for a veto — but
+/// NOT enough to send someone to restart a daemon, which is why the
+/// veto text asks for the next check to confirm before acting.
+/// Requiring two mismatching samples before escalating the wording
+/// needs history the runtime does not keep; filed rather than bolted on
+/// here.
+fn authority_sample_verdict(
+    completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+) -> Option<packetframe_common::fib::Completeness> {
+    completeness.as_ref().map(|h| h.verdict())
+}
+
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
     core: Rc<RefCell<Core>>,
@@ -1089,16 +1191,23 @@ impl Runtime {
             steer_missing: c.steer_missing,
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
-            authority: if c.completeness.is_none() {
-                AuthorityPosture::Absent
-            } else if matches!(
-                &c.deferred_resync,
-                Some(DeferredResync::AwaitingFallback { demoted: true, .. })
-            ) {
-                AuthorityPosture::DemotedByFlap
-            } else {
-                AuthorityPosture::Attesting
-            },
+            authority: authority_posture(
+                c.completeness.is_some(),
+                matches!(
+                    &c.deferred_resync,
+                    Some(DeferredResync::AwaitingFallback { demoted: true, .. })
+                ),
+                matches!(
+                    &c.deferred_resync,
+                    Some(DeferredResync::AwaitingFallback { .. })
+                ),
+                // The SAME recompute the release path applies, not a
+                // re-derivation of it: the health line and the gate must
+                // not be able to disagree about whether the authority is
+                // currently permitting.
+                authority_current(&c.completeness, c.source.route_count()),
+                authority_sample_verdict(&c.completeness),
+            ),
         }
     }
 }
@@ -1124,12 +1233,51 @@ const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 pub enum AuthorityPosture {
     /// No `require-table-complete` handle; the proxies stand alone.
     Absent,
-    /// Configured and usable.
+    /// Configured, usable, and currently permitting.
     Attesting,
     /// Configured, but this deferral saw the feed flap and has not yet
     /// seen the current epoch reconciled, so the authority's word
     /// cannot be trusted to describe the current stream.
     DemotedByFlap,
+    /// Configured, usable, currently saying NO — **and the running
+    /// deferral is one that asks.** Its report does not describe the
+    /// mirror as it is now, so `authority_current` vetoes release
+    /// regardless of floor, liveness or quiescence.
+    ///
+    /// Added because the posture could not express it, and that gap had
+    /// a measured cost. On the shadow (2026-08-12) a box whose local
+    /// bird holds 13 routes against a 1.3M-route mirror sat deferred
+    /// for 23 hours reading `Attesting`, while the health line told the
+    /// operator to wait for the source to go quiet — the one thing that
+    /// could never release it. A veto does not clear on its own: it
+    /// clears when the authority's report agrees with the mirror, or
+    /// not at all.
+    ///
+    /// Scoped to the deferral by `authority_posture`, because only
+    /// `AwaitingFallback` consults the authority; the diff stage
+    /// releases on floor-and-quiet and a disagreeing authority there is
+    /// not blocking anything.
+    ///
+    /// And scoped to the PERSISTENT verdict, `AuthorityMismatch`.
+    /// `assess()` already draws that line — "short of the authority is a
+    /// mirror still loading — wait; larger than the authority cannot be
+    /// a loading state at all" — and the first version of this variant
+    /// flattened all four non-permitting verdicts into it, so a box
+    /// whose first integrity check had simply not run yet was told that
+    /// waiting would not help. That fires at every startup on a box
+    /// with an authority (review finding).
+    Vetoing,
+    /// Configured, currently not permitting, for a reason that clears
+    /// itself: no report yet (`Unknown`), one that aged out (`Stale`),
+    /// or a mirror still short of the authority (`Incomplete`). The
+    /// integrity checker publishes a fresh report every interval and
+    /// the deferral releases on its own.
+    ///
+    /// Distinct from `Vetoing` because the operator action differs
+    /// completely — wait, versus go and find out which bird `birdc` is
+    /// talking to — and distinct from `Attesting` because release IS
+    /// currently blocked, which a line saying "attesting" would deny.
+    AwaitingAuthority,
 }
 
 /// One coherent snapshot of the runtime's observable state, for the
@@ -2228,6 +2376,224 @@ mod tests {
     // Only the Linux-gated process tests need these.
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+
+    /// A veto is only a veto where the gate actually asks.
+    ///
+    /// `AwaitingFallback` consults `authority_current` and a `false`
+    /// there blocks release outright. `AwaitingDiff` releases on
+    /// floor-and-quiet and never asks — so a disagreeing authority
+    /// during the diff stage blocks nothing, and reporting `Vetoing`
+    /// there tells an operator that waiting cannot clear a deferral
+    /// that waiting clears perfectly well (review finding). The first
+    /// version of this posture keyed on the authority alone and did
+    /// exactly that, which is the same defect class it was written to
+    /// fix, one stage over.
+    #[test]
+    fn a_veto_is_scoped_to_the_gate_that_consults_the_authority() {
+        use packetframe_common::fib::Completeness;
+        let mismatch = Some(Completeness::AuthorityMismatch {
+            authority: 13,
+            mirror: 1_303_920,
+        });
+        // Absent beats everything: no handle, nothing to say.
+        for consults in [true, false] {
+            assert_eq!(
+                authority_posture(false, false, consults, None, None),
+                AuthorityPosture::Absent
+            );
+        }
+        // A flap demotes — but NOT over a persistent mismatch. The veto
+        // survives the demotion clearing (`drain_batch` applies it
+        // regardless of epoch), so reporting the flap there would send
+        // an operator to idle the feed for something the feed cannot
+        // release (review finding).
+        assert_eq!(
+            authority_posture(true, true, true, Some(false), mismatch.clone()),
+            AuthorityPosture::Vetoing,
+            "a mismatch outranks a flap: letting the feed settle only reveals the veto"
+        );
+        assert_eq!(
+            authority_posture(
+                true,
+                true,
+                true,
+                Some(false),
+                Some(packetframe_common::fib::Completeness::Unknown {
+                    why: "no check has run yet"
+                })
+            ),
+            AuthorityPosture::DemotedByFlap,
+            "but with a self-clearing verdict the flap IS the story worth telling"
+        );
+        // THE RULE: same disagreeing authority, opposite verdicts,
+        // decided only by whether this deferral's gate consults it.
+        assert_eq!(
+            authority_posture(true, false, true, Some(false), mismatch.clone()),
+            AuthorityPosture::Vetoing,
+            "AwaitingFallback consults the authority, so a false there IS the blocker"
+        );
+        assert_eq!(
+            authority_posture(true, false, false, Some(false), mismatch.clone()),
+            AuthorityPosture::Attesting,
+            "AwaitingDiff never asks, so a disagreeing authority is not blocking it and \
+             must not be reported as if it were"
+        );
+        // A permitting or unknown authority is never a veto.
+        for current in [Some(true), None] {
+            assert_eq!(
+                authority_posture(true, false, true, current, mismatch.clone()),
+                AuthorityPosture::Attesting
+            );
+        }
+    }
+
+    /// A mirror that has moved since the last sample is not a faulty
+    /// authority.
+    ///
+    /// **This test asserted the opposite one round earlier, and that
+    /// assertion was wrong.** It was written for a real finding — the
+    /// reason and the gate were reading different mirrors — but the
+    /// conclusion it encoded, that the classification should therefore
+    /// substitute the live count too, manufactures a permanent-sounding
+    /// verdict out of ordinary loading: the checker samples every 300 s,
+    /// a DFZ mirror grows past 1% drift in far less, and comparing that
+    /// live mirror against the stale authority number reads as "not the
+    /// authority feeding this mirror" when the next sample re-measures
+    /// both and agrees (review finding).
+    ///
+    /// The fault question is asked of the sample, where both numbers
+    /// describe one moment. A genuine mismatch survives into the next
+    /// sample and is classified then, within one interval; one created
+    /// by the clock does not. The gate still blocks meanwhile — that is
+    /// `authority_current`'s job and is unchanged — and the
+    /// blocked-but-clearing message is what says so.
+    #[test]
+    fn a_mirror_that_outgrew_its_sample_is_not_a_faulty_authority() {
+        use packetframe_common::fib::{Completeness, CompletenessReport, TableCompleteness};
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        handle.publish(CompletenessReport {
+            authority_routes: 1_000_000,
+            mirror_routes: 1_000_000,
+            at: std::time::Instant::now(),
+        });
+        let completeness = Some(handle);
+
+        // The sample itself: both counts from one instant, converged.
+        assert!(matches!(
+            authority_sample_verdict(&completeness),
+            Some(Completeness::Converged { .. })
+        ));
+
+        // The source has grown since. The gate DOES block on the live
+        // count — unchanged, and correct.
+        assert_eq!(authority_current(&completeness, 1_400_000), Some(false));
+
+        // But the authority is not what is wrong: nothing has asked it
+        // since, and the next check will. So the operator is told this
+        // clears itself, not to go restarting daemons.
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                authority_sample_verdict(&completeness)
+            ),
+            AuthorityPosture::AwaitingAuthority,
+            "a stale authority count against a grown mirror is the clock, not a fault"
+        );
+
+        // And when the mismatch is real — both counts from the same
+        // sample — it is a fault, which is the shadow's actual case.
+        let real = std::sync::Arc::new(TableCompleteness::new());
+        real.publish(CompletenessReport {
+            authority_routes: 13,
+            mirror_routes: 1_303_920,
+            at: std::time::Instant::now(),
+        });
+        let real = Some(real);
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                authority_sample_verdict(&real)
+            ),
+            AuthorityPosture::Vetoing,
+            "13 routes against 1.3M in ONE sample is the authority being wrong"
+        );
+    }
+
+    /// Only `AuthorityMismatch` is a veto; the rest clear themselves.
+    ///
+    /// `authority_current` returns false for EVERY non-permitting
+    /// verdict, so keying the veto on it alone told a box whose first
+    /// integrity check simply had not run yet that waiting would not
+    /// help — at every startup with an authority configured (review
+    /// finding). `assess()` already draws the line this test pins:
+    /// short of the authority is a mirror still loading; larger than
+    /// the authority cannot be a loading state at all.
+    #[test]
+    fn only_a_mismatched_authority_is_a_veto() {
+        use packetframe_common::fib::Completeness;
+        let self_clearing = [
+            Completeness::Unknown {
+                why: "no check has run yet",
+            },
+            Completeness::Stale {
+                age: Duration::from_secs(9_999),
+            },
+            Completeness::Incomplete {
+                drift: 0.5,
+                authority: 1_000_000,
+                mirror: 500_000,
+            },
+        ];
+        // An authority answering ZERO is not a transient unknown. It
+        // arrives as `Unknown` because `assess` returns that before the
+        // mismatch branch, and it is exactly as permanent as a
+        // mismatch — the fully-empty form of the shadow incident
+        // (review finding).
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                Some(packetframe_common::fib::Completeness::Unknown {
+                    why: packetframe_common::fib::ZERO_ROUTE_AUTHORITY
+                })
+            ),
+            AuthorityPosture::Vetoing,
+            "a bird with no routes at all cannot be waited out any more than a mismatched \
+             one can"
+        );
+        for verdict in self_clearing {
+            assert_eq!(
+                authority_posture(true, false, true, Some(false), Some(verdict.clone())),
+                AuthorityPosture::AwaitingAuthority,
+                "{verdict:?} is a report that has not arrived, aged out, or describes a \
+                 mirror still loading — the next check can clear all three, so this must \
+                 not be reported as a veto"
+            );
+        }
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                Some(Completeness::AuthorityMismatch {
+                    authority: 13,
+                    mirror: 1_303_920,
+                })
+            ),
+            AuthorityPosture::Vetoing,
+            "a mirror holding far more than the authority claims is not a loading state \
+             and no check will clear it"
+        );
+    }
 
     /// Activity cannot divide away, however slowly the tick ran.
     ///
