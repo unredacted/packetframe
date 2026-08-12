@@ -297,6 +297,23 @@ fn decide_from_record(
             why: format!("pid {pid} is running but its identity could not be read"),
         };
     };
+    // A record that does NOT describe the live process settles nothing:
+    // two situations produce it and the data cannot separate them. The
+    // pid was reused after our daemon died, or the record is stale — a
+    // rollback to a build that does not maintain the sidecar rewrites
+    // only the pid file and cannot know to remove it, and after a
+    // reboot the pids can coincide.
+    //
+    // Concluding `Gone` there was the fail-open half: it licenses
+    // `detach` while a rolled-back daemon is live. Falling back to the
+    // executable match answers both correctly — a live daemon at that
+    // pid is found, and a reused pid held by anything else lands in
+    // `Unknown`, where the destructive path refuses.
+    //
+    // The previous attempt dated the two files by mtime, which a
+    // coarse-resolution filesystem defeats and which forced an ordering
+    // on the writer. Removed: cleverness standing in for the
+    // observation that a mismatched record is simply not evidence.
     if ticks == recorded.start_ticks && boot == recorded.boot_id {
         // Identity matched, and the record was shown to be root-owned
         // before it was read — see `record_is_authentic`, which is what
@@ -310,12 +327,15 @@ fn decide_from_record(
         // against an attacker who cannot get past the file check
         // anyway.
         DaemonPresence::Running { pid }
+    } else if exe_matches {
+        // Not the recorded process, but a daemon nonetheless — which is
+        // what a rollback leaves behind.
+        DaemonPresence::Running { pid }
     } else {
-        // Alive, but not the process that wrote the record: the pid was
-        // reused. The one case where a live pid still proves absence.
-        DaemonPresence::Gone {
+        DaemonPresence::Unknown {
             why: format!(
-                "pid {pid} is running but was reused; the daemon that wrote the record is gone"
+                "pid {pid} does not match the recorded identity — reused, or the record is \
+                 stale — and it is not running a packetframe daemon"
             ),
         }
     }
@@ -374,7 +394,7 @@ pub fn self_boot_id() -> Option<String> {
 /// create in its place is theirs and fails, which drops the identity
 /// and falls back to the executable match — as if none were recorded.
 #[cfg(target_os = "linux")]
-fn read_authentic_identity(path: &Path, pid: i32, pid_path: &Path) -> Option<DaemonIdentity> {
+fn read_authentic_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -385,20 +405,6 @@ fn read_authentic_identity(path: &Path, pid: i32, pid_path: &Path) -> Option<Dae
         .ok()?;
     let meta = f.metadata().ok()?;
     if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-        return None;
-    }
-    // OLDER than the pid record means it describes a previous daemon.
-    // The pid alone cannot tell them apart: roll back to a pre-sidecar
-    // build, which rewrites only the pid file and cannot know to remove
-    // this one, and after a reboot the pids can coincide — then the
-    // stale ticks reject the live daemon as reused and `reconfigure`
-    // stays unavailable for its whole life (review finding). The daemon
-    // writes the pid file first and this second, so a current pair is
-    // never inverted.
-    let record_time = std::fs::metadata(pid_path)
-        .and_then(|m| m.modified())
-        .ok()?;
-    if meta.modified().ok()? < record_time {
         return None;
     }
     let mut raw = String::new();
@@ -432,7 +438,7 @@ pub fn presence_of(
             // It also stays a bare pid on the write side, because CLIs
             // from other bundles parse it whole.
             Ok((pid, _unauthenticated)) => {
-                Record::Found(pid, read_authentic_identity(identity_path, pid, pid_path))
+                Record::Found(pid, read_authentic_identity(identity_path, pid))
             }
             Err(e) => Record::Unreadable(format!("unreadable {}: {e}", pid_path.display())),
         },
@@ -519,27 +525,31 @@ mod tests {
             DaemonPresence::Running { pid: 42 }
         );
 
-        // Identity mismatch: the pid was reused, so our daemon IS gone.
-        // The only case where a live pid proves absence.
-        let reused = decide(
-            Record::Found(42, Some(id(42, 900))),
-            true,
-            Some((901, "boot-a".into())),
-            true,
-            || None,
-        );
-        assert!(is_gone(&reused), "{reused:?}");
-
-        // Same pid and ticks across a reboot is a real collision, and
-        // the boot id is what separates them.
-        let rebooted = decide(
-            Record::Found(42, Some(id(42, 900))),
-            true,
-            Some((900, "boot-b".into())),
-            true,
-            || None,
-        );
-        assert!(is_gone(&rebooted), "{rebooted:?}");
+        // A record that does not describe the live process is NOT
+        // absence. Two situations produce it — the pid was reused, or
+        // the record is stale after a rollback to a build that does not
+        // maintain it — and nothing in the data separates them, so
+        // concluding `Gone` licensed `detach` while a rolled-back
+        // daemon was live (review finding).
+        for live in [(901, "boot-a"), (900, "boot-b")] {
+            let mismatch = |exe| {
+                decide(
+                    Record::Found(42, Some(id(42, 900))),
+                    true,
+                    Some((live.0, live.1.to_string())),
+                    exe,
+                    || None,
+                )
+            };
+            assert!(
+                !is_gone(&mismatch(false)) && !is_gone(&mismatch(true)),
+                "a mismatched record never proves absence, whatever the executable says"
+            );
+            // And it falls back rather than refusing outright: a daemon
+            // at that pid is still a daemon.
+            assert_eq!(mismatch(true), DaemonPresence::Running { pid: 42 });
+            assert!(matches!(mismatch(false), DaemonPresence::Unknown { .. }));
+        }
 
         // Identity recorded but unreadable now: cannot tell.
         assert!(!is_gone(&decide(
@@ -574,12 +584,6 @@ mod tests {
                 Record::Found(42, Some(id(42, 900))),
                 false,
                 None,
-            ),
-            (
-                "recorded pid reused",
-                Record::Found(42, Some(id(42, 900))),
-                true,
-                Some((901, "boot-a".to_string())),
             ),
         ] {
             let alone = decide(record.clone(), alive, live.clone(), false, || None);
@@ -682,7 +686,7 @@ mod tests {
         std::fs::write(&ident, real.encode()).expect("write");
         std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         assert!(
-            read_authentic_identity(&ident, me, &pidfile).is_none(),
+            read_authentic_identity(&ident, me).is_none(),
             "a record any user can write must not decide which pid is our daemon"
         );
 
@@ -699,37 +703,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A sidecar older than the pid record belongs to a past daemon.
+    /// A rollback to a build without the sidecar still works.
     ///
-    /// Roll back to a build that predates the sidecar: it rewrites only
-    /// the pid file and cannot know to remove this one, and after a
-    /// reboot the pids can coincide. Matched by pid alone, the stale
-    /// ticks then reject the live daemon as reused, and `reconfigure`
-    /// stays unavailable for its whole life (review finding).
-    #[cfg(target_os = "linux")]
+    /// That build rewrites only the pid file and cannot know to remove
+    /// `packetframe.identity`; after a reboot the pids can coincide, so
+    /// the stale record gets matched to the live daemon and rejects it.
+    /// The first attempt dated the files by mtime, which a coarse
+    /// filesystem defeats. The answer is simpler: a record that does
+    /// not describe the live process is not evidence about it, so the
+    /// executable match decides — and a rolled-back daemon is found.
     #[test]
-    fn a_sidecar_older_than_the_pid_record_is_ignored() {
-        let dir = std::env::temp_dir().join(format!("pf-rollback-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        let ident = dir.join("packetframe.identity");
-        let pidfile = dir.join("packetframe.pid");
-        let me = std::process::id() as i32;
-
-        // The newer daemon's sidecar, written first…
-        let real = DaemonIdentity::current().expect("own identity");
-        std::fs::write(&ident, real.encode()).expect("write");
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        // …then a rollback daemon writes only the pid file, later.
-        std::fs::write(&pidfile, format!("{me}\n")).expect("write");
-
-        assert!(
-            read_authentic_identity(&ident, me, &pidfile).is_none(),
-            "a sidecar predating the pid record describes a daemon that is gone, and \
-             matching it by pid rejects the live one as reused"
+    fn a_stale_record_does_not_condemn_the_daemon_that_replaced_it() {
+        let stale = |exe| {
+            decide(
+                Record::Found(42, Some(id(42, 900))),
+                true,
+                Some((7777, "boot-after-reboot".to_string())),
+                exe,
+                || None,
+            )
+        };
+        assert_eq!(
+            stale(true),
+            DaemonPresence::Running { pid: 42 },
+            "the live daemon is found by its executable, not condemned by a record it \
+             never wrote"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !is_gone(&stale(false)),
+            "and where nothing confirms it, the answer is unknown rather than absent"
+        );
     }
 
     /// A partial identity is not a legacy record.
