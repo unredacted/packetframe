@@ -882,14 +882,6 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     let pid_path = state_dir.join(PIDFILE_NAME);
     let marker_path = state_dir.join(RECONFIGURE_MARKER_NAME);
 
-    let pid = read_pid_file(&pid_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ReconfigureError::DaemonNotRunning(format!(
-            "PID file not found at {}, daemon doesn't appear to be running",
-            pid_path.display()
-        )),
-        _ => ReconfigureError::Io(format!("read PID file {}: {e}", pid_path.display())),
-    })?;
-
     // /proc/<pid>/exe cross-check defends against a stale PID file
     // pointing at a recycled PID. We previously consulted
     // /proc/<pid>/comm, but `comm` is user-settable via
@@ -1009,19 +1001,6 @@ fn scan_for_running_daemon() -> Option<i32> {
         }
     }
     None
-}
-
-/// The pid from the record, whichever format it is in.
-///
-/// This parsed the WHOLE trimmed file as a number, so the identity
-/// record (`<pid> <start_ticks> <boot_id>`) failed with `InvalidData`
-/// and `reconfigure` returned before it could signal anything — the
-/// canary lever, broken by the commit that was fixing it (review
-/// finding, P1).
-#[cfg(target_os = "linux")]
-fn read_pid_file(path: &Path) -> std::io::Result<libc::pid_t> {
-    let s = std::fs::read_to_string(path)?;
-    crate::daemon_presence::DaemonIdentity::decode(&s).map(|(pid, _)| pid as libc::pid_t)
 }
 
 /// Read /proc/<pid>/exe as a symlink and compare against the
@@ -1850,7 +1829,8 @@ mod vpp_detach_tests {
 
         // The exe check fails, as it does whenever the CLI runs from a
         // different path than the daemon.
-        let p = presence_of(&dir.join(PIDFILE_NAME), |_| false);
+        // No scan: this is about what the RECORD can establish.
+        let p = presence_of(&dir.join(PIDFILE_NAME), |_| false, || None);
         assert!(
             matches!(p, DaemonPresence::Unknown { .. }),
             "a live pid with no verifiable identity must be Unknown, not Gone — Gone is \
@@ -1860,7 +1840,7 @@ mod vpp_detach_tests {
         // And the same record with the exe check passing still resolves
         // to Running, so the guard has not simply been loosened.
         assert!(matches!(
-            presence_of(&dir.join(PIDFILE_NAME), |_| true),
+            presence_of(&dir.join(PIDFILE_NAME), |_| true, || None),
             DaemonPresence::Running { .. }
         ));
 
