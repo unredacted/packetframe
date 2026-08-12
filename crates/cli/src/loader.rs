@@ -1844,23 +1844,39 @@ fn print_module_health(state_dir: &Path) {
              The report below is history, {age}.",
             snapshot.pid
         ),
-        crate::daemon_presence::DaemonPresence::Gone { why } => println!(
-            "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
-             report below is history, {age}; the dataplane may still be forwarding via its \
-             pins (§8.5).",
-            snapshot.pid
-        ),
-        // Neither shown. Saying "gone" here is what printed STALE over
-        // a live daemon on the shadow (2026-08-12), because the check
-        // asked whether the daemon ran this CLI's own binary.
-        // The record could not answer, but the SNAPSHOT can: it carries
-        // the publisher's own identity, and a match proves that exact
-        // process is running. Reachable whenever the pid record is
-        // missing or stale — a non-fatal write failure, or a
-        // replacement that has attached but not yet rewritten it — and
-        // without this the report reads CANNOT CONFIRM for that
-        // daemon's whole lifetime while the proof sits in the file
-        // being printed (review finding).
+        // The record could not answer — or answered WRONG — but the
+        // SNAPSHOT can: it carries the publisher's own identity, and a
+        // match against the live process proves that exact process is
+        // running. This override reaches `Gone` as well as `Unknown`,
+        // and has to: a daemon whose non-fatal record writes BOTH
+        // failed, running under a name the scan's prefix check does not
+        // admit, resolves to `Gone` — and printing STALE over its
+        // freshly published report is this PR's motivating bug again,
+        // surviving in the one arm the override skipped (review
+        // finding; the first version guarded only `Unknown`). Saying
+        // "gone" over a live daemon is what happened on the shadow,
+        // 2026-08-12.
+        //
+        // Safe for `status` precisely because status ACTS on nothing:
+        // matching identity is the strongest evidence there is, and it
+        // is only being used to label a report. `detach` and
+        // `reconfigure` do not read snapshots and keep their verdicts.
+        // Two arms rather than one, because the operator guidance
+        // differs and a single message would promise `detach` behaviour
+        // one of the two paths does not deliver (the #157 class):
+        // `detach` refuses on `Unknown` but proceeds on `Gone` — the
+        // documented residual — so the `Gone` text must warn, not
+        // reassure.
+        crate::daemon_presence::DaemonPresence::Gone { .. } if snapshot_matches_live(&snapshot) => {
+            println!(
+                "module health (pid {}, {age}) — confirmed by the report's own recorded \
+                 identity. WARNING: every record-based check reads this daemon as absent \
+                 (no pid file, no identity sidecar, and the process-table scan cannot see \
+                 it), so `packetframe detach` would proceed under it. Stop the daemon \
+                 before detaching.",
+                snapshot.pid
+            )
+        }
         crate::daemon_presence::DaemonPresence::Unknown { .. }
             if snapshot_matches_live(&snapshot) =>
         {
@@ -1871,6 +1887,12 @@ fn print_module_health(state_dir: &Path) {
                 snapshot.pid
             )
         }
+        crate::daemon_presence::DaemonPresence::Gone { why } => println!(
+            "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
+             report below is history, {age}; the dataplane may still be forwarding via its \
+             pins (§8.5).",
+            snapshot.pid
+        ),
         crate::daemon_presence::DaemonPresence::Unknown { why } => println!(
             "module health (pid {}, {age}) — CANNOT CONFIRM the daemon is still running \
              ({why}). Read the report as possibly historical until it can be checked.",

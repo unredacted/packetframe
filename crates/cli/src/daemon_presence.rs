@@ -352,20 +352,38 @@ fn decide_from_record(
         };
     }
     let Some(recorded) = recorded else {
-        // Legacy record. The exe match still CONFIRMS — a process
-        // running this very binary, at the pid a root-owned file names,
-        // is ours. Its FAILURE proves nothing, and reading that as
-        // absence is the whole defect.
-        return if exe_matches {
-            DaemonPresence::Running { pid }
+        // Legacy record: a root-owned file names a pid and nothing
+        // else. THE RULE, now applied here too: only a matching
+        // identity confirms a live pid, and weaker evidence never
+        // upgrades a verdict.
+        //
+        // This arm used to confirm on the executable match, arguing
+        // that our binary at a root-recorded pid is ours. But the exe
+        // predicate deliberately accepts versioned siblings across
+        // bundles — right for FINDING a daemon, not for identifying
+        // one — so a legacy record surviving a crash, its pid reused
+        // by a `packetframe* run` from another bundle and another
+        // state directory, read as `Running` and took root's SIGHUP
+        // (review finding; the identity-mismatch arm fell to the same
+        // reasoning one round earlier).
+        //
+        // The cost lands once, on the first upgrade from a pre-sidecar
+        // build: `reconfigure` refuses and `status` cannot confirm
+        // until the daemon restarts on a build that records identity.
+        // `status` usually recovers sooner than that — the health
+        // snapshot carries the publisher's own identity, which is the
+        // matching-identity evidence this record lacks.
+        let what = if exe_matches {
+            "a packetframe daemon is running at that pid, but a pid alone cannot show it \
+             is the one that wrote the record"
         } else {
-            DaemonPresence::Unknown {
-                why: format!(
-                    "pid {pid} is running but the record predates identity tracking, and this \
-                     command is a different binary than that process — restart the daemon on \
-                     this build to make it checkable"
-                ),
-            }
+            "this command is a different binary than that process"
+        };
+        return DaemonPresence::Unknown {
+            why: format!(
+                "pid {pid} is running but the record predates identity tracking — {what}; \
+                 restart the daemon on this build to make it checkable"
+            ),
         };
     };
     let Some((ticks, boot)) = live_identity else {
@@ -646,12 +664,20 @@ mod tests {
             "so nothing destructive may proceed on it"
         );
 
-        // Same record, same binary: the exe match still confirms.
-        assert_eq!(
-            decide(Record::Found(42, None), true, None, true, || {
-                Scan::NoneFound
-            }),
-            DaemonPresence::Running { pid: 42 }
+        // Same record, exe match passing: STILL Unknown. The predicate
+        // accepts versioned siblings across bundles — right for finding
+        // a daemon, not for identifying one — so a legacy record whose
+        // pid was reused by a `packetframe* run` from another bundle
+        // read as Running and took root's SIGHUP (review finding).
+        // Only a matching identity confirms; this record cannot carry
+        // one, so a live pid under it is never better than Unknown.
+        let legacy_exe = decide(Record::Found(42, None), true, None, true, || {
+            Scan::NoneFound
+        });
+        assert!(
+            matches!(legacy_exe, DaemonPresence::Unknown { .. }),
+            "an exe match must not upgrade an identity-less record to signal-capable: \
+             {legacy_exe:?}"
         );
 
         // Identity recorded and matching: Running whatever the exe says.

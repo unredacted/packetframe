@@ -1128,7 +1128,10 @@ module's own deltas.
 >   removes both files on the way out and `detach` is the advertised
 >   recovery path. Closing it properly means checking whether any
 >   process holds the pinned links, which is evidence that never goes
->   through a pid; that is not built.
+>   through a pid; that is not built. `status` DOES see such a daemon
+>   when its health snapshot matches the live process, and warns
+>   explicitly that `detach` would proceed under it — stop the daemon
+>   first.
 > - The scan has to *complete* to count as evidence of absence. If
 >   `/proc` cannot be listed, or a process in it cannot be examined
 >   (running `detach` as a non-root user is the ordinary cause), the
@@ -1149,6 +1152,17 @@ module's own deltas.
 >   the sidecar, but only if the pids coincide across a reboot; the
 >   ordinary rollback leaves a sidecar naming a different pid, which is
 >   ignored.
+> - **Only a matching identity confirms.** A record that carries no
+>   identity — the pid-only file a pre-sidecar build writes — never
+>   resolves a *live* pid to "our daemon", even when a packetframe
+>   binary holds it: the executable check finds *a* daemon, not *the*
+>   one the record describes. The cost lands once, on the first upgrade
+>   from a pre-sidecar build: `reconfigure` refuses and `status` says
+>   CANNOT CONFIRM until the daemon restarts on a build that records
+>   identity. (`status` usually recovers sooner — the health snapshot
+>   carries the publisher's own identity, and a match against the live
+>   process confirms the report even when every pid record failed or
+>   is missing.)
 > - `detach` refuses on "cannot tell", not only on "daemon present".
 >   When the message names a pid that is **not** a packetframe daemon,
 >   and you have established there is none, remove the pid file and the
