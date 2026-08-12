@@ -404,11 +404,28 @@ impl TableCompleteness {
 
     /// The verdict now, under the steering policy.
     pub fn verdict(&self) -> Completeness {
-        assess(
-            self.latest(),
-            std::time::Instant::now(),
-            STEER_MAX_DRIFT,
-            STEER_MAX_REPORT_AGE,
+        self.latest_verdict().1
+    }
+
+    /// The verdict **and the report it was read from**, under one lock
+    /// acquisition.
+    ///
+    /// For callers that need to know WHICH sample produced a verdict —
+    /// `CompletenessReport::at` is the sample's identity, and a consumer
+    /// asking "have two distinct checks now said this?" cannot get that
+    /// from `verdict()` and `latest()` called separately: a publish
+    /// landing between the two returns a verdict from one report and a
+    /// timestamp from the next.
+    pub fn latest_verdict(&self) -> (Option<CompletenessReport>, Completeness) {
+        let latest = *self.0.read().expect("completeness lock");
+        (
+            latest,
+            assess(
+                latest,
+                std::time::Instant::now(),
+                STEER_MAX_DRIFT,
+                STEER_MAX_REPORT_AGE,
+            ),
         )
     }
 }
