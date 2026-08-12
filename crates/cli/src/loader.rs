@@ -1658,6 +1658,19 @@ fn snapshot_matches_live(snapshot: &crate::health::Snapshot) -> bool {
     let (Some(ticks), Some(boot)) = (snapshot.start_ticks, snapshot.boot_id.as_deref()) else {
         return false;
     };
+    // ALIVE first. An unreaped exit keeps its start ticks, so matching
+    // them proves the publisher is the process that once held that pid
+    // — not that it can still publish. The zombie rule lives in
+    // `presence_of`, and the snapshot fallback added later did not go
+    // through it, so a crashed daemon whose pid record had also become
+    // unreadable read as "confirmed current" (review finding).
+    //
+    // Checked HERE rather than at that call site, so the next caller
+    // inherits it instead of having to remember.
+    match crate::daemon_presence::proc_state(snapshot.pid) {
+        Ok(state) if crate::daemon_presence::state_is_alive(state) => {}
+        _ => return false,
+    }
     matches!(
         (
             crate::daemon_presence::start_ticks(snapshot.pid),
