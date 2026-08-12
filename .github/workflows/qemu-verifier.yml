@@ -90,6 +90,16 @@ jobs:
       - name: Install QEMU + virtme-ng
         run: |
           set -eux
+          # Drop the vendor repos the hosted runner image ships and this
+          # job does not use. `apt-get update` exits non-zero if ANY
+          # configured source fails, so a 403 from packages.microsoft.com
+          # — which happens periodically and has nothing to do with us —
+          # fails the whole job before qemu is even installed (observed
+          # 2026-08-12: azure-cli and prod both 403, exit 100, no test
+          # ever ran). Everything below comes from the Ubuntu archive.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list \
+                     /etc/apt/sources.list.d/azure*.list \
+                     /etc/apt/sources.list.d/google-chrome*.list
           sudo apt-get update
           # virtme-ng is the maintained fork (classic virtme-run uses
           # -watchdog which QEMU 8.x dropped). Its `--run <deb>` accepts
