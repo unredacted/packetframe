@@ -600,6 +600,14 @@ pub struct ActiveState {
     /// stack on rvu-nicpf hardware (kernel panic, full reboot);
     /// this is the same class of bug §11.8 calls out for attach.
     pub attach_settle_time: std::time::Duration,
+    /// The `integrity-authority` in force, as attach resolved it
+    /// (absent directive ⇒ `Birdc` default). Retained for the same
+    /// reason `attach_settle_time` is: the value is consumed once, when
+    /// the `RouteController` is built, so a later SIGHUP has nothing to
+    /// compare against unless the attach-time answer is kept. Without
+    /// it a reload that changes the authority returns OK and changes
+    /// nothing — the checker keeps using the old one (review finding).
+    pub integrity_authority: packetframe_common::config::IntegrityAuthoritySpec,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -646,6 +654,26 @@ impl LinkHandle {
     pub fn persists_across_exit(&self) -> bool {
         matches!(self, LinkHandle::Pinned(_) | LinkHandle::Tc { .. })
     }
+}
+
+/// The `integrity-authority` a config asks for, with the default
+/// applied.
+///
+/// ONE derivation, three readers — `load` records it, `attach` builds
+/// the checker from it, and `reconcile` compares against it. Three
+/// copies of "absent means birdc" is how a reload comes to disagree
+/// with the running daemon about which authority is in force.
+pub fn integrity_authority_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> packetframe_common::config::IntegrityAuthoritySpec {
+    cfg.section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::IntegrityAuthority(spec) => Some(spec.clone()),
+            _ => None,
+        })
+        .unwrap_or(packetframe_common::config::IntegrityAuthoritySpec::Birdc { path: None })
 }
 
 pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveState> {
@@ -698,6 +726,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         bpffs_root: ctx.bpffs_root.to_path_buf(),
         route_controller: None,
         attach_settle_time: cfg.global.attach_settle_time,
+        integrity_authority: integrity_authority_from_cfg(cfg),
     })
 }
 
@@ -1530,6 +1559,13 @@ pub fn attach(
             }
             _ => None,
         });
+        // Which authority the integrity checker cross-checks against.
+        // Absent ⇒ `Birdc` with the default path, so every existing
+        // config behaves exactly as before; `none` declares this box has
+        // no local authority (the mirror is fed from elsewhere) and the
+        // checker does not run a comparison it knows is against the wrong
+        // RIB.
+        let integrity_authority = integrity_authority_from_cfg(cfg);
         // v0.2.1: collect operator-declared `local-prefix` directives
         // and pass them to the controller. Empty list = feature off
         // (back-compat with v0.2.0 configs that never had this).
@@ -1632,7 +1668,10 @@ pub fn attach(
         };
         let ctrl = crate::fib::controller::RouteController::start(
             &state.bpffs_root,
-            route_source,
+            crate::fib::controller::RouteFeed {
+                source: route_source,
+                integrity_authority,
+            },
             local_prefixes,
             fallback_default,
             fdb_pin_chains,
@@ -3449,6 +3488,9 @@ mod tests {
             bpffs_root: tmp,
             route_controller: None,
             attach_settle_time: std::time::Duration::ZERO,
+            integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::Birdc {
+                path: None,
+            },
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();
