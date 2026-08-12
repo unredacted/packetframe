@@ -302,11 +302,10 @@ impl VppOffloadConfig {
 ///   within this module and nowhere else: `reconfigure_from_signal`
 ///   publishes the shared allowlist and runs fast-path's `reconcile`
 ///   BEFORE vpp-offload is asked anything — modules reconfigure in config
-///   order and `fast-path` is *required* to be declared first — so an
-///   `allow-prefix` edit in the same file has already landed on the eBPF
-///   tier. Saying "nothing else was applied" sends an operator to look
-///   for a whole rollback that did not happen, when what they have is a
-///   split configuration. Making the SIGHUP atomic across modules needs a
+///   order and `fast-path` is *required* to be declared first. Saying
+///   "nothing else was applied" sends an operator to look for a whole
+///   rollback that did not happen, when what they have is a split
+///   configuration. Making the SIGHUP atomic across modules needs a
 ///   reload-validation hook on the `Module` trait and a loader change;
 ///   filed, not widened into this.
 /// - **Where traffic currently is.** Neither direction of the flag can be
@@ -319,6 +318,30 @@ impl VppOffloadConfig {
 ///   only what they can support: which lever the operator moved, and that
 ///   it was not applied.
 ///
+/// Two more, from the round after — the same class again, which is why
+/// the rule below is stated as a rule rather than as three more patches:
+///
+/// - **That fast-path's half LANDED.** Ordering proves it was attempted
+///   first, not that it succeeded: the loader records a module failure
+///   and carries on to the next module, and `reconcile` is not
+///   transactional, so a failure there can be partial. The result is
+///   reported next to this one in the same `packetframe reconfigure`
+///   output, which is where the operator should be sent.
+/// - **That a clean re-send applies immediately.** It is still subject to
+///   `State::accepts_steering_changes`: `service::apply_steering` refuses
+///   from anything but `Ready`/`Steered`, and that set excludes the
+///   deferred adopted resync where this directive's own remedy is read.
+///   Promising an immediate rollback there sends an operator into the
+///   same failed emergency rollback twice — and contradicts the finding
+///   this whole PR is built on.
+///
+/// **The rule, since patching one claim kept producing the next:** this
+/// function sees two config structs. It may say what the operator asked
+/// for and that this module did not apply it. Every other question —
+/// what the NIC holds, what the eBPF tier holds, whether a retry will be
+/// admitted — belongs to a surface that can observe the answer, and this
+/// text's job is to name that surface, not to predict it.
+///
 /// The lever sentence appears only when a lever actually moved: a warning
 /// about a rollback nobody asked for is noise on every ordinary
 /// restart-only refusal. Matched by INTERFACE rather than by position,
@@ -327,11 +350,13 @@ impl VppOffloadConfig {
 /// list as a lever move.
 fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     let mut out = String::from(
-        ". This module applied NOTHING from this reload — but the SIGHUP is not atomic \
-         across modules: the loader publishes the shared allowlist and runs fast-path's \
-         reconcile before vpp-offload is asked anything, so an `allow-prefix` edit in the \
-         same file has ALREADY taken effect on the eBPF tier. The two tiers are configured \
-         differently until this is resolved",
+        ". This module applied NOTHING from this reload. The SIGHUP is not atomic across \
+         modules, though: the loader publishes the shared allowlist and runs fast-path's \
+         reconcile BEFORE vpp-offload is asked anything, so an `allow-prefix` edit in the \
+         same file was already ATTEMPTED against the eBPF tier — whether it landed is \
+         fast-path's own result, reported beside this one in the same `packetframe \
+         reconfigure` output, and its reconcile is not transactional so a failure there \
+         can be partial. Expect the two tiers to disagree until this is resolved",
     );
     // Direction is named because a skipped rollback is the urgent one —
     // but as a statement about the REQUEST, never about where traffic
@@ -351,11 +376,15 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     if !rolled_back.is_empty() {
         out.push_str(&format!(
             ". IN PARTICULAR {rolled_back:?} asked for `steer on → off` and it was NOT \
-             applied — a rollback that did not happen. The NIC still holds whatever rules \
-             it held before this reload; `packetframe status` says what those are, and this \
-             message deliberately does not guess. Re-send the `steer` change in an edit \
-             that does not also touch a restart-only directive and it applies immediately \
-             — that part does not need the restart"
+             applied — a rollback that did not happen. This reload changed nothing in the \
+             NIC; what it actually holds is `packetframe status`'s answer, not this \
+             message's to guess — the supervisor moves steering on its own cadence too. Re-send the `steer` change in an edit \
+             that does not also touch a restart-only directive: that part needs no restart, \
+             but it is still subject to the steering admission gate — it applies from \
+             `Ready`/`Steered` and is REFUSED from a resync or backoff state, which \
+             includes the deferred adopted resync that `require-table-complete`'s own \
+             remedy is read in. `packetframe status` names the remedy for the state the \
+             module is actually in"
         ));
     }
     if !turned_on.is_empty() {
@@ -1663,38 +1692,62 @@ mod tests {
             "and named precisely — eth5 did not move: {full}"
         );
         assert!(
-            full.contains("applies immediately"),
+            full.contains("needs no restart"),
             "and the way out must not read as another restart: {full}"
         );
 
-        // The two claims this message MUST NOT make, both of which the
-        // first version made (review findings on the fix itself).
+        // THE RULE, asserted as a rule: this function sees two config
+        // structs. Every claim it made about a state it cannot observe
+        // became a review finding, in four separate rounds — so what the
+        // test pins is the ABSENCE of each, not just the presence of the
+        // replacement text.
         //
-        // One: the reload was not atomic. Fast-path is required to be
-        // declared first and the loader publishes the allowlist before
-        // the module loop, so its half of the same edit has already
-        // landed. Promising a whole rollback sends the operator looking
-        // for something that did not happen.
+        // (1) The reload was not atomic across modules...
         assert!(
-            full.contains("not atomic") && full.contains("ALREADY taken effect"),
-            "the eBPF tier already moved; the message must say so rather than claim the \
-             reload rolled back whole: {full}"
+            full.contains("not atomic"),
+            "fast-path's half of the same edit went first; claiming a whole rollback sends \
+             the operator looking for something that did not happen: {full}"
         );
         assert!(
             !full.contains("Nothing else in this reload was applied"),
-            "that claim is false and was the finding: {full}"
+            "round 1's false claim: {full}"
         );
-        // Two: where traffic is. `self.cfg` is deliberately left unmoved
+        // ...but ordering proves fast-path was ATTEMPTED first, not that
+        // it succeeded: the loader records a module failure and carries
+        // on, and `reconcile` is not transactional.
+        assert!(
+            full.contains("ATTEMPTED") && !full.contains("ALREADY taken effect"),
+            "round 3's false claim — the eBPF tier's state is fast-path's result to \
+             report, not ours to assert: {full}"
+        );
+        // (2) Where traffic is. `self.cfg` is deliberately left unmoved
         // when a steer apply fails, and the supervisor keeps the want and
         // installs on its own once its gate clears — so neither direction
         // of the flag testifies about the NIC.
         assert!(
             !full.contains("still on VPP") && !full.contains("nothing was diverted"),
-            "this snapshot cannot see the NIC and must not claim to: {full}"
+            "round 2's false claims, in opposite directions: {full}"
+        );
+        // (3) Whether the clean retry will even be admitted. It is gated
+        // by `State::accepts_steering_changes`, and the excluded set
+        // includes the deferred adopted resync this directive's remedy is
+        // read in — so promising an immediate rollback there walks the
+        // operator into the same failed rollback twice.
+        assert!(
+            !full.contains("applies immediately"),
+            "round 4's false claim: the retry is still subject to the admission gate: \
+             {full}"
         );
         assert!(
-            full.contains("packetframe status"),
-            "and it must point at the surface that CAN answer that: {full}"
+            full.contains("REFUSED from a resync or backoff state"),
+            "and the gate must be named, since the state the remedy is read in is inside \
+             it: {full}"
+        );
+        // Every one of those defers to a surface that CAN observe the
+        // answer. Naming it is this text's job; predicting it is not.
+        assert!(
+            full.contains("packetframe status") && full.contains("packetframe reconfigure"),
+            "the message must name the surfaces that know what it does not: {full}"
         );
 
         // The unconditional half covers the allowlist, which this module
