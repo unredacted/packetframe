@@ -1104,9 +1104,12 @@ module's own deltas.
 > **proceeded**, unlinking pins while the daemon still held the
 > `bpf_link` FDs.
 >
-> The daemon now records `(pid, start_ticks, boot_id)` in its pid file
-> and the checks verify against that, so the CLI's own path no longer
-> matters. Two limits worth knowing:
+> The daemon now records `(pid, start_ticks, boot_id)` in
+> `packetframe.identity`, beside the pid file, and the checks verify
+> against that — so the CLI's own path no longer matters.
+> `packetframe.pid` stays a bare pid on purpose: CLIs from other
+> bundles parse it whole, and a rollback has to keep working. Two
+> limits worth knowing:
 >
 > - A daemon that never wrote a pid file (the write is non-fatal, and
 >   happens after attach) is found by a `/proc` scan instead. That scan

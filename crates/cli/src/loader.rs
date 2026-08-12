@@ -77,6 +77,15 @@ pub enum ReconfigureError {
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 const PIDFILE_NAME: &str = "packetframe.pid";
 
+/// Sidecar holding the running daemon's `(pid, start_ticks, boot_id)`.
+///
+/// Separate from the pid file rather than folded into it: that file's
+/// format is load-bearing for CLIs we do not ship with, and older ones
+/// parse it whole. A reader that does not know about this file falls
+/// back to what it always did.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+const IDENTITY_NAME: &str = "packetframe.identity";
+
 /// Sub-path under `state-dir` for the reconfigure ack marker. The
 /// daemon writes one line `OK <unix_ns>` after a successful SIGHUP
 /// reconcile or `ERR <unix_ns> <message>` on parse / per-module
@@ -435,6 +444,21 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // Clean-exit paths below remove it; an uncontrolled crash leaves
     // it stale, which `packetframe reconfigure` detects via the
     // /proc/<pid>/comm cross-check.
+    let identity_path = config.global.state_dir.join(IDENTITY_NAME);
+    match crate::daemon_presence::DaemonIdentity::current()
+        .and_then(|id| std::fs::write(&identity_path, id.encode()))
+    {
+        Ok(()) => {}
+        // Non-fatal, like the pid file: readers treat a missing
+        // identity as "cannot verify" and fall back, which is safe in
+        // every direction — `detach` refuses rather than proceeds.
+        Err(e) => tracing::warn!(
+            path = %identity_path.display(),
+            error = %e,
+            "could not record process identity; `detach` will refuse rather than risk \
+             unlinking pins under this daemon"
+        ),
+    }
     let pid_file_path = config.global.state_dir.join(PIDFILE_NAME);
     if let Err(e) = write_pid_file(&pid_file_path) {
         tracing::warn!(
@@ -498,6 +522,11 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
     // Best-effort PID file cleanup. Non-fatal, the file is harmless
     // if left behind (PID will be unrecognized on re-validate).
+    if let Err(e) = std::fs::remove_file(&identity_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %identity_path.display(), error = %e, "could not remove identity file");
+        }
+    }
     if let Err(e) = std::fs::remove_file(&pid_file_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -576,20 +605,14 @@ fn write_pid_file(path: &Path) -> std::io::Result<()> {
     let tmp = path.with_extension("pid.tmp");
     {
         let mut f = create_excl_no_follow_with_retry(&tmp)?;
-        // Identity, not just a pid. A bare pid is reusable, so every
-        // later reader had to fall back to "does some process run my
-        // exact binary path" — which is false whenever a CLI runs from
-        // a newly deployed bundle while the old daemon is still up,
-        // i.e. during every upgrade. See `daemon_presence`.
-        match crate::daemon_presence::DaemonIdentity::current() {
-            Ok(id) => writeln!(f, "{}", id.encode())?,
-            // The pid alone still works: readers treat a record with no
-            // identity as legacy and fall back rather than guessing.
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read own process identity; recording pid alone");
-                writeln!(f, "{}", std::process::id())?;
-            }
-        }
+        // A BARE PID, exactly as before. The identity goes in a sidecar
+        // instead, because this file has readers we do not ship with:
+        // a CLI from the previous bundle parses the whole trimmed file
+        // as one integer, so widening the format here broke
+        // `reconfigure` for anyone rolling back or running mixed
+        // versions — the same upgrade window this change exists to fix,
+        // in the other direction (review finding).
+        writeln!(f, "{}", std::process::id())?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
@@ -899,6 +922,7 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     // recycled process, as root (review finding).
     let pid = match crate::daemon_presence::presence_of(
         &pid_path,
+        &state_dir.join(IDENTITY_NAME),
         |p| proc_exe_matches_current(p as libc::pid_t),
         scan_for_running_daemon,
     ) {
@@ -1177,6 +1201,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let presence = crate::daemon_presence::presence_of(
         &state_dir.join(PIDFILE_NAME),
+        &state_dir.join(IDENTITY_NAME),
         |p| proc_exe_matches_current(p as libc::pid_t),
         scan_for_running_daemon,
     );
@@ -1622,6 +1647,7 @@ fn print_module_health(state_dir: &Path) {
     #[cfg(target_os = "linux")]
     let presence = crate::daemon_presence::presence_of(
         &state_dir.join(PIDFILE_NAME),
+        &state_dir.join(IDENTITY_NAME),
         |p| proc_exe_matches_current(p as libc::pid_t),
         scan_for_running_daemon,
     );
@@ -1924,7 +1950,12 @@ mod vpp_detach_tests {
         // The exe check fails, as it does whenever the CLI runs from a
         // different path than the daemon.
         // No scan: this is about what the RECORD can establish.
-        let p = presence_of(&dir.join(PIDFILE_NAME), |_| false, || None);
+        let p = presence_of(
+            &dir.join(PIDFILE_NAME),
+            &dir.join(IDENTITY_NAME),
+            |_| false,
+            || None,
+        );
         assert!(
             matches!(p, DaemonPresence::Unknown { .. }),
             "a live pid with no verifiable identity must be Unknown, not Gone — Gone is \
@@ -1934,7 +1965,12 @@ mod vpp_detach_tests {
         // And the same record with the exe check passing still resolves
         // to Running, so the guard has not simply been loosened.
         assert!(matches!(
-            presence_of(&dir.join(PIDFILE_NAME), |_| true, || None),
+            presence_of(
+                &dir.join(PIDFILE_NAME),
+                &dir.join(IDENTITY_NAME),
+                |_| true,
+                || None
+            ),
             DaemonPresence::Running { .. }
         ));
 

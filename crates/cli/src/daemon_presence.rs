@@ -324,17 +324,42 @@ pub fn self_boot_id() -> Option<String> {
     }
 }
 
+/// The sidecar identity, if it describes the pid the pid file names.
+///
+/// A sidecar naming a DIFFERENT pid is left over from a previous
+/// daemon. Treating it as this one's would compare a live process
+/// against a dead one's ticks and call the live process reused — so a
+/// mismatch reads as "no identity recorded", which falls back rather
+/// than concluding.
+#[cfg(target_os = "linux")]
+fn read_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let (recorded_pid, id) = DaemonIdentity::decode(&raw).ok()?;
+    if recorded_pid != pid {
+        return None;
+    }
+    id
+}
+
 /// Establish presence from the record at `pid_path`. Thin I/O over
 /// [`decide`], which holds the policy.
 #[cfg(target_os = "linux")]
 pub fn presence_of(
     pid_path: &Path,
+    identity_path: &Path,
     exe_matches: impl Fn(i32) -> bool,
     scan: impl Fn() -> Option<i32>,
 ) -> DaemonPresence {
     let record = match std::fs::read_to_string(pid_path) {
         Ok(s) => match DaemonIdentity::decode(&s) {
-            Ok((pid, id)) => Record::Found(pid, id),
+            // The pid file stays a BARE PID — CLIs from other bundles
+            // parse it whole, and widening it broke their `reconfigure`
+            // (review finding) — so identity comes from the sidecar.
+            // `decode` still accepts a combined record, because a
+            // reader must not care which shape it meets.
+            Ok((pid, inline)) => {
+                Record::Found(pid, inline.or_else(|| read_identity(identity_path, pid)))
+            }
             Err(e) => Record::Unreadable(format!("unreadable {}: {e}", pid_path.display())),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Record::Absent,
@@ -523,13 +548,17 @@ mod tests {
         let path = dir.join("packetframe.pid");
         // A record naming a pid that cannot exist: dead, so the record
         // alone says Gone.
-        std::fs::write(&path, "2147483646 1 boot-a").expect("write");
+        // Bare pid in the pid file, identity in the sidecar — the
+        // shapes the daemon actually writes.
+        std::fs::write(&path, "2147483646\n").expect("write");
+        let ident = dir.join("packetframe.identity");
+        std::fs::write(&ident, "2147483646 1 boot-a").expect("write");
 
         assert!(
-            is_gone(&presence_of(&path, |_| false, || None)),
+            is_gone(&presence_of(&path, &ident, |_| false, || None)),
             "with nothing running, a dead record is absence"
         );
-        let with_daemon = presence_of(&path, |_| false, || Some(77));
+        let with_daemon = presence_of(&path, &ident, |_| false, || Some(77));
         assert!(
             matches!(with_daemon, DaemonPresence::Unknown { .. }),
             "but a live daemon the scan can see must reach this path too — this is \
