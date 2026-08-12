@@ -150,26 +150,45 @@ impl VppOffloadConfig {
 
     /// What in `new` cannot be applied without a restart.
     ///
-    /// `Ok(())` means the only differences are ones a reload does not
-    /// have to refuse: the per-port `steer` flag and
-    /// `require-table-complete`, neither of which VPP knows about.
-    /// Everything else is fixed at VPP's start or at VF acquisition, so
-    /// the honest answer is to refuse and say so — the alternative is a
-    /// daemon whose running configuration silently differs from the
-    /// file an operator just edited, which is how the wrong thing gets
-    /// debugged for an hour.
+    /// `Ok(())` means the only difference is the per-port `steer` flag —
+    /// the canary lever, and the only thing a reload may change under a
+    /// running VPP. Everything else is fixed at VPP's start, at VF
+    /// acquisition, or (for `require-table-complete`) when the runtime is
+    /// built, so the honest answer is to refuse and say so — the
+    /// alternative is a daemon whose running configuration silently
+    /// differs from the file an operator just edited, which is how the
+    /// wrong thing gets debugged for an hour.
     ///
-    /// **Only the steer flag is actually APPLIED by `reconfigure`.**
-    /// This comment used to say both were, and they are not:
-    /// `require-table-complete` is read at bring-up
-    /// (`Runtime::require_table_complete` installs or withholds the
-    /// completeness handle) and `reconfigure` never touches that
-    /// handle, so a toggled value is stored in `cfg` and takes effect
-    /// only at the next start. The health text says so where it
-    /// recommends the toggle; making the reload apply it is filed
-    /// separately, since installing or removing the authority under a
-    /// deferral that is mid-flight is a release-semantics change and
-    /// not a message fix (review finding).
+    /// **`require-table-complete` is refused here rather than wired into
+    /// `reconfigure`, and that is a decision, not an omission.** It used
+    /// to be permitted and then ignored: the handle is installed or
+    /// withheld once, by the attach wiring
+    /// (`Runtime::require_table_complete`), and `reconfigure` never
+    /// touched it — so a toggled value was stored in `cfg`, reported OK,
+    /// and changed nothing until the next start. Three things decided
+    /// refusal over wiring:
+    ///
+    /// - **Where the toggle is recommended, a reload is already refused.**
+    ///   The `AuthorityMismatch` remedy is read from a deferred adopted
+    ///   resync, whose state is `AdoptedResyncing` or `Syncing`;
+    ///   `apply_steering` admits changes only from `Ready`/`Steered`. So
+    ///   wiring the toggle through the steering request would deliver it
+    ///   everywhere EXCEPT the state it exists for. Delivering it there
+    ///   means a second in-loop request path with its own admission rule,
+    ///   past `State::accepts_steering_changes` — new machinery in the
+    ///   module's most safety-critical seam, to reach a case a restart
+    ///   already reaches.
+    /// - **This check runs first**, before the attachment is consulted, so
+    ///   the operator gets a message about the directive they edited in
+    ///   EVERY state — including the deferred one, which today answers a
+    ///   `require-table-complete` edit with a refusal about steering and a
+    ///   promise ("takes effect at the next successful convergence") that
+    ///   is not true of this directive.
+    /// - **The silent window included the arming direction.** From
+    ///   `Ready`/`Steered` the reload was accepted, so an operator turning
+    ///   the gate ON was told the safety gate was armed while the runtime
+    ///   held no handle at all. That is worse than the remedy needing a
+    ///   restart, and refusing fixes both directions at once.
     ///
     /// A pure function over two configs so the rule is testable without
     /// a VPP, a NIC, or an attachment.
@@ -222,6 +241,29 @@ impl VppOffloadConfig {
                 self.vpp_binary, new.vpp_binary
             ));
         }
+        // Restart-only for a different reason than everything above:
+        // VPP has never heard of this directive. What is fixed is the
+        // WIRING — the attach sequence installs or withholds the
+        // completeness handle once, and the first-steer gate and the
+        // adopted resync's release both read whatever it decided. See
+        // this function's doc comment for why the reload refuses it
+        // rather than applying it.
+        if self.require_table_complete != new.require_table_complete {
+            let onoff = |v: bool| if v { "on" } else { "off" };
+            return Err(format!(
+                "`require-table-complete` changed ({} → {}); the completeness handle is \
+                 installed or withheld once, when the runtime is built, and both gates that \
+                 read it — the first-steer refusal and the adopted resync's release — were \
+                 decided from it at that moment. Restart to apply. Refused rather than \
+                 accepted-and-ignored on purpose: `packetframe status` and the \
+                 AuthorityMismatch text recommend toggling this directive, and a reload that \
+                 answered OK while the running daemon kept the old gate is a remedy that gets \
+                 tried, believed, and debugged for an hour. Turning it ON is worse — that \
+                 reports a safety gate as armed when no handle was ever installed",
+                onoff(self.require_table_complete),
+                onoff(new.require_table_complete)
+            ));
+        }
         Ok(())
     }
 
@@ -237,6 +279,133 @@ impl VppOffloadConfig {
             .map(|(_, cores, _)| u32::from(*cores))
             .sum()
     }
+}
+
+/// What a refused reload must ALSO say: what it left behind.
+///
+/// The refusal named only the restart-only directive, and the rest of the
+/// edit vanished in silence. The case that matters: one SIGHUP that
+/// changes `require-table-complete` **and** rolls a port back to
+/// `steer off` returns an error about a completeness gate,
+/// `apply_steering` never runs, and the `steer off` whose whole purpose
+/// is to get traffic off a misbehaving VPP quickly did nothing and said
+/// nothing (review finding, PR #170).
+///
+/// Not new to `require-table-complete`: every restart-only field has
+/// always refused this way, which is why this hangs off the refusal
+/// rather than off one directive.
+///
+/// **Two things this must not claim, both of which the first version
+/// claimed** (review findings on the fix, same class as the defect):
+///
+/// - **That the reload was atomic.** It was not. A SIGHUP is atomic
+///   within this module and nowhere else: `reconfigure_from_signal`
+///   publishes the shared allowlist and runs fast-path's `reconcile`
+///   BEFORE vpp-offload is asked anything — modules reconfigure in config
+///   order and `fast-path` is *required* to be declared first. Saying
+///   "nothing else was applied" sends an operator to look for a whole
+///   rollback that did not happen, when what they have is a split
+///   configuration. Making the SIGHUP atomic across modules needs a
+///   reload-validation hook on the `Module` trait and a loader change;
+///   filed, not widened into this.
+/// - **Where traffic currently is.** Neither direction of the flag can be
+///   read off this snapshot. `reconfigure` deliberately leaves `self.cfg`
+///   unmoved when a steer apply fails — so the config can say `off` while
+///   the supervisor holds the want and installs the rules the moment its
+///   gate clears — and equally it can say `on` over a steer that was
+///   refused and never landed. `packetframe status` reads the NIC and the
+///   supervisor; this function reads two config structs, and must say
+///   only what they can support: which lever the operator moved, and that
+///   it was not applied.
+///
+/// Two more, from the round after — the same class again, which is why
+/// the rule below is stated as a rule rather than as three more patches:
+///
+/// - **That fast-path's half LANDED.** Ordering proves it was attempted
+///   first, not that it succeeded: the loader records a module failure
+///   and carries on to the next module, and `reconcile` is not
+///   transactional, so a failure there can be partial. The result is
+///   reported next to this one in the same `packetframe reconfigure`
+///   output, which is where the operator should be sent.
+/// - **That the allowlist changed AT ALL.** The module holds a live
+///   [`SharedAllowlist`] handle and keeps no previous snapshot, so it
+///   cannot diff one — which is exactly why the split-tier warning is
+///   phrased as a conditional. A reload that touched only a restart-only
+///   directive left fast-path reconciling an unchanged allowlist and
+///   introduced no split, and telling that operator to expect the tiers
+///   to disagree sends them hunting a divergence that is not there.
+/// - **That a clean re-send applies immediately.** It is still subject to
+///   `State::accepts_steering_changes`: `service::apply_steering` refuses
+///   from anything but `Ready`/`Steered`, and that set excludes the
+///   deferred adopted resync where this directive's own remedy is read.
+///   Promising an immediate rollback there sends an operator into the
+///   same failed emergency rollback twice — and contradicts the finding
+///   this whole PR is built on.
+///
+/// **The rule, since patching one claim kept producing the next:** this
+/// function sees two config structs. It may say what the operator asked
+/// for and that this module did not apply it. Every other question —
+/// what the NIC holds, what the eBPF tier holds, whether a retry will be
+/// admitted — belongs to a surface that can observe the answer, and this
+/// text's job is to name that surface, not to predict it.
+///
+/// The lever sentence appears only when a lever actually moved: a warning
+/// about a rollback nobody asked for is noise on every ordinary
+/// restart-only refusal. Matched by INTERFACE rather than by position,
+/// because the port list is one of the things that may have just been
+/// refused — so a positional comparison could read a reordered or resized
+/// list as a lever move.
+fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
+    let mut out = String::from(
+        ". This module applied NOTHING from this reload. The SIGHUP is not atomic across \
+         modules, though: the loader publishes the shared allowlist and runs fast-path's \
+         reconcile BEFORE vpp-offload is asked anything. So IF this reload also edited \
+         `allow-prefix`, that edit was already ATTEMPTED against the eBPF tier — whether \
+         it landed is fast-path's own result, reported beside this one in the same \
+         `packetframe reconfigure` output, and its reconcile is not transactional so a \
+         failure there can be partial. This module holds a live allowlist handle with no \
+         previous snapshot, so it cannot tell you whether that is what happened; where it \
+         is, expect the two tiers to disagree until this is resolved",
+    );
+    // Direction is named because a skipped rollback is the urgent one —
+    // but as a statement about the REQUEST, never about where traffic
+    // ended up, which this snapshot cannot see.
+    let mut rolled_back: Vec<&str> = Vec::new();
+    let mut turned_on: Vec<&str> = Vec::new();
+    for (iface, _, was) in &old.ports {
+        let Some((_, _, now)) = new.ports.iter().find(|(i, _, _)| i == iface) else {
+            continue;
+        };
+        match (was, now) {
+            (true, false) => rolled_back.push(iface.as_str()),
+            (false, true) => turned_on.push(iface.as_str()),
+            _ => {}
+        }
+    }
+    if !rolled_back.is_empty() {
+        out.push_str(&format!(
+            ". IN PARTICULAR {rolled_back:?} asked for `steer on → off` and it was NOT \
+             applied — a rollback that did not happen. This reload changed nothing in the \
+             NIC; what it actually holds is `packetframe status`'s answer, not this \
+             message's to guess — the supervisor moves steering on its own cadence too. Re-send the `steer` change in an edit \
+             that does not also touch a restart-only directive: that part needs no restart, \
+             but it is still subject to the steering admission gate — it applies from \
+             `Ready`/`Steered` and is REFUSED from a resync or backoff state, which \
+             includes the deferred adopted resync that `require-table-complete`'s own \
+             remedy is read in. `packetframe status` names the remedy for the state the \
+             module is actually in"
+        ));
+    }
+    if !turned_on.is_empty() {
+        out.push_str(&format!(
+            ". {turned_on:?} asked for `steer off → on` and it was NOT applied either, so \
+             that canary step did not happen — which is not the same as nothing being \
+             steered there: a want recorded by an earlier refused steer survives in the \
+             supervisor and installs on its own once its gate clears. `packetframe status` \
+             is the surface that knows"
+        ));
+    }
+    out
 }
 
 /// The fast-path allowlist, as a live handle rather than a copy.
@@ -794,11 +963,20 @@ impl Module for VppOffloadModule {
     /// and the stats segment, which VPP also fixes at start — applying a
     /// raised ceiling to a VPP running on the old segments is the
     /// mid-resync OOM abort gate 0b found; `vpp-binary` and `hugepages`
-    /// likewise only mean anything at spawn.
+    /// likewise only mean anything at spawn. `require-table-complete` is
+    /// restart-only too, though nothing about VPP makes it so: the
+    /// completeness handle is installed once by the attach wiring and
+    /// this method never touches it, so the refusal is the only thing
+    /// keeping the running gate and the file on disk from disagreeing.
+    /// See [`VppOffloadConfig::restart_only_delta`] for why refusing beat
+    /// wiring it up.
     fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         let new = VppOffloadConfig::from_directives(&cfg.section.directives);
         if let Err(why) = self.cfg.restart_only_delta(&new) {
-            return Err(ModuleError::other(MODULE_NAME, why));
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!("{why}{}", reload_collateral(&self.cfg, &new)),
+            ));
         }
 
         // Nothing to steer into. Not an error: a config with every port
@@ -1381,6 +1559,250 @@ mod tests {
         before
             .restart_only_delta(&after)
             .expect("steer on|off must be applicable under a running VPP");
+    }
+
+    /// Toggling `require-table-complete` is refused, in both directions.
+    ///
+    /// The third acceptable outcome — accepted-and-ignored — is the one
+    /// that shipped: the directive was permitted through this function
+    /// and then never applied, because the completeness handle is
+    /// installed once by the attach wiring and `reconfigure` never
+    /// touches it. So an operator following the `AuthorityMismatch`
+    /// remedy edited the file, reloaded, was told OK, and ran on the old
+    /// gate. Either it takes effect or it is refused; "OK" over no
+    /// change is the one answer that is not allowed.
+    ///
+    /// Both directions, deliberately. `on → off` is the documented
+    /// remedy and the obvious case; `off → on` is the dangerous one,
+    /// because a success there reports a safety gate as armed when the
+    /// runtime holds no handle at all.
+    #[test]
+    fn toggling_require_table_complete_is_a_restart() {
+        let on = cfg(&[("eth4", 1, false)], 1_600_000);
+        let mut off = on.clone();
+        off.require_table_complete = false;
+
+        for (before, after, from, to) in [(&on, &off, "on", "off"), (&off, &on, "off", "on")] {
+            let e = before
+                .restart_only_delta(after)
+                .expect_err("a toggled `require-table-complete` must never be accepted silently");
+            assert!(
+                e.contains("`require-table-complete` changed"),
+                "the operator has to be told WHICH knob: {e}"
+            );
+            assert!(
+                e.contains(&format!("({from} → {to})")),
+                "and in the direction they edited it: {e}"
+            );
+            assert!(
+                e.contains("Restart to apply"),
+                "and what to DO about it, since the reload will not: {e}"
+            );
+        }
+
+        // The positive control: same value, no refusal. Without this the
+        // test above passes just as well against a function that refuses
+        // every reload.
+        on.restart_only_delta(&on.clone())
+            .expect("an unchanged directive is not a change");
+    }
+
+    /// And the refusal is reachable through the RELOAD, not just through
+    /// the pure function.
+    ///
+    /// `restart_only_delta` is called first in `reconfigure`, before the
+    /// attachment is consulted — which is what makes the message right
+    /// in every state, including the deferred adopted resync where the
+    /// remedy is read and where `apply_steering` would otherwise answer
+    /// with a refusal about steering and a promise ("takes effect at the
+    /// next successful convergence") that is false of this directive.
+    /// Asserted end-to-end because that ordering is the whole reason
+    /// refusing was chosen over wiring it up.
+    #[test]
+    fn a_reload_that_toggles_the_directive_is_refused_not_ignored() {
+        use packetframe_common::config::{GlobalConfig, ModuleDirective, ModuleSection};
+        use packetframe_common::module::{Module as _, ModuleConfig};
+
+        let section_with = |require: bool| ModuleSection {
+            name: "vpp-offload".into(),
+            directives: vec![
+                ModuleDirective::VppPort {
+                    iface: "eth4".into(),
+                    cores: 1,
+                    steer: false,
+                    line: 1,
+                },
+                ModuleDirective::VppRequireTableComplete(require),
+            ],
+        };
+        let global = GlobalConfig::default();
+        let loaded = section_with(true);
+        let ctx = LoaderCtx {
+            bpffs_root: std::path::Path::new("/sys/fs/bpf"),
+            state_dir: std::path::Path::new("/tmp/pf-require-table-complete"),
+        };
+
+        let mut m = VppOffloadModule::new();
+        m.load(&ModuleConfig::new(&loaded, &global), &ctx)
+            .expect("a single-port section loads");
+
+        // Unchanged reloads through the same path, so the refusal below
+        // cannot be an artefact of reconfiguring an unattached module.
+        m.reconfigure(&ModuleConfig::new(&loaded, &global))
+            .expect("an unchanged section reloads");
+
+        let toggled = section_with(false);
+        let e = m
+            .reconfigure(&ModuleConfig::new(&toggled, &global))
+            .expect_err("the reload must refuse a toggled `require-table-complete`");
+        let msg = e.to_string();
+        assert!(msg.contains("`require-table-complete` changed"), "{msg}");
+        assert!(msg.contains("Restart to apply"), "{msg}");
+
+        // And the refusal did not half-apply: `cfg` still holds what the
+        // running daemon was built from, so a later status or a second
+        // reload describes the gate that is actually installed.
+        assert!(
+            m.cfg.require_table_complete,
+            "a refused reload must not record the value it refused"
+        );
+    }
+
+    /// A refused reload says what ELSE it did not apply.
+    ///
+    /// The trap the refusal used to leave open: one SIGHUP that changes
+    /// `require-table-complete` and rolls a port back to `steer off`
+    /// returns an error about a completeness gate. `apply_steering` never
+    /// runs, so the MCAM rules keep diverting what they diverted before —
+    /// an emergency rollback that did nothing, reported as a refusal
+    /// about something else entirely (review finding, PR #170).
+    ///
+    /// Not specific to this directive: every restart-only field has
+    /// always refused the whole reload, which is why the sentence hangs
+    /// off the refusal rather than off one knob.
+    #[test]
+    fn a_refused_reload_names_the_rollback_it_skipped() {
+        let steered = cfg(&[("eth4", 1, true), ("eth5", 1, true)], 1_600_000);
+        // The dangerous edit: gate toggled AND one port rolled back.
+        let mut both = steered.clone();
+        both.require_table_complete = false;
+        both.ports[0].2 = false;
+
+        let e = steered.restart_only_delta(&both).expect_err("refused");
+        let full = format!("{e}{}", reload_collateral(&steered, &both));
+        assert!(
+            full.contains("asked for `steer on → off` and it was NOT applied")
+                && full.contains("a rollback that did not happen"),
+            "a skipped rollback must be named, not left to be inferred from a message \
+             about a completeness gate: {full}"
+        );
+        assert!(
+            full.contains("eth4") && !full.contains("eth5"),
+            "and named precisely — eth5 did not move: {full}"
+        );
+        assert!(
+            full.contains("needs no restart"),
+            "and the way out must not read as another restart: {full}"
+        );
+
+        // THE RULE, asserted as a rule: this function sees two config
+        // structs. Every claim it made about a state it cannot observe
+        // became a review finding, in four separate rounds — so what the
+        // test pins is the ABSENCE of each, not just the presence of the
+        // replacement text.
+        //
+        // (1) The reload was not atomic across modules...
+        assert!(
+            full.contains("not atomic"),
+            "fast-path's half of the same edit went first; claiming a whole rollback sends \
+             the operator looking for something that did not happen: {full}"
+        );
+        assert!(
+            !full.contains("Nothing else in this reload was applied"),
+            "round 1's false claim: {full}"
+        );
+        // ...but ordering proves fast-path was ATTEMPTED first, not that
+        // it succeeded: the loader records a module failure and carries
+        // on, and `reconcile` is not transactional.
+        assert!(
+            full.contains("ATTEMPTED") && !full.contains("ALREADY taken effect"),
+            "round 3's false claim — the eBPF tier's state is fast-path's result to \
+             report, not ours to assert: {full}"
+        );
+        // ...and it is a CONDITIONAL, because the module holds a live
+        // allowlist handle with no previous snapshot: it cannot know
+        // whether `allow-prefix` changed at all. A reload touching only a
+        // restart-only directive introduced no split, and sending that
+        // operator to hunt a divergence is the same over-claim once more.
+        assert!(
+            full.contains("IF this reload also edited `allow-prefix`")
+                && full.contains("cannot tell you whether that is what happened"),
+            "round 5's false claim: the split-tier warning must be conditional and say why \
+             it cannot be more than that: {full}"
+        );
+        // (2) Where traffic is. `self.cfg` is deliberately left unmoved
+        // when a steer apply fails, and the supervisor keeps the want and
+        // installs on its own once its gate clears — so neither direction
+        // of the flag testifies about the NIC.
+        assert!(
+            !full.contains("still on VPP") && !full.contains("nothing was diverted"),
+            "round 2's false claims, in opposite directions: {full}"
+        );
+        // (3) Whether the clean retry will even be admitted. It is gated
+        // by `State::accepts_steering_changes`, and the excluded set
+        // includes the deferred adopted resync this directive's remedy is
+        // read in — so promising an immediate rollback there walks the
+        // operator into the same failed rollback twice.
+        assert!(
+            !full.contains("applies immediately"),
+            "round 4's false claim: the retry is still subject to the admission gate: \
+             {full}"
+        );
+        assert!(
+            full.contains("REFUSED from a resync or backoff state"),
+            "and the gate must be named, since the state the remedy is read in is inside \
+             it: {full}"
+        );
+        // Every one of those defers to a surface that CAN observe the
+        // answer. Naming it is this text's job; predicting it is not.
+        assert!(
+            full.contains("packetframe status") && full.contains("packetframe reconfigure"),
+            "the message must name the surfaces that know what it does not: {full}"
+        );
+
+        // The unconditional half covers the allowlist, which this module
+        // cannot diff — it holds a live handle, so there is no previous
+        // list to compare against.
+        assert!(
+            full.contains("allow-prefix"),
+            "an allowlist edit in the same file is named too: {full}"
+        );
+
+        // And no crying wolf: a restart-only refusal with no lever
+        // movement must not claim a rollback was skipped. Otherwise the
+        // sentence appears on every `expected-routes` edit and stops
+        // being read.
+        let mut sizing = steered.clone();
+        sizing.expected_routes = 2_000_000;
+        let quiet = reload_collateral(&steered, &sizing);
+        assert!(
+            !quiet.contains("steer on → off"),
+            "no lever moved, so nothing was rolled back: {quiet}"
+        );
+        assert!(
+            quiet.contains("allow-prefix"),
+            "but the general statement still holds: {quiet}"
+        );
+
+        // A port added or removed by the same edit must not read as a
+        // lever move. Matching by position rather than by interface is
+        // how a reordered list manufactures one.
+        let reordered = cfg(&[("eth5", 1, true), ("eth4", 1, true)], 1_600_000);
+        let swapped = reload_collateral(&steered, &reordered);
+        assert!(
+            !swapped.contains("steer on"),
+            "reordering moved no lever: {swapped}"
+        );
     }
 
     /// Everything VPP fixes at start is refused, and says which knob and

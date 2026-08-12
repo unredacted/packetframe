@@ -315,8 +315,9 @@ impl Completeness {
                 "the route mirror holds {mirror} routes but the authority reports only \
                  {authority} — that is not the authority feeding this mirror. Check which \
                  bird `birdc` is talking to; on a box whose routes come from elsewhere, \
-                 `require-table-complete off` is the right answer — but it takes effect at \
-                 the next bring-up, so the daemon has to be restarted for it, not reloaded"
+                 `require-table-complete off` is the right answer — but it is read once at \
+                 bring-up, so the daemon has to be RESTARTED for it. A reload is refused by \
+                 name rather than accepted and ignored, so there is nothing to try first"
             ),
             Completeness::Stale { age } => format!(
                 "the last completeness check was {}s ago, too old to act on",

@@ -661,9 +661,10 @@ impl StatusSnapshot {
                          (within 300 s) still reports one, it is real. Then: check which \
                          bird `birdc` is talking to on THIS box; where the routes \
                          legitimately come from elsewhere, `require-table-complete off` is \
-                         the right answer — but it is read at bring-up, so it needs a \
-                         daemon RESTART, and a reload will not do it (from here a reload \
-                         is refused outright). The adopted FIB keeps forwarding untouched \
+                         the right answer — but it is read once at bring-up, so it needs a \
+                         daemon RESTART. A reload is refused by name and says so, so there \
+                         is nothing to try first and nothing that silently carries the old \
+                         gate forward. The adopted FIB keeps forwarding untouched \
                          meanwhile, and every steering change is refused while this holds"
                     )
                 } else if self.authority == AuthorityPosture::AwaitingAuthority {
@@ -2603,16 +2604,24 @@ mod tests {
             vetoed.contains("CONFIRM BEFORE ACTING"),
             "a single sample must not send an operator to restart anything: {vetoed}"
         );
-        // The opt-out it recommends is read at bring-up, and
+        // The opt-out it recommends is read once at bring-up, and
         // `reconfigure` never installs or removes the completeness
-        // handle — so recommending it without saying RESTART sends an
-        // operator to edit a file and reload into no change at all,
-        // from a state where the reload is refused anyway (review
-        // finding).
+        // handle — so recommending it without saying RESTART sent an
+        // operator to edit a file and reload into no change at all
+        // (review finding). The reload now refuses the change by name
+        // (`VppOffloadConfig::restart_only_delta`), which is why the
+        // line can promise there is nothing to try first; if that
+        // refusal is ever removed, this text becomes a lie and this
+        // assertion is the tripwire.
         assert!(
             vetoed.contains("RESTART"),
             "recommending `require-table-complete off` without saying it needs a restart \
              is a remedy that silently does nothing: {vetoed}"
+        );
+        assert!(
+            vetoed.contains("reload is refused"),
+            "and it must say the reload refuses rather than leaving a plausible cheaper \
+             thing to try: {vetoed}"
         );
 
         // The permitting posture keeps the quiescence wording, so this
