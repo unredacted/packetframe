@@ -1142,6 +1142,7 @@ carrying that traffic; VPP still is.
   | `drift N%, at or above the M% warn threshold` | Real disagreement. The gate reads the same comparison and will refuse. |
   | `bird reports NO routes in master4/master6` | The degenerate authority: bird up, carrying none of this mirror's table. This is the 23 h deferral above. |
   | `could not complete: <error>` with `HISTORY` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
+  | `NOT evidence for a rollout ... reads this same report as Stale` | The comparison has aged past the 900 s window the gate acts within. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
   | no `fib-integrity` row at all | Nothing is checking on this box — kernel-fib mode, or a control plane with no route source. The authority will read `Absent`. |
 
   The row appears whenever a checker exists, *including before its
@@ -1159,6 +1160,14 @@ carrying that traffic; VPP still is.
   with **no** error alongside it means checks have stopped landing
   altogether rather than failing — look for the checker task, not for
   bird.
+
+  You do not have to watch that number to stay safe. At `STEER_MAX_REPORT_AGE`
+  (900 s) the row stops reporting agreement on its own and says so, on
+  the same constant and the same `>` the steering gate applies — so the
+  row and the gate flip together, and `status` cannot advertise the
+  evidence for a rollout the gate is already refusing. A parity test
+  pins the two. Reading the age is for catching the problem in the
+  ~10 minutes before that, not for avoiding a bad rollout.
 
   **The other positive evidence is the canary steer itself**, and it
   costs nothing to lean on. With `require-table-complete on`, a steer

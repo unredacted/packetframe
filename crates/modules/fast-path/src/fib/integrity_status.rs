@@ -325,6 +325,39 @@ impl IntegrityPosture {
             "bird {} routes, mirror {}",
             s.bird_routes, s.packetframe_routes
         );
+        // Age first, and against the consumer's own constant rather than
+        // a second copy of the number — for exactly the reason
+        // `packetframe_common::fib::assess` gives for checking it first:
+        // "a report whose drift looks fine but which predates anything
+        // we care about is not evidence, and reporting its drift would
+        // invite acting on it."
+        //
+        // Without this the row was the *inverse* of useful. A checker
+        // task that stalls or exits after one good comparison stops
+        // advancing `last_run` and records no error, so neither age
+        // affected the verdict and the row went on printing "the
+        // positive evidence a rollout needs" forever — while `assess`,
+        // reading the same comparison through the completeness handle,
+        // had already called it `Stale` and was refusing the steer. A
+        // status surface that contradicts the gate it exists to predict
+        // is worse than the silence it replaced (review finding).
+        //
+        // The drift is deliberately NOT printed here. It is the number
+        // an operator would act on, and it is precisely what has expired.
+        if s.age > packetframe_common::fib::STEER_MAX_REPORT_AGE {
+            return (
+                HealthState::Degraded,
+                format!(
+                    "{counts} — but that comparison is {:.0}s old, past the {:.0}s window a \
+                     steering gate acts within, so it is NOT evidence for a rollout: the gate \
+                     reads this same report as `Stale` and refuses. Comparisons have stopped \
+                     landing; where no error is reported alongside this, they are not even \
+                     being attempted, so look at the daemon's checker task rather than at bird",
+                    s.age.as_secs_f64(),
+                    packetframe_common::fib::STEER_MAX_REPORT_AGE.as_secs_f64()
+                ),
+            );
+        }
         match s.drift {
             Some(d) if d.above => (
                 HealthState::Degraded,
@@ -479,6 +512,77 @@ mod tests {
             !m.contains("drift 0"),
             "a zero authority must not read as agreement: {m}"
         );
+    }
+
+    /// A comparison that has aged out is not evidence, however well the
+    /// two counts agreed when it was taken. Without this the row printed
+    /// "the positive evidence a rollout needs" indefinitely after the
+    /// checker task stopped, because nothing recorded an error and no
+    /// age fed the verdict.
+    #[test]
+    fn stale_sample_does_not_read_as_agreement() {
+        let at = t0();
+        let snap = clean_run(at, 1_272_306, 1_272_281, drift(0.0000196, 0.01));
+        let stale = IntegrityPosture::observe(
+            &snap,
+            at + packetframe_common::fib::STEER_MAX_REPORT_AGE + Duration::from_secs(1),
+        )
+        .subsystem_health();
+        assert_eq!(stale.state, HealthState::Degraded);
+        let m = stale.message.unwrap();
+        assert!(m.contains("NOT evidence for a rollout"), "{m}");
+        assert!(m.contains("`Stale`"), "{m}");
+        // The drift is what an operator would act on, and it is what has
+        // expired. `assess` withholds it for the same reason.
+        assert!(!m.contains("within the"), "expired drift still shown: {m}");
+        // Still a real completed comparison, so its age is still
+        // reported — that number is the whole diagnosis here.
+        assert_eq!(
+            stale.last_success_age_seconds,
+            Some(packetframe_common::fib::STEER_MAX_REPORT_AGE.as_secs() + 1)
+        );
+    }
+
+    /// The row and the gate must flip at the same instant. They read the
+    /// same comparison — the checker publishes it to both — so a status
+    /// surface that says "proceed" while `assess` says `Stale` is worse
+    /// than no surface at all. Pinned to the consumer's own constant, so
+    /// changing one side without the other fails here.
+    #[test]
+    fn freshness_window_matches_the_steering_gate() {
+        use packetframe_common::fib::{
+            assess, Completeness, CompletenessReport, STEER_MAX_DRIFT, STEER_MAX_REPORT_AGE,
+        };
+        let at = t0();
+        // Drift far below either threshold, so age is the only variable.
+        let snap = clean_run(at, 1_000_000, 1_000_000, drift(0.0, 0.01));
+        let report = CompletenessReport {
+            authority_routes: 1_000_000,
+            mirror_routes: 1_000_000,
+            at,
+        };
+        for offset in [
+            Duration::from_secs(0),
+            STEER_MAX_REPORT_AGE - Duration::from_secs(1),
+            STEER_MAX_REPORT_AGE,
+            STEER_MAX_REPORT_AGE + Duration::from_secs(1),
+            STEER_MAX_REPORT_AGE * 3,
+        ] {
+            let now = at + offset;
+            let row_says_go = IntegrityPosture::observe(&snap, now)
+                .subsystem_health()
+                .state
+                == HealthState::Healthy;
+            let gate_says_go = matches!(
+                assess(Some(report), now, STEER_MAX_DRIFT, STEER_MAX_REPORT_AGE),
+                Completeness::Converged { .. }
+            );
+            assert_eq!(
+                row_says_go, gate_says_go,
+                "row and gate disagree at age {offset:?}: status healthy={row_says_go}, \
+                 gate converged={gate_says_go}"
+            );
+        }
     }
 
     #[test]
