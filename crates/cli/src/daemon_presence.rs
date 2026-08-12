@@ -320,12 +320,18 @@ fn decide_from_record(
         // stops an unprivileged writer naming a victim pid here.
         //
         // Deliberately NOT also requiring an executable match. The
-        // ownership check already closes that attack (an unprivileged
-        // user cannot create a root-owned file), and demanding the exe
+        // ownership check already closes that attack — an unprivileged
+        // user cannot create a root-owned file — and demanding the exe
         // as well would refuse a daemon deployed under a different
-        // binary NAME — a legitimate packaging choice — for no gain
-        // against an attacker who cannot get past the file check
-        // anyway.
+        // binary NAME for no gain against an attacker who cannot get
+        // past the file check anyway.
+        //
+        // That claim about renamed binaries was inconsistent with the
+        // scan, which required an exactly equal filename and so missed
+        // the daemon it exists to find (review finding). The scan now
+        // accepts a versioned sibling; a name sharing no prefix is
+        // found by this record and by nothing else, which is why the
+        // record path may not add an executable requirement on top.
         DaemonPresence::Running { pid }
     } else if exe_matches {
         // Not the recorded process, but a daemon nonetheless — which is

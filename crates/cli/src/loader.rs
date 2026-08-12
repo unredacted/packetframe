@@ -1063,8 +1063,23 @@ fn proc_exe_looks_like_a_daemon(pid: libc::pid_t) -> bool {
     // is the state an upgraded-in-place daemon is in.
     let target = target.to_string_lossy();
     let target = target.strip_suffix(" (deleted)").unwrap_or(&target);
+    // Equal names, or a versioned sibling: `packetframe-v2` alongside
+    // `packetframe-v1` is a real packaging shape, and the identity path
+    // says elsewhere that a renamed binary is legitimate — so a scan
+    // that demanded exact equality contradicted it, and missed the
+    // daemon it exists to find (review finding).
+    //
+    // The residual limit, stated rather than papered over: a daemon
+    // deployed under a name sharing no prefix with ours is NOT found
+    // here. Nothing short of trusting argv could find it, and argv is
+    // what the May 2026 audit rejected — any local process could then
+    // block `detach` at will. The pid record is what covers that case;
+    // this scan is the backstop for when there is none.
     match (Path::new(target).file_name(), current.as_path().file_name()) {
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+            a == b || (a.starts_with("packetframe") && b.starts_with("packetframe"))
+        }
         _ => false,
     }
 }
@@ -1769,6 +1784,24 @@ fn print_module_health(state_dir: &Path) {
         // Neither shown. Saying "gone" here is what printed STALE over
         // a live daemon on the shadow (2026-08-12), because the check
         // asked whether the daemon ran this CLI's own binary.
+        // The record could not answer, but the SNAPSHOT can: it carries
+        // the publisher's own identity, and a match proves that exact
+        // process is running. Reachable whenever the pid record is
+        // missing or stale — a non-fatal write failure, or a
+        // replacement that has attached but not yet rewritten it — and
+        // without this the report reads CANNOT CONFIRM for that
+        // daemon's whole lifetime while the proof sits in the file
+        // being printed (review finding).
+        crate::daemon_presence::DaemonPresence::Unknown { .. }
+            if snapshot_matches_live(&snapshot) =>
+        {
+            println!(
+                "module health (pid {}, {age}) — confirmed by the report's own recorded \
+                 identity; the pid record is missing or stale, which `packetframe detach` \
+                 will refuse on until it is resolved.",
+                snapshot.pid
+            )
+        }
         crate::daemon_presence::DaemonPresence::Unknown { why } => println!(
             "module health (pid {}, {age}) — CANNOT CONFIRM the daemon is still running \
              ({why}). Read the report as possibly historical until it can be checked.",
