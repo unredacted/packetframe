@@ -369,6 +369,13 @@ pub enum ModuleDirective {
     /// when this is set and `forwarding-mode` is `custom-fib` or
     /// `compare`. See [`RouteSourceSpec`] for the per-kind shape.
     RouteSource(RouteSourceSpec),
+    /// Which authority the integrity checker cross-checks the mirror
+    /// against — the thing that decides whether "the mirror disagrees
+    /// with the RIB" is a real alarm or a comparison against the wrong
+    /// reference. See [`IntegrityAuthoritySpec`]. Absent ⇒ `Birdc` with
+    /// the default path, which is the fleet's shape and preserves
+    /// every existing config.
+    IntegrityAuthority(IntegrityAuthoritySpec),
     /// Max entries for the custom-FIB LPM tries and side arrays.
     /// Accepted but **not yet runtime-applied**, aya / kernel
     /// allocate maps at compile-time sizes set in
@@ -435,6 +442,43 @@ impl FromStr for ForwardingMode {
 /// declare an `IpNet` ACL via one or more `peer-from <cidr>` sub-
 /// keywords. The BGP variant additionally accepts `peer-ip <ip>`
 /// to pin the configured `peer-as` to a specific source address.
+/// What the integrity checker treats as the authority for the mirror.
+///
+/// The checker compares packetframe's FIB mirror against an authority
+/// and calls the difference "drift". The only authority it ever knew
+/// was a local `birdc`, hardcoded — which is correct on a box whose own
+/// bird feeds the mirror, and simply wrong on a box fed from somewhere
+/// else. The shadow is the second kind: its route source is the
+/// PRIMARY's bird dialing in over TCP, so the local bird holds 19
+/// prefixes while the mirror holds 1.3M, and every check reported a
+/// 6.8-million-percent "drift" against a RIB that was never the feed.
+///
+/// So the authority is now a stated deployment fact rather than a
+/// guess. It is deliberately NOT inferred from the route-source address
+/// (loopback-vs-remote), because that is the same correlation-for-fact
+/// substitution that produced the bug: the operator knows which daemon
+/// feeds the box; make them say it.
+///
+/// Two authorities exist today, and the roadmap has two more that need
+/// no external process and work with any BGP daemon — **feed
+/// accounting** (the listener's own live-prefix count against the
+/// mirror) and **BMP stats reports** (RFC 7854 Loc-RIB counts in-band).
+/// Neither is built; the enum is left open for them rather than shimmed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum IntegrityAuthoritySpec {
+    /// A local `birdc` is the authority. `None` path ⇒ the default
+    /// (`/usr/sbin/birdc`). This is the value assumed when the directive
+    /// is absent, so the fleet's existing configs behave unchanged.
+    Birdc { path: Option<PathBuf> },
+    /// Nothing local can attest completeness: the mirror is fed from a
+    /// route source elsewhere, so no comparison is run. The
+    /// `fib-integrity` row reports this as informational rather than an
+    /// alarm, and the second tier treats the mirror as unattested —
+    /// which is why `require-table-complete on` is refused alongside it,
+    /// there being no authority for it to require.
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum RouteSourceSpec {
     /// BMP station listen address. Bird dials out to this
@@ -1047,6 +1091,42 @@ impl Config {
                  its allowlist; the eBPF path is the failover tier)",
             ));
         };
+
+        // `require-table-complete on` demands a completeness authority,
+        // and `integrity-authority none` declares there is none. The two
+        // together are a config that can never permit a first steer: the
+        // gate waits for an attestation nothing will ever produce. Caught
+        // here rather than discovered as a canary that defers forever
+        // (the shadow's 23 h, in the shape an operator could actually
+        // configure by accident). `require-table-complete` defaults ON,
+        // so this fires whenever `integrity-authority none` is set on a
+        // steering box without an explicit `off`.
+        let require_complete = vpp
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::VppRequireTableComplete(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(true);
+        let authority_is_none = fast_path.is_some_and(|fp| {
+            fp.directives.iter().any(|d| {
+                matches!(
+                    d,
+                    ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::None)
+                )
+            })
+        });
+        if require_complete && authority_is_none {
+            return Err(ConfigError::parse(
+                0,
+                "module vpp-offload has `require-table-complete on` (the default) but module \
+                 fast-path has `integrity-authority none`: there is no authority to attest \
+                 completeness, so the first steer would defer forever. Either name an \
+                 authority (`integrity-authority birdc`) or opt the gate out \
+                 (`require-table-complete off`)",
+            ));
+        }
 
         let any_steer = ports.iter().any(|(_, steer, _)| *steer);
         if !any_steer {
@@ -1896,6 +1976,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::ForwardingMode(mode))
         }),
         "route-source" => parse_route_source(line, rest),
+        "integrity-authority" => parse_integrity_authority(line, rest),
         "fib-v4-max-entries" => parse_u32_directive(line, rest, "fib-v4-max-entries", |n| {
             ModuleDirective::FibSize(FibSizeDirective::FibV4MaxEntries(n))
         }),
@@ -1973,6 +2054,48 @@ where
         ));
     }
     Ok(wrap(n))
+}
+
+/// Parse `integrity-authority <birdc [path] | none>`.
+///
+/// `birdc` with no path uses the default; `birdc /some/birdc` overrides
+/// it. `none` declares that no local authority attests this mirror. See
+/// [`IntegrityAuthoritySpec`] for why this is a stated fact rather than
+/// something inferred from the route source.
+fn parse_integrity_authority<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    let kind = rest.next().ok_or_else(|| {
+        ConfigError::parse(
+            line,
+            "integrity-authority requires `birdc [path]` or `none`",
+        )
+    })?;
+    let spec = match kind {
+        "birdc" => {
+            let path = match rest.next() {
+                Some(raw) => Some(validate_safe_path(line, "integrity-authority birdc", raw)?),
+                None => None,
+            };
+            IntegrityAuthoritySpec::Birdc { path }
+        }
+        "none" => IntegrityAuthoritySpec::None,
+        other => {
+            return Err(ConfigError::parse(
+                line,
+                format!("integrity-authority expects `birdc [path]` or `none`, got `{other}`"),
+            ))
+        }
+    };
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(
+            line,
+            "integrity-authority takes at most `birdc <path>` — extra arguments are not \
+             allowed",
+        ));
+    }
+    Ok(ModuleDirective::IntegrityAuthority(spec))
 }
 
 /// Parse `route-source <kind> <args...>`. Two kinds supported:
@@ -2767,6 +2890,81 @@ module fast-path
         assert!(Config::parse("module fast-path\n  fdb-pin maybe\n").is_err());
         assert!(Config::parse("module fast-path\n  fdb-pin\n").is_err());
         assert!(Config::parse("module fast-path\n  fdb-pin auto extra\n").is_err());
+    }
+
+    #[test]
+    fn integrity_authority_parses() {
+        let birdc_default = Config::parse("module fast-path\n  integrity-authority birdc\n")
+            .unwrap()
+            .modules[0]
+            .directives[0]
+            .clone();
+        assert_eq!(
+            birdc_default,
+            ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Birdc { path: None })
+        );
+
+        let birdc_path =
+            Config::parse("module fast-path\n  integrity-authority birdc /opt/bird/birdc\n")
+                .unwrap()
+                .modules[0]
+                .directives[0]
+                .clone();
+        assert!(matches!(
+            birdc_path,
+            ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Birdc { path: Some(_) })
+        ));
+
+        let none = Config::parse("module fast-path\n  integrity-authority none\n")
+            .unwrap()
+            .modules[0]
+            .directives[0]
+            .clone();
+        assert_eq!(
+            none,
+            ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::None)
+        );
+
+        for bad in [
+            "module fast-path\n  integrity-authority\n",
+            "module fast-path\n  integrity-authority bmp\n",
+            "module fast-path\n  integrity-authority none extra\n",
+            "module fast-path\n  integrity-authority birdc /a /b\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    /// `require-table-complete on` + `integrity-authority none` is a
+    /// config that can never permit a first steer, so it is refused at
+    /// load rather than discovered as a canary that defers forever.
+    #[test]
+    fn require_table_complete_needs_an_authority() {
+        let base = "module fast-path\n  forwarding-mode custom-fib\n  \
+                    route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1\n  \
+                    integrity-authority none\n\
+                    module vpp-offload\n  loopback-address 192.0.2.1/32\n  \
+                    port eth1 cores 1 steer off\n";
+
+        // `require-table-complete` defaults ON, so the bare config is
+        // already the conflict.
+        let cfg = Config::parse(base).unwrap();
+        let err = cfg.validate_vpp_offload().unwrap_err();
+        assert!(
+            format!("{err}").contains("no authority to attest completeness"),
+            "{err}"
+        );
+
+        // Opting the gate out resolves it.
+        let ok = base.replace(
+            "port eth1 cores 1 steer off\n",
+            "port eth1 cores 1 steer off\n  require-table-complete off\n",
+        );
+        Config::parse(&ok).unwrap().validate_vpp_offload().unwrap();
+
+        // Naming an authority resolves it too.
+        let ok2 = base.replace("integrity-authority none\n", "integrity-authority birdc\n");
+        Config::parse(&ok2).unwrap().validate_vpp_offload().unwrap();
     }
 
     #[test]

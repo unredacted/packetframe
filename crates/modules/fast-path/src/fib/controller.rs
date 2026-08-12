@@ -37,6 +37,7 @@ use crate::fib::netlink_neigh::{
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
 use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
 use crate::fib::route_source_bmp::BmpStation;
+use packetframe_common::config::IntegrityAuthoritySpec;
 
 /// Forwarding-feed source. The controller spawns at most one route
 /// source: operators pick `bmp` or `bgp` via `route-source ...`.
@@ -113,8 +114,31 @@ pub struct RouteController {
     neigh_handle: NeighborResolveHandle,
     prog_handle: FibProgrammerHandle,
     /// Shared snapshot from the integrity checker. `None` when the
-    /// checker isn't enabled (no BMP configured → no bird to ask).
+    /// checker isn't enabled (no route source → no bird to ask, or
+    /// `integrity-authority none` → nothing local to ask).
     integrity: Option<SharedSnapshot>,
+    /// The operator declared `integrity-authority none`: there is a
+    /// route source but no local authority for the mirror, so no
+    /// comparison runs. Distinct from `integrity: None` with no route
+    /// source, because the health surface says something different —
+    /// "not attested by choice" versus "nothing to attest".
+    authority_declared_none: bool,
+}
+
+/// The external route feed and the authority the integrity checker
+/// validates the resulting mirror against. One struct because they are
+/// two halves of one decision — where the routes come from, and what
+/// counts as the truth to check them against — and pairing them keeps
+/// `start()` under the argument-count lint (which only the cross-clippy
+/// job sees, since this file is `cfg(target_os = "linux")`).
+pub struct RouteFeed {
+    /// `Some(...)` when `route-source bmp|bgp ...` was configured;
+    /// `None` runs without a live feed (test harnesses).
+    pub source: Option<RouteSourceConfig>,
+    /// Which authority the integrity checker cross-checks against. See
+    /// [`IntegrityAuthoritySpec`]; absent in config ⇒ `Birdc` default,
+    /// resolved by the caller.
+    pub integrity_authority: IntegrityAuthoritySpec,
 }
 
 /// The handles a second forwarding tier registers before attach — how
@@ -140,13 +164,17 @@ impl RouteController {
     /// programmer directly via its `FibProgrammerHandle`.
     pub fn start(
         bpffs_root: &Path,
-        route_source: Option<RouteSourceConfig>,
+        feed: RouteFeed,
         local_prefixes: Vec<LocalPrefixSpec>,
         fallback_default: Option<FallbackDefaultSpec>,
         fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
         route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
         signals: SecondTierSignals,
     ) -> Result<Self, ControllerError> {
+        let RouteFeed {
+            source: route_source,
+            integrity_authority,
+        } = feed;
         let SecondTierSignals {
             completeness,
             feed_session,
@@ -242,18 +270,31 @@ impl RouteController {
                 peer_acl,
             }) => {
                 let snapshot = shared_snapshot();
-                let mut checker = IntegrityChecker::new(
-                    IntegrityConfig::default(),
-                    snapshot.clone(),
-                    prog_handle.clone(),
-                    shutdown_token.clone(),
-                );
-                // The second tier's steering gate reads what this
-                // publishes; see `TableCompleteness`.
-                if let Some(h) = completeness.clone() {
-                    checker = checker.with_completeness(h);
+                // Spawn the checker only when a LOCAL authority is named.
+                // `integrity-authority none` still allocates the snapshot
+                // (the BMP stall gate reads it) but runs no comparison:
+                // there is no local RIB that is this mirror's authority,
+                // so a birdc comparison would be against the wrong
+                // reference — the 6.8-million-percent "drift" the shadow
+                // reported for months.
+                if let IntegrityAuthoritySpec::Birdc { path } = &integrity_authority {
+                    let mut icfg = IntegrityConfig::default();
+                    if let Some(p) = path {
+                        icfg.birdc_path = p.clone();
+                    }
+                    let mut checker = IntegrityChecker::new(
+                        icfg,
+                        snapshot.clone(),
+                        prog_handle.clone(),
+                        shutdown_token.clone(),
+                    );
+                    // The second tier's steering gate reads what this
+                    // publishes; see `TableCompleteness`.
+                    if let Some(h) = completeness.clone() {
+                        checker = checker.with_completeness(h);
+                    }
+                    tasks.push(runtime.spawn(async move { checker.run().await }));
                 }
-                tasks.push(runtime.spawn(async move { checker.run().await }));
 
                 // v0.2.2: spawn under a retry-with-backoff loop. Pre-fix,
                 // a `bind` failure (TIME_WAIT after a quick restart) would
@@ -314,18 +355,31 @@ impl RouteController {
                 expected_peer_ip,
             }) => {
                 let snapshot = shared_snapshot();
-                let mut checker = IntegrityChecker::new(
-                    IntegrityConfig::default(),
-                    snapshot.clone(),
-                    prog_handle.clone(),
-                    shutdown_token.clone(),
-                );
-                // The second tier's steering gate reads what this
-                // publishes; see `TableCompleteness`.
-                if let Some(h) = completeness.clone() {
-                    checker = checker.with_completeness(h);
+                // Spawn the checker only when a LOCAL authority is named.
+                // `integrity-authority none` still allocates the snapshot
+                // (the BMP stall gate reads it) but runs no comparison:
+                // there is no local RIB that is this mirror's authority,
+                // so a birdc comparison would be against the wrong
+                // reference — the 6.8-million-percent "drift" the shadow
+                // reported for months.
+                if let IntegrityAuthoritySpec::Birdc { path } = &integrity_authority {
+                    let mut icfg = IntegrityConfig::default();
+                    if let Some(p) = path {
+                        icfg.birdc_path = p.clone();
+                    }
+                    let mut checker = IntegrityChecker::new(
+                        icfg,
+                        snapshot.clone(),
+                        prog_handle.clone(),
+                        shutdown_token.clone(),
+                    );
+                    // The second tier's steering gate reads what this
+                    // publishes; see `TableCompleteness`.
+                    if let Some(h) = completeness.clone() {
+                        checker = checker.with_completeness(h);
+                    }
+                    tasks.push(runtime.spawn(async move { checker.run().await }));
                 }
-                tasks.push(runtime.spawn(async move { checker.run().await }));
 
                 // v0.2.2: same retry-with-backoff pattern as BmpStation
                 // above. See that comment for rationale.
@@ -410,6 +464,10 @@ impl RouteController {
             neigh_handle,
             prog_handle,
             integrity,
+            authority_declared_none: matches!(
+                integrity_authority,
+                packetframe_common::config::IntegrityAuthoritySpec::None
+            ),
         })
     }
 
@@ -434,6 +492,15 @@ impl RouteController {
     /// losing the race is vanishingly rare and says so when it happens
     /// rather than being mistaken for "no check yet".
     pub fn integrity_posture(&self) -> Option<IntegrityPosture> {
+        // `integrity-authority none`: a route source exists but no local
+        // authority attests it, so there is a checker-shaped hole to
+        // explain rather than a comparison to read. Reported as its own
+        // posture — informational, not an alarm — because silence here
+        // would read as "checker crashed", and a birdc comparison would
+        // be against the wrong RIB.
+        if self.authority_declared_none {
+            return Some(IntegrityPosture::NoAuthority);
+        }
         let snapshot = self.integrity.as_ref()?;
         Some(match snapshot.try_read() {
             Ok(snap) => IntegrityPosture::observe(&snap, Instant::now()),

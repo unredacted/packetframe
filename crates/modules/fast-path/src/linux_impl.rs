@@ -1530,6 +1530,21 @@ pub fn attach(
             }
             _ => None,
         });
+        // Which authority the integrity checker cross-checks against.
+        // Absent ⇒ `Birdc` with the default path, so every existing
+        // config behaves exactly as before; `none` declares this box has
+        // no local authority (the mirror is fed from elsewhere) and the
+        // checker does not run a comparison it knows is against the wrong
+        // RIB.
+        let integrity_authority = cfg
+            .section
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::IntegrityAuthority(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .unwrap_or(packetframe_common::config::IntegrityAuthoritySpec::Birdc { path: None });
         // v0.2.1: collect operator-declared `local-prefix` directives
         // and pass them to the controller. Empty list = feature off
         // (back-compat with v0.2.0 configs that never had this).
@@ -1632,7 +1647,10 @@ pub fn attach(
         };
         let ctrl = crate::fib::controller::RouteController::start(
             &state.bpffs_root,
-            route_source,
+            crate::fib::controller::RouteFeed {
+                source: route_source,
+                integrity_authority,
+            },
             local_prefixes,
             fallback_default,
             fdb_pin_chains,

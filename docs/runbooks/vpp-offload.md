@@ -1186,12 +1186,20 @@ carrying that traffic; VPP still is.
   | --- | --- |
   | `would permit a steer` | Agreement. Proceed. |
   | `no comparison has completed yet` | The checker has not reached its first interval, or has only just started. **Not agreement** — wait 300 s and read it again. |
-  | `REFUSES: the route mirror holds N of the authority's M routes` | The mirror is short — usually still loading. |
-  | `REFUSES: ... that is not the authority feeding this mirror` | The 23 h deferral above: bird up, carrying a table that is not this one. |
-  | `REFUSES: completeness is unknown: the authority reports zero routes` | The degenerate form of the same thing — bird answering, and answering nothing. |
-  | `REFUSES: the last completeness check was Ns ago, too old to act on` | Aged past the 900 s window. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
+  | `no integrity authority on this box (integrity-authority none)` | The operator declared this box is fed from elsewhere, so nothing local attests the mirror. Informational, **not** a pass and **not** an alarm — a steering gate treats the mirror as unattested, which is only valid with `require-table-complete off`. This is the shadow's correct state. |
+  | `would refuse: the route mirror holds N of the authority's M routes` | The mirror is short — usually still loading. |
+  | `... mismatch, not a drift ... would refuse: ... that is not the authority feeding this mirror` | Bird up, carrying a table that is not this one — the 23 h deferral above. If this box is *meant* to be fed from elsewhere, set `integrity-authority none` and it becomes the informational row above rather than a false alarm. |
+  | `would refuse: completeness is unknown: the authority reports zero routes` | The degenerate form of the same thing — bird answering, and answering nothing. |
+  | `would refuse: the last completeness check was Ns ago, too old to act on` | Aged past the 900 s window. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
   | `could not complete: <error>` with `HISTORY` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
   | no `fib-integrity` row at all | Nothing is checking on this box — kernel-fib mode, or a control plane with no route source. The authority will read `Absent`. |
+
+  > The verdict is **subjunctive** — "would permit" / "would refuse" —
+  > because it predicts what a steer would do from this comparison, not
+  > something that has happened. On a `require-table-complete off` box no
+  > gate consults it at all; the row still tells you what one *would*
+  > decide, which is exactly the pre-flight signal you want before
+  > turning the gate on.
 
   The row appears whenever a checker exists, *including before its
   first comparison*, and that is the distinction the check turns on:

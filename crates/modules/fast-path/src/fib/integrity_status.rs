@@ -193,6 +193,13 @@ impl Sample {
 /// the first two must never print the same line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IntegrityPosture {
+    /// `integrity-authority none`: the operator declared this box has no
+    /// local authority for the mirror (it is fed from a route source
+    /// elsewhere), so no comparison runs. Informational, not an alarm —
+    /// the checker is not broken, it is correctly not guessing. The
+    /// second tier treats the mirror as unattested, which is why
+    /// `require-table-complete on` is refused alongside this at load.
+    NoAuthority,
     /// The checker is running and no check has finished yet. **Not
     /// agreement** — nothing has compared bird against the mirror.
     AwaitingFirstCheck,
@@ -250,6 +257,21 @@ impl IntegrityPosture {
     /// The row `packetframe status` prints.
     pub fn subsystem_health(&self) -> SubsystemHealth {
         let (state, message) = match self {
+            Self::NoAuthority => (
+                // Healthy: this is a stated deployment fact, not a
+                // fault. The box's routes come from a source elsewhere,
+                // so nothing local can attest the mirror — and the
+                // checker correctly does not compare against a RIB that
+                // is not the feed.
+                HealthState::Healthy,
+                "no integrity authority on this box (`integrity-authority none`): its routes \
+                 are fed from a source elsewhere, so a local birdc would compare the mirror \
+                 against the wrong RIB. No comparison is run and completeness is not \
+                 attested here — a second-tier steering gate treats the mirror as \
+                 unattested, which is why `require-table-complete on` is refused with this \
+                 setting"
+                    .to_string(),
+            ),
             Self::AwaitingFirstCheck => (
                 // Healthy: forwarding does not depend on this. The
                 // checker is a diagnostic safety net, and a box that has
@@ -291,7 +313,7 @@ impl IntegrityPosture {
     fn last_success_age(&self) -> Option<u64> {
         match self {
             Self::Checked { sample, .. } => sample.map(|s| s.age().as_secs()),
-            Self::AwaitingFirstCheck | Self::Unread => None,
+            Self::NoAuthority | Self::AwaitingFirstCheck | Self::Unread => None,
         }
     }
 
@@ -396,34 +418,52 @@ impl IntegrityPosture {
             s.bird_prefixes, s.packetframe_prefixes
         );
 
-        let diagnostic = match s.drift {
-            Some(d) => {
-                if d.above {
-                    state = state.worse_of(HealthState::Degraded);
+        let gate = s.gate_verdict();
+
+        // The drift PERCENTAGE is only worth printing when it is a
+        // drift. When the authority is at fault — the mirror holds far
+        // more than the authority claims, or the authority claims zero —
+        // `|bird - mirror| / bird` is the 6.8-million-percent figure the
+        // domain code explicitly decided not to print (see
+        // `Completeness::AuthorityMismatch`), and leading with it buries
+        // the real explanation under noise. In that case the diagnostic
+        // states the mismatch and leaves the number to the gate verdict.
+        let diagnostic = if gate.authority_is_at_fault() {
+            state = state.worse_of(HealthState::Degraded);
+            "the mirror holds far more than the authority reports (or the authority reports \
+             none) — this is a mismatch, not a drift, so no percentage is meaningful"
+                .to_string()
+        } else {
+            match s.drift {
+                Some(d) => {
+                    if d.above {
+                        state = state.worse_of(HealthState::Degraded);
+                    }
+                    format!(
+                        "drift {:.3}%, {} the {:.3}% warn threshold",
+                        d.fraction * 100.0,
+                        if d.above { "at or above" } else { "within" },
+                        d.threshold * 100.0
+                    )
                 }
-                format!(
-                    "drift {:.3}%, {} the {:.3}% warn threshold",
-                    d.fraction * 100.0,
-                    if d.above { "at or above" } else { "within" },
-                    d.threshold * 100.0
-                )
+                None => "no drift fraction is defined: bird reports NO prefixes in \
+                         master4/master6, and a fraction of zero says nothing"
+                    .to_string(),
             }
-            // Not "no drift". A zero authority cannot attest anything,
-            // and it is a real and documented state — a box running a
-            // bird that carries none of the table the mirror is fed.
-            None => "no drift fraction is defined: bird reports NO prefixes in \
-                     master4/master6, and a fraction of zero says nothing"
-                .to_string(),
         };
 
-        let gate = s.gate_verdict();
+        // SUBJUNCTIVE, deliberately. This row predicts what a steer
+        // WOULD do from this comparison; it is not a refusal that has
+        // happened. "would permit" / "would refuse" is accurate whether
+        // or not a gate is even consulting the comparison on this box —
+        // and on a `require-table-complete off` box none is — where
+        // "REFUSES" reads as an action that never occurred. Same
+        // discipline that separated "the record is stale" from "the
+        // daemon is gone".
         let rollout = if gate.permits_steering() {
-            // No `describe()` here: on the converged path it only
-            // restates the drift already printed. Refusals keep it
-            // verbatim, where it carries the reason and the remedy.
-            "A steering gate reads this same comparison and would permit a steer — this is the \
-             positive evidence a rollout needs, and the counts behind it are bird's master4 plus \
-             master6 against the mirror's v4+v6"
+            "a second-tier steering gate reads this same comparison and would permit a steer \
+             — this is the positive evidence a rollout needs, and the counts behind it are \
+             bird's master4 plus master6 against the mirror's v4+v6"
                 .to_string()
         } else {
             state = state.worse_of(HealthState::Degraded);
@@ -431,7 +471,7 @@ impl IntegrityPosture {
             // steer itself, verbatim — including the staleness case,
             // which `assess` checks before it will look at drift at all.
             format!(
-                "A steering gate reads this same comparison and REFUSES: {}",
+                "a second-tier steering gate reads this same comparison and would refuse: {}",
                 gate.describe()
             )
         };
@@ -557,7 +597,8 @@ mod tests {
             m.contains("would permit a steer"),
             "claimed a refusal the gate will not make: {m}"
         );
-        assert!(!m.contains("REFUSES"), "{m}");
+        assert!(!m.contains("would refuse"), "{m}");
+        assert!(m.contains("would permit a steer"), "{m}");
     }
 
     /// A tuned `drift-warn-fraction` is the range version of the same
@@ -572,7 +613,7 @@ mod tests {
         let h = IntegrityPosture::observe(&snap, at).subsystem_health();
         let m = h.message.clone().unwrap();
         assert!(m.contains("within the 5.000% warn threshold"), "{m}");
-        assert!(m.contains("REFUSES"), "{m}");
+        assert!(m.contains("would refuse"), "{m}");
         assert_eq!(
             h.state,
             HealthState::Degraded,
@@ -595,6 +636,49 @@ mod tests {
             .contains("within the 5.000% warn threshold"));
     }
 
+    /// `integrity-authority none` is informational, not an alarm, and
+    /// says why so an operator does not read it as a broken checker.
+    #[test]
+    fn no_authority_is_healthy_and_explains_itself() {
+        let h = IntegrityPosture::NoAuthority.subsystem_health();
+        assert_eq!(
+            h.state,
+            HealthState::Healthy,
+            "declaring no authority is a config fact, not a fault"
+        );
+        let m = h.message.unwrap();
+        assert!(m.contains("integrity-authority none"), "{m}");
+        assert!(m.contains("unattested"), "{m}");
+        // It must NOT print a comparison or a would-refuse verdict:
+        // there is nothing to compare.
+        assert!(!m.contains("would refuse"), "{m}");
+        assert!(!m.contains("would permit"), "{m}");
+    }
+
+    /// The shadow's exact case: bird 19 prefixes against a 1.3M mirror.
+    /// The `|bird-mirror|/bird` fraction is ~6.8 million percent, which
+    /// the domain code decided not to print. The row must state the
+    /// mismatch, not lead with that number.
+    #[test]
+    fn a_gross_mismatch_does_not_print_a_nonsense_percentage() {
+        let at = t0();
+        // A real drift was computed (bird != 0), yet the gate verdict is
+        // AuthorityMismatch, so the percentage is the meaningless one.
+        let d = drift((1_303_290.0 - 19.0) / 19.0, 0.01);
+        let h = IntegrityPosture::observe(&clean_run(at, 19, 1_303_290, d), at).subsystem_health();
+        assert_eq!(h.state, HealthState::Degraded);
+        let m = h.message.unwrap();
+        assert!(
+            m.contains("mismatch, not a drift"),
+            "a gross mismatch states itself: {m}"
+        );
+        assert!(
+            !m.contains("6859") && !m.contains("685916"),
+            "the 6.8-million-percent figure must not appear: {m}"
+        );
+        assert!(m.contains("would refuse"), "{m}");
+    }
+
     /// The runbook's measured case: bird up, carrying 13 routes against
     /// a 1.3M mirror. Here the degenerate end of it — a bird with none.
     #[test]
@@ -604,7 +688,10 @@ mod tests {
             IntegrityPosture::observe(&clean_run(at, 0, 1_300_000, None), at).subsystem_health();
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
-        assert!(m.contains("NO prefixes in master4/master6"), "{m}");
+        assert!(
+            m.contains("mismatch, not a drift"),
+            "a zero authority is a mismatch, not a drift figure: {m}"
+        );
         assert!(
             !m.contains("drift 0"),
             "a zero authority must not read as agreement: {m}"
@@ -627,7 +714,7 @@ mod tests {
         .subsystem_health();
         assert_eq!(stale.state, HealthState::Degraded);
         let m = stale.message.unwrap();
-        assert!(m.contains("REFUSES"), "{m}");
+        assert!(m.contains("would refuse"), "{m}");
         // Verbatim from `Completeness::describe()`, so the row prints
         // the refusal the steer itself would print.
         assert!(m.contains("too old to act on"), "{m}");
