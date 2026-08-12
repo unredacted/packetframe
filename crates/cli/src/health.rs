@@ -173,7 +173,15 @@ pub fn publish(state_dir: &Path, modules: Vec<ModuleEntry>) -> Result<(), String
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn remove(state_dir: &Path) {
     let path = Snapshot::path_in(state_dir);
-    match std::fs::remove_file(&path) {
+    // Through the walked directory descriptor on Linux — a pathname
+    // `remove_file` follows intermediate symlinks, and this runs as
+    // root (review finding on the identity cleanup; same rule for
+    // every removal in a configured directory).
+    #[cfg(target_os = "linux")]
+    let removed = crate::loader::remove_state_record(&path);
+    #[cfg(not(target_os = "linux"))]
+    let removed = std::fs::remove_file(&path);
+    match removed {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {

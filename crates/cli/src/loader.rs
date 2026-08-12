@@ -478,7 +478,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 "could not record process identity; removing any stale one so readers fall \
                  back rather than compare against a predecessor"
             );
-            if let Err(e) = std::fs::remove_file(&identity_path) {
+            if let Err(e) = remove_state_record(&identity_path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::error!(
                         path = %identity_path.display(),
@@ -545,12 +545,16 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
     // Best-effort PID file cleanup. Non-fatal, the file is harmless
     // if left behind (PID will be unrecognized on re-validate).
-    if let Err(e) = std::fs::remove_file(&identity_path) {
+    // Through the walked descriptor, like every other touch of the
+    // state dir by this root process — `remove_file` follows
+    // intermediate symlinks (review finding on the failed-write
+    // cleanup; same rule here).
+    if let Err(e) = remove_state_record(&identity_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(path = %identity_path.display(), error = %e, "could not remove identity file");
         }
     }
-    if let Err(e) = std::fs::remove_file(&pid_file_path) {
+    if let Err(e) = remove_state_record(&pid_file_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
                 path = %pid_file_path.display(),
@@ -562,34 +566,12 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Open `path` for writing with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600`
-/// the symlink-safe atomic-write primitive both pidfile / marker
-/// writes (here) and the metrics-textfile writer ([`crate::metrics`])
-/// use for their `.tmp` staging files.
-///
-/// `O_NOFOLLOW` makes the open fail (`ELOOP`) when `path` is a
-/// symlink, so an attacker who can pre-create `<...>.tmp` as a
-/// symlink pointing at e.g. `/etc/passwd` cannot redirect the
-/// privileged daemon's write target. `O_EXCL` makes the open fail
-/// (`EEXIST`) when the path already exists, so a stale `.tmp`
-/// leftover from a crashed run is also surfaced rather than silently
-/// truncated and overwritten, callers handle that one-shot with
-/// `unlink-and-retry`.
-///
-/// The May 2026 audit Slice 4 finding flagged the previous use of
-/// `File::create` (which both follows symlinks and `O_TRUNC`s) on
-/// these temp paths as a privileged-write redirection primitive any
-/// time the parent directory is writable to a non-root user.
-#[cfg(target_os = "linux")]
-pub(crate) fn create_excl_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(path)
-}
+// `create_excl_no_follow` — the pathname O_NOFOLLOW|O_EXCL primitive
+// from the May 2026 audit — is gone. Every privileged write, rename,
+// and unlink in a configured directory now goes through
+// `walk_dir_no_follow` + the `openat`/`renameat`/`unlinkat` helpers
+// below, because O_NOFOLLOW on the final component never guarded the
+// intermediate ones (review finding, P1).
 
 /// Open an ABSOLUTE directory path one component at a time, each step
 /// `openat(O_DIRECTORY | O_NOFOLLOW)` relative to the descriptor of the
@@ -611,7 +593,20 @@ pub(crate) fn create_excl_no_follow(path: &Path) -> std::io::Result<std::fs::Fil
 /// specified through parent traversal, and accepting it would make the
 /// walk's guarantees path-dependent.
 #[cfg(target_os = "linux")]
-fn create_and_open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_and_open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    walk_dir_no_follow(path, true)
+}
+
+/// The non-creating walk, for operations that have no business making
+/// directories — removal in particular: if the walk cannot reach the
+/// directory, there is nothing there this process is entitled to touch.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    walk_dir_no_follow(path, false)
+}
+
+#[cfg(target_os = "linux")]
+fn walk_dir_no_follow(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     if !path.is_absolute() {
@@ -637,7 +632,10 @@ fn create_and_open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> 
         })?;
         let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC;
         let mut fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-        if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        if create
+            && fd < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
             // Create it and re-open. A concurrent creator making this
             // mkdirat lose with EEXIST is fine — the reopen decides.
             unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
@@ -682,7 +680,10 @@ fn openat_excl_no_follow(dir: &std::fs::File, name: &str) -> std::io::Result<std
 /// an attacker's symlink is not misclassified as a file. A second
 /// `EEXIST` is a real race between competing writers and errors out.
 #[cfg(target_os = "linux")]
-fn openat_excl_with_retry(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+pub(crate) fn openat_excl_with_retry(
+    dir: &std::fs::File,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     match openat_excl_no_follow(dir, name) {
         Ok(f) => Ok(f),
@@ -714,9 +715,39 @@ fn openat_excl_with_retry(dir: &std::fs::File, name: &str) -> std::io::Result<st
     }
 }
 
+/// Remove a state record through the same component-wise no-follow
+/// walk the writers use — never by resolving the pathname whole.
+///
+/// `std::fs::remove_file` does not follow a symlink at the FINAL
+/// component, but it follows every intermediate one, so the identity
+/// cleanup on a failed write could be pointed at another instance's
+/// state directory and have this root daemon delete THAT instance's
+/// sidecar — disabling its identity-based status and reconfigure
+/// (review finding, P1; the writes had just been converted to
+/// descriptor-relative operations while this cleanup stayed
+/// pathname-based). If the walk cannot reach the directory, nothing is
+/// removed: a path this process refuses to write through is a path it
+/// must refuse to delete through.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_state_record(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let dir = open_dir_no_follow(parent)?;
+    let c = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `renameat` within one already-walked directory descriptor.
 #[cfg(target_os = "linux")]
-fn renameat_within(dir: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
+pub(crate) fn renameat_within(dir: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let (f, t) = (std::ffi::CString::new(from), std::ffi::CString::new(to));
     let (f, t) = (

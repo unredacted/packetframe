@@ -209,8 +209,8 @@ pub enum Record {
     /// finding).
     Unauthenticated(i32),
     /// Two authenticated records that disagree: a valid pid file names
-    /// one pid, and the sidecar names a DIFFERENT pid whose identity
-    /// matches a live process.
+    /// one pid, and the sidecar names a DIFFERENT pid that could not be
+    /// ruled out as a live process — shown live, or unanswerable.
     ///
     /// Nothing in the data says which record is stale. A restart whose
     /// pid-file rewrite failed (it is non-fatal) leaves the OLD pid
@@ -370,9 +370,9 @@ fn decide_from_record(
             return DaemonPresence::Unknown {
                 why: format!(
                     "two authenticated records disagree: the pid file names {recorded} but \
-                     the identity sidecar names {sidecar}, which matches a live process — \
-                     likely a failed pid-file rewrite during a restart. Restart the daemon \
-                     to re-record both, or remove the stale pid file"
+                     the identity sidecar names {sidecar}, which could not be ruled out as \
+                     a live daemon — likely a failed pid-file rewrite during a restart. \
+                     Restart the daemon to re-record both, or remove the stale pid file"
                 ),
             }
         }
@@ -523,17 +523,44 @@ pub fn self_boot_id() -> Option<String> {
 }
 
 /// Whether a recorded identity describes a process that is alive right
-/// now: the pid exists in a non-zombie state, its start ticks match,
-/// and the boot id is this boot's.
+/// now. THREE answers, because the callers act on the negative:
+/// `Some(true)` — alive, non-zombie, ticks and boot id match;
+/// `Some(false)` — positively shown absent, exited, or a different
+/// process (the pid was reused); `None` — could not be established.
 ///
-/// This is the one question that can arbitrate between two
-/// authenticated records that disagree — `/proc` is the only party
-/// with an opinion about which of them still describes something.
+/// This is the arbiter between two authenticated records that disagree
+/// — `/proc` is the only party with an opinion about which still
+/// describes something — and the first version was a bool, collapsing
+/// "could not read its state" into "not live". A transient `/proc`
+/// read failure then discarded the live replacement's sidecar as
+/// stale, and the dead pid in the old record resolved to `Gone`
+/// (review finding: the same cannot-tell-vs-no collapse as `Scan` and
+/// `Sidecar`, in the third structure this module grew).
 #[cfg(target_os = "linux")]
-fn identity_is_live(id: &DaemonIdentity) -> bool {
-    proc_state(id.pid).is_ok_and(state_is_alive)
-        && start_ticks(id.pid).ok() == Some(id.start_ticks)
-        && boot_id().ok().as_deref() == Some(id.boot_id.as_str())
+fn identity_liveness(id: &DaemonIdentity) -> Option<bool> {
+    let state = match proc_state(id.pid) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    if !state_is_alive(state) {
+        return Some(false);
+    }
+    let ticks = match start_ticks(id.pid) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    if ticks != id.start_ticks {
+        return Some(false);
+    }
+    match boot_id() {
+        Ok(b) if b == id.boot_id => Some(true),
+        // A different boot id means every recorded tick count is from a
+        // previous boot: the recorded process is positively gone.
+        Ok(_) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// Read a state file and say whether it was root-owned, through ONE
@@ -741,15 +768,23 @@ pub fn presence_of(
                     // pid dead" resolve to `Gone` under the live
                     // replacement (review finding, P1). Which record
                     // is stale is decided by /proc, the only party
-                    // with an opinion: an identity matching a live
-                    // process is a daemon, whoever else is named.
-                    Sidecar::Identity(id) if identity_is_live(&id) => Record::ConflictingRecords {
-                        recorded: pid,
-                        sidecar: id.pid,
-                    },
-                    // The sidecar names nothing living, so IT is the
-                    // stale one; the pid file stands alone, as an
-                    // identity-less record.
+                    // with an opinion — and ONLY a positive answer
+                    // discards: `Some(false)` means shown dead,
+                    // exited, or a different process. `None` means the
+                    // question went unanswered, and an unanswered
+                    // question keeps the conflict, because "could not
+                    // read its state" is not "not live" (review
+                    // finding: the arbiter itself had the module's
+                    // recurring collapse).
+                    Sidecar::Identity(id) if identity_liveness(&id) != Some(false) => {
+                        Record::ConflictingRecords {
+                            recorded: pid,
+                            sidecar: id.pid,
+                        }
+                    }
+                    // The sidecar names something positively gone, so
+                    // IT is the stale one; the pid file stands alone,
+                    // as an identity-less record.
                     Sidecar::Identity(_) => Record::Found(pid, None),
                     _ => Record::Found(pid, None),
                 }
