@@ -1108,8 +1108,8 @@ module's own deltas.
 > `packetframe.identity`, beside the pid file, and the checks verify
 > against that — so the CLI's own path no longer matters.
 > `packetframe.pid` stays a bare pid on purpose: CLIs from other
-> bundles parse it whole, and a rollback has to keep working. Two
-> limits worth knowing:
+> bundles parse it whole, and a rollback has to keep working. Limits
+> worth knowing:
 >
 > - A daemon that never wrote a pid file (the write is non-fatal, and
 >   happens after attach) is found by a `/proc` scan instead. That scan
@@ -1124,10 +1124,22 @@ module's own deltas.
 >   many processes were unexaminable. Re-run as root; removing the pid
 >   file will not help, because the scan is what the missing record
 >   falls back to.
+> - A recorded pid whose live identity **does not match** is never
+>   resolved either way: the pid was reused, or the record is stale, and
+>   nothing in the data separates them. `status` says CANNOT CONFIRM,
+>   `reconfigure` and `detach` refuse, and the message says whether a
+>   packetframe daemon holds that pid. It is deliberately not resolved
+>   by "well, it is *a* daemon" — a `packetframe run` from another
+>   bundle and another state dir satisfies that, and signalling it would
+>   reload a stranger's config. Restart the daemon to re-record the
+>   identity.
+>   This is reachable after a rollback to a build that does not write
+>   the sidecar, but only if the pids coincide across a reboot; the
+>   ordinary rollback leaves a sidecar naming a different pid, which is
+>   ignored.
 > - `detach` refuses on "cannot tell", not only on "daemon present".
->   When the message names a **stale record** — a pid that is not the
->   recorded process and is not running a packetframe daemon — and you
->   have established there is no daemon, remove the pid file and the
+>   When the message names a pid that is **not** a packetframe daemon,
+>   and you have established there is none, remove the pid file and the
 >   identity sidecar from the state dir.
 
 

@@ -343,12 +343,27 @@ fn decide_from_record(
     // reboot the pids can coincide.
     //
     // Concluding `Gone` there was the fail-open half: it licenses
-    // `detach` while a rolled-back daemon is live. Falling back to the
-    // executable match answers both correctly — a live daemon at that
-    // pid is found, and a reused pid held by anything else lands in
-    // `Unknown`, where the destructive path refuses.
+    // `detach` while a rolled-back daemon is live. `Unknown` is the
+    // whole answer — the mismatch says which daemon this is NOT, and
+    // nothing says which one it is.
     //
-    // The previous attempt dated the two files by mtime, which a
+    // It briefly fell back to the executable match and returned
+    // `Running`. That rehabilitated a record the identity had just
+    // CONTRADICTED, on weaker evidence than the contradiction: a
+    // `packetframe run` from another bundle and another state directory
+    // satisfies the exe check, so a reused pid made `reconfigure`
+    // SIGHUP an unrelated production daemon into a config reload while
+    // the intended one timed out (review finding). Reachable because
+    // that predicate now accepts versioned siblings, which is exactly
+    // right for FINDING a daemon and not enough for identifying one.
+    //
+    // The rollback case it was meant to serve — an old build rewriting
+    // the pid file under a sidecar it cannot know to remove — needs the
+    // pids to coincide across a reboot before it lands here at all, and
+    // its cost is a refusal that names the pid. Signalling a stranger
+    // is not.
+    //
+    // An earlier attempt dated the two files by mtime, which a
     // coarse-resolution filesystem defeats and which forced an ordering
     // on the writer. Removed: cleverness standing in for the
     // observation that a mismatched record is simply not evidence.
@@ -371,15 +386,21 @@ fn decide_from_record(
         // found by this record and by nothing else, which is why the
         // record path may not add an executable requirement on top.
         DaemonPresence::Running { pid }
-    } else if exe_matches {
-        // Not the recorded process, but a daemon nonetheless — which is
-        // what a rollback leaves behind.
-        DaemonPresence::Running { pid }
     } else {
+        // `exe_matches` deliberately does not appear here. It changes
+        // this from "some process holds that pid" to "some packetframe
+        // daemon holds that pid", which is worth SAYING — an operator
+        // triaging the refusal wants to know — and is not identity.
+        let what = if exe_matches {
+            "is running a packetframe daemon, but not the one the record describes"
+        } else {
+            "does not match the recorded identity and is not a packetframe daemon"
+        };
         DaemonPresence::Unknown {
             why: format!(
-                "pid {pid} does not match the recorded identity — reused, or the record is \
-                 stale — and it is not running a packetframe daemon"
+                "pid {pid} {what} — the pid was reused, or the record is stale. Check what \
+                 pid {pid} is before acting on it; restarting the daemon re-records the \
+                 identity"
             ),
         }
     }
@@ -593,9 +614,11 @@ mod tests {
                 !is_gone(&mismatch(false)) && !is_gone(&mismatch(true)),
                 "a mismatched record never proves absence, whatever the executable says"
             );
-            // And it falls back rather than refusing outright: a daemon
-            // at that pid is still a daemon.
-            assert_eq!(mismatch(true), DaemonPresence::Running { pid: 42 });
+            // Nor is it confirmation. The executable check finds *a*
+            // daemon, which is not *the* daemon, and reading it as one
+            // aimed `reconfigure`'s SIGHUP at an unrelated instance
+            // (review finding).
+            assert!(matches!(mismatch(true), DaemonPresence::Unknown { .. }));
             assert!(matches!(mismatch(false), DaemonPresence::Unknown { .. }));
         }
 
@@ -770,17 +793,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A rollback to a build without the sidecar still works.
+    /// A contradicted record settles nothing in EITHER direction.
     ///
-    /// That build rewrites only the pid file and cannot know to remove
-    /// `packetframe.identity`; after a reboot the pids can coincide, so
-    /// the stale record gets matched to the live daemon and rejects it.
-    /// The first attempt dated the files by mtime, which a coarse
-    /// filesystem defeats. The answer is simpler: a record that does
-    /// not describe the live process is not evidence about it, so the
-    /// executable match decides — and a rolled-back daemon is found.
+    /// Not `Gone`: a rollback to a build without the sidecar rewrites
+    /// only the pid file and cannot know to remove
+    /// `packetframe.identity`, so after a reboot the pids can coincide
+    /// and the stale record rejects a live daemon — concluding absence
+    /// there licenses `detach` to unlink pins beneath it. (The first
+    /// attempt dated the files by mtime, which a coarse filesystem
+    /// defeats.)
+    ///
+    /// And not `Running` on an executable match either, which is what
+    /// it briefly did: a `packetframe run` from another bundle and
+    /// another state directory passes that check, so a reused pid put
+    /// `reconfigure`'s SIGHUP into an unrelated daemon (review
+    /// finding). The identity said this is not the recorded process;
+    /// a weaker check does not get to overrule it.
     #[test]
-    fn a_stale_record_does_not_condemn_the_daemon_that_replaced_it() {
+    fn a_contradicted_record_identifies_nothing_in_either_direction() {
         let stale = |exe| {
             decide(
                 Record::Found(42, Some(id(42, 900))),
@@ -790,15 +820,22 @@ mod tests {
                 || Scan::NoneFound,
             )
         };
-        assert_eq!(
-            stale(true),
-            DaemonPresence::Running { pid: 42 },
-            "the live daemon is found by its executable, not condemned by a record it \
-             never wrote"
-        );
+        for exe in [true, false] {
+            assert!(
+                matches!(stale(exe), DaemonPresence::Unknown { .. }),
+                "exe_matches={exe}: a mismatched identity is unknown, never absent and \
+                 never confirmed: {:?}",
+                stale(exe)
+            );
+        }
+        // The distinction still reaches the operator, because it is
+        // what they triage with — it just does not license an action.
+        let DaemonPresence::Unknown { why } = stale(true) else {
+            unreachable!()
+        };
         assert!(
-            !is_gone(&stale(false)),
-            "and where nothing confirms it, the answer is unknown rather than absent"
+            why.contains("packetframe daemon"),
+            "the refusal has to say a daemon holds that pid: {why}"
         );
     }
 
