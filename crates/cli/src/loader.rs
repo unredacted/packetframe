@@ -576,7 +576,20 @@ fn write_pid_file(path: &Path) -> std::io::Result<()> {
     let tmp = path.with_extension("pid.tmp");
     {
         let mut f = create_excl_no_follow_with_retry(&tmp)?;
-        writeln!(f, "{}", std::process::id())?;
+        // Identity, not just a pid. A bare pid is reusable, so every
+        // later reader had to fall back to "does some process run my
+        // exact binary path" — which is false whenever a CLI runs from
+        // a newly deployed bundle while the old daemon is still up,
+        // i.e. during every upgrade. See `daemon_presence`.
+        match crate::daemon_presence::DaemonIdentity::current() {
+            Ok(id) => writeln!(f, "{}", id.encode())?,
+            // The pid alone still works: readers treat a record with no
+            // identity as legacy and fall back rather than guessing.
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read own process identity; recording pid alone");
+                writeln!(f, "{}", std::process::id())?;
+            }
+        }
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
@@ -887,11 +900,28 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     // user-writable; readlink-comparing it against our own
     // current_exe is a real identity check rather than a name match.
     // See the May 2026 audit Slice 4 finding.
-    if !proc_exe_matches_current(pid) {
-        return Err(ReconfigureError::DaemonNotRunning(format!(
-            "PID {pid} from {} is not a packetframe process (stale pidfile?)",
-            pid_path.display()
-        )));
+    match crate::daemon_presence::presence_of(&pid_path, |p| {
+        proc_exe_matches_current(p as libc::pid_t)
+    }) {
+        crate::daemon_presence::DaemonPresence::Running { .. } => {}
+        crate::daemon_presence::DaemonPresence::Gone { why } => {
+            return Err(ReconfigureError::DaemonNotRunning(format!(
+                "no daemon to reconfigure: {why} (stale pidfile at {}?)",
+                pid_path.display()
+            )));
+        }
+        // A pid we cannot identify is one we must not signal. The old
+        // check reported this as "not a packetframe process", which was
+        // also how it read a LIVE daemon whenever this CLI ran from a
+        // different path than it — so the canary lever failed during
+        // exactly the upgrade it was meant to drive.
+        crate::daemon_presence::DaemonPresence::Unknown { why } => {
+            return Err(ReconfigureError::DaemonNotRunning(format!(
+                "cannot confirm pid {pid} from {} is the packetframe daemon ({why}); refusing \
+                 to signal it",
+                pid_path.display()
+            )));
+        }
     }
 
     // Snapshot the marker mtime (or NotFound) before signaling so we
@@ -1025,53 +1055,6 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
     }
 }
 
-/// Look for a live `packetframe run` daemon via `/proc`. Returns the
-/// pid of the first match, None if none found. Only our own process
-/// name is matched (not arbitrary substrings), so a text editor
-/// holding a `packetframe.conf` file doesn't false-positive.
-#[cfg(target_os = "linux")]
-fn daemon_pid() -> Option<u32> {
-    let self_pid = std::process::id();
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let pid: u32 = match name.to_str().and_then(|s| s.parse().ok()) {
-            Some(p) => p,
-            None => continue,
-        };
-        if pid == self_pid {
-            continue;
-        }
-        // /proc/<pid>/exe is the kernel-managed identity check (the
-        // May 2026 audit Slice 4 finding). The `comm` field used to
-        // gate this is user-settable via prctl(PR_SET_NAME), so a
-        // local user could rename their own process to "packetframe"
-        // and block the operator's `packetframe detach`. The exe
-        // symlink resolves to the inode the kernel actually exec'd,
-        // and is not user-writable.
-        if !proc_exe_matches_current(pid as libc::pid_t) {
-            continue;
-        }
-        // Confirm it's actually the `run` subcommand, not e.g.
-        // `packetframe detach` from another shell. argv IS still
-        // user-settable, but the exe match above pins identity; a
-        // spoofed argv "run" entry only sources a self-match against
-        // the very same binary.
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-            if cmdline.split('\0').any(|a| a == "run") {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn daemon_pid() -> Option<u32> {
-    None
-}
-
 pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // Refuse to detach while a `packetframe run` daemon is live. The
     // daemon holds PinnedLink FDs in-process; unlinking the bpffs pin
@@ -1081,16 +1064,6 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // Confirmed outage-adjacent on the reference EFG 2026-04-21, the
     // detach ran, reported clean, but `ip link show` still had
     // `xdpgeneric` attached.
-    if let Some(pid) = daemon_pid() {
-        return Err(format!(
-            "a `packetframe run` daemon is still running (pid {pid}); \
-             stop it first (e.g. `kill {pid}`) before detaching. \
-             Detach unlinks bpffs pins, but the kernel-side bpf_link \
-             holds refs through the daemon's open FDs, both have to \
-             be released for the iface to actually detach."
-        ));
-    }
-
     // `config_has_vpp` decides whether a SCOPED detach may touch VPP.
     //
     // `--all` means "tear down modules beyond those in the supplied config",
@@ -1118,6 +1091,42 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             false,
         ),
     };
+
+    // Positive evidence of ABSENCE, not merely failure to find a
+    // match. `daemon_pid()` answered by scanning /proc for a process
+    // running this CLI's own executable path, so a detach run from a
+    // freshly deployed bundle — the shape every upgrade has — found
+    // nothing and proceeded straight past this guard, under a live
+    // daemon. That is the outage this refusal exists to prevent, and
+    // it was reachable exactly when someone was upgrading.
+    #[cfg(target_os = "linux")]
+    let presence = crate::daemon_presence::presence_of(&state_dir.join(PIDFILE_NAME), |p| {
+        proc_exe_matches_current(p as libc::pid_t)
+    });
+    #[cfg(not(target_os = "linux"))]
+    let presence = crate::daemon_presence::DaemonPresence::Gone {
+        why: "no /proc on this platform; nothing could be attached".into(),
+    };
+    match presence {
+        crate::daemon_presence::DaemonPresence::Gone { .. } => {}
+        crate::daemon_presence::DaemonPresence::Running { pid } => {
+            return Err(format!(
+                "a `packetframe run` daemon is still running (pid {pid}); \
+                 stop it first (e.g. `kill {pid}`) before detaching. \
+                 Detach unlinks bpffs pins, but the kernel-side bpf_link \
+                 holds refs through the daemon's open FDs, both have to \
+                 be released for the iface to actually detach."
+            ));
+        }
+        crate::daemon_presence::DaemonPresence::Unknown { why } => {
+            return Err(format!(
+                "cannot confirm no `packetframe run` daemon is running ({why}); refusing to \
+                 detach. Unlinking pins under a live daemon leaves the program attached \
+                 through its open FDs while reporting success. Stop the daemon, or remove \
+                 a stale pid file if you have established there is none."
+            ));
+        }
+    }
 
     // `--all` used to be a no-op with a comment saying it would "become
     // meaningful once a second module ships". A second module has now
@@ -1507,11 +1516,15 @@ fn print_module_health(state_dir: &Path) {
     // only then learns the daemon is dead has already drawn the
     // conclusion, and it was the wrong one.
     #[cfg(target_os = "linux")]
-    let live = proc_exe_matches_current(snapshot.pid);
+    let presence = crate::daemon_presence::presence_of(&state_dir.join(PIDFILE_NAME), |p| {
+        proc_exe_matches_current(p as libc::pid_t)
+    });
     // No /proc to cross-check against, so liveness is unknown rather
     // than assumed either way.
     #[cfg(not(target_os = "linux"))]
-    let live = false;
+    let presence = crate::daemon_presence::DaemonPresence::Unknown {
+        why: "no /proc on this platform".into(),
+    };
 
     let age = match crate::health::age_seconds(&snapshot) {
         Some(a) => format!("{a}s old"),
@@ -1520,15 +1533,24 @@ fn print_module_health(state_dir: &Path) {
         None => "written in the future (clock skew)".to_string(),
     };
 
-    if live {
-        println!("module health (pid {}, {age}):", snapshot.pid);
-    } else {
-        println!(
-            "module health: STALE — the daemon that wrote this (pid {}) is gone. The report \
-             below is history, {age}; the dataplane may still be forwarding via its pins \
-             (§8.5).",
+    match &presence {
+        crate::daemon_presence::DaemonPresence::Running { pid } => {
+            println!("module health (pid {pid}, {age}):")
+        }
+        crate::daemon_presence::DaemonPresence::Gone { why } => println!(
+            "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
+             report below is history, {age}; the dataplane may still be forwarding via its \
+             pins (§8.5).",
             snapshot.pid
-        );
+        ),
+        // Neither shown. Saying "gone" here is what printed STALE over
+        // a live daemon on the shadow (2026-08-12), because the check
+        // asked whether the daemon ran this CLI's own binary.
+        crate::daemon_presence::DaemonPresence::Unknown { why } => println!(
+            "module health (pid {}, {age}) — CANNOT CONFIRM the daemon is still running \
+             ({why}). Read the report as possibly historical until it can be checked.",
+            snapshot.pid
+        ),
     }
 
     for m in &snapshot.modules {
@@ -1741,6 +1763,52 @@ mod vpp_detach_tests {
         // The right order is accepted, so the test above is about order
         // and not about the pair being rejected outright.
         assert_eq!(feed_wiring(&["fast-path", "vpp-offload"]), Ok(true));
+    }
+
+    /// `detach` refuses when it cannot prove no daemon is running.
+    ///
+    /// The policy lives in `daemon_presence::decide` and is tested
+    /// there; this asserts the WIRING, which is the half that was
+    /// wrong. `detach` consulted a /proc scan for a process running its
+    /// own executable path, so a detach launched from a freshly
+    /// deployed bundle — every upgrade — matched nothing and walked
+    /// straight past the guard while the daemon was live. Unlinking
+    /// pins under it leaves the program attached through its open FDs
+    /// and reports success, which is the 2026-04-21 outage.
+    ///
+    /// Uses a legacy record naming THIS process with a deliberately
+    /// non-matching exe check: a live pid whose identity cannot be
+    /// established. The only safe reading is "cannot tell", and the
+    /// only safe action is to stop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_refuses_a_daemon_it_cannot_rule_out() {
+        use crate::daemon_presence::{presence_of, DaemonPresence};
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A legacy record — pid only — naming a process that really is
+        // running. This is what an older daemon leaves behind.
+        std::fs::write(dir.join(PIDFILE_NAME), format!("{}\n", std::process::id())).unwrap();
+
+        // The exe check fails, as it does whenever the CLI runs from a
+        // different path than the daemon.
+        let p = presence_of(&dir.join(PIDFILE_NAME), |_| false);
+        assert!(
+            matches!(p, DaemonPresence::Unknown { .. }),
+            "a live pid with no verifiable identity must be Unknown, not Gone — Gone is \
+             what let detach proceed: {p:?}"
+        );
+
+        // And the same record with the exe check passing still resolves
+        // to Running, so the guard has not simply been loosened.
+        assert!(matches!(
+            presence_of(&dir.join(PIDFILE_NAME), |_| true),
+            DaemonPresence::Running { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A recorded pid with no start-time cookie must not be signalled, and

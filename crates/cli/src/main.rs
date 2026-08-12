@@ -11,6 +11,7 @@
 mod atomic;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod breaker;
+mod daemon_presence;
 mod feasibility;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod fib_cli;
