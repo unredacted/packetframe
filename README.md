@@ -188,7 +188,7 @@ sudo packetframe reconfigure                # synchronous; exits non-zero on par
 sudo systemctl reload packetframe           # equivalent under systemd; both end up sending SIGHUP
 ```
 
-What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix`/`local-prefix6` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
+What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp`, `log-level`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix`/`local-prefix6` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
 
 ### 6. Tear down
 
@@ -314,7 +314,7 @@ Quick directive index:
 - `hugepages <n>`, `vpp-binary <path>`
 - `require-table-complete {on|off}`: wait for the routing table to finish loading before steering (default on)
 
-`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, forwarding-mode bits, and vpp-offload's `steer` switches. Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, editing `local-prefix`/`local-prefix6`, or changing any vpp-offload directive other than `steer` requires a restart.
+`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, forwarding-mode bits, `log-level`, and vpp-offload's `steer` switches. (`log-level` is the daemon's tracing filter, and `RUST_LOG` in its environment overrides it for the life of the process.) Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, editing `local-prefix`/`local-prefix6`, or changing any vpp-offload directive other than `steer` requires a restart.
 
 ## Operator tools
 

@@ -204,7 +204,7 @@ periodic job that shells out to `birdc show route count` and
 programmer's mirror size, and logs warnings on drift ≥ 1%:
 
 ```
-WARN integrity drift above threshold bird_routes=1048587 packetframe_routes=1048501 drift_fraction=0.000082
+WARN integrity drift above threshold bird_prefixes=1048587 packetframe_prefixes=1048501 drift_fraction=0.000082
 ```
 
 The drift threshold is `IntegrityConfig::drift_warn_fraction`
@@ -221,7 +221,7 @@ applied, the sample's age, and any error:
 
 ```
   fast-path: healthy
-    fib-integrity  healthy — bird 1272306 routes, mirror 1272281 — drift 0.002%,
+    fib-integrity  healthy — bird 1272306 prefixes, mirror 1272281 — drift 0.002%,
                    within the 1.000% warn threshold. A steering gate reads this same
                    comparison and would permit a steer ... (last ok 41s ago)
 ```

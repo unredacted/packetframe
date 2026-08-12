@@ -18,6 +18,7 @@ mod fib_cli;
 #[cfg(feature = "fast-path")]
 mod health;
 mod loader;
+pub(crate) mod logging;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod metrics;
 #[cfg(feature = "probe")]
@@ -30,7 +31,6 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use packetframe_common::config::Config;
-use tracing_subscriber::EnvFilter;
 
 /// Exit codes per SPEC.md §7.3.
 pub(crate) const EXIT_OK: u8 = 0;
@@ -111,8 +111,10 @@ enum Command {
     },
 
     /// Re-read config and apply hot-reloadable changes (allow-prefix,
-    /// block-prefix, dry-run, forwarding-mode, mss-clamp, etc.) on the
-    /// running daemon without touching attach state. Reads the
+    /// block-prefix, dry-run, forwarding-mode, mss-clamp, log-level,
+    /// etc.) on the running daemon without touching attach state. Note
+    /// that `log-level` does nothing while `RUST_LOG` is set in the
+    /// daemon's environment: env beats file. Reads the
     /// daemon's PID file, sends SIGHUP, then polls the
     /// `last-reconfigure.timestamp` marker for confirmation.
     /// Equivalent to `systemctl reload packetframe` under systemd.
@@ -259,31 +261,10 @@ fn restore_default_sigpipe() {}
 fn main() -> ExitCode {
     restore_default_sigpipe();
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default: info from our crates, plus suppress one upstream
-        // noise source. `bgpkit_parser::parser::bgp::messages`
-        // emits a `WARN seeing strange one-byte NLRI field` whenever
-        // a BGP UPDATE arrives with a 1-byte NLRI section, which is
-        // the valid wire encoding of a default route (`0.0.0.0/0`:
-        // prefix-length byte = 0, zero prefix bytes follow).
-        // bgpkit-parser conservatively treats it as malformed and
-        // skips. For our use case (bird with `accept-default: false`,
-        // no defaults in the RIB), the warning fires once per session
-        // when bird emits a withdraw of the default and is otherwise
-        // misleading noise. Demote that one module's warnings to
-        // error level so genuine bgpkit-parser failures still
-        // surface but the cosmetic noise is gone.
-        //
-        // Operators who want the raw parser warnings back: set
-        // `RUST_LOG=info,bgpkit_parser::parser::bgp::messages=warn`.
-        EnvFilter::new("info,bgpkit_parser::parser::bgp::messages=error")
-    });
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .compact()
-        .init();
+    // Reloadable, at the built-in default. `global.log-level` from the
+    // config takes over once there is a config to read it from; see
+    // [`logging`] for the ordering and the `RUST_LOG` precedence.
+    logging::init();
 
     let cli = Cli::parse();
     match cli.command {

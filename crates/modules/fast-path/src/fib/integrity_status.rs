@@ -90,9 +90,9 @@ pub struct Comparison {
     /// [`IntegritySnapshot::last_run`] for that same run, which is what
     /// lets a reader tell a current comparison from a retained one.
     pub at: Instant,
-    pub bird_routes: usize,
-    pub packetframe_routes: usize,
-    /// `None` when bird reported zero routes, where a fraction of the
+    pub bird_prefixes: usize,
+    pub packetframe_prefixes: usize,
+    /// `None` when bird reported zero prefixes, where a fraction of the
     /// authority's count is undefined. Not "no drift" — see
     /// [`IntegrityPosture::subsystem_health`], which reports a zero
     /// authority as its own condition.
@@ -132,8 +132,8 @@ pub struct Sample {
     /// two cannot disagree.
     pub at: Instant,
     pub observed_at: Instant,
-    pub bird_routes: usize,
-    pub packetframe_routes: usize,
+    pub bird_prefixes: usize,
+    pub packetframe_prefixes: usize,
     pub drift: Option<Drift>,
     /// This comparison is the most recent run's own result, rather than
     /// one retained across a run that failed. A retained sample is
@@ -156,8 +156,8 @@ impl Sample {
     /// work there too.
     fn report(&self) -> packetframe_common::fib::CompletenessReport {
         packetframe_common::fib::CompletenessReport {
-            authority_routes: self.bird_routes as u64,
-            mirror_routes: self.packetframe_routes as u64,
+            authority_routes: self.bird_prefixes as u64,
+            mirror_routes: self.packetframe_prefixes as u64,
             at: self.at,
         }
     }
@@ -235,8 +235,8 @@ impl IntegrityPosture {
             sample: snap.last_comparison.map(|c| Sample {
                 at: c.at,
                 observed_at: now,
-                bird_routes: c.bird_routes,
-                packetframe_routes: c.packetframe_routes,
+                bird_prefixes: c.bird_prefixes,
+                packetframe_prefixes: c.packetframe_prefixes,
                 drift: c.drift,
                 // Instant equality, not an age comparison: the checker
                 // stamps one `Instant` per run and writes it to both
@@ -392,8 +392,8 @@ impl IntegrityPosture {
     fn verdict(s: &Sample) -> (HealthState, String) {
         let mut state = HealthState::Healthy;
         let counts = format!(
-            "bird {} routes, mirror {}",
-            s.bird_routes, s.packetframe_routes
+            "bird {} prefixes, mirror {}",
+            s.bird_prefixes, s.packetframe_prefixes
         );
 
         let diagnostic = match s.drift {
@@ -411,7 +411,7 @@ impl IntegrityPosture {
             // Not "no drift". A zero authority cannot attest anything,
             // and it is a real and documented state — a box running a
             // bird that carries none of the table the mirror is fed.
-            None => "no drift fraction is defined: bird reports NO routes in \
+            None => "no drift fraction is defined: bird reports NO prefixes in \
                      master4/master6, and a fraction of zero says nothing"
                 .to_string(),
         };
@@ -463,8 +463,8 @@ mod tests {
             last_run: Some(at),
             last_comparison: Some(Comparison {
                 at,
-                bird_routes: bird,
-                packetframe_routes: mirror,
+                bird_prefixes: bird,
+                packetframe_prefixes: mirror,
                 drift: d,
             }),
             bird_established_peers: Some(2),
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(agreeing.last_success_age_seconds, Some(30));
 
         let agreeing_msg = agreeing.message.unwrap();
-        assert!(agreeing_msg.contains("bird 1272306 routes, mirror 1272281"));
+        assert!(agreeing_msg.contains("bird 1272306 prefixes, mirror 1272281"));
         assert!(agreeing_msg.contains("within the 1.000% warn threshold"));
     }
 
@@ -604,7 +604,7 @@ mod tests {
             IntegrityPosture::observe(&clean_run(at, 0, 1_300_000, None), at).subsystem_health();
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
-        assert!(m.contains("NO routes in master4/master6"), "{m}");
+        assert!(m.contains("NO prefixes in master4/master6"), "{m}");
         assert!(
             !m.contains("drift 0"),
             "a zero authority must not read as agreement: {m}"
@@ -708,8 +708,8 @@ mod tests {
             last_run: Some(compared_at + Duration::from_secs(300)),
             last_comparison: Some(Comparison {
                 at: compared_at,
-                bird_routes: 1_272_306,
-                packetframe_routes: 1_272_281,
+                bird_prefixes: 1_272_306,
+                packetframe_prefixes: 1_272_281,
                 drift: drift(0.0000196, 0.01),
             }),
             bird_established_peers: Some(2),

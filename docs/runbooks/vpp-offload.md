@@ -1128,7 +1128,7 @@ carrying that traffic; VPP still is.
   ```
   $ packetframe status                     # message wrapped here; it prints on one line
     fast-path: healthy
-      fib-integrity  healthy — bird 1272306 routes, mirror 1272281 — drift 0.002%,
+      fib-integrity  healthy — bird 1272306 prefixes, mirror 1272281 — drift 0.002%,
                      within the 1.000% warn threshold. A steering gate reads this same
                      comparison and would permit a steer — this is the positive evidence
                      a rollout needs ... (last ok 41s ago)
@@ -1196,15 +1196,26 @@ carrying that traffic; VPP still is.
   doubles as the test, and a refusal costs a message rather than
   traffic. Read the reason it prints; do not retry past it.
 
-  **Do not hand-roll the comparison from `birdc` output.** Two traps
-  make a hand-rolled check pass a box that will veto. **`master6`
-  counts**: the checker compares bird's `master4` **plus** `master6`
-  against the mirror's v4+v6, so a box whose `master4` matches while
-  its `master6` is missing or wrong still fails the combined
-  comparison, and checking `master4` alone approves a rollout the gate
-  will refuse. And **`fib-synced`'s installed count is not the number
-  to compare** — that is VPP's table, which is v4-only by policy,
-  against an authority figure that includes v6.
+  **Do not hand-roll the comparison from `birdc` output.** Three traps
+  make a hand-rolled check pass a box that will veto.
+
+  **The `networks` column, not the `routes` one.** On the line `N of M
+  routes for K networks in table master4`, the mirror holds one entry
+  per *prefix*, so `K` is the comparable number. `N` counts paths, and
+  on a multihomed box it is larger by roughly the number of upstreams —
+  measured on the production primary as 2,594,691 routes against a
+  1,303,120-entry mirror, a 49.8% "drift" that was pure units (#168).
+  Read the wrong column by hand and a converged box looks broken.
+
+  **`master6` counts.** The checker compares `master4` **plus**
+  `master6` against the mirror's v4+v6, so a box whose `master4`
+  matches while its `master6` is missing or wrong still fails the
+  combined comparison, and checking `master4` alone approves a rollout
+  the gate will refuse.
+
+  **`fib-synced`'s installed count is not the number to compare** —
+  that is VPP's table, which is v4-only by policy, against an authority
+  figure that includes v6.
 
   A box that adopts while steered under a vetoing authority has no fast
   rollback. Worth knowing before the canary rather than during it.
