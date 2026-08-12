@@ -149,9 +149,46 @@ impl IntegrityChecker {
     }
 
     async fn run_check(&self) {
-        let bird_route = run_birdc_count(&self.config.birdc_path).await;
+        // THE PAIR, CONCURRENTLY. These two numbers are the whole
+        // content of the report the steering gate acts on, and the gap
+        // between them is the report's error bar: whatever the mirror
+        // does while the other number is being fetched shows up as
+        // drift that never existed. Sequentially — bird, then a SECOND
+        // `birdc` for protocols, then the mirror — that gap was at
+        // least one subprocess round trip, and under a bulk withdrawal
+        // or a reload it read bird low and the mirror high, which
+        // `assess` classifies as `AuthorityMismatch`: the authority
+        // being wrong, not the clock.
+        //
+        // `join!` polls both on this task; the birdc side does its work
+        // on a blocking thread and the mirror side is a message to the
+        // programmer, so they genuinely overlap rather than interleave.
+        // This NARROWS the window to the difference between two
+        // concurrent completions — it does not close it, so consumers
+        // that escalate on a mismatch still need more than one sample.
+        let (bird_route, pf_route) = tokio::join!(
+            run_birdc_count(&self.config.birdc_path),
+            self.prog.mirror_counts()
+        );
+        // ONE `Instant` for the whole run, stamped the moment the pair
+        // completes — `last_run`, the comparison and the published
+        // report all carry it.
+        //
+        // Both halves of that matter. The equality is load-bearing:
+        // `IntegrityPosture` tells a current comparison from a retained
+        // one by comparing `Comparison::at` against `last_run`, so two
+        // separate `now()` calls would make every comparison read as
+        // history. And taking it HERE rather than after the peer count
+        // means an age is measured from when the two numbers were
+        // sampled, not from the end of a tick that goes on to spend
+        // another subprocess call on something neither number depends
+        // on.
+        let at = Instant::now();
+        // The stall detector's input, and NOT part of the comparison —
+        // so it runs outside the pair. It used to sit between the two
+        // halves of the report, which is the whole reason the gap was
+        // subprocess-sized.
         let bird_peers = run_birdc_protocols(&self.config.birdc_path).await;
-        let pf_route = self.prog.mirror_counts().await;
 
         // Captured from THIS run's results, before anything is folded
         // into the snapshot.
@@ -168,12 +205,6 @@ impl IntegrityChecker {
         let fresh_bird = bird_route.as_ref().ok().copied();
         let fresh_mirror = pf_route.as_ref().ok().map(|(v4, v6)| v4 + v6);
 
-        // One `Instant` for the whole run, written to `last_run` and to
-        // the comparison alike. That equality is load-bearing:
-        // `IntegrityPosture` tells a current comparison from a retained
-        // one by comparing the two, so two separate `now()` calls would
-        // make every comparison read as history.
-        let at = Instant::now();
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
         snap.last_error = None;
