@@ -670,6 +670,32 @@ impl StatusSnapshot {
                          table, or give this box a bird and enable \
                          `require-table-complete`"
                     )
+                } else if self.authority == AuthorityPosture::Vetoing {
+                    // The floor is met and quiescence is NOT the blocker:
+                    // `authority_current` is returning false, which vetoes
+                    // release unconditionally — no amount of quiet, floor
+                    // or liveness gets past it.
+                    //
+                    // This arm exists because the message below was
+                    // printed for 23 hours on a box whose local bird held
+                    // 13 routes against a 1.3M-route mirror (shadow,
+                    // 2026-08-12). It told the operator to wait for the
+                    // source to go quiet. The source going quiet could
+                    // never have released it, and nothing said so — the
+                    // posture had no way to express a veto, so every
+                    // surface read `Attesting`.
+                    format!(
+                        "resync deferred: the route source holds {have} routes (release \
+                         floor {want} met) and the source may well be quiet — but the \
+                         completeness authority currently reports that its own route count \
+                         does not describe this mirror, which vetoes the release outright. \
+                         Waiting will not clear it: the authority has to agree with the \
+                         mirror first. Check that bird on THIS box carries the table the \
+                         mirror was built from (a near-empty local bird against a full \
+                         mirror is the usual cause), or run without an authority. The \
+                         adopted FIB keeps forwarding untouched meanwhile, and every \
+                         steering change is refused while this holds"
+                    )
                 } else {
                     format!(
                         "resync deferred: the route source holds {have} routes (release \
@@ -2483,6 +2509,70 @@ mod tests {
             FibSync::from_outcome(&good, Duration::ZERO),
             FibSync::Verified { sampled: 64, .. }
         ));
+    }
+
+    /// A vetoed deferral must not be described as waiting for quiet.
+    ///
+    /// Measured, not hypothesised: on the shadow (2026-08-12) a box
+    /// whose local bird held 13 routes against a 1.3M-route mirror sat
+    /// deferred for 23 hours printing "the diff runs once the source is
+    /// live and has gone quiet". The source going quiet could never
+    /// have released it — `authority_current` was returning false, which
+    /// vetoes the release outright — and no surface said so, because
+    /// `AuthorityPosture` had no variant for a veto and the snapshot
+    /// therefore read `Attesting`.
+    ///
+    /// The assertion is on the DIFFERENCE the operator acts on: the
+    /// vetoed message must not send them to watch quiescence, and must
+    /// name the authority as the blocker.
+    #[test]
+    fn a_vetoed_deferral_does_not_blame_quiescence() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let deferred = |authority| {
+            let mut snap = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(200),
+                },
+                FibSync::NeverVerified,
+                ports_up(),
+            );
+            // Floor MET — so the only thing that can be holding this is
+            // quiescence or the authority.
+            snap.resync_deferred = Some((1_303_920, 156_734));
+            snap.authority = authority;
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|s| s.name == SUBSYS_FIB)
+                .and_then(|s| s.message)
+                .expect("a deferral always explains itself")
+        };
+
+        let vetoed = deferred(AuthorityPosture::Vetoing);
+        assert!(
+            !vetoed.contains("gone quiet"),
+            "a vetoed deferral must not point at quiescence, which cannot release it: \
+             {vetoed}"
+        );
+        assert!(
+            vetoed.contains("completeness authority") && vetoed.contains("vetoes"),
+            "and it must name the authority as the blocker: {vetoed}"
+        );
+        assert!(
+            vetoed.contains("Waiting will not clear it"),
+            "and say plainly that waiting is not the remedy: {vetoed}"
+        );
+
+        // The permitting posture keeps the quiescence wording, so this
+        // test cannot pass by making every deferral message identical.
+        let attesting = deferred(AuthorityPosture::Attesting);
+        assert!(
+            attesting.contains("gone quiet"),
+            "a non-vetoed deferral above the floor IS waiting for quiet: {attesting}"
+        );
     }
 
     #[test]

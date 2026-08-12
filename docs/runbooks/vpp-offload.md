@@ -1047,15 +1047,29 @@ says so explicitly when that is what is happening — read it before
 concluding the checker is broken. Nothing is dropping meanwhile.
 
 **A second unbounded case, and this one takes the rollback lever with
-it: no completeness authority configured at all.** With no bird for the
-checker to compare against, the release falls to the unattested gate,
-which tolerates an activity rate of exactly **zero** for 5 s
-(`UNATTESTED_QUIET_RATE_PER_SEC`) — deliberately, since without an
-authority nothing can tell slow churn from a throttled reload. A live
-DFZ feed may never be literally still for 5 s, so an adopted resync
-over a **steered** VPP can defer indefinitely. Measured on the shadow:
-**23 h and still deferred** (2026-08-11 → 2026-08-12), floor long since
-met, feed healthy, nothing dropping.
+it: the completeness authority is VETOING.** `authority_current`
+compares the checker's report against the mirror as it is now, and a
+`false` there vetoes the release **outright** — no floor, liveness or
+quiescence gets past it, and unlike a quiet-wait it does not clear on
+its own. It clears when the authority's report agrees with the mirror,
+or never.
+
+Measured on the shadow, 2026-08-11 → 2026-08-12: **23 h deferred and
+still holding**, floor long since met, feed healthy, nothing dropping.
+The cause was mundane once looked at — that box's own bird carries
+**13 routes** in `master4` while the mirror holds 1.30M fed from the
+primary, so the checker could only ever report a mismatch:
+
+```
+$ birdc show route count
+13 of 13 routes for 13 networks in table master4      # <- the authority
+757074 ... in table rpki4                             # <- NOT routes
+```
+
+Two traps in that output, both of which cost time here. The `Total:`
+line counts RPKI tables and means nothing for this comparison — read
+`master4`. And a box can have bird *running* and still be useless as an
+authority, which is not the same as having no bird at all.
 
 What makes it more than cosmetic is what `AdoptedResyncing` refuses:
 **steering changes, which includes `steer off`.** For the length of the
@@ -1063,18 +1077,25 @@ deferral an operator cannot roll traffic off VPP with `packetframe
 reconfigure` — it answers "not converged". The eBPF tier is not
 carrying that traffic; VPP still is.
 
-- **On a box with bird** (the fleet, the primary) this does not apply:
-  the authority carries completion truth and releases on its own word.
-- **On a box without one** (the shadow, any box where the checker is
-  unconfigured or `birdc` is unreachable), the only escape is a cold
-  restart — stop the daemon, `packetframe detach --all`, start. That
-  tears VPP down and costs the offload for a full resync, which is
-  exactly the trade the deferral exists to avoid, so it is a last
-  resort rather than a routine step.
-- **Before a rollout, verify the authority is live** (`fib-synced`
-  naming a completeness verdict rather than the unattested wording).
-  A box that adopts while steered with no authority has no fast
-  rollback, and that is worth knowing before the canary, not during it.
+- **`fib-synced` now names the veto** rather than pointing at
+  quiescence. Until this was fixed the line read "the diff runs once the
+  source is live and has gone quiet" throughout — sending an operator to
+  watch a feed that could never release it, because `AuthorityPosture`
+  had no variant for a veto and every surface read `Attesting`.
+- **On a box whose bird carries the real table** (the fleet, the
+  primary) this does not arise: the report agrees with the mirror and
+  the authority releases on its own word.
+- **Where the authority cannot agree** — a near-empty local bird, a
+  `birdc` that fails, a mirror fed from somewhere else — the fix is to
+  make it agree or to run without one. Failing both, the escape is a
+  cold restart (stop the daemon, `packetframe detach --all`, start),
+  which tears VPP down and costs a full resync: the exact trade the
+  deferral exists to avoid, so it is a last resort.
+- **Before a rollout, verify the authority actually agrees.** Not that
+  bird is running — that `birdc show route count` on THAT box reports
+  the table the mirror was built from. A box that adopts while steered
+  under a vetoing authority has no fast rollback, and that is worth
+  knowing before the canary rather than during it.
 
 ### A member port needs two things admin-up does not give it
 

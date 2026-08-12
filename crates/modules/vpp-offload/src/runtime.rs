@@ -1096,6 +1096,13 @@ impl Runtime {
                 Some(DeferredResync::AwaitingFallback { demoted: true, .. })
             ) {
                 AuthorityPosture::DemotedByFlap
+            } else if authority_current(&c.completeness, c.source.route_count()) == Some(false) {
+                // The SAME recompute the release path applies, not a
+                // re-derivation of it: the health line and the gate must
+                // not be able to disagree about whether the authority is
+                // currently permitting. `Attesting` used to cover this
+                // case, so a veto was invisible to every surface.
+                AuthorityPosture::Vetoing
             } else {
                 AuthorityPosture::Attesting
             },
@@ -1124,12 +1131,25 @@ const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 pub enum AuthorityPosture {
     /// No `require-table-complete` handle; the proxies stand alone.
     Absent,
-    /// Configured and usable.
+    /// Configured, usable, and currently permitting.
     Attesting,
     /// Configured, but this deferral saw the feed flap and has not yet
     /// seen the current epoch reconciled, so the authority's word
     /// cannot be trusted to describe the current stream.
     DemotedByFlap,
+    /// Configured, usable, and currently saying NO: its report does not
+    /// describe the mirror as it is now, so `authority_current` vetoes
+    /// release regardless of floor, liveness or quiescence.
+    ///
+    /// Added because the posture could not express it, and that gap had
+    /// a measured cost. On the shadow (2026-08-12) a box whose local
+    /// bird holds 13 routes against a 1.3M-route mirror sat deferred
+    /// for 23 hours reading `Attesting`, while the health line told the
+    /// operator to wait for the source to go quiet — the one thing that
+    /// could never release it. A veto does not clear on its own: it
+    /// clears when the authority's report agrees with the mirror, or
+    /// not at all.
+    Vetoing,
 }
 
 /// One coherent snapshot of the runtime's observable state, for the
