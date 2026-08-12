@@ -656,7 +656,9 @@ impl StatusSnapshot {
                          table size. Waiting will not clear it. \
                          Check which bird `birdc` is talking to on THIS box; where the \
                          routes legitimately come from elsewhere, `require-table-complete \
-                         off` is the right answer. The adopted FIB keeps forwarding \
+                         off` is the right answer — but it is read at bring-up, so it \
+                         needs a daemon RESTART, and a reload will not do it (from here a \
+                         reload is refused outright). The adopted FIB keeps forwarding \
                          untouched meanwhile, and every steering change is refused while \
                          this holds"
                     )
@@ -2583,6 +2585,17 @@ mod tests {
         assert!(
             vetoed.contains("Waiting will not clear it"),
             "and say plainly that waiting is not the remedy: {vetoed}"
+        );
+        // The opt-out it recommends is read at bring-up, and
+        // `reconfigure` never installs or removes the completeness
+        // handle — so recommending it without saying RESTART sends an
+        // operator to edit a file and reload into no change at all,
+        // from a state where the reload is refused anyway (review
+        // finding).
+        assert!(
+            vetoed.contains("RESTART"),
+            "recommending `require-table-complete off` without saying it needs a restart \
+             is a remedy that silently does nothing: {vetoed}"
         );
 
         // The permitting posture keeps the quiescence wording, so this

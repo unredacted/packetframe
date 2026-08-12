@@ -1099,13 +1099,19 @@ carrying that traffic; VPP still is.
   check lands). Only *"not the authority feeding it ... Waiting will
   not clear it"* is the persistent one below.
 - **A persistent disagreement is the case that needs a decision**: a
-  local bird that does not carry the mirror's table, or a mirror fed
-  from a different source than the authority measures. Make them agree,
-  or run that box without an authority. Only if neither is possible is
-  the escape a cold restart (stop the daemon, `packetframe detach
-  --all`, start) — it tears VPP down and costs a full resync, the exact
-  trade the deferral exists to avoid, so it is a last resort and not a
-  troubleshooting step.
+  local bird that does not carry the mirror's table, a bird carrying no
+  routes at all, or a mirror fed from a different source than the
+  authority measures. Make them agree, or run that box without an
+  authority.
+  **`require-table-complete off` needs a restart, not a reload.** It is
+  read at bring-up, and `reconfigure` never touches the runtime's
+  completeness handle — so editing it and reloading stores the new
+  value and changes nothing, and from a vetoed adopted resync the
+  reload is refused outright anyway. Since a restart is required
+  regardless, the cold sequence below is the same operation: stop the
+  daemon, `packetframe detach --all`, start. It tears VPP down and
+  costs a full resync, the exact trade the deferral exists to avoid, so
+  it is a last resort and not a troubleshooting step.
 - **Before a rollout, check the authority AGREES — not that bird is
   running.** The two are different, and this box proved it: bird was up
   the whole time.
