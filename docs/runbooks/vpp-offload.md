@@ -1111,12 +1111,24 @@ module's own deltas.
 > bundles parse it whole, and a rollback has to keep working. Limits
 > worth knowing:
 >
-> - A daemon that never wrote a pid file (the write is non-fatal, and
->   happens after attach) is found by a `/proc` scan instead. That scan
->   matches a binary named `packetframe` running `run`, so an unrelated
->   process named the same way will make `detach` refuse and name the
->   pid. That is deliberate — refusing is recoverable, unlinking under
->   a live daemon is not.
+> - A daemon whose pid-file write failed (it is non-fatal, and happens
+>   after attach) is found by its **identity sidecar**, which the daemon
+>   goes on to write and which names its own pid — so nothing depends on
+>   what the binary is called. If that is missing too, a `/proc` scan is
+>   the last backstop. The scan matches a binary named `packetframe`
+>   running `run`, so an unrelated process named that way will make
+>   `detach` refuse and name the pid. That is deliberate — refusing is
+>   recoverable, unlinking under a live daemon is not.
+>
+>   **Residual, deliberate:** a daemon that wrote *neither* file — an
+>   unwritable state dir — *and* runs under a binary name sharing no
+>   prefix with `packetframe` is invisible to all three checks, and
+>   `detach` will proceed. Refusing on every recordless state instead
+>   would disable `detach` after every clean stop, since the daemon
+>   removes both files on the way out and `detach` is the advertised
+>   recovery path. Closing it properly means checking whether any
+>   process holds the pinned links, which is evidence that never goes
+>   through a pid; that is not built.
 > - The scan has to *complete* to count as evidence of absence. If
 >   `/proc` cannot be listed, or a process in it cannot be examined
 >   (running `detach` as a non-root user is the ordinary cause), the

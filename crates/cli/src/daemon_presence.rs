@@ -195,6 +195,16 @@ pub enum Record {
     Unreadable(String),
     /// A pid, and an identity if the daemon that wrote it recorded one.
     Found(i32, Option<DaemonIdentity>),
+    /// A pid from a record that is not root-owned, so its provenance is
+    /// whoever could write the state directory.
+    ///
+    /// Kept apart from `Found` rather than folded into it: an
+    /// unauthenticated record may still show that a pid is DEAD — that
+    /// is a fact about `/proc`, not about the file — and `detach` after
+    /// a crash depends on it. What it may not do is confirm a LIVE pid,
+    /// which is what let a planted record aim root's SIGHUP (review
+    /// finding).
+    Unauthenticated(i32),
 }
 
 /// What a search of the process table established.
@@ -293,19 +303,47 @@ fn decide_from_record(
         // after every module attaches — deliberately, so systemd's
         // `PIDFile=` never points at a half-attached daemon — and a
         // failed write is non-fatal, so a live daemon can legitimately
-        // have none. The scan is the independent check, and on this
-        // branch it is the ONLY evidence in play — so `decide` demotes
-        // this to `Unknown` unless the scan actually completed. A scan
-        // that could not look is not a scan that looked and saw
-        // nothing, which is the polarity the deleted /proc scan had
-        // backwards and that its replacement re-introduced one level
-        // down (review findings).
+        // have none. Reaching here means the sidecar did not cover it
+        // either (`presence_of` reads that first), so the scan is the
+        // only evidence in play — and `decide` demotes this to
+        // `Unknown` unless the scan actually completed. A scan that
+        // could not look is not a scan that looked and saw nothing,
+        // which is the polarity the deleted /proc scan had backwards
+        // and that its replacement re-introduced one level down
+        // (review findings).
+        //
+        // THE RESIDUAL, stated because it is a deliberate trade and not
+        // an oversight: a completed scan is still name-limited, so a
+        // daemon that wrote NEITHER file and runs under a binary name
+        // sharing no prefix with ours reads as absent. Refusing on
+        // every recordless `Absent` instead would disable `detach`
+        // after every clean stop — the daemon removes both files on the
+        // way out, and `detach` is the advertised recovery path — which
+        // trades a narrow hole for a certain one. Closing it properly
+        // needs evidence that does not go through pids at all: whether
+        // any process holds the pinned links. See the runbook.
         Record::Absent => {
             return DaemonPresence::Gone {
                 why: "no pid file".into(),
             }
         }
         Record::Unreadable(why) => return DaemonPresence::Unknown { why },
+        // A record anyone could have written names a pid; it does not
+        // vouch for it. Liveness still applies below — a dead pid is
+        // dead whoever claimed it, and `detach` after a crash needs
+        // that — but a LIVE one cannot be confirmed from here, which is
+        // what let a planted record pick the process root SIGHUPs
+        // (review finding).
+        Record::Unauthenticated(pid) if proc_alive => {
+            return DaemonPresence::Unknown {
+                why: format!(
+                    "pid {pid} is running, but the record naming it is not root-owned — \
+                     anything with write access to the state directory could have put it \
+                     there, so it cannot be acted on"
+                ),
+            }
+        }
+        Record::Unauthenticated(pid) => (pid, None),
         Record::Found(pid, id) => (pid, id),
     };
     if !proc_alive {
@@ -454,34 +492,57 @@ pub fn self_boot_id() -> Option<String> {
 /// THERE used to supply an identity that never passed this function at
 /// all.
 ///
-/// Root-owned, a regular file, and not group- or world-writable. An
-/// attacker with directory write can still unlink it; anything they
-/// create in its place is theirs and fails, which drops the identity
-/// and falls back to the executable match — as if none were recorded.
+/// Unlinking it is still available to an attacker with directory write;
+/// anything they create in its place is theirs and fails the check,
+/// which drops the identity — as if none had been recorded. What that
+/// falls back to is no longer an executable match alone: the pid file
+/// must itself be root-owned before the identity-less path will confirm
+/// anything (review finding).
 #[cfg(target_os = "linux")]
-fn read_authentic_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
+fn read_authentic_identity(path: &Path, pid: Option<i32>) -> Option<DaemonIdentity> {
+    let (raw, root_owned) = read_with_provenance(path).ok()?;
+    if !root_owned {
+        return None;
+    }
+    let (recorded_pid, id) = DaemonIdentity::decode(&raw).ok()?;
+    // A sidecar naming a different pid is left from a previous daemon.
+    // Comparing a live process against a dead one's ticks would call
+    // the live one reused, so this reads as "no identity recorded".
+    //
+    // `None` is the case where there is no pid file to disagree with,
+    // so the sidecar's own pid is the record — see `presence_of`.
+    if pid.is_some_and(|pid| recorded_pid != pid) {
+        return None;
+    }
+    id
+}
+
+/// Read a state file and say whether it was root-owned, through ONE
+/// descriptor.
+///
+/// Provenance rather than a bare read because the two files are trusted
+/// differently and both are trusted for something: the sidecar only if
+/// authentic, the pid file's pid for liveness either way. Returning the
+/// bit alongside the bytes is what stops a caller reading the file and
+/// then forgetting to ask.
+///
+/// Root-owned, a regular file, and not group- or world-writable. An
+/// attacker with directory write can still unlink either file; anything
+/// they create in its place is theirs and fails this.
+#[cfg(target_os = "linux")]
+fn read_with_provenance(path: &Path) -> std::io::Result<(String, bool)> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    let meta = f.metadata().ok()?;
-    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-        return None;
-    }
+        .open(path)?;
+    let meta = f.metadata()?;
+    let root_owned = meta.is_file() && meta.uid() == 0 && meta.mode() & 0o022 == 0;
     let mut raw = String::new();
-    f.read_to_string(&mut raw).ok()?;
-    let (recorded_pid, id) = DaemonIdentity::decode(&raw).ok()?;
-    // A sidecar naming a different pid is left from a previous daemon.
-    // Comparing a live process against a dead one's ticks would call
-    // the live one reused, so this reads as "no identity recorded".
-    if recorded_pid != pid {
-        return None;
-    }
-    id
+    f.read_to_string(&mut raw)?;
+    Ok((raw, root_owned))
 }
 
 /// Establish presence from the record at `pid_path`. Thin I/O over
@@ -493,8 +554,8 @@ pub fn presence_of(
     exe_matches: impl Fn(i32) -> bool,
     scan: impl Fn() -> Scan,
 ) -> DaemonPresence {
-    let record = match std::fs::read_to_string(pid_path) {
-        Ok(s) => match DaemonIdentity::decode(&s) {
+    let record = match read_with_provenance(pid_path) {
+        Ok((s, root_owned)) => match DaemonIdentity::decode(&s) {
             // The pid file yields a PID AND NOTHING ELSE. It is not
             // authenticated, so an identity read from it would let an
             // attacker with directory write plant a combined record and
@@ -502,16 +563,29 @@ pub fn presence_of(
             // an inline identity was preferred here (review finding).
             // It also stays a bare pid on the write side, because CLIs
             // from other bundles parse it whole.
-            Ok((pid, _unauthenticated)) => {
-                Record::Found(pid, read_authentic_identity(identity_path, pid))
+            Ok((pid, _unauthenticated)) if root_owned => {
+                Record::Found(pid, read_authentic_identity(identity_path, Some(pid)))
             }
+            Ok((pid, _)) => Record::Unauthenticated(pid),
             Err(e) => Record::Unreadable(format!("unreadable {}: {e}", pid_path.display())),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Record::Absent,
+        // NO pid file, which is not the same as no daemon: the write is
+        // non-fatal and happens after attach, and the daemon carries on
+        // to write its sidecar. So the sidecar is the record here — it
+        // carries its own pid, it is authenticated, and it identifies
+        // the daemon WITHOUT reference to what its binary is called,
+        // which is the case the name-limited `/proc` scan cannot see
+        // (review finding).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match read_authentic_identity(identity_path, None) {
+                Some(id) => Record::Found(id.pid, Some(id)),
+                None => Record::Absent,
+            }
+        }
         Err(e) => Record::Unreadable(format!("cannot read {}: {e}", pid_path.display())),
     };
     let pid = match &record {
-        Record::Found(pid, _) => *pid,
+        Record::Found(pid, _) | Record::Unauthenticated(pid) => *pid,
         _ => return decide(record, false, None, false, scan),
     };
     // Not directory existence: a zombie keeps its entry and its start
@@ -776,7 +850,7 @@ mod tests {
         std::fs::write(&ident, real.encode()).expect("write");
         std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         assert!(
-            read_authentic_identity(&ident, me).is_none(),
+            read_authentic_identity(&ident, Some(me)).is_none(),
             "a record any user can write must not decide which pid is our daemon"
         );
 
@@ -788,6 +862,79 @@ mod tests {
         assert!(
             !matches!(planted, DaemonPresence::Running { .. }),
             "an identity in the unauthenticated pid file is not an identity: {planted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record anyone could have written names a pid; it vouches for
+    /// nothing.
+    ///
+    /// With directory write and no sidecar to authenticate, an
+    /// unprivileged user could plant a pid file naming any
+    /// `packetframe* run` process — one from another bundle, with its
+    /// own state directory — and the identity-less path read the
+    /// widened executable match as proof it was ours. A root
+    /// `reconfigure` then SIGHUPs a stranger into a config reload
+    /// (review finding).
+    ///
+    /// Liveness is the exception, and deliberately so: a dead pid is
+    /// dead whoever named it. That keeps `detach` working after a crash
+    /// on a state dir the daemon no longer owns.
+    #[test]
+    fn an_unauthenticated_record_cannot_confirm_a_live_pid() {
+        for exe in [true, false] {
+            let live = decide(Record::Unauthenticated(42), true, None, exe, || {
+                Scan::NoneFound
+            });
+            assert!(
+                matches!(live, DaemonPresence::Unknown { .. }),
+                "exe_matches={exe}: a planted record must not be able to name the process \
+                 root acts on: {live:?}"
+            );
+            let dead = decide(Record::Unauthenticated(42), false, None, exe, || {
+                Scan::NoneFound
+            });
+            assert!(
+                is_gone(&dead),
+                "exe_matches={exe}: but a dead pid is dead whoever named it, or `detach` \
+                 stops working after a crash: {dead:?}"
+            );
+        }
+    }
+
+    /// A daemon whose pid-file write failed is found by its sidecar.
+    ///
+    /// The write is non-fatal and the daemon carries on to record its
+    /// identity, so this is the ordinary shape of "no pid file, live
+    /// daemon" — and the `/proc` scan that used to be the only
+    /// backstop for it is name-limited by construction, so a daemon
+    /// deployed under an unrelated binary name was invisible and
+    /// `detach` unlinked pins beneath it (review finding). The sidecar
+    /// identifies it without reference to what it is called.
+    ///
+    /// Root-only, because the point is a root-owned record and this
+    /// cannot forge one. It runs in the qemu CI job, which is root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_whose_pid_write_failed_is_found_by_its_sidecar() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pf-sidecar-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let pidfile = dir.join("packetframe.pid");
+        let ident = dir.join("packetframe.identity");
+        // No pid file at all — only the identity, naming this process.
+        let real = DaemonIdentity::current().expect("own identity");
+        std::fs::write(&ident, real.encode()).expect("write");
+
+        let p = presence_of(&pidfile, &ident, |_| false, || Scan::NoneFound);
+        assert!(
+            matches!(p, DaemonPresence::Running { .. }),
+            "the sidecar names a live process and is root-owned; nothing about the \
+             executable's NAME may be needed to find it: {p:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

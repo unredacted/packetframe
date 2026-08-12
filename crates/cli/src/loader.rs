@@ -2141,49 +2141,50 @@ mod vpp_detach_tests {
     /// pins under it leaves the program attached through its open FDs
     /// and reports success, which is the 2026-04-21 outage.
     ///
-    /// Uses a legacy record naming THIS process with a deliberately
-    /// non-matching exe check: a live pid whose identity cannot be
-    /// established. The only safe reading is "cannot tell", and the
-    /// only safe action is to stop.
+    /// Uses a legacy record naming THIS process: a live pid whose
+    /// identity cannot be established. The only safe reading is "cannot
+    /// tell", and the only safe action is to stop.
+    ///
+    /// The record is made world-writable on purpose, so the assertion
+    /// holds whether or not the suite runs as root — and so it covers
+    /// the second half of the rule as well: a record anyone could have
+    /// written confirms nothing about a LIVE pid, whatever the
+    /// executable says, because otherwise a planted pid file picks the
+    /// process root signals (review finding). The authentic legacy
+    /// record, which this test cannot create without being root, is
+    /// covered in `daemon_presence`'s policy table.
     #[cfg(target_os = "linux")]
     #[test]
     fn detach_refuses_a_daemon_it_cannot_rule_out() {
         use crate::daemon_presence::{presence_of, DaemonPresence};
+        use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("pf-detach-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A legacy record — pid only — naming a process that really is
         // running. This is what an older daemon leaves behind.
-        std::fs::write(dir.join(PIDFILE_NAME), format!("{}\n", std::process::id())).unwrap();
+        let pidfile = dir.join(PIDFILE_NAME);
+        std::fs::write(&pidfile, format!("{}\n", std::process::id())).unwrap();
+        std::fs::set_permissions(&pidfile, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-        // The exe check fails, as it does whenever the CLI runs from a
-        // different path than the daemon.
         // A scan that ran and found nothing, so what is under test is
-        // what the RECORD alone establishes.
-        let p = presence_of(
-            &dir.join(PIDFILE_NAME),
-            &dir.join(IDENTITY_NAME),
-            |_| false,
-            || crate::daemon_presence::Scan::NoneFound,
-        );
-        assert!(
-            matches!(p, DaemonPresence::Unknown { .. }),
-            "a live pid with no verifiable identity must be Unknown, not Gone — Gone is \
-             what let detach proceed: {p:?}"
-        );
-
-        // And the same record with the exe check passing still resolves
-        // to Running, so the guard has not simply been loosened.
-        assert!(matches!(
-            presence_of(
-                &dir.join(PIDFILE_NAME),
+        // what the RECORD alone establishes — with the exe check
+        // failing, as it does whenever the CLI runs from a different
+        // path than the daemon, and then passing.
+        for exe in [false, true] {
+            let p = presence_of(
+                &pidfile,
                 &dir.join(IDENTITY_NAME),
-                |_| true,
-                || crate::daemon_presence::Scan::NoneFound
-            ),
-            DaemonPresence::Running { .. }
-        ));
+                |_| exe,
+                || crate::daemon_presence::Scan::NoneFound,
+            );
+            assert!(
+                matches!(p, DaemonPresence::Unknown { .. }),
+                "exe_matches={exe}: a live pid with no verifiable identity must be Unknown, \
+                 not Gone — Gone is what let detach proceed: {p:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
