@@ -2870,6 +2870,16 @@ pub fn snapshot_links(state: &ActiveState) -> Vec<(String, u32, AttachMode)> {
         .collect()
 }
 
+/// The custom-FIB control plane's last integrity check, for the
+/// module's health surface.
+///
+/// `None` in kernel-fib mode, where no control plane runs at all, and
+/// on a control plane with no route source — neither has a bird to
+/// compare against, so neither has a verdict to withhold.
+pub fn integrity_posture(state: &ActiveState) -> Option<crate::fib::integrity::IntegrityPosture> {
+    state.route_controller.as_ref()?.integrity_posture()
+}
+
 // Read current stats, aggregated across all CPUs.
 pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     use aya::maps::PerCpuArray;

@@ -21,14 +21,16 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::fib::integrity::{shared_snapshot, IntegrityChecker, IntegrityConfig, SharedSnapshot};
+use crate::fib::integrity::{
+    shared_snapshot, IntegrityChecker, IntegrityConfig, IntegrityPosture, SharedSnapshot,
+};
 use crate::fib::netlink_neigh::{
     FallbackDefaultSpec, LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver,
 };
@@ -411,12 +413,32 @@ impl RouteController {
         })
     }
 
-    /// Shared snapshot from the integrity checker. `None` when BMP
-    /// isn't configured. Callers read the snapshot to diagnose drift
-    /// or to gate a BmpStalled alert on "bird still thinks there are
-    /// peers to hear from."
-    pub fn integrity_snapshot(&self) -> Option<SharedSnapshot> {
-        self.integrity.clone()
+    /// The last integrity check, for the module's health surface.
+    ///
+    /// `None` when no checker is running — no route source is
+    /// configured, so there is no bird to cross-check against and no
+    /// verdict to report. That is the one case the health surface
+    /// prints no row for; every other case has something to say,
+    /// including "nothing has compared yet".
+    ///
+    /// Replaces an `integrity_snapshot()` getter that had no caller
+    /// anywhere in the tree: the checker compared bird against the
+    /// mirror every 300 s and threw the result away, leaving a debug
+    /// log as the only way to see it.
+    ///
+    /// `try_read` rather than a blocking one. This is called from the
+    /// daemon's sync signal loop today, where blocking would be safe,
+    /// but `Module::health_check` is a public surface and a blocking
+    /// tokio read panics inside an async context. The writer holds this
+    /// lock for a handful of field assignments once per interval, so
+    /// losing the race is vanishingly rare and says so when it happens
+    /// rather than being mistaken for "no check yet".
+    pub fn integrity_posture(&self) -> Option<IntegrityPosture> {
+        let snapshot = self.integrity.as_ref()?;
+        Some(match snapshot.try_read() {
+            Ok(snap) => IntegrityPosture::observe(&snap, Instant::now()),
+            Err(_) => IntegrityPosture::Unread,
+        })
     }
 
     /// Cooperative shutdown. Signals the cancellation token, awaits

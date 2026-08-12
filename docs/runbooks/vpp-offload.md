@@ -1100,6 +1100,10 @@ carrying that traffic; VPP still is.
   or a mirror still short — including every startup before the first
   check lands). Only *"not the authority feeding it ... Waiting will
   not clear it"* is the persistent one below.
+  Fast-path's `fib-integrity` row answers it from the other side, and
+  more directly: an unreachable `birdc` shows there as `could not
+  complete: <error>`, a bird carrying the wrong table as a drift or
+  zero-authority verdict.
 - **A persistent disagreement is the case that needs a decision**: a
   local bird that does not carry the mirror's table, a bird carrying no
   routes at all, or a mirror fed from a different source than the
@@ -1131,79 +1135,100 @@ carrying that traffic; VPP still is.
   running.** The two are different, and this box proved it: bird was up
   the whole time.
 
-  **Do not hand-roll the comparison, and do not read silence as
-  agreement.** The checker compares bird's `master4` **plus** `master6`
-  against the fast-path mirror's v4+v6 count. It logs the successful
-  comparison at **debug**; at the default `log-level info` a healthy
-  check prints *nothing at all*, and its three failure paths
-  (`integrity check: birdc route count failed`, `... birdc protocols
-  failed`, `... mirror_counts failed`) print something different again.
-  So an absent `integrity drift above threshold` line is equally
-  consistent with the checker never having run, `birdc` failing every
-  time, or the log having rotated — which would approve a rollout onto
-  a handle that is `Unknown` and will refuse.
+  **Read `fib-integrity` in `packetframe status`.** It is the fast-path
+  module's own row and it carries the last comparison verbatim — both
+  counts, the drift against the threshold that was actually applied,
+  and the age beside it:
 
-  **The cheapest positive evidence is the canary steer itself.** With
-  `require-table-complete on`, a steer the authority will not support
-  is *refused*, and the refusal names the verdict verbatim — "the route
-  mirror holds N routes but the authority reports only M — that is not
-  the authority feeding this mirror", or "completeness is unknown", or
-  "too old to act on". Nothing is steered when it refuses, so rung 0's
-  first `steer on` doubles as the test, and a refusal costs a message
-  rather than traffic. Read the reason it prints; do not retry past it.
-
-  To know *before* attempting, sample the checker directly. Both counts
-  come from `birdc`, and the comparison is logged — but only at debug,
-  so the level has to come up first. `log-level` in the config is
-  hot-reloadable (v0.2.7+), so this costs a reload rather than a
-  restart: the checker keeps its 300 s cadence across it, and nothing is
-  detached.
-
-  ```bash
-  birdc show route count | grep -E 'in table master(4|6)'
-  # /etc/packetframe/packetframe.conf: global -> log-level debug
-  packetframe reconfigure && sleep 310
-  journalctl -u packetframe --since '-6min' \
-      | grep -E 'integrity check OK|integrity drift above threshold|integrity check:'
-  # then put log-level back and reload again — whole-process debug on a
-  # forwarding box is loud, and nothing above needs it to stay on.
+  ```
+  $ packetframe status                     # message wrapped here; it prints on one line
+    fast-path: healthy
+      fib-integrity  healthy — bird 1272306 prefixes, mirror 1272281 — drift 0.002%,
+                     within the 1.000% warn threshold. A steering gate reads this same
+                     comparison and would permit a steer — this is the positive evidence
+                     a rollout needs ... (last ok 41s ago)
   ```
 
-  `integrity check OK` carrying `bird_routes` and `packetframe_routes`
-  is the evidence the gate acts on. A drift warning, one of the three
-  failure lines, or **no line at all** are each not a pass.
+  **`would permit a steer` is the pass, and it is the only one.** The
+  row carries two separate facts and you want the second:
 
-  **Two ways this reload can no-op.** `RUST_LOG` in the daemon's
-  environment overrides the config for the whole life of the process —
-  including a drop-in some earlier bring-up left behind — and the daemon
-  says so, once, the first time the config would have applied a level:
-  *"RUST_LOG is set; the config's log-level is ignored for this
-  process"*. Clearing it is the one case that still costs a restart
-  (`systemctl edit packetframe`, drop the `Environment=` line, then the
-  cold sequence — a plain `systemctl restart` crash-loops on surviving
-  pins, see [reconfigure.md](reconfigure.md)). If you would rather keep
-  it, override with the narrower filter instead and skip the config
-  entirely: `RUST_LOG=info,packetframe_fast_path::fib::integrity=debug`
-  is the one thing a whole-process level cannot express, and it is
-  quieter than `debug`. Second: a reload the daemon *refuses* (a config
-  that does not parse, or one `validate_vpp_offload` rejects) applies no
-  part of itself, level included. `packetframe reconfigure` exits
-  non-zero and names the reason — read it rather than moving on to the
-  `journalctl` line, which would show the same empty output as a healthy
-  checker at info.
+  - The **drift-catch diagnostic** — `drift N%, within/at or above the
+    M% warn threshold` — is fast-path's own alarm against the
+    configurable `drift-warn-fraction`. It is a good thing to watch and
+    it is **not** the rollout verdict. At a tuned warn fraction the two
+    part company by design: 3% drift is "within" a 5% warn threshold
+    while the gate, on its own fixed `STEER_MAX_DRIFT`, refuses.
+  - The **rollout verdict** — `A steering gate reads this same
+    comparison and would permit a steer` / `and REFUSES: <reason>` — is
+    produced by calling the gate's own decision function on the same
+    report the gate receives, so it cannot disagree with what the steer
+    will actually do. On a refusal the reason is the refusal message
+    verbatim, remedy included.
 
-  > What is still awkward here — turning a log level up and reading a
-  > log, rather than asking — comes from one gap: `IntegrityChecker`'s
-  > snapshot is published and `RouteController::integrity_snapshot()`
-  > has no caller, so the verdict has no `status` surface outside a
-  > refusal message. Worth closing; until it is, prefer the canary
-  > refusal above, which needs neither.
+  | The row says | What it means |
+  | --- | --- |
+  | `would permit a steer` | Agreement. Proceed. |
+  | `no comparison has completed yet` | The checker has not reached its first interval, or has only just started. **Not agreement** — wait 300 s and read it again. |
+  | `REFUSES: the route mirror holds N of the authority's M routes` | The mirror is short — usually still loading. |
+  | `REFUSES: ... that is not the authority feeding this mirror` | The 23 h deferral above: bird up, carrying a table that is not this one. |
+  | `REFUSES: completeness is unknown: the authority reports zero routes` | The degenerate form of the same thing — bird answering, and answering nothing. |
+  | `REFUSES: the last completeness check was Ns ago, too old to act on` | Aged past the 900 s window. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
+  | `could not complete: <error>` with `HISTORY` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
+  | no `fib-integrity` row at all | Nothing is checking on this box — kernel-fib mode, or a control plane with no route source. The authority will read `Absent`. |
 
-  Two traps that make a hand-rolled check pass a box that will veto.
-  **`master6` counts**: a box whose `master4` matches but whose
-  `master6` is missing or wrong still fails the combined comparison, so
-  checking `master4` alone approves a rollout the gate will refuse.
-  And **`fib-synced`'s installed count is not the number to compare** —
+  The row appears whenever a checker exists, *including before its
+  first comparison*, and that is the distinction the check turns on:
+  silence used to be equally consistent with the checker never having
+  run, `birdc` failing every time, or the log having rotated — and
+  would approve a rollout onto a handle that is `Unknown` and will
+  refuse.
+
+  `packetframe status` reads a snapshot the daemon publishes every 5 s,
+  so the row is at most that stale — but the comparison behind it is up
+  to one interval (300 s) old by design, which is what the `last ok Ns
+  ago` beside it is for. Its ceiling in normal operation is ~320 s (the
+  interval plus two 10 s `birdc` budgets), so an age climbing past that
+  with **no** error alongside it means checks have stopped landing
+  altogether rather than failing — look for the checker task, not for
+  bird.
+
+  You do not have to watch that number to stay safe. Past
+  `STEER_MAX_REPORT_AGE` (900 s) the rollout verdict becomes `REFUSES:
+  ... too old to act on` on its own — the row asks the gate's own
+  decision function rather than re-deriving the rule, so the two cannot
+  disagree, and `status` cannot advertise evidence for a rollout the
+  gate is already refusing. A parity test pins them across the
+  boundary. Reading the age is for catching the problem in the
+  ~10 minutes before that, not for avoiding a bad rollout.
+
+  **The other positive evidence is the canary steer itself**, and it
+  costs nothing to lean on. With `require-table-complete on`, a steer
+  the authority will not support is *refused*, and the refusal names
+  the verdict verbatim — "the route mirror holds N routes but the
+  authority reports only M — that is not the authority feeding this
+  mirror", or "completeness is unknown", or "too old to act on".
+  Nothing is steered when it refuses, so rung 0's first `steer on`
+  doubles as the test, and a refusal costs a message rather than
+  traffic. Read the reason it prints; do not retry past it.
+
+  **Do not hand-roll the comparison from `birdc` output.** Three traps
+  make a hand-rolled check pass a box that will veto.
+
+  **The `networks` column, not the `routes` one.** On the line `N of M
+  routes for K networks in table master4`, the mirror holds one entry
+  per *prefix*, so `K` is the comparable number. `N` counts paths, and
+  on a multihomed box it is larger by roughly the number of upstreams —
+  measured on the production primary as 2,594,691 routes against a
+  1,303,120-entry mirror, a 49.8% "drift" that was pure units (#168).
+  Read the wrong column by hand and a converged box looks broken.
+
+  **`master6` counts.** The checker compares `master4` **plus**
+  `master6` against the mirror's v4+v6, so a box whose `master4`
+  matches while its `master6` is missing or wrong still fails the
+  combined comparison, and checking `master4` alone approves a rollout
+  the gate will refuse.
+
+  **`fib-synced`'s installed count is not the number to compare** —
   that is VPP's table, which is v4-only by policy, against an authority
   figure that includes v6.
 

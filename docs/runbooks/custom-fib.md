@@ -204,11 +204,43 @@ periodic job that shells out to `birdc show route count` and
 programmer's mirror size, and logs warnings on drift ≥ 1%:
 
 ```
-WARN integrity drift above threshold bird_routes=1048587 packetframe_routes=1048501 drift_fraction=0.000082
+WARN integrity drift above threshold bird_prefixes=1048587 packetframe_prefixes=1048501 drift_fraction=0.000082
 ```
 
 The drift threshold is `IntegrityConfig::drift_warn_fraction`
 (default `0.01` = 1%). Below threshold goes to `DEBUG` level only.
+A bird reporting **zero** routes in `master4`/`master6` warns on its
+own line (`integrity check: bird reports no routes in master4/master6`)
+rather than passing silently — an authority with no routes cannot
+attest anything, and it used to log nothing at all.
+
+**Read the verdict from `packetframe status`, not from the log.** The
+same comparison is the `fib-integrity` subsystem row on the fast-path
+module, carrying both counts, the drift against the threshold that was
+applied, the sample's age, and any error:
+
+```
+  fast-path: healthy
+    fib-integrity  healthy — bird 1272306 prefixes, mirror 1272281 — drift 0.002%,
+                   within the 1.000% warn threshold. A steering gate reads this same
+                   comparison and would permit a steer ... (last ok 41s ago)
+```
+
+Two facts, and they are not interchangeable. The drift against the
+warn threshold is **this module's** alarm, and `drift-warn-fraction`
+tunes it. The sentence after it is what a second tier's steering gate
+would decide from the same comparison, obtained by calling that gate's
+own decision function — which uses its own fixed threshold and its own
+900 s freshness window, so at a tuned warn fraction the two verdicts
+legitimately differ. For a rollout, the second one is the one that
+matters.
+
+The row is present whenever a checker is running, **including before
+its first comparison completes** — "no comparison has completed yet"
+and "compared, and they agree" are deliberately different lines,
+because a rollout is gated on the difference (see
+`docs/runbooks/vpp-offload.md`). No row at all means no checker: either
+`kernel-fib` mode or a control plane with no `route-source`.
 
 BmpStalled:
 

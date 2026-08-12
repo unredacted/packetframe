@@ -11,6 +11,12 @@
 pub mod hash;
 pub mod types;
 
+/// Ungated deliberately: it is the integrity check's *result* and its
+/// operator-facing rendering, with no syscalls in it, so the tests run
+/// on a macOS dev loop instead of only in the qemu job. See the module
+/// docs.
+pub mod integrity_status;
+
 #[cfg(target_os = "linux")]
 pub mod controller;
 
