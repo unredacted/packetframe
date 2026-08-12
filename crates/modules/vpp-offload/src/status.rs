@@ -671,12 +671,15 @@ impl StatusSnapshot {
                     // "fixed" into a broken one.
                     format!(
                         "resync deferred: the completeness authority has not attested yet \
-                         — no report has arrived, the last one aged out, or the mirror is \
-                         still short of it — so release is blocked for now. The integrity \
-                         checker publishes a fresh report every interval (300 s) and this \
-                         releases itself once one agrees; the source holds {have} routes \
-                         against a floor of {want}. Nothing is dropping: the adopted FIB \
-                         keeps forwarding untouched"
+                         — no report has arrived, the last one aged out, the mirror is \
+                         still short of it, or the mirror has grown past the count the \
+                         last sample took (the checker measures both every 300 s, and a \
+                         loading DFZ moves further than that in between) — so release is \
+                         blocked for now. It releases itself once a sample agrees; the \
+                         source holds {have} routes against a floor of {want}. If the \
+                         authority really is behind rather than merely unasked, the next \
+                         sample says so and this line changes to name it. Nothing is \
+                         dropping: the adopted FIB keeps forwarding untouched"
                     )
                 } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(

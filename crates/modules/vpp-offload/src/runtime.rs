@@ -886,42 +886,35 @@ fn authority_posture(
     }
 }
 
-/// The verdict as it applies to the mirror **as it is now** — the same
-/// substitution [`authority_current`] makes before deciding the veto.
+/// The verdict on the sample **as it was taken** — both counts from the
+/// same instant.
 ///
-/// `TableCompleteness::verdict()` assesses the report's own recorded
-/// `mirror_routes`, which is the mirror as it was when the checker ran.
-/// The gate does not: it swaps in the current count and recomputes
-/// drift. Classifying the block reason from the un-substituted verdict
-/// therefore reads a different mirror than the decision it is
-/// explaining, and the two part company in exactly the case that
-/// matters — a report that WAS converged, with a source that has since
-/// outgrown it, vetoes while still assessing `Converged`, so the reason
-/// came out `AwaitingAuthority` and promised a self-clearing wait for a
-/// mismatch that persists (review finding).
+/// This function briefly substituted the LIVE mirror count first, to
+/// match what [`authority_current`] does before deciding the veto. That
+/// was an over-correction, and the two review findings that produced
+/// and then removed it are worth keeping together, because they look
+/// contradictory and are not.
 ///
-/// Only the REASON is derived here. `authority_current` keeps deciding
-/// the veto, unchanged, because it additionally requires the cached
-/// verdict to permit and changing that would move release semantics,
-/// which this fix has no business doing.
-fn authority_verdict_now(
+/// The first was right that the reason and the decision were reading
+/// different mirrors. The wrong conclusion I drew was that the
+/// classification should therefore substitute too — because a live
+/// mirror measured against a STALE authority count manufactures an
+/// `AuthorityMismatch` out of ordinary loading: a sample of 1.0M/1.0M
+/// at T, a mirror at 1.3M by T+200s, and the substitution calls that
+/// "the authority is measuring a different table" when the next 300 s
+/// check simply re-measures both and agrees (review finding).
+///
+/// So the fault question — *is the authority itself wrong* — is asked
+/// of the sample, where both numbers describe the same moment. A
+/// mismatch that is real survives into the next sample and is
+/// classified then, within one interval; one created by the clock does
+/// not. What the substituted view legitimately shows is that release is
+/// blocked RIGHT NOW, and that belongs in the blocked-but-clearing
+/// message, which names it.
+fn authority_sample_verdict(
     completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
-    mirror_now: u64,
 ) -> Option<packetframe_common::fib::Completeness> {
-    completeness.as_ref().map(|h| {
-        let substituted = h
-            .latest()
-            .map(|r| packetframe_common::fib::CompletenessReport {
-                mirror_routes: mirror_now,
-                ..r
-            });
-        packetframe_common::fib::assess(
-            substituted,
-            std::time::Instant::now(),
-            packetframe_common::fib::STEER_MAX_DRIFT,
-            packetframe_common::fib::STEER_MAX_REPORT_AGE,
-        )
-    })
+    completeness.as_ref().map(|h| h.verdict())
 }
 
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
@@ -1198,7 +1191,7 @@ impl Runtime {
                 // not be able to disagree about whether the authority is
                 // currently permitting.
                 authority_current(&c.completeness, c.source.route_count()),
-                authority_verdict_now(&c.completeness, c.source.route_count()),
+                authority_sample_verdict(&c.completeness),
             ),
         }
     }
@@ -2439,18 +2432,28 @@ mod tests {
         }
     }
 
-    /// The reason must be read off the SAME mirror the veto was
-    /// decided from.
+    /// A mirror that has moved since the last sample is not a faulty
+    /// authority.
     ///
-    /// `verdict()` assesses the report's recorded `mirror_routes`;
-    /// `authority_current` swaps in the live count first. A report that
-    /// was converged when it was taken, with a source that has since
-    /// outgrown its authority, therefore vetoes while still assessing
-    /// `Converged` — and the reason came out `AwaitingAuthority`,
-    /// promising a wait that clears itself for a mismatch that does not
-    /// (review finding).
+    /// **This test asserted the opposite one round earlier, and that
+    /// assertion was wrong.** It was written for a real finding — the
+    /// reason and the gate were reading different mirrors — but the
+    /// conclusion it encoded, that the classification should therefore
+    /// substitute the live count too, manufactures a permanent-sounding
+    /// verdict out of ordinary loading: the checker samples every 300 s,
+    /// a DFZ mirror grows past 1% drift in far less, and comparing that
+    /// live mirror against the stale authority number reads as "not the
+    /// authority feeding this mirror" when the next sample re-measures
+    /// both and agrees (review finding).
+    ///
+    /// The fault question is asked of the sample, where both numbers
+    /// describe one moment. A genuine mismatch survives into the next
+    /// sample and is classified then, within one interval; one created
+    /// by the clock does not. The gate still blocks meanwhile — that is
+    /// `authority_current`'s job and is unchanged — and the
+    /// blocked-but-clearing message is what says so.
     #[test]
-    fn the_verdict_is_reassessed_against_the_live_mirror() {
+    fn a_mirror_that_outgrew_its_sample_is_not_a_faulty_authority() {
         use packetframe_common::fib::{Completeness, CompletenessReport, TableCompleteness};
         let handle = std::sync::Arc::new(TableCompleteness::new());
         handle.publish(CompletenessReport {
@@ -2460,26 +2463,50 @@ mod tests {
         });
         let completeness = Some(handle);
 
-        // As reported: converged, and the cached verdict agrees.
+        // The sample itself: both counts from one instant, converged.
         assert!(matches!(
-            authority_verdict_now(&completeness, 1_000_000),
+            authority_sample_verdict(&completeness),
             Some(Completeness::Converged { .. })
         ));
 
-        // The source has since outgrown the authority. The gate vetoes
-        // on this, so the reason has to be the mismatch — not "no
-        // report yet".
+        // The source has grown since. The gate DOES block on the live
+        // count — unchanged, and correct.
         assert_eq!(authority_current(&completeness, 1_400_000), Some(false));
-        let verdict = authority_verdict_now(&completeness, 1_400_000);
-        assert!(
-            matches!(verdict, Some(Completeness::AuthorityMismatch { .. })),
-            "a mirror that has outgrown its authority is a mismatch, whatever the cached \
-             report said: {verdict:?}"
-        );
+
+        // But the authority is not what is wrong: nothing has asked it
+        // since, and the next check will. So the operator is told this
+        // clears itself, not to go restarting daemons.
         assert_eq!(
-            authority_posture(true, false, true, Some(false), verdict),
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                authority_sample_verdict(&completeness)
+            ),
+            AuthorityPosture::AwaitingAuthority,
+            "a stale authority count against a grown mirror is the clock, not a fault"
+        );
+
+        // And when the mismatch is real — both counts from the same
+        // sample — it is a fault, which is the shadow's actual case.
+        let real = std::sync::Arc::new(TableCompleteness::new());
+        real.publish(CompletenessReport {
+            authority_routes: 13,
+            mirror_routes: 1_303_920,
+            at: std::time::Instant::now(),
+        });
+        let real = Some(real);
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                authority_sample_verdict(&real)
+            ),
             AuthorityPosture::Vetoing,
-            "and it must reach the operator as a veto, not as a wait that clears itself"
+            "13 routes against 1.3M in ONE sample is the authority being wrong"
         );
     }
 
