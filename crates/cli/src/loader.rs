@@ -952,7 +952,7 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     let pid = match crate::daemon_presence::presence_of(
         &pid_path,
         &state_dir.join(IDENTITY_NAME),
-        |p| proc_exe_looks_like_a_daemon(p as libc::pid_t),
+        |p| is_daemon_process(p as libc::pid_t),
         scan_for_running_daemon,
     ) {
         crate::daemon_presence::DaemonPresence::Running { pid } => pid as libc::pid_t,
@@ -1076,6 +1076,33 @@ fn proc_exe_looks_like_a_daemon(pid: libc::pid_t) -> bool {
 ///
 /// `/proc/<pid>/exe` rather than `comm`, which is user-settable via
 /// `prctl` — the May 2026 audit Slice 4 finding.
+/// Whether `pid` is a packetframe DAEMON: our binary (or another copy
+/// of it), running the `run` subcommand.
+///
+/// One predicate, because the scan and the record path must ask the
+/// same question. They did not: the scan filtered argv for `run`, while
+/// the legacy record path took a bare executable match — so a stale
+/// pid-only file whose pid had been reused by a long `packetframe
+/// probe` from another bundle read as `Running`, and `reconfigure`
+/// SIGHUPed the probe (review finding).
+///
+/// Reading argv is sound only after the executable check: a spoofed
+/// `run` on its own proves nothing, which is why `comm` was rejected
+/// for this to begin with.
+#[cfg(target_os = "linux")]
+fn is_daemon_process(pid: libc::pid_t) -> bool {
+    if !proc_exe_looks_like_a_daemon(pid) {
+        return false;
+    }
+    // BYTES: `read_to_string` rejects the whole cmdline if any argument
+    // is not UTF-8, and a `--config` path may legally contain arbitrary
+    // bytes.
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => cmdline.split(|b| *b == 0).any(|a| a == b"run"),
+        Err(_) => false,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn scan_for_running_daemon() -> Option<i32> {
     let self_pid = std::process::id();
@@ -1090,28 +1117,8 @@ fn scan_for_running_daemon() -> Option<i32> {
         if pid == self_pid {
             continue;
         }
-        if !proc_exe_looks_like_a_daemon(pid as libc::pid_t) {
-            continue;
-        }
-        // And it must be the DAEMON, not another invocation of the same
-        // binary. Dropping this filter when the scanner came back would
-        // have made a concurrent `packetframe probe --duration ...`
-        // look like a daemon and refuse every `detach` for its
-        // lifetime — recovery blocked by an unrelated command (review
-        // finding). Safe to read argv here only because the exe check
-        // above already established the binary; a spoofed "run" alone
-        // proves nothing.
-        // BYTES. `read_to_string` rejects the whole cmdline if any
-        // argument is not UTF-8 — a `--config` path may legally contain
-        // arbitrary bytes — and a scan that cannot read the daemon's
-        // argv would then fail to find it, which `presence_of` turns
-        // into `Gone` and `detach` turns into unlinking pins beneath it
-        // (review finding, P1). An unreadable cmdline is not evidence
-        // of anything.
-        if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-            if cmdline.split(|b| *b == 0).any(|a| a == b"run") {
-                return Some(pid as i32);
-            }
+        if is_daemon_process(pid as libc::pid_t) {
+            return Some(pid as i32);
         }
     }
     None
@@ -1238,7 +1245,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     let presence = crate::daemon_presence::presence_of(
         &state_dir.join(PIDFILE_NAME),
         &state_dir.join(IDENTITY_NAME),
-        |p| proc_exe_looks_like_a_daemon(p as libc::pid_t),
+        |p| is_daemon_process(p as libc::pid_t),
         scan_for_running_daemon,
     );
     #[cfg(not(target_os = "linux"))]
@@ -1684,7 +1691,7 @@ fn print_module_health(state_dir: &Path) {
     let presence = crate::daemon_presence::presence_of(
         &state_dir.join(PIDFILE_NAME),
         &state_dir.join(IDENTITY_NAME),
-        |p| proc_exe_looks_like_a_daemon(p as libc::pid_t),
+        |p| is_daemon_process(p as libc::pid_t),
         scan_for_running_daemon,
     );
     // No /proc to cross-check against, so liveness is unknown rather
