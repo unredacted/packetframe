@@ -882,6 +882,44 @@ fn authority_posture(
     }
 }
 
+/// The verdict as it applies to the mirror **as it is now** — the same
+/// substitution [`authority_current`] makes before deciding the veto.
+///
+/// `TableCompleteness::verdict()` assesses the report's own recorded
+/// `mirror_routes`, which is the mirror as it was when the checker ran.
+/// The gate does not: it swaps in the current count and recomputes
+/// drift. Classifying the block reason from the un-substituted verdict
+/// therefore reads a different mirror than the decision it is
+/// explaining, and the two part company in exactly the case that
+/// matters — a report that WAS converged, with a source that has since
+/// outgrown it, vetoes while still assessing `Converged`, so the reason
+/// came out `AwaitingAuthority` and promised a self-clearing wait for a
+/// mismatch that persists (review finding).
+///
+/// Only the REASON is derived here. `authority_current` keeps deciding
+/// the veto, unchanged, because it additionally requires the cached
+/// verdict to permit and changing that would move release semantics,
+/// which this fix has no business doing.
+fn authority_verdict_now(
+    completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    mirror_now: u64,
+) -> Option<packetframe_common::fib::Completeness> {
+    completeness.as_ref().map(|h| {
+        let substituted = h
+            .latest()
+            .map(|r| packetframe_common::fib::CompletenessReport {
+                mirror_routes: mirror_now,
+                ..r
+            });
+        packetframe_common::fib::assess(
+            substituted,
+            std::time::Instant::now(),
+            packetframe_common::fib::STEER_MAX_DRIFT,
+            packetframe_common::fib::STEER_MAX_REPORT_AGE,
+        )
+    })
+}
+
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
     core: Rc<RefCell<Core>>,
@@ -1156,7 +1194,7 @@ impl Runtime {
                 // not be able to disagree about whether the authority is
                 // currently permitting.
                 authority_current(&c.completeness, c.source.route_count()),
-                c.completeness.as_ref().map(|h| h.verdict()),
+                authority_verdict_now(&c.completeness, c.source.route_count()),
             ),
         }
     }
@@ -2395,6 +2433,50 @@ mod tests {
                 AuthorityPosture::Attesting
             );
         }
+    }
+
+    /// The reason must be read off the SAME mirror the veto was
+    /// decided from.
+    ///
+    /// `verdict()` assesses the report's recorded `mirror_routes`;
+    /// `authority_current` swaps in the live count first. A report that
+    /// was converged when it was taken, with a source that has since
+    /// outgrown its authority, therefore vetoes while still assessing
+    /// `Converged` — and the reason came out `AwaitingAuthority`,
+    /// promising a wait that clears itself for a mismatch that does not
+    /// (review finding).
+    #[test]
+    fn the_verdict_is_reassessed_against_the_live_mirror() {
+        use packetframe_common::fib::{Completeness, CompletenessReport, TableCompleteness};
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        handle.publish(CompletenessReport {
+            authority_routes: 1_000_000,
+            mirror_routes: 1_000_000,
+            at: std::time::Instant::now(),
+        });
+        let completeness = Some(handle);
+
+        // As reported: converged, and the cached verdict agrees.
+        assert!(matches!(
+            authority_verdict_now(&completeness, 1_000_000),
+            Some(Completeness::Converged { .. })
+        ));
+
+        // The source has since outgrown the authority. The gate vetoes
+        // on this, so the reason has to be the mismatch — not "no
+        // report yet".
+        assert_eq!(authority_current(&completeness, 1_400_000), Some(false));
+        let verdict = authority_verdict_now(&completeness, 1_400_000);
+        assert!(
+            matches!(verdict, Some(Completeness::AuthorityMismatch { .. })),
+            "a mirror that has outgrown its authority is a mismatch, whatever the cached \
+             report said: {verdict:?}"
+        );
+        assert_eq!(
+            authority_posture(true, false, true, Some(false), verdict),
+            AuthorityPosture::Vetoing,
+            "and it must reach the operator as a veto, not as a wait that clears itself"
+        );
     }
 
     /// Only `AuthorityMismatch` is a veto; the rest clear themselves.
