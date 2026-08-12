@@ -1095,6 +1095,30 @@ module's own deltas.
 
 ## Install and upgrade on the router
 
+> **`detach` and `status` can be run from a newly deployed bundle.**
+> Until 2026-08-12 they could not: every liveness check asked whether
+> some process ran *the CLI's own executable path*, which is false
+> whenever a command runs from a new bundle while the old daemon is up
+> — the shape every upgrade has. `status` printed `STALE` over a live
+> daemon, `reconfigure` refused, and `detach` found no daemon and
+> **proceeded**, unlinking pins while the daemon still held the
+> `bpf_link` FDs.
+>
+> The daemon now records `(pid, start_ticks, boot_id)` in its pid file
+> and the checks verify against that, so the CLI's own path no longer
+> matters. Two limits worth knowing:
+>
+> - A daemon that never wrote a pid file (the write is non-fatal, and
+>   happens after attach) is found by a `/proc` scan instead. That scan
+>   matches a binary named `packetframe` running `run`, so an unrelated
+>   process named the same way will make `detach` refuse and name the
+>   pid. That is deliberate — refusing is recoverable, unlinking under
+>   a live daemon is not.
+> - `detach` refuses on "cannot tell", not only on "daemon present". If
+>   it refuses and you have established there is no daemon, remove the
+>   stale pid file from the state dir.
+
+
 VPP is **not** bundled in packetframe's .deb — 100 MB against 1.3 MB,
 mismatched cadence, and independent rollback, which the failover design
 wants anyway. It ships on its own release tag, built from *unmodified*

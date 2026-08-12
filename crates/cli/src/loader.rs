@@ -969,6 +969,47 @@ pub fn reconfigure(_config_path: &Path) -> Result<(), ReconfigureError> {
     ))
 }
 
+/// Whether `pid`'s executable could be a packetframe daemon — this
+/// build's binary, or another copy of it deployed elsewhere.
+///
+/// Path equality alone answers "is it MY binary", which is exactly the
+/// question that made every check in this module wrong during an
+/// upgrade. A daemon from the previous bundle lives at a different
+/// path, so an exe-path scan cannot see it, and a scan that cannot see
+/// it must not be read as proving it absent.
+///
+/// So the basename counts too, and ONLY for finding. A false positive
+/// here refuses a `detach` and names the pid, which an operator can
+/// look at and resolve; a false negative unlinks pins under a live
+/// daemon, which is the 2026-04-21 outage. Those are not symmetric.
+///
+/// This deliberately widens what the May 2026 audit narrowed, and not
+/// as far back. That finding was about `comm`, settable to anything by
+/// any local process via `prctl` with no file involved. Matching
+/// `/proc/<pid>/exe`'s basename requires actually controlling a binary
+/// named `packetframe`, exec'ing it, and carrying `run` in argv — and
+/// the worst it buys is a refusal that says which pid to look at.
+#[cfg(target_os = "linux")]
+fn proc_exe_looks_like_a_daemon(pid: libc::pid_t) -> bool {
+    if proc_exe_matches_current(pid) {
+        return true;
+    }
+    let Ok(target) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    // The kernel appends ` (deleted)` once the inode is unlinked, which
+    // is the state an upgraded-in-place daemon is in.
+    let target = target.to_string_lossy();
+    let target = target.strip_suffix(" (deleted)").unwrap_or(&target);
+    match (Path::new(target).file_name(), current.as_path().file_name()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Find a process running this executable, if there is one.
 ///
 /// **Finds only.** This was `daemon_pid`, and its answer was read as
@@ -996,7 +1037,7 @@ fn scan_for_running_daemon() -> Option<i32> {
         if pid == self_pid {
             continue;
         }
-        if !proc_exe_matches_current(pid as libc::pid_t) {
+        if !proc_exe_looks_like_a_daemon(pid as libc::pid_t) {
             continue;
         }
         // And it must be the DAEMON, not another invocation of the same

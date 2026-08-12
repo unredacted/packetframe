@@ -137,6 +137,33 @@ pub fn start_ticks(pid: i32) -> std::io::Result<u64> {
         .map_err(|e| bad_data(&format!("start_ticks parse: {e}")))
 }
 
+/// Whether the process is alive in the sense that matters here: it can
+/// still hold FDs, answer a signal, and publish health.
+///
+/// Directory existence is not that. A daemon that has exited but has
+/// not been reaped keeps `/proc/<pid>` and its original start ticks, so
+/// it read as `Running` — `status` presented its final snapshot as
+/// current, `reconfigure` waited out its timeout for an acknowledgement
+/// that could never come, and `detach` refused for as long as the
+/// zombie persisted, even though its FDs are already closed and the
+/// links released (review finding).
+///
+/// The state is the first token after the comm field, which is why the
+/// last `)` is the anchor here too.
+#[cfg(target_os = "linux")]
+pub fn proc_state(pid: i32) -> std::io::Result<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rfind(')')
+        .and_then(|i| stat[i + 1..].split_whitespace().next())
+        .and_then(|s| s.chars().next())
+        .ok_or_else(|| bad_data("no state field in /proc/<pid>/stat"))
+}
+
+/// `Z` (zombie) and `X` (dead) are exits that have not been reaped.
+pub fn state_is_alive(state: char) -> bool {
+    !matches!(state, 'Z' | 'X' | 'x')
+}
+
 #[cfg(target_os = "linux")]
 pub fn boot_id() -> std::io::Result<String> {
     Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
@@ -305,7 +332,16 @@ pub fn presence_of(
         // Only the no-record path consults the scan, and only to find.
         _ => return decide(record, false, None, false, scan()),
     };
-    let alive = Path::new(&format!("/proc/{pid}")).exists();
+    // Not directory existence: a zombie keeps its entry and its start
+    // ticks, and is not a daemon anything can talk to.
+    let alive = match proc_state(pid) {
+        Ok(state) => state_is_alive(state),
+        // No entry at all is the ordinary dead case. Any other read
+        // error leaves `alive` true, so the identity check below
+        // decides rather than this line guessing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => Path::new(&format!("/proc/{pid}")).exists(),
+    };
     let live_identity = match (start_ticks(pid), boot_id()) {
         (Ok(t), Ok(b)) => Some((t, b)),
         _ => None,
@@ -452,6 +488,17 @@ mod tests {
             false,
             None
         )));
+    }
+
+    /// A zombie is not a daemon.
+    #[test]
+    fn unreaped_exits_are_not_alive() {
+        for dead in ['Z', 'X', 'x'] {
+            assert!(!state_is_alive(dead), "state {dead} has already exited");
+        }
+        for live in ['R', 'S', 'D', 'T', 't', 'I'] {
+            assert!(state_is_alive(live), "state {live} is a process to respect");
+        }
     }
 
     /// A legacy record parses as "pid, no identity" rather than as an
