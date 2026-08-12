@@ -423,9 +423,19 @@ steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
                      completeness gate. Both settle in the staging state
                      with the want remembered, and from there the module
                      re-attempts the steer by itself once both gates
-                     permit. `packetframe reconfigure` asks immediately
-                     rather than waiting
+                     permit. Until it converges there is nothing to ask:
+                     `packetframe reconfigure` answers "not converged"
+                     from here and changes no steering
 ```
+
+That last sentence used to read *"`packetframe reconfigure` asks
+immediately rather than waiting"* — which contradicted the paragraph
+directly above it, and was wrong on every line it ever printed: the
+only states that reach this arm are the ones that refuse steering
+changes. It printed on the shadow for 23 hours under a held deferral,
+and the reconfigure it named answered *"not converged"* (2026-08-12,
+hardware). Fixed, with an invariant test derived from
+`accepts_steering_changes()` rather than a list of states.
 
 **Read that second sentence.** There are two ways the automatic path
 declines. A verify that ends `VerifyIncomplete` — routes withheld or
