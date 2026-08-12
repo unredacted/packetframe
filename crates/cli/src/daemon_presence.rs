@@ -374,7 +374,7 @@ pub fn self_boot_id() -> Option<String> {
 /// create in its place is theirs and fails, which drops the identity
 /// and falls back to the executable match — as if none were recorded.
 #[cfg(target_os = "linux")]
-fn read_authentic_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
+fn read_authentic_identity(path: &Path, pid: i32, pid_path: &Path) -> Option<DaemonIdentity> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -385,6 +385,20 @@ fn read_authentic_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
         .ok()?;
     let meta = f.metadata().ok()?;
     if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        return None;
+    }
+    // OLDER than the pid record means it describes a previous daemon.
+    // The pid alone cannot tell them apart: roll back to a pre-sidecar
+    // build, which rewrites only the pid file and cannot know to remove
+    // this one, and after a reboot the pids can coincide — then the
+    // stale ticks reject the live daemon as reused and `reconfigure`
+    // stays unavailable for its whole life (review finding). The daemon
+    // writes the pid file first and this second, so a current pair is
+    // never inverted.
+    let record_time = std::fs::metadata(pid_path)
+        .and_then(|m| m.modified())
+        .ok()?;
+    if meta.modified().ok()? < record_time {
         return None;
     }
     let mut raw = String::new();
@@ -418,7 +432,7 @@ pub fn presence_of(
             // It also stays a bare pid on the write side, because CLIs
             // from other bundles parse it whole.
             Ok((pid, _unauthenticated)) => {
-                Record::Found(pid, read_authentic_identity(identity_path, pid))
+                Record::Found(pid, read_authentic_identity(identity_path, pid, pid_path))
             }
             Err(e) => Record::Unreadable(format!("unreadable {}: {e}", pid_path.display())),
         },
@@ -668,7 +682,7 @@ mod tests {
         std::fs::write(&ident, real.encode()).expect("write");
         std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         assert!(
-            read_authentic_identity(&ident, me).is_none(),
+            read_authentic_identity(&ident, me, &pidfile).is_none(),
             "a record any user can write must not decide which pid is our daemon"
         );
 
@@ -680,6 +694,39 @@ mod tests {
         assert!(
             !matches!(planted, DaemonPresence::Running { .. }),
             "an identity in the unauthenticated pid file is not an identity: {planted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar older than the pid record belongs to a past daemon.
+    ///
+    /// Roll back to a build that predates the sidecar: it rewrites only
+    /// the pid file and cannot know to remove this one, and after a
+    /// reboot the pids can coincide. Matched by pid alone, the stale
+    /// ticks then reject the live daemon as reused, and `reconfigure`
+    /// stays unavailable for its whole life (review finding).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sidecar_older_than_the_pid_record_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("pf-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let ident = dir.join("packetframe.identity");
+        let pidfile = dir.join("packetframe.pid");
+        let me = std::process::id() as i32;
+
+        // The newer daemon's sidecar, written first…
+        let real = DaemonIdentity::current().expect("own identity");
+        std::fs::write(&ident, real.encode()).expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // …then a rollback daemon writes only the pid file, later.
+        std::fs::write(&pidfile, format!("{me}\n")).expect("write");
+
+        assert!(
+            read_authentic_identity(&ident, me, &pidfile).is_none(),
+            "a sidecar predating the pid record describes a daemon that is gone, and \
+             matching it by pid rejects the live one as reused"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

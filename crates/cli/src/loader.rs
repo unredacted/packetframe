@@ -444,6 +444,21 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // Clean-exit paths below remove it; an uncontrolled crash leaves
     // it stale, which `packetframe reconfigure` detects via the
     // /proc/<pid>/comm cross-check.
+    let pid_file_path = config.global.state_dir.join(PIDFILE_NAME);
+    if let Err(e) = write_pid_file(&pid_file_path) {
+        tracing::warn!(
+            path = %pid_file_path.display(),
+            error = %e,
+            "could not write PID file; `packetframe reconfigure` and `systemctl reload` will not work"
+        );
+    }
+
+    // AFTER the pid file, and that order is load-bearing: a reader
+    // accepts the sidecar only if it is at least as new as the pid
+    // record. A rollback to a pre-sidecar daemon rewrites only the pid
+    // file and cannot know to remove this one, so without the ordering
+    // its stale identity would be matched to the new daemon by pid and
+    // then reject it as reused (review finding).
     let identity_path = config.global.state_dir.join(IDENTITY_NAME);
     match crate::daemon_presence::DaemonIdentity::current()
         .and_then(|id| write_state_record(&identity_path, &id.encode()))
@@ -476,15 +491,6 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             }
         }
     }
-    let pid_file_path = config.global.state_dir.join(PIDFILE_NAME);
-    if let Err(e) = write_pid_file(&pid_file_path) {
-        tracing::warn!(
-            path = %pid_file_path.display(),
-            error = %e,
-            "could not write PID file; `packetframe reconfigure` and `systemctl reload` will not work"
-        );
-    }
-
     tracing::info!("fast-path running, SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
     let termination = drive_signal_loop(
@@ -1733,7 +1739,8 @@ fn print_module_health(state_dir: &Path) {
         // honest answer, and the one that does not mislead in either
         // direction.
         crate::daemon_presence::DaemonPresence::Running { pid }
-            if *pid == snapshot.pid && snapshot.start_ticks.is_none() =>
+            if *pid == snapshot.pid
+                && (snapshot.start_ticks.is_none() || snapshot.boot_id.is_none()) =>
         {
             println!(
                 "module health (pid {pid}, {age}) — CANNOT CONFIRM this is the report of \
