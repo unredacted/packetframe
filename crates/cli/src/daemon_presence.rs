@@ -198,7 +198,7 @@ pub fn decide(
     proc_alive: bool,
     live_identity: Option<(u64, String)>,
     exe_matches: bool,
-    scanned: Option<i32>,
+    scan: impl FnOnce() -> Option<i32>,
 ) -> DaemonPresence {
     // ANY route to `Gone` has to survive the scan, not just the
     // missing-record one. A replacement daemon attaches BEFORE it
@@ -208,6 +208,19 @@ pub fn decide(
     // unlink pins under it. The first fix covered the case that was
     // named; this covers the rule (review finding, P1).
     let verdict = decide_from_record(record, proc_alive, live_identity, exe_matches);
+    // The scan is a CLOSURE, and it is run here rather than passed in
+    // as a value. As a value the caller had to remember to supply it on
+    // every path, and did not: `presence_of` hard-coded `None` for
+    // every `Record::Found`, so the rule this function had just been
+    // restructured to enforce never reached the case it was written
+    // for. The policy was right and the wiring silently was not, which
+    // the table test could not see because it called this directly
+    // (review finding). Now there is no `None` to hard-code, and it is
+    // only invoked where it can change the answer.
+    let scanned = match &verdict {
+        DaemonPresence::Gone { .. } => scan(),
+        _ => None,
+    };
     match (&verdict, scanned) {
         (DaemonPresence::Gone { why }, Some(found)) => DaemonPresence::Unknown {
             why: format!(
@@ -329,8 +342,7 @@ pub fn presence_of(
     };
     let pid = match &record {
         Record::Found(pid, _) => *pid,
-        // Only the no-record path consults the scan, and only to find.
-        _ => return decide(record, false, None, false, scan()),
+        _ => return decide(record, false, None, false, scan),
     };
     // Not directory existence: a zombie keeps its entry and its start
     // ticks, and is not a daemon anything can talk to.
@@ -346,7 +358,7 @@ pub fn presence_of(
         (Ok(t), Ok(b)) => Some((t, b)),
         _ => None,
     };
-    decide(record, alive, live_identity, exe_matches(pid), None)
+    decide(record, alive, live_identity, exe_matches(pid), scan)
 }
 
 #[cfg(test)]
@@ -378,7 +390,7 @@ mod tests {
     fn absence_is_never_concluded_from_a_failed_identity_check() {
         // The upgrade window, and the whole bug: a live daemon, a
         // legacy record, and a CLI at a different path. Was `Gone`.
-        let unknown = decide(Record::Found(42, None), true, None, false, None);
+        let unknown = decide(Record::Found(42, None), true, None, false, || None);
         assert!(
             matches!(unknown, DaemonPresence::Unknown { .. }),
             "a live pid we cannot identify is not absence: {unknown:?}"
@@ -390,7 +402,7 @@ mod tests {
 
         // Same record, same binary: the exe match still confirms.
         assert_eq!(
-            decide(Record::Found(42, None), true, None, true, None),
+            decide(Record::Found(42, None), true, None, true, || None),
             DaemonPresence::Running { pid: 42 }
         );
 
@@ -403,7 +415,7 @@ mod tests {
                 true,
                 Some((900, "boot-a".into())),
                 false,
-                None,
+                || None,
             ),
             DaemonPresence::Running { pid: 42 }
         );
@@ -415,7 +427,7 @@ mod tests {
             true,
             Some((901, "boot-a".into())),
             true,
-            None,
+            || None,
         );
         assert!(is_gone(&reused), "{reused:?}");
 
@@ -426,7 +438,7 @@ mod tests {
             true,
             Some((900, "boot-b".into())),
             true,
-            None,
+            || None,
         );
         assert!(is_gone(&rebooted), "{rebooted:?}");
 
@@ -436,7 +448,7 @@ mod tests {
             true,
             None,
             true,
-            None
+            || None
         )));
 
         // No process: absent, regardless of what was recorded.
@@ -445,9 +457,11 @@ mod tests {
             false,
             None,
             true,
-            None
+            || None
         )));
-        assert!(is_gone(&decide(Record::Absent, false, None, false, None)));
+        assert!(is_gone(&decide(Record::Absent, false, None, false, || {
+            None
+        })));
 
         // EVERY route to Gone must survive the scan, not just the
         // missing-record one — a replacement attaches before it
@@ -469,9 +483,9 @@ mod tests {
                 Some((901, "boot-a".to_string())),
             ),
         ] {
-            let alone = decide(record.clone(), alive, live.clone(), false, None);
+            let alone = decide(record.clone(), alive, live.clone(), false, || None);
             assert!(is_gone(&alone), "{label}: the record alone says gone");
-            let with_scan = decide(record, alive, live, false, Some(77));
+            let with_scan = decide(record, alive, live, false, || Some(77));
             assert!(
                 matches!(with_scan, DaemonPresence::Unknown { .. }),
                 "{label}: but a process running this binary makes it unprovable: \
@@ -486,8 +500,43 @@ mod tests {
             false,
             None,
             false,
-            None
+            || None
         )));
+    }
+
+    /// The WIRING, not the policy: `presence_of` must hand the scan to
+    /// every path, including a record that names a dead pid.
+    ///
+    /// The policy test above passes `decide` its arguments directly, so
+    /// it could not see that `presence_of` hard-coded `None` for every
+    /// `Record::Found` — the rule was enforced in the function and
+    /// never delivered to the case it was written for, which is a live
+    /// replacement whose predecessor's record is still on disk (review
+    /// finding). Testing a policy in isolation says nothing about
+    /// whether anything asks it the right question.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scan_reaches_the_stale_record_path() {
+        let dir = std::env::temp_dir().join(format!("pf-wiring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("packetframe.pid");
+        // A record naming a pid that cannot exist: dead, so the record
+        // alone says Gone.
+        std::fs::write(&path, "2147483646 1 boot-a").expect("write");
+
+        assert!(
+            is_gone(&presence_of(&path, |_| false, || None)),
+            "with nothing running, a dead record is absence"
+        );
+        let with_daemon = presence_of(&path, |_| false, || Some(77));
+        assert!(
+            matches!(with_daemon, DaemonPresence::Unknown { .. }),
+            "but a live daemon the scan can see must reach this path too — this is \
+             where `detach` would otherwise unlink pins beneath it: {with_daemon:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A zombie is not a daemon.
