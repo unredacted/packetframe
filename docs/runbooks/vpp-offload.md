@@ -1117,9 +1117,18 @@ module's own deltas.
 >   process named the same way will make `detach` refuse and name the
 >   pid. That is deliberate — refusing is recoverable, unlinking under
 >   a live daemon is not.
-> - `detach` refuses on "cannot tell", not only on "daemon present". If
->   it refuses and you have established there is no daemon, remove the
->   stale pid file from the state dir.
+> - The scan has to *complete* to count as evidence of absence. If
+>   `/proc` cannot be listed, or a process in it cannot be examined
+>   (running `detach` as a non-root user is the ordinary cause), the
+>   refusal says `the process table could not be searched` and names how
+>   many processes were unexaminable. Re-run as root; removing the pid
+>   file will not help, because the scan is what the missing record
+>   falls back to.
+> - `detach` refuses on "cannot tell", not only on "daemon present".
+>   When the message names a **stale record** — a pid that is not the
+>   recorded process and is not running a packetframe daemon — and you
+>   have established there is no daemon, remove the pid file and the
+>   identity sidecar from the state dir.
 
 
 VPP is **not** bundled in packetframe's .deb — 100 MB against 1.3 MB,

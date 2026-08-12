@@ -197,6 +197,31 @@ pub enum Record {
     Found(i32, Option<DaemonIdentity>),
 }
 
+/// What a search of the process table established.
+///
+/// Three-valued for the same reason [`DaemonPresence`] is: a search
+/// that could not run and a search that ran and found nothing are
+/// different facts, and collapsing them into one `None` made the
+/// second the default reading of the first (review finding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scan {
+    /// A process running a packetframe daemon, at this pid.
+    Found(i32),
+    /// The table was walked end to end, every process in it was
+    /// examined, and none was a daemon.
+    ///
+    /// The strongest negative available, and still not a proof of
+    /// absence: a daemon deployed under a name sharing no prefix with
+    /// ours is invisible here by construction — see
+    /// `proc_exe_looks_like_a_daemon`'s residual limit. The pid record
+    /// is what covers that case, and this variant is only ever
+    /// consulted when there is no record to consult.
+    NoneFound,
+    /// The table could not be walked, or a process in it could not be
+    /// examined. Evidence in neither direction.
+    Inconclusive(String),
+}
+
 /// THE POLICY, as a pure function.
 ///
 /// Deliberately separate from the `/proc` reads: this is a safety
@@ -212,7 +237,7 @@ pub fn decide(
     proc_alive: bool,
     live_identity: Option<(u64, String)>,
     exe_matches: bool,
-    scan: impl FnOnce() -> Option<i32>,
+    scan: impl FnOnce() -> Scan,
 ) -> DaemonPresence {
     // ANY route to `Gone` has to survive the scan, not just the
     // missing-record one. A replacement daemon attaches BEFORE it
@@ -231,18 +256,28 @@ pub fn decide(
     // the table test could not see because it called this directly
     // (review finding). Now there is no `None` to hard-code, and it is
     // only invoked where it can change the answer.
-    let scanned = match &verdict {
-        DaemonPresence::Gone { .. } => scan(),
-        _ => None,
+    let DaemonPresence::Gone { why } = verdict else {
+        return verdict;
     };
-    match (&verdict, scanned) {
-        (DaemonPresence::Gone { why }, Some(found)) => DaemonPresence::Unknown {
+    match scan() {
+        Scan::Found(found) => DaemonPresence::Unknown {
             why: format!(
                 "{why}, but pid {found} is running this binary — it may be a daemon whose \
                  record is stale or was never written"
             ),
         },
-        _ => verdict,
+        // "Survives the scan" has to mean the scan RAN. It returned a
+        // bare `Option`, so a `/proc` that could not be read — or a
+        // process in it that could not be examined — was indistinguishable
+        // from a table with no daemon in it, and licensed `detach`. That
+        // is the same "cannot establish X, therefore not X" this whole
+        // module exists to undo, reproduced inside its own fix (review
+        // finding, P1). It matters most for `Record::Absent`, where the
+        // scan is the ONLY evidence there is.
+        Scan::Inconclusive(reason) => DaemonPresence::Unknown {
+            why: format!("{why}, and the process table could not be searched for one ({reason})"),
+        },
+        Scan::NoneFound => DaemonPresence::Gone { why },
     }
 }
 
@@ -258,10 +293,13 @@ fn decide_from_record(
         // after every module attaches — deliberately, so systemd's
         // `PIDFile=` never points at a half-attached daemon — and a
         // failed write is non-fatal, so a live daemon can legitimately
-        // have none. `scanned` is the independent check: it can FIND a
-        // daemon (a process running this binary), and its silence
-        // proves nothing, which is the polarity the deleted /proc scan
-        // had backwards (review finding).
+        // have none. The scan is the independent check, and on this
+        // branch it is the ONLY evidence in play — so `decide` demotes
+        // this to `Unknown` unless the scan actually completed. A scan
+        // that could not look is not a scan that looked and saw
+        // nothing, which is the polarity the deleted /proc scan had
+        // backwards and that its replacement re-introduced one level
+        // down (review findings).
         Record::Absent => {
             return DaemonPresence::Gone {
                 why: "no pid file".into(),
@@ -432,7 +470,7 @@ pub fn presence_of(
     pid_path: &Path,
     identity_path: &Path,
     exe_matches: impl Fn(i32) -> bool,
-    scan: impl Fn() -> Option<i32>,
+    scan: impl Fn() -> Scan,
 ) -> DaemonPresence {
     let record = match std::fs::read_to_string(pid_path) {
         Ok(s) => match DaemonIdentity::decode(&s) {
@@ -501,7 +539,9 @@ mod tests {
     fn absence_is_never_concluded_from_a_failed_identity_check() {
         // The upgrade window, and the whole bug: a live daemon, a
         // legacy record, and a CLI at a different path. Was `Gone`.
-        let unknown = decide(Record::Found(42, None), true, None, false, || None);
+        let unknown = decide(Record::Found(42, None), true, None, false, || {
+            Scan::NoneFound
+        });
         assert!(
             matches!(unknown, DaemonPresence::Unknown { .. }),
             "a live pid we cannot identify is not absence: {unknown:?}"
@@ -513,7 +553,9 @@ mod tests {
 
         // Same record, same binary: the exe match still confirms.
         assert_eq!(
-            decide(Record::Found(42, None), true, None, true, || None),
+            decide(Record::Found(42, None), true, None, true, || {
+                Scan::NoneFound
+            }),
             DaemonPresence::Running { pid: 42 }
         );
 
@@ -526,7 +568,7 @@ mod tests {
                 true,
                 Some((900, "boot-a".into())),
                 false,
-                || None,
+                || Scan::NoneFound,
             ),
             DaemonPresence::Running { pid: 42 }
         );
@@ -544,7 +586,7 @@ mod tests {
                     true,
                     Some((live.0, live.1.to_string())),
                     exe,
-                    || None,
+                    || Scan::NoneFound,
                 )
             };
             assert!(
@@ -563,7 +605,7 @@ mod tests {
             true,
             None,
             true,
-            || None
+            || Scan::NoneFound
         )));
 
         // No process: absent, regardless of what was recorded.
@@ -572,10 +614,10 @@ mod tests {
             false,
             None,
             true,
-            || None
+            || Scan::NoneFound
         )));
         assert!(is_gone(&decide(Record::Absent, false, None, false, || {
-            None
+            Scan::NoneFound
         })));
 
         // EVERY route to Gone must survive the scan, not just the
@@ -592,13 +634,32 @@ mod tests {
                 None,
             ),
         ] {
-            let alone = decide(record.clone(), alive, live.clone(), false, || None);
+            let alone = decide(record.clone(), alive, live.clone(), false, || {
+                Scan::NoneFound
+            });
             assert!(is_gone(&alone), "{label}: the record alone says gone");
-            let with_scan = decide(record, alive, live, false, || Some(77));
+            let with_scan = decide(record.clone(), alive, live.clone(), false, || {
+                Scan::Found(77)
+            });
             assert!(
                 matches!(with_scan, DaemonPresence::Unknown { .. }),
                 "{label}: but a process running this binary makes it unprovable: \
                  {with_scan:?}"
+            );
+            // And a scan that could not LOOK is not a scan that looked
+            // and saw nothing. `Option` conflated the two, so an
+            // unreadable `/proc` — or one process in it that could not
+            // be examined — read as positive absence and licensed
+            // `detach` (review finding). This is the same defect the
+            // whole module exists to undo, one level inside its own
+            // fix, which is why the assertion is here rather than in a
+            // test of its own.
+            let blind = decide(record, alive, live, false, || {
+                Scan::Inconclusive("proc unreadable".into())
+            });
+            assert!(
+                matches!(blind, DaemonPresence::Unknown { .. }),
+                "{label}: a scan that could not run cannot confirm absence: {blind:?}"
             );
         }
 
@@ -609,7 +670,7 @@ mod tests {
             false,
             None,
             false,
-            || None
+            || Scan::NoneFound
         )));
     }
 
@@ -639,10 +700,10 @@ mod tests {
         std::fs::write(&ident, "2147483646 1 boot-a").expect("write");
 
         assert!(
-            is_gone(&presence_of(&path, &ident, |_| false, || None)),
+            is_gone(&presence_of(&path, &ident, |_| false, || Scan::NoneFound)),
             "with nothing running, a dead record is absence"
         );
-        let with_daemon = presence_of(&path, &ident, |_| false, || Some(77));
+        let with_daemon = presence_of(&path, &ident, |_| false, || Scan::Found(77));
         assert!(
             matches!(with_daemon, DaemonPresence::Unknown { .. }),
             "but a live daemon the scan can see must reach this path too — this is \
@@ -700,7 +761,7 @@ mod tests {
         // though `decode` understands the shape.
         std::fs::write(&pidfile, real.encode()).expect("write");
         let _ = std::fs::remove_file(&ident);
-        let planted = presence_of(&pidfile, &ident, |_| false, || None);
+        let planted = presence_of(&pidfile, &ident, |_| false, || Scan::NoneFound);
         assert!(
             !matches!(planted, DaemonPresence::Running { .. }),
             "an identity in the unauthenticated pid file is not an identity: {planted:?}"
@@ -726,7 +787,7 @@ mod tests {
                 true,
                 Some((7777, "boot-after-reboot".to_string())),
                 exe,
-                || None,
+                || Scan::NoneFound,
             )
         };
         assert_eq!(

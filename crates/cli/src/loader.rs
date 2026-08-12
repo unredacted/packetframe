@@ -1084,19 +1084,6 @@ fn proc_exe_looks_like_a_daemon(pid: libc::pid_t) -> bool {
     }
 }
 
-/// Find a process running this executable, if there is one.
-///
-/// **Finds only.** This was `daemon_pid`, and its answer was read as
-/// "no daemon is running" whenever it came back empty — which is false
-/// for any daemon started from a different path, i.e. during every
-/// upgrade, and is how `detach` walked past its own guard. It is kept
-/// because the converse is still sound and still useful: a process
-/// running this exact binary IS a daemon worth refusing to detach
-/// under, even when no pid file names it (a failed record write leaves
-/// exactly that).
-///
-/// `/proc/<pid>/exe` rather than `comm`, which is user-settable via
-/// `prctl` — the May 2026 audit Slice 4 finding.
 /// Whether `pid` is a packetframe DAEMON: our binary (or another copy
 /// of it), running the `run` subcommand.
 ///
@@ -1112,8 +1099,33 @@ fn proc_exe_looks_like_a_daemon(pid: libc::pid_t) -> bool {
 /// for this to begin with.
 #[cfg(target_os = "linux")]
 fn is_daemon_process(pid: libc::pid_t) -> bool {
+    daemon_process_verdict(pid) == Some(true)
+}
+
+/// The same question, keeping "could not tell" apart from "no".
+///
+/// `None` means a read failed for a reason other than the process
+/// having exited: the answer is unavailable, not negative. The scan
+/// needs that distinction because its negative is what licenses a
+/// destructive `detach`; `is_daemon_process` does not, because there
+/// an unavailable answer already falls through to `Unknown`.
+#[cfg(target_os = "linux")]
+fn daemon_process_verdict(pid: libc::pid_t) -> Option<bool> {
+    // Not knowing our OWN path makes every comparison below vacuous, so
+    // it is unavailability rather than a mismatch — for every pid at
+    // once, which is why the scan cannot conclude anything at all.
+    std::env::current_exe().ok()?;
     if !proc_exe_looks_like_a_daemon(pid) {
-        return false;
+        // Distinguish "the exe link says it is something else" from
+        // "the exe link could not be read at all". A process that has
+        // exited takes its whole `/proc` entry with it and is a plain
+        // no; anything else (EACCES on a hardened kernel, EPERM under
+        // a non-root caller) is unreadable.
+        return match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(_) => Some(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        };
     }
     // BYTES: `read_to_string` rejects the whole cmdline if any argument
     // is not UTF-8, and a `--config` path may legally contain arbitrary
@@ -1125,15 +1137,52 @@ fn is_daemon_process(pid: libc::pid_t) -> bool {
     // carries nothing but the subcommand, so clap accepts no global
     // options before it and argv[1] is where `run` must be.
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(cmdline) => cmdline.split(|b| *b == 0).nth(1) == Some(b"run".as_slice()),
-        Err(_) => false,
+        Ok(cmdline) => Some(cmdline.split(|b| *b == 0).nth(1) == Some(b"run".as_slice())),
+        // Gone between the two reads: not a daemon, and not a mystery.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        // It runs our binary and its argv cannot be read. The only
+        // question left is the only one unanswerable, so this is not a
+        // process the scan may report as harmless.
+        Err(_) => None,
     }
 }
 
+/// Search the process table for a running daemon.
+///
+/// This was `daemon_pid`, and its answer was read as "no daemon is
+/// running" whenever it came back empty — which is false for any daemon
+/// started from a different path, i.e. during every upgrade, and is how
+/// `detach` walked past its own guard. Its positive is still sound and
+/// still useful: a process running this binary IS a daemon worth
+/// refusing to detach under, even when no pid file names it (a failed
+/// record write leaves exactly that).
+///
+/// So it reports THREE answers rather than an `Option`. `NoneFound`
+/// still is not proof of absence — a differently named daemon is
+/// invisible to `proc_exe_looks_like_a_daemon` — but it does assert
+/// that the table was walked and every process in it examined, which
+/// is the part `Option::None` was silently standing in for.
+///
+/// `/proc/<pid>/exe` rather than `comm`, which is user-settable via
+/// `prctl` — the May 2026 audit Slice 4 finding.
 #[cfg(target_os = "linux")]
-fn scan_for_running_daemon() -> Option<i32> {
+fn scan_for_running_daemon() -> crate::daemon_presence::Scan {
+    use crate::daemon_presence::Scan;
     let self_pid = std::process::id();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+    let dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(e) => return Scan::Inconclusive(format!("/proc could not be listed: {e}")),
+    };
+    // Counted, never skipped. Each is a process the scan cannot vouch
+    // for, and this scan's NEGATIVE is what licenses `detach` to unlink
+    // pins — so an unexaminable process has to reach the caller rather
+    // than quietly leave the total looking complete.
+    let mut unexamined = 0usize;
+    for entry in dir {
+        let Ok(entry) = entry else {
+            unexamined += 1;
+            continue;
+        };
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -1144,11 +1193,18 @@ fn scan_for_running_daemon() -> Option<i32> {
         if pid == self_pid {
             continue;
         }
-        if is_daemon_process(pid as libc::pid_t) {
-            return Some(pid as i32);
+        match daemon_process_verdict(pid as libc::pid_t) {
+            Some(true) => return Scan::Found(pid as i32),
+            Some(false) => {}
+            None => unexamined += 1,
         }
     }
-    None
+    if unexamined > 0 {
+        return Scan::Inconclusive(format!(
+            "{unexamined} process(es) in /proc could not be examined"
+        ));
+    }
+    Scan::NoneFound
 }
 
 /// Read /proc/<pid>/exe as a symlink and compare against the
@@ -2103,12 +2159,13 @@ mod vpp_detach_tests {
 
         // The exe check fails, as it does whenever the CLI runs from a
         // different path than the daemon.
-        // No scan: this is about what the RECORD can establish.
+        // A scan that ran and found nothing, so what is under test is
+        // what the RECORD alone establishes.
         let p = presence_of(
             &dir.join(PIDFILE_NAME),
             &dir.join(IDENTITY_NAME),
             |_| false,
-            || None,
+            || crate::daemon_presence::Scan::NoneFound,
         );
         assert!(
             matches!(p, DaemonPresence::Unknown { .. }),
@@ -2123,7 +2180,7 @@ mod vpp_detach_tests {
                 &dir.join(PIDFILE_NAME),
                 &dir.join(IDENTITY_NAME),
                 |_| true,
-                || None
+                || crate::daemon_presence::Scan::NoneFound
             ),
             DaemonPresence::Running { .. }
         ));
