@@ -1139,24 +1139,46 @@ carrying that traffic; VPP still is.
 
   To know *before* attempting, sample the checker directly. Both counts
   come from `birdc`, and the comparison is logged — but only at debug,
-  and **`log-level` in the config does not control it**: the filter is
-  built from `RUST_LOG` at process start, so this costs a restart.
+  so the level has to come up first. `log-level` in the config is
+  hot-reloadable (v0.2.7+), so this costs a reload rather than a
+  restart: the checker keeps its 300 s cadence across it, and nothing is
+  detached.
 
   ```bash
   birdc show route count | grep -E 'in table master(4|6)'
-  systemctl edit packetframe   # [Service] Environment=RUST_LOG=info,packetframe_fast_path::fib::integrity=debug
-  systemctl restart packetframe && sleep 310
+  # /etc/packetframe/packetframe.conf: global -> log-level debug
+  packetframe reconfigure && sleep 310
   journalctl -u packetframe --since '-6min' \
       | grep -E 'integrity check OK|integrity drift above threshold|integrity check:'
+  # then put log-level back and reload again — whole-process debug on a
+  # forwarding box is loud, and nothing above needs it to stay on.
   ```
 
   `integrity check OK` carrying `bird_routes` and `packetframe_routes`
   is the evidence the gate acts on. A drift warning, one of the three
-  failure lines, or **no line at all** are each not a pass. Revert the
-  override afterwards.
+  failure lines, or **no line at all** are each not a pass.
 
-  > Both awkward parts of this — needing a restart, and reading a log
-  > rather than a command — come from one gap: `IntegrityChecker`'s
+  **Two ways this reload can no-op.** `RUST_LOG` in the daemon's
+  environment overrides the config for the whole life of the process —
+  including a drop-in some earlier bring-up left behind — and the daemon
+  says so, once, the first time the config would have applied a level:
+  *"RUST_LOG is set; the config's log-level is ignored for this
+  process"*. Clearing it is the one case that still costs a restart
+  (`systemctl edit packetframe`, drop the `Environment=` line, then the
+  cold sequence — a plain `systemctl restart` crash-loops on surviving
+  pins, see [reconfigure.md](reconfigure.md)). If you would rather keep
+  it, override with the narrower filter instead and skip the config
+  entirely: `RUST_LOG=info,packetframe_fast_path::fib::integrity=debug`
+  is the one thing a whole-process level cannot express, and it is
+  quieter than `debug`. Second: a reload the daemon *refuses* (a config
+  that does not parse, or one `validate_vpp_offload` rejects) applies no
+  part of itself, level included. `packetframe reconfigure` exits
+  non-zero and names the reason — read it rather than moving on to the
+  `journalctl` line, which would show the same empty output as a healthy
+  checker at info.
+
+  > What is still awkward here — turning a log level up and reading a
+  > log, rather than asking — comes from one gap: `IntegrityChecker`'s
   > snapshot is published and `RouteController::integrity_snapshot()`
   > has no caller, so the verdict has no `status` surface outside a
   > refusal message. Worth closing; until it is, prefer the canary
