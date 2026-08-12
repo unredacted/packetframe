@@ -567,8 +567,10 @@ fn read_with_provenance(path: &Path) -> std::io::Result<(String, bool)> {
     Ok((raw, root_owned))
 }
 
-/// Whether the state DIRECTORY itself can vouch for what it contains:
-/// root-owned, a real directory, not group- or world-writable.
+/// Whether the state DIRECTORY can vouch for what it contains: the
+/// directory itself root-owned, a real directory, not group- or
+/// world-writable — and NOT MOVABLE, which is a property of its
+/// ancestors, not of it.
 ///
 /// Per-file ownership is not enough, and the gap is `rename`: moving a
 /// file needs write on the two directories and nothing from the file,
@@ -579,12 +581,36 @@ fn read_with_provenance(path: &Path) -> std::io::Result<(String, bool)> {
 /// write is a directory whose contents they choose, whoever owns the
 /// files; so in such a directory, no record confirms a live pid.
 ///
-/// Opened `O_DIRECTORY | O_NOFOLLOW` and judged on the descriptor,
-/// which also refuses a state dir that is itself a symlink. Errors
-/// return `false` — treat as unauthenticated, never as trusted.
+/// And checking the directory alone is not enough either, for the same
+/// operation one level up: under a writable parent, two whole
+/// root-owned state directories can have their NAMES exchanged without
+/// a byte of either being modified, so the configured path leads to the
+/// other instance's records and every per-file and per-directory check
+/// passes (review finding — the first replay fix, replayed against
+/// itself). So the ancestors are checked too, every one to the root:
+/// each must be root-owned and either not writable by others or
+/// sticky — in a sticky directory (`/tmp`) only the owner of an entry
+/// may rename it, and the entry in question is root-owned.
+///
+/// Symlinks are refused ANYWHERE in the path, not just at the final
+/// component: a symlinked ancestor is repointable by whoever can write
+/// its containing directory, which is the swap again without a rename
+/// of the target. `canonicalize` resolves every link, so equality with
+/// the configured path proves there were none. The cost, documented in
+/// the runbook: a state dir configured through a symlinked path (e.g.
+/// `/var/run` on systems where it links to `/run`) must be configured
+/// by its real path.
+///
+/// Judged on descriptors and canonical paths; errors return `false` —
+/// unauthenticated, never trusted.
 #[cfg(target_os = "linux")]
 fn dir_is_authentic(dir: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // No symlinks anywhere in the path.
+    match std::fs::canonicalize(dir) {
+        Ok(canon) if canon == dir => {}
+        _ => return false,
+    }
     let Ok(f) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -595,7 +621,24 @@ fn dir_is_authentic(dir: &Path) -> bool {
     let Ok(meta) = f.metadata() else {
         return false;
     };
-    meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0
+    if !(meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0) {
+        return false;
+    }
+    // The chain: nobody below root may be able to rename this
+    // directory or any ancestor of it. The path is symlink-free (just
+    // proven), so plain metadata on each ancestor examines the
+    // directory it names.
+    for ancestor in dir.ancestors().skip(1) {
+        let Ok(meta) = std::fs::metadata(ancestor) else {
+            return false;
+        };
+        let mode = meta.mode();
+        let unmovable_children = mode & 0o022 == 0 || mode & 0o1000 != 0;
+        if !(meta.is_dir() && meta.uid() == 0 && unmovable_children) {
+            return false;
+        }
+    }
+    true
 }
 
 /// What the sidecar yields when it must stand as the record of last
@@ -1166,6 +1209,31 @@ mod tests {
             matches!(p, DaemonPresence::Unknown { .. }),
             "records in a directory others can write may have been renamed in whole from \
              another instance's state dir; they must not become signal-capable: {p:?}"
+        );
+
+        // And the swap one level up: a state dir that is ITSELF
+        // impeccable — root-owned, 0755, authentic records — sitting
+        // under a writable parent can be renamed away whole and another
+        // instance's swapped into its name, so the ancestor chain is
+        // part of what authenticates it (review finding).
+        let sub = dir.join("state");
+        std::fs::create_dir_all(&sub).expect("scratch");
+        let sub_pid = sub.join("packetframe.pid");
+        let sub_ident = sub.join("packetframe.identity");
+        std::fs::write(&sub_pid, format!("{}\n", real.pid)).expect("write");
+        std::fs::write(&sub_ident, real.encode()).expect("write");
+        if unsafe { libc::geteuid() } == 0 {
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            std::fs::set_permissions(&sub_pid, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            std::fs::set_permissions(&sub_ident, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+        let p = presence_of(&sub_pid, &sub_ident, |_| true, || Scan::NoneFound);
+        assert!(
+            matches!(p, DaemonPresence::Unknown { .. }),
+            "a movable state dir is not bound to its configured path, however authentic \
+             its contents: {p:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

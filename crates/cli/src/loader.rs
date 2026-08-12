@@ -643,12 +643,30 @@ fn write_state_record(path: &Path, body: &str) -> std::io::Result<()> {
     // lifetime. Clear exactly the group/world-write bits and leave the
     // rest alone (an operator's deliberate 0700 stays 0700). Best
     // effort: if it fails, the reader refuses, which is the safe side.
-    if let Ok(meta) = std::fs::metadata(parent) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        if mode & 0o022 != 0 {
-            let _ =
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode & !0o022));
+    //
+    // ON THE DESCRIPTOR, never the pathname. The first version ran
+    // `metadata` + `set_permissions` on the path, and both follow
+    // symlinks — so a pre-created `state-dir` symlink pointed this
+    // root chmod at any directory on the system, stripping write bits
+    // from whatever the attacker chose (review finding, P1; the same
+    // pathname-vs-descriptor defect as the record writes, one level
+    // up). `O_DIRECTORY | O_NOFOLLOW` refuses the symlink outright, and
+    // the fchmod applies to the directory that was actually opened. A
+    // symlinked state dir gets no chmod and no trust — the reader's
+    // `dir_is_authentic` refuses it the same way.
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(dirf) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent)
+        {
+            if let Ok(meta) = dirf.metadata() {
+                let mode = meta.permissions().mode();
+                if meta.is_dir() && mode & 0o022 != 0 {
+                    let _ = dirf.set_permissions(std::fs::Permissions::from_mode(mode & !0o022));
+                }
+            }
         }
     }
     let tmp = path.with_extension("tmp");

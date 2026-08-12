@@ -1141,6 +1141,14 @@ module's own deltas.
 >   clears the group/world-write bits on its state dir whenever it
 >   writes a record; if you hand-create a custom `state-dir`, make it
 >   `root:root` mode `0755` (or tighter).
+>   The same rule runs up the **ancestor chain**: every directory above
+>   the state dir must be root-owned and either not group/world-writable
+>   or sticky (`/tmp` qualifies) — otherwise the whole state dir could
+>   be renamed and another one swapped into its place without touching
+>   a file. And the configured `state-dir` path must contain **no
+>   symlinks** (a symlinked component is the same swap, done by
+>   repointing): on systems where `/var/run` links to `/run`, configure
+>   the real `/run/...` path.
 > - A sidecar that is present but unreadable or malformed is treated as
 >   "cannot tell", never as missing — a torn write is what a live
 >   daemon's record looks like mid-trouble. Conversely, a torn *pid
