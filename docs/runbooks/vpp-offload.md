@@ -1085,17 +1085,35 @@ carrying that traffic; VPP still is.
 - **On a box whose bird carries the real table** (the fleet, the
   primary) this does not arise: the report agrees with the mirror and
   the authority releases on its own word.
-- **Where the authority cannot agree** — a near-empty local bird, a
-  `birdc` that fails, a mirror fed from somewhere else — the fix is to
-  make it agree or to run without one. Failing both, the escape is a
-  cold restart (stop the daemon, `packetframe detach --all`, start),
-  which tears VPP down and costs a full resync: the exact trade the
-  deferral exists to avoid, so it is a last resort.
-- **Before a rollout, verify the authority actually agrees.** Not that
-  bird is running — that `birdc show route count` on THAT box reports
-  the table the mirror was built from. A box that adopts while steered
-  under a vetoing authority has no fast rollback, and that is worth
-  knowing before the canary rather than during it.
+- **A `birdc` that is temporarily unreachable is NOT this case, and
+  needs no intervention.** The integrity checker retries every interval
+  (300 s) and publishes a fresh report once it recovers, which releases
+  the deferral on its own. Restore bird or the checker and wait one
+  interval. Do **not** reach for a restart here — tearing down a
+  working VPP to fix a transient read is strictly worse than the
+  problem.
+- **A persistent disagreement is the case that needs a decision**: a
+  local bird that does not carry the mirror's table, or a mirror fed
+  from a different source than the authority measures. Make them agree,
+  or run that box without an authority. Only if neither is possible is
+  the escape a cold restart (stop the daemon, `packetframe detach
+  --all`, start) — it tears VPP down and costs a full resync, the exact
+  trade the deferral exists to avoid, so it is a last resort and not a
+  troubleshooting step.
+- **Before a rollout, check the authority AGREES — not that bird is
+  running.** The two are different, and this box proved it: bird was up
+  the whole time. Compare directly, on the box that will steer:
+
+  ```bash
+  birdc show route count | grep master4     # the authority's own count
+  packetframe status | grep -E 'fib-synced' # routes the mirror installed
+  ```
+
+  Those two numbers must be within the drift bound. `fib-synced` names
+  the veto explicitly when one is in force, but do not wait for a
+  deferral to find out: a box that adopts while steered under a vetoing
+  authority has no fast rollback, and that is worth knowing before the
+  canary rather than during it.
 
 ### A member port needs two things admin-up does not give it
 

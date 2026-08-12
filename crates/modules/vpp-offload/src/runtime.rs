@@ -830,6 +830,37 @@ fn authority_current(
     })
 }
 
+/// What the authority means **for the deferral that is actually
+/// running** — a pure function so the rule can be stated and tested
+/// rather than assembled inline in a struct literal.
+///
+/// Deferral-scoped, exactly like `DemotedByFlap`, and that is the whole
+/// point. The question is not "what does the authority say" but "what
+/// does THIS deferral's release path do with what it says", and the two
+/// stages differ: `AwaitingFallback` consults `authority_current` and a
+/// `false` there vetoes release outright, while `AwaitingDiff` releases
+/// on floor-and-quiet alone and never asks. Reporting a veto on the
+/// diff stage would tell an operator that waiting cannot clear a
+/// deferral that waiting clears perfectly well — the first version of
+/// this did exactly that (review finding), which is the same defect
+/// class as the message it was written to fix.
+fn authority_posture(
+    configured: bool,
+    demoted: bool,
+    gate_consults_authority: bool,
+    current: Option<bool>,
+) -> AuthorityPosture {
+    if !configured {
+        AuthorityPosture::Absent
+    } else if demoted {
+        AuthorityPosture::DemotedByFlap
+    } else if gate_consults_authority && current == Some(false) {
+        AuthorityPosture::Vetoing
+    } else {
+        AuthorityPosture::Attesting
+    }
+}
+
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
 pub struct Runtime {
     core: Rc<RefCell<Core>>,
@@ -1089,23 +1120,22 @@ impl Runtime {
             steer_missing: c.steer_missing,
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
-            authority: if c.completeness.is_none() {
-                AuthorityPosture::Absent
-            } else if matches!(
-                &c.deferred_resync,
-                Some(DeferredResync::AwaitingFallback { demoted: true, .. })
-            ) {
-                AuthorityPosture::DemotedByFlap
-            } else if authority_current(&c.completeness, c.source.route_count()) == Some(false) {
+            authority: authority_posture(
+                c.completeness.is_some(),
+                matches!(
+                    &c.deferred_resync,
+                    Some(DeferredResync::AwaitingFallback { demoted: true, .. })
+                ),
+                matches!(
+                    &c.deferred_resync,
+                    Some(DeferredResync::AwaitingFallback { .. })
+                ),
                 // The SAME recompute the release path applies, not a
                 // re-derivation of it: the health line and the gate must
                 // not be able to disagree about whether the authority is
-                // currently permitting. `Attesting` used to cover this
-                // case, so a veto was invisible to every surface.
-                AuthorityPosture::Vetoing
-            } else {
-                AuthorityPosture::Attesting
-            },
+                // currently permitting.
+                authority_current(&c.completeness, c.source.route_count()),
+            ),
         }
     }
 }
@@ -1137,9 +1167,10 @@ pub enum AuthorityPosture {
     /// seen the current epoch reconciled, so the authority's word
     /// cannot be trusted to describe the current stream.
     DemotedByFlap,
-    /// Configured, usable, and currently saying NO: its report does not
-    /// describe the mirror as it is now, so `authority_current` vetoes
-    /// release regardless of floor, liveness or quiescence.
+    /// Configured, usable, currently saying NO — **and the running
+    /// deferral is one that asks.** Its report does not describe the
+    /// mirror as it is now, so `authority_current` vetoes release
+    /// regardless of floor, liveness or quiescence.
     ///
     /// Added because the posture could not express it, and that gap had
     /// a measured cost. On the shadow (2026-08-12) a box whose local
@@ -1149,6 +1180,11 @@ pub enum AuthorityPosture {
     /// could never release it. A veto does not clear on its own: it
     /// clears when the authority's report agrees with the mirror, or
     /// not at all.
+    ///
+    /// Scoped to the deferral by `authority_posture`, because only
+    /// `AwaitingFallback` consults the authority; the diff stage
+    /// releases on floor-and-quiet and a disagreeing authority there is
+    /// not blocking anything.
     Vetoing,
 }
 
@@ -2248,6 +2284,53 @@ mod tests {
     // Only the Linux-gated process tests need these.
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+
+    /// A veto is only a veto where the gate actually asks.
+    ///
+    /// `AwaitingFallback` consults `authority_current` and a `false`
+    /// there blocks release outright. `AwaitingDiff` releases on
+    /// floor-and-quiet and never asks — so a disagreeing authority
+    /// during the diff stage blocks nothing, and reporting `Vetoing`
+    /// there tells an operator that waiting cannot clear a deferral
+    /// that waiting clears perfectly well (review finding). The first
+    /// version of this posture keyed on the authority alone and did
+    /// exactly that, which is the same defect class it was written to
+    /// fix, one stage over.
+    #[test]
+    fn a_veto_is_scoped_to_the_gate_that_consults_the_authority() {
+        // Absent beats everything: no handle, nothing to say.
+        for consults in [true, false] {
+            assert_eq!(
+                authority_posture(false, false, consults, None),
+                AuthorityPosture::Absent
+            );
+        }
+        // A flap demotes regardless of the current word.
+        assert_eq!(
+            authority_posture(true, true, true, Some(false)),
+            AuthorityPosture::DemotedByFlap
+        );
+        // THE RULE: same disagreeing authority, opposite verdicts,
+        // decided only by whether this deferral's gate consults it.
+        assert_eq!(
+            authority_posture(true, false, true, Some(false)),
+            AuthorityPosture::Vetoing,
+            "AwaitingFallback consults the authority, so a false there IS the blocker"
+        );
+        assert_eq!(
+            authority_posture(true, false, false, Some(false)),
+            AuthorityPosture::Attesting,
+            "AwaitingDiff never asks, so a disagreeing authority is not blocking it and \
+             must not be reported as if it were"
+        );
+        // A permitting or unknown authority is never a veto.
+        for current in [Some(true), None] {
+            assert_eq!(
+                authority_posture(true, false, true, current),
+                AuthorityPosture::Attesting
+            );
+        }
+    }
 
     /// Activity cannot divide away, however slowly the tick ran.
     ///
