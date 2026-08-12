@@ -88,26 +88,40 @@ impl DaemonIdentity {
     /// Parse a record. `Ok(None)` for a legacy file holding only a pid,
     /// which is a different thing from a malformed one.
     pub fn decode(s: &str) -> std::io::Result<(i32, Option<Self>)> {
-        let mut parts = s.split_whitespace();
-        let pid: i32 = parts
-            .next()
-            .ok_or_else(|| bad_data("empty pid file"))?
-            .parse()
-            .map_err(|e| bad_data(&format!("pid parse: {e}")))?;
-        let (Some(ticks), Some(boot)) = (parts.next(), parts.next()) else {
-            return Ok((pid, None));
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        let pid = |raw: &str| -> std::io::Result<i32> {
+            raw.parse()
+                .map_err(|e| bad_data(&format!("pid parse: {e}")))
         };
-        let start_ticks = ticks
-            .parse()
-            .map_err(|e| bad_data(&format!("start_ticks parse: {e}")))?;
-        Ok((
-            pid,
-            Some(Self {
-                pid,
-                start_ticks,
-                boot_id: boot.to_string(),
-            }),
-        ))
+        match parts.as_slice() {
+            [] => Err(bad_data("empty record")),
+            // EXACTLY one field is the legacy shape. A partially
+            // written identity — pid and ticks, no boot id, which a
+            // truncated write produces — used to land here too, and the
+            // legacy path then accepted a reused pid on an exe match
+            // alone: `reconfigure` would signal it and `status` would
+            // present the old report as current (review finding).
+            [one] => Ok((pid(one)?, None)),
+            [p, ticks, boot] => {
+                let p = pid(p)?;
+                Ok((
+                    p,
+                    Some(Self {
+                        pid: p,
+                        start_ticks: ticks
+                            .parse()
+                            .map_err(|e| bad_data(&format!("start_ticks parse: {e}")))?,
+                        boot_id: boot.to_string(),
+                    }),
+                ))
+            }
+            // Anything else is a record this build does not understand:
+            // report it rather than guessing which half to trust.
+            other => Err(bad_data(&format!(
+                "expected 1 or 3 fields, found {}",
+                other.len()
+            ))),
+        }
     }
 }
 
@@ -576,6 +590,22 @@ mod tests {
         }
         for live in ['R', 'S', 'D', 'T', 't', 'I'] {
             assert!(state_is_alive(live), "state {live} is a process to respect");
+        }
+    }
+
+    /// A partial identity is not a legacy record.
+    ///
+    /// Both arrive as "a pid and no usable identity", and treating them
+    /// alike put a truncated write on the legacy path, where an exe
+    /// match alone accepts a reused pid (review finding).
+    #[test]
+    fn a_half_written_identity_is_refused_not_downgraded() {
+        for partial in ["12345 998877", "12345 998877 boot extra", "12345 x y"] {
+            assert!(
+                DaemonIdentity::decode(partial).is_err(),
+                "`{partial}` is not a record this build understands, and guessing which \
+                 half to trust is how a reused pid gets accepted"
+            );
         }
     }
 
