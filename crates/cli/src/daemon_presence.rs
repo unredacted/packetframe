@@ -298,6 +298,17 @@ fn decide_from_record(
         };
     };
     if ticks == recorded.start_ticks && boot == recorded.boot_id {
+        // Identity matched, and the record was shown to be root-owned
+        // before it was read — see `record_is_authentic`, which is what
+        // stops an unprivileged writer naming a victim pid here.
+        //
+        // Deliberately NOT also requiring an executable match. The
+        // ownership check already closes that attack (an unprivileged
+        // user cannot create a root-owned file), and demanding the exe
+        // as well would refuse a daemon deployed under a different
+        // binary NAME — a legitimate packaging choice — for no gain
+        // against an attacker who cannot get past the file check
+        // anyway.
         DaemonPresence::Running { pid }
     } else {
         // Alive, but not the process that wrote the record: the pid was
@@ -338,6 +349,31 @@ pub fn self_boot_id() -> Option<String> {
     }
 }
 
+/// Whether a record can be believed about WHICH process it names.
+///
+/// The identity path returns `Running` without consulting the
+/// executable, so the record decides who `reconfigure` signals as root.
+/// If `state-dir` is writable by an unprivileged user — a custom one
+/// under `/tmp`, say — that user can unlink both records and write
+/// their own naming a victim pid, with the victim's start ticks and
+/// boot id, both world-readable. The exe check this replaced would have
+/// refused; without this, root SIGHUPs whatever they chose (review
+/// finding, P1).
+///
+/// Root-owned and not writable by group or other. An attacker with
+/// directory write can still delete the file, but anything they create
+/// in its place is theirs and fails here — which drops the identity and
+/// falls back to the executable match, exactly as if none had been
+/// recorded.
+#[cfg(target_os = "linux")]
+fn record_is_authentic(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(m) => m.uid() == 0 && m.mode() & 0o022 == 0,
+        Err(_) => false,
+    }
+}
+
 /// The sidecar identity, if it describes the pid the pid file names.
 ///
 /// A sidecar naming a DIFFERENT pid is left over from a previous
@@ -347,6 +383,11 @@ pub fn self_boot_id() -> Option<String> {
 /// than concluding.
 #[cfg(target_os = "linux")]
 fn read_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
+    // Unauthenticated records name a pid; they do not get to decide
+    // that a pid is ours.
+    if !record_is_authentic(path) {
+        return None;
+    }
     let raw = std::fs::read_to_string(path).ok()?;
     let (recorded_pid, id) = DaemonIdentity::decode(&raw).ok()?;
     if recorded_pid != pid {
@@ -591,6 +632,49 @@ mod tests {
         for live in ['R', 'S', 'D', 'T', 't', 'I'] {
             assert!(state_is_alive(live), "state {live} is a process to respect");
         }
+    }
+
+    /// An identity record only counts if root wrote it.
+    ///
+    /// The identity path returns `Running` without consulting the
+    /// executable, so the record decides who `reconfigure` signals as
+    /// root. With a `state-dir` an unprivileged user can write, that
+    /// user could name a victim pid and supply its start ticks and boot
+    /// id — both world-readable — and the exe check this replaced would
+    /// no longer be there to refuse (review finding, P1).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unprivileged_identity_record_is_not_believed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("pf-authentic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("packetframe.identity");
+        std::fs::write(&path, "1 2 boot").expect("write");
+
+        // Written by this test, so not root-owned unless the suite runs
+        // as root — in which case the mode is what has to disqualify it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        assert!(
+            !record_is_authentic(&path),
+            "a record any user can write must not decide which pid is our daemon"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let owned_by_root = std::fs::metadata(&path)
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.uid() == 0
+            })
+            .unwrap_or(false);
+        assert_eq!(
+            record_is_authentic(&path),
+            owned_by_root,
+            "0600 is necessary but not sufficient — ownership is the other half"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A partial identity is not a legacy record.

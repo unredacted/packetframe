@@ -449,15 +449,32 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         .and_then(|id| write_state_record(&identity_path, &id.encode()))
     {
         Ok(()) => {}
-        // Non-fatal, like the pid file: readers treat a missing
-        // identity as "cannot verify" and fall back, which is safe in
-        // every direction — `detach` refuses rather than proceeds.
-        Err(e) => tracing::warn!(
-            path = %identity_path.display(),
-            error = %e,
-            "could not record process identity; `detach` will refuse rather than risk \
-             unlinking pins under this daemon"
-        ),
+        // Non-fatal, but the OLD sidecar must not survive. A restart
+        // handed its predecessor's pid — routine after a crash — leaves
+        // a record that `read_identity` accepts by pid and whose ticks
+        // then reject the live process, so `reconfigure` and current
+        // health stay unavailable for that daemon's whole lifetime. The
+        // comment here used to claim a failed write "falls back
+        // safely"; it did not (review finding).
+        Err(e) => {
+            tracing::warn!(
+                path = %identity_path.display(),
+                error = %e,
+                "could not record process identity; removing any stale one so readers fall \
+                 back rather than compare against a predecessor"
+            );
+            if let Err(e) = std::fs::remove_file(&identity_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(
+                        path = %identity_path.display(),
+                        error = %e,
+                        "could not remove the stale identity either; `packetframe \
+                         reconfigure` and current health will be unavailable for this \
+                         daemon — remove the file by hand"
+                    );
+                }
+            }
+        }
     }
     let pid_file_path = config.global.state_dir.join(PIDFILE_NAME);
     if let Err(e) = write_pid_file(&pid_file_path) {
@@ -935,7 +952,7 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     let pid = match crate::daemon_presence::presence_of(
         &pid_path,
         &state_dir.join(IDENTITY_NAME),
-        |p| proc_exe_matches_current(p as libc::pid_t),
+        |p| proc_exe_looks_like_a_daemon(p as libc::pid_t),
         scan_for_running_daemon,
     ) {
         crate::daemon_presence::DaemonPresence::Running { pid } => pid as libc::pid_t,
@@ -1221,7 +1238,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     let presence = crate::daemon_presence::presence_of(
         &state_dir.join(PIDFILE_NAME),
         &state_dir.join(IDENTITY_NAME),
-        |p| proc_exe_matches_current(p as libc::pid_t),
+        |p| proc_exe_looks_like_a_daemon(p as libc::pid_t),
         scan_for_running_daemon,
     );
     #[cfg(not(target_os = "linux"))]
@@ -1667,7 +1684,7 @@ fn print_module_health(state_dir: &Path) {
     let presence = crate::daemon_presence::presence_of(
         &state_dir.join(PIDFILE_NAME),
         &state_dir.join(IDENTITY_NAME),
-        |p| proc_exe_matches_current(p as libc::pid_t),
+        |p| proc_exe_looks_like_a_daemon(p as libc::pid_t),
         scan_for_running_daemon,
     );
     // No /proc to cross-check against, so liveness is unknown rather
