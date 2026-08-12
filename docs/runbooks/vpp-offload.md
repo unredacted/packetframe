@@ -1129,20 +1129,36 @@ carrying that traffic; VPP still is.
   $ packetframe status                     # message wrapped here; it prints on one line
     fast-path: healthy
       fib-integrity  healthy — bird 1272306 routes, mirror 1272281 — drift 0.002%,
-                     within the 1.000% warn threshold ... (last ok 41s ago)
+                     within the 1.000% warn threshold. A steering gate reads this same
+                     comparison and would permit a steer — this is the positive evidence
+                     a rollout needs ... (last ok 41s ago)
   ```
 
-  That line is the pass. **Every other line is not**, and each says
-  which of the several ways it is not:
+  **`would permit a steer` is the pass, and it is the only one.** The
+  row carries two separate facts and you want the second:
+
+  - The **drift-catch diagnostic** — `drift N%, within/at or above the
+    M% warn threshold` — is fast-path's own alarm against the
+    configurable `drift-warn-fraction`. It is a good thing to watch and
+    it is **not** the rollout verdict. At a tuned warn fraction the two
+    part company by design: 3% drift is "within" a 5% warn threshold
+    while the gate, on its own fixed `STEER_MAX_DRIFT`, refuses.
+  - The **rollout verdict** — `A steering gate reads this same
+    comparison and would permit a steer` / `and REFUSES: <reason>` — is
+    produced by calling the gate's own decision function on the same
+    report the gate receives, so it cannot disagree with what the steer
+    will actually do. On a refusal the reason is the refusal message
+    verbatim, remedy included.
 
   | The row says | What it means |
   | --- | --- |
-  | `drift N%, within the M% warn threshold` | Agreement. Proceed. |
+  | `would permit a steer` | Agreement. Proceed. |
   | `no comparison has completed yet` | The checker has not reached its first interval, or has only just started. **Not agreement** — wait 300 s and read it again. |
-  | `drift N%, at or above the M% warn threshold` | Real disagreement. The gate reads the same comparison and will refuse. |
-  | `bird reports NO routes in master4/master6` | The degenerate authority: bird up, carrying none of this mirror's table. This is the 23 h deferral above. |
+  | `REFUSES: the route mirror holds N of the authority's M routes` | The mirror is short — usually still loading. |
+  | `REFUSES: ... that is not the authority feeding this mirror` | The 23 h deferral above: bird up, carrying a table that is not this one. |
+  | `REFUSES: completeness is unknown: the authority reports zero routes` | The degenerate form of the same thing — bird answering, and answering nothing. |
+  | `REFUSES: the last completeness check was Ns ago, too old to act on` | Aged past the 900 s window. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
   | `could not complete: <error>` with `HISTORY` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
-  | `NOT evidence for a rollout ... reads this same report as Stale` | The comparison has aged past the 900 s window the gate acts within. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
   | no `fib-integrity` row at all | Nothing is checking on this box — kernel-fib mode, or a control plane with no route source. The authority will read `Absent`. |
 
   The row appears whenever a checker exists, *including before its
@@ -1161,12 +1177,13 @@ carrying that traffic; VPP still is.
   altogether rather than failing — look for the checker task, not for
   bird.
 
-  You do not have to watch that number to stay safe. At `STEER_MAX_REPORT_AGE`
-  (900 s) the row stops reporting agreement on its own and says so, on
-  the same constant and the same `>` the steering gate applies — so the
-  row and the gate flip together, and `status` cannot advertise the
-  evidence for a rollout the gate is already refusing. A parity test
-  pins the two. Reading the age is for catching the problem in the
+  You do not have to watch that number to stay safe. Past
+  `STEER_MAX_REPORT_AGE` (900 s) the rollout verdict becomes `REFUSES:
+  ... too old to act on` on its own — the row asks the gate's own
+  decision function rather than re-deriving the rule, so the two cannot
+  disagree, and `status` cannot advertise evidence for a rollout the
+  gate is already refusing. A parity test pins them across the
+  boundary. Reading the age is for catching the problem in the
   ~10 minutes before that, not for avoiding a bad rollout.
 
   **The other positive evidence is the canary steer itself**, and it

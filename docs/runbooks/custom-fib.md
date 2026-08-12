@@ -222,8 +222,18 @@ applied, the sample's age, and any error:
 ```
   fast-path: healthy
     fib-integrity  healthy — bird 1272306 routes, mirror 1272281 — drift 0.002%,
-                   within the 1.000% warn threshold ... (last ok 41s ago)
+                   within the 1.000% warn threshold. A steering gate reads this same
+                   comparison and would permit a steer ... (last ok 41s ago)
 ```
+
+Two facts, and they are not interchangeable. The drift against the
+warn threshold is **this module's** alarm, and `drift-warn-fraction`
+tunes it. The sentence after it is what a second tier's steering gate
+would decide from the same comparison, obtained by calling that gate's
+own decision function — which uses its own fixed threshold and its own
+900 s freshness window, so at a tuned warn fraction the two verdicts
+legitimately differ. For a rollout, the second one is the one that
+matters.
 
 The row is present whenever a checker is running, **including before
 its first comparison completes** — "no comparison has completed yet"

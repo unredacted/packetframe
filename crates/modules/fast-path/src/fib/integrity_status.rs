@@ -125,7 +125,13 @@ pub struct IntegritySnapshot {
 /// whether it came from the most recent run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
-    pub age: Duration,
+    /// When the comparison was recorded, and when it was read. Both,
+    /// rather than a precomputed age, because [`Self::gate_verdict`]
+    /// needs to hand the real decision function the same two instants
+    /// it would get in production. `age` is derived from them so the
+    /// two cannot disagree.
+    pub at: Instant,
+    pub observed_at: Instant,
     pub bird_routes: usize,
     pub packetframe_routes: usize,
     pub drift: Option<Drift>,
@@ -133,6 +139,52 @@ pub struct Sample {
     /// one retained across a run that failed. A retained sample is
     /// history and must be labelled as such.
     pub current: bool,
+}
+
+impl Sample {
+    pub fn age(&self) -> Duration {
+        self.observed_at.saturating_duration_since(self.at)
+    }
+
+    /// The comparison as the second tier's steering gate receives it.
+    ///
+    /// Field-for-field what [`crate::fib::integrity::IntegrityChecker`]
+    /// publishes to `TableCompleteness` in the same breath that it
+    /// records the comparison — same counts, same `at`. Reconstructed
+    /// rather than read back off the handle because the handle is
+    /// `None` in every single-module deployment, and this row has to
+    /// work there too.
+    fn report(&self) -> packetframe_common::fib::CompletenessReport {
+        packetframe_common::fib::CompletenessReport {
+            authority_routes: self.bird_routes as u64,
+            mirror_routes: self.packetframe_routes as u64,
+            at: self.at,
+        }
+    }
+
+    /// What a steering gate would decide from this comparison —
+    /// obtained by **calling the decision function**, not by
+    /// reimplementing its rules.
+    ///
+    /// This surface exists to predict the gate, so any rule restated
+    /// here is a rule that can drift out from under it. It already did,
+    /// twice, and both were caught in review rather than by a test:
+    /// staleness was not considered at all, and the drift comparison
+    /// used the checker's configurable **warn** threshold with a `>=`
+    /// where the gate uses its own fixed `STEER_MAX_DRIFT` with a `<=`.
+    /// The boundary was the visible symptom; the real defect was that
+    /// two different thresholds were being passed off as one, so any
+    /// operator who tuned `drift-warn-fraction` away from the default
+    /// got a row that advertised a rollout across a whole range the
+    /// gate refuses.
+    pub fn gate_verdict(&self) -> packetframe_common::fib::Completeness {
+        packetframe_common::fib::assess(
+            Some(self.report()),
+            self.observed_at,
+            packetframe_common::fib::STEER_MAX_DRIFT,
+            packetframe_common::fib::STEER_MAX_REPORT_AGE,
+        )
+    }
 }
 
 /// The integrity check's standing, as `packetframe status` reports it.
@@ -181,7 +233,8 @@ impl IntegrityPosture {
         Self::Checked {
             run_age: now.saturating_duration_since(last_run),
             sample: snap.last_comparison.map(|c| Sample {
-                age: now.saturating_duration_since(c.at),
+                at: c.at,
+                observed_at: now,
                 bird_routes: c.bird_routes,
                 packetframe_routes: c.packetframe_routes,
                 drift: c.drift,
@@ -237,7 +290,7 @@ impl IntegrityPosture {
     /// and reporting its age would read as freshness on a dashboard.
     fn last_success_age(&self) -> Option<u64> {
         match self {
-            Self::Checked { sample, .. } => sample.map(|s| s.age.as_secs()),
+            Self::Checked { sample, .. } => sample.map(|s| s.age().as_secs()),
             Self::AwaitingFirstCheck | Self::Unread => None,
         }
     }
@@ -320,78 +373,70 @@ impl IntegrityPosture {
     }
 
     /// The comparison itself, without regard to what else the run did.
+    ///
+    /// **Two facts, from two authorities, and neither speaks for the
+    /// other.** They were one fact once, and that was the bug:
+    ///
+    /// - The **drift-catch diagnostic** is fast-path's own alarm,
+    ///   measured against the `drift-warn-fraction` the run applied.
+    ///   Configurable, and nothing outside this module acts on it.
+    /// - The **rollout verdict** is what a second tier's steering gate
+    ///   will decide, and it is obtained by calling
+    ///   [`Sample::gate_verdict`] rather than by restating its rules.
+    ///
+    /// Conflating them let the row print "the positive evidence a
+    /// rollout needs" from a threshold the gate does not use — exactly
+    /// at the boundary where the two comparisons differ (`>=` here,
+    /// `<=` there), and across the entire range between them for any
+    /// operator who had tuned the warn fraction (review finding).
     fn verdict(s: &Sample) -> (HealthState, String) {
+        let mut state = HealthState::Healthy;
         let counts = format!(
             "bird {} routes, mirror {}",
             s.bird_routes, s.packetframe_routes
         );
-        // Age first, and against the consumer's own constant rather than
-        // a second copy of the number — for exactly the reason
-        // `packetframe_common::fib::assess` gives for checking it first:
-        // "a report whose drift looks fine but which predates anything
-        // we care about is not evidence, and reporting its drift would
-        // invite acting on it."
-        //
-        // Without this the row was the *inverse* of useful. A checker
-        // task that stalls or exits after one good comparison stops
-        // advancing `last_run` and records no error, so neither age
-        // affected the verdict and the row went on printing "the
-        // positive evidence a rollout needs" forever — while `assess`,
-        // reading the same comparison through the completeness handle,
-        // had already called it `Stale` and was refusing the steer. A
-        // status surface that contradicts the gate it exists to predict
-        // is worse than the silence it replaced (review finding).
-        //
-        // The drift is deliberately NOT printed here. It is the number
-        // an operator would act on, and it is precisely what has expired.
-        if s.age > packetframe_common::fib::STEER_MAX_REPORT_AGE {
-            return (
-                HealthState::Degraded,
+
+        let diagnostic = match s.drift {
+            Some(d) => {
+                if d.above {
+                    state = state.worse_of(HealthState::Degraded);
+                }
                 format!(
-                    "{counts} — but that comparison is {:.0}s old, past the {:.0}s window a \
-                     steering gate acts within, so it is NOT evidence for a rollout: the gate \
-                     reads this same report as `Stale` and refuses. Comparisons have stopped \
-                     landing; where no error is reported alongside this, they are not even \
-                     being attempted, so look at the daemon's checker task rather than at bird",
-                    s.age.as_secs_f64(),
-                    packetframe_common::fib::STEER_MAX_REPORT_AGE.as_secs_f64()
-                ),
-            );
-        }
-        match s.drift {
-            Some(d) if d.above => (
-                HealthState::Degraded,
-                format!(
-                    "{counts} — drift {:.3}%, at or above the {:.3}% warn threshold. The \
-                     mirror is not carrying what bird holds; a second-tier steering gate \
-                     reads this same comparison and refuses to steer while the two disagree",
+                    "drift {:.3}%, {} the {:.3}% warn threshold",
                     d.fraction * 100.0,
+                    if d.above { "at or above" } else { "within" },
                     d.threshold * 100.0
-                ),
-            ),
-            Some(d) => (
-                HealthState::Healthy,
-                format!(
-                    "{counts} — drift {:.3}%, within the {:.3}% warn threshold. This is the \
-                     positive evidence a rollout needs: the counts are bird's master4 plus \
-                     master6 against the mirror's v4+v6",
-                    d.fraction * 100.0,
-                    d.threshold * 100.0
-                ),
-            ),
+                )
+            }
             // Not "no drift". A zero authority cannot attest anything,
             // and it is a real and documented state — a box running a
             // bird that carries none of the table the mirror is fed.
-            None => (
-                HealthState::Degraded,
-                format!(
-                    "{counts} — bird reports NO routes in master4/master6, so no drift \
-                     fraction is defined and nothing here attests completeness. Check which \
-                     bird `birdc` reaches on this box: a bird that is running but carries \
-                     none of this mirror's table is not the same as having no bird at all"
-                ),
-            ),
-        }
+            None => "no drift fraction is defined: bird reports NO routes in \
+                     master4/master6, and a fraction of zero says nothing"
+                .to_string(),
+        };
+
+        let gate = s.gate_verdict();
+        let rollout = if gate.permits_steering() {
+            // No `describe()` here: on the converged path it only
+            // restates the drift already printed. Refusals keep it
+            // verbatim, where it carries the reason and the remedy.
+            "A steering gate reads this same comparison and would permit a steer — this is the \
+             positive evidence a rollout needs, and the counts behind it are bird's master4 plus \
+             master6 against the mirror's v4+v6"
+                .to_string()
+        } else {
+            state = state.worse_of(HealthState::Degraded);
+            // `describe()` is the refusal an operator would see from the
+            // steer itself, verbatim — including the staleness case,
+            // which `assess` checks before it will look at drift at all.
+            format!(
+                "A steering gate reads this same comparison and REFUSES: {}",
+                gate.describe()
+            )
+        };
+
+        (state, format!("{counts} — {diagnostic}. {rollout}"))
     }
 }
 
@@ -483,6 +528,58 @@ mod tests {
         assert_eq!(h.last_success_age_seconds, Some(12));
     }
 
+    /// Drift exactly ON the threshold. The checker's warn fires at
+    /// `>=` while the gate converges at `<=`, so this is the one drift
+    /// where the diagnostic and the rollout verdict legitimately
+    /// disagree — the row must report both rather than let the warn
+    /// speak for the gate. Reported Degraded either way, but the text
+    /// must not claim a refusal that will not happen.
+    #[test]
+    fn drift_exactly_on_the_threshold_does_not_claim_a_refusal() {
+        use packetframe_common::fib::STEER_MAX_DRIFT;
+        let at = t0();
+        // bird=1000, mirror=990 → drift exactly 0.01.
+        let snap = clean_run(at, 1000, 990, drift(STEER_MAX_DRIFT, STEER_MAX_DRIFT));
+        let s = match IntegrityPosture::observe(&snap, at) {
+            IntegrityPosture::Checked { sample, .. } => sample.expect("a comparison"),
+            other => panic!("expected Checked, got {other:?}"),
+        };
+        // The gate permits at the boundary; the warn fires at it.
+        assert!(s.gate_verdict().permits_steering());
+        assert!(s.drift.unwrap().above);
+
+        let m = IntegrityPosture::observe(&snap, at)
+            .subsystem_health()
+            .message
+            .unwrap();
+        assert!(m.contains("at or above the 1.000% warn threshold"), "{m}");
+        assert!(
+            m.contains("would permit a steer"),
+            "claimed a refusal the gate will not make: {m}"
+        );
+        assert!(!m.contains("REFUSES"), "{m}");
+    }
+
+    /// A tuned `drift-warn-fraction` is the range version of the same
+    /// defect, and the reason aligning the two comparison operators
+    /// would not have been enough: at a 5% warn threshold, a 3% drift
+    /// is "within" fast-path's alarm while the gate — which uses its
+    /// own fixed `STEER_MAX_DRIFT` — refuses outright.
+    #[test]
+    fn a_tuned_warn_threshold_does_not_speak_for_the_gate() {
+        let at = t0();
+        let snap = clean_run(at, 1_000_000, 970_000, drift(0.03, 0.05));
+        let h = IntegrityPosture::observe(&snap, at).subsystem_health();
+        let m = h.message.clone().unwrap();
+        assert!(m.contains("within the 5.000% warn threshold"), "{m}");
+        assert!(m.contains("REFUSES"), "{m}");
+        assert_eq!(
+            h.state,
+            HealthState::Degraded,
+            "the gate refuses, so the row cannot be healthy: {m}"
+        );
+    }
+
     /// The threshold travels with the comparison, so a non-default
     /// `drift_warn_fraction` is reported as the one actually applied
     /// rather than a constant re-read at render time.
@@ -530,11 +627,10 @@ mod tests {
         .subsystem_health();
         assert_eq!(stale.state, HealthState::Degraded);
         let m = stale.message.unwrap();
-        assert!(m.contains("NOT evidence for a rollout"), "{m}");
-        assert!(m.contains("`Stale`"), "{m}");
-        // The drift is what an operator would act on, and it is what has
-        // expired. `assess` withholds it for the same reason.
-        assert!(!m.contains("within the"), "expired drift still shown: {m}");
+        assert!(m.contains("REFUSES"), "{m}");
+        // Verbatim from `Completeness::describe()`, so the row prints
+        // the refusal the steer itself would print.
+        assert!(m.contains("too old to act on"), "{m}");
         // Still a real completed comparison, so its age is still
         // reported — that number is the whole diagnosis here.
         assert_eq!(
