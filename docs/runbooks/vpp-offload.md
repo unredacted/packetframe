@@ -1098,6 +1098,10 @@ carrying that traffic; VPP still is.
   or a mirror still short — including every startup before the first
   check lands). Only *"not the authority feeding it ... Waiting will
   not clear it"* is the persistent one below.
+  Fast-path's `fib-integrity` row answers it from the other side, and
+  more directly: an unreachable `birdc` shows there as `could not
+  complete: <error>`, a bird carrying the wrong table as a drift or
+  zero-authority verdict.
 - **A persistent disagreement is the case that needs a decision**: a
   local bird that does not carry the mirror's table, a bird carrying no
   routes at all, or a mirror fed from a different source than the
@@ -1116,59 +1120,65 @@ carrying that traffic; VPP still is.
   running.** The two are different, and this box proved it: bird was up
   the whole time.
 
-  **Do not hand-roll the comparison, and do not read silence as
-  agreement.** The checker compares bird's `master4` **plus** `master6`
-  against the fast-path mirror's v4+v6 count. It logs the successful
-  comparison at **debug**; at the default `log-level info` a healthy
-  check prints *nothing at all*, and its three failure paths
-  (`integrity check: birdc route count failed`, `... birdc protocols
-  failed`, `... mirror_counts failed`) print something different again.
-  So an absent `integrity drift above threshold` line is equally
-  consistent with the checker never having run, `birdc` failing every
-  time, or the log having rotated — which would approve a rollout onto
-  a handle that is `Unknown` and will refuse.
+  **Read `fib-integrity` in `packetframe status`.** It is the fast-path
+  module's own row and it carries the last comparison verbatim — both
+  counts, the drift against the threshold that was actually applied,
+  and the age beside it:
 
-  **The cheapest positive evidence is the canary steer itself.** With
-  `require-table-complete on`, a steer the authority will not support
-  is *refused*, and the refusal names the verdict verbatim — "the route
-  mirror holds N routes but the authority reports only M — that is not
-  the authority feeding this mirror", or "completeness is unknown", or
-  "too old to act on". Nothing is steered when it refuses, so rung 0's
-  first `steer on` doubles as the test, and a refusal costs a message
-  rather than traffic. Read the reason it prints; do not retry past it.
-
-  To know *before* attempting, sample the checker directly. Both counts
-  come from `birdc`, and the comparison is logged — but only at debug,
-  and **`log-level` in the config does not control it**: the filter is
-  built from `RUST_LOG` at process start, so this costs a restart.
-
-  ```bash
-  birdc show route count | grep -E 'in table master(4|6)'
-  systemctl edit packetframe   # [Service] Environment=RUST_LOG=info,packetframe_fast_path::fib::integrity=debug
-  systemctl restart packetframe && sleep 310
-  journalctl -u packetframe --since '-6min' \
-      | grep -E 'integrity check OK|integrity drift above threshold|integrity check:'
+  ```
+  $ packetframe status                     # message wrapped here; it prints on one line
+    fast-path: healthy
+      fib-integrity  healthy — bird 1272306 routes, mirror 1272281 — drift 0.002%,
+                     within the 1.000% warn threshold ... (last ok 41s ago)
   ```
 
-  `integrity check OK` carrying `bird_routes` and `packetframe_routes`
-  is the evidence the gate acts on. A drift warning, one of the three
-  failure lines, or **no line at all** are each not a pass. Revert the
-  override afterwards.
+  That line is the pass. **Every other line is not**, and each says
+  which of the several ways it is not:
 
-  > Both awkward parts of this — needing a restart, and reading a log
-  > rather than a command — come from one gap: `IntegrityChecker`'s
-  > snapshot is published and `RouteController::integrity_snapshot()`
-  > has no caller, so the verdict has no `status` surface outside a
-  > refusal message. Worth closing; until it is, prefer the canary
-  > refusal above, which needs neither.
+  | The row says | What it means |
+  | --- | --- |
+  | `drift N%, within the M% warn threshold` | Agreement. Proceed. |
+  | `no comparison has completed yet` | The checker has not reached its first interval, or has only just started. **Not agreement** — wait 300 s and read it again. |
+  | `drift N%, at or above the M% warn threshold` | Real disagreement. The gate reads the same comparison and will refuse. |
+  | `bird reports NO routes in master4/master6` | The degenerate authority: bird up, carrying none of this mirror's table. This is the 23 h deferral above. |
+  | `could not complete: <error>` with `HISTORY` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
+  | no `fib-integrity` row at all | Nothing is checking on this box — kernel-fib mode, or a control plane with no route source. The authority will read `Absent`. |
 
-  Two traps that make a hand-rolled check pass a box that will veto.
-  **`master6` counts**: a box whose `master4` matches but whose
-  `master6` is missing or wrong still fails the combined comparison, so
-  checking `master4` alone approves a rollout the gate will refuse.
-  And **`fib-synced`'s installed count is not the number to compare** —
-  that is VPP's table, which is v4-only by policy, against an authority
-  figure that includes v6.
+  The row appears whenever a checker exists, *including before its
+  first comparison*, and that is the distinction the check turns on:
+  silence used to be equally consistent with the checker never having
+  run, `birdc` failing every time, or the log having rotated — and
+  would approve a rollout onto a handle that is `Unknown` and will
+  refuse.
+
+  `packetframe status` reads a snapshot the daemon publishes every 5 s,
+  so the row is at most that stale — but the comparison behind it is up
+  to one interval (300 s) old by design, which is what the `last ok Ns
+  ago` beside it is for. Its ceiling in normal operation is ~320 s (the
+  interval plus two 10 s `birdc` budgets), so an age climbing past that
+  with **no** error alongside it means checks have stopped landing
+  altogether rather than failing — look for the checker task, not for
+  bird.
+
+  **The other positive evidence is the canary steer itself**, and it
+  costs nothing to lean on. With `require-table-complete on`, a steer
+  the authority will not support is *refused*, and the refusal names
+  the verdict verbatim — "the route mirror holds N routes but the
+  authority reports only M — that is not the authority feeding this
+  mirror", or "completeness is unknown", or "too old to act on".
+  Nothing is steered when it refuses, so rung 0's first `steer on`
+  doubles as the test, and a refusal costs a message rather than
+  traffic. Read the reason it prints; do not retry past it.
+
+  **Do not hand-roll the comparison from `birdc` output.** Two traps
+  make a hand-rolled check pass a box that will veto. **`master6`
+  counts**: the checker compares bird's `master4` **plus** `master6`
+  against the mirror's v4+v6, so a box whose `master4` matches while
+  its `master6` is missing or wrong still fails the combined
+  comparison, and checking `master4` alone approves a rollout the gate
+  will refuse. And **`fib-synced`'s installed count is not the number
+  to compare** — that is VPP's table, which is v4-only by policy,
+  against an authority figure that includes v6.
 
   A box that adopts while steered under a vetoing authority has no fast
   rollback. Worth knowing before the canary rather than during it.

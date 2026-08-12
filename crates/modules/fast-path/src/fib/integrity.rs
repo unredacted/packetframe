@@ -31,10 +31,12 @@ use tracing::{debug, info, warn};
 
 use super::programmer::FibProgrammerHandle;
 
-/// Default interval between integrity checks. Slow enough to be
-/// cheap, fast enough that a drift window of "up to 5 minutes"
-/// is acceptable.
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
+/// The result types and their rendering live in a platform-independent
+/// module so `packetframe status`'s view of this check is testable off
+/// Linux; re-exported here because this is where callers expect them.
+pub use crate::fib::integrity_status::{
+    Comparison, Drift, IntegrityPosture, IntegritySnapshot, DEFAULT_INTERVAL, SUBSYS_FIB_INTEGRITY,
+};
 
 /// Drift threshold above which the checker warns (as a fraction:
 /// `0.01` = 1%). BGP convergence can transiently drift by several
@@ -67,19 +69,6 @@ impl Default for IntegrityConfig {
             drift_warn_fraction: DEFAULT_DRIFT_WARN_FRACTION,
         }
     }
-}
-
-/// Snapshot of the most recent integrity-check result. Readers
-/// specifically the BmpStalled gate, consult this to decide whether
-/// a stall warrants an alert.
-#[derive(Debug, Clone, Default)]
-pub struct IntegritySnapshot {
-    pub last_run: Option<Instant>,
-    pub bird_route_count: Option<usize>,
-    pub packetframe_route_count: Option<usize>,
-    pub bird_established_peers: Option<usize>,
-    pub drift_fraction: Option<f64>,
-    pub last_error: Option<String>,
 }
 
 pub type SharedSnapshot = Arc<RwLock<IntegritySnapshot>>;
@@ -164,88 +153,110 @@ impl IntegrityChecker {
         let bird_peers = run_birdc_protocols(&self.config.birdc_path).await;
         let pf_route = self.prog.mirror_counts().await;
 
-        // Captured from THIS run's results, before they are folded into
-        // the snapshot.
+        // Captured from THIS run's results, before anything is folded
+        // into the snapshot.
         //
-        // The snapshot's count fields are sticky — a failed `birdc` or a
-        // failed `mirror_counts` leaves the previous run's number in
-        // place, which is right for a drift-catch display and wrong as
-        // the basis of a steering decision. Reading them back below
-        // would publish a report built from one fresh number and one
-        // five minutes old, and the reader acts on it.
+        // Nothing derived from a mix of runs ever reaches the snapshot:
+        // a failed `birdc` or a failed `mirror_counts` used to leave the
+        // previous run's number in a sticky per-count field, so a drift
+        // fraction could be computed from one fresh number and one five
+        // minutes old. That was tolerable while the only reader was a
+        // log line; it is not, now that `packetframe status` prints the
+        // verdict and a rollout is gated on it. A partial run records
+        // its error and leaves the previous COMPARISON standing whole,
+        // aged, and labelled as history.
         let fresh_bird = bird_route.as_ref().ok().copied();
         let fresh_mirror = pf_route.as_ref().ok().map(|(v4, v6)| v4 + v6);
 
+        // One `Instant` for the whole run, written to `last_run` and to
+        // the comparison alike. That equality is load-bearing:
+        // `IntegrityPosture` tells a current comparison from a retained
+        // one by comparing the two, so two separate `now()` calls would
+        // make every comparison read as history.
+        let at = Instant::now();
         let mut snap = self.snapshot.write().await;
-        snap.last_run = Some(Instant::now());
+        snap.last_run = Some(at);
         snap.last_error = None;
 
-        match bird_route {
-            Ok(n) => snap.bird_route_count = Some(n),
-            Err(e) => {
-                snap.last_error = Some(format!("birdc show route count: {e}"));
-                warn!(error = %e, "integrity check: birdc route count failed");
-            }
+        if let Err(e) = &bird_route {
+            snap.last_error = Some(format!("birdc show route count: {e}"));
+            warn!(error = %e, "integrity check: birdc route count failed");
         }
         match bird_peers {
             Ok(n) => snap.bird_established_peers = Some(n),
             Err(e) => {
                 // Non-fatal for the route-count side, but the stall
                 // gate relies on this so surface it.
-                let msg = format!("birdc show protocols: {e}");
                 if snap.last_error.is_none() {
-                    snap.last_error = Some(msg.clone());
+                    snap.last_error = Some(format!("birdc show protocols: {e}"));
                 }
                 warn!(error = %e, "integrity check: birdc protocols failed");
             }
         }
-        match pf_route {
-            Ok((v4, v6)) => snap.packetframe_route_count = Some(v4 + v6),
-            Err(e) => {
-                snap.last_error = Some(format!("programmer mirror_counts: {e}"));
-                warn!(error = %e, "integrity check: mirror_counts failed");
-            }
+        if let Err(e) = &pf_route {
+            snap.last_error = Some(format!("programmer mirror_counts: {e}"));
+            warn!(error = %e, "integrity check: mirror_counts failed");
         }
 
-        // Republished for the steering gate, and only when BOTH counts
-        // came from THIS run.
+        // Recorded, and republished to the steering gate, only when BOTH
+        // counts came from THIS run.
         //
         // A partial run publishes nothing rather than a mixed report:
         // the reader treats an absent report as "refuse to steer", which
         // is the safe reading, while a fabricated one would be acted on.
         // Leaving the previous report in place is correct — it ages out
         // on its own, and its own timestamp says how far behind it is.
-        if let (Some(handle), Some(bird), Some(pf)) =
-            (self.completeness.as_ref(), fresh_bird, fresh_mirror)
-        {
-            handle.publish(packetframe_common::fib::CompletenessReport {
-                authority_routes: bird as u64,
-                mirror_routes: pf as u64,
-                at: Instant::now(),
-            });
-        }
-
-        if let (Some(bird), Some(pf)) = (snap.bird_route_count, snap.packetframe_route_count) {
-            if bird == 0 {
-                snap.drift_fraction = None;
-            } else {
-                let frac = (bird as f64 - pf as f64).abs() / bird as f64;
-                snap.drift_fraction = Some(frac);
-                if frac >= self.config.drift_warn_fraction {
-                    warn!(
-                        bird_routes = bird,
-                        packetframe_routes = pf,
-                        drift_fraction = frac,
-                        "integrity drift above threshold"
-                    );
-                } else {
-                    debug!(
-                        bird_routes = bird,
-                        packetframe_routes = pf,
-                        drift_fraction = frac,
-                        "integrity check OK"
-                    );
+        if let (Some(bird), Some(pf)) = (fresh_bird, fresh_mirror) {
+            // `above` is decided here, in the same place that decides
+            // whether to warn, and carried on the comparison. The health
+            // surface reports that verdict rather than re-applying the
+            // threshold, so the log and `packetframe status` cannot
+            // disagree about whether a box has drifted.
+            let drift = (bird != 0).then(|| {
+                let fraction = (bird as f64 - pf as f64).abs() / bird as f64;
+                Drift {
+                    fraction,
+                    threshold: self.config.drift_warn_fraction,
+                    above: fraction >= self.config.drift_warn_fraction,
                 }
+            });
+            match drift {
+                Some(d) if d.above => warn!(
+                    bird_routes = bird,
+                    packetframe_routes = pf,
+                    drift_fraction = d.fraction,
+                    "integrity drift above threshold"
+                ),
+                Some(d) => debug!(
+                    bird_routes = bird,
+                    packetframe_routes = pf,
+                    drift_fraction = d.fraction,
+                    "integrity check OK"
+                ),
+                // A zero authority used to record `drift_fraction =
+                // None` and log nothing at all — the quietest possible
+                // treatment of a bird that cannot attest anything. It is
+                // the degenerate end of the case the vpp-offload runbook
+                // measured (a box whose own bird carried 13 routes
+                // against a 1.3M mirror), so it warns like drift does.
+                None => warn!(
+                    bird_routes = bird,
+                    packetframe_routes = pf,
+                    "integrity check: bird reports no routes in master4/master6"
+                ),
+            }
+            snap.last_comparison = Some(Comparison {
+                at,
+                bird_routes: bird,
+                packetframe_routes: pf,
+                drift,
+            });
+            if let Some(handle) = self.completeness.as_ref() {
+                handle.publish(packetframe_common::fib::CompletenessReport {
+                    authority_routes: bird as u64,
+                    mirror_routes: pf as u64,
+                    at,
+                });
             }
         }
     }

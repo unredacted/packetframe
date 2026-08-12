@@ -249,13 +249,48 @@ impl Module for FastPathModule {
         Ok(())
     }
 
+    /// Subsystem health for the custom-FIB control plane.
+    ///
+    /// One row so far: the integrity check's verdict, which was
+    /// computed every 300 s and discarded — `packetframe status` had
+    /// nothing to say about whether the mirror matches bird, and the
+    /// second tier's steering gate acts on exactly that comparison.
+    /// BmpStation and NeighborResolver freshness are the obvious next
+    /// rows; neither publishes anything readable yet, and a row that
+    /// reported "fine" from an unread source would be worse than none.
+    ///
+    /// The row is absent only when nothing is checking (kernel-fib
+    /// mode, or a control plane with no route source). Whenever a
+    /// checker exists the row appears, including before its first
+    /// check completes — the whole point being that silence must not
+    /// be readable as agreement.
+    #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
-        // Phase 1 (Option F): structured health reporting is now the
-        // trait surface, but fast-path has no live subsystems yet
-        // RouteController / BmpStation / NeighborResolver land in
-        // Phase 2-3 and will populate `subsystems`. For now, always
-        // report healthy with no subsystems. Circuit-breaker wiring
-        // stays as-is until the reporting contract is consumed.
+        let subsystems: Vec<_> = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::integrity_posture)
+            .map(|p| p.subsystem_health())
+            .into_iter()
+            .collect();
+        // `worse_of` rather than a hand-rolled escalation: a module that
+        // reports Healthy over a Degraded subsystem disagrees with its
+        // own report, which is the defect vpp-offload's `nominal()`
+        // documents at length.
+        let overall = subsystems.iter().fold(
+            packetframe_common::module::HealthState::Healthy,
+            |acc, s| acc.worse_of(s.state),
+        );
+        Ok(HealthReport {
+            overall,
+            subsystems,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
+        // Nothing runs here to report on: the control plane is
+        // Linux-only, so there is no check whose silence could mislead.
         Ok(HealthReport::healthy())
     }
 }
@@ -289,6 +324,23 @@ mod tests {
         let mut w = MetricsWriter::new(&mut buf, "fast-path");
         assert!(m.sample_metrics(&mut w).is_ok());
         assert!(m.health_check(&HealthCtx::new()).is_ok());
+    }
+
+    /// With nothing loaded there is no control plane, so there is no
+    /// integrity row — and its absence is deliberate rather than the
+    /// old unconditional `healthy()`. Whenever a checker DOES exist the
+    /// row is present even before its first comparison; that
+    /// distinction is covered in `fib::integrity_status`.
+    #[test]
+    fn unloaded_module_reports_no_integrity_row() {
+        let m = FastPathModule::new();
+        let r = m.health_check(&HealthCtx::new()).unwrap();
+        assert!(r.subsystems.is_empty());
+        assert_eq!(
+            r.overall,
+            packetframe_common::module::HealthState::Healthy,
+            "nothing is running, so nothing is impaired"
+        );
     }
 
     #[test]
