@@ -77,6 +77,15 @@ pub enum ReconfigureError {
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 const PIDFILE_NAME: &str = "packetframe.pid";
 
+/// Sidecar holding the running daemon's `(pid, start_ticks, boot_id)`.
+///
+/// Separate from the pid file rather than folded into it: that file's
+/// format is load-bearing for CLIs we do not ship with, and older ones
+/// parse it whole. A reader that does not know about this file falls
+/// back to what it always did.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+const IDENTITY_NAME: &str = "packetframe.identity";
+
 /// Sub-path under `state-dir` for the reconfigure ack marker. The
 /// daemon writes one line `OK <unix_ns>` after a successful SIGHUP
 /// reconcile or `ERR <unix_ns> <message>` on parse / per-module
@@ -444,6 +453,44 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         );
     }
 
+    // AFTER the pid file, and that order is load-bearing: a reader
+    // accepts the sidecar only if it is at least as new as the pid
+    // record. A rollback to a pre-sidecar daemon rewrites only the pid
+    // file and cannot know to remove this one, so without the ordering
+    // its stale identity would be matched to the new daemon by pid and
+    // then reject it as reused (review finding).
+    let identity_path = config.global.state_dir.join(IDENTITY_NAME);
+    match crate::daemon_presence::DaemonIdentity::current()
+        .and_then(|id| write_state_record(&identity_path, &id.encode()))
+    {
+        Ok(()) => {}
+        // Non-fatal, but the OLD sidecar must not survive. A restart
+        // handed its predecessor's pid — routine after a crash — leaves
+        // a record that `read_identity` accepts by pid and whose ticks
+        // then reject the live process, so `reconfigure` and current
+        // health stay unavailable for that daemon's whole lifetime. The
+        // comment here used to claim a failed write "falls back
+        // safely"; it did not (review finding).
+        Err(e) => {
+            tracing::warn!(
+                path = %identity_path.display(),
+                error = %e,
+                "could not record process identity; removing any stale one so readers fall \
+                 back rather than compare against a predecessor"
+            );
+            if let Err(e) = remove_state_record(&identity_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(
+                        path = %identity_path.display(),
+                        error = %e,
+                        "could not remove the stale identity either; `packetframe \
+                         reconfigure` and current health will be unavailable for this \
+                         daemon — remove the file by hand"
+                    );
+                }
+            }
+        }
+    }
     tracing::info!("fast-path running, SIGHUP to reconfigure, SIGTERM/SIGINT to exit (§8.5)");
 
     let termination = drive_signal_loop(
@@ -498,7 +545,16 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
     // Best-effort PID file cleanup. Non-fatal, the file is harmless
     // if left behind (PID will be unrecognized on re-validate).
-    if let Err(e) = std::fs::remove_file(&pid_file_path) {
+    // Through the walked descriptor, like every other touch of the
+    // state dir by this root process — `remove_file` follows
+    // intermediate symlinks (review finding on the failed-write
+    // cleanup; same rule here).
+    if let Err(e) = remove_state_record(&identity_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %identity_path.display(), error = %e, "could not remove identity file");
+        }
+    }
+    if let Err(e) = remove_state_record(&pid_file_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
                 path = %pid_file_path.display(),
@@ -510,58 +566,198 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Open `path` for writing with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600`
-/// the symlink-safe atomic-write primitive both pidfile / marker
-/// writes (here) and the metrics-textfile writer ([`crate::metrics`])
-/// use for their `.tmp` staging files.
+// `create_excl_no_follow` — the pathname O_NOFOLLOW|O_EXCL primitive
+// from the May 2026 audit — is gone. Every privileged write, rename,
+// and unlink in a configured directory now goes through
+// `walk_dir_no_follow` + the `openat`/`renameat`/`unlinkat` helpers
+// below, because O_NOFOLLOW on the final component never guarded the
+// intermediate ones (review finding, P1).
+
+/// Open an ABSOLUTE directory path one component at a time, each step
+/// `openat(O_DIRECTORY | O_NOFOLLOW)` relative to the descriptor of the
+/// previous one, creating missing components (0755) on the way.
 ///
-/// `O_NOFOLLOW` makes the open fail (`ELOOP`) when `path` is a
-/// symlink, so an attacker who can pre-create `<...>.tmp` as a
-/// symlink pointing at e.g. `/etc/passwd` cannot redirect the
-/// privileged daemon's write target. `O_EXCL` makes the open fail
-/// (`EEXIST`) when the path already exists, so a stale `.tmp`
-/// leftover from a crashed run is also surfaced rather than silently
-/// truncated and overwritten, callers handle that one-shot with
-/// `unlink-and-retry`.
+/// Why a walk and not one `open`: `O_NOFOLLOW` guards only the FINAL
+/// component. The state-dir writes and the umask chmod used to resolve
+/// the whole path at once, so a symlink at an intermediate component —
+/// `/tmp/plant/state` with `plant` attacker-controlled — carried this
+/// root process wherever the attacker pointed, and the descriptor
+/// "verified" at the end belonged to a directory of their choosing
+/// (review finding, P1; the reader was already refusing such paths via
+/// canonicalize-equality, and the privileged writer must be at least as
+/// suspicious as the reader). Every component is opened without
+/// following; a symlink ANYWHERE fails with `ELOOP` and the write is
+/// refused.
 ///
-/// The May 2026 audit Slice 4 finding flagged the previous use of
-/// `File::create` (which both follows symlinks and `O_TRUNC`s) on
-/// these temp paths as a privileged-write redirection primitive any
-/// time the parent directory is writable to a non-root user.
+/// `..` is refused outright — a state dir has no business being
+/// specified through parent traversal, and accepting it would make the
+/// walk's guarantees path-dependent.
 #[cfg(target_os = "linux")]
-pub(crate) fn create_excl_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(path)
+pub(crate) fn create_and_open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    walk_dir_no_follow(path, true)
 }
 
-/// Same shape but with one stale-`.tmp` retry. The retry runs only
-/// when `create_excl_no_follow` returns `AlreadyExists` and the
-/// existing path is a regular file (a leftover from a crashed run);
-/// a `.tmp` that's a symlink hits `ELOOP` on the retried open and
-/// the function gives up. A second `EEXIST` is treated as a real
-/// race between competing writers and errors out.
+/// The non-creating walk, for operations that have no business making
+/// directories — removal in particular: if the walk cannot reach the
+/// directory, there is nothing there this process is entitled to touch.
 #[cfg(target_os = "linux")]
-fn create_excl_no_follow_with_retry(path: &Path) -> std::io::Result<std::fs::File> {
-    match create_excl_no_follow(path) {
+pub(crate) fn open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    walk_dir_no_follow(path, false)
+}
+
+#[cfg(target_os = "linux")]
+fn walk_dir_no_follow(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("state paths must be absolute: {}", path.display()),
+        ));
+    }
+    let mut dir = std::fs::File::open("/")?;
+    for comp in path.components() {
+        let name = match comp {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(n) => n,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing path component {other:?} in {}", path.display()),
+                ))
+            }
+        };
+        let c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path component")
+        })?;
+        let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if create
+            && fd < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
+            // Create it and re-open. A concurrent creator making this
+            // mkdirat lose with EEXIST is fine — the reopen decides.
+            unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
+            fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        }
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "open component {name:?} of {}: {e} (a symlink here is refused)",
+                    path.display()
+                ),
+            ));
+        }
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(dir)
+}
+
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` a file RELATIVE to an already-walked
+/// directory descriptor, mode 0600 — the dirfd twin of
+/// `create_excl_no_follow`, for writers that must not re-resolve the
+/// directory path between verifying it and using it.
+#[cfg(target_os = "linux")]
+fn openat_excl_no_follow(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Same shape but with one stale-`.tmp` retry, dirfd-relative
+/// throughout. The retry runs only when the create returns
+/// `AlreadyExists` and the existing entry is a regular file (a leftover
+/// from a crashed run), checked with `fstatat(AT_SYMLINK_NOFOLLOW)` so
+/// an attacker's symlink is not misclassified as a file. A second
+/// `EEXIST` is a real race between competing writers and errors out.
+#[cfg(target_os = "linux")]
+pub(crate) fn openat_excl_with_retry(
+    dir: &std::fs::File,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    match openat_excl_no_follow(dir, name) {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // unlink-and-retry, but only if the leftover is a plain
-            // file. symlink_metadata avoids following the symlink so
-            // we don't misclassify an attacker's symlink as a file.
-            let meta = std::fs::symlink_metadata(path)?;
-            if !meta.file_type().is_file() {
+            let c = std::ffi::CString::new(name).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name")
+            })?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG {
                 return Err(e);
             }
-            std::fs::remove_file(path)?;
-            create_excl_no_follow(path)
+            if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            openat_excl_no_follow(dir, name)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Remove a state record through the same component-wise no-follow
+/// walk the writers use — never by resolving the pathname whole.
+///
+/// `std::fs::remove_file` does not follow a symlink at the FINAL
+/// component, but it follows every intermediate one, so the identity
+/// cleanup on a failed write could be pointed at another instance's
+/// state directory and have this root daemon delete THAT instance's
+/// sidecar — disabling its identity-based status and reconfigure
+/// (review finding, P1; the writes had just been converted to
+/// descriptor-relative operations while this cleanup stayed
+/// pathname-based). If the walk cannot reach the directory, nothing is
+/// removed: a path this process refuses to write through is a path it
+/// must refuse to delete through.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_state_record(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let dir = open_dir_no_follow(parent)?;
+    let c = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `renameat` within one already-walked directory descriptor.
+#[cfg(target_os = "linux")]
+pub(crate) fn renameat_within(dir: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (f, t) = (std::ffi::CString::new(from), std::ffi::CString::new(to));
+    let (f, t) = (
+        f.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?,
+        t.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?,
+    );
+    if unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Atomically write the current PID to `path`. Uses write-then-rename
@@ -569,17 +765,65 @@ fn create_excl_no_follow_with_retry(path: &Path) -> std::io::Result<std::fs::Fil
 /// with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600` so a pre-existing
 /// symlink at `<path>.tmp` cannot redirect the write.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
-fn write_pid_file(path: &Path) -> std::io::Result<()> {
+/// Write a state-dir record without following a symlink.
+///
+/// O_EXCL|O_NOFOLLOW into a temp name, then rename. `std::fs::write`
+/// would follow: `state-dir` can be a pre-existing directory an
+/// unprivileged user can write, so a `packetframe.identity` symlink
+/// planted before startup would have this root daemon truncate whatever
+/// it pointed at (review finding, P1). The pid file has always been
+/// written this way; the identity sidecar was not, until it was routed
+/// through here.
+fn write_state_record(path: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension("pid.tmp");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    // EVERYTHING below happens relative to this one descriptor,
+    // obtained by a component-wise no-follow walk: the directory that
+    // was verified is the directory that is chmodded, written into,
+    // and renamed within. Resolving the path again for any of those
+    // steps would reintroduce the symlink redirections this exists to
+    // refuse (review findings, two rounds of them: first the final
+    // component, then the intermediate ones).
+    let dir = create_and_open_dir_no_follow(parent)?;
+    // The reader trusts records only in a directory nobody else can
+    // write (`dir_is_authentic`): a writable directory lets `rename`
+    // relocate root-owned records whole, so per-file ownership proves
+    // nothing there. `create_dir_all` inherits the umask, and a 002
+    // umask would create a group-writable dir whose every record then
+    // reads as untrusted — `reconfigure` refused for the daemon's whole
+    // lifetime. Clear exactly the group/world-write bits and leave the
+    // rest alone (an operator's deliberate 0700 stays 0700). Best
+    // effort: if it fails, the reader refuses, which is the safe side.
     {
-        let mut f = create_excl_no_follow_with_retry(&tmp)?;
-        writeln!(f, "{}", std::process::id())?;
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = dir.metadata() {
+            let mode = meta.permissions().mode();
+            if meta.is_dir() && mode & 0o022 != 0 {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode & !0o022));
+            }
+        }
+    }
+    let tmp = format!("{name}.tmp");
+    {
+        let mut f = openat_excl_with_retry(&dir, &tmp)?;
+        writeln!(f, "{body}")?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    renameat_within(&dir, &tmp, name)
+}
+
+/// A BARE PID, exactly as before. The identity lives in a sidecar
+/// instead, because this file has readers we do not ship with: a CLI
+/// from the previous bundle parses the whole trimmed file as one
+/// integer, so widening the format broke `reconfigure` for anyone
+/// rolling back or running mixed versions.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn write_pid_file(path: &Path) -> std::io::Result<()> {
+    write_state_record(path, &std::process::id().to_string())
 }
 
 /// Look through a module section's directives and return its
@@ -840,17 +1084,23 @@ fn write_reconfigure_marker(path: &Path, status: &str) {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        tracing::warn!(error = %e, "could not create reconfigure marker dir");
-        return;
-    }
-    let tmp = path.with_extension("timestamp.tmp");
     let body = format!("{} {}\n", crate::scrub::scrub_control_chars(status), now_ns);
+    // Same dirfd discipline as `write_state_record`: this runs as root
+    // in the daemon's SIGHUP handler, and a marker path resolved whole
+    // would follow an intermediate symlink to wherever it points.
     let r = (|| -> std::io::Result<()> {
-        let mut f = create_excl_no_follow_with_retry(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+        let dir = create_and_open_dir_no_follow(parent)?;
+        let tmp = format!("{name}.tmp");
+        {
+            let mut f = openat_excl_with_retry(&dir, &tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+        }
+        renameat_within(&dir, &tmp, name)
     })();
     if let Err(e) = r {
         tracing::warn!(error = %e, "could not write reconfigure marker");
@@ -869,14 +1119,6 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     let pid_path = state_dir.join(PIDFILE_NAME);
     let marker_path = state_dir.join(RECONFIGURE_MARKER_NAME);
 
-    let pid = read_pid_file(&pid_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ReconfigureError::DaemonNotRunning(format!(
-            "PID file not found at {}, daemon doesn't appear to be running",
-            pid_path.display()
-        )),
-        _ => ReconfigureError::Io(format!("read PID file {}: {e}", pid_path.display())),
-    })?;
-
     // /proc/<pid>/exe cross-check defends against a stale PID file
     // pointing at a recycled PID. We previously consulted
     // /proc/<pid>/comm, but `comm` is user-settable via
@@ -887,12 +1129,36 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     // user-writable; readlink-comparing it against our own
     // current_exe is a real identity check rather than a name match.
     // See the May 2026 audit Slice 4 finding.
-    if !proc_exe_matches_current(pid) {
-        return Err(ReconfigureError::DaemonNotRunning(format!(
-            "PID {pid} from {} is not a packetframe process (stale pidfile?)",
-            pid_path.display()
-        )));
-    }
+    // The pid to signal comes FROM the check, not from a second read
+    // of the same file. Reading twice let a concurrent restart swap the
+    // record in between, so the check could validate the replacement
+    // while the signal went to the pid the first read captured — a
+    // recycled process, as root (review finding).
+    let pid = match crate::daemon_presence::presence_of(
+        &pid_path,
+        &state_dir.join(IDENTITY_NAME),
+        |p| is_daemon_process(p as libc::pid_t),
+        scan_for_running_daemon,
+    ) {
+        crate::daemon_presence::DaemonPresence::Running { pid } => pid as libc::pid_t,
+        crate::daemon_presence::DaemonPresence::Gone { why } => {
+            return Err(ReconfigureError::DaemonNotRunning(format!(
+                "no daemon to reconfigure: {why} (stale pidfile at {}?)",
+                pid_path.display()
+            )));
+        }
+        // A pid we cannot identify is one we must not signal. The old
+        // check reported this as "not a packetframe process", which was
+        // also how it read a LIVE daemon whenever this CLI ran from a
+        // different path than it — so the canary lever failed during
+        // exactly the upgrade it was meant to drive.
+        crate::daemon_presence::DaemonPresence::Unknown { why } => {
+            return Err(ReconfigureError::DaemonNotRunning(format!(
+                "cannot confirm the daemon named by {} ({why}); refusing to signal it",
+                pid_path.display()
+            )));
+        }
+    };
 
     // Snapshot the marker mtime (or NotFound) before signaling so we
     // can detect "changed since SIGHUP."
@@ -941,15 +1207,183 @@ pub fn reconfigure(_config_path: &Path) -> Result<(), ReconfigureError> {
     ))
 }
 
+/// Whether `pid`'s executable could be a packetframe daemon — this
+/// build's binary, or another copy of it deployed elsewhere.
+///
+/// Path equality alone answers "is it MY binary", which is exactly the
+/// question that made every check in this module wrong during an
+/// upgrade. A daemon from the previous bundle lives at a different
+/// path, so an exe-path scan cannot see it, and a scan that cannot see
+/// it must not be read as proving it absent.
+///
+/// So the basename counts too, and ONLY for finding. A false positive
+/// here refuses a `detach` and names the pid, which an operator can
+/// look at and resolve; a false negative unlinks pins under a live
+/// daemon, which is the 2026-04-21 outage. Those are not symmetric.
+///
+/// This deliberately widens what the May 2026 audit narrowed, and not
+/// as far back. That finding was about `comm`, settable to anything by
+/// any local process via `prctl` with no file involved. Matching
+/// `/proc/<pid>/exe`'s basename requires actually controlling a binary
+/// named `packetframe`, exec'ing it, and carrying `run` in argv — and
+/// the worst it buys is a refusal that says which pid to look at.
 #[cfg(target_os = "linux")]
-fn read_pid_file(path: &Path) -> std::io::Result<libc::pid_t> {
-    let s = std::fs::read_to_string(path)?;
-    s.trim().parse::<libc::pid_t>().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("PID parse `{}`: {e}", s.trim()),
-        )
-    })
+fn proc_exe_looks_like_a_daemon(pid: libc::pid_t) -> bool {
+    if proc_exe_matches_current(pid) {
+        return true;
+    }
+    let Ok(target) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    // The kernel appends ` (deleted)` once the inode is unlinked, which
+    // is the state an upgraded-in-place daemon is in.
+    let target = target.to_string_lossy();
+    let target = target.strip_suffix(" (deleted)").unwrap_or(&target);
+    // Equal names, or a versioned sibling: `packetframe-v2` alongside
+    // `packetframe-v1` is a real packaging shape, and the identity path
+    // says elsewhere that a renamed binary is legitimate — so a scan
+    // that demanded exact equality contradicted it, and missed the
+    // daemon it exists to find (review finding).
+    //
+    // The residual limit, stated rather than papered over: a daemon
+    // deployed under a name sharing no prefix with ours is NOT found
+    // here. Nothing short of trusting argv could find it, and argv is
+    // what the May 2026 audit rejected — any local process could then
+    // block `detach` at will. The pid record is what covers that case;
+    // this scan is the backstop for when there is none.
+    match (Path::new(target).file_name(), current.as_path().file_name()) {
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+            a == b || (a.starts_with("packetframe") && b.starts_with("packetframe"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `pid` is a packetframe DAEMON: our binary (or another copy
+/// of it), running the `run` subcommand.
+///
+/// One predicate, because the scan and the record path must ask the
+/// same question. They did not: the scan filtered argv for `run`, while
+/// the legacy record path took a bare executable match — so a stale
+/// pid-only file whose pid had been reused by a long `packetframe
+/// probe` from another bundle read as `Running`, and `reconfigure`
+/// SIGHUPed the probe (review finding).
+///
+/// Reading argv is sound only after the executable check: a spoofed
+/// `run` on its own proves nothing, which is why `comm` was rejected
+/// for this to begin with.
+#[cfg(target_os = "linux")]
+fn is_daemon_process(pid: libc::pid_t) -> bool {
+    daemon_process_verdict(pid) == Some(true)
+}
+
+/// The same question, keeping "could not tell" apart from "no".
+///
+/// `None` means a read failed for a reason other than the process
+/// having exited: the answer is unavailable, not negative. The scan
+/// needs that distinction because its negative is what licenses a
+/// destructive `detach`; `is_daemon_process` does not, because there
+/// an unavailable answer already falls through to `Unknown`.
+#[cfg(target_os = "linux")]
+fn daemon_process_verdict(pid: libc::pid_t) -> Option<bool> {
+    // Not knowing our OWN path makes every comparison below vacuous, so
+    // it is unavailability rather than a mismatch — for every pid at
+    // once, which is why the scan cannot conclude anything at all.
+    std::env::current_exe().ok()?;
+    if !proc_exe_looks_like_a_daemon(pid) {
+        // Distinguish "the exe link says it is something else" from
+        // "the exe link could not be read at all". A process that has
+        // exited takes its whole `/proc` entry with it and is a plain
+        // no; anything else (EACCES on a hardened kernel, EPERM under
+        // a non-root caller) is unreadable.
+        return match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(_) => Some(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        };
+    }
+    // BYTES: `read_to_string` rejects the whole cmdline if any argument
+    // is not UTF-8, and a `--config` path may legally contain arbitrary
+    // bytes.
+    // The SUBCOMMAND SLOT, not anywhere in argv. `any` matched a probe
+    // run as `packetframe probe --iface run ...` on an interface named
+    // `run` — which then reads as a daemon, takes SIGHUP from
+    // `reconfigure`, and blocks `detach` (review finding). `struct Cli`
+    // carries nothing but the subcommand, so clap accepts no global
+    // options before it and argv[1] is where `run` must be.
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => Some(cmdline.split(|b| *b == 0).nth(1) == Some(b"run".as_slice())),
+        // Gone between the two reads: not a daemon, and not a mystery.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        // It runs our binary and its argv cannot be read. The only
+        // question left is the only one unanswerable, so this is not a
+        // process the scan may report as harmless.
+        Err(_) => None,
+    }
+}
+
+/// Search the process table for a running daemon.
+///
+/// This was `daemon_pid`, and its answer was read as "no daemon is
+/// running" whenever it came back empty — which is false for any daemon
+/// started from a different path, i.e. during every upgrade, and is how
+/// `detach` walked past its own guard. Its positive is still sound and
+/// still useful: a process running this binary IS a daemon worth
+/// refusing to detach under, even when no pid file names it (a failed
+/// record write leaves exactly that).
+///
+/// So it reports THREE answers rather than an `Option`. `NoneFound`
+/// still is not proof of absence — a differently named daemon is
+/// invisible to `proc_exe_looks_like_a_daemon` — but it does assert
+/// that the table was walked and every process in it examined, which
+/// is the part `Option::None` was silently standing in for.
+///
+/// `/proc/<pid>/exe` rather than `comm`, which is user-settable via
+/// `prctl` — the May 2026 audit Slice 4 finding.
+#[cfg(target_os = "linux")]
+fn scan_for_running_daemon() -> crate::daemon_presence::Scan {
+    use crate::daemon_presence::Scan;
+    let self_pid = std::process::id();
+    let dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(e) => return Scan::Inconclusive(format!("/proc could not be listed: {e}")),
+    };
+    // Counted, never skipped. Each is a process the scan cannot vouch
+    // for, and this scan's NEGATIVE is what licenses `detach` to unlink
+    // pins — so an unexaminable process has to reach the caller rather
+    // than quietly leave the total looking complete.
+    let mut unexamined = 0usize;
+    for entry in dir {
+        let Ok(entry) = entry else {
+            unexamined += 1;
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        match daemon_process_verdict(pid as libc::pid_t) {
+            Some(true) => return Scan::Found(pid as i32),
+            Some(false) => {}
+            None => unexamined += 1,
+        }
+    }
+    if unexamined > 0 {
+        return Scan::Inconclusive(format!(
+            "{unexamined} process(es) in /proc could not be examined"
+        ));
+    }
+    Scan::NoneFound
 }
 
 /// Read /proc/<pid>/exe as a symlink and compare against the
@@ -1025,53 +1459,6 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
     }
 }
 
-/// Look for a live `packetframe run` daemon via `/proc`. Returns the
-/// pid of the first match, None if none found. Only our own process
-/// name is matched (not arbitrary substrings), so a text editor
-/// holding a `packetframe.conf` file doesn't false-positive.
-#[cfg(target_os = "linux")]
-fn daemon_pid() -> Option<u32> {
-    let self_pid = std::process::id();
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let pid: u32 = match name.to_str().and_then(|s| s.parse().ok()) {
-            Some(p) => p,
-            None => continue,
-        };
-        if pid == self_pid {
-            continue;
-        }
-        // /proc/<pid>/exe is the kernel-managed identity check (the
-        // May 2026 audit Slice 4 finding). The `comm` field used to
-        // gate this is user-settable via prctl(PR_SET_NAME), so a
-        // local user could rename their own process to "packetframe"
-        // and block the operator's `packetframe detach`. The exe
-        // symlink resolves to the inode the kernel actually exec'd,
-        // and is not user-writable.
-        if !proc_exe_matches_current(pid as libc::pid_t) {
-            continue;
-        }
-        // Confirm it's actually the `run` subcommand, not e.g.
-        // `packetframe detach` from another shell. argv IS still
-        // user-settable, but the exe match above pins identity; a
-        // spoofed argv "run" entry only sources a self-match against
-        // the very same binary.
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-            if cmdline.split('\0').any(|a| a == "run") {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn daemon_pid() -> Option<u32> {
-    None
-}
-
 pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // Refuse to detach while a `packetframe run` daemon is live. The
     // daemon holds PinnedLink FDs in-process; unlinking the bpffs pin
@@ -1081,16 +1468,6 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // Confirmed outage-adjacent on the reference EFG 2026-04-21, the
     // detach ran, reported clean, but `ip link show` still had
     // `xdpgeneric` attached.
-    if let Some(pid) = daemon_pid() {
-        return Err(format!(
-            "a `packetframe run` daemon is still running (pid {pid}); \
-             stop it first (e.g. `kill {pid}`) before detaching. \
-             Detach unlinks bpffs pins, but the kernel-side bpf_link \
-             holds refs through the daemon's open FDs, both have to \
-             be released for the iface to actually detach."
-        ));
-    }
-
     // `config_has_vpp` decides whether a SCOPED detach may touch VPP.
     //
     // `--all` means "tear down modules beyond those in the supplied config",
@@ -1118,6 +1495,45 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             false,
         ),
     };
+
+    // Positive evidence of ABSENCE, not merely failure to find a
+    // match. `daemon_pid()` answered by scanning /proc for a process
+    // running this CLI's own executable path, so a detach run from a
+    // freshly deployed bundle — the shape every upgrade has — found
+    // nothing and proceeded straight past this guard, under a live
+    // daemon. That is the outage this refusal exists to prevent, and
+    // it was reachable exactly when someone was upgrading.
+    #[cfg(target_os = "linux")]
+    let presence = crate::daemon_presence::presence_of(
+        &state_dir.join(PIDFILE_NAME),
+        &state_dir.join(IDENTITY_NAME),
+        |p| is_daemon_process(p as libc::pid_t),
+        scan_for_running_daemon,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let presence = crate::daemon_presence::DaemonPresence::Gone {
+        why: "no /proc on this platform; nothing could be attached".into(),
+    };
+    match presence {
+        crate::daemon_presence::DaemonPresence::Gone { .. } => {}
+        crate::daemon_presence::DaemonPresence::Running { pid } => {
+            return Err(format!(
+                "a `packetframe run` daemon is still running (pid {pid}); \
+                 stop it first (e.g. `kill {pid}`) before detaching. \
+                 Detach unlinks bpffs pins, but the kernel-side bpf_link \
+                 holds refs through the daemon's open FDs, both have to \
+                 be released for the iface to actually detach."
+            ));
+        }
+        crate::daemon_presence::DaemonPresence::Unknown { why } => {
+            return Err(format!(
+                "cannot confirm no `packetframe run` daemon is running ({why}); refusing to \
+                 detach. Unlinking pins under a live daemon leaves the program attached \
+                 through its open FDs while reporting success. Stop the daemon, or remove \
+                 a stale pid file if you have established there is none."
+            ));
+        }
+    }
 
     // `--all` used to be a no-op with a comment saying it would "become
     // meaningful once a second module ships". A second module has now
@@ -1467,6 +1883,46 @@ pub fn status(config_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the snapshot's own publisher is the process running now.
+///
+/// `false` when the snapshot recorded no identity: that is "cannot
+/// confirm", and for a report that will be read as current it is the
+/// same class of claim this module exists to stop making.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn snapshot_matches_live(snapshot: &crate::health::Snapshot) -> bool {
+    let (Some(ticks), Some(boot)) = (snapshot.start_ticks, snapshot.boot_id.as_deref()) else {
+        return false;
+    };
+    // ALIVE first. An unreaped exit keeps its start ticks, so matching
+    // them proves the publisher is the process that once held that pid
+    // — not that it can still publish. The zombie rule lives in
+    // `presence_of`, and the snapshot fallback added later did not go
+    // through it, so a crashed daemon whose pid record had also become
+    // unreadable read as "confirmed current" (review finding).
+    //
+    // Checked HERE rather than at that call site, so the next caller
+    // inherits it instead of having to remember.
+    match crate::daemon_presence::proc_state(snapshot.pid) {
+        Ok(state) if crate::daemon_presence::state_is_alive(state) => {}
+        _ => return false,
+    }
+    matches!(
+        (
+            crate::daemon_presence::start_ticks(snapshot.pid),
+            crate::daemon_presence::boot_id()
+        ),
+        (Ok(t), Ok(b)) if t == ticks && b == boot
+    )
+}
+
+/// No `/proc` to compare against, so the publisher cannot be matched —
+/// which reads as "cannot confirm", the same as an unidentified
+/// snapshot on Linux.
+#[cfg(all(not(target_os = "linux"), feature = "fast-path"))]
+fn snapshot_matches_live(_snapshot: &crate::health::Snapshot) -> bool {
+    false
+}
+
 /// Render the daemon's last published module health.
 ///
 /// Everything else `status` prints is read from the kernel or from a pin
@@ -1507,11 +1963,18 @@ fn print_module_health(state_dir: &Path) {
     // only then learns the daemon is dead has already drawn the
     // conclusion, and it was the wrong one.
     #[cfg(target_os = "linux")]
-    let live = proc_exe_matches_current(snapshot.pid);
+    let presence = crate::daemon_presence::presence_of(
+        &state_dir.join(PIDFILE_NAME),
+        &state_dir.join(IDENTITY_NAME),
+        |p| is_daemon_process(p as libc::pid_t),
+        scan_for_running_daemon,
+    );
     // No /proc to cross-check against, so liveness is unknown rather
     // than assumed either way.
     #[cfg(not(target_os = "linux"))]
-    let live = false;
+    let presence = crate::daemon_presence::DaemonPresence::Unknown {
+        why: "no /proc on this platform".into(),
+    };
 
     let age = match crate::health::age_seconds(&snapshot) {
         Some(a) => format!("{a}s old"),
@@ -1520,15 +1983,100 @@ fn print_module_health(state_dir: &Path) {
         None => "written in the future (clock skew)".to_string(),
     };
 
-    if live {
-        println!("module health (pid {}, {age}):", snapshot.pid);
-    } else {
-        println!(
-            "module health: STALE — the daemon that wrote this (pid {}) is gone. The report \
-             below is history, {age}; the dataplane may still be forwarding via its pins \
-             (§8.5).",
+    match &presence {
+        // Running AND the same process that wrote this. A crash whose
+        // replacement records its own pid before publishing health
+        // leaves the old report on disk under a new pid file: validating
+        // the file alone presented history as current, and labelled it
+        // with the replacement's pid (review finding).
+        crate::daemon_presence::DaemonPresence::Running { pid }
+            if *pid == snapshot.pid && snapshot_matches_live(&snapshot) =>
+        {
+            println!("module health (pid {pid}, {age}):")
+        }
+        // A LIVE daemon whose snapshot predates identity recording —
+        // an older build, still publishing. Its report is almost
+        // certainly current, and calling it history was this PR's own
+        // motivating bug in a new shape: a new CLI declaring a running
+        // old daemon dead (review finding). Cannot confirm is the
+        // honest answer, and the one that does not mislead in either
+        // direction.
+        crate::daemon_presence::DaemonPresence::Running { pid }
+            if *pid == snapshot.pid
+                && (snapshot.start_ticks.is_none() || snapshot.boot_id.is_none()) =>
+        {
+            println!(
+                "module health (pid {pid}, {age}) — CANNOT CONFIRM this is the report of \
+                 the daemon running now: it recorded no identity, which an older build \
+                 does not. Restarting on this build makes it checkable."
+            )
+        }
+        // Same pid is not the same process. A replacement handed the
+        // pid its predecessor had — routine across a reboot — made the
+        // pre-crash report read as live until the replacement published
+        // its own (review finding). The identity settles it, and where
+        // the snapshot predates identity recording it says so rather
+        // than guessing either way.
+        crate::daemon_presence::DaemonPresence::Running { pid } => println!(
+            "module health: STALE — this report was written by pid {}, and the daemon \
+             running now is pid {pid} (a different process, by its recorded identity). \
+             The report below is history, {age}.",
             snapshot.pid
-        );
+        ),
+        // The record could not answer — or answered WRONG — but the
+        // SNAPSHOT can: it carries the publisher's own identity, and a
+        // match against the live process proves that exact process is
+        // running. This override reaches `Gone` as well as `Unknown`,
+        // and has to: a daemon whose non-fatal record writes BOTH
+        // failed, running under a name the scan's prefix check does not
+        // admit, resolves to `Gone` — and printing STALE over its
+        // freshly published report is this PR's motivating bug again,
+        // surviving in the one arm the override skipped (review
+        // finding; the first version guarded only `Unknown`). Saying
+        // "gone" over a live daemon is what happened on the shadow,
+        // 2026-08-12.
+        //
+        // Safe for `status` precisely because status ACTS on nothing:
+        // matching identity is the strongest evidence there is, and it
+        // is only being used to label a report. `detach` and
+        // `reconfigure` do not read snapshots and keep their verdicts.
+        // Two arms rather than one, because the operator guidance
+        // differs and a single message would promise `detach` behaviour
+        // one of the two paths does not deliver (the #157 class):
+        // `detach` refuses on `Unknown` but proceeds on `Gone` — the
+        // documented residual — so the `Gone` text must warn, not
+        // reassure.
+        crate::daemon_presence::DaemonPresence::Gone { .. } if snapshot_matches_live(&snapshot) => {
+            println!(
+                "module health (pid {}, {age}) — confirmed by the report's own recorded \
+                 identity. WARNING: every record-based check reads this daemon as absent \
+                 (no pid file, no identity sidecar, and the process-table scan cannot see \
+                 it), so `packetframe detach` would proceed under it. Stop the daemon \
+                 before detaching.",
+                snapshot.pid
+            )
+        }
+        crate::daemon_presence::DaemonPresence::Unknown { .. }
+            if snapshot_matches_live(&snapshot) =>
+        {
+            println!(
+                "module health (pid {}, {age}) — confirmed by the report's own recorded \
+                 identity; the pid record is missing or stale, which `packetframe detach` \
+                 will refuse on until it is resolved.",
+                snapshot.pid
+            )
+        }
+        crate::daemon_presence::DaemonPresence::Gone { why } => println!(
+            "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
+             report below is history, {age}; the dataplane may still be forwarding via its \
+             pins (§8.5).",
+            snapshot.pid
+        ),
+        crate::daemon_presence::DaemonPresence::Unknown { why } => println!(
+            "module health (pid {}, {age}) — CANNOT CONFIRM the daemon is still running \
+             ({why}). Read the report as possibly historical until it can be checked.",
+            snapshot.pid
+        ),
     }
 
     for m in &snapshot.modules {
@@ -1741,6 +2289,105 @@ mod vpp_detach_tests {
         // The right order is accepted, so the test above is about order
         // and not about the pair being rejected outright.
         assert_eq!(feed_wiring(&["fast-path", "vpp-offload"]), Ok(true));
+    }
+
+    /// State records are never written through a symlink.
+    ///
+    /// `state-dir` can be a pre-existing directory an unprivileged user
+    /// writes to, so a record name planted as a symlink before startup
+    /// would have this root daemon truncate whatever it points at. The
+    /// pid file was always written no-follow; the identity sidecar was
+    /// added with `std::fs::write`, which follows (review finding, P1).
+    /// Both go through one writer now, so the next record cannot get it
+    /// wrong by being written somewhere else.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_symlink_does_not_capture_a_state_record() {
+        let dir = std::env::temp_dir().join(format!("pf-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "do not truncate me").unwrap();
+
+        // The attacker's plant, at the name the daemon will write.
+        let planted = dir.join("packetframe.identity");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        // Writing succeeds — the rename replaces the symlink itself —
+        // and the victim is untouched.
+        write_state_record(&planted, "1 2 boot").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me",
+            "the symlink target must not be written through"
+        );
+        assert!(
+            std::fs::read_to_string(&planted)
+                .unwrap()
+                .starts_with("1 2 boot"),
+            "and the record lands at the real path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `detach` refuses when it cannot prove no daemon is running.
+    ///
+    /// The policy lives in `daemon_presence::decide` and is tested
+    /// there; this asserts the WIRING, which is the half that was
+    /// wrong. `detach` consulted a /proc scan for a process running its
+    /// own executable path, so a detach launched from a freshly
+    /// deployed bundle — every upgrade — matched nothing and walked
+    /// straight past the guard while the daemon was live. Unlinking
+    /// pins under it leaves the program attached through its open FDs
+    /// and reports success, which is the 2026-04-21 outage.
+    ///
+    /// Uses a legacy record naming THIS process: a live pid whose
+    /// identity cannot be established. The only safe reading is "cannot
+    /// tell", and the only safe action is to stop.
+    ///
+    /// The record is made world-writable on purpose, so the assertion
+    /// holds whether or not the suite runs as root — and so it covers
+    /// the second half of the rule as well: a record anyone could have
+    /// written confirms nothing about a LIVE pid, whatever the
+    /// executable says, because otherwise a planted pid file picks the
+    /// process root signals (review finding). The authentic legacy
+    /// record, which this test cannot create without being root, is
+    /// covered in `daemon_presence`'s policy table.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_refuses_a_daemon_it_cannot_rule_out() {
+        use crate::daemon_presence::{presence_of, DaemonPresence};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A legacy record — pid only — naming a process that really is
+        // running. This is what an older daemon leaves behind.
+        let pidfile = dir.join(PIDFILE_NAME);
+        std::fs::write(&pidfile, format!("{}\n", std::process::id())).unwrap();
+        std::fs::set_permissions(&pidfile, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        // A scan that ran and found nothing, so what is under test is
+        // what the RECORD alone establishes — with the exe check
+        // failing, as it does whenever the CLI runs from a different
+        // path than the daemon, and then passing.
+        for exe in [false, true] {
+            let p = presence_of(
+                &pidfile,
+                &dir.join(IDENTITY_NAME),
+                |_| exe,
+                || crate::daemon_presence::Scan::NoneFound,
+            );
+            assert!(
+                matches!(p, DaemonPresence::Unknown { .. }),
+                "exe_matches={exe}: a live pid with no verifiable identity must be Unknown, \
+                 not Gone — Gone is what let detach proceed: {p:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A recorded pid with no start-time cookie must not be signalled, and

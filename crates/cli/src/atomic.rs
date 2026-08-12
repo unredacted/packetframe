@@ -7,10 +7,13 @@
 //! neither takes a lock, so a partially written file is not a rare race
 //! but the ordinary outcome of overlapping a read with a write.
 //!
-//! The temp path is opened `O_NOFOLLOW | O_EXCL | O_CREAT | 0600` (see
-//! [`crate::loader::create_excl_no_follow`]) so a pre-existing symlink
-//! at the temp path cannot redirect the privileged write — the May 2026
-//! audit Slice 4 finding.
+//! On Linux the write happens relative to a directory descriptor
+//! obtained by a component-wise no-follow walk (see
+//! `crate::loader::create_and_open_dir_no_follow`), and the temp file
+//! is opened `O_NOFOLLOW | O_EXCL | O_CREAT | 0600` against it — so
+//! neither a symlink at the temp path (the May 2026 audit Slice 4
+//! finding) nor one at any intermediate component (review finding on
+//! the state writers) can redirect the privileged write.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -30,33 +33,37 @@ pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     // The same filename with `.tmp` appended, so the temp file stays on
     // the same filesystem as the target. `with_extension("tmp")` would
     // drop the `.prom` and stop a second writer distinguishing ours.
-    let tmp = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("packetframe.out"),
-    ));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let tmp_name = format!("{name}.tmp");
+    // On Linux everything happens relative to ONE directory descriptor
+    // obtained by a component-wise no-follow walk — the same discipline
+    // as the state-record writers, for the same reason: `O_NOFOLLOW` on
+    // the temp file guards only the final component, so an intermediate
+    // symlink in a configured path carried this root writer wherever it
+    // pointed (review finding on the state writers; this is the same
+    // primitive with different callers). A symlink anywhere in the path
+    // fails `ELOOP` and the write is refused.
+    #[cfg(target_os = "linux")]
     {
-        #[cfg(target_os = "linux")]
-        let mut f = crate::loader::create_excl_no_follow(&tmp).or_else(|e| {
-            // Symmetry with the loader helper's retry path. On a crashed
-            // predecessor the `.tmp` leftover is a regular file: unlink
-            // and retry once. A symlink (attacker pre-creation) trips
-            // O_NOFOLLOW on the retry too.
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                let meta = std::fs::symlink_metadata(&tmp)?;
-                if meta.file_type().is_file() {
-                    std::fs::remove_file(&tmp)?;
-                    return crate::loader::create_excl_no_follow(&tmp);
-                }
-            }
-            Err(e)
-        })?;
-        #[cfg(not(target_os = "linux"))]
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let dir = crate::loader::create_and_open_dir_no_follow(parent)?;
+        {
+            let mut f = crate::loader::openat_excl_with_retry(&dir, &tmp_name)?;
+            f.write_all(contents)?;
+            f.sync_all()?;
+        }
+        crate::loader::renameat_within(&dir, &tmp_name, name)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let tmp = path.with_file_name(&tmp_name);
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
     }
-    std::fs::rename(&tmp, path)?;
     Ok(())
 }

@@ -1095,6 +1095,108 @@ module's own deltas.
 
 ## Install and upgrade on the router
 
+> **`detach` and `status` can be run from a newly deployed bundle.**
+> Until 2026-08-12 they could not: every liveness check asked whether
+> some process ran *the CLI's own executable path*, which is false
+> whenever a command runs from a new bundle while the old daemon is up
+> — the shape every upgrade has. `status` printed `STALE` over a live
+> daemon, `reconfigure` refused, and `detach` found no daemon and
+> **proceeded**, unlinking pins while the daemon still held the
+> `bpf_link` FDs.
+>
+> The daemon now records `(pid, start_ticks, boot_id)` in
+> `packetframe.identity`, beside the pid file, and the checks verify
+> against that — so the CLI's own path no longer matters.
+> `packetframe.pid` stays a bare pid on purpose: CLIs from other
+> bundles parse it whole, and a rollback has to keep working. Limits
+> worth knowing:
+>
+> - A daemon whose pid-file write failed (it is non-fatal, and happens
+>   after attach) is found by its **identity sidecar**, which the daemon
+>   goes on to write and which names its own pid — so nothing depends on
+>   what the binary is called. If that is missing too, a `/proc` scan is
+>   the last backstop. The scan matches a binary named `packetframe`
+>   running `run`, so an unrelated process named that way will make
+>   `detach` refuse and name the pid. That is deliberate — refusing is
+>   recoverable, unlinking under a live daemon is not.
+>
+>   **Residual, deliberate:** a daemon that wrote *neither* file — an
+>   unwritable state dir — *and* runs under a binary name sharing no
+>   prefix with `packetframe` is invisible to all three checks, and
+>   `detach` will proceed. Refusing on every recordless state instead
+>   would disable `detach` after every clean stop, since the daemon
+>   removes both files on the way out and `detach` is the advertised
+>   recovery path. Closing it properly means checking whether any
+>   process holds the pinned links, which is evidence that never goes
+>   through a pid; that is not built. `status` DOES see such a daemon
+>   when its health snapshot matches the live process, and warns
+>   explicitly that `detach` would proceed under it — stop the daemon
+>   first.
+> - **The state directory itself must be root-owned and not group- or
+>   world-writable**, or every record in it is treated as plantable and
+>   live pids read as CANNOT CONFIRM. Per-file ownership is not enough:
+>   `rename` moves a root-owned record between directories without
+>   touching its contents, so a writable directory's records could have
+>   been replayed whole from another instance's state dir. The daemon
+>   clears the group/world-write bits on its state dir whenever it
+>   writes a record; if you hand-create a custom `state-dir`, make it
+>   `root:root` mode `0755` (or tighter).
+>   The same rule runs up the **ancestor chain**: every directory above
+>   the state dir must be root-owned and either not group/world-writable
+>   or sticky (`/tmp` qualifies) — otherwise the whole state dir could
+>   be renamed and another one swapped into its place without touching
+>   a file. And the configured `state-dir` path must contain **no
+>   symlinks** (a symlinked component is the same swap, done by
+>   repointing): on systems where `/var/run` links to `/run`, configure
+>   the real `/run/...` path.
+> - A sidecar that is present but unreadable or malformed is treated as
+>   "cannot tell", never as missing — a torn write is what a live
+>   daemon's record looks like mid-trouble. Conversely, a torn *pid
+>   file* next to a whole sidecar still identifies the daemon: the
+>   sidecar is consulted whenever the pid file cannot answer alone.
+> - If the pid file and the sidecar **disagree** and the sidecar's
+>   identity matches a live process, everything answers CANNOT CONFIRM
+>   ("two authenticated records disagree"). This is what a restart
+>   whose pid-file rewrite failed leaves behind: new sidecar, old pid
+>   file. Restart the daemon to re-record both, or remove the stale
+>   pid file.
+> - The scan has to *complete* to count as evidence of absence. If
+>   `/proc` cannot be listed, or a process in it cannot be examined
+>   (running `detach` as a non-root user is the ordinary cause), the
+>   refusal says `the process table could not be searched` and names how
+>   many processes were unexaminable. Re-run as root; removing the pid
+>   file will not help, because the scan is what the missing record
+>   falls back to.
+> - A recorded pid whose live identity **does not match** is never
+>   resolved either way: the pid was reused, or the record is stale, and
+>   nothing in the data separates them. `status` says CANNOT CONFIRM,
+>   `reconfigure` and `detach` refuse, and the message says whether a
+>   packetframe daemon holds that pid. It is deliberately not resolved
+>   by "well, it is *a* daemon" — a `packetframe run` from another
+>   bundle and another state dir satisfies that, and signalling it would
+>   reload a stranger's config. Restart the daemon to re-record the
+>   identity.
+>   This is reachable after a rollback to a build that does not write
+>   the sidecar, but only if the pids coincide across a reboot; the
+>   ordinary rollback leaves a sidecar naming a different pid, which is
+>   ignored.
+> - **Only a matching identity confirms.** A record that carries no
+>   identity — the pid-only file a pre-sidecar build writes — never
+>   resolves a *live* pid to "our daemon", even when a packetframe
+>   binary holds it: the executable check finds *a* daemon, not *the*
+>   one the record describes. The cost lands once, on the first upgrade
+>   from a pre-sidecar build: `reconfigure` refuses and `status` says
+>   CANNOT CONFIRM until the daemon restarts on a build that records
+>   identity. (`status` usually recovers sooner — the health snapshot
+>   carries the publisher's own identity, and a match against the live
+>   process confirms the report even when every pid record failed or
+>   is missing.)
+> - `detach` refuses on "cannot tell", not only on "daemon present".
+>   When the message names a pid that is **not** a packetframe daemon,
+>   and you have established there is none, remove the pid file and the
+>   identity sidecar from the state dir.
+
+
 VPP is **not** bundled in packetframe's .deb — 100 MB against 1.3 MB,
 mismatched cadence, and independent rollback, which the failover design
 wants anyway. It ships on its own release tag, built from *unmodified*

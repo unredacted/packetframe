@@ -56,6 +56,19 @@ pub struct Snapshot {
     /// The publishing daemon's pid. See the module docs: this is the
     /// liveness question, not a diagnostic.
     pub pid: i32,
+    /// The publisher's start time in clock ticks, and the boot id it
+    /// counts from.
+    ///
+    /// The pid alone cannot say the report is current. A crash whose
+    /// replacement is handed the SAME pid — routine after a reboot,
+    /// possible any time — made the pre-crash report read as live until
+    /// the replacement published its own (review finding). `None` for a
+    /// snapshot written before this was recorded, which reads as
+    /// "cannot confirm" rather than as either answer.
+    #[serde(default)]
+    pub start_ticks: Option<u64>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     /// Unix seconds at write time, for the age.
     pub written_at: u64,
     pub modules: Vec<ModuleEntry>,
@@ -144,6 +157,8 @@ pub fn poll(state_dir: &Path, modules: &[(String, Box<dyn Module>)], gauges: &Mu
 pub fn publish(state_dir: &Path, modules: Vec<ModuleEntry>) -> Result<(), String> {
     let snapshot = Snapshot {
         pid: std::process::id() as i32,
+        start_ticks: crate::daemon_presence::self_start_ticks(),
+        boot_id: crate::daemon_presence::self_boot_id(),
         written_at: unix_now(),
         modules,
     };
@@ -158,7 +173,15 @@ pub fn publish(state_dir: &Path, modules: Vec<ModuleEntry>) -> Result<(), String
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn remove(state_dir: &Path) {
     let path = Snapshot::path_in(state_dir);
-    match std::fs::remove_file(&path) {
+    // Through the walked directory descriptor on Linux — a pathname
+    // `remove_file` follows intermediate symlinks, and this runs as
+    // root (review finding on the identity cleanup; same rule for
+    // every removal in a configured directory).
+    #[cfg(target_os = "linux")]
+    let removed = crate::loader::remove_state_record(&path);
+    #[cfg(not(target_os = "linux"))]
+    let removed = std::fs::remove_file(&path);
+    match removed {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
@@ -299,6 +322,8 @@ mod tests {
     fn a_snapshot_from_the_future_reports_no_age() {
         let s = Snapshot {
             pid: 1,
+            start_ticks: None,
+            boot_id: None,
             written_at: unix_now() + 3600,
             modules: Vec::new(),
         };
