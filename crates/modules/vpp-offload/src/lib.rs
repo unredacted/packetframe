@@ -281,44 +281,61 @@ impl VppOffloadConfig {
     }
 }
 
-/// What a refused reload must ALSO say: nothing else in it was applied.
+/// What a refused reload must ALSO say: what it left behind.
 ///
-/// [`VppOffloadConfig::restart_only_delta`] refuses the whole reload, and
-/// that is the right contract — a half-applied reload leaves the daemon
-/// matching neither the file it had nor the file on disk. But the refusal
-/// named only the restart-only directive, and the rest of the edit
-/// vanished in silence. The case that matters: one SIGHUP that changes
-/// `require-table-complete` **and** rolls a port back to `steer off`
-/// returns an error about a completeness gate, `apply_steering` never
-/// runs, and the MCAM rules keep diverting exactly what they diverted
-/// before — so the `steer off` whose whole purpose is to get traffic off
-/// a misbehaving VPP quickly did nothing, and said nothing (review
-/// finding, PR #170).
+/// The refusal named only the restart-only directive, and the rest of the
+/// edit vanished in silence. The case that matters: one SIGHUP that
+/// changes `require-table-complete` **and** rolls a port back to
+/// `steer off` returns an error about a completeness gate,
+/// `apply_steering` never runs, and the `steer off` whose whole purpose
+/// is to get traffic off a misbehaving VPP quickly did nothing and said
+/// nothing (review finding, PR #170).
 ///
 /// Not new to `require-table-complete`: every restart-only field has
-/// always refused this way, which is why this is written against the
-/// refusal rather than against one directive. Making the reload atomic
-/// ACROSS modules is a different change — the loader publishes the
-/// shared allowlist and runs fast-path's `reconfigure` before this
-/// module is asked anything, so a preflight would need a reload-
-/// validation hook on the `Module` trait — and is filed rather than
-/// widened into this one.
+/// always refused this way, which is why this hangs off the refusal
+/// rather than off one directive.
 ///
-/// The lever sentence appears only when a lever actually moved: a
-/// warning about a rollback nobody asked for is noise on every ordinary
+/// **Two things this must not claim, both of which the first version
+/// claimed** (review findings on the fix, same class as the defect):
+///
+/// - **That the reload was atomic.** It was not. A SIGHUP is atomic
+///   within this module and nowhere else: `reconfigure_from_signal`
+///   publishes the shared allowlist and runs fast-path's `reconcile`
+///   BEFORE vpp-offload is asked anything — modules reconfigure in config
+///   order and `fast-path` is *required* to be declared first — so an
+///   `allow-prefix` edit in the same file has already landed on the eBPF
+///   tier. Saying "nothing else was applied" sends an operator to look
+///   for a whole rollback that did not happen, when what they have is a
+///   split configuration. Making the SIGHUP atomic across modules needs a
+///   reload-validation hook on the `Module` trait and a loader change;
+///   filed, not widened into this.
+/// - **Where traffic currently is.** Neither direction of the flag can be
+///   read off this snapshot. `reconfigure` deliberately leaves `self.cfg`
+///   unmoved when a steer apply fails — so the config can say `off` while
+///   the supervisor holds the want and installs the rules the moment its
+///   gate clears — and equally it can say `on` over a steer that was
+///   refused and never landed. `packetframe status` reads the NIC and the
+///   supervisor; this function reads two config structs, and must say
+///   only what they can support: which lever the operator moved, and that
+///   it was not applied.
+///
+/// The lever sentence appears only when a lever actually moved: a warning
+/// about a rollback nobody asked for is noise on every ordinary
 /// restart-only refusal. Matched by INTERFACE rather than by position,
 /// because the port list is one of the things that may have just been
-/// refused — so a positional comparison here could read a reordered or
-/// resized list as a lever move.
+/// refused — so a positional comparison could read a reordered or resized
+/// list as a lever move.
 fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     let mut out = String::from(
-        ". Nothing else in this reload was applied either — a refused reload is refused \
-         whole, so an `allow-prefix` edit in the same file is not reflected in the NIC's \
-         rules",
+        ". This module applied NOTHING from this reload — but the SIGHUP is not atomic \
+         across modules: the loader publishes the shared allowlist and runs fast-path's \
+         reconcile before vpp-offload is asked anything, so an `allow-prefix` edit in the \
+         same file has ALREADY taken effect on the eBPF tier. The two tiers are configured \
+         differently until this is resolved",
     );
-    // `on → off` first and reported alone: it is the rollback, and the
-    // one whose silence leaves traffic somewhere the operator believes
-    // it is not.
+    // Direction is named because a skipped rollback is the urgent one —
+    // but as a statement about the REQUEST, never about where traffic
+    // ended up, which this snapshot cannot see.
     let mut rolled_back: Vec<&str> = Vec::new();
     let mut turned_on: Vec<&str> = Vec::new();
     for (iface, _, was) in &old.ports {
@@ -333,18 +350,21 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     }
     if !rolled_back.is_empty() {
         out.push_str(&format!(
-            ". IN PARTICULAR {:?} changed `steer on → off` and did NOT take effect: that \
-             traffic is still on VPP. Re-send that change in an edit that does not also \
-             touch a restart-only directive and it applies immediately — it does not need \
-             the restart",
-            rolled_back
+            ". IN PARTICULAR {rolled_back:?} asked for `steer on → off` and it was NOT \
+             applied — a rollback that did not happen. The NIC still holds whatever rules \
+             it held before this reload; `packetframe status` says what those are, and this \
+             message deliberately does not guess. Re-send the `steer` change in an edit \
+             that does not also touch a restart-only directive and it applies immediately \
+             — that part does not need the restart"
         ));
     }
     if !turned_on.is_empty() {
         out.push_str(&format!(
-            ". {:?} changed `steer off → on` and did NOT take effect either; nothing was \
-             diverted, which is the safe direction, but the canary step did not happen",
-            turned_on
+            ". {turned_on:?} asked for `steer off → on` and it was NOT applied either, so \
+             that canary step did not happen — which is not the same as nothing being \
+             steered there: a want recorded by an earlier refused steer survives in the \
+             supervisor and installs on its own once its gate clears. `packetframe status` \
+             is the surface that knows"
         ));
     }
     out
@@ -1633,7 +1653,8 @@ mod tests {
         let e = steered.restart_only_delta(&both).expect_err("refused");
         let full = format!("{e}{}", reload_collateral(&steered, &both));
         assert!(
-            full.contains("`steer on → off` and did NOT take effect"),
+            full.contains("asked for `steer on → off` and it was NOT applied")
+                && full.contains("a rollback that did not happen"),
             "a skipped rollback must be named, not left to be inferred from a message \
              about a completeness gate: {full}"
         );
@@ -1642,13 +1663,38 @@ mod tests {
             "and named precisely — eth5 did not move: {full}"
         );
         assert!(
-            full.contains("still on VPP"),
-            "the consequence is where the traffic is, which is the thing being got wrong: \
-             {full}"
-        );
-        assert!(
             full.contains("applies immediately"),
             "and the way out must not read as another restart: {full}"
+        );
+
+        // The two claims this message MUST NOT make, both of which the
+        // first version made (review findings on the fix itself).
+        //
+        // One: the reload was not atomic. Fast-path is required to be
+        // declared first and the loader publishes the allowlist before
+        // the module loop, so its half of the same edit has already
+        // landed. Promising a whole rollback sends the operator looking
+        // for something that did not happen.
+        assert!(
+            full.contains("not atomic") && full.contains("ALREADY taken effect"),
+            "the eBPF tier already moved; the message must say so rather than claim the \
+             reload rolled back whole: {full}"
+        );
+        assert!(
+            !full.contains("Nothing else in this reload was applied"),
+            "that claim is false and was the finding: {full}"
+        );
+        // Two: where traffic is. `self.cfg` is deliberately left unmoved
+        // when a steer apply fails, and the supervisor keeps the want and
+        // installs on its own once its gate clears — so neither direction
+        // of the flag testifies about the NIC.
+        assert!(
+            !full.contains("still on VPP") && !full.contains("nothing was diverted"),
+            "this snapshot cannot see the NIC and must not claim to: {full}"
+        );
+        assert!(
+            full.contains("packetframe status"),
+            "and it must point at the surface that CAN answer that: {full}"
         );
 
         // The unconditional half covers the allowlist, which this module
@@ -1656,7 +1702,7 @@ mod tests {
         // list to compare against.
         assert!(
             full.contains("allow-prefix"),
-            "an allowlist edit in the same file is skipped too: {full}"
+            "an allowlist edit in the same file is named too: {full}"
         );
 
         // And no crying wolf: a restart-only refusal with no lever
