@@ -173,6 +173,32 @@ pub fn decide(
     exe_matches: bool,
     scanned: Option<i32>,
 ) -> DaemonPresence {
+    // ANY route to `Gone` has to survive the scan, not just the
+    // missing-record one. A replacement daemon attaches BEFORE it
+    // rewrites the record, and its write is non-fatal — so a stale
+    // record naming a dead or recycled pid is exactly the shape a live
+    // replacement leaves, and returning `Gone` there let `detach`
+    // unlink pins under it. The first fix covered the case that was
+    // named; this covers the rule (review finding, P1).
+    let verdict = decide_from_record(record, proc_alive, live_identity, exe_matches);
+    match (&verdict, scanned) {
+        (DaemonPresence::Gone { why }, Some(found)) => DaemonPresence::Unknown {
+            why: format!(
+                "{why}, but pid {found} is running this binary — it may be a daemon whose \
+                 record is stale or was never written"
+            ),
+        },
+        _ => verdict,
+    }
+}
+
+/// What the record alone establishes, before the scan gets a say.
+fn decide_from_record(
+    record: Record,
+    proc_alive: bool,
+    live_identity: Option<(u64, String)>,
+    exe_matches: bool,
+) -> DaemonPresence {
     let (pid, recorded) = match record {
         // No record is NOT evidence of no daemon. The file is written
         // after every module attaches — deliberately, so systemd's
@@ -183,16 +209,8 @@ pub fn decide(
         // proves nothing, which is the polarity the deleted /proc scan
         // had backwards (review finding).
         Record::Absent => {
-            return match scanned {
-                Some(pid) => DaemonPresence::Unknown {
-                    why: format!(
-                        "no pid file, but pid {pid} is running this binary — it may be a \
-                         daemon that could not write its record"
-                    ),
-                },
-                None => DaemonPresence::Gone {
-                    why: "no pid file, and no process is running this binary".into(),
-                },
+            return DaemonPresence::Gone {
+                why: "no pid file".into(),
             }
         }
         Record::Unreadable(why) => return DaemonPresence::Unknown { why },
@@ -235,6 +253,34 @@ pub fn decide(
                 "pid {pid} is running but was reused; the daemon that wrote the record is gone"
             ),
         }
+    }
+}
+
+/// This process's own start ticks, or `None` where they cannot be read.
+///
+/// `Option` rather than a fallible read the caller must handle: a
+/// snapshot that cannot record its identity is still worth publishing,
+/// and the reader treats the absence as "cannot confirm".
+pub fn self_start_ticks() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        start_ticks(std::process::id() as i32).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// This boot's id, or `None` where it cannot be read.
+pub fn self_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        boot_id().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -367,15 +413,35 @@ mod tests {
         )));
         assert!(is_gone(&decide(Record::Absent, false, None, false, None)));
 
-        // No record, but a process IS running this binary: the daemon
-        // may simply have failed to write one — the file is written
-        // after attach and a failed write is non-fatal. Must not read
-        // as absence (review finding, P1).
-        let orphan = decide(Record::Absent, false, None, false, Some(77));
-        assert!(
-            matches!(orphan, DaemonPresence::Unknown { .. }),
-            "a running copy of this binary with no record is not absence: {orphan:?}"
-        );
+        // EVERY route to Gone must survive the scan, not just the
+        // missing-record one — a replacement attaches before it
+        // rewrites the record, and its write is non-fatal, so each of
+        // these is a shape a live daemon leaves behind. The first fix
+        // covered only the case that had been named (review finding).
+        for (label, record, alive, live) in [
+            ("no record", Record::Absent, false, None),
+            (
+                "recorded pid dead",
+                Record::Found(42, Some(id(42, 900))),
+                false,
+                None,
+            ),
+            (
+                "recorded pid reused",
+                Record::Found(42, Some(id(42, 900))),
+                true,
+                Some((901, "boot-a".to_string())),
+            ),
+        ] {
+            let alone = decide(record.clone(), alive, live.clone(), false, None);
+            assert!(is_gone(&alone), "{label}: the record alone says gone");
+            let with_scan = decide(record, alive, live, false, Some(77));
+            assert!(
+                matches!(with_scan, DaemonPresence::Unknown { .. }),
+                "{label}: but a process running this binary makes it unprovable: \
+                 {with_scan:?}"
+            );
+        }
 
         // Unreadable record: cannot tell. A corrupt file is exactly
         // when the destructive path must not fire.

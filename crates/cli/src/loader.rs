@@ -996,8 +996,21 @@ fn scan_for_running_daemon() -> Option<i32> {
         if pid == self_pid {
             continue;
         }
-        if proc_exe_matches_current(pid as libc::pid_t) {
-            return Some(pid as i32);
+        if !proc_exe_matches_current(pid as libc::pid_t) {
+            continue;
+        }
+        // And it must be the DAEMON, not another invocation of the same
+        // binary. Dropping this filter when the scanner came back would
+        // have made a concurrent `packetframe probe --duration ...`
+        // look like a daemon and refuse every `detach` for its
+        // lifetime — recovery blocked by an unrelated command (review
+        // finding). Safe to read argv here only because the exe check
+        // above already established the binary; a spoofed "run" alone
+        // proves nothing.
+        if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+            if cmdline.split('\0').any(|a| a == "run") {
+                return Some(pid as i32);
+            }
         }
     }
     None
@@ -1499,6 +1512,33 @@ pub fn status(config_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the snapshot's own publisher is the process running now.
+///
+/// `false` when the snapshot recorded no identity: that is "cannot
+/// confirm", and for a report that will be read as current it is the
+/// same class of claim this module exists to stop making.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn snapshot_matches_live(snapshot: &crate::health::Snapshot) -> bool {
+    let (Some(ticks), Some(boot)) = (snapshot.start_ticks, snapshot.boot_id.as_deref()) else {
+        return false;
+    };
+    matches!(
+        (
+            crate::daemon_presence::start_ticks(snapshot.pid),
+            crate::daemon_presence::boot_id()
+        ),
+        (Ok(t), Ok(b)) if t == ticks && b == boot
+    )
+}
+
+/// No `/proc` to compare against, so the publisher cannot be matched —
+/// which reads as "cannot confirm", the same as an unidentified
+/// snapshot on Linux.
+#[cfg(all(not(target_os = "linux"), feature = "fast-path"))]
+fn snapshot_matches_live(_snapshot: &crate::health::Snapshot) -> bool {
+    false
+}
+
 /// Render the daemon's last published module health.
 ///
 /// Everything else `status` prints is read from the kernel or from a pin
@@ -1564,13 +1604,26 @@ fn print_module_health(state_dir: &Path) {
         // leaves the old report on disk under a new pid file: validating
         // the file alone presented history as current, and labelled it
         // with the replacement's pid (review finding).
-        crate::daemon_presence::DaemonPresence::Running { pid } if *pid == snapshot.pid => {
+        crate::daemon_presence::DaemonPresence::Running { pid }
+            if *pid == snapshot.pid && snapshot_matches_live(&snapshot) =>
+        {
             println!("module health (pid {pid}, {age}):")
         }
+        // Same pid is not the same process. A replacement handed the
+        // pid its predecessor had — routine across a reboot — made the
+        // pre-crash report read as live until the replacement published
+        // its own (review finding). The identity settles it, and where
+        // the snapshot predates identity recording it says so rather
+        // than guessing either way.
         crate::daemon_presence::DaemonPresence::Running { pid } => println!(
-            "module health: STALE — this report was written by pid {}, but the daemon \
+            "module health: STALE — this report was written by pid {}{}, and the daemon \
              running now is pid {pid}. The report below is history, {age}.",
-            snapshot.pid
+            snapshot.pid,
+            if snapshot.start_ticks.is_none() {
+                " (which recorded no identity, so it cannot be matched)"
+            } else {
+                ""
+            }
         ),
         crate::daemon_presence::DaemonPresence::Gone { why } => println!(
             "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
