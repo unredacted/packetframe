@@ -195,8 +195,11 @@ pub enum Record {
     Unreadable(String),
     /// A pid, and an identity if the daemon that wrote it recorded one.
     Found(i32, Option<DaemonIdentity>),
-    /// A pid from a record that is not root-owned, so its provenance is
-    /// whoever could write the state directory.
+    /// A pid from a record whose provenance is whoever could write the
+    /// state directory: the file is not root-owned, or the directory
+    /// itself is writable by others — in which case even a root-owned
+    /// file proves nothing, because `rename` moves files between
+    /// directories without touching their contents or ownership.
     ///
     /// Kept apart from `Found` rather than folded into it: an
     /// unauthenticated record may still show that a pid is DEAD — that
@@ -337,9 +340,10 @@ fn decide_from_record(
         Record::Unauthenticated(pid) if proc_alive => {
             return DaemonPresence::Unknown {
                 why: format!(
-                    "pid {pid} is running, but the record naming it is not root-owned — \
-                     anything with write access to the state directory could have put it \
-                     there, so it cannot be acted on"
+                    "pid {pid} is running, but the record naming it cannot be trusted — the \
+                     file is not root-owned, or the state directory is writable by others, \
+                     and anything with write access could have put the record there (or \
+                     moved it there whole), so it cannot be acted on"
                 ),
             }
         }
@@ -563,6 +567,91 @@ fn read_with_provenance(path: &Path) -> std::io::Result<(String, bool)> {
     Ok((raw, root_owned))
 }
 
+/// Whether the state DIRECTORY itself can vouch for what it contains:
+/// root-owned, a real directory, not group- or world-writable.
+///
+/// Per-file ownership is not enough, and the gap is `rename`: moving a
+/// file needs write on the two directories and nothing from the file,
+/// so an unprivileged user with write on two state dirs could relocate
+/// a root-owned pid file and sidecar — never creating or modifying a
+/// root-owned byte — and have root's `reconfigure` for one instance
+/// SIGHUP the other (review finding). A directory the attacker can
+/// write is a directory whose contents they choose, whoever owns the
+/// files; so in such a directory, no record confirms a live pid.
+///
+/// Opened `O_DIRECTORY | O_NOFOLLOW` and judged on the descriptor,
+/// which also refuses a state dir that is itself a symlink. Errors
+/// return `false` — treat as unauthenticated, never as trusted.
+#[cfg(target_os = "linux")]
+fn dir_is_authentic(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+    else {
+        return false;
+    };
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0
+}
+
+/// What the sidecar yields when it must stand as the record of last
+/// resort — when the pid file is missing or unusable.
+///
+/// Three-valued, because "no sidecar" and "a sidecar that cannot
+/// vouch" license opposite things: a missing file falls through to the
+/// scan and may end in `Gone`, while a present-but-unreadable one is
+/// exactly a live daemon's record mid-trouble and must stay `Unknown`.
+/// The first version collapsed both into `None`, so a transient read
+/// failure on the sidecar of a daemon whose pid write had also failed
+/// read as `Absent`, survived a name-limited scan, and licensed
+/// `detach` (review finding, P1 — the same collapse the `Scan` enum
+/// had just been introduced to fix, one file over).
+#[cfg(target_os = "linux")]
+enum Sidecar {
+    /// No file at all.
+    Missing,
+    /// Authentic, whole, and carrying a full identity.
+    Identity(DaemonIdentity),
+    /// Present, but it cannot vouch: unreadable, malformed, not
+    /// root-owned, identity-less, or sitting in a directory anyone can
+    /// rewrite.
+    Unusable(String),
+}
+
+#[cfg(target_os = "linux")]
+fn sidecar_record(path: &Path, dir_authentic: bool) -> Sidecar {
+    match read_with_provenance(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Sidecar::Missing,
+        Err(e) => Sidecar::Unusable(format!("cannot read {}: {e}", path.display())),
+        Ok((raw, root_owned)) => {
+            if !dir_authentic {
+                return Sidecar::Unusable(format!(
+                    "{} sits in a state directory that is not root-owned and unwritable by \
+                     others, so its contents could have been placed there by anyone",
+                    path.display()
+                ));
+            }
+            if !root_owned {
+                return Sidecar::Unusable(format!("{} is not root-owned", path.display()));
+            }
+            match DaemonIdentity::decode(&raw) {
+                Ok((_, Some(id))) => Sidecar::Identity(id),
+                // The daemon never writes a pid-only sidecar; whatever
+                // produced this, it identifies nothing.
+                Ok((pid, None)) => Sidecar::Unusable(format!(
+                    "{} holds only a pid ({pid}), not an identity",
+                    path.display()
+                )),
+                Err(e) => Sidecar::Unusable(format!("malformed {}: {e}", path.display())),
+            }
+        }
+    }
+}
+
 /// Establish presence from the record at `pid_path`. Thin I/O over
 /// [`decide`], which holds the policy.
 #[cfg(target_os = "linux")]
@@ -572,6 +661,26 @@ pub fn presence_of(
     exe_matches: impl Fn(i32) -> bool,
     scan: impl Fn() -> Scan,
 ) -> DaemonPresence {
+    // The directory gate applies to BOTH files: file ownership cannot
+    // say which directory a record was written FOR, and `rename` moves
+    // root-owned files between attacker-writable directories without
+    // touching a byte of them (review finding — the replay).
+    let dir_ok = pid_path.parent().is_some_and(dir_is_authentic);
+    // The sidecar consulted whenever the pid file cannot answer alone —
+    // missing, unreadable, or undecodable. It carries its own pid, it
+    // is authenticated, and it identifies the daemon WITHOUT reference
+    // to what its binary is called, which is the case the name-limited
+    // `/proc` scan cannot see (review finding). The identity it names
+    // still has to match the live process in `decide`, so a stale one
+    // ends in `Unknown`, not a confirmation.
+    let fall_back_to_sidecar = |on_no_sidecar: Record| match sidecar_record(identity_path, dir_ok) {
+        Sidecar::Identity(id) => Record::Found(id.pid, Some(id)),
+        Sidecar::Missing => on_no_sidecar,
+        // A sidecar that exists but cannot vouch is not a missing one:
+        // it is what a live daemon's record looks like mid-trouble, and
+        // reading it as absence licensed `detach` (review finding, P1).
+        Sidecar::Unusable(why) => Record::Unreadable(why),
+    };
     let record = match read_with_provenance(pid_path) {
         Ok((s, root_owned)) => match DaemonIdentity::decode(&s) {
             // The pid file yields a PID AND NOTHING ELSE. It is not
@@ -581,26 +690,28 @@ pub fn presence_of(
             // an inline identity was preferred here (review finding).
             // It also stays a bare pid on the write side, because CLIs
             // from other bundles parse it whole.
-            Ok((pid, _unauthenticated)) if root_owned => {
+            Ok((pid, _unauthenticated)) if root_owned && dir_ok => {
                 Record::Found(pid, read_authentic_identity(identity_path, Some(pid)))
             }
             Ok((pid, _)) => Record::Unauthenticated(pid),
-            Err(e) => Record::Unreadable(format!("unreadable {}: {e}", pid_path.display())),
+            // A pid file that exists but does not parse says nothing —
+            // but the sidecar might: a torn pid write next to a whole,
+            // authentic identity is still an identifiable daemon, and
+            // refusing `reconfigure` for its whole lifetime over the
+            // torn file helped no one (review finding).
+            Err(e) => fall_back_to_sidecar(Record::Unreadable(format!(
+                "unreadable {}: {e}",
+                pid_path.display()
+            ))),
         },
         // NO pid file, which is not the same as no daemon: the write is
         // non-fatal and happens after attach, and the daemon carries on
-        // to write its sidecar. So the sidecar is the record here — it
-        // carries its own pid, it is authenticated, and it identifies
-        // the daemon WITHOUT reference to what its binary is called,
-        // which is the case the name-limited `/proc` scan cannot see
-        // (review finding).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match read_authentic_identity(identity_path, None) {
-                Some(id) => Record::Found(id.pid, Some(id)),
-                None => Record::Absent,
-            }
-        }
-        Err(e) => Record::Unreadable(format!("cannot read {}: {e}", pid_path.display())),
+        // to write its sidecar. So the sidecar is the record here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fall_back_to_sidecar(Record::Absent),
+        Err(e) => fall_back_to_sidecar(Record::Unreadable(format!(
+            "cannot read {}: {e}",
+            pid_path.display()
+        ))),
     };
     let pid = match &record {
         Record::Found(pid, _) | Record::Unauthenticated(pid) => *pid,
@@ -947,20 +1058,114 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("pf-sidecar-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
+        // The reader trusts nothing in a directory others can write, so
+        // pin the mode rather than inherit the umask.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let pidfile = dir.join("packetframe.pid");
         let ident = dir.join("packetframe.identity");
         // No pid file at all — only the identity, naming this process.
         let real = DaemonIdentity::current().expect("own identity");
         std::fs::write(&ident, real.encode()).expect("write");
+        std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
         let p = presence_of(&pidfile, &ident, |_| false, || Scan::NoneFound);
         assert!(
             matches!(p, DaemonPresence::Running { .. }),
             "the sidecar names a live process and is root-owned; nothing about the \
              executable's NAME may be needed to find it: {p:?}"
+        );
+
+        // And a TORN PID FILE beside that sidecar is the same daemon:
+        // the pid file exists but does not parse, and refusing
+        // `reconfigure` for the daemon's whole lifetime over the torn
+        // file helps no one when the sidecar identifies it (review
+        // finding).
+        std::fs::write(&pidfile, "12a4!\n").expect("write");
+        std::fs::set_permissions(&pidfile, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let p = presence_of(&pidfile, &ident, |_| false, || Scan::NoneFound);
+        assert!(
+            matches!(p, DaemonPresence::Running { .. }),
+            "a torn pid file next to a whole, authentic sidecar is still an identifiable \
+             daemon: {p:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar that exists but cannot vouch is not a missing one.
+    ///
+    /// With no pid file, the sidecar is the record of last resort, and
+    /// the first version collapsed "present but unreadable or
+    /// malformed" into "no sidecar" — `Record::Absent` — so a daemon
+    /// whose pid write failed and whose sidecar hit transient trouble
+    /// read as absent, survived a completed name-limited scan, and
+    /// licensed `detach` (review finding, P1). Malformed lands the same
+    /// whether or not the suite runs as root: as root the file is
+    /// authentic and fails decode; as non-root it fails provenance.
+    /// Either way it must surface as `Unknown`, never `Gone`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unusable_sidecar_is_not_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("pf-sidecar-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let pidfile = dir.join("packetframe.pid");
+        let ident = dir.join("packetframe.identity");
+        std::fs::write(&ident, "not an identity at all\n").expect("write");
+
+        let p = presence_of(&pidfile, &ident, |_| false, || Scan::NoneFound);
+        assert!(
+            matches!(p, DaemonPresence::Unknown { .. }),
+            "a present-but-unusable sidecar, as the record of last resort, is `cannot \
+             tell` — reading it as absence is what licenses detach under a live daemon: \
+             {p:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writable state directory vouches for nothing inside it.
+    ///
+    /// Per-file root ownership cannot say which directory a record was
+    /// written FOR: `rename` moves a root-owned file between
+    /// attacker-writable directories without reading or modifying it,
+    /// so records replayed whole from another instance's state dir
+    /// would pass every per-file check and aim root's SIGHUP at that
+    /// other instance (review finding). The directory gate makes the
+    /// replay unexpressible — a directory the attacker can write into
+    /// is a directory whose records confirm nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writable_state_directory_vouches_for_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        // Records that would be fully authentic in a root-owned dir:
+        // this process's real identity, its real pid.
+        let real = DaemonIdentity::current().expect("own identity");
+        let pidfile = dir.join("packetframe.pid");
+        let ident = dir.join("packetframe.identity");
+        std::fs::write(&pidfile, format!("{}\n", real.pid)).expect("write");
+        std::fs::write(&ident, real.encode()).expect("write");
+        if unsafe { libc::geteuid() } == 0 {
+            std::fs::set_permissions(&pidfile, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+        // The directory itself is world-writable — the replay surface.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+
+        let p = presence_of(&pidfile, &ident, |_| true, || Scan::NoneFound);
+        assert!(
+            matches!(p, DaemonPresence::Unknown { .. }),
+            "records in a directory others can write may have been renamed in whole from \
+             another instance's state dir; they must not become signal-capable: {p:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

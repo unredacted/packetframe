@@ -634,6 +634,23 @@ fn write_state_record(path: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
+    // The reader trusts records only in a directory nobody else can
+    // write (`dir_is_authentic`): a writable directory lets `rename`
+    // relocate root-owned records whole, so per-file ownership proves
+    // nothing there. `create_dir_all` inherits the umask, and a 002
+    // umask would create a group-writable dir whose every record then
+    // reads as untrusted — `reconfigure` refused for the daemon's whole
+    // lifetime. Clear exactly the group/world-write bits and leave the
+    // rest alone (an operator's deliberate 0700 stays 0700). Best
+    // effort: if it fails, the reader refuses, which is the safe side.
+    if let Ok(meta) = std::fs::metadata(parent) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o022 != 0 {
+            let _ =
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode & !0o022));
+        }
+    }
     let tmp = path.with_extension("tmp");
     {
         let mut f = create_excl_no_follow_with_retry(&tmp)?;

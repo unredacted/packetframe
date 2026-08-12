@@ -1132,6 +1132,20 @@ module's own deltas.
 >   when its health snapshot matches the live process, and warns
 >   explicitly that `detach` would proceed under it — stop the daemon
 >   first.
+> - **The state directory itself must be root-owned and not group- or
+>   world-writable**, or every record in it is treated as plantable and
+>   live pids read as CANNOT CONFIRM. Per-file ownership is not enough:
+>   `rename` moves a root-owned record between directories without
+>   touching its contents, so a writable directory's records could have
+>   been replayed whole from another instance's state dir. The daemon
+>   clears the group/world-write bits on its state dir whenever it
+>   writes a record; if you hand-create a custom `state-dir`, make it
+>   `root:root` mode `0755` (or tighter).
+> - A sidecar that is present but unreadable or malformed is treated as
+>   "cannot tell", never as missing — a torn write is what a live
+>   daemon's record looks like mid-trouble. Conversely, a torn *pid
+>   file* next to a whole sidecar still identifies the daemon: the
+>   sidecar is consulted whenever the pid file cannot answer alone.
 > - The scan has to *complete* to count as evidence of absence. If
 >   `/proc` cannot be listed, or a process in it cannot be examined
 >   (running `detach` as a non-root user is the ordinary cause), the
