@@ -97,9 +97,17 @@ jobs:
           # fails the whole job before qemu is even installed (observed
           # 2026-08-12: azure-cli and prod both 403, exit 100, no test
           # ever ran). Everything below comes from the Ubuntu archive.
-          sudo rm -f /etc/apt/sources.list.d/microsoft*.list \
-                     /etc/apt/sources.list.d/azure*.list \
-                     /etc/apt/sources.list.d/google-chrome*.list
+          #
+          # Matched by CONTENT, not by filename. The 24.04 image writes
+          # azure-cli as deb822 `/etc/apt/sources.list.d/azure-cli.sources`,
+          # which a `*.list` glob silently misses — so a glob-based
+          # version of this step would have left the exact repo that
+          # broke the job enabled (review finding). Grepping for the
+          # hosts that failed covers .list and .sources alike, and keeps
+          # working when the image renames them again.
+          sudo grep -rlE 'packages\.microsoft\.com|dl\.google\.com' \
+              /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f
+          ls -la /etc/apt/sources.list.d/ || true
           sudo apt-get update
           # virtme-ng is the maintained fork (classic virtme-run uses
           # -watchdog which QEMU 8.x dropped). Its `--run <deb>` accepts
