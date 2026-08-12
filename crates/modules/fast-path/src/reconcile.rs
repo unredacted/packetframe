@@ -30,6 +30,52 @@ use crate::linux_impl::{
 };
 use crate::MODULE_NAME;
 
+/// Refuse a reload that changes `integrity-authority`, by name.
+///
+/// The directive is consumed once, when `attach` builds the
+/// `RouteController` and decides whether to spawn a checker and with
+/// which `birdc`. Nothing here can move that decision under a running
+/// controller: the checker is a spawned task holding its own config.
+/// So a reload that edits it would return OK while the daemon kept
+/// comparing against the old authority — the false drift alarm
+/// persisting after the operator "fixed" it, or attestation staying
+/// off after they turned it back on (review finding).
+///
+/// Refusing rather than reconciling, and the choice is the same one
+/// `VppOffloadConfig::restart_only_delta` makes for
+/// `require-table-complete`: a directive an operator edits *because a
+/// health line told them to* must not silently do nothing, and the two
+/// cases interact — `integrity-authority none` is exactly what the
+/// mismatch remedy recommends. Wiring a live swap would mean stopping a
+/// checker task, rebuilding it, and deciding what happens to the
+/// completeness handle a second tier may be mid-deferral on; that is a
+/// release-semantics change, not a reload.
+///
+/// Only when a controller exists. In `kernel-fib` mode nothing consumes
+/// the directive, so there is no divergence to refuse — and reaching
+/// custom-fib from there is itself a restart.
+fn refuse_integrity_authority_change(
+    state: &ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<()> {
+    if state.route_controller.is_none() {
+        return Ok(());
+    }
+    let wanted = crate::linux_impl::integrity_authority_from_cfg(cfg);
+    state
+        .integrity_authority
+        .restart_only_delta(&wanted)
+        .map_err(|why| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!(
+                    "{why}. Refused by name rather than accepted and ignored, because this \
+                     is the directive the authority-mismatch remedy tells operators to edit"
+                ),
+            )
+        })
+}
+
 /// Per-map count of entries added and removed during reconcile.
 #[derive(Default, Debug)]
 pub struct DeltaCount {
@@ -38,6 +84,7 @@ pub struct DeltaCount {
 }
 
 pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    refuse_integrity_authority_change(state, cfg)?;
     reconcile_cfg(state, cfg)?;
     let v4 = reconcile_allow_v4(state, cfg)?;
     let v6 = reconcile_allow_v6(state, cfg)?;

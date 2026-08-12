@@ -479,6 +479,35 @@ pub enum IntegrityAuthoritySpec {
     None,
 }
 
+impl IntegrityAuthoritySpec {
+    /// Whether a reload may move a running daemon from `self` to `new`.
+    ///
+    /// It may not: the directive is read once, when the route
+    /// controller starts and decides whether to spawn a checker and
+    /// with which `birdc`. A pure function over two values, mirroring
+    /// `VppOffloadConfig::restart_only_delta`, so the rule is testable
+    /// without an attach, a BPF object, or a running checker — the
+    /// module-side caller supplies the "is a controller actually
+    /// running" half.
+    ///
+    /// Refused rather than silently ignored because this is the
+    /// directive an operator edits *because a health line told them
+    /// to*: `integrity-authority none` is what the authority-mismatch
+    /// remedy recommends, and a reload that accepts it while the
+    /// checker keeps using the old authority leaves the false alarm
+    /// standing and the operator believing they fixed it.
+    pub fn restart_only_delta(&self, new: &Self) -> Result<(), String> {
+        if self == new {
+            return Ok(());
+        }
+        Err(format!(
+            "`integrity-authority` changed ({self:?} → {new:?}) and it is read once, when \
+             the route controller starts: a reload cannot move the running checker onto a \
+             different authority. Restart the daemon for it"
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum RouteSourceSpec {
     /// BMP station listen address. Bird dials out to this
@@ -2932,6 +2961,42 @@ module fast-path
             "module fast-path\n  integrity-authority birdc /a /b\n",
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    /// A reload may not move the authority under a running checker.
+    ///
+    /// The directive is consumed once, when the route controller
+    /// starts. Accepting the edit and continuing to compare against the
+    /// old authority is the silent no-op class — and this is precisely
+    /// the directive the mismatch remedy tells an operator to change,
+    /// so "it returned OK" would read as "it took effect".
+    #[test]
+    fn integrity_authority_is_restart_only() {
+        let birdc = IntegrityAuthoritySpec::Birdc { path: None };
+        let none = IntegrityAuthoritySpec::None;
+        let other = IntegrityAuthoritySpec::Birdc {
+            path: Some(PathBuf::from("/opt/bird/birdc")),
+        };
+
+        // Unchanged reloads are fine — the common case, every SIGHUP
+        // that edits an allowlist.
+        birdc.restart_only_delta(&birdc).unwrap();
+        none.restart_only_delta(&none).unwrap();
+
+        // Every real change is refused, in both directions, including a
+        // path swap that keeps the same variant.
+        for (from, to) in [
+            (&birdc, &none),
+            (&none, &birdc),
+            (&birdc, &other),
+            (&other, &none),
+        ] {
+            let err = from.restart_only_delta(to).unwrap_err();
+            assert!(
+                err.contains("read once") && err.contains("Restart the daemon"),
+                "a refused change must say why and what to do: {err}"
+            );
         }
     }
 
