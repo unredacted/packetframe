@@ -231,7 +231,9 @@ effect.
 **Rung 0 — membership, everything off.** Every fast-path attach port
 gets a `port` line; every one is `steer off`.
 
-Decide `require-table-complete` first. On a box running its own bird,
+Decide `require-table-complete` first — **it is restart-only**, so
+getting it wrong here costs a daemon restart rather than a reload;
+`reconfigure` refuses a changed value by name. On a box running its own bird,
 leave it `on` (the default); the first steer then waits until the route
 mirror matches bird's route count. On a box without a local bird, attach
 refuses to start with `on`, because the check could never pass. Set it
@@ -1104,14 +1106,27 @@ carrying that traffic; VPP still is.
   authority measures. Make them agree, or run that box without an
   authority.
   **`require-table-complete off` needs a restart, not a reload.** It is
-  read at bring-up, and `reconfigure` never touches the runtime's
-  completeness handle — so editing it and reloading stores the new
-  value and changes nothing, and from a vetoed adopted resync the
-  reload is refused outright anyway. Since a restart is required
-  regardless, the cold sequence below is the same operation: stop the
-  daemon, `packetframe detach --all`, start. It tears VPP down and
-  costs a full resync, the exact trade the deferral exists to avoid, so
-  it is a last resort and not a troubleshooting step.
+  read once at bring-up: the attach wiring installs or withholds the
+  runtime's completeness handle, and `reconfigure` never touches it. So
+  the reload **refuses the change by name** — "`require-table-complete`
+  changed (on → off) ... Restart to apply" — rather than answering OK
+  and running on the old gate, which is what it used to do. Nothing is
+  worth trying first. Since a restart is required regardless, the cold
+  sequence below is the same operation: stop the daemon, `packetframe
+  detach --all`, start. It tears VPP down and costs a full resync, the
+  exact trade the deferral exists to avoid, so it is a last resort and
+  not a troubleshooting step.
+
+  The refusal is deliberate rather than a missing feature. Wiring the
+  toggle into `reconfigure` would deliver it from `Ready`/`Steered` and
+  **not** from here, because `apply_steering` admits changes only from
+  those two states — i.e. everywhere except the state this remedy is
+  read in. Reaching this state would need a second in-loop request path
+  with its own admission rule. Refusing costs nothing here (the restart
+  was already required) and fixes the direction that actually bites: an
+  operator turning the gate **on** used to get a success while the
+  runtime held no handle at all, and believed a safety gate was armed
+  when it was not.
 - **Before a rollout, check the authority AGREES — not that bird is
   running.** The two are different, and this box proved it: bird was up
   the whole time.
