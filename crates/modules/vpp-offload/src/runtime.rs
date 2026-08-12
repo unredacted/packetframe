@@ -849,15 +849,25 @@ fn authority_posture(
     demoted: bool,
     gate_consults_authority: bool,
     current: Option<bool>,
+    verdict: Option<packetframe_common::fib::Completeness>,
 ) -> AuthorityPosture {
+    use packetframe_common::fib::Completeness;
     if !configured {
         AuthorityPosture::Absent
     } else if demoted {
         AuthorityPosture::DemotedByFlap
-    } else if gate_consults_authority && current == Some(false) {
+    } else if !gate_consults_authority || current != Some(false) {
+        AuthorityPosture::Attesting
+    } else if matches!(verdict, Some(Completeness::AuthorityMismatch { .. })) {
+        // The ONLY verdict that waiting cannot fix: the mirror holds
+        // substantially more than the authority claims, so the
+        // authority is not the thing feeding this mirror. Every other
+        // non-permitting verdict is a report that has not arrived yet,
+        // has aged out, or describes a mirror still loading — all of
+        // which the next check can clear.
         AuthorityPosture::Vetoing
     } else {
-        AuthorityPosture::Attesting
+        AuthorityPosture::AwaitingAuthority
     }
 }
 
@@ -1135,6 +1145,7 @@ impl Runtime {
                 // not be able to disagree about whether the authority is
                 // currently permitting.
                 authority_current(&c.completeness, c.source.route_count()),
+                c.completeness.as_ref().map(|h| h.verdict()),
             ),
         }
     }
@@ -1185,7 +1196,27 @@ pub enum AuthorityPosture {
     /// `AwaitingFallback` consults the authority; the diff stage
     /// releases on floor-and-quiet and a disagreeing authority there is
     /// not blocking anything.
+    ///
+    /// And scoped to the PERSISTENT verdict, `AuthorityMismatch`.
+    /// `assess()` already draws that line — "short of the authority is a
+    /// mirror still loading — wait; larger than the authority cannot be
+    /// a loading state at all" — and the first version of this variant
+    /// flattened all four non-permitting verdicts into it, so a box
+    /// whose first integrity check had simply not run yet was told that
+    /// waiting would not help. That fires at every startup on a box
+    /// with an authority (review finding).
     Vetoing,
+    /// Configured, currently not permitting, for a reason that clears
+    /// itself: no report yet (`Unknown`), one that aged out (`Stale`),
+    /// or a mirror still short of the authority (`Incomplete`). The
+    /// integrity checker publishes a fresh report every interval and
+    /// the deferral releases on its own.
+    ///
+    /// Distinct from `Vetoing` because the operator action differs
+    /// completely — wait, versus go and find out which bird `birdc` is
+    /// talking to — and distinct from `Attesting` because release IS
+    /// currently blocked, which a line saying "attesting" would deny.
+    AwaitingAuthority,
 }
 
 /// One coherent snapshot of the runtime's observable state, for the
@@ -2298,27 +2329,32 @@ mod tests {
     /// fix, one stage over.
     #[test]
     fn a_veto_is_scoped_to_the_gate_that_consults_the_authority() {
+        use packetframe_common::fib::Completeness;
+        let mismatch = Some(Completeness::AuthorityMismatch {
+            authority: 13,
+            mirror: 1_303_920,
+        });
         // Absent beats everything: no handle, nothing to say.
         for consults in [true, false] {
             assert_eq!(
-                authority_posture(false, false, consults, None),
+                authority_posture(false, false, consults, None, None),
                 AuthorityPosture::Absent
             );
         }
         // A flap demotes regardless of the current word.
         assert_eq!(
-            authority_posture(true, true, true, Some(false)),
+            authority_posture(true, true, true, Some(false), mismatch.clone()),
             AuthorityPosture::DemotedByFlap
         );
         // THE RULE: same disagreeing authority, opposite verdicts,
         // decided only by whether this deferral's gate consults it.
         assert_eq!(
-            authority_posture(true, false, true, Some(false)),
+            authority_posture(true, false, true, Some(false), mismatch.clone()),
             AuthorityPosture::Vetoing,
             "AwaitingFallback consults the authority, so a false there IS the blocker"
         );
         assert_eq!(
-            authority_posture(true, false, false, Some(false)),
+            authority_posture(true, false, false, Some(false), mismatch.clone()),
             AuthorityPosture::Attesting,
             "AwaitingDiff never asks, so a disagreeing authority is not blocking it and \
              must not be reported as if it were"
@@ -2326,10 +2362,61 @@ mod tests {
         // A permitting or unknown authority is never a veto.
         for current in [Some(true), None] {
             assert_eq!(
-                authority_posture(true, false, true, current),
+                authority_posture(true, false, true, current, mismatch.clone()),
                 AuthorityPosture::Attesting
             );
         }
+    }
+
+    /// Only `AuthorityMismatch` is a veto; the rest clear themselves.
+    ///
+    /// `authority_current` returns false for EVERY non-permitting
+    /// verdict, so keying the veto on it alone told a box whose first
+    /// integrity check simply had not run yet that waiting would not
+    /// help — at every startup with an authority configured (review
+    /// finding). `assess()` already draws the line this test pins:
+    /// short of the authority is a mirror still loading; larger than
+    /// the authority cannot be a loading state at all.
+    #[test]
+    fn only_a_mismatched_authority_is_a_veto() {
+        use packetframe_common::fib::Completeness;
+        let self_clearing = [
+            Completeness::Unknown {
+                why: "no check has run yet",
+            },
+            Completeness::Stale {
+                age: Duration::from_secs(9_999),
+            },
+            Completeness::Incomplete {
+                drift: 0.5,
+                authority: 1_000_000,
+                mirror: 500_000,
+            },
+        ];
+        for verdict in self_clearing {
+            assert_eq!(
+                authority_posture(true, false, true, Some(false), Some(verdict.clone())),
+                AuthorityPosture::AwaitingAuthority,
+                "{verdict:?} is a report that has not arrived, aged out, or describes a \
+                 mirror still loading — the next check can clear all three, so this must \
+                 not be reported as a veto"
+            );
+        }
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                Some(Completeness::AuthorityMismatch {
+                    authority: 13,
+                    mirror: 1_303_920,
+                })
+            ),
+            AuthorityPosture::Vetoing,
+            "a mirror holding far more than the authority claims is not a loading state \
+             and no check will clear it"
+        );
     }
 
     /// Activity cannot divide away, however slowly the tick ran.

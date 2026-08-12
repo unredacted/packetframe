@@ -1092,6 +1092,12 @@ carrying that traffic; VPP still is.
   interval. Do **not** reach for a restart here — tearing down a
   working VPP to fix a transient read is strictly worse than the
   problem.
+  `fib-synced` tells the two apart, and the wording is the tell: *"the
+  completeness authority has not attested yet ... releases itself once
+  one agrees"* is the self-clearing case (no report yet, one aged out,
+  or a mirror still short — including every startup before the first
+  check lands). Only *"not the authority feeding it ... Waiting will
+  not clear it"* is the persistent one below.
 - **A persistent disagreement is the case that needs a decision**: a
   local bird that does not carry the mirror's table, or a mirror fed
   from a different source than the authority measures. Make them agree,

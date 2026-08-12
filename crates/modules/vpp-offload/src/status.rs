@@ -635,7 +635,47 @@ impl StatusSnapshot {
                 // feed passes through every count on its way to full
                 // and only quiescence says "done".
                 use crate::runtime::AuthorityPosture;
-                let msg = if have < want && self.authority == AuthorityPosture::Attesting {
+                // ORDER MATTERS, and every arm names its posture. The
+                // veto arm goes FIRST because it is the one case where
+                // the floor is irrelevant — the authority blocks release
+                // at any table size — and when it sat after the
+                // unconditional below-floor arm, a vetoing box below the
+                // floor was told it had "no authority" and should enable
+                // `require-table-complete`, which was already enabled and
+                // was the thing blocking it (review finding).
+                let msg = if self.authority == AuthorityPosture::Vetoing {
+                    // Persistent by construction: `Vetoing` is only
+                    // `AuthorityMismatch`, the one verdict waiting cannot
+                    // fix.
+                    format!(
+                        "resync deferred: the route source holds {have} routes (release \
+                         floor {want}) and the floor is not what is holding this — the \
+                         completeness authority reports a route count that cannot describe \
+                         this mirror, so it is not the authority feeding it, and that \
+                         vetoes release at any table size. Waiting will not clear it. \
+                         Check which bird `birdc` is talking to on THIS box; where the \
+                         routes legitimately come from elsewhere, `require-table-complete \
+                         off` is the right answer. The adopted FIB keeps forwarding \
+                         untouched meanwhile, and every steering change is refused while \
+                         this holds"
+                    )
+                } else if self.authority == AuthorityPosture::AwaitingAuthority {
+                    // Blocked, but self-clearing: no report yet, one that
+                    // aged out, or a mirror still short. Deliberately
+                    // does NOT tell the operator to go looking — the next
+                    // check releases it, and sending someone after a
+                    // startup transient is how a healthy box gets
+                    // "fixed" into a broken one.
+                    format!(
+                        "resync deferred: the completeness authority has not attested yet \
+                         — no report has arrived, the last one aged out, or the mirror is \
+                         still short of it — so release is blocked for now. The integrity \
+                         checker publishes a fresh report every interval (300 s) and this \
+                         releases itself once one agrees; the source holds {have} routes \
+                         against a floor of {want}. Nothing is dropping: the adopted FIB \
+                         keeps forwarding untouched"
+                    )
+                } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
@@ -660,6 +700,10 @@ impl StatusSnapshot {
                          table is loaded so the adoption starts unsteered"
                     )
                 } else if have < want {
+                    // Reachable only with NO authority now: every other
+                    // posture is claimed by an arm above, which is what
+                    // makes this text's "with no authority" accurate
+                    // rather than an assumption.
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
@@ -669,32 +713,6 @@ impl StatusSnapshot {
                          floor, by design. Size `expected-routes` within 16x of the real \
                          table, or give this box a bird and enable \
                          `require-table-complete`"
-                    )
-                } else if self.authority == AuthorityPosture::Vetoing {
-                    // The floor is met and quiescence is NOT the blocker:
-                    // `authority_current` is returning false, which vetoes
-                    // release unconditionally — no amount of quiet, floor
-                    // or liveness gets past it.
-                    //
-                    // This arm exists because the message below was
-                    // printed for 23 hours on a box whose local bird held
-                    // 13 routes against a 1.3M-route mirror (shadow,
-                    // 2026-08-12). It told the operator to wait for the
-                    // source to go quiet. The source going quiet could
-                    // never have released it, and nothing said so — the
-                    // posture had no way to express a veto, so every
-                    // surface read `Attesting`.
-                    format!(
-                        "resync deferred: the route source holds {have} routes (release \
-                         floor {want} met) and the source may well be quiet — but the \
-                         completeness authority currently reports that its own route count \
-                         does not describe this mirror, which vetoes the release outright. \
-                         Waiting will not clear it: the authority has to agree with the \
-                         mirror first. Check that bird on THIS box carries the table the \
-                         mirror was built from (a near-empty local bird against a full \
-                         mirror is the usual cause), or run without an authority. The \
-                         adopted FIB keeps forwarding untouched meanwhile, and every \
-                         steering change is refused while this holds"
                     )
                 } else {
                     format!(
@@ -2572,6 +2590,69 @@ mod tests {
         assert!(
             attesting.contains("gone quiet"),
             "a non-vetoed deferral above the floor IS waiting for quiet: {attesting}"
+        );
+
+        // A blocked-but-self-clearing authority must NOT inherit the
+        // veto's "waiting will not clear it" — that fires at every
+        // startup before the first integrity check lands (review
+        // finding).
+        let awaiting = deferred(AuthorityPosture::AwaitingAuthority);
+        assert!(
+            !awaiting.contains("Waiting will not clear it"),
+            "an authority that has merely not reported yet clears itself: {awaiting}"
+        );
+        assert!(
+            awaiting.contains("releases itself"),
+            "and the line must say so, or an operator goes looking for a fault that is a \
+             startup transient: {awaiting}"
+        );
+    }
+
+    /// A vetoing authority below the release floor must not be told it
+    /// has no authority.
+    ///
+    /// The below-floor arm was unconditional, so it consumed the
+    /// snapshot before the veto arm could be reached: a box that HAD
+    /// `require-table-complete` enabled and was being vetoed by it read
+    /// "with no authority ... give this box a bird and enable
+    /// `require-table-complete`" (review finding). Both halves of that
+    /// advice were already true and neither was the problem.
+    #[test]
+    fn a_vetoed_deferral_below_the_floor_is_not_an_absent_authority() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let mut snap = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            FibSync::NeverVerified,
+            ports_up(),
+        );
+        // BELOW the floor and vetoing — the ordering trap.
+        snap.resync_deferred = Some((40_000, 156_734));
+        snap.authority = AuthorityPosture::Vetoing;
+        let msg = snap
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|s| s.name == SUBSYS_FIB)
+            .and_then(|s| s.message)
+            .expect("a deferral always explains itself");
+
+        assert!(
+            !msg.contains("with no authority"),
+            "the authority is configured and is the thing blocking release: {msg}"
+        );
+        assert!(
+            !msg.contains("give this box a bird and enable"),
+            "and telling the operator to enable what is already enabled sends them \
+             nowhere: {msg}"
+        );
+        assert!(
+            msg.contains("not the authority feeding it"),
+            "it must name the real blocker instead: {msg}"
         );
     }
 
