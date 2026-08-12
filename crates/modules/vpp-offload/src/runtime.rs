@@ -1008,19 +1008,37 @@ impl Runtime {
                 match c.steering.missing_from_nic() {
                     Ok(audit) => {
                         if !audit.missing.is_empty() && c.steer_missing != audit.missing.len() {
+                            // NAMES NO REMEDY. The audit runs in every
+                            // state, and the remedy depends on the state:
+                            // `reconfigure` reconciles steering only from
+                            // `Ready`/`Steered`, so this line promised it
+                            // during adopted resyncs and backoffs, where
+                            // it answers "not converged" and changes
+                            // nothing (observed on the shadow,
+                            // 2026-08-12). `steering_health` already
+                            // selects the right remedy from the state and
+                            // is tested to; a second copy here is a copy
+                            // that cannot see what it needs and drifts
+                            // from the one that can.
                             tracing::warn!(
                                 missing = ?audit.missing,
                                 "steering rules this target needs are not in the NIC; \
                                  traffic for them is on the eBPF tier. `packetframe \
-                                 reconfigure` reinstalls them"
+                                 status` names the remedy for the current state"
                             );
                         }
                         c.steer_missing = audit.missing.len();
                         if !audit.stray.is_empty() && c.steer_stray != audit.stray.len() {
+                            // Same reason as the missing arm above, and
+                            // the stray remedy is the one that must not
+                            // be waited on — the health line says so,
+                            // with the by-hand `ethtool` removal for
+                            // where reconfigure will not run.
                             tracing::warn!(
                                 stray = ?audit.stray,
                                 "rules are still steering a port this config asks to leave \
-                                 unsteered; `packetframe reconfigure` removes them"
+                                 unsteered; `packetframe status` names the remedy for the \
+                                 current state"
                             );
                         }
                         c.steer_stray = audit.stray.len();

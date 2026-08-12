@@ -856,13 +856,27 @@ impl StatusSnapshot {
             // resync running yet, which is why this does not say "this
             // resync"), and the target it will reconcile to is non-empty,
             // so its stale-rule removal covers whatever is left over.
+            //
+            // This arm ends by saying `reconfigure` will NOT help, which
+            // is the opposite of what it shipped saying. Every state that
+            // reaches it — `Starting`, `Syncing`, `Verifying`,
+            // `AdoptedResyncing`, `Backoff` — fails
+            // `accepts_steering_changes()`, since the two that pass it
+            // took the first arm. So the promise that reconfigure "asks
+            // immediately" was wrong on every line it ever printed, not
+            // in a corner: measured on the shadow 2026-08-12, where an
+            // adopted resync deferred for 23 hours printed it and the
+            // reconfigure it named answered "not converged" and changed
+            // nothing. The comment at the top of this selection had
+            // already written down the rule; the last sentence of this
+            // arm broke it, and no test compared the two.
             "a convergence re-applies steering only if it verifies clean — one that ends \
              with routes withheld or unresolvable parks in the staging state and emits no \
              steer at all, and a steer that IS emitted can still be refused by the \
              completeness gate. Both settle in the staging state with the want \
              remembered, and from there the module re-attempts the steer by itself once \
-             both gates permit. `packetframe reconfigure` asks immediately rather than \
-             waiting"
+             both gates permit. Until it converges there is nothing to ask: `packetframe \
+             reconfigure` answers \"not converged\" from here and changes no steering"
                 .to_string()
         };
         // Stray rules do NOT share that remedy, and sharing it was a
@@ -1702,6 +1716,84 @@ mod tests {
             seen.len() >= 4,
             "the matrix must actually render commands, or this proves nothing: {seen:?}"
         );
+    }
+
+    /// A remedy may not present `packetframe reconfigure` as something
+    /// to run NOW from a state that refuses it.
+    ///
+    /// The rule, not the case. #157 split the remedy four ways for
+    /// exactly this reason and wrote the rule into the comment above
+    /// the selection — and the convergence arm's last sentence then
+    /// broke it, saying reconfigure "asks immediately rather than
+    /// waiting" from the only states that reach that arm, all of which
+    /// fail `accepts_steering_changes()`. It printed on the shadow for
+    /// 23 hours under an adopted resync, and the reconfigure it named
+    /// answered "not converged" (2026-08-12, hardware). No test
+    /// compared the message against the gate the module actually
+    /// applies, so this one does: the assertion is derived from
+    /// `accepts_steering_changes()` rather than from a list of states I
+    /// thought of, and it fails if a future arm regresses the same way.
+    #[test]
+    fn no_remedy_offers_reconfigure_where_the_module_refuses_it() {
+        for state in [
+            State::Stopped,
+            State::Backoff,
+            State::Starting,
+            State::Syncing,
+            State::Verifying,
+            State::Ready,
+            State::Steered,
+            State::AdoptedResyncing,
+        ] {
+            if state.accepts_steering_changes() {
+                continue;
+            }
+            for steer_configured in [true, false] {
+                for steering in steering_postures() {
+                    for (missing, stray) in [(1usize, 0usize), (0, 1), (1, 1)] {
+                        let led = ledger_with(10, 0, 0);
+                        let mut snap = snap_of(
+                            &steered_supervisor(),
+                            &led,
+                            ApiHealth::Answering {
+                                silent_for: Duration::from_millis(200),
+                            },
+                            verified(3),
+                            ports_up(),
+                        );
+                        snap.state = state;
+                        snap.steer_configured = steer_configured;
+                        (snap.steered, snap.steer_intended) = steering;
+                        snap.steer_missing = missing;
+                        snap.steer_stray = stray;
+
+                        for sub in snap.report().subsystems {
+                            let Some(msg) = sub.message else { continue };
+                            // The exact phrasing that was wrong, plus the
+                            // generic form of the same promise. A remedy
+                            // may still NAME reconfigure — the stray arm
+                            // does, hedged with "where reconfigure will
+                            // not run" — but it may not say it works now.
+                            for banned in [
+                                "asks immediately",
+                                "re-applies steering, and reports its own reason",
+                            ] {
+                                assert!(
+                                    !msg.contains(banned),
+                                    "{} in {state:?} (steer_configured={steer_configured}, \
+                                     missing={missing}, stray={stray}) offers reconfigure \
+                                     as an immediate remedy, but \
+                                     accepts_steering_changes() is false there, so the \
+                                     module answers \"not converged\" and changes nothing. \
+                                     Full line: {msg}",
+                                    sub.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// No health message contains a run of whitespace.
