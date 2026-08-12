@@ -1122,26 +1122,39 @@ carrying that traffic; VPP still is.
   time, or the log having rotated — which would approve a rollout onto
   a handle that is `Unknown` and will refuse.
 
-  Get positive, timestamped evidence instead. Set `log-level debug`,
-  wait one interval (300 s), and require a line **from the last
-  interval** carrying both counts:
+  **The cheapest positive evidence is the canary steer itself.** With
+  `require-table-complete on`, a steer the authority will not support
+  is *refused*, and the refusal names the verdict verbatim — "the route
+  mirror holds N routes but the authority reports only M — that is not
+  the authority feeding this mirror", or "completeness is unknown", or
+  "too old to act on". Nothing is steered when it refuses, so rung 0's
+  first `steer on` doubles as the test, and a refusal costs a message
+  rather than traffic. Read the reason it prints; do not retry past it.
+
+  To know *before* attempting, sample the checker directly. Both counts
+  come from `birdc`, and the comparison is logged — but only at debug,
+  and **`log-level` in the config does not control it**: the filter is
+  built from `RUST_LOG` at process start, so this costs a restart.
 
   ```bash
   birdc show route count | grep -E 'in table master(4|6)'
-  grep -E 'integrity check OK|integrity drift above threshold|integrity check:' \
-      /var/log/packetframe.log | tail -5
+  systemctl edit packetframe   # [Service] Environment=RUST_LOG=info,packetframe_fast_path::fib::integrity=debug
+  systemctl restart packetframe && sleep 310
+  journalctl -u packetframe --since '-6min' \
+      | grep -E 'integrity check OK|integrity drift above threshold|integrity check:'
   ```
 
-  `integrity check OK` with `bird_routes` and `packetframe_routes` is
-  the evidence the gate acts on. Anything else — a drift warning, a
-  failure line, or **no line at all** — is not a pass. Restore the log
-  level afterwards.
+  `integrity check OK` carrying `bird_routes` and `packetframe_routes`
+  is the evidence the gate acts on. A drift warning, one of the three
+  failure lines, or **no line at all** are each not a pass. Revert the
+  override afterwards.
 
-  > There is no `packetframe status` surface for this today:
-  > `IntegrityChecker`'s snapshot is published and never read, so the
-  > log is the only window onto the verdict outside a refusal message.
-  > That gap is worth closing; it is why this check is as awkward as it
-  > is.
+  > Both awkward parts of this — needing a restart, and reading a log
+  > rather than a command — come from one gap: `IntegrityChecker`'s
+  > snapshot is published and `RouteController::integrity_snapshot()`
+  > has no caller, so the verdict has no `status` surface outside a
+  > refusal message. Worth closing; until it is, prefer the canary
+  > refusal above, which needs neither.
 
   Two traps that make a hand-rolled check pass a box that will veto.
   **`master6` counts**: a box whose `master4` matches but whose
