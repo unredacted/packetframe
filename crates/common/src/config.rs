@@ -115,6 +115,21 @@ pub enum LogLevel {
     Error,
 }
 
+impl LogLevel {
+    /// The lowercase spelling: the one [`FromStr`] accepts, the one
+    /// `Serialize` emits, and the one a `tracing` filter directive
+    /// wants. Kept as one function so those three can't drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
 impl FromStr for LogLevel {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -2601,6 +2616,19 @@ module fast-path
     fn attach_settle_time_bad_number_errors() {
         let err = Config::parse("global\n  attach-settle-time abcs\n").expect_err("must fail");
         assert!(format!("{err}").contains("bad duration"));
+    }
+
+    #[test]
+    fn log_level_as_str_round_trips_through_from_str() {
+        for level in [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+        ] {
+            assert_eq!(level.as_str().parse::<LogLevel>(), Ok(level));
+        }
     }
 
     #[test]

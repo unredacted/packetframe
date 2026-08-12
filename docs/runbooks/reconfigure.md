@@ -40,6 +40,25 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | `mss-clamp …` (all four grammars) | `MSS_CLAMP_V4/V6` + `MSS_CLAMP_BY_IFACE` + `CFG.mss_clamp_global` | v0.2.4+; value changes also pick up |
 | (auto) VLAN-subif resolution | `VLAN_RESOLVE` | Re-scanned from `/proc/net/vlan/config` |
 | (auto) Redirect devmap | `REDIRECT_DEVMAP` | Re-scanned from `/sys/class/net` |
+| `log-level` | (none — userspace tracing filter) | v0.2.7+; applied before the module loop, so the reconcile it is on logs at the new level. **No effect while `RUST_LOG` is set** — see below |
+
+`log-level` is the one entry here that touches no BPF map: it swaps the
+daemon's tracing filter in place. Raising to `debug` to watch a canary
+steer or a route mirror converge, and dropping back after, is a reload
+rather than a restart.
+
+Two things to know about it:
+
+- **`RUST_LOG` in the daemon's environment wins, for the life of the
+  process.** Env beats file, which keeps per-module overrides like
+  `RUST_LOG=info,packetframe_fast_path::fib::integrity=debug` working —
+  no whole-process level can express those. A daemon started with
+  `RUST_LOG` set logs a single line saying the config directive is being
+  ignored, the first time it would have applied one; clearing the
+  environment variable needs a restart, since only a restart re-reads it.
+- **`log-level debug` on a forwarding box is loud.** It is a whole-process
+  level, not a per-module one. Reload it back down when you are done
+  rather than leaving it on.
 
 Adds-before-removes ordering: a renamed prefix (remove + add of the same value) never has a window where neither exists.
 

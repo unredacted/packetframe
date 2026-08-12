@@ -105,6 +105,14 @@ const RECONFIGURE_TIMEOUT_MS: u64 = 5_000;
 pub fn run(config_path: &Path) -> Result<(), RunError> {
     let config = Config::from_file(config_path)
         .map_err(|e| RunError::Startup(format!("config parse: {e}")))?;
+
+    // First thing after the parse, so the level the operator asked for
+    // covers the whole of startup — the feasibility gate, the attach,
+    // and the route-source bring-up are where the debug lines that are
+    // worth turning on actually live. A parse failure above keeps the
+    // startup default, which is how its own error message got printed.
+    crate::logging::apply_config_level(config.global.log_level);
+
     config
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
@@ -1002,6 +1010,14 @@ fn reconfigure_from_signal(
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
         return Published::No;
     }
+
+    // After the two refusals above and before the module loop: a
+    // rejected reload changes nothing, including this, and a module
+    // reconcile that is about to run at debug should say so under the
+    // level the operator just asked for. Hot-reloading the level is the
+    // point — raising to debug to watch a canary steer, or a route
+    // mirror converge, must not cost a restart of the data plane.
+    crate::logging::apply_config_level(new_config.global.log_level);
 
     // Before the module loop, and for the WHOLE config rather than per
     // module. vpp-offload's steering target is derived from fast-path's
