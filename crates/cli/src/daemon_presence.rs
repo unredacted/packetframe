@@ -349,47 +349,50 @@ pub fn self_boot_id() -> Option<String> {
     }
 }
 
-/// Whether a record can be believed about WHICH process it names.
+/// The sidecar identity, read and authenticated through ONE descriptor.
 ///
-/// The identity path returns `Running` without consulting the
-/// executable, so the record decides who `reconfigure` signals as root.
-/// If `state-dir` is writable by an unprivileged user — a custom one
-/// under `/tmp`, say — that user can unlink both records and write
-/// their own naming a victim pid, with the victim's start ticks and
-/// boot id, both world-readable. The exe check this replaced would have
-/// refused; without this, root SIGHUPs whatever they chose (review
-/// finding, P1).
+/// Two ways this was bypassable, both P1, both found after the first
+/// attempt at it:
 ///
-/// Root-owned and not writable by group or other. An attacker with
-/// directory write can still delete the file, but anything they create
-/// in its place is theirs and fails here — which drops the identity and
-/// falls back to the executable match, exactly as if none had been
-/// recorded.
+/// The check ran `metadata()` on a pathname and then `read_to_string()`
+/// on the same pathname. An attacker with directory write can point the
+/// name at a root-owned file for the first call and swap in their own
+/// before the second — a check-then-use race they can retry until it
+/// lands. So the file is opened once, `O_NOFOLLOW`, and both the
+/// ownership check and the read happen on that descriptor: whatever
+/// passes the check is what is read, and a symlink at the final
+/// component fails the open outright.
+///
+/// And identity is taken from HERE ONLY. `decode` accepts a combined
+/// `<pid> <ticks> <boot>` record because the sidecar uses that shape,
+/// but the pid file is not authenticated, so a combined record planted
+/// THERE used to supply an identity that never passed this function at
+/// all.
+///
+/// Root-owned, a regular file, and not group- or world-writable. An
+/// attacker with directory write can still unlink it; anything they
+/// create in its place is theirs and fails, which drops the identity
+/// and falls back to the executable match — as if none were recorded.
 #[cfg(target_os = "linux")]
-fn record_is_authentic(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata(path) {
-        Ok(m) => m.uid() == 0 && m.mode() & 0o022 == 0,
-        Err(_) => false,
-    }
-}
+fn read_authentic_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-/// The sidecar identity, if it describes the pid the pid file names.
-///
-/// A sidecar naming a DIFFERENT pid is left over from a previous
-/// daemon. Treating it as this one's would compare a live process
-/// against a dead one's ticks and call the live process reused — so a
-/// mismatch reads as "no identity recorded", which falls back rather
-/// than concluding.
-#[cfg(target_os = "linux")]
-fn read_identity(path: &Path, pid: i32) -> Option<DaemonIdentity> {
-    // Unauthenticated records name a pid; they do not get to decide
-    // that a pid is ours.
-    if !record_is_authentic(path) {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
         return None;
     }
-    let raw = std::fs::read_to_string(path).ok()?;
+    let mut raw = String::new();
+    f.read_to_string(&mut raw).ok()?;
     let (recorded_pid, id) = DaemonIdentity::decode(&raw).ok()?;
+    // A sidecar naming a different pid is left from a previous daemon.
+    // Comparing a live process against a dead one's ticks would call
+    // the live one reused, so this reads as "no identity recorded".
     if recorded_pid != pid {
         return None;
     }
@@ -407,13 +410,15 @@ pub fn presence_of(
 ) -> DaemonPresence {
     let record = match std::fs::read_to_string(pid_path) {
         Ok(s) => match DaemonIdentity::decode(&s) {
-            // The pid file stays a BARE PID — CLIs from other bundles
-            // parse it whole, and widening it broke their `reconfigure`
-            // (review finding) — so identity comes from the sidecar.
-            // `decode` still accepts a combined record, because a
-            // reader must not care which shape it meets.
-            Ok((pid, inline)) => {
-                Record::Found(pid, inline.or_else(|| read_identity(identity_path, pid)))
+            // The pid file yields a PID AND NOTHING ELSE. It is not
+            // authenticated, so an identity read from it would let an
+            // attacker with directory write plant a combined record and
+            // pick the pid root signals — which is what happened when
+            // an inline identity was preferred here (review finding).
+            // It also stays a bare pid on the write side, because CLIs
+            // from other bundles parse it whole.
+            Ok((pid, _unauthenticated)) => {
+                Record::Found(pid, read_authentic_identity(identity_path, pid))
             }
             Err(e) => Record::Unreadable(format!("unreadable {}: {e}", pid_path.display())),
         },
@@ -634,44 +639,47 @@ mod tests {
         }
     }
 
-    /// An identity record only counts if root wrote it.
+    /// An identity record only counts if root wrote it, and only the
+    /// SIDECAR can carry one.
     ///
     /// The identity path returns `Running` without consulting the
-    /// executable, so the record decides who `reconfigure` signals as
-    /// root. With a `state-dir` an unprivileged user can write, that
-    /// user could name a victim pid and supply its start ticks and boot
-    /// id — both world-readable — and the exe check this replaced would
-    /// no longer be there to refuse (review finding, P1).
+    /// executable — that is what survives an upgrade — so the record
+    /// decides which pid `reconfigure` signals as root. Three ways that
+    /// was reachable by an unprivileged writer, each found after the
+    /// last was fixed: no ownership check at all; a check on the
+    /// pathname rather than the file that was read; and a combined
+    /// record planted in the unauthenticated pid file, which bypassed
+    /// the check entirely.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_unprivileged_identity_record_is_not_believed() {
+    fn only_a_root_owned_sidecar_can_name_our_daemon() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("pf-authentic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
-        let path = dir.join("packetframe.identity");
-        std::fs::write(&path, "1 2 boot").expect("write");
+        let me = std::process::id() as i32;
+        let ident = dir.join("packetframe.identity");
+        let pidfile = dir.join("packetframe.pid");
 
-        // Written by this test, so not root-owned unless the suite runs
-        // as root — in which case the mode is what has to disqualify it.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        // A sidecar this test wrote — so not root-owned unless the
+        // suite runs as root, in which case the mode disqualifies it.
+        let real = DaemonIdentity::current().expect("own identity");
+        std::fs::write(&ident, real.encode()).expect("write");
+        std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         assert!(
-            !record_is_authentic(&path),
+            read_authentic_identity(&ident, me).is_none(),
             "a record any user can write must not decide which pid is our daemon"
         );
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let owned_by_root = std::fs::metadata(&path)
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                m.uid() == 0
-            })
-            .unwrap_or(false);
-        assert_eq!(
-            record_is_authentic(&path),
-            owned_by_root,
-            "0600 is necessary but not sufficient — ownership is the other half"
+        // The combined record in the PID FILE must supply nothing, even
+        // though `decode` understands the shape.
+        std::fs::write(&pidfile, real.encode()).expect("write");
+        let _ = std::fs::remove_file(&ident);
+        let planted = presence_of(&pidfile, &ident, |_| false, || None);
+        assert!(
+            !matches!(planted, DaemonPresence::Running { .. }),
+            "an identity in the unauthenticated pid file is not an identity: {planted:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
