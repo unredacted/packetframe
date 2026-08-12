@@ -905,12 +905,27 @@ fn authority_posture(
 /// check simply re-measures both and agrees (review finding).
 ///
 /// So the fault question — *is the authority itself wrong* — is asked
-/// of the sample, where both numbers describe the same moment. A
-/// mismatch that is real survives into the next sample and is
-/// classified then, within one interval; one created by the clock does
-/// not. What the substituted view legitimately shows is that release is
-/// blocked RIGHT NOW, and that belongs in the blocked-but-clearing
-/// message, which names it.
+/// of the sample rather than of a live count measured against a stale
+/// one. A mismatch that is real survives into the next sample and is
+/// classified again; one created by the clock does not. What the
+/// substituted view legitimately shows is that release is blocked RIGHT
+/// NOW, and that belongs in the blocked-but-clearing message, which
+/// names it.
+///
+/// **A sample is not an instant, and the message must not pretend it
+/// is.** `IntegrityChecker::run_check` awaits the bird count, then a
+/// second `birdc` for protocols, then the mirror count — three
+/// sequential subprocess-scale steps — so the two numbers in one report
+/// are separated by at least one `birdc` invocation. Under a bulk
+/// withdrawal or reload that gap alone can read bird low and the mirror
+/// high, producing a single `AuthorityMismatch` that the next check
+/// does not reproduce (review finding). One sample is therefore enough
+/// to say quiescence is not the blocker — it never is, for a veto — but
+/// NOT enough to send someone to restart a daemon, which is why the
+/// veto text asks for the next check to confirm before acting.
+/// Requiring two mismatching samples before escalating the wording
+/// needs history the runtime does not keep; filed rather than bolted on
+/// here.
 fn authority_sample_verdict(
     completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
 ) -> Option<packetframe_common::fib::Completeness> {

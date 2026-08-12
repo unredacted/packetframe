@@ -653,14 +653,18 @@ impl StatusSnapshot {
                          completeness authority reports a route count that cannot describe \
                          this mirror (far fewer than it holds, or none at all), so it is \
                          not the authority feeding it, and that vetoes release at any \
-                         table size. Waiting will not clear it. \
-                         Check which bird `birdc` is talking to on THIS box; where the \
-                         routes legitimately come from elsewhere, `require-table-complete \
-                         off` is the right answer — but it is read at bring-up, so it \
-                         needs a daemon RESTART, and a reload will not do it (from here a \
-                         reload is refused outright). The adopted FIB keeps forwarding \
-                         untouched meanwhile, and every steering change is refused while \
-                         this holds"
+                         table size, so waiting for the source to go quiet will not clear \
+                         it — quiescence is never what releases a veto. CONFIRM BEFORE \
+                         ACTING: the checker reads bird and the mirror a few subprocess \
+                         calls apart, so one report can catch a bulk withdrawal mid-flight \
+                         and show a mismatch the next check does not. If the next check \
+                         (within 300 s) still reports one, it is real. Then: check which \
+                         bird `birdc` is talking to on THIS box; where the routes \
+                         legitimately come from elsewhere, `require-table-complete off` is \
+                         the right answer — but it is read at bring-up, so it needs a \
+                         daemon RESTART, and a reload will not do it (from here a reload \
+                         is refused outright). The adopted FIB keeps forwarding untouched \
+                         meanwhile, and every steering change is refused while this holds"
                     )
                 } else if self.authority == AuthorityPosture::AwaitingAuthority {
                     // Blocked, but self-clearing: no report yet, one that
@@ -2586,8 +2590,18 @@ mod tests {
             "and it must name the authority as the blocker: {vetoed}"
         );
         assert!(
-            vetoed.contains("Waiting will not clear it"),
-            "and say plainly that waiting is not the remedy: {vetoed}"
+            vetoed.contains("quiescence is never what releases a veto"),
+            "and say plainly that waiting for quiet is not the remedy: {vetoed}"
+        );
+        // But one sample is not proof of permanence: the checker reads
+        // bird and the mirror a few subprocess calls apart, so a bulk
+        // withdrawal caught mid-flight can produce a mismatch the next
+        // check does not reproduce. The line may say "stop waiting for
+        // quiet"; it may not say "go restart a daemon" on that evidence
+        // alone (review finding).
+        assert!(
+            vetoed.contains("CONFIRM BEFORE ACTING"),
+            "a single sample must not send an operator to restart anything: {vetoed}"
         );
         // The opt-out it recommends is read at bring-up, and
         // `reconfigure` never installs or removes the completeness
