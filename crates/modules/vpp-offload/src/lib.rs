@@ -281,6 +281,75 @@ impl VppOffloadConfig {
     }
 }
 
+/// What a refused reload must ALSO say: nothing else in it was applied.
+///
+/// [`VppOffloadConfig::restart_only_delta`] refuses the whole reload, and
+/// that is the right contract — a half-applied reload leaves the daemon
+/// matching neither the file it had nor the file on disk. But the refusal
+/// named only the restart-only directive, and the rest of the edit
+/// vanished in silence. The case that matters: one SIGHUP that changes
+/// `require-table-complete` **and** rolls a port back to `steer off`
+/// returns an error about a completeness gate, `apply_steering` never
+/// runs, and the MCAM rules keep diverting exactly what they diverted
+/// before — so the `steer off` whose whole purpose is to get traffic off
+/// a misbehaving VPP quickly did nothing, and said nothing (review
+/// finding, PR #170).
+///
+/// Not new to `require-table-complete`: every restart-only field has
+/// always refused this way, which is why this is written against the
+/// refusal rather than against one directive. Making the reload atomic
+/// ACROSS modules is a different change — the loader publishes the
+/// shared allowlist and runs fast-path's `reconfigure` before this
+/// module is asked anything, so a preflight would need a reload-
+/// validation hook on the `Module` trait — and is filed rather than
+/// widened into this one.
+///
+/// The lever sentence appears only when a lever actually moved: a
+/// warning about a rollback nobody asked for is noise on every ordinary
+/// restart-only refusal. Matched by INTERFACE rather than by position,
+/// because the port list is one of the things that may have just been
+/// refused — so a positional comparison here could read a reordered or
+/// resized list as a lever move.
+fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
+    let mut out = String::from(
+        ". Nothing else in this reload was applied either — a refused reload is refused \
+         whole, so an `allow-prefix` edit in the same file is not reflected in the NIC's \
+         rules",
+    );
+    // `on → off` first and reported alone: it is the rollback, and the
+    // one whose silence leaves traffic somewhere the operator believes
+    // it is not.
+    let mut rolled_back: Vec<&str> = Vec::new();
+    let mut turned_on: Vec<&str> = Vec::new();
+    for (iface, _, was) in &old.ports {
+        let Some((_, _, now)) = new.ports.iter().find(|(i, _, _)| i == iface) else {
+            continue;
+        };
+        match (was, now) {
+            (true, false) => rolled_back.push(iface.as_str()),
+            (false, true) => turned_on.push(iface.as_str()),
+            _ => {}
+        }
+    }
+    if !rolled_back.is_empty() {
+        out.push_str(&format!(
+            ". IN PARTICULAR {:?} changed `steer on → off` and did NOT take effect: that \
+             traffic is still on VPP. Re-send that change in an edit that does not also \
+             touch a restart-only directive and it applies immediately — it does not need \
+             the restart",
+            rolled_back
+        ));
+    }
+    if !turned_on.is_empty() {
+        out.push_str(&format!(
+            ". {:?} changed `steer off → on` and did NOT take effect either; nothing was \
+             diverted, which is the safe direction, but the canary step did not happen",
+            turned_on
+        ));
+    }
+    out
+}
+
 /// The fast-path allowlist, as a live handle rather than a copy.
 ///
 /// A handle because a copy is wrong at exactly one moment, and it is the
@@ -846,7 +915,10 @@ impl Module for VppOffloadModule {
     fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         let new = VppOffloadConfig::from_directives(&cfg.section.directives);
         if let Err(why) = self.cfg.restart_only_delta(&new) {
-            return Err(ModuleError::other(MODULE_NAME, why));
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!("{why}{}", reload_collateral(&self.cfg, &new)),
+            ));
         }
 
         // Nothing to steer into. Not an error: a config with every port
@@ -1535,6 +1607,82 @@ mod tests {
         assert!(
             m.cfg.require_table_complete,
             "a refused reload must not record the value it refused"
+        );
+    }
+
+    /// A refused reload says what ELSE it did not apply.
+    ///
+    /// The trap the refusal used to leave open: one SIGHUP that changes
+    /// `require-table-complete` and rolls a port back to `steer off`
+    /// returns an error about a completeness gate. `apply_steering` never
+    /// runs, so the MCAM rules keep diverting what they diverted before —
+    /// an emergency rollback that did nothing, reported as a refusal
+    /// about something else entirely (review finding, PR #170).
+    ///
+    /// Not specific to this directive: every restart-only field has
+    /// always refused the whole reload, which is why the sentence hangs
+    /// off the refusal rather than off one knob.
+    #[test]
+    fn a_refused_reload_names_the_rollback_it_skipped() {
+        let steered = cfg(&[("eth4", 1, true), ("eth5", 1, true)], 1_600_000);
+        // The dangerous edit: gate toggled AND one port rolled back.
+        let mut both = steered.clone();
+        both.require_table_complete = false;
+        both.ports[0].2 = false;
+
+        let e = steered.restart_only_delta(&both).expect_err("refused");
+        let full = format!("{e}{}", reload_collateral(&steered, &both));
+        assert!(
+            full.contains("`steer on → off` and did NOT take effect"),
+            "a skipped rollback must be named, not left to be inferred from a message \
+             about a completeness gate: {full}"
+        );
+        assert!(
+            full.contains("eth4") && !full.contains("eth5"),
+            "and named precisely — eth5 did not move: {full}"
+        );
+        assert!(
+            full.contains("still on VPP"),
+            "the consequence is where the traffic is, which is the thing being got wrong: \
+             {full}"
+        );
+        assert!(
+            full.contains("applies immediately"),
+            "and the way out must not read as another restart: {full}"
+        );
+
+        // The unconditional half covers the allowlist, which this module
+        // cannot diff — it holds a live handle, so there is no previous
+        // list to compare against.
+        assert!(
+            full.contains("allow-prefix"),
+            "an allowlist edit in the same file is skipped too: {full}"
+        );
+
+        // And no crying wolf: a restart-only refusal with no lever
+        // movement must not claim a rollback was skipped. Otherwise the
+        // sentence appears on every `expected-routes` edit and stops
+        // being read.
+        let mut sizing = steered.clone();
+        sizing.expected_routes = 2_000_000;
+        let quiet = reload_collateral(&steered, &sizing);
+        assert!(
+            !quiet.contains("steer on → off"),
+            "no lever moved, so nothing was rolled back: {quiet}"
+        );
+        assert!(
+            quiet.contains("allow-prefix"),
+            "but the general statement still holds: {quiet}"
+        );
+
+        // A port added or removed by the same edit must not read as a
+        // lever move. Matching by position rather than by interface is
+        // how a reordered list manufactures one.
+        let reordered = cfg(&[("eth5", 1, true), ("eth4", 1, true)], 1_600_000);
+        let swapped = reload_collateral(&steered, &reordered);
+        assert!(
+            !swapped.contains("steer on"),
+            "reordering moved no lever: {swapped}"
         );
     }
 
