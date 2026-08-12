@@ -852,21 +852,32 @@ fn authority_posture(
     verdict: Option<packetframe_common::fib::Completeness>,
 ) -> AuthorityPosture {
     use packetframe_common::fib::Completeness;
+    let vetoing = gate_consults_authority
+        && current == Some(false)
+        && matches!(verdict, Some(Completeness::AuthorityMismatch { .. }));
     if !configured {
         AuthorityPosture::Absent
+    } else if vetoing {
+        // BEFORE the demotion, deliberately. `drain_batch` applies the
+        // veto regardless of epoch — "a NEGATIVE word still vetoes
+        // regardless of epoch; caution does not expire" — so when a
+        // flap and a mismatch coincide, clearing the flap only reveals
+        // the veto. Reporting the demotion there sends an operator to
+        // idle the feed for a deferral that the feed cannot release
+        // (review finding). The mismatch is the blocker that has to be
+        // fixed either way; once it is, a surviving demotion reports
+        // itself on the next snapshot.
+        AuthorityPosture::Vetoing
     } else if demoted {
         AuthorityPosture::DemotedByFlap
     } else if !gate_consults_authority || current != Some(false) {
         AuthorityPosture::Attesting
-    } else if matches!(verdict, Some(Completeness::AuthorityMismatch { .. })) {
-        // The ONLY verdict that waiting cannot fix: the mirror holds
-        // substantially more than the authority claims, so the
-        // authority is not the thing feeding this mirror. Every other
-        // non-permitting verdict is a report that has not arrived yet,
-        // has aged out, or describes a mirror still loading — all of
-        // which the next check can clear.
-        AuthorityPosture::Vetoing
     } else {
+        // Blocked, but by a verdict the next check can clear: no report
+        // yet, one that aged out, or a mirror still short of the
+        // authority. Only `AuthorityMismatch` — a mirror holding
+        // substantially MORE than the authority claims — is not a
+        // loading state, and that is `vetoing` above.
         AuthorityPosture::AwaitingAuthority
     }
 }
@@ -2341,10 +2352,28 @@ mod tests {
                 AuthorityPosture::Absent
             );
         }
-        // A flap demotes regardless of the current word.
+        // A flap demotes — but NOT over a persistent mismatch. The veto
+        // survives the demotion clearing (`drain_batch` applies it
+        // regardless of epoch), so reporting the flap there would send
+        // an operator to idle the feed for something the feed cannot
+        // release (review finding).
         assert_eq!(
             authority_posture(true, true, true, Some(false), mismatch.clone()),
-            AuthorityPosture::DemotedByFlap
+            AuthorityPosture::Vetoing,
+            "a mismatch outranks a flap: letting the feed settle only reveals the veto"
+        );
+        assert_eq!(
+            authority_posture(
+                true,
+                true,
+                true,
+                Some(false),
+                Some(packetframe_common::fib::Completeness::Unknown {
+                    why: "no check has run yet"
+                })
+            ),
+            AuthorityPosture::DemotedByFlap,
+            "but with a self-clearing verdict the flap IS the story worth telling"
         );
         // THE RULE: same disagreeing authority, opposite verdicts,
         // decided only by whether this deferral's gate consults it.

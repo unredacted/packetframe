@@ -1108,18 +1108,32 @@ carrying that traffic; VPP still is.
   troubleshooting step.
 - **Before a rollout, check the authority AGREES — not that bird is
   running.** The two are different, and this box proved it: bird was up
-  the whole time. Compare directly, on the box that will steer:
+  the whole time.
+
+  **Do not hand-roll the comparison.** The checker compares bird's
+  `master4` **plus** `master6` against the fast-path mirror's v4+v6
+  count, and it already prints both numbers when they disagree. Read
+  that, on the box that will steer:
 
   ```bash
-  birdc show route count | grep master4     # the authority's own count
-  packetframe status | grep -E 'fib-synced' # routes the mirror installed
+  birdc show route count | grep -E 'in table master(4|6)'
+  grep 'integrity drift above threshold' /var/log/packetframe.log | tail -3
   ```
 
-  Those two numbers must be within the drift bound. `fib-synced` names
-  the veto explicitly when one is in force, but do not wait for a
-  deferral to find out: a box that adopts while steered under a vetoing
-  authority has no fast rollback, and that is worth knowing before the
-  canary rather than during it.
+  No drift warning in the last interval (300 s) means the checker
+  agrees. A warning prints `bird_routes` and `packetframe_routes` —
+  that pair **is** the evidence the gate acts on.
+
+  Two traps that make a hand-rolled check pass a box that will veto.
+  **`master6` counts**: a box whose `master4` matches but whose
+  `master6` is missing or wrong still fails the combined comparison, so
+  checking `master4` alone approves a rollout the gate will refuse.
+  And **`fib-synced`'s installed count is not the number to compare** —
+  that is VPP's table, which is v4-only by policy, against an authority
+  figure that includes v6.
+
+  A box that adopts while steered under a vetoing authority has no fast
+  rollback. Worth knowing before the canary rather than during it.
 
 ### A member port needs two things admin-up does not give it
 
