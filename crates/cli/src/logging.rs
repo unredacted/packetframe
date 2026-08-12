@@ -129,10 +129,18 @@ impl LogControl {
     fn apply(&self, level: LogLevel) {
         if self.source == FilterSource::Env {
             if !self.env_notice_said.swap(true, Ordering::Relaxed) {
+                // "for this process" is the whole of it: the source is
+                // decided in `init` and the environment is never read
+                // again, so clearing RUST_LOG needs a restart. Saying
+                // "reload" here would be this module's own defect —
+                // pointing an operator at an action that changes
+                // nothing — one layer up from the one it fixes.
                 tracing::info!(
                     config_log_level = level.as_str(),
                     "RUST_LOG is set; the config's log-level is ignored for this process \
-                     (env beats file). Unset it and reload to hand the level back to the config."
+                     (env beats file). Overriding it needs a narrower RUST_LOG, not this \
+                     directive; handing the level back to the config needs RUST_LOG cleared \
+                     and the daemon restarted."
                 );
             }
             return;
