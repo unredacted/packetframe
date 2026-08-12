@@ -327,6 +327,13 @@ impl VppOffloadConfig {
 ///   transactional, so a failure there can be partial. The result is
 ///   reported next to this one in the same `packetframe reconfigure`
 ///   output, which is where the operator should be sent.
+/// - **That the allowlist changed AT ALL.** The module holds a live
+///   [`SharedAllowlist`] handle and keeps no previous snapshot, so it
+///   cannot diff one — which is exactly why the split-tier warning is
+///   phrased as a conditional. A reload that touched only a restart-only
+///   directive left fast-path reconciling an unchanged allowlist and
+///   introduced no split, and telling that operator to expect the tiers
+///   to disagree sends them hunting a divergence that is not there.
 /// - **That a clean re-send applies immediately.** It is still subject to
 ///   `State::accepts_steering_changes`: `service::apply_steering` refuses
 ///   from anything but `Ready`/`Steered`, and that set excludes the
@@ -352,11 +359,13 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     let mut out = String::from(
         ". This module applied NOTHING from this reload. The SIGHUP is not atomic across \
          modules, though: the loader publishes the shared allowlist and runs fast-path's \
-         reconcile BEFORE vpp-offload is asked anything, so an `allow-prefix` edit in the \
-         same file was already ATTEMPTED against the eBPF tier — whether it landed is \
-         fast-path's own result, reported beside this one in the same `packetframe \
-         reconfigure` output, and its reconcile is not transactional so a failure there \
-         can be partial. Expect the two tiers to disagree until this is resolved",
+         reconcile BEFORE vpp-offload is asked anything. So IF this reload also edited \
+         `allow-prefix`, that edit was already ATTEMPTED against the eBPF tier — whether \
+         it landed is fast-path's own result, reported beside this one in the same \
+         `packetframe reconfigure` output, and its reconcile is not transactional so a \
+         failure there can be partial. This module holds a live allowlist handle with no \
+         previous snapshot, so it cannot tell you whether that is what happened; where it \
+         is, expect the two tiers to disagree until this is resolved",
     );
     // Direction is named because a skipped rollback is the urgent one —
     // but as a statement about the REQUEST, never about where traffic
@@ -1719,6 +1728,17 @@ mod tests {
             full.contains("ATTEMPTED") && !full.contains("ALREADY taken effect"),
             "round 3's false claim — the eBPF tier's state is fast-path's result to \
              report, not ours to assert: {full}"
+        );
+        // ...and it is a CONDITIONAL, because the module holds a live
+        // allowlist handle with no previous snapshot: it cannot know
+        // whether `allow-prefix` changed at all. A reload touching only a
+        // restart-only directive introduced no split, and sending that
+        // operator to hunt a divergence is the same over-claim once more.
+        assert!(
+            full.contains("IF this reload also edited `allow-prefix`")
+                && full.contains("cannot tell you whether that is what happened"),
+            "round 5's false claim: the split-tier warning must be conditional and say why \
+             it cannot be more than that: {full}"
         );
         // (2) Where traffic is. `self.cfg` is deliberately left unmoved
         // when a steer apply fails, and the supervisor keeps the want and
