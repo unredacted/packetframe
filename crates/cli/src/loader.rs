@@ -1097,8 +1097,14 @@ fn is_daemon_process(pid: libc::pid_t) -> bool {
     // BYTES: `read_to_string` rejects the whole cmdline if any argument
     // is not UTF-8, and a `--config` path may legally contain arbitrary
     // bytes.
+    // The SUBCOMMAND SLOT, not anywhere in argv. `any` matched a probe
+    // run as `packetframe probe --iface run ...` on an interface named
+    // `run` — which then reads as a daemon, takes SIGHUP from
+    // `reconfigure`, and blocks `detach` (review finding). `struct Cli`
+    // carries nothing but the subcommand, so clap accepts no global
+    // options before it and argv[1] is where `run` must be.
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(cmdline) => cmdline.split(|b| *b == 0).any(|a| a == b"run"),
+        Ok(cmdline) => cmdline.split(|b| *b == 0).nth(1) == Some(b"run".as_slice()),
         Err(_) => false,
     }
 }
@@ -1719,6 +1725,22 @@ fn print_module_health(state_dir: &Path) {
         {
             println!("module health (pid {pid}, {age}):")
         }
+        // A LIVE daemon whose snapshot predates identity recording —
+        // an older build, still publishing. Its report is almost
+        // certainly current, and calling it history was this PR's own
+        // motivating bug in a new shape: a new CLI declaring a running
+        // old daemon dead (review finding). Cannot confirm is the
+        // honest answer, and the one that does not mislead in either
+        // direction.
+        crate::daemon_presence::DaemonPresence::Running { pid }
+            if *pid == snapshot.pid && snapshot.start_ticks.is_none() =>
+        {
+            println!(
+                "module health (pid {pid}, {age}) — CANNOT CONFIRM this is the report of \
+                 the daemon running now: it recorded no identity, which an older build \
+                 does not. Restarting on this build makes it checkable."
+            )
+        }
         // Same pid is not the same process. A replacement handed the
         // pid its predecessor had — routine across a reboot — made the
         // pre-crash report read as live until the replacement published
@@ -1726,14 +1748,10 @@ fn print_module_health(state_dir: &Path) {
         // the snapshot predates identity recording it says so rather
         // than guessing either way.
         crate::daemon_presence::DaemonPresence::Running { pid } => println!(
-            "module health: STALE — this report was written by pid {}{}, and the daemon \
-             running now is pid {pid}. The report below is history, {age}.",
-            snapshot.pid,
-            if snapshot.start_ticks.is_none() {
-                " (which recorded no identity, so it cannot be matched)"
-            } else {
-                ""
-            }
+            "module health: STALE — this report was written by pid {}, and the daemon \
+             running now is pid {pid} (a different process, by its recorded identity). \
+             The report below is history, {age}.",
+            snapshot.pid
         ),
         crate::daemon_presence::DaemonPresence::Gone { why } => println!(
             "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
