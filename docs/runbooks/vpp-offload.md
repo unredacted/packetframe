@@ -1096,14 +1096,31 @@ carrying that traffic; VPP still is.
   problem.
   `fib-synced` tells the two apart, and the wording is the tell: *"the
   completeness authority has not attested yet ... releases itself once
-  one agrees"* is the self-clearing case (no report yet, one aged out,
-  or a mirror still short — including every startup before the first
-  check lands). Only *"not the authority feeding it ... Waiting will
-  not clear it"* is the persistent one below.
+  a sample agrees"* is the self-clearing case (no report yet, one aged
+  out, a mirror still short — including every startup before the first
+  check lands — or a single unconfirmed mismatch, below). Only *"not
+  the authority feeding it ... quiescence is never what releases a
+  veto"* is the persistent one.
   Fast-path's `fib-integrity` row answers it from the other side, and
   more directly: an unreachable `birdc` shows there as `could not
   complete: <error>`, a bird carrying the wrong table as a drift or
   zero-authority verdict.
+- **A veto is only reported after TWO CONSECUTIVE checks say so, and
+  that is why the line can be trusted.** A `CompletenessReport` is two
+  counts — bird's and the mirror's — and they are taken concurrently
+  but not simultaneously. A bulk withdrawal or a bird reload landing in
+  that window reads bird low and the mirror high, which is exactly the
+  shape of a real mismatch. So the classification requires the same
+  fault in two DISTINCT samples (told apart by the report's timestamp,
+  not by elapsed time): the first reports the self-clearing line above,
+  and a second confirming one within ~300 s escalates it to the veto.
+  Release is blocked either way from the first sample — the gate is
+  unchanged, and refusing to steer on a doubtful reading is the safe
+  direction. What the second sample buys is the right to send someone
+  after bird. A `fib-synced` line that flips to the self-clearing
+  wording on the next check WAS the transient, and needs nothing; the
+  `fib-integrity` row shows the same thing one check earlier, since it
+  prints each comparison as it lands.
 - **A persistent disagreement is the case that needs a decision**: a
   local bird that does not carry the mirror's table, a bird carrying no
   routes at all, or a mirror fed from a different source than the

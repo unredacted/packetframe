@@ -417,6 +417,26 @@ struct Core {
     /// as of the last audit. Its own count because it points the other
     /// way: `steer_missing` says install, this says remove.
     steer_stray: usize,
+    /// The `at` of the FIRST sample in the current unbroken run of
+    /// readings that blamed the AUTHORITY, or `None` when the last
+    /// reading did not.
+    ///
+    /// The runtime's only piece of history about the authority, and it
+    /// exists because one sample cannot establish the thing the health
+    /// line escalates on. `CompletenessReport` carries two counts taken
+    /// a moment apart, and a bulk withdrawal landing in that moment
+    /// reads as "the authority is measuring a different table" — which
+    /// sends an operator to restart a daemon. A fault that is real is
+    /// still there when the next report measures both counts again; one
+    /// made by the clock is not. See [`track_authority_fault`].
+    ///
+    /// Updated on the tick path (`drain_batch`), next to the
+    /// `authority_current` call whose answer it qualifies, because that
+    /// is the only place that runs every tick of a deferral. `status()`
+    /// reads it and does not advance it — a health surface that is
+    /// polled irregularly, or never, must not be what decides whether a
+    /// fault has persisted.
+    authority_fault_since: Option<std::time::Instant>,
     /// Why the last audit could not read the NIC, if it could not.
     ///
     /// Kept apart from `steer_missing` because they answer different
@@ -817,8 +837,13 @@ fn authority_current(
     mirror_now: u64,
 ) -> Option<bool> {
     completeness.as_ref().map(|h| {
-        h.verdict().permits_steering()
-            && h.latest().is_some_and(|r| {
+        // One read for both halves — the verdict and the report it came
+        // from have to describe the SAME sample, or a publish landing
+        // between two separate reads recomputes one report's drift
+        // against another report's verdict.
+        let (report, verdict) = h.latest_verdict();
+        verdict.permits_steering()
+            && report.is_some_and(|r| {
                 let now_r = packetframe_common::fib::CompletenessReport {
                     mirror_routes: mirror_now,
                     ..r
@@ -850,14 +875,24 @@ fn authority_posture(
     gate_consults_authority: bool,
     current: Option<bool>,
     verdict: Option<packetframe_common::fib::Completeness>,
+    fault_confirmed: bool,
 ) -> AuthorityPosture {
     // `authority_is_at_fault` rather than a match on the variant: the
     // zero-route case arrives as `Unknown` (assess returns it before the
     // mismatch branch) and is just as permanent, so the classification
     // has to live next to the variants and their reason strings rather
     // than being re-derived here (review finding).
+    //
+    // `fault_confirmed` is the second half of the same question, and it
+    // is about the DATA rather than the verdict: one sample saying the
+    // authority is wrong is a claim two counts taken a moment apart can
+    // manufacture on their own (see [`authority_fault_confirmed`]). A
+    // fault seen once is reported as `AwaitingAuthority` — blocked, and
+    // clearing on its own if the next check disagrees — and becomes a
+    // veto when a second, distinct sample says the same thing.
     let vetoing = gate_consults_authority
         && current == Some(false)
+        && fault_confirmed
         && verdict.as_ref().is_some_and(|v| v.authority_is_at_fault());
     if !configured {
         AuthorityPosture::Absent
@@ -871,6 +906,12 @@ fn authority_posture(
         // (review finding). The mismatch is the blocker that has to be
         // fixed either way; once it is, a surviving demotion reports
         // itself on the next snapshot.
+        //
+        // An UNCONFIRMED fault falls through to the demotion below, and
+        // that ordering is right rather than merely tolerable: the flap
+        // is an observed fact and the fault is not established yet, so
+        // for that one interval the demotion is the true story. If the
+        // next sample confirms the fault, it takes precedence here.
         AuthorityPosture::Vetoing
     } else if demoted {
         AuthorityPosture::DemotedByFlap
@@ -878,18 +919,24 @@ fn authority_posture(
         AuthorityPosture::Attesting
     } else {
         // Blocked, but by a verdict the next check can clear: no report
-        // yet, one that aged out, or a mirror still short of the
-        // authority. Only `AuthorityMismatch` — a mirror holding
-        // substantially MORE than the authority claims — is not a
-        // loading state, and that is `vetoing` above.
+        // yet, one that aged out, a mirror still short of the authority,
+        // or a fault only one sample has claimed. Only a CONFIRMED
+        // `AuthorityMismatch` — a mirror holding substantially MORE than
+        // the authority claims, twice — is not a loading state, and that
+        // is `vetoing` above.
         AuthorityPosture::AwaitingAuthority
     }
 }
 
-/// The verdict on the sample **as it was taken** — both counts from the
-/// same instant.
+/// One reading of the authority: the verdict on the sample **as it was
+/// taken**, and **which sample it was read from**.
 ///
-/// This function briefly substituted the LIVE mirror count first, to
+/// The identity matters as much as the verdict. The supervision loop
+/// ticks every ~50 ms against a checker that publishes every ~300 s, so
+/// the same sample is read some six thousand times, and "seen twice" has
+/// to mean two different reports rather than two reads of one.
+///
+/// The verdict here briefly substituted the LIVE mirror count first, to
 /// match what [`authority_current`] does before deciding the veto. That
 /// was an over-correction, and the two review findings that produced
 /// and then removed it are worth keeping together, because they look
@@ -912,24 +959,84 @@ fn authority_posture(
 /// NOW, and that belongs in the blocked-but-clearing message, which
 /// names it.
 ///
-/// **A sample is not an instant, and the message must not pretend it
-/// is.** `IntegrityChecker::run_check` awaits the bird count, then a
-/// second `birdc` for protocols, then the mirror count — three
-/// sequential subprocess-scale steps — so the two numbers in one report
-/// are separated by at least one `birdc` invocation. Under a bulk
-/// withdrawal or reload that gap alone can read bird low and the mirror
-/// high, producing a single `AuthorityMismatch` that the next check
-/// does not reproduce (review finding). One sample is therefore enough
-/// to say quiescence is not the blocker — it never is, for a veto — but
-/// NOT enough to send someone to restart a daemon, which is why the
-/// veto text asks for the next check to confirm before acting.
-/// Requiring two mismatching samples before escalating the wording
-/// needs history the runtime does not keep; filed rather than bolted on
-/// here.
-fn authority_sample_verdict(
+/// **A sample is not an instant, and one sample is not proof.**
+/// `IntegrityChecker::run_check` now takes its two counts concurrently,
+/// so the gap between them is the difference between two concurrent
+/// completions rather than a whole `birdc` invocation — but it is still
+/// a gap, and under a bulk withdrawal or a reload a narrow one can
+/// still read bird low and the mirror high, producing an
+/// `AuthorityMismatch` the next check does not reproduce (review
+/// finding). So the escalation to `Vetoing` is not decided by this
+/// verdict alone: it needs the same fault in two DISTINCT samples, which
+/// [`authority_fault_confirmed`] answers from the run tracked on the
+/// tick path.
+///
+/// Both halves come out of ONE lock acquisition — see
+/// `TableCompleteness::latest_verdict` for why a verdict read separately
+/// from the report it describes can pair the two across a publish.
+#[derive(Debug, Clone, PartialEq)]
+struct AuthorityReading {
+    /// `CompletenessReport::at` — the sample's identity. `None` only
+    /// before the first report has ever been published, where the
+    /// verdict is `Unknown` and nothing is at fault.
+    at: Option<std::time::Instant>,
+    verdict: packetframe_common::fib::Completeness,
+}
+
+fn authority_reading(
     completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
-) -> Option<packetframe_common::fib::Completeness> {
-    completeness.as_ref().map(|h| h.verdict())
+) -> Option<AuthorityReading> {
+    completeness.as_ref().map(|h| {
+        let (report, verdict) = h.latest_verdict();
+        AuthorityReading {
+            at: report.map(|r| r.at),
+            verdict,
+        }
+    })
+}
+
+/// Fold one reading into the run of consecutive at-fault samples,
+/// returning the `at` of the FIRST sample in it.
+///
+/// The whole persistence rule is these few lines, and it is deliberately
+/// interval-independent: nothing here knows the checker's 300 s cadence,
+/// so changing it (or running a test at millisecond speed) does not
+/// change what escalates. Keeping the FIRST sample's identity rather
+/// than the latest is what makes the comparison in
+/// [`authority_fault_confirmed`] mean "a second distinct sample agreed".
+///
+/// Any verdict that is not the authority's fault ends the run —
+/// including `Stale` and every self-clearing unknown. That is the point:
+/// a mismatch, a clean check, then another mismatch is two transients,
+/// and only an unbroken run is evidence of something that will not
+/// clear itself.
+fn track_authority_fault(
+    run_since: Option<std::time::Instant>,
+    reading: Option<&AuthorityReading>,
+) -> Option<std::time::Instant> {
+    match reading {
+        Some(r) if r.verdict.authority_is_at_fault() => run_since.or(r.at),
+        _ => None,
+    }
+}
+
+/// Whether the authority's fault has now been seen in TWO DISTINCT
+/// samples: this reading is at fault, and the run it belongs to started
+/// at a different sample.
+///
+/// Note what this does NOT require: a fixed number of ticks, a minimum
+/// elapsed time, or the checker's cadence. Two reports is the property
+/// that matters, because the transient this exists to filter — the two
+/// counts of ONE report taken a moment apart — cannot survive being
+/// measured again.
+fn authority_fault_confirmed(
+    run_since: Option<std::time::Instant>,
+    reading: Option<&AuthorityReading>,
+) -> bool {
+    reading.is_some_and(|r| {
+        r.verdict.authority_is_at_fault()
+            && matches!((run_since, r.at), (Some(first), Some(at)) if first != at)
+    })
 }
 
 /// Owner handle. Create once, then [`Runtime::views`] per tick.
@@ -978,6 +1085,7 @@ impl Runtime {
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
+                authority_fault_since: None,
             })),
         }
     }
@@ -1174,6 +1282,10 @@ impl Runtime {
             }
         }
         let c = self.core.borrow();
+        // ONE reading, used for both the verdict and the question of
+        // whether it has been seen before: asking twice could pair a
+        // verdict from one sample with the identity of the next.
+        let reading = authority_reading(&c.completeness);
         RuntimeStatus {
             counts: c.engine.counts(),
             pending_ops: c.engine.pending().len() as u64,
@@ -1206,7 +1318,12 @@ impl Runtime {
                 // not be able to disagree about whether the authority is
                 // currently permitting.
                 authority_current(&c.completeness, c.source.route_count()),
-                authority_sample_verdict(&c.completeness),
+                reading.as_ref().map(|r| r.verdict.clone()),
+                // Read, never advanced, from the run the tick path
+                // keeps. A fault this reading has already contributed to
+                // that run confirms itself only if the run started at a
+                // DIFFERENT sample.
+                authority_fault_confirmed(c.authority_fault_since, reading.as_ref()),
             ),
         }
     }
@@ -1266,12 +1383,21 @@ pub enum AuthorityPosture {
     /// whose first integrity check had simply not run yet was told that
     /// waiting would not help. That fires at every startup on a box
     /// with an authority (review finding).
+    ///
+    /// And scoped to a fault seen in TWO DISTINCT SAMPLES. The verdict
+    /// alone cannot carry that: a report's two counts are taken a moment
+    /// apart, so a bulk withdrawal in that moment manufactures one
+    /// `AuthorityMismatch` out of a healthy pair. A first such sample
+    /// reports `AwaitingAuthority` — release is blocked either way — and
+    /// this variant is reached when the next report says the same thing.
+    /// See [`authority_fault_confirmed`].
     Vetoing,
     /// Configured, currently not permitting, for a reason that clears
     /// itself: no report yet (`Unknown`), one that aged out (`Stale`),
-    /// or a mirror still short of the authority (`Incomplete`). The
-    /// integrity checker publishes a fresh report every interval and
-    /// the deferral releases on its own.
+    /// a mirror still short of the authority (`Incomplete`), or a
+    /// mismatch that only ONE sample has reported and no second has
+    /// confirmed. The integrity checker publishes a fresh report every
+    /// interval and the deferral releases on its own.
     ///
     /// Distinct from `Vetoing` because the operator action differs
     /// completely — wait, versus go and find out which bird `birdc` is
@@ -1747,6 +1873,31 @@ impl Observe for ObserveView {
                     // stand on their own.
                     let authority = authority_current(&c.completeness, have);
                     let veto = authority == Some(false);
+                    // The authority's word is acted on here; whether it
+                    // has said the same thing TWICE is recorded here for
+                    // the same reason — this is the only path that runs
+                    // every tick of the deferral, and the health surface
+                    // that reports the escalation cannot be the thing
+                    // that decides it (`status()` may never be called).
+                    //
+                    // Nothing about the release changes: a veto is a
+                    // veto on the first sample, because refusing to
+                    // steer on a doubtful reading is the safe direction.
+                    // What two samples buy is the right to tell an
+                    // operator the authority itself is broken.
+                    //
+                    // A releasing tick clears the run on its way out: it
+                    // releases with `authority != Some(false)`, meaning
+                    // the verdict permits or there is no authority, and
+                    // neither is at fault — so a deferral does not hand
+                    // a half-run to the next one. Nothing depends on
+                    // that being airtight; a leftover start only ever
+                    // costs one interval of earliness on a fault that is
+                    // being reported again anyway.
+                    let reading = authority_reading(&c.completeness);
+                    let fault_since =
+                        track_authority_fault(c.authority_fault_since, reading.as_ref());
+                    c.authority_fault_since = fault_since;
                     // `!flapped` here too: a positive authority word is
                     // epoch-blind — the report may predate the
                     // reconnect entirely, and stale prior-session
@@ -2395,10 +2546,14 @@ mod tests {
             authority: 13,
             mirror: 1_303_920,
         });
+        // Every call here passes a CONFIRMED fault (the trailing
+        // `true`), so what is under test is the scoping rule alone —
+        // `one_mismatching_sample_is_not_yet_a_veto` covers the other
+        // axis.
         // Absent beats everything: no handle, nothing to say.
         for consults in [true, false] {
             assert_eq!(
-                authority_posture(false, false, consults, None, None),
+                authority_posture(false, false, consults, None, None, true),
                 AuthorityPosture::Absent
             );
         }
@@ -2408,7 +2563,7 @@ mod tests {
         // an operator to idle the feed for something the feed cannot
         // release (review finding).
         assert_eq!(
-            authority_posture(true, true, true, Some(false), mismatch.clone()),
+            authority_posture(true, true, true, Some(false), mismatch.clone(), true),
             AuthorityPosture::Vetoing,
             "a mismatch outranks a flap: letting the feed settle only reveals the veto"
         );
@@ -2420,7 +2575,8 @@ mod tests {
                 Some(false),
                 Some(packetframe_common::fib::Completeness::Unknown {
                     why: "no check has run yet"
-                })
+                }),
+                true
             ),
             AuthorityPosture::DemotedByFlap,
             "but with a self-clearing verdict the flap IS the story worth telling"
@@ -2428,12 +2584,12 @@ mod tests {
         // THE RULE: same disagreeing authority, opposite verdicts,
         // decided only by whether this deferral's gate consults it.
         assert_eq!(
-            authority_posture(true, false, true, Some(false), mismatch.clone()),
+            authority_posture(true, false, true, Some(false), mismatch.clone(), true),
             AuthorityPosture::Vetoing,
             "AwaitingFallback consults the authority, so a false there IS the blocker"
         );
         assert_eq!(
-            authority_posture(true, false, false, Some(false), mismatch.clone()),
+            authority_posture(true, false, false, Some(false), mismatch.clone(), true),
             AuthorityPosture::Attesting,
             "AwaitingDiff never asks, so a disagreeing authority is not blocking it and \
              must not be reported as if it were"
@@ -2441,7 +2597,7 @@ mod tests {
         // A permitting or unknown authority is never a veto.
         for current in [Some(true), None] {
             assert_eq!(
-                authority_posture(true, false, true, current, mismatch.clone()),
+                authority_posture(true, false, true, current, mismatch.clone(), true),
                 AuthorityPosture::Attesting
             );
         }
@@ -2478,9 +2634,10 @@ mod tests {
         });
         let completeness = Some(handle);
 
-        // The sample itself: both counts from one instant, converged.
+        // The sample itself: both counts describing one moment,
+        // converged.
         assert!(matches!(
-            authority_sample_verdict(&completeness),
+            authority_reading(&completeness).map(|r| r.verdict),
             Some(Completeness::Converged { .. })
         ));
 
@@ -2497,14 +2654,22 @@ mod tests {
                 false,
                 true,
                 Some(false),
-                authority_sample_verdict(&completeness)
+                authority_reading(&completeness).map(|r| r.verdict),
+                // Nothing to confirm: the sample is not at fault at all,
+                // so no run of at-fault readings exists to be in.
+                false
             ),
             AuthorityPosture::AwaitingAuthority,
             "a stale authority count against a grown mirror is the clock, not a fault"
         );
 
-        // And when the mismatch is real — both counts from the same
+        // And when the mismatch is real — both counts describing one
         // sample — it is a fault, which is the shadow's actual case.
+        // Confirmation (the trailing `true`) is the separate axis pinned
+        // by `one_mismatching_sample_is_not_yet_a_veto`; what this
+        // asserts is that the CLASSIFICATION still reaches the veto once
+        // a second sample agrees, where the grown-mirror case above
+        // never does however many times it is sampled.
         let real = std::sync::Arc::new(TableCompleteness::new());
         real.publish(CompletenessReport {
             authority_routes: 13,
@@ -2518,10 +2683,204 @@ mod tests {
                 false,
                 true,
                 Some(false),
-                authority_sample_verdict(&real)
+                authority_reading(&real).map(|r| r.verdict),
+                true
             ),
             AuthorityPosture::Vetoing,
-            "13 routes against 1.3M in ONE sample is the authority being wrong"
+            "13 routes against 1.3M is the authority being wrong, not a mirror loading"
+        );
+    }
+
+    /// One mismatching sample is not a veto; two consecutive ones are.
+    ///
+    /// A `CompletenessReport` is two counts, and they are not taken at
+    /// the same instant — concurrently since this change, but still not
+    /// simultaneously. A bulk withdrawal or a reload landing in that gap
+    /// reads bird low and the mirror high, which `assess` classifies as
+    /// `AuthorityMismatch`: the authority measuring a different table.
+    /// That verdict sends an operator to restart a daemon, and the next
+    /// check does not reproduce it.
+    ///
+    /// PR #166 answered this in prose — the veto text gated its
+    /// disruptive half behind "CONFIRM BEFORE ACTING" and pointed at the
+    /// next check. This asserts the property instead, and it is the
+    /// stronger claim: the escalation is not reachable from one sample
+    /// at all, so the wording no longer has to ask the operator to do
+    /// the checking.
+    ///
+    /// Interval-independent by construction — samples are told apart by
+    /// `CompletenessReport::at`, not by elapsed time or tick count — so
+    /// this test runs at memory speed over a rule that ships at 300 s.
+    #[test]
+    fn one_mismatching_sample_is_not_yet_a_veto() {
+        use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        let completeness = Some(std::sync::Arc::clone(&handle));
+        let t0 = std::time::Instant::now();
+        let mismatch = |at| CompletenessReport {
+            authority_routes: 13,
+            mirror_routes: 1_303_920,
+            at,
+        };
+        // The posture as the deferral would report it, given the run
+        // state the tick path is holding.
+        let posture = |run| {
+            let reading = authority_reading(&completeness);
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                reading.as_ref().map(|r| r.verdict.clone()),
+                authority_fault_confirmed(run, reading.as_ref()),
+            )
+        };
+
+        // FIRST at-fault sample. Release is blocked either way — that is
+        // `authority_current`'s job and is untouched — but the operator
+        // is told this can clear itself, because it can.
+        handle.publish(mismatch(t0));
+        // `None` is what a fresh `Core` holds: no run in progress.
+        let mut run = track_authority_fault(None, authority_reading(&completeness).as_ref());
+        assert_eq!(
+            run,
+            Some(t0),
+            "the run starts at the sample that first blamed the authority"
+        );
+        assert_eq!(
+            posture(run),
+            AuthorityPosture::AwaitingAuthority,
+            "one sample can be two counts taken across a withdrawal; it is not proof the \
+             authority is wrong"
+        );
+
+        // The supervision loop ticks every ~50 ms against a checker that
+        // publishes every ~300 s, so this same sample is read thousands
+        // of times. Re-reading one report is not a second opinion.
+        for _ in 0..5 {
+            run = track_authority_fault(run, authority_reading(&completeness).as_ref());
+            assert_eq!(run, Some(t0));
+            assert_eq!(
+                posture(run),
+                AuthorityPosture::AwaitingAuthority,
+                "a sample seen twice is one sample"
+            );
+        }
+
+        // THE SECOND SAMPLE reproduces it. A transient cannot: the next
+        // report measures both counts again.
+        handle.publish(mismatch(t0 + Duration::from_secs(300)));
+        run = track_authority_fault(run, authority_reading(&completeness).as_ref());
+        assert_eq!(
+            run,
+            Some(t0),
+            "the run keeps the FIRST sample's identity — that is what makes the second one \
+             distinguishable from it"
+        );
+        assert_eq!(
+            posture(run),
+            AuthorityPosture::Vetoing,
+            "two distinct samples agreeing is the authority being wrong, and now it may be \
+             said without hedging"
+        );
+
+        // And a good check in between resets it: a mismatch, agreement,
+        // a mismatch is two transients, not one persistent fault. The
+        // escalation needs an UNBROKEN run.
+        handle.publish(CompletenessReport {
+            authority_routes: 1_303_920,
+            mirror_routes: 1_303_920,
+            at: t0 + Duration::from_secs(600),
+        });
+        run = track_authority_fault(run, authority_reading(&completeness).as_ref());
+        assert_eq!(
+            run, None,
+            "a verdict that does not blame the authority ends the run"
+        );
+        handle.publish(mismatch(t0 + Duration::from_secs(900)));
+        run = track_authority_fault(run, authority_reading(&completeness).as_ref());
+        assert_eq!(
+            posture(run),
+            AuthorityPosture::AwaitingAuthority,
+            "the run restarted, so this is a first sample again"
+        );
+    }
+
+    /// The same rule, through the surfaces that actually carry it: the
+    /// tick path records the run, `status()` reads it.
+    ///
+    /// `one_mismatching_sample_is_not_yet_a_veto` pins the rule; this
+    /// pins the WIRING, and the wiring is where this could quietly do
+    /// nothing. `RuntimeStatus` is built from a `&Core` that cannot
+    /// mutate, so the run has to be advanced somewhere else — and if
+    /// that update were dropped, or the field were never written, every
+    /// pure-function test above would still pass while the escalation
+    /// became unreachable. Two published samples, one `drain_batch` per
+    /// sample, and the posture read from `status()` each time.
+    #[test]
+    fn the_tick_path_is_what_turns_a_repeated_mismatch_into_a_veto() {
+        use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+
+        // Steered at adoption: that is what defers into
+        // `AwaitingFallback`, the one stage that consults the authority.
+        let steering = LedgerSteering {
+            rules: vec![("eth4".into(), 1024)],
+            configured: 1,
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        rt.require_table_complete(std::sync::Arc::clone(&handle));
+        let t0 = std::time::Instant::now();
+        let mismatch = |at| CompletenessReport {
+            authority_routes: 13,
+            mirror_routes: 1_303_920,
+            at,
+        };
+
+        let (_, mut fx) = rt.views();
+        fx.start_resync().expect("a steered adoption defers");
+        assert!(
+            matches!(
+                rt.core.borrow().deferred_resync,
+                Some(DeferredResync::AwaitingFallback { .. })
+            ),
+            "the deferral this posture is scoped to"
+        );
+
+        let (mut obs, _) = rt.views();
+        handle.publish(mismatch(t0));
+        obs.drain_batch(t0).expect("a vetoed deferral just waits");
+        assert_eq!(
+            rt.status().authority,
+            AuthorityPosture::AwaitingAuthority,
+            "the first sample blocks release, but must not be reported as a fault an \
+             operator should act on"
+        );
+
+        // A second tick over the SAME report is not a second opinion,
+        // and this is the case the run state exists for: the loop ticks
+        // ~6000 times per published report.
+        obs.drain_batch(t0 + Duration::from_millis(50))
+            .expect("still waiting");
+        assert_eq!(rt.status().authority, AuthorityPosture::AwaitingAuthority);
+
+        // The next check reproduces it.
+        handle.publish(mismatch(t0 + Duration::from_secs(300)));
+        obs.drain_batch(t0 + Duration::from_secs(300))
+            .expect("still waiting, and now for a reason worth naming");
+        assert_eq!(
+            rt.status().authority,
+            AuthorityPosture::Vetoing,
+            "two distinct samples reached the health surface through the tick path"
         );
     }
 
@@ -2563,7 +2922,8 @@ mod tests {
                 Some(false),
                 Some(packetframe_common::fib::Completeness::Unknown {
                     why: packetframe_common::fib::ZERO_ROUTE_AUTHORITY
-                })
+                }),
+                true
             ),
             AuthorityPosture::Vetoing,
             "a bird with no routes at all cannot be waited out any more than a mismatched \
@@ -2571,7 +2931,7 @@ mod tests {
         );
         for verdict in self_clearing {
             assert_eq!(
-                authority_posture(true, false, true, Some(false), Some(verdict.clone())),
+                authority_posture(true, false, true, Some(false), Some(verdict.clone()), true),
                 AuthorityPosture::AwaitingAuthority,
                 "{verdict:?} is a report that has not arrived, aged out, or describes a \
                  mirror still loading — the next check can clear all three, so this must \
@@ -2587,7 +2947,8 @@ mod tests {
                 Some(Completeness::AuthorityMismatch {
                     authority: 13,
                     mirror: 1_303_920,
-                })
+                }),
+                true
             ),
             AuthorityPosture::Vetoing,
             "a mirror holding far more than the authority claims is not a loading state \

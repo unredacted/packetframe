@@ -644,9 +644,14 @@ impl StatusSnapshot {
                 // `require-table-complete`, which was already enabled and
                 // was the thing blocking it (review finding).
                 let msg = if self.authority == AuthorityPosture::Vetoing {
-                    // Persistent by construction: `Vetoing` is only
-                    // `AuthorityMismatch`, the one verdict waiting cannot
-                    // fix.
+                    // Persistent by construction, in BOTH senses now:
+                    // `Vetoing` is only `AuthorityMismatch` (the one
+                    // verdict waiting cannot fix), and only after two
+                    // distinct samples have reported it. So this text no
+                    // longer has to hedge its remedy — the confirmation
+                    // it used to ask the operator to perform is what
+                    // produced the posture. See
+                    // `authority_fault_confirmed`.
                     format!(
                         "resync deferred: the route source holds {have} routes (release \
                          floor {want}) and the floor is not what is holding this — the \
@@ -654,18 +659,16 @@ impl StatusSnapshot {
                          this mirror (far fewer than it holds, or none at all), so it is \
                          not the authority feeding it, and that vetoes release at any \
                          table size, so waiting for the source to go quiet will not clear \
-                         it — quiescence is never what releases a veto. CONFIRM BEFORE \
-                         ACTING: the checker reads bird and the mirror a few subprocess \
-                         calls apart, so one report can catch a bulk withdrawal mid-flight \
-                         and show a mismatch the next check does not. If the next check \
-                         (within 300 s) still reports one, it is real. Then: check which \
-                         bird `birdc` is talking to on THIS box; where the routes \
-                         legitimately come from elsewhere, `require-table-complete off` is \
-                         the right answer — but it is read once at bring-up, so it needs a \
-                         daemon RESTART. A reload is refused by name and says so, so there \
-                         is nothing to try first and nothing that silently carries the old \
-                         gate forward. The adopted FIB keeps forwarding untouched \
-                         meanwhile, and every steering change is refused while this holds"
+                         it — quiescence is never what releases a veto. TWO CONSECUTIVE \
+                         CHECKS reported it, so this is not one report catching a bulk \
+                         withdrawal mid-flight. Check which bird `birdc` is talking to on \
+                         THIS box; where the routes legitimately come from elsewhere, \
+                         `require-table-complete off` is the right answer — but it is read \
+                         once at bring-up, so it needs a daemon RESTART. A reload is \
+                         refused by name and says so, so there is nothing to try first and \
+                         nothing that silently carries the old gate forward. The adopted \
+                         FIB keeps forwarding untouched meanwhile, and every steering \
+                         change is refused while this holds"
                     )
                 } else if self.authority == AuthorityPosture::AwaitingAuthority {
                     // Blocked, but self-clearing: no report yet, one that
@@ -677,14 +680,16 @@ impl StatusSnapshot {
                     format!(
                         "resync deferred: the completeness authority has not attested yet \
                          — no report has arrived, the last one aged out, the mirror is \
-                         still short of it, or the mirror has grown past the count the \
-                         last sample took (the checker measures both every 300 s, and a \
-                         loading DFZ moves further than that in between) — so release is \
-                         blocked for now. It releases itself once a sample agrees; the \
-                         source holds {have} routes against a floor of {want}. If the \
-                         authority really is behind rather than merely unasked, the next \
-                         sample says so and this line changes to name it. Nothing is \
-                         dropping: the adopted FIB keeps forwarding untouched"
+                         still short of it, the mirror has grown past the count the last \
+                         sample took (the checker measures both every 300 s, and a loading \
+                         DFZ moves further than that in between), or ONE sample reported a \
+                         count that cannot describe this mirror and no second check has \
+                         confirmed it — so release is blocked for now. It releases itself \
+                         once a sample agrees; the source holds {have} routes against a \
+                         floor of {want}. If the authority really is at fault rather than \
+                         merely unasked or caught mid-withdrawal, the next sample says so \
+                         and this line changes to name it. Nothing is dropping: the \
+                         adopted FIB keeps forwarding untouched"
                     )
                 } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
@@ -2594,15 +2599,21 @@ mod tests {
             vetoed.contains("quiescence is never what releases a veto"),
             "and say plainly that waiting for quiet is not the remedy: {vetoed}"
         );
-        // But one sample is not proof of permanence: the checker reads
-        // bird and the mirror a few subprocess calls apart, so a bulk
-        // withdrawal caught mid-flight can produce a mismatch the next
-        // check does not reproduce. The line may say "stop waiting for
-        // quiet"; it may not say "go restart a daemon" on that evidence
-        // alone (review finding).
+        // One sample is still not proof of permanence — but that is now
+        // enforced where it belongs, in the classification: `Vetoing`
+        // needs the same fault in two distinct samples
+        // (`one_mismatching_sample_is_not_yet_a_veto`). So this text no
+        // longer asks the operator to do the confirming, and must not:
+        // a caution that repeats on a reading already confirmed twice
+        // trains people to discount it.
         assert!(
-            vetoed.contains("CONFIRM BEFORE ACTING"),
-            "a single sample must not send an operator to restart anything: {vetoed}"
+            !vetoed.contains("CONFIRM BEFORE ACTING"),
+            "the persistence is a property of the data now, not a caution in prose: \
+             {vetoed}"
+        );
+        assert!(
+            vetoed.contains("TWO CONSECUTIVE CHECKS"),
+            "and the line must say what makes it trustworthy: {vetoed}"
         );
         // The opt-out it recommends is read once at bring-up, and
         // `reconfigure` never installs or removes the completeness
