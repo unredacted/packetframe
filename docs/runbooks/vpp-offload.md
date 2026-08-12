@@ -1110,19 +1110,38 @@ carrying that traffic; VPP still is.
   running.** The two are different, and this box proved it: bird was up
   the whole time.
 
-  **Do not hand-roll the comparison.** The checker compares bird's
-  `master4` **plus** `master6` against the fast-path mirror's v4+v6
-  count, and it already prints both numbers when they disagree. Read
-  that, on the box that will steer:
+  **Do not hand-roll the comparison, and do not read silence as
+  agreement.** The checker compares bird's `master4` **plus** `master6`
+  against the fast-path mirror's v4+v6 count. It logs the successful
+  comparison at **debug**; at the default `log-level info` a healthy
+  check prints *nothing at all*, and its three failure paths
+  (`integrity check: birdc route count failed`, `... birdc protocols
+  failed`, `... mirror_counts failed`) print something different again.
+  So an absent `integrity drift above threshold` line is equally
+  consistent with the checker never having run, `birdc` failing every
+  time, or the log having rotated — which would approve a rollout onto
+  a handle that is `Unknown` and will refuse.
+
+  Get positive, timestamped evidence instead. Set `log-level debug`,
+  wait one interval (300 s), and require a line **from the last
+  interval** carrying both counts:
 
   ```bash
   birdc show route count | grep -E 'in table master(4|6)'
-  grep 'integrity drift above threshold' /var/log/packetframe.log | tail -3
+  grep -E 'integrity check OK|integrity drift above threshold|integrity check:' \
+      /var/log/packetframe.log | tail -5
   ```
 
-  No drift warning in the last interval (300 s) means the checker
-  agrees. A warning prints `bird_routes` and `packetframe_routes` —
-  that pair **is** the evidence the gate acts on.
+  `integrity check OK` with `bird_routes` and `packetframe_routes` is
+  the evidence the gate acts on. Anything else — a drift warning, a
+  failure line, or **no line at all** — is not a pass. Restore the log
+  level afterwards.
+
+  > There is no `packetframe status` surface for this today:
+  > `IntegrityChecker`'s snapshot is published and never read, so the
+  > log is the only window onto the verdict outside a refusal message.
+  > That gap is worth closing; it is why this check is as awkward as it
+  > is.
 
   Two traps that make a hand-rolled check pass a box that will veto.
   **`master6` counts**: a box whose `master4` matches but whose
