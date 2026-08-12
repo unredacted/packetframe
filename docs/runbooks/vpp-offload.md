@@ -1046,6 +1046,36 @@ updates and which a live DFZ feed may never give. The deferral message
 says so explicitly when that is what is happening — read it before
 concluding the checker is broken. Nothing is dropping meanwhile.
 
+**A second unbounded case, and this one takes the rollback lever with
+it: no completeness authority configured at all.** With no bird for the
+checker to compare against, the release falls to the unattested gate,
+which tolerates an activity rate of exactly **zero** for 5 s
+(`UNATTESTED_QUIET_RATE_PER_SEC`) — deliberately, since without an
+authority nothing can tell slow churn from a throttled reload. A live
+DFZ feed may never be literally still for 5 s, so an adopted resync
+over a **steered** VPP can defer indefinitely. Measured on the shadow:
+**23 h and still deferred** (2026-08-11 → 2026-08-12), floor long since
+met, feed healthy, nothing dropping.
+
+What makes it more than cosmetic is what `AdoptedResyncing` refuses:
+**steering changes, which includes `steer off`.** For the length of the
+deferral an operator cannot roll traffic off VPP with `packetframe
+reconfigure` — it answers "not converged". The eBPF tier is not
+carrying that traffic; VPP still is.
+
+- **On a box with bird** (the fleet, the primary) this does not apply:
+  the authority carries completion truth and releases on its own word.
+- **On a box without one** (the shadow, any box where the checker is
+  unconfigured or `birdc` is unreachable), the only escape is a cold
+  restart — stop the daemon, `packetframe detach --all`, start. That
+  tears VPP down and costs the offload for a full resync, which is
+  exactly the trade the deferral exists to avoid, so it is a last
+  resort rather than a routine step.
+- **Before a rollout, verify the authority is live** (`fib-synced`
+  naming a completeness verdict rather than the unattested wording).
+  A box that adopts while steered with no authority has no fast
+  rollback, and that is worth knowing before the canary, not during it.
+
 ### A member port needs two things admin-up does not give it
 
 Both were found by tracing a live VPP on 2026-08-07, each hidden behind
