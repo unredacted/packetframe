@@ -446,7 +446,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // /proc/<pid>/comm cross-check.
     let identity_path = config.global.state_dir.join(IDENTITY_NAME);
     match crate::daemon_presence::DaemonIdentity::current()
-        .and_then(|id| std::fs::write(&identity_path, id.encode()))
+        .and_then(|id| write_state_record(&identity_path, &id.encode()))
     {
         Ok(()) => {}
         // Non-fatal, like the pid file: readers treat a missing
@@ -598,24 +598,36 @@ fn create_excl_no_follow_with_retry(path: &Path) -> std::io::Result<std::fs::Fil
 /// with `O_NOFOLLOW | O_EXCL | O_CREAT | 0600` so a pre-existing
 /// symlink at `<path>.tmp` cannot redirect the write.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
-fn write_pid_file(path: &Path) -> std::io::Result<()> {
+/// Write a state-dir record without following a symlink.
+///
+/// O_EXCL|O_NOFOLLOW into a temp name, then rename. `std::fs::write`
+/// would follow: `state-dir` can be a pre-existing directory an
+/// unprivileged user can write, so a `packetframe.identity` symlink
+/// planted before startup would have this root daemon truncate whatever
+/// it pointed at (review finding, P1). The pid file has always been
+/// written this way; the identity sidecar was not, until it was routed
+/// through here.
+fn write_state_record(path: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension("pid.tmp");
+    let tmp = path.with_extension("tmp");
     {
         let mut f = create_excl_no_follow_with_retry(&tmp)?;
-        // A BARE PID, exactly as before. The identity goes in a sidecar
-        // instead, because this file has readers we do not ship with:
-        // a CLI from the previous bundle parses the whole trimmed file
-        // as one integer, so widening the format here broke
-        // `reconfigure` for anyone rolling back or running mixed
-        // versions — the same upgrade window this change exists to fix,
-        // in the other direction (review finding).
-        writeln!(f, "{}", std::process::id())?;
+        writeln!(f, "{body}")?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+/// A BARE PID, exactly as before. The identity lives in a sidecar
+/// instead, because this file has readers we do not ship with: a CLI
+/// from the previous bundle parses the whole trimmed file as one
+/// integer, so widening the format broke `reconfigure` for anyone
+/// rolling back or running mixed versions.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn write_pid_file(path: &Path) -> std::io::Result<()> {
+    write_state_record(path, &std::process::id().to_string())
 }
 
 /// Look through a module section's directives and return its
@@ -1072,8 +1084,15 @@ fn scan_for_running_daemon() -> Option<i32> {
         // finding). Safe to read argv here only because the exe check
         // above already established the binary; a spoofed "run" alone
         // proves nothing.
-        if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-            if cmdline.split('\0').any(|a| a == "run") {
+        // BYTES. `read_to_string` rejects the whole cmdline if any
+        // argument is not UTF-8 — a `--config` path may legally contain
+        // arbitrary bytes — and a scan that cannot read the daemon's
+        // argv would then fail to find it, which `presence_of` turns
+        // into `Gone` and `detach` turns into unlinking pins beneath it
+        // (review finding, P1). An unreadable cmdline is not evidence
+        // of anything.
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            if cmdline.split(|b| *b == 0).any(|a| a == b"run") {
                 return Some(pid as i32);
             }
         }
@@ -1918,6 +1937,46 @@ mod vpp_detach_tests {
         // The right order is accepted, so the test above is about order
         // and not about the pair being rejected outright.
         assert_eq!(feed_wiring(&["fast-path", "vpp-offload"]), Ok(true));
+    }
+
+    /// State records are never written through a symlink.
+    ///
+    /// `state-dir` can be a pre-existing directory an unprivileged user
+    /// writes to, so a record name planted as a symlink before startup
+    /// would have this root daemon truncate whatever it points at. The
+    /// pid file was always written no-follow; the identity sidecar was
+    /// added with `std::fs::write`, which follows (review finding, P1).
+    /// Both go through one writer now, so the next record cannot get it
+    /// wrong by being written somewhere else.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_symlink_does_not_capture_a_state_record() {
+        let dir = std::env::temp_dir().join(format!("pf-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "do not truncate me").unwrap();
+
+        // The attacker's plant, at the name the daemon will write.
+        let planted = dir.join("packetframe.identity");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        // Writing succeeds — the rename replaces the symlink itself —
+        // and the victim is untouched.
+        write_state_record(&planted, "1 2 boot").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me",
+            "the symlink target must not be written through"
+        );
+        assert!(
+            std::fs::read_to_string(&planted)
+                .unwrap()
+                .starts_with("1 2 boot"),
+            "and the record lands at the real path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `detach` refuses when it cannot prove no daemon is running.
