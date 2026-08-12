@@ -900,10 +900,17 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
     // user-writable; readlink-comparing it against our own
     // current_exe is a real identity check rather than a name match.
     // See the May 2026 audit Slice 4 finding.
-    match crate::daemon_presence::presence_of(&pid_path, |p| {
-        proc_exe_matches_current(p as libc::pid_t)
-    }) {
-        crate::daemon_presence::DaemonPresence::Running { .. } => {}
+    // The pid to signal comes FROM the check, not from a second read
+    // of the same file. Reading twice let a concurrent restart swap the
+    // record in between, so the check could validate the replacement
+    // while the signal went to the pid the first read captured — a
+    // recycled process, as root (review finding).
+    let pid = match crate::daemon_presence::presence_of(
+        &pid_path,
+        |p| proc_exe_matches_current(p as libc::pid_t),
+        scan_for_running_daemon,
+    ) {
+        crate::daemon_presence::DaemonPresence::Running { pid } => pid as libc::pid_t,
         crate::daemon_presence::DaemonPresence::Gone { why } => {
             return Err(ReconfigureError::DaemonNotRunning(format!(
                 "no daemon to reconfigure: {why} (stale pidfile at {}?)",
@@ -917,12 +924,11 @@ pub fn reconfigure(config_path: &Path) -> Result<(), ReconfigureError> {
         // exactly the upgrade it was meant to drive.
         crate::daemon_presence::DaemonPresence::Unknown { why } => {
             return Err(ReconfigureError::DaemonNotRunning(format!(
-                "cannot confirm pid {pid} from {} is the packetframe daemon ({why}); refusing \
-                 to signal it",
+                "cannot confirm the daemon named by {} ({why}); refusing to signal it",
                 pid_path.display()
             )));
         }
-    }
+    };
 
     // Snapshot the marker mtime (or NotFound) before signaling so we
     // can detect "changed since SIGHUP."
@@ -971,15 +977,51 @@ pub fn reconfigure(_config_path: &Path) -> Result<(), ReconfigureError> {
     ))
 }
 
+/// Find a process running this executable, if there is one.
+///
+/// **Finds only.** This was `daemon_pid`, and its answer was read as
+/// "no daemon is running" whenever it came back empty — which is false
+/// for any daemon started from a different path, i.e. during every
+/// upgrade, and is how `detach` walked past its own guard. It is kept
+/// because the converse is still sound and still useful: a process
+/// running this exact binary IS a daemon worth refusing to detach
+/// under, even when no pid file names it (a failed record write leaves
+/// exactly that).
+///
+/// `/proc/<pid>/exe` rather than `comm`, which is user-settable via
+/// `prctl` — the May 2026 audit Slice 4 finding.
+#[cfg(target_os = "linux")]
+fn scan_for_running_daemon() -> Option<i32> {
+    let self_pid = std::process::id();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        if proc_exe_matches_current(pid as libc::pid_t) {
+            return Some(pid as i32);
+        }
+    }
+    None
+}
+
+/// The pid from the record, whichever format it is in.
+///
+/// This parsed the WHOLE trimmed file as a number, so the identity
+/// record (`<pid> <start_ticks> <boot_id>`) failed with `InvalidData`
+/// and `reconfigure` returned before it could signal anything — the
+/// canary lever, broken by the commit that was fixing it (review
+/// finding, P1).
 #[cfg(target_os = "linux")]
 fn read_pid_file(path: &Path) -> std::io::Result<libc::pid_t> {
     let s = std::fs::read_to_string(path)?;
-    s.trim().parse::<libc::pid_t>().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("PID parse `{}`: {e}", s.trim()),
-        )
-    })
+    crate::daemon_presence::DaemonIdentity::decode(&s).map(|(pid, _)| pid as libc::pid_t)
 }
 
 /// Read /proc/<pid>/exe as a symlink and compare against the
@@ -1100,9 +1142,11 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // daemon. That is the outage this refusal exists to prevent, and
     // it was reachable exactly when someone was upgrading.
     #[cfg(target_os = "linux")]
-    let presence = crate::daemon_presence::presence_of(&state_dir.join(PIDFILE_NAME), |p| {
-        proc_exe_matches_current(p as libc::pid_t)
-    });
+    let presence = crate::daemon_presence::presence_of(
+        &state_dir.join(PIDFILE_NAME),
+        |p| proc_exe_matches_current(p as libc::pid_t),
+        scan_for_running_daemon,
+    );
     #[cfg(not(target_os = "linux"))]
     let presence = crate::daemon_presence::DaemonPresence::Gone {
         why: "no /proc on this platform; nothing could be attached".into(),
@@ -1516,9 +1560,11 @@ fn print_module_health(state_dir: &Path) {
     // only then learns the daemon is dead has already drawn the
     // conclusion, and it was the wrong one.
     #[cfg(target_os = "linux")]
-    let presence = crate::daemon_presence::presence_of(&state_dir.join(PIDFILE_NAME), |p| {
-        proc_exe_matches_current(p as libc::pid_t)
-    });
+    let presence = crate::daemon_presence::presence_of(
+        &state_dir.join(PIDFILE_NAME),
+        |p| proc_exe_matches_current(p as libc::pid_t),
+        scan_for_running_daemon,
+    );
     // No /proc to cross-check against, so liveness is unknown rather
     // than assumed either way.
     #[cfg(not(target_os = "linux"))]
@@ -1534,9 +1580,19 @@ fn print_module_health(state_dir: &Path) {
     };
 
     match &presence {
-        crate::daemon_presence::DaemonPresence::Running { pid } => {
+        // Running AND the same process that wrote this. A crash whose
+        // replacement records its own pid before publishing health
+        // leaves the old report on disk under a new pid file: validating
+        // the file alone presented history as current, and labelled it
+        // with the replacement's pid (review finding).
+        crate::daemon_presence::DaemonPresence::Running { pid } if *pid == snapshot.pid => {
             println!("module health (pid {pid}, {age}):")
         }
+        crate::daemon_presence::DaemonPresence::Running { pid } => println!(
+            "module health: STALE — this report was written by pid {}, but the daemon \
+             running now is pid {pid}. The report below is history, {age}.",
+            snapshot.pid
+        ),
         crate::daemon_presence::DaemonPresence::Gone { why } => println!(
             "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
              report below is history, {age}; the dataplane may still be forwarding via its \

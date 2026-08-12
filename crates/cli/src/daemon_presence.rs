@@ -171,11 +171,28 @@ pub fn decide(
     proc_alive: bool,
     live_identity: Option<(u64, String)>,
     exe_matches: bool,
+    scanned: Option<i32>,
 ) -> DaemonPresence {
     let (pid, recorded) = match record {
+        // No record is NOT evidence of no daemon. The file is written
+        // after every module attaches — deliberately, so systemd's
+        // `PIDFile=` never points at a half-attached daemon — and a
+        // failed write is non-fatal, so a live daemon can legitimately
+        // have none. `scanned` is the independent check: it can FIND a
+        // daemon (a process running this binary), and its silence
+        // proves nothing, which is the polarity the deleted /proc scan
+        // had backwards (review finding).
         Record::Absent => {
-            return DaemonPresence::Gone {
-                why: "no pid file; nothing recorded a daemon".into(),
+            return match scanned {
+                Some(pid) => DaemonPresence::Unknown {
+                    why: format!(
+                        "no pid file, but pid {pid} is running this binary — it may be a \
+                         daemon that could not write its record"
+                    ),
+                },
+                None => DaemonPresence::Gone {
+                    why: "no pid file, and no process is running this binary".into(),
+                },
             }
         }
         Record::Unreadable(why) => return DaemonPresence::Unknown { why },
@@ -224,7 +241,11 @@ pub fn decide(
 /// Establish presence from the record at `pid_path`. Thin I/O over
 /// [`decide`], which holds the policy.
 #[cfg(target_os = "linux")]
-pub fn presence_of(pid_path: &Path, exe_matches: impl Fn(i32) -> bool) -> DaemonPresence {
+pub fn presence_of(
+    pid_path: &Path,
+    exe_matches: impl Fn(i32) -> bool,
+    scan: impl Fn() -> Option<i32>,
+) -> DaemonPresence {
     let record = match std::fs::read_to_string(pid_path) {
         Ok(s) => match DaemonIdentity::decode(&s) {
             Ok((pid, id)) => Record::Found(pid, id),
@@ -235,14 +256,15 @@ pub fn presence_of(pid_path: &Path, exe_matches: impl Fn(i32) -> bool) -> Daemon
     };
     let pid = match &record {
         Record::Found(pid, _) => *pid,
-        _ => return decide(record, false, None, false),
+        // Only the no-record path consults the scan, and only to find.
+        _ => return decide(record, false, None, false, scan()),
     };
     let alive = Path::new(&format!("/proc/{pid}")).exists();
     let live_identity = match (start_ticks(pid), boot_id()) {
         (Ok(t), Ok(b)) => Some((t, b)),
         _ => None,
     };
-    decide(record, alive, live_identity, exe_matches(pid))
+    decide(record, alive, live_identity, exe_matches(pid), None)
 }
 
 #[cfg(test)]
@@ -274,7 +296,7 @@ mod tests {
     fn absence_is_never_concluded_from_a_failed_identity_check() {
         // The upgrade window, and the whole bug: a live daemon, a
         // legacy record, and a CLI at a different path. Was `Gone`.
-        let unknown = decide(Record::Found(42, None), true, None, false);
+        let unknown = decide(Record::Found(42, None), true, None, false, None);
         assert!(
             matches!(unknown, DaemonPresence::Unknown { .. }),
             "a live pid we cannot identify is not absence: {unknown:?}"
@@ -286,7 +308,7 @@ mod tests {
 
         // Same record, same binary: the exe match still confirms.
         assert_eq!(
-            decide(Record::Found(42, None), true, None, true),
+            decide(Record::Found(42, None), true, None, true, None),
             DaemonPresence::Running { pid: 42 }
         );
 
@@ -299,6 +321,7 @@ mod tests {
                 true,
                 Some((900, "boot-a".into())),
                 false,
+                None,
             ),
             DaemonPresence::Running { pid: 42 }
         );
@@ -310,6 +333,7 @@ mod tests {
             true,
             Some((901, "boot-a".into())),
             true,
+            None,
         );
         assert!(is_gone(&reused), "{reused:?}");
 
@@ -320,6 +344,7 @@ mod tests {
             true,
             Some((900, "boot-b".into())),
             true,
+            None,
         );
         assert!(is_gone(&rebooted), "{rebooted:?}");
 
@@ -328,7 +353,8 @@ mod tests {
             Record::Found(42, Some(id(42, 900))),
             true,
             None,
-            true
+            true,
+            None
         )));
 
         // No process: absent, regardless of what was recorded.
@@ -336,9 +362,20 @@ mod tests {
             Record::Found(42, Some(id(42, 900))),
             false,
             None,
-            true
+            true,
+            None
         )));
-        assert!(is_gone(&decide(Record::Absent, false, None, false)));
+        assert!(is_gone(&decide(Record::Absent, false, None, false, None)));
+
+        // No record, but a process IS running this binary: the daemon
+        // may simply have failed to write one — the file is written
+        // after attach and a failed write is non-fatal. Must not read
+        // as absence (review finding, P1).
+        let orphan = decide(Record::Absent, false, None, false, Some(77));
+        assert!(
+            matches!(orphan, DaemonPresence::Unknown { .. }),
+            "a running copy of this binary with no record is not absence: {orphan:?}"
+        );
 
         // Unreadable record: cannot tell. A corrupt file is exactly
         // when the destructive path must not fire.
@@ -346,7 +383,8 @@ mod tests {
             Record::Unreadable("torn".into()),
             false,
             None,
-            false
+            false,
+            None
         )));
     }
 
