@@ -233,15 +233,15 @@ impl IntegrityChecker {
                 snap.drift_fraction = Some(frac);
                 if frac >= self.config.drift_warn_fraction {
                     warn!(
-                        bird_routes = bird,
-                        packetframe_routes = pf,
+                        bird_prefixes = bird,
+                        packetframe_prefixes = pf,
                         drift_fraction = frac,
                         "integrity drift above threshold"
                     );
                 } else {
                     debug!(
-                        bird_routes = bird,
-                        packetframe_routes = pf,
+                        bird_prefixes = bird,
+                        packetframe_prefixes = pf,
                         drift_fraction = frac,
                         "integrity check OK"
                     );
@@ -252,6 +252,27 @@ impl IntegrityChecker {
 }
 
 /// Parse `birdc show route count` output and return the selected-route
+/// **The NETWORKS column, not the routes column — and the difference is
+/// the whole point.** Bird counts one route entry per PATH: on a
+/// multihomed box every prefix appears once per upstream, so
+/// `show route count` reports roughly 2x the prefix count. packetframe's
+/// mirror holds one entry per PREFIX (the resolved best path), so
+/// comparing the two counted different things and produced a constant,
+/// unfixable drift.
+///
+/// Measured on the production primary, 2026-08-12: bird reported
+/// 2,594,691 routes across master4+master6 against a 1,303,120-entry
+/// mirror — a permanent **49.78%** drift, logged every 5 minutes for
+/// months. The alarm was saturated, so it could not have detected real
+/// drift; and `require-table-complete on` would have refused every
+/// steer forever, since the authority can never converge. The networks
+/// figures for the same tables sum to 1,303,033 against that mirror:
+/// 0.007% apart.
+///
+/// No test caught it because every fixture below was written from
+/// single-path output where routes and networks are equal or nearly so.
+/// A fixture from the real dual-homed box is now among them.
+///
 /// total across the BGP RIB tables (`master4` + `master6`). Bird emits
 /// one `N of M routes for K networks in table <name>` line per table,
 /// followed by a `Total: ...` summary across ALL tables in
@@ -278,7 +299,7 @@ impl IntegrityChecker {
 /// `routes`, including transient lines that produced >2× counts. The
 /// `in table master[46]` filter is strict enough that this can't
 /// recur.
-pub fn parse_route_count(output: &str) -> Result<usize, String> {
+pub fn parse_prefix_count(output: &str) -> Result<usize, String> {
     let mut sum: Option<usize> = None;
 
     for line in output.lines() {
@@ -289,15 +310,25 @@ pub fn parse_route_count(output: &str) -> Result<usize, String> {
         if !(trimmed.contains("in table master4") || trimmed.contains("in table master6")) {
             continue;
         }
-        if let Some(first) = trimmed.split_whitespace().next() {
-            if let Ok(n) = first.parse::<usize>() {
-                sum = Some(sum.unwrap_or(0) + n);
-            }
+        // The NETWORKS column, not the leading routes column. Anchored
+        // on the word rather than a fixed index so a bird that rewords
+        // the prefix of the line does not silently shift us onto a
+        // different number — which is the whole failure being fixed.
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(idx) = toks.iter().position(|t| *t == "networks") else {
+            continue;
+        };
+        if let Some(n) = idx
+            .checked_sub(1)
+            .and_then(|i| toks.get(i))
+            .and_then(|t| t.parse::<usize>().ok())
+        {
+            sum = Some(sum.unwrap_or(0) + n);
         }
     }
 
     sum.ok_or_else(|| {
-        "no `... in table master4` / `... in table master6` line in birdc output".to_string()
+        "no `... for N networks in table master4` / `... master6` line in birdc output".to_string()
     })
 }
 
@@ -328,7 +359,7 @@ pub fn parse_established_peers(output: &str) -> Result<usize, String> {
 
 async fn run_birdc_count(birdc: &std::path::Path) -> Result<usize, String> {
     let output = run_birdc(birdc, &["show", "route", "count"]).await?;
-    parse_route_count(&output)
+    parse_prefix_count(&output)
 }
 
 async fn run_birdc_protocols(birdc: &std::path::Path) -> Result<usize, String> {
@@ -440,25 +471,70 @@ fn read_capped<R: std::io::Read>(
 mod tests {
     use super::*;
 
+    /// The real production primary, which no fixture here resembled.
+    ///
+    /// Every other fixture in this file was written from output where
+    /// routes and networks are equal or within a handful — single-path
+    /// data — so the routes column and the networks column were
+    /// interchangeable and nothing could distinguish them. On a
+    /// multihomed box they are not: bird counts one entry per PATH, so
+    /// with two upstreams `show route count` reports about twice the
+    /// prefix count, while packetframe's mirror holds one entry per
+    /// prefix.
+    ///
+    /// Captured from edge1-mci1-net on 2026-08-12, where the checker
+    /// had been comparing 2,594,691 against a 1,303,120-entry mirror
+    /// and logging a 49.78% drift every five minutes — an alarm pinned
+    /// at half by construction, unable to detect any real drift, and
+    /// enough to make `require-table-complete on` refuse every steer
+    /// forever.
     #[test]
-    fn parse_route_count_single_table() {
+    fn parse_prefix_count_on_a_multihomed_box_counts_prefixes_not_paths() {
         let out = "BIRD 2.17.2 ready.\n\
-                   1048587 of 1048587 routes for 1048573 networks in table master4\n";
-        assert_eq!(parse_route_count(out).unwrap(), 1_048_587);
+                   2106597 of 2106597 routes for 1054342 networks in table master4\n\
+                   488101 of 488101 routes for 248691 networks in table master6\n\
+                   757180 of 757180 routes for 757180 networks in table rpki4\n\
+                   232702 of 232702 routes for 232702 networks in table rpki6\n\
+                   Total: 3584580 of 3584580 routes for 2292915 networks in 4 tables\n";
+        let got = parse_prefix_count(out).unwrap();
+        assert_eq!(
+            got,
+            1_054_342 + 248_691,
+            "the authority must be counted in prefixes, like the mirror it is compared \
+             against — taking the routes column gives {} and a permanent ~50% drift",
+            2_106_597 + 488_101
+        );
+        // And the number it is compared against, measured the same day:
+        // 1,303,120 mirror entries. Well inside the 1% steering bound,
+        // where the routes column was 49.78% outside it.
+        let mirror = 1_303_120f64;
+        let drift = (got as f64 - mirror).abs() / got as f64;
+        assert!(
+            drift < 0.01,
+            "prefix-to-prefix must land inside the 1% bound the steering gate uses, got \
+             {drift}"
+        );
     }
 
     #[test]
-    fn parse_route_count_multi_table_no_total_line_sums_per_table() {
+    fn parse_prefix_count_single_table() {
+        let out = "BIRD 2.17.2 ready.\n\
+                   1048587 of 1048587 routes for 1048573 networks in table master4\n";
+        assert_eq!(parse_prefix_count(out).unwrap(), 1_048_573);
+    }
+
+    #[test]
+    fn parse_prefix_count_multi_table_no_total_line_sums_per_table() {
         // Older bird builds (or single-table outputs) don't emit a
         // Total line. Fall back to summing per-table firsts.
         let out = "BIRD 2.17.2 ready.\n\
                    1048587 of 1048587 routes for 1048573 networks in table master4\n\
                    233456 of 233456 routes for 233456 networks in table master6\n";
-        assert_eq!(parse_route_count(out).unwrap(), 1_048_587 + 233_456);
+        assert_eq!(parse_prefix_count(out).unwrap(), 1_048_573 + 233_456);
     }
 
     #[test]
-    fn parse_route_count_ignores_total_line() {
+    fn parse_prefix_count_ignores_total_line() {
         // v0.2.2: even when `Total:` is present, we sum master4 +
         // master6 ourselves. This protects against the RPKI-table
         // case where Total includes tables we don't mirror.
@@ -466,11 +542,11 @@ mod tests {
                    1037000 of 1500467 routes for 1037000 networks in table master4\n\
                    235306 of 457217 routes for 235306 networks in table master6\n\
                    Total: 1272306 of 1957684 routes for 1272306 networks in 2 tables\n";
-        assert_eq!(parse_route_count(out).unwrap(), 1_037_000 + 235_306);
+        assert_eq!(parse_prefix_count(out).unwrap(), 1_037_000 + 235_306);
     }
 
     #[test]
-    fn parse_route_count_excludes_rpki_tables() {
+    fn parse_prefix_count_excludes_rpki_tables() {
         // v0.2.2 fix: operators with `rtr-server` enabled get rpki4 /
         // rpki6 tables in `show route count`. Pre-fix we picked the
         // Total: line which summed all 4 tables, producing a count
@@ -484,11 +560,11 @@ mod tests {
                    188943 of 188943 routes for 188943 networks in table rpki6\n\
                    Total: 2120822 of 2120822 routes for 2120820 networks in 4 tables\n";
         // Should be master4 + master6 only, NOT the 2.12M Total.
-        assert_eq!(parse_route_count(out).unwrap(), 1_038_232 + 235_677);
+        assert_eq!(parse_prefix_count(out).unwrap(), 1_038_230 + 235_677);
     }
 
     #[test]
-    fn parse_route_count_ignores_kernel_protocol_tables() {
+    fn parse_prefix_count_ignores_kernel_protocol_tables() {
         // Bird operators sometimes have additional tables for
         // kernel-import / static / per-protocol shadow RIBs. Confirm
         // we don't accidentally count those either.
@@ -496,22 +572,22 @@ mod tests {
                    1000 of 1000 routes for 1000 networks in table master4\n\
                    500  of  500 routes for  500 networks in table kernel_in\n\
                    200  of  200 routes for  200 networks in table master6\n";
-        assert_eq!(parse_route_count(out).unwrap(), 1_000 + 200);
+        assert_eq!(parse_prefix_count(out).unwrap(), 1_000 + 200);
     }
 
     #[test]
-    fn parse_route_count_missing_errors() {
+    fn parse_prefix_count_missing_errors() {
         let out = "BIRD 2.17.2 ready.\n";
-        let err = parse_route_count(out).unwrap_err();
+        let err = parse_prefix_count(out).unwrap_err();
         assert!(err.contains("master4"));
     }
 
     #[test]
-    fn parse_route_count_only_master4() {
+    fn parse_prefix_count_only_master4() {
         // Single-table case (operator only runs IPv4 BGP).
         let out = "BIRD 2.17.2 ready.\n\
                    42 of 100 routes for 42 networks in table master4\n";
-        assert_eq!(parse_route_count(out).unwrap(), 42);
+        assert_eq!(parse_prefix_count(out).unwrap(), 42);
     }
 
     #[test]
