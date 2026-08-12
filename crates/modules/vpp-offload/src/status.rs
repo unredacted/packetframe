@@ -651,8 +651,9 @@ impl StatusSnapshot {
                         "resync deferred: the route source holds {have} routes (release \
                          floor {want}) and the floor is not what is holding this — the \
                          completeness authority reports a route count that cannot describe \
-                         this mirror, so it is not the authority feeding it, and that \
-                         vetoes release at any table size. Waiting will not clear it. \
+                         this mirror (far fewer than it holds, or none at all), so it is \
+                         not the authority feeding it, and that vetoes release at any \
+                         table size. Waiting will not clear it. \
                          Check which bird `birdc` is talking to on THIS box; where the \
                          routes legitimately come from elsewhere, `require-table-complete \
                          off` is the right answer. The adopted FIB keeps forwarding \

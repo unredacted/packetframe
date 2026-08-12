@@ -243,7 +243,47 @@ pub enum Completeness {
     Unknown { why: &'static str },
 }
 
+/// Why an otherwise-successful sample still cannot judge completeness:
+/// the authority answered, and answered zero.
+///
+/// A named constant because two places need to agree on it —
+/// [`assess`] produces it and [`Completeness::authority_is_at_fault`]
+/// classifies it — and a string literal compared in one place against a
+/// literal written in another is a pair that drifts silently the first
+/// time someone rewords the message.
+pub const ZERO_ROUTE_AUTHORITY: &str = "the authority reports zero routes";
+
 impl Completeness {
+    /// Whether the AUTHORITY is the thing that is wrong — as opposed to
+    /// a check that has not run yet, a report that aged out, or a
+    /// mirror still filling.
+    ///
+    /// The distinction consumers actually act on, because it decides
+    /// what an operator is told: wait, or go and look at bird. Both
+    /// arms here describe an authority that is answering and whose
+    /// answer cannot describe this mirror — one holding far fewer
+    /// routes than the mirror, or none at all — and no amount of
+    /// waiting or converging changes either. Everything else resolves
+    /// as the system settles.
+    ///
+    /// `Unknown { ZERO_ROUTE_AUTHORITY }` belongs here rather than with
+    /// the transient unknowns, and that is the whole reason this
+    /// predicate exists: `assess` returns it BEFORE the mismatch
+    /// branch, so an empty bird against a full mirror — the fully-empty
+    /// form of the 2026-08-12 shadow incident, which survived only
+    /// because that box had 13 routes rather than 0 — was classified as
+    /// self-clearing and promised a wait that could never end (review
+    /// finding).
+    pub fn authority_is_at_fault(&self) -> bool {
+        match self {
+            Completeness::AuthorityMismatch { .. } => true,
+            Completeness::Unknown { why } => *why == ZERO_ROUTE_AUTHORITY,
+            Completeness::Converged { .. }
+            | Completeness::Incomplete { .. }
+            | Completeness::Stale { .. } => false,
+        }
+    }
+
     /// Whether traffic may be steered on the strength of this.
     ///
     /// Only `Converged` says yes. `Unknown` deliberately does **not** —
@@ -308,7 +348,7 @@ pub fn assess(
     }
     let Some(drift) = r.drift() else {
         return Completeness::Unknown {
-            why: "the authority reports zero routes",
+            why: ZERO_ROUTE_AUTHORITY,
         };
     };
     if drift <= max_drift {
@@ -778,6 +818,66 @@ impl std::error::Error for NeighError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every variant is classified, and the zero-route unknown is a
+    /// fault rather than a wait.
+    ///
+    /// `assess` returns `Unknown { ZERO_ROUTE_AUTHORITY }` BEFORE it
+    /// can reach `AuthorityMismatch`, so an authority answering zero
+    /// against a populated mirror looks like a transient unknown while
+    /// being exactly as permanent as a mismatch — every later sample
+    /// says the same thing until bird itself gains routes. Consumers
+    /// that told an operator to wait on it recreated the 2026-08-12
+    /// shadow incident in its fully-empty form (review finding), which
+    /// is why the classification lives here beside the reason strings
+    /// and not in the consumer.
+    #[test]
+    fn a_zero_route_authority_is_a_fault_not_a_wait() {
+        assert!(Completeness::AuthorityMismatch {
+            authority: 13,
+            mirror: 1_303_920
+        }
+        .authority_is_at_fault());
+        assert!(Completeness::Unknown {
+            why: ZERO_ROUTE_AUTHORITY
+        }
+        .authority_is_at_fault());
+
+        // The genuinely transient ones, which a later sample clears.
+        assert!(!Completeness::Unknown {
+            why: "no check has run yet"
+        }
+        .authority_is_at_fault());
+        assert!(!Completeness::Stale {
+            age: std::time::Duration::from_secs(9_999)
+        }
+        .authority_is_at_fault());
+        assert!(!Completeness::Incomplete {
+            drift: 0.5,
+            authority: 1_000_000,
+            mirror: 500_000
+        }
+        .authority_is_at_fault());
+        assert!(!Completeness::Converged { drift: 0.0 }.authority_is_at_fault());
+
+        // And the constant is what `assess` actually emits — a literal
+        // compared against a literal written elsewhere is the pair this
+        // constant exists to prevent.
+        let verdict = assess(
+            Some(CompletenessReport {
+                authority_routes: 0,
+                mirror_routes: 1_000_000,
+                at: std::time::Instant::now(),
+            }),
+            std::time::Instant::now(),
+            STEER_MAX_DRIFT,
+            STEER_MAX_REPORT_AGE,
+        );
+        assert!(
+            verdict.authority_is_at_fault(),
+            "an empty authority against a full mirror must classify as a fault: {verdict:?}"
+        );
+    }
 
     /// The epoch counts down-to-up transitions and rides in the same
     /// word as the liveness it belongs to.

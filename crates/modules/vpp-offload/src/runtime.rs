@@ -851,10 +851,14 @@ fn authority_posture(
     current: Option<bool>,
     verdict: Option<packetframe_common::fib::Completeness>,
 ) -> AuthorityPosture {
-    use packetframe_common::fib::Completeness;
+    // `authority_is_at_fault` rather than a match on the variant: the
+    // zero-route case arrives as `Unknown` (assess returns it before the
+    // mismatch branch) and is just as permanent, so the classification
+    // has to live next to the variants and their reason strings rather
+    // than being re-derived here (review finding).
     let vetoing = gate_consults_authority
         && current == Some(false)
-        && matches!(verdict, Some(Completeness::AuthorityMismatch { .. }));
+        && verdict.as_ref().is_some_and(|v| v.authority_is_at_fault());
     if !configured {
         AuthorityPosture::Absent
     } else if vetoing {
@@ -2504,6 +2508,25 @@ mod tests {
                 mirror: 500_000,
             },
         ];
+        // An authority answering ZERO is not a transient unknown. It
+        // arrives as `Unknown` because `assess` returns that before the
+        // mismatch branch, and it is exactly as permanent as a
+        // mismatch — the fully-empty form of the shadow incident
+        // (review finding).
+        assert_eq!(
+            authority_posture(
+                true,
+                false,
+                true,
+                Some(false),
+                Some(packetframe_common::fib::Completeness::Unknown {
+                    why: packetframe_common::fib::ZERO_ROUTE_AUTHORITY
+                })
+            ),
+            AuthorityPosture::Vetoing,
+            "a bird with no routes at all cannot be waited out any more than a mismatched \
+             one can"
+        );
         for verdict in self_clearing {
             assert_eq!(
                 authority_posture(true, false, true, Some(false), Some(verdict.clone())),
