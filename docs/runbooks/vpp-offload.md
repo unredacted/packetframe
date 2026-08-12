@@ -1154,6 +1154,12 @@ module's own deltas.
 >   daemon's record looks like mid-trouble. Conversely, a torn *pid
 >   file* next to a whole sidecar still identifies the daemon: the
 >   sidecar is consulted whenever the pid file cannot answer alone.
+> - If the pid file and the sidecar **disagree** and the sidecar's
+>   identity matches a live process, everything answers CANNOT CONFIRM
+>   ("two authenticated records disagree"). This is what a restart
+>   whose pid-file rewrite failed leaves behind: new sidecar, old pid
+>   file. Restart the daemon to re-record both, or remove the stale
+>   pid file.
 > - The scan has to *complete* to count as evidence of absence. If
 >   `/proc` cannot be listed, or a process in it cannot be examined
 >   (running `detach` as a non-root user is the ordinary cause), the

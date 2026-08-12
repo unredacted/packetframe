@@ -208,6 +208,19 @@ pub enum Record {
     /// which is what let a planted record aim root's SIGHUP (review
     /// finding).
     Unauthenticated(i32),
+    /// Two authenticated records that disagree: a valid pid file names
+    /// one pid, and the sidecar names a DIFFERENT pid whose identity
+    /// matches a live process.
+    ///
+    /// Nothing in the data says which record is stale. A restart whose
+    /// pid-file rewrite failed (it is non-fatal) leaves the OLD pid
+    /// file beside the NEW daemon's sidecar — so discarding the
+    /// sidecar for disagreeing with the pid file turned "old pid dead"
+    /// plus a name-limited scan into `Gone`, and `detach` unlinked
+    /// pins beneath the live replacement (review finding, P1). A
+    /// disagreement between two authenticated records with a live
+    /// daemon in one of them can never resolve to absence.
+    ConflictingRecords { recorded: i32, sidecar: i32 },
 }
 
 /// What a search of the process table established.
@@ -348,6 +361,21 @@ fn decide_from_record(
             }
         }
         Record::Unauthenticated(pid) => (pid, None),
+        // A live daemon exists whichever record is stale, so no
+        // verdict below — least of all `Gone` — may be reached from
+        // the pid file alone. Signalling needs certainty about WHICH
+        // process, and two disagreeing authenticated records are the
+        // definition of not having it.
+        Record::ConflictingRecords { recorded, sidecar } => {
+            return DaemonPresence::Unknown {
+                why: format!(
+                    "two authenticated records disagree: the pid file names {recorded} but \
+                     the identity sidecar names {sidecar}, which matches a live process — \
+                     likely a failed pid-file rewrite during a restart. Restart the daemon \
+                     to re-record both, or remove the stale pid file"
+                ),
+            }
+        }
         Record::Found(pid, id) => (pid, id),
     };
     if !proc_alive {
@@ -494,49 +522,18 @@ pub fn self_boot_id() -> Option<String> {
     }
 }
 
-/// The sidecar identity, read and authenticated through ONE descriptor.
+/// Whether a recorded identity describes a process that is alive right
+/// now: the pid exists in a non-zombie state, its start ticks match,
+/// and the boot id is this boot's.
 ///
-/// Two ways this was bypassable, both P1, both found after the first
-/// attempt at it:
-///
-/// The check ran `metadata()` on a pathname and then `read_to_string()`
-/// on the same pathname. An attacker with directory write can point the
-/// name at a root-owned file for the first call and swap in their own
-/// before the second — a check-then-use race they can retry until it
-/// lands. So the file is opened once, `O_NOFOLLOW`, and both the
-/// ownership check and the read happen on that descriptor: whatever
-/// passes the check is what is read, and a symlink at the final
-/// component fails the open outright.
-///
-/// And identity is taken from HERE ONLY. `decode` accepts a combined
-/// `<pid> <ticks> <boot>` record because the sidecar uses that shape,
-/// but the pid file is not authenticated, so a combined record planted
-/// THERE used to supply an identity that never passed this function at
-/// all.
-///
-/// Unlinking it is still available to an attacker with directory write;
-/// anything they create in its place is theirs and fails the check,
-/// which drops the identity — as if none had been recorded. What that
-/// falls back to is no longer an executable match alone: the pid file
-/// must itself be root-owned before the identity-less path will confirm
-/// anything (review finding).
+/// This is the one question that can arbitrate between two
+/// authenticated records that disagree — `/proc` is the only party
+/// with an opinion about which of them still describes something.
 #[cfg(target_os = "linux")]
-fn read_authentic_identity(path: &Path, pid: Option<i32>) -> Option<DaemonIdentity> {
-    let (raw, root_owned) = read_with_provenance(path).ok()?;
-    if !root_owned {
-        return None;
-    }
-    let (recorded_pid, id) = DaemonIdentity::decode(&raw).ok()?;
-    // A sidecar naming a different pid is left from a previous daemon.
-    // Comparing a live process against a dead one's ticks would call
-    // the live one reused, so this reads as "no identity recorded".
-    //
-    // `None` is the case where there is no pid file to disagree with,
-    // so the sidecar's own pid is the record — see `presence_of`.
-    if pid.is_some_and(|pid| recorded_pid != pid) {
-        return None;
-    }
-    id
+fn identity_is_live(id: &DaemonIdentity) -> bool {
+    proc_state(id.pid).is_ok_and(state_is_alive)
+        && start_ticks(id.pid).ok() == Some(id.start_ticks)
+        && boot_id().ok().as_deref() == Some(id.boot_id.as_str())
 }
 
 /// Read a state file and say whether it was root-owned, through ONE
@@ -734,7 +731,28 @@ pub fn presence_of(
             // It also stays a bare pid on the write side, because CLIs
             // from other bundles parse it whole.
             Ok((pid, _unauthenticated)) if root_owned && dir_ok => {
-                Record::Found(pid, read_authentic_identity(identity_path, Some(pid)))
+                match sidecar_record(identity_path, dir_ok) {
+                    Sidecar::Identity(id) if id.pid == pid => Record::Found(pid, Some(id)),
+                    // A sidecar naming a DIFFERENT pid used to be
+                    // discarded as a previous daemon's leftover. It is
+                    // just as much the shape a restart leaves when its
+                    // pid-file rewrite fails: NEW sidecar, OLD pid
+                    // file — and discarding the newer record let "old
+                    // pid dead" resolve to `Gone` under the live
+                    // replacement (review finding, P1). Which record
+                    // is stale is decided by /proc, the only party
+                    // with an opinion: an identity matching a live
+                    // process is a daemon, whoever else is named.
+                    Sidecar::Identity(id) if identity_is_live(&id) => Record::ConflictingRecords {
+                        recorded: pid,
+                        sidecar: id.pid,
+                    },
+                    // The sidecar names nothing living, so IT is the
+                    // stale one; the pid file stands alone, as an
+                    // identity-less record.
+                    Sidecar::Identity(_) => Record::Found(pid, None),
+                    _ => Record::Found(pid, None),
+                }
             }
             Ok((pid, _)) => Record::Unauthenticated(pid),
             // A pid file that exists but does not parse says nothing —
@@ -1020,7 +1038,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pf-authentic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
-        let me = std::process::id() as i32;
         let ident = dir.join("packetframe.identity");
         let pidfile = dir.join("packetframe.pid");
 
@@ -1030,7 +1047,7 @@ mod tests {
         std::fs::write(&ident, real.encode()).expect("write");
         std::fs::set_permissions(&ident, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         assert!(
-            read_authentic_identity(&ident, Some(me)).is_none(),
+            matches!(sidecar_record(&ident, true), Sidecar::Unusable(_)),
             "a record any user can write must not decide which pid is our daemon"
         );
 
@@ -1136,7 +1153,47 @@ mod tests {
              daemon: {p:?}"
         );
 
+        // A VALID stale pid file — naming a dead pid — beside that live
+        // sidecar is the restart-with-failed-rewrite shape, and it used
+        // to discard the sidecar for disagreeing with the pid file:
+        // "old pid dead" plus a name-limited scan became `Gone`, and
+        // `detach` unlinked pins beneath the live replacement (review
+        // finding, P1). Two authenticated records that disagree, with a
+        // live daemon in one, resolve to nothing.
+        std::fs::write(&pidfile, "2147483646\n").expect("write");
+        std::fs::set_permissions(&pidfile, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let p = presence_of(&pidfile, &ident, |_| false, || Scan::NoneFound);
+        assert!(
+            matches!(p, DaemonPresence::Unknown { .. }),
+            "a stale-but-valid pid file must not override a live sidecar into Gone: {p:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two authenticated records that disagree resolve to nothing —
+    /// never to absence, never to a signal-capable confirmation.
+    #[test]
+    fn conflicting_records_never_resolve_either_way() {
+        for alive in [false, true] {
+            for exe in [false, true] {
+                let p = decide(
+                    Record::ConflictingRecords {
+                        recorded: 42,
+                        sidecar: 43,
+                    },
+                    alive,
+                    None,
+                    exe,
+                    || Scan::NoneFound,
+                );
+                assert!(
+                    matches!(p, DaemonPresence::Unknown { .. }),
+                    "alive={alive} exe={exe}: a record conflict with a live daemon in it \
+                     must stay Unknown: {p:?}"
+                );
+            }
+        }
     }
 
     /// A sidecar that exists but cannot vouch is not a missing one.

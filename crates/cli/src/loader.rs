@@ -591,29 +591,142 @@ pub(crate) fn create_excl_no_follow(path: &Path) -> std::io::Result<std::fs::Fil
         .open(path)
 }
 
-/// Same shape but with one stale-`.tmp` retry. The retry runs only
-/// when `create_excl_no_follow` returns `AlreadyExists` and the
-/// existing path is a regular file (a leftover from a crashed run);
-/// a `.tmp` that's a symlink hits `ELOOP` on the retried open and
-/// the function gives up. A second `EEXIST` is treated as a real
-/// race between competing writers and errors out.
+/// Open an ABSOLUTE directory path one component at a time, each step
+/// `openat(O_DIRECTORY | O_NOFOLLOW)` relative to the descriptor of the
+/// previous one, creating missing components (0755) on the way.
+///
+/// Why a walk and not one `open`: `O_NOFOLLOW` guards only the FINAL
+/// component. The state-dir writes and the umask chmod used to resolve
+/// the whole path at once, so a symlink at an intermediate component —
+/// `/tmp/plant/state` with `plant` attacker-controlled — carried this
+/// root process wherever the attacker pointed, and the descriptor
+/// "verified" at the end belonged to a directory of their choosing
+/// (review finding, P1; the reader was already refusing such paths via
+/// canonicalize-equality, and the privileged writer must be at least as
+/// suspicious as the reader). Every component is opened without
+/// following; a symlink ANYWHERE fails with `ELOOP` and the write is
+/// refused.
+///
+/// `..` is refused outright — a state dir has no business being
+/// specified through parent traversal, and accepting it would make the
+/// walk's guarantees path-dependent.
 #[cfg(target_os = "linux")]
-fn create_excl_no_follow_with_retry(path: &Path) -> std::io::Result<std::fs::File> {
-    match create_excl_no_follow(path) {
+fn create_and_open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("state paths must be absolute: {}", path.display()),
+        ));
+    }
+    let mut dir = std::fs::File::open("/")?;
+    for comp in path.components() {
+        let name = match comp {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(n) => n,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing path component {other:?} in {}", path.display()),
+                ))
+            }
+        };
+        let c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path component")
+        })?;
+        let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            // Create it and re-open. A concurrent creator making this
+            // mkdirat lose with EEXIST is fine — the reopen decides.
+            unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
+            fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        }
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "open component {name:?} of {}: {e} (a symlink here is refused)",
+                    path.display()
+                ),
+            ));
+        }
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(dir)
+}
+
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` a file RELATIVE to an already-walked
+/// directory descriptor, mode 0600 — the dirfd twin of
+/// `create_excl_no_follow`, for writers that must not re-resolve the
+/// directory path between verifying it and using it.
+#[cfg(target_os = "linux")]
+fn openat_excl_no_follow(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Same shape but with one stale-`.tmp` retry, dirfd-relative
+/// throughout. The retry runs only when the create returns
+/// `AlreadyExists` and the existing entry is a regular file (a leftover
+/// from a crashed run), checked with `fstatat(AT_SYMLINK_NOFOLLOW)` so
+/// an attacker's symlink is not misclassified as a file. A second
+/// `EEXIST` is a real race between competing writers and errors out.
+#[cfg(target_os = "linux")]
+fn openat_excl_with_retry(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    match openat_excl_no_follow(dir, name) {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // unlink-and-retry, but only if the leftover is a plain
-            // file. symlink_metadata avoids following the symlink so
-            // we don't misclassify an attacker's symlink as a file.
-            let meta = std::fs::symlink_metadata(path)?;
-            if !meta.file_type().is_file() {
+            let c = std::ffi::CString::new(name).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name")
+            })?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG {
                 return Err(e);
             }
-            std::fs::remove_file(path)?;
-            create_excl_no_follow(path)
+            if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            openat_excl_no_follow(dir, name)
         }
         Err(e) => Err(e),
     }
+}
+
+/// `renameat` within one already-walked directory descriptor.
+#[cfg(target_os = "linux")]
+fn renameat_within(dir: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (f, t) = (std::ffi::CString::new(from), std::ffi::CString::new(to));
+    let (f, t) = (
+        f.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?,
+        t.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?,
+    );
+    if unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Atomically write the current PID to `path`. Uses write-then-rename
@@ -633,7 +746,18 @@ fn create_excl_no_follow_with_retry(path: &Path) -> std::io::Result<std::fs::Fil
 fn write_state_record(path: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    // EVERYTHING below happens relative to this one descriptor,
+    // obtained by a component-wise no-follow walk: the directory that
+    // was verified is the directory that is chmodded, written into,
+    // and renamed within. Resolving the path again for any of those
+    // steps would reintroduce the symlink redirections this exists to
+    // refuse (review findings, two rounds of them: first the final
+    // component, then the intermediate ones).
+    let dir = create_and_open_dir_no_follow(parent)?;
     // The reader trusts records only in a directory nobody else can
     // write (`dir_is_authentic`): a writable directory lets `rename`
     // relocate root-owned records whole, so per-file ownership proves
@@ -643,39 +767,22 @@ fn write_state_record(path: &Path, body: &str) -> std::io::Result<()> {
     // lifetime. Clear exactly the group/world-write bits and leave the
     // rest alone (an operator's deliberate 0700 stays 0700). Best
     // effort: if it fails, the reader refuses, which is the safe side.
-    //
-    // ON THE DESCRIPTOR, never the pathname. The first version ran
-    // `metadata` + `set_permissions` on the path, and both follow
-    // symlinks — so a pre-created `state-dir` symlink pointed this
-    // root chmod at any directory on the system, stripping write bits
-    // from whatever the attacker chose (review finding, P1; the same
-    // pathname-vs-descriptor defect as the record writes, one level
-    // up). `O_DIRECTORY | O_NOFOLLOW` refuses the symlink outright, and
-    // the fchmod applies to the directory that was actually opened. A
-    // symlinked state dir gets no chmod and no trust — the reader's
-    // `dir_is_authentic` refuses it the same way.
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Ok(dirf) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(parent)
-        {
-            if let Ok(meta) = dirf.metadata() {
-                let mode = meta.permissions().mode();
-                if meta.is_dir() && mode & 0o022 != 0 {
-                    let _ = dirf.set_permissions(std::fs::Permissions::from_mode(mode & !0o022));
-                }
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = dir.metadata() {
+            let mode = meta.permissions().mode();
+            if meta.is_dir() && mode & 0o022 != 0 {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode & !0o022));
             }
         }
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = format!("{name}.tmp");
     {
-        let mut f = create_excl_no_follow_with_retry(&tmp)?;
+        let mut f = openat_excl_with_retry(&dir, &tmp)?;
         writeln!(f, "{body}")?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    renameat_within(&dir, &tmp, name)
 }
 
 /// A BARE PID, exactly as before. The identity lives in a sidecar
@@ -946,17 +1053,23 @@ fn write_reconfigure_marker(path: &Path, status: &str) {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        tracing::warn!(error = %e, "could not create reconfigure marker dir");
-        return;
-    }
-    let tmp = path.with_extension("timestamp.tmp");
     let body = format!("{} {}\n", crate::scrub::scrub_control_chars(status), now_ns);
+    // Same dirfd discipline as `write_state_record`: this runs as root
+    // in the daemon's SIGHUP handler, and a marker path resolved whole
+    // would follow an intermediate symlink to wherever it points.
     let r = (|| -> std::io::Result<()> {
-        let mut f = create_excl_no_follow_with_retry(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+        let dir = create_and_open_dir_no_follow(parent)?;
+        let tmp = format!("{name}.tmp");
+        {
+            let mut f = openat_excl_with_retry(&dir, &tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+        }
+        renameat_within(&dir, &tmp, name)
     })();
     if let Err(e) = r {
         tracing::warn!(error = %e, "could not write reconfigure marker");
