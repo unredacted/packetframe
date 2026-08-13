@@ -103,9 +103,13 @@ pub struct VerifyOutcome {
 impl VerifyOutcome {
     /// Whether the FIB itself agrees with the ledger: at least one
     /// route was actually probed, nothing sampled disagreed, and the
-    /// nexthop-device mapping has no holes. This — and only this — is
-    /// the restart-worthy question: a wrong FIB is rebuilt by a fresh
-    /// resync, so teardown is a remedy.
+    /// nexthop-device mapping has no holes. This is the *fit to take
+    /// traffic* question, NOT the restart-worthy one — those were the
+    /// same predicate until 2026-08-13, when the primary's w7 window
+    /// showed the difference the hard way. Only `mismatches` is
+    /// restart-worthy (a fresh resync rebuilds a wrong FIB); the other
+    /// two failure modes here are conditions a teardown cannot change,
+    /// and `Verdict::event` routes them to a hold instead.
     ///
     /// **`sampled == 0` fails.** An earlier version treated it as a
     /// vacuous pass, and a test asserted that as intended — which was
@@ -114,7 +118,11 @@ impl VerifyOutcome {
     /// would (re-)steer traffic into a VPP with an empty FIB. That is
     /// the blackhole rule 1 exists to prevent, arrived at through the
     /// gate meant to prevent it. A box with genuinely no routes should
-    /// not be steered either, so failing is right in both readings.
+    /// not be steered either, so failing is right in both readings —
+    /// but failing here means "refuse steering", never "tear down": an
+    /// empty sample is what a fresh attach looks like before bird has
+    /// dumped, and tearing down for it produced seven kill-respawn
+    /// cycles in 31 s on the primary (w7, 2026-08-13).
     ///
     /// `unresolvable > 0` fails because it means the nexthop-device
     /// mapping is wrong — a misconfiguration, not a capacity condition
@@ -146,10 +154,14 @@ impl VerifyOutcome {
 
     /// One-line operator summary. Separates the two degraded counts,
     /// because "mapping is misconfigured" and "table outgrew the box"
-    /// are different pages at 03:00 — and a third label for dark
-    /// members, because "the FIB is wrong" and "a cable is out" are
-    /// too: the first is restart-worthy, the second reads FAIL only if
-    /// you want an operator to bounce a healthy dataplane.
+    /// are different pages at 03:00 — and distinct labels for dark
+    /// members and for a not-yet-deliverable table, because "the FIB
+    /// is wrong" and "a cable is out" and "bird has not dumped yet"
+    /// are three different situations: only the first is
+    /// restart-worthy, and labelling the others FAIL invites an
+    /// operator to bounce a dataplane a bounce cannot fix (the
+    /// supervisor made exactly that mistake until 2026-08-13 — see
+    /// `Verdict::event`).
     pub fn summary(&self) -> String {
         let mut s = format!(
             "verify {}: {}/{} probes matched, unresolvable={}, withheld={}",
@@ -157,8 +169,10 @@ impl VerifyOutcome {
                 "PASS"
             } else if self.fib_correct() {
                 "FIB OK, IN-USE MEMBER(S) DARK — steering refused, no restart"
-            } else {
+            } else if !self.mismatches.is_empty() {
                 "FAIL"
+            } else {
+                "INCOMPLETE — steering refused, no restart"
             },
             self.sampled.saturating_sub(self.mismatches.len()),
             self.sampled,

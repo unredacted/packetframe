@@ -409,6 +409,11 @@ struct Core {
     /// itself freezes VPP's workers (drill (d10), 2026-08-09). See
     /// [`DeferredResync`] for the two stages.
     deferred_resync: Option<DeferredResync>,
+    /// `Some` while a FRESH resync is holding `SyncComplete` back until
+    /// the completeness authority says the source has converged. Armed
+    /// by `start_resync`'s fresh arm when an authority is configured;
+    /// cleared by `drain_batch` on release. See [`FreshHold`].
+    fresh_hold: Option<FreshHold>,
     /// When the NIC was last audited against the steering ledger, and
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
@@ -626,6 +631,39 @@ impl SourceGate {
 enum SteerRequest {
     Settle,
     Revoke,
+}
+
+/// Armed by a FRESH `start_resync` when a completeness authority is
+/// configured (`require-table-complete on`). While armed, an idle
+/// drain during the resync reports [`crate::driver::Drain::AwaitingSource`]
+/// instead of `Idle`, so `SyncComplete` cannot fire — and the single
+/// verify runs over the full table rather than over whatever had
+/// trickled in when the pending map first went momentarily empty.
+///
+/// Why this exists: on a fresh attach the feed connects AFTER the
+/// module (bird dials the passive listener), so the first idle drain
+/// lands ~1 s after spawn with the mirror holding only the local seeds
+/// the tee excludes. Verify then sampled nothing, and the old verdict
+/// mapping tore VPP down for it — seven kill-respawn cycles in 31 s on
+/// the primary (w7, 2026-08-13), the first BEFORE bird's session had
+/// even opened, each respawn re-running the octeon driver's port start
+/// against the shared LMAC and blacking out the switch0 bridge. The
+/// adopted paths already defer behind [`SourceGate`]s for exactly this
+/// reason; this is the fresh path's equivalent, minus the floor
+/// machinery an empty dataplane does not need — installs keep
+/// trickling in while the hold is armed, so convergence overlaps the
+/// dump instead of following it.
+///
+/// Release needs the authority's CURRENT word (`authority_current`,
+/// the same helper the adopted release consults) AND a drained source
+/// backlog — the mirror-vs-bird comparison cannot see updates the feed
+/// still holds (`source_current`'s doc describes that gap). With no
+/// authority configured there is nothing honest to wait for, the hold
+/// is never armed, and `Verdict::event`'s `VerifyIncomplete` arm is
+/// the backstop.
+struct FreshHold {
+    /// One log line per hold, not one per tick.
+    announced: bool,
 }
 
 /// What a deferred adopted reconciliation is waiting for.
@@ -1081,6 +1119,7 @@ impl Runtime {
                 last_store_error: None,
                 last_drain_error: None,
                 deferred_resync: None,
+                fresh_hold: None,
                 last_steer_audit: None,
                 steer_missing: 0,
                 steer_stray: 0,
@@ -2149,6 +2188,8 @@ impl Observe for ObserveView {
             engine,
             source,
             last_drain_error,
+            completeness,
+            fresh_hold,
             ..
         } = &mut *c;
         // `?`-equivalent: a failed neighbour programming must not be
@@ -2172,6 +2213,47 @@ impl Observe for ObserveView {
         // reports a fault that recovered as though it were still
         // happening.
         *last_drain_error = r.as_ref().err().cloned();
+        // The fresh-resync hold: an idle pending map during a fresh
+        // resync is NOT completion while the authority still says the
+        // source is short — it is what "bird has not dumped yet" looks
+        // like from in here, and letting it become `SyncComplete` runs
+        // verify against a table that is not there (see [`FreshHold`]).
+        // `AwaitingSource` extends the phase deadline, exactly as the
+        // adopted deferrals do, so a multi-minute dump cannot time the
+        // convergence out either. Backlog must be drained too: the
+        // authority compares bird against the MIRROR, which the tee has
+        // already updated, so an idle map plus a converged word can
+        // still hide a burst the feed holds (`source_current`'s gap).
+        let mut release_hold = false;
+        if let (Ok(crate::driver::Drain::Idle), Some(hold)) = (&r, fresh_hold.as_mut()) {
+            let have = source.route_count();
+            let released =
+                authority_current(completeness, have) == Some(true) && source.backlog() == 0;
+            if !released {
+                if !hold.announced {
+                    hold.announced = true;
+                    tracing::info!(
+                        have,
+                        "fresh resync is idle but the route source has not converged; \
+                         holding verify while installs continue"
+                    );
+                }
+                let want = completeness
+                    .as_ref()
+                    .and_then(|h| h.latest_verdict().0)
+                    .map_or(0, |rep| rep.authority_routes);
+                return Ok(crate::driver::Drain::AwaitingSource { have, want });
+            }
+            tracing::info!(
+                have,
+                "route source converged and drained; fresh resync complete — verifying \
+                 the full table"
+            );
+            release_hold = true;
+        }
+        if release_hold {
+            *fresh_hold = None;
+        }
         r
     }
 }
@@ -2408,6 +2490,9 @@ impl Effects for EffectsView {
 
     fn start_resync(&mut self) -> Result<(), String> {
         let mut c = self.core.borrow_mut();
+        // Any hold from an earlier attempt is that attempt's state.
+        // The fresh arm below re-arms it when it applies.
+        c.fresh_hold = None;
         // A steered start is necessarily a steered ADOPTION: rules
         // reach the NIC only after a verify, which no fresh spawn has
         // had, and inherited orphan rules are torn down before
@@ -2512,7 +2597,20 @@ impl Effects for EffectsView {
                 })
             }
         };
+        // The fresh arm (deferral: none) trickle-converges by design,
+        // but its VERIFY must wait for the loaded table where anyone
+        // can attest one. See [`FreshHold`] for the incident this
+        // encodes.
+        let fresh = deferral.is_none();
         c.deferred_resync = deferral;
+        if fresh && c.completeness.is_some() {
+            tracing::info!(
+                "fresh resync under a completeness authority: routes install as the \
+                 source loads, and verify waits until the authority confirms the \
+                 table is complete (require-table-complete)"
+            );
+            c.fresh_hold = Some(FreshHold { announced: false });
+        }
         Ok(())
     }
 
@@ -2552,6 +2650,23 @@ impl Effects for EffectsView {
                 // not from inside this Effects call — the same seam
                 // every driver test drives.
                 let event = verdict.event();
+                // Logged HERE, with the outcome's own words: the w7
+                // window (2026-08-13) produced seven teardowns whose
+                // only trace was the supervisor WARN naming the event
+                // — sampled/mismatches/unresolvable were invisible
+                // even with the unit log captured, and the loop was
+                // misread for a hardware fault because of it.
+                match event {
+                    Event::VerifyFailed => tracing::warn!(
+                        outcome = %verdict.outcome.summary(),
+                        "verify found FIB mismatches; teardown and a fresh resync follow"
+                    ),
+                    Event::VerifyIncomplete => tracing::info!(
+                        outcome = %verdict.outcome.summary(),
+                        "verify incomplete; steering stays refused and VPP stays up"
+                    ),
+                    _ => tracing::info!(outcome = %verdict.outcome.summary(), "verify passed"),
+                }
                 c.pending.push(event);
                 Ok(())
             }

@@ -2546,9 +2546,11 @@ fn a_steer_refused_by_completeness_retries_when_the_mirror_catches_up() {
     );
     let handle = std::sync::Arc::new(TableCompleteness::new());
     rt.require_table_complete(handle.clone());
-    // bird's dump is still arriving: five of a thousand.
+    // Converged at bring-up, so the fresh-resync hold releases and the
+    // box reaches `Ready` the honest way (the hold is its own test;
+    // this one is about the seam AT Ready).
     handle.publish(CompletenessReport {
-        authority_routes: 1_000,
+        authority_routes: 5,
         mirror_routes: 5,
         at: std::time::Instant::now(),
     });
@@ -2565,6 +2567,14 @@ fn a_steer_refused_by_completeness_retries_when_the_mirror_catches_up() {
         d.inject(t0, Event::Adopted { steered: false }, &mut fx);
     }
     let (mut now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+
+    // bird bounces and reloads: its count runs ahead of the mirror,
+    // and the verdict turns incomplete under a box already at Ready.
+    handle.publish(CompletenessReport {
+        authority_routes: 1_000,
+        mirror_routes: 5,
+        at: std::time::Instant::now(),
+    });
 
     // The operator turns the lever. The gate declines it.
     {
@@ -2853,12 +2863,13 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
         Box::new(EmptyTarget(Vec::new())),
         2,
     );
-    // A condemning verdict on top, because a rollback happens in
-    // exactly this weather and neither gate may hold it.
+    // Converged at bring-up so the fresh-resync hold releases; the
+    // condemning verdict lands AFTER Ready, which is when a rollback
+    // actually happens in this weather.
     let handle = std::sync::Arc::new(packetframe_common::fib::TableCompleteness::new());
     rt.require_table_complete(handle.clone());
     handle.publish(packetframe_common::fib::CompletenessReport {
-        authority_routes: 1_000,
+        authority_routes: 5,
         mirror_routes: 5,
         at: std::time::Instant::now(),
     });
@@ -2884,6 +2895,11 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
         counts.blocks_first_steer() && counts.withheld > 0,
         "and the FIB gate must really be closed, or this proves nothing: {counts:?}"
     );
+    handle.publish(packetframe_common::fib::CompletenessReport {
+        authority_routes: 1_000,
+        mirror_routes: 5,
+        at: std::time::Instant::now(),
+    });
 
     let (mut obs, _) = rt.views();
     use packetframe_vpp_offload::driver::Observe as _;
@@ -2891,5 +2907,253 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
         obs.steer_permitted(),
         "a reconcile that only removes must not be held by gates describing a table \
          traffic would be diverted INTO — that is what leaves a rollback unfinished"
+    );
+}
+
+/// The fresh-resync hold, end to end (primary w7, 2026-08-13): a fresh
+/// convergence under `require-table-complete on` whose source has not
+/// loaded yet must SIT in `Syncing` — installs trickling in as the feed
+/// delivers — and verify exactly once, over the full table, after the
+/// authority confirms it. The old behaviour was `SyncComplete` on the
+/// first momentarily-empty drain, ~1 s after spawn and before bird's
+/// session had even opened, then `sampled == 0` riding the
+/// restart-worthy verdict: seven kill-respawn cycles in 31 s, each one
+/// re-running the octeon driver's port start against the shared LMAC
+/// and blacking out the switch0 bridge below the kernel.
+///
+/// Driven through the adopted-an-empty-FIB door because host CI cannot
+/// spawn a real VPP — `adopted == 0` takes the identical fresh arm of
+/// `start_resync` (the harness note on `the_full_loop` test explains
+/// the constraint).
+#[test]
+fn a_fresh_convergence_holds_verify_until_the_authority_confirms_the_table() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+    use packetframe_vpp_offload::engine::SourceChanges;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A live-feed stand-in: the mirror fills over time, and new routes
+    /// reach the engine through `drain_changes`, exactly like the
+    /// production tee.
+    struct LoadingFeed {
+        mirror: Rc<RefCell<Vec<IpPrefix>>>,
+        queued: Rc<RefCell<Vec<IpPrefix>>>,
+    }
+    impl RouteSource for LoadingFeed {
+        fn requeue(&self, changes: SourceChanges) {
+            // Fill-if-absent is moot here: the test never fails a send.
+            self.queued
+                .borrow_mut()
+                .extend(changes.routes.into_iter().map(|(p, _)| p));
+        }
+        fn route_count(&self) -> u64 {
+            self.mirror.borrow().len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            self.mirror.borrow().len() as u64
+        }
+        fn backlog(&self) -> u64 {
+            self.queued.borrow().len() as u64
+        }
+        fn drain_changes(&self, max: usize) -> SourceChanges {
+            let mut q = self.queued.borrow_mut();
+            let take = q.len().min(max);
+            SourceChanges {
+                routes: q
+                    .drain(..take)
+                    .map(|p| (p, Some(vec![fake_vpp::nh()])))
+                    .collect(),
+                neighbours: Vec::new(),
+            }
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in self.mirror.borrow().iter() {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+
+    let fake = Fake::start("fresh-hold");
+    let mirror = Rc::new(RefCell::new(Vec::new()));
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let rt = runtime_with_source(
+        &fake,
+        Box::new(LoadingFeed {
+            mirror: Rc::clone(&mirror),
+            queued: Rc::clone(&queued),
+        }),
+    );
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, Event::Adopted { steered: false }, &mut fx);
+    }
+    assert_eq!(d.state(), State::Syncing);
+
+    // The incident window: the source is empty and the authority has
+    // published nothing. Thirty ticks was ~three teardowns' worth of
+    // wall time on the primary; here the loop must go NOWHERE.
+    let (mut obs, mut fx) = rt.views();
+    for _ in 0..30 {
+        let t = d.tick(now, &mut obs, &mut fx);
+        assert!(
+            !t.events.contains(&Event::SyncComplete),
+            "an empty pending map is not a complete sync while the authority is silent"
+        );
+        for e in rt.take_pending() {
+            assert!(
+                !matches!(e, Event::VerifyFailed),
+                "the exact verdict that kill-looped the primary"
+            );
+            d.inject(now, e, &mut fx);
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+    assert_eq!(
+        d.state(),
+        State::Syncing,
+        "holding IS the fix: no verify, no teardown, VPP untouched"
+    );
+    drop((obs, fx));
+
+    // bird's dump lands (through the delta seam, like the live feed)
+    // and the authority confirms it.
+    let table: Vec<IpPrefix> = (0..5).map(|i| fake_vpp::v4(0, i)).collect();
+    mirror.borrow_mut().extend(table.iter().copied());
+    queued.borrow_mut().extend(table.iter().copied());
+    handle.publish(CompletenessReport {
+        authority_routes: 5,
+        mirror_routes: 5,
+        at: Instant::now(),
+    });
+
+    let (_, events) = run_until(&mut d, &rt, now, |d| d.state() == State::Ready);
+    assert!(
+        events.contains(&Event::SyncComplete),
+        "the hold must release once the authority confirms: {events:?}"
+    );
+    assert!(
+        events.contains(&Event::VerifyPassed),
+        "and the one verify runs over the FULL table: {events:?}"
+    );
+    assert!(
+        !events.contains(&Event::VerifyFailed),
+        "no teardown anywhere in the whole convergence: {events:?}"
+    );
+    assert_eq!(rt.status().counts.installed, 5);
+}
+
+/// The two release conditions are AND, and the verdict backstop holds
+/// when the gate cannot: a converged authority word over a feed still
+/// HOLDING changes must not release (the mirror-vs-bird comparison
+/// cannot see them — the #160 gap), and when the release does come with
+/// nothing installed, the empty sample rides `VerifyIncomplete` — reach
+/// `Ready`, refuse steering — never the teardown verdict.
+#[test]
+fn a_backlog_blocks_the_release_and_an_empty_sample_never_tears_down() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+    use packetframe_vpp_offload::engine::SourceChanges;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Claims five routes and a converged-looking count, but has never
+    /// handed anything over and still holds a backlog.
+    struct Withholding {
+        backlog: Rc<Cell<u64>>,
+    }
+    impl RouteSource for Withholding {
+        fn requeue(&self, _: SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
+        fn route_count(&self) -> u64 {
+            5
+        }
+        fn change_seq(&self) -> u64 {
+            5
+        }
+        fn backlog(&self) -> u64 {
+            self.backlog.get()
+        }
+        fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+
+    let fake = Fake::start("fresh-hold-backlog");
+    let backlog = Rc::new(Cell::new(4_096u64));
+    let rt = runtime_with_source(
+        &fake,
+        Box::new(Withholding {
+            backlog: Rc::clone(&backlog),
+        }),
+    );
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    handle.publish(CompletenessReport {
+        authority_routes: 5,
+        mirror_routes: 5,
+        at: Instant::now(),
+    });
+
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, Event::Adopted { steered: false }, &mut fx);
+    }
+
+    // Authority says converged — but the feed still holds a backlog,
+    // and the backlog wins.
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..10 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            assert!(
+                !t.events.contains(&Event::SyncComplete),
+                "a converged word cannot vouch for changes the feed has not handed over"
+            );
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        assert_eq!(d.state(), State::Syncing);
+    }
+
+    // Backlog drains; the hold releases — onto a ledger that installed
+    // nothing, which is exactly the shape the verdict backstop covers.
+    backlog.set(0);
+    let (_, events) = run_until(&mut d, &rt, now, |d| d.state() == State::Ready);
+    assert!(
+        events.contains(&Event::VerifyIncomplete),
+        "an empty sample holds: {events:?}"
+    );
+    assert!(
+        !events.contains(&Event::VerifyFailed),
+        "and never tears down — a restart cannot conjure routes: {events:?}"
     );
 }
