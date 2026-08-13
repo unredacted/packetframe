@@ -82,38 +82,75 @@ jobs:
         # ship an encoder that silently disagrees with the VPP it talks
         # to — which would corrupt a FIB, not error out.
         #
-        # Two checks, because they close different gaps:
-        #   1. provenance: the vendored bundle's SOURCE.json (the
-        #      manifest of the release it was extracted from) must name
-        #      the same ref+platform as vpp/pin.toml. Without this, a
-        #      pin bump that forgets to re-vendor stays green — the
-        #      regenerate below would diff generated.rs against the
-        #      OLD bundle and find it reassuringly unchanged, and the
-        #      mismatch would surface only as a CRC refusal on a
-        #      router at attach time.
-        #   2. regenerate-and-diff: generated.rs matches the vendored
+        # Three checks, because they close different gaps:
+        #   1. provenance fields: the vendored bundle's SOURCE.json
+        #      (the manifest of the release it was extracted from)
+        #      must name the same repo+ref+platform as vpp/pin.toml.
+        #      Without this, a pin bump that forgets to re-vendor
+        #      stays green — the regenerate below would diff
+        #      generated.rs against the OLD bundle and find it
+        #      reassuringly unchanged, and the mismatch would surface
+        #      only as a CRC refusal on a router at attach time.
+        #      Network-free, so it gives the clear error first.
+        #   2. bytes against the release itself: download the pinned
+        #      release's vpp-api-json.tar.gz and byte-compare every
+        #      vendored .api.json (and SOURCE.json against the
+        #      release's manifest). Field checks alone cannot catch a
+        #      re-vendor that copied the new manifest but left stale
+        #      .api.json files behind — and a vendored checksum file
+        #      would just be a third thing to forget in the same
+        #      operation. The release is the truth; nothing vendored
+        #      attests itself. This also makes a pin naming a
+        #      nonexistent tag fail here instead of on a router.
+        #   3. regenerate-and-diff: generated.rs matches the vendored
         #      bundle, so a re-vendor that skipped the codegen step
         #      (or a hand-edit of generated.rs) fails here.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          vendored=crates/modules/vpp-offload/vpp-api
           pin_repo=$(grep -E '^\s*repo\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
           pin_ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
           pin_platform=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
-          src_ref=$(jq -r '.vpp_ref' crates/modules/vpp-offload/vpp-api/SOURCE.json)
-          src_platform=$(jq -r '.platform' crates/modules/vpp-offload/vpp-api/SOURCE.json)
+          src_ref=$(jq -r '.vpp_ref' "$vendored/SOURCE.json")
+          src_platform=$(jq -r '.platform' "$vendored/SOURCE.json")
           # built_by is "<repo>@<workflow sha>"; the repo half is the
           # provenance. Compared as well as ref/platform: a `repo`
           # change is a change of who attests the artifact, and a
           # bundle vendored from the old publisher must not silently
           # vouch for a tag on the new one — same-named releases on
           # different repos are not the same artifact.
-          src_repo=$(jq -r '.built_by' crates/modules/vpp-offload/vpp-api/SOURCE.json | cut -d'@' -f1)
+          src_repo=$(jq -r '.built_by' "$vendored/SOURCE.json" | cut -d'@' -f1)
           if [ "$pin_repo" != "$src_repo" ] || [ "$pin_ref" != "$src_ref" ] || [ "$pin_platform" != "$src_platform" ]; then
             echo "::error::vpp/pin.toml says ${pin_repo} ${pin_ref}/${pin_platform} but the vendored API bundle came from ${src_repo} ${src_ref}/${src_platform} — re-vendor vpp-api-json.tar.gz AND its release's manifest.json (as SOURCE.json) from the pinned release, then re-run the codegen"
             exit 1
           fi
+
+          # Check 2: the vendored bytes against the release the pin
+          # names. Same tag construction as the hwtest bundle's fetch
+          # line; the api bundle is the small asset, published
+          # separately for exactly this kind of consumer.
+          tag="vpp-${pin_ref}-${pin_platform}-bullseye-arm64"
+          dl=$(mktemp -d)
+          gh release download "$tag" --repo "$pin_repo" --dir "$dl" \
+            --pattern 'vpp-api-json.tar.gz' --pattern 'manifest.json' --pattern 'SHA256SUMS'
+          ( cd "$dl" && grep ' vpp-api-json\.tar\.gz$' SHA256SUMS | sha256sum -c - )
+          if ! diff <(jq -S . "$dl/manifest.json") <(jq -S . "$vendored/SOURCE.json"); then
+            echo "::error::SOURCE.json does not match the pinned release's manifest.json — re-vendor it"
+            exit 1
+          fi
+          mkdir "$dl/api" && tar xzf "$dl/vpp-api-json.tar.gz" -C "$dl/api"
+          for f in "$vendored"/*.api.json; do
+            base=$(basename "$f")
+            rel=$(find "$dl/api" -name "$base" -print -quit)
+            [ -n "$rel" ] || { echo "::error::$base is vendored but absent from the pinned release's API bundle"; exit 1; }
+            cmp -s "$rel" "$f" || { echo "::error::$base differs from the pinned release's copy — the vendored bundle is stale, re-vendor it"; exit 1; }
+          done
+          echo "vendored bundle matches $pin_repo $tag byte for byte"
+
           cargo run -q -p packetframe-vpp-api-codegen -- \
-            crates/modules/vpp-offload/vpp-api \
+            "$vendored" \
             crates/modules/vpp-offload/src/vpp_api/generated.rs
           if ! git diff --exit-code -- crates/modules/vpp-offload/src/vpp_api/generated.rs; then
             echo "::error::generated.rs is stale — re-run the codegen and commit the result"
