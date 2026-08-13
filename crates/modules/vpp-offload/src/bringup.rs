@@ -732,6 +732,13 @@ fn finish(
         if let Some(handle) = feed_session {
             runtime.feed_session(handle);
         }
+        // The kernel rx-mode kick — the AllmultiKick doc in `runtime`
+        // carries the w6/w8 evidence. Installed unconditionally on
+        // Linux: every member VF attach needs it, and the real
+        // implementation logs each kick, so its absence from an attach
+        // log is itself the diagnostic.
+        #[cfg(target_os = "linux")]
+        runtime.rx_mode_kick(Box::new(crate::runtime::AllmultiKick));
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is

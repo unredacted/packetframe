@@ -3157,3 +3157,91 @@ fn a_backlog_blocks_the_release_and_an_empty_sample_never_tears_down() {
         "and never tears down — a restart cannot conjure routes: {events:?}"
     );
 }
+
+/// The kernel rx-mode kick runs once per member port after the device
+/// attach — the PF-side half of bringing a VF up on a shared LMAC.
+///
+/// w8 (primary, 2026-08-13) is the evidence this encodes: a single
+/// stable VPP — zero `VerifyFailed`, promisc vote acknowledged — and
+/// eth4's `rx_drops` froze within a second of device attach anyway,
+/// with the AF's channel-default entries 2004/2005 `enabled: no` at
+/// tFAIL. Only a PF-side rx-mode event re-installs them (five-for-five
+/// in the w6 kick cycles), so the module must issue that event itself,
+/// on every attach, or the first steer-less membership test blacks out
+/// the bridge again.
+#[test]
+fn the_rx_mode_kick_runs_per_member_after_the_device_attach() {
+    use packetframe_vpp_offload::runtime::RxModeKick;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Recording(Rc<RefCell<Vec<String>>>);
+    impl RxModeKick for Recording {
+        fn kick(&mut self, port: &str) -> Result<(), String> {
+            self.0.borrow_mut().push(port.to_string());
+            Ok(())
+        }
+    }
+
+    let fake = Fake::start("rx-kick");
+    let rt = runtime_for(&fake, 2);
+    let kicks = Rc::new(RefCell::new(Vec::new()));
+    rt.rx_mode_kick(Box::new(Recording(Rc::clone(&kicks))));
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (_, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    assert_eq!(
+        kicks.borrow().as_slice(),
+        ["eth4"],
+        "one kick per member port, after the attach, exactly once"
+    );
+}
+
+/// A failed kick degrades and warns; it must NOT fail the attach.
+///
+/// A teardown cannot fix a host-side ioctl — escalating this is the
+/// #180 defect with a new face. The port may be dark below the kernel,
+/// which is why the warning names the by-hand remedy, but the offload
+/// still converges and the operator decides.
+#[test]
+fn a_failed_kick_degrades_without_failing_the_attach() {
+    use packetframe_vpp_offload::runtime::RxModeKick;
+
+    struct Refusing;
+    impl RxModeKick for Refusing {
+        fn kick(&mut self, _port: &str) -> Result<(), String> {
+            Err("SIOCSIFFLAGS on eth4: Operation not permitted".into())
+        }
+    }
+
+    let fake = Fake::start("rx-kick-fail");
+    let rt = runtime_for(&fake, 2);
+    rt.rx_mode_kick(Box::new(Refusing));
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (_, events) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    assert!(
+        events.contains(&Event::VerifyPassed),
+        "the convergence itself is untouched by a kick failure: {events:?}"
+    );
+}

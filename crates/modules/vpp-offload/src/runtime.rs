@@ -172,6 +172,108 @@ impl ResourceRelease for NoResources {
     }
 }
 
+/// Re-asserts a member port's KERNEL PF rx-mode after the VPP side of
+/// a device attach settles.
+///
+/// Why this exists (w8, primary, 2026-08-13): bringing the member VF up
+/// disables the AF's channel-default MCAM entries for the whole shared
+/// LMAC (observed as entries 2004/2005 flipping `enabled: no`), which
+/// leaves the kernel PF deaf BELOW the kernel — `rx_drops` frozen,
+/// `IFF_PROMISC` still set, every host surface green — and on a
+/// bridge-member port (the primary's eth4/switch0) that is a full
+/// bridge blackout. The VF-side promisc vote (#178) provably does NOT
+/// re-enable them: w8 ran a single stable VPP — no respawns, zero
+/// `VerifyFailed`, `sw_interface_set_promisc` acknowledged — and the
+/// port froze within a second of device attach anyway. Only a PF-side
+/// rx-mode event makes the AF re-install its defaults, proven
+/// five-for-five by the w6 kick cycles (~1 s recovery each). The
+/// re-breaks that made the kick look non-viable in w6 were the verify
+/// kill-respawn loop #180 removed: each new VPP's port start
+/// re-disabled the entries within its backoff interval.
+///
+/// A trait rather than a direct ioctl so the service tests can record
+/// calls and non-Linux builds never pretend.
+pub trait RxModeKick {
+    /// Force the kernel netdev named `port` to resend its rx-mode to
+    /// the AF. Any rx-mode event does it; the Linux implementation
+    /// toggles `IFF_ALLMULTI`.
+    fn kick(&mut self, port: &str) -> Result<(), String>;
+}
+
+/// No kick installed: tests and harnesses. Deliberately SILENT — the
+/// real implementation logs each kick, so a production attach log
+/// without the kick lines means the wiring did not install
+/// [`AllmultiKick`], visibly, rather than a stub logging success it
+/// never performed.
+#[derive(Debug, Default)]
+pub struct NoKick;
+impl RxModeKick for NoKick {
+    fn kick(&mut self, _port: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The real kick: `IFF_ALLMULTI` on, then back to the flags that were
+/// read, via `SIOCSIFFLAGS` on the kernel netdev. Two rx-mode events,
+/// each forcing the PF driver to resend `NIX_RX_MODE` to the AF; the
+/// entries end enabled and the port's flags end where they started.
+/// Same ioctl shape and musl/glibc cast note as
+/// `ntuple::sys::ethtool_raw`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub struct AllmultiKick;
+
+#[cfg(target_os = "linux")]
+impl RxModeKick for AllmultiKick {
+    fn kick(&mut self, port: &str) -> Result<(), String> {
+        fn flags_ioctl(port: &str, set_to: Option<libc::c_short>) -> Result<libc::c_short, String> {
+            let name = port.as_bytes();
+            let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+            if name.len() >= ifr.ifr_name.len() {
+                return Err(format!("interface name `{port}` exceeds IFNAMSIZ"));
+            }
+            for (dst, src) in ifr.ifr_name.iter_mut().zip(name) {
+                *dst = *src as libc::c_char;
+            }
+            let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            if sock < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let (cmd, verb) = match set_to {
+                Some(f) => {
+                    ifr.ifr_ifru.ifru_flags = f;
+                    (libc::SIOCSIFFLAGS, "SIOCSIFFLAGS")
+                }
+                None => (libc::SIOCGIFFLAGS, "SIOCGIFFLAGS"),
+            };
+            // `ioctl`'s request argument is `c_ulong` on glibc and
+            // `c_int` on musl; without the cast one published target
+            // does not compile, with it the other needs the allow.
+            #[allow(clippy::unnecessary_cast)]
+            let rc = unsafe { libc::ioctl(sock, cmd as _, &mut ifr) };
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(sock) };
+            if rc != 0 {
+                return Err(format!("{verb} on {port}: {err}"));
+            }
+            Ok(unsafe { ifr.ifr_ifru.ifru_flags })
+        }
+
+        let original = flags_ioctl(port, None)?;
+        let allmulti = libc::IFF_ALLMULTI as libc::c_short;
+        flags_ioctl(port, Some(original | allmulti))?;
+        // Restore EXACTLY what was read — an operator running with
+        // allmulti deliberately on must get it back.
+        flags_ioctl(port, Some(original))?;
+        tracing::info!(
+            port,
+            "kernel rx-mode re-asserted (allmulti toggle): the AF re-installs its \
+             channel-default MCAM entries for this LMAC"
+        );
+        Ok(())
+    }
+}
+
 /// What one pass of the steering audit established.
 ///
 /// Two facts rather than one, because they are independent: a pass can
@@ -414,6 +516,10 @@ struct Core {
     /// by `start_resync`'s fresh arm when an authority is configured;
     /// cleared by `drain_batch` on release. See [`FreshHold`].
     fresh_hold: Option<FreshHold>,
+    /// The kernel rx-mode kick, run per member port after every device
+    /// attach. [`NoKick`] until the attach wiring installs
+    /// [`AllmultiKick`] on Linux. See [`RxModeKick`] for the incident.
+    rx_kick: Box<dyn RxModeKick>,
     /// When the NIC was last audited against the steering ledger, and
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
@@ -1120,6 +1226,7 @@ impl Runtime {
                 last_drain_error: None,
                 deferred_resync: None,
                 fresh_hold: None,
+                rx_kick: Box::new(NoKick),
                 last_steer_audit: None,
                 steer_missing: 0,
                 steer_stray: 0,
@@ -1175,6 +1282,13 @@ impl Runtime {
     /// leaves behind.
     pub fn feed_session(&self, handle: std::sync::Arc<packetframe_common::fib::FeedSession>) {
         self.core.borrow_mut().feed_session = Some(handle);
+    }
+
+    /// Install the kernel rx-mode kick. The attach wiring installs the
+    /// ioctl-backed [`AllmultiKick`] on Linux; everything else keeps
+    /// [`NoKick`]. See [`RxModeKick`] for why this exists.
+    pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
+        self.core.borrow_mut().rx_kick = k;
     }
 
     /// Point steering at a new set of ports and rules.
@@ -2485,6 +2599,28 @@ impl Effects for EffectsView {
         // whole-record (see `note_persist`).
         let r = c.store.interfaces_attached(&indices);
         let _ = c.note_persist(r);
+        // The kernel PF's half of the attach: the VF that just came up
+        // disabled the AF's channel-default MCAM entries for the whole
+        // LMAC, and only a PF-side rx-mode event re-enables them — the
+        // VPP-side promisc vote provably does not (w8, 2026-08-13; see
+        // [`RxModeKick`]). Per member port, after EVERY device attach,
+        // so a supervisor respawn re-asserts it on the same path that
+        // re-created the condition. Failure is surfaced, not fatal: a
+        // teardown cannot fix a host-side ioctl, and escalating it is
+        // the #180 defect with a new face — but it IS a possible bridge
+        // blackout, so the warning names the by-hand remedy.
+        for (port, _) in &indices {
+            if let Err(e) = c.rx_kick.kick(port) {
+                tracing::warn!(
+                    port = %port,
+                    error = %e,
+                    "kernel rx-mode kick failed; the AF's channel-default MCAM entries \
+                     for this LMAC may be disabled and the kernel PF deaf below the \
+                     kernel (bridge members go dark). By hand: `ip link set <port> \
+                     allmulti on` then `allmulti off`"
+                );
+            }
+        }
         Ok(())
     }
 

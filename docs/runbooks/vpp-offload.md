@@ -852,6 +852,43 @@ keyword mis-encodes it on the rvu driver, so a rule installed by hand
 with that keyword lands somewhere else. Gate 0a established this by
 inserting both forms and reading back what the NIC stored.
 
+### A bridge-member port goes dark right after attach — hosts behind the bridge unreachable, every status green
+
+The shared-LMAC MCAM disable (found on the primary, w3–w8, 2026-08-13).
+On rvu, the AF's channel-default MCAM entries (the promisc/multicast
+catch-alls that make the KERNEL PF receive; `Installed by: PF0`,
+`Forward to: PF1` in the debugfs dump) cover the whole LMAC, and
+bringing the member VF up under VPP disables them. Fingerprint: the
+port's `ethtool -S <pf> | grep rx_drops` counter **freezes** within a
+second or two of the device attach while `ip link` still shows
+`PROMISC,UP`; hosts behind any bridge that port is a member of become
+unreachable, including from the router itself; nothing in `packetframe
+status`, VPP, or the kernel log complains. Confirm at the hardware
+table: `grep -A12 'mcam entry: <n>' /sys/kernel/debug/octeontx2/npc/mcam_rules`
+— the channel's default entries read `enabled: no`.
+
+The module handles this itself: after every device attach it toggles
+`IFF_ALLMULTI` on each member's kernel netdev (the "rx-mode kick" —
+look for `kernel rx-mode re-asserted` in the attach log), which forces
+the PF driver to resend its rx-mode and the AF to re-install its
+defaults. The VPP-side `sw_interface_set_promisc` the attach also sends
+does NOT re-enable them — only a PF-side event does; that was measured,
+not assumed (w6: five kick cycles, ~1 s recovery each; w8: a stable
+promisc-voting VPP went dark anyway).
+
+If the attach log shows the kick **failing**, or the port went dark
+later without an attach, apply it by hand and confirm the counter moves
+again:
+
+```sh
+ip link set <port> allmulti on && ip link set <port> allmulti off
+ethtool -S <port> | grep rx_drops   # twice, a second apart — must move
+```
+
+A port that re-breaks *without* a VPP restart in between is new
+behaviour beyond this entry: capture the mcam_rules dump before and
+after and treat it as an AF-level finding, not a packetframe one.
+
 ### A steer is refused with "the route mirror holds N of M routes"
 
 The completeness gate. bird's initial dump has not finished, so the
