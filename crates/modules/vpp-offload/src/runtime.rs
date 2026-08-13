@@ -1453,6 +1453,18 @@ impl Runtime {
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
+            // `want` is the authority's own count so the status row can
+            // say how far along the dump is; 0 until its first report,
+            // which the row words for separately.
+            fresh_hold: c.fresh_hold.as_ref().map(|_| {
+                (
+                    c.source.route_count(),
+                    c.completeness
+                        .as_ref()
+                        .and_then(|h| h.latest_verdict().0)
+                        .map_or(0, |r| r.authority_routes),
+                )
+            }),
             steer_missing: c.steer_missing,
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
@@ -1585,6 +1597,10 @@ pub struct RuntimeStatus {
     /// `Some((have, want))` while an adopted resync is deferred for a
     /// still-loading route source. See `Core::deferred_resync`.
     pub resync_deferred: Option<(u64, u64)>,
+    /// `Some((have, want))` while a fresh convergence holds verify for
+    /// the completeness authority. See [`FreshHold`] and the status
+    /// row's doc in `status.rs`.
+    pub fresh_hold: Option<(u64, u64)>,
     /// What the authority can say right now — the deferral health text
     /// depends on it: an attested deployment's below-floor wait
     /// resolves through the authority and telling it to "add bird"

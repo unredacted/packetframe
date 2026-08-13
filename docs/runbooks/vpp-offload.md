@@ -198,6 +198,15 @@ vppctl -s /run/packetframe/vpp/api.sock.cli show ip fib summary
 ```
 
 ```bash
+# What is the VF absorbing? While VPP holds a member VF, the kernel
+# PF's `rx_drops` legitimately freezes (w9/w10: the flood the kernel
+# used to receive-and-drop diverts to the VF) — these counters are
+# where it went. Worth reading before the first steer: flood absorbed
+# by poll-mode workers is CPU the canary should account for.
+vppctl -s /run/packetframe/vpp/api.sock.cli show interface
+```
+
+```bash
 # The interfaces VPP created, and their link state.
 vppctl -s /run/packetframe/vpp/api.sock.cli show interface
 ```
@@ -858,14 +867,23 @@ The shared-LMAC MCAM disable (found on the primary, w3–w8, 2026-08-13).
 On rvu, the AF's channel-default MCAM entries (the promisc/multicast
 catch-alls that make the KERNEL PF receive; `Installed by: PF0`,
 `Forward to: PF1` in the debugfs dump) cover the whole LMAC, and
-bringing the member VF up under VPP disables them. Fingerprint: the
-port's `ethtool -S <pf> | grep rx_drops` counter **freezes** within a
-second or two of the device attach while `ip link` still shows
-`PROMISC,UP`; hosts behind any bridge that port is a member of become
-unreachable, including from the router itself; nothing in `packetframe
-status`, VPP, or the kernel log complains. Confirm at the hardware
-table: `grep -A12 'mcam entry: <n>' /sys/kernel/debug/octeontx2/npc/mcam_rules`
+bringing the member VF up under VPP disables them. Fingerprint —
+**both halves required**: hosts behind any bridge that port is a
+member of become unreachable, including from the router itself, while
+every host surface stays green (`ip link` still shows `PROMISC,UP`,
+nothing in `packetframe status`, VPP, or the kernel log complains).
+The authoritative check is the hardware table:
+`grep -A12 'mcam entry: <n>' /sys/kernel/debug/octeontx2/npc/mcam_rules`
 — the channel's default entries read `enabled: no`.
+
+A frozen `ethtool -S <pf> | grep rx_drops` counter is **NOT** the
+fingerprint on its own, and treating it as one will false-alarm every
+healthy window. While VPP holds the member VF, `rx_drops` on the
+kernel PF legitimately stops counting (w9 and w10, both with entries
+enabled and traffic flowing perfectly): the flood the kernel used to
+receive-and-drop diverts to the VF instead. It resumes when VPP
+releases the VF. Deaf is *frozen counter AND unreachable hosts AND*
+`enabled: no` *in the table* — the middle one is what pages.
 
 The module handles this itself: after every device attach it toggles
 `IFF_ALLMULTI` on each member's kernel netdev (the "rx-mode kick" —
@@ -888,6 +906,10 @@ ethtool -S <port> | grep rx_drops   # twice, a second apart — must move
 A port that re-breaks *without* a VPP restart in between is new
 behaviour beyond this entry: capture the mcam_rules dump before and
 after and treat it as an AF-level finding, not a packetframe one.
+
+The complete evidence chain for the vendor report — the asymmetry,
+the reproduction, the w5–w10 forensics index — lives in
+`docs/vendor/rvu-af-channel-default-mcam.md`.
 
 ### A steer is refused with "the route mirror holds N of M routes"
 
@@ -1063,6 +1085,8 @@ Be precise about this when reasoning about an incident.
 | `ip_route_dump` at adoption | **7.04 s** for 1,054,548 routes | 2026-08-11, timed directly rather than inferred from a traffic gap. This is the barrier-sync freeze §the deferral exists to keep away from steered traffic. |
 | Adopted restart, UNSTEERED | ~53 s start→verified | 2026-08-11. Dump at +7 s, deferral held 32.8 s waiting for the mirror, diff+verify after. No traffic impact — nothing was steered. |
 | Cold bring-up (nothing running) | **11.4 s to `healthy`, ≤61 s to full table** | 2026-08-11. Read the caveat: `healthy` at 11.4 s meant **110,724 routes** — 10% of the table, verified clean. See "A verified FIB is not a complete one". |
+| Fresh six-port attach on the PRIMARY, behind bird's live dump | **~5 min in `Syncing` (held), then one verify** | 2026-08-13, w9 + w10: the #180 hold engaged at have≈23k and released at have≈1,055k; w10 verified PASS 64/64 on the release. This is the number to expect on every primary fresh attach — the 40.32 s row above is a resync from an already-loaded mirror, a different situation. |
+| Load while VPP runs, six workers | **~+7 load permanent** (poll mode), ~22 total during convergence vs ~6 baseline | 2026-08-13 w10. See the load note below. |
 | `reconfigure` (lever move) | **0.215 s** | 2026-08-11, exit 0, writes `OK <ns>` to `last-reconfigure.timestamp`. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
@@ -1071,6 +1095,50 @@ Be precise about this when reasoning about an incident.
 | number | status |
 |---|---|
 | `detach` across **more than one** VF | UNMEASURED — the single-VF case is measured above at 2.814 s. Nothing has torn down N>1 VFs, and the per-VF cost is unknown. |
+
+### A fresh attach on a full-table box holds in `Syncing` for minutes. That is the fix working.
+
+A FRESH attach (no VPP to adopt) under `require-table-complete on`
+converges *behind* bird's dump: routes install as they arrive, and the
+one readback verify waits until the completeness authority confirms
+the table. On the primary that is **~5 minutes of `Syncing`**,
+measured twice (2026-08-13, w9/w10). The status row says so while it
+holds:
+
+```
+fib-synced   DEGRADED — fresh convergence: routes install as the
+             source loads (mirror holds N of the authority's M) ...
+```
+
+and the log brackets it with `fresh resync is idle but the route
+source has not converged` and `route source converged and drained;
+fresh resync complete — verifying the full table`. Do not restart it,
+and do not page on it — the state before this hold existed was seven
+kill-respawn cycles in 31 s over an empty table (w7), and a restart
+re-enters the same dump from zero.
+
+A verify that ends `INCOMPLETE — steering refused, no restart` is the
+same philosophy after the hold releases: the FIB is not fit to divert
+traffic into (unresolvable routes, or nothing sampled), but nothing a
+teardown fixes is wrong. `FAIL` is reserved for probe mismatches —
+the one verdict a restart genuinely repairs — and only `FAIL`
+tears down.
+
+### Load rises by roughly one core per VPP worker, permanently. That is poll mode, not a fault.
+
+The native octeon driver supports neither interrupt nor adaptive rx
+mode (gate 0b item 9), so every VPP worker is a pure poll loop pinned
+at 100% — load average counts always-runnable threads, so six member
+ports at `cores 1` add ~7 to load (workers + main) for as long as VPP
+runs, forwarding or idle. w10 measured ~22 during convergence against
+a ~6 baseline: ~7 of that is the permanent poll cost, the rest was
+bird's dump plus the daemon feeding two tiers, and it subsides when
+convergence ends. Load average here is not starvation: the worker
+cores are deliberately vacated (daemon threads restricted away, NIC
+IRQs moved off them pre-attach), and w10's own counters showed the
+eBPF tier matching and forwarding normally throughout
+(`matched_v4` ≈ `rx_total`, `fwd_ok` climbing). Whether ~7 hot cores
+buy enough forwarding is exactly what the steering canary measures.
 
 ### A planned restart looks Degraded for 40-80 seconds. Do not page on it.
 
