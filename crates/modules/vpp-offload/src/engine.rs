@@ -306,15 +306,44 @@ impl Verdict {
     /// one place so a caller cannot pick `VerifyPassed` for an
     /// incomplete table.
     ///
-    /// `VerifyFailed` — the restart-worthy verdict — fires only when
-    /// the FIB itself is wrong ([`VerifyOutcome::fib_correct`]): a
-    /// fresh resync rebuilds a wrong FIB, so teardown is a remedy.
-    /// Dark member interfaces that CARRY ROUTES route through
-    /// `VerifyIncomplete` instead: same destination as a withheld
-    /// table — reach `Ready`, do NOT steer, keep the want — because a
-    /// restart cannot plug in a cable. Mapping them to `VerifyFailed`
-    /// turned three uncabled shadow ports into an infinite
-    /// kill-respawn loop over a flawless FIB (repro 2026-08-13).
+    /// `VerifyFailed` — the restart-worthy verdict — fires only on
+    /// **mismatches**: VPP answered a probe and disagreed with the
+    /// ledger. That is the one condition a teardown remedies, because
+    /// a fresh resync rebuilds a wrong FIB. Everything else that fails
+    /// [`VerifyOutcome::fib_correct`] is a condition a restart cannot
+    /// change, and each has produced a kill-respawn loop by riding
+    /// this verdict:
+    ///
+    /// - `sampled == 0` — the source has not delivered the table yet.
+    ///   On a fresh attach the feed connects AFTER the module (bird
+    ///   dials the passive listener), so the first verify can run with
+    ///   the sink legitimately empty. The primary's w7 window
+    ///   (2026-08-13) took SEVEN teardowns in 31 s through this arm —
+    ///   the first before bird's session had even opened — and every
+    ///   respawn re-ran the octeon driver's port start against the
+    ///   shared LMAC, blacking out the switch0 bridge below the
+    ///   kernel. A restart cannot make bird dump faster. (The
+    ///   fresh-resync hold in `runtime.rs` keeps verify from running
+    ///   this early at all when a completeness authority is
+    ///   configured; this arm is the backstop for deployments
+    ///   without one.)
+    /// - `unresolvable > 0` — the nexthop-device mapping has holes: a
+    ///   nexthop egresses a port VPP does not own, or a neighbour has
+    ///   not resolved yet. A restart cannot make eth3 a member. The
+    ///   single-member bisection configs are the standing case: the
+    ///   full table's nexthops egress non-member ports, permanently.
+    /// - Dark member interfaces that CARRY ROUTES — a restart cannot
+    ///   plug in a cable. Three uncabled shadow ports turned exactly
+    ///   this into an infinite kill-respawn loop over a flawless FIB
+    ///   (repro 2026-08-13).
+    ///
+    /// All of those ride `VerifyIncomplete`: reach `Ready`, keep the
+    /// want, do NOT steer. Steering stays refused by the LIVE gates —
+    /// `steer_permitted` re-reads the authority verdict, the source
+    /// backlog and `blocks_first_steer` on every retry, none of which
+    /// consult this verdict's snapshot — so recovery is the retry loop
+    /// noticing conditions changed, not a verdict going stale in
+    /// either direction.
     ///
     /// A dark member that is IDLE — no installed route can egress it,
     /// which is the normal state of a dark port, since the BGP session
@@ -324,16 +353,11 @@ impl Verdict {
     /// steer five live ports over one uncabled one would hold the
     /// whole offload hostage to a port that poses no risk (the
     /// primary's eth5 is the motivating case).
-    ///
-    /// The steer path re-checks link state AND usage fresh at steer
-    /// time, so recovery is the existing retry loop noticing the cable
-    /// came back, not a verify verdict going stale in either
-    /// direction.
     pub fn event(&self) -> crate::supervisor::Event {
         let blocking_dark = self.outcome.dead_interfaces.iter().any(|d| d.in_use);
-        if !self.outcome.fib_correct() {
+        if !self.outcome.mismatches.is_empty() {
             crate::supervisor::Event::VerifyFailed
-        } else if self.may_steer && !blocking_dark {
+        } else if self.outcome.fib_correct() && self.may_steer && !blocking_dark {
             crate::supervisor::Event::VerifyPassed
         } else {
             crate::supervisor::Event::VerifyIncomplete
@@ -2118,13 +2142,70 @@ mod tests {
             "and must not re-steer either"
         );
 
-        // A genuinely wrong FIB still fails, regardless of steerability.
+        // A genuinely wrong FIB still fails, regardless of steerability
+        // — and "wrong" means MISMATCHES: VPP answered a probe and
+        // disagreed. That is the only condition a teardown repairs.
         let wrong = Verdict {
-            outcome: VerifyOutcome::default(),
+            outcome: VerifyOutcome {
+                sampled: 64,
+                mismatches: vec![crate::verify::Mismatch::NoPaths {
+                    prefix: IpPrefix::V4 {
+                        addr: [192, 0, 2, 0],
+                        prefix_len: 24,
+                    },
+                }],
+                ..Default::default()
+            },
             may_steer: true,
         };
         assert!(!wrong.outcome.passed());
         assert_eq!(wrong.event(), Event::VerifyFailed);
+    }
+
+    /// A table the source has not delivered yet is not a wrong FIB,
+    /// and neither is a nexthop-device mapping with holes. Both fail
+    /// `fib_correct` — steering must refuse them — but neither is
+    /// restart-worthy: a teardown cannot make bird dump faster, and it
+    /// cannot make a non-member port a member.
+    ///
+    /// The primary's w7 window (2026-08-13) is the repro for the first
+    /// arm: verify ran ~1 s after spawn, before bird's session opened,
+    /// sampled nothing, and `sampled == 0` rode the restart-worthy
+    /// verdict — seven kill-respawn cycles in 31 s, each one re-running
+    /// the octeon driver's port start against the shared LMAC and
+    /// blacking out the switch0 bridge. The eth4-only bisection config
+    /// is the repro for the second: the full table's nexthops egress
+    /// eth2/eth3, which are not members, so `unresolvable` is
+    /// structurally nonzero and the old mapping could never converge.
+    #[test]
+    fn an_undelivered_or_unmappable_table_holds_rather_than_restarts() {
+        use crate::supervisor::Event;
+
+        let empty = Verdict {
+            outcome: VerifyOutcome::default(),
+            may_steer: false,
+        };
+        assert!(!empty.outcome.fib_correct(), "empty is still not correct");
+        assert_eq!(
+            empty.event(),
+            Event::VerifyIncomplete,
+            "an empty sample must hold, not tear down"
+        );
+
+        let holes = Verdict {
+            outcome: VerifyOutcome {
+                sampled: 64,
+                unresolvable: 3,
+                ..Default::default()
+            },
+            may_steer: false,
+        };
+        assert!(!holes.outcome.fib_correct(), "holes still refuse steering");
+        assert_eq!(
+            holes.event(),
+            Event::VerifyIncomplete,
+            "unresolvable routes must hold, not tear down"
+        );
     }
 
     /// A dark member interface is not a wrong FIB, and must not reach
@@ -2198,10 +2279,20 @@ mod tests {
         );
 
         // Both at once: a wrong FIB wins — teardown IS the remedy for
-        // that half, whatever the cabling looks like.
+        // that half, whatever the cabling looks like. "Wrong" means a
+        // probe mismatch; an empty sample alongside a dark member is
+        // two hold conditions, not a failure (the old `sampled: 0`
+        // fixture here asserted the exact mapping that kill-looped the
+        // primary's w7 window, 2026-08-13).
         let dark_and_wrong = Verdict {
             outcome: VerifyOutcome {
-                sampled: 0,
+                sampled: 64,
+                mismatches: vec![crate::verify::Mismatch::NoPaths {
+                    prefix: IpPrefix::V4 {
+                        addr: [192, 0, 2, 0],
+                        prefix_len: 24,
+                    },
+                }],
                 dead_interfaces: vec![DeadInterface {
                     sw_if_index: 2,
                     name: "octeon0/0".into(),
