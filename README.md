@@ -236,8 +236,11 @@ if VPP stops running.
 
 Steering is per-interface and off by default. You turn it on one
 interface at a time and turn it back off with a config reload, without
-restarting VPP. No VPP source lives in this repo: PacketFrame builds
-unmodified upstream VPP and publishes it under its own release tag.
+restarting VPP. No VPP source lives in this repo: unmodified upstream
+VPP is built and published for UniFi gateways by
+[unredacted/vpp-unifi](https://github.com/unredacted/vpp-unifi), and
+[`vpp/pin.toml`](vpp/pin.toml) records which of its release tags this
+repo consumes.
 
 The code is finished but has never run against a real VPP process or a
 real NIC. Read
@@ -376,7 +379,7 @@ packetframe/
 │   └── tools/vpp-api-codegen/        # generates VPP binary-API structs from its .api.json
 ├── conf/example.conf                 # annotated reference config
 ├── docs/runbooks/                    # operational runbooks
-├── vpp/pin.toml                      # which upstream VPP we build and ship
+├── vpp/pin.toml                      # which published VPP artifact we consume (built by unredacted/vpp-unifi)
 └── .github/workflows/                # CI (fmt/clippy/test, cross-build, qemu-verifier, release)
 ```
 

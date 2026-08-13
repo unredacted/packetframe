@@ -1,129 +1,34 @@
-# VPP upstream pin for the vpp-offload module (phase 4).
+# Which published VPP artifact the vpp-offload module consumes.
 #
-# THIS FILE IS THE BUILD TRIGGER. Editing it runs
-# `.github/workflows/vpp-build.yml`, which builds *unmodified upstream*
-# VPP inside a `debian:bullseye` container on a native arm64 runner and
-# publishes the .debs + API definitions under their own release tag.
-# Nothing else triggers that build — packetframe releases deliberately
-# do not, because VPP's artifacts are a function of this pin alone and
-# rebuilding them per release would burn ~45 min of CI reproducing
-# byte-identical output.
+# THIS FILE IS A CONSUMER RECORD, NOT A BUILD TRIGGER. The build lives
+# in github.com/unredacted/vpp-unifi (one pin file per UniFi gateway
+# target; the EFG's is pins/efg.toml, which also carries the full
+# empirical record of why platform=octeon9 is mandatory on that
+# hardware). It moved there because the build is a property of UniFi
+# hardware, not of packetframe — this repo is one consumer of the
+# published artifacts.
 #
-# Why we build at all (settled empirically 2026-08-01/02). Precisely:
-# fd.io DOES publish Debian bullseye packages in its per-release
-# repos (fdio/<YYMM>) — but amd64 only. Its arm64 builds are
-# Ubuntu-only (jammy/noble). So bullseye+arm64, the one combination
-# UniFi OS can install, is published nowhere at any version, and
-# Debian has never packaged VPP. Substituting the jammy arm64 deb
-# fails three ways: bullseye's dpkg can't unpack its zstd members, and
-# its symbol floor is GLIBC_2.34 against our 2.31. See
-# docs/runbooks/vpp-offload-spike.md.
+# What this file asserts: the release tag below —
+# `vpp-<ref>-<platform>-bullseye-arm64` on the repo below — is the VPP
+# that (a) the vendored API definitions under
+# crates/modules/vpp-offload/vpp-api/ were extracted from, so the
+# binary-API codegen generates against exactly this wire format, and
+# (b) the runbooks and the hwtest bundle's vpp-pin.txt tell operators
+# to install.
 #
-# We ship NO patches. This is repackaging, not forking.
+# Bumping VPP is therefore a TWO-REPO sequence, in order:
+#   1. vpp-unifi: edit the gateway pin, merge; CI builds, verifies and
+#      publishes the new tag (~45 min).
+#   2. here: update ref/platform below, re-vendor vpp-api-json.tar.gz
+#      from the new release into crates/modules/vpp-offload/vpp-api/,
+#      re-run the codegen and commit the result. CI's
+#      regenerate-and-diff job catches a wire-format change that this
+#      step missed; the transport's CRC handshake catches a router
+#      running a different VPP than this pin at attach time.
+# No cross-version adoption: upgrading a router is detach -> install
+# -> attach (see docs/runbooks/vpp-offload.md).
 
 [vpp]
-# Git ref in github.com/FDio/vpp. Use a release tag, never a branch:
-# branches move, and a moving pin defeats the point.
-#
-# Latest upstream stable release, and PROVISIONAL only in the sense
-# that gate 0b must confirm the DPDK↔AF mailbox handshake on the
-# reference hardware before we depend on it.
-#
-# Default to newest, not oldest. Newest gets security fixes and
-# upstream support; you drop back only when something forces you to,
-# and "might not build" was not a good enough reason — VPP's Makefile
-# in stable/2606 has explicit `debian-11` handling, so bullseye is a
-# supported build host. (An earlier version of this file pinned 23.06
-# on the assumption that newer lines had dropped Debian 11. That was
-# inferred from fd.io's *package* matrix, which describes their CI,
-# not what the source can build. Checked, wrong, corrected.)
-#
-# That said, "install-dep succeeds" is NOT the same as "bullseye's
-# toolchain is new enough". 26.06 requires CMake >= 3.19 and bullseye
-# ships 3.18.4, so the workflow installs upstream CMake before
-# building. Expect that supplementing to be the shape of any future
-# obstacle on this line: dependency PACKAGING still targets debian-11,
-# but individual TOOL floors have moved past it. If the list of
-# supplements ever grows past a couple of pinned tools, that is the
-# signal to take the fallback ladder below rather than to keep
-# rebuilding bullseye's toolchain from tarballs.
-#
-# v26.06 was tried on the shadow (2026-08-02) and its cnxk PMD fails
-# BEFORE the mailbox — this is measured, not assumed:
-#
-#   CNXK: populate_model(): Invalid RoC model (impl=0x43, part=0xb2,
-#                                              major=0x3, minor=0x0)
-#   CNXK: cn9k_nix_probe(): Failed to initialize platform model, rc=-22
-#
-# The cn9670 reports MIDR variant 3 — a die stepping absent from
-# drivers/common/cnxk/roc_model.c in EVERY public DPDK (the CN96xx
-# table stops at variant 2), and unknown MIDR is a hard -EINVAL with
-# no override (checked in v26.03 source: no env, no devargs, no
-# default-to-nearest). That gates the ENTIRE cnxk era, so the middle
-# fallback rungs (v25.10 / v24.10 / v23.06) would fail identically
-# and are SKIPPED on purpose.
-#
-# The octeontx2 era has no such gate: DPDK 21.11's otx2 code reads no
-# MIDR at probe (verified in source), and gate 0a's DPDK 20.11
-# testpmd moved real packets on this exact silicon. Hence v22.02 —
-# DPDK 21.11, the last `octeontx2`-named era. Note 21.11 ships BOTH
-# PMD families; if its cnxk half hits the same model gate, EAL tries
-# the next matching driver, which is exactly the gate-free octeontx2.
-#
-# v22.02 was then tried on the shadow (2026-08-02) and settled the
-# big question: **the AF↔VF mailbox WORKS.** DPDK 21.11's otx2 PMD
-# probed the VF through the SDK-era AF — interface created, MAC
-# assigned, full capability tables read. It then failed one layer up:
-#
-#   PMD: otx2_nix_rx_queue_setup(): mempool ops should be of
-#        octeontx2_npa type   (rte_eth_rx_queue_setup -> -22)
-#
-# Both otx2 and cnxk hard-require NPA mempool ops for packet buffers
-# (checked in 21.11 and 26.03 source — no bypass, no devarg), and
-# mainline VPP's buffer manager only provides its own "vpp" mempool
-# ops. So DPDK-PMD-inside-VPP is a dead end on this NIC at EVERY
-# version — the wall is VPP<->PMD buffer integration, not the
-# hardware, the kernel, or the era.
-#
-# The mainline path that remains is VPP's NATIVE octeon driver
-# (src/drivers/octeon), and every piece checks out in source:
-#   - it is gated on VPP_PLATFORM octeon9|octeon10 — which is why the
-#     generic build never contained it;
-#   - it links marvell-octeon-roc, and octeon-roc v26.05's model
-#     table (unlike DPDK's stale copy) HAS the cn9670's stepping:
-#     MIDR (0x43, 0xB2, major=3, minor=0) = **CN96xx D0**;
-#   - CN9K support is first-class (roc_model_is_cn9k() paths,
-#     PLATFORM_OCTEON9 defines).
-# Hence: ref back to latest stable, platform=octeon9. The native
-# driver is configured through VPP's vnet/dev `devices {}` startup
-# stanza, NOT `dpdk {}` — the spike runbook carries the shape.
-#
-# Kept for the record (all measured on the shadow, 2026-08-02):
-#   - v26.06 generic: cnxk PMD fails PRE-mailbox — DPDK's
-#     drivers/common/cnxk/roc_model.c stops at CN96xx variant 2 and
-#     hard-fails unknown MIDR with no override. Task #22 upstreams
-#     the D0 entry to DPDK (sync from octeon-roc); a courtesy fix
-#     now, not our critical path.
-#   - v25.10 / v24.10 / v23.06: same stale table, same failure, skip.
-#   - v22.02 generic: mailbox PASSES, rx queue setup fails on NPA
-#     mempool ops (above). Published tag stays as the mailbox-proof
-#     artifact.
+repo = "unredacted/vpp-unifi"
 ref = "v26.06"
-
-# Optional strict pin. When non-empty the workflow verifies the ref
-# resolves to exactly this commit and fails otherwise, so a retagged
-# upstream can't silently change what we ship. Recorded in the
-# published manifest either way.
-commit = ""
-
-# Build variant. Changing this produces a separately-tagged artifact;
-# variants coexist on the release page.
-#   "octeon9" = VPP_PLATFORM=octeon9: the ONLY shape that builds the
-#               native octeon driver (armv8.2-a+crc+crypto, 128B cache
-#               lines — correct for CN96xx). Required for this fleet;
-#               see above for why the DPDK PMD path cannot work.
-#   "generic" = baseline armv8-a, no octeon driver. Useful only for
-#               non-datapath testing of VPP itself.
-#   "cn9k"    = legacy DPDK-era tuning (octeontx2-era pins like
-#               v22.02): DPDK_MACHINE=cn9k + -mcpu=octeontx2.
 platform = "octeon9"

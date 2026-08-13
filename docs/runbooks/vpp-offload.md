@@ -1423,8 +1423,11 @@ module's own deltas.
 
 VPP is **not** bundled in packetframe's .deb — 100 MB against 1.3 MB,
 mismatched cadence, and independent rollback, which the failover design
-wants anyway. It ships on its own release tag, built from *unmodified*
-upstream source (no fd.io bullseye+arm64 package exists at any version).
+wants anyway. It ships on its own release tag from
+**github.com/unredacted/vpp-unifi** (the UniFi VPP build repo; this
+repo's `vpp/pin.toml` records which tag we consume), built from
+*unmodified* upstream source (no fd.io bullseye+arm64 package exists
+at any version).
 
 Pin: **v26.06**, `platform = "octeon9"`, tag
 `vpp-v26.06-octeon9-bullseye-arm64`. The platform is mandatory rather
