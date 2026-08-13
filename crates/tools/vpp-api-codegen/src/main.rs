@@ -83,6 +83,20 @@ const MESSAGES: &[&str] = &[
     //   rejection at /32).
     "sw_interface_set_mac_address",
     "sw_interface_set_mac_address_reply",
+    //   Promiscuous mode is a shared-LMAC VOTE on this hardware, not a
+    //   local flag. The rvu AF keeps per-function rx-mode state and
+    //   re-evaluates the channel's default MCAM entries (promisc +
+    //   multicast, AF-installed, forwarding to the kernel PF) on every
+    //   rx-mode event from ANY function on the LMAC. VPP's octeon
+    //   driver asserts promisc=off at port start by default, which
+    //   disabled those entries and made the bridge-member PF deaf to
+    //   all service traffic — measured on the primary 2026-08-14,
+    //   MCAM entries 2004/2005 flipping enabled:yes->no, recovered by
+    //   an rx-mode kick and re-broken within seconds by the next
+    //   re-evaluation. Setting the VPP port promiscuous flips the
+    //   stored vote, so every future re-evaluation lands enabled.
+    "sw_interface_set_promisc",
+    "sw_interface_set_promisc_reply",
     "create_loopback",
     "create_loopback_reply",
     "sw_interface_add_del_address",

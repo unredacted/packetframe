@@ -37,7 +37,7 @@ use packetframe_vpp_offload::vpp_api::generated::{
     ControlPingReply, CreateLoopbackReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute,
     IpRouteLookupReply, MessageTableEntry, SockclntCreateReply, SwInterfaceAddDelAddressReply,
     SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetUnnumberedReply, MESSAGE_META,
+    SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
 
@@ -312,6 +312,14 @@ impl Fake {
                     "sw_interface_set_flags" => {
                         out = reply_head("sw_interface_set_flags_reply");
                         SwInterfaceSetFlagsReply {
+                            context: ctx,
+                            retval: 0,
+                        }
+                        .encode(&mut out);
+                    }
+                    "sw_interface_set_promisc" => {
+                        out = reply_head("sw_interface_set_promisc_reply");
+                        SwInterfaceSetPromiscReply {
                             context: ctx,
                             retval: 0,
                         }
@@ -657,6 +665,13 @@ fn attach_sends_every_message_a_forwarding_port_needs_in_order() {
             "sw_interface_set_mac_address".to_string(),
             "sw_interface_dump".to_string(),
             "control_ping".to_string(),
+            // The promisc VOTE, after the MAC and before the port is
+            // announced. On this hardware promisc is shared-LMAC state
+            // the AF re-evaluates from every function's stored vote;
+            // VPP's own default (off) disabled the kernel PF's bridge
+            // entries and blacked out service delivery (primary,
+            // 2026-08-14). Missing this call is that outage.
+            "sw_interface_set_promisc".to_string(),
             "sw_interface_set_unnumbered".to_string(),
         ]
     );
@@ -790,6 +805,13 @@ fn a_recorded_interface_is_reused_not_re_attached() {
     // this is the reconcile point.
     assert!(
         seen.contains(&"sw_interface_set_flags".to_string()),
+        "{seen:?}"
+    );
+    // And so is the promisc vote — an adopted VPP re-applies its port
+    // config on our schedule too, and the vote is what keeps the AF
+    // re-evaluations landing enabled (primary blackout, 2026-08-14).
+    assert!(
+        seen.contains(&"sw_interface_set_promisc".to_string()),
         "{seen:?}"
     );
 }

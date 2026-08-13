@@ -35,8 +35,8 @@ use packetframe_vpp_offload::vpp_api::generated::{
     IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
     IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
     SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
-    SwInterfaceSetMacAddressReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
-    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    SwInterfaceSetMacAddressReply, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply,
+    ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -314,6 +314,14 @@ fn serve(
             "sw_interface_set_flags" => {
                 out = reply_head("sw_interface_set_flags_reply");
                 SwInterfaceSetFlagsReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+            }
+            "sw_interface_set_promisc" => {
+                out = reply_head("sw_interface_set_promisc_reply");
+                SwInterfaceSetPromiscReply {
                     context: ctx,
                     retval: 0,
                 }
