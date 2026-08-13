@@ -73,6 +73,8 @@ pub struct AttachPaths {
     pub sys: SysPaths,
     /// `/sys/devices/system/cpu`, for the worker placement.
     pub sysfs_cpu: PathBuf,
+    /// `/proc/irq`, for the NIC-IRQ/worker-core overlap check.
+    pub proc_irq: PathBuf,
     pub api_socket: PathBuf,
     pub startup_conf: PathBuf,
 }
@@ -82,6 +84,7 @@ impl AttachPaths {
         Self {
             sys: SysPaths::live(state_dir, hugepage_bytes),
             sysfs_cpu: PathBuf::from(cores::SYSFS_CPU),
+            proc_irq: PathBuf::from("/proc/irq"),
             api_socket: PathBuf::from(API_SOCKET),
             startup_conf: PathBuf::from(STARTUP_CONF),
         }
@@ -264,6 +267,44 @@ pub fn bring_up(
     let workers = cfg.total_workers();
     let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;
     let core_map = cores::derive_from_sysfs(&paths.sysfs_cpu, workers)?;
+
+    // NIC queue IRQs must not fire on the cores VPP is about to burn.
+    // This used to be an advice line in the attach log ("move PF IRQ
+    // affinity off the worker cores") — printed and unenforced on the
+    // first primary attach (2026-08-13), where six poll-mode workers
+    // landed on CPUs carrying production rx-queue IRQs: load ~10,
+    // management ssh dropped, birdc past its budget, and VPP itself
+    // starved into a supervisor restart loop. Still pure/read-only —
+    // a refused config must cost no sysfs writes.
+    let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _)| i.clone()).collect();
+    let mut vpp_cores = vec![core_map.main];
+    vpp_cores.extend(&core_map.workers);
+    let conflicts = cores::nic_irq_conflicts(
+        &paths.sys.sysfs_net,
+        &paths.proc_irq,
+        &member_ifaces,
+        &vpp_cores,
+    )?;
+    if !conflicts.is_empty() {
+        let sample: Vec<String> = conflicts
+            .iter()
+            .take(8)
+            .map(|c| format!("{} irq {} -> cpu {:?}", c.iface, c.irq, c.cpus))
+            .collect();
+        return Err(format!(
+            "{} NIC queue IRQ(s) currently fire on the cores derived for VPP (main {}, \
+             workers {:?}): {}{}. Six hot pollers sharing CPUs with production rx-queue \
+             IRQs is how the first primary attach starved the box into a restart loop. \
+             Move these IRQs off the VPP cores first — for each: \
+             `echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list` — \
+             then re-attach (docs/runbooks/vpp-offload.md, \"IRQ affinity before attach\")",
+            conflicts.len(),
+            core_map.main,
+            core_map.workers,
+            sample.join(", "),
+            if conflicts.len() > 8 { ", ..." } else { "" },
+        ));
+    }
 
     let hugepage_bytes = paths.sys.hugepage_bytes;
     if hugepage_bytes == 0 {

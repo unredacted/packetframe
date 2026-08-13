@@ -668,9 +668,156 @@ mod affinity_tests {
     }
 }
 
+/// A NIC queue interrupt that currently fires on a CPU VPP is about to
+/// occupy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrqConflict {
+    pub iface: String,
+    pub irq: u32,
+    /// The overlapping CPUs — the intersection of the IRQ's effective
+    /// affinity with VPP's derived cores.
+    pub cpus: Vec<u16>,
+}
+
+/// Every NIC queue IRQ of `ifaces` whose *effective* affinity lands on
+/// one of `vpp_cores`.
+///
+/// This is the module-doc's "operator action" (move the PF IRQs off the
+/// derived worker set) turned into a checkable precondition. The first
+/// primary attach (2026-08-13) ran without it: NIC queue IRQs were
+/// pinned one-per-core across all 18 CPUs, six poll-mode workers landed
+/// on seven of them, and production softirq fought the pollers — load
+/// 10, management ssh dropped, birdc past its budget, and VPP itself
+/// starved into a supervisor restart loop. The attach log's advice line
+/// was printed and nothing enforced it.
+///
+/// `effective_affinity_list` rather than `smp_affinity_list`, because
+/// the question is where the IRQ **fires today**, not where it is
+/// permitted to fire: a 0-17 wildcard mask still delivers to exactly
+/// one CPU, and that CPU either is or is not about to become a hot
+/// poller. Falls back to `smp_affinity_list` on kernels that don't
+/// expose the effective file.
+///
+/// A port without an `msi_irqs` directory contributes nothing — that is
+/// the fixture-sysfs case and any non-MSI device, where there is no
+/// queue IRQ to conflict with. Unreadable affinity files skip the one
+/// IRQ (it may have been freed between the listing and the read);
+/// unreadable directories fail loudly.
+pub fn nic_irq_conflicts(
+    sysfs_net: &std::path::Path,
+    proc_irq: &std::path::Path,
+    ifaces: &[String],
+    vpp_cores: &[u16],
+) -> Result<Vec<IrqConflict>, String> {
+    let mut conflicts = Vec::new();
+    for iface in ifaces {
+        let dir = sysfs_net.join(iface).join("device").join("msi_irqs");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read {}: {e}", dir.display())),
+        };
+        let mut irqs: Vec<u32> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
+            .collect();
+        irqs.sort_unstable();
+        for irq in irqs {
+            let eff = proc_irq
+                .join(irq.to_string())
+                .join("effective_affinity_list");
+            let raw = match std::fs::read_to_string(&eff) {
+                Ok(s) => s,
+                Err(_) => {
+                    let smp = proc_irq.join(irq.to_string()).join("smp_affinity_list");
+                    match std::fs::read_to_string(&smp) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            let cpus = match parse_cpu_list(raw.trim()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let overlap: Vec<u16> = cpus.into_iter().filter(|c| vpp_cores.contains(c)).collect();
+            if !overlap.is_empty() {
+                conflicts.push(IrqConflict {
+                    iface: iface.clone(),
+                    irq,
+                    cpus: overlap,
+                });
+            }
+        }
+    }
+    Ok(conflicts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixture for the IRQ-overlap check: a sysfs-net with msi_irqs
+    /// entries and a proc-irq with affinity files, in a throwaway dir.
+    fn irq_fixture(tag: &str, irqs: &[(u32, &str)]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let mut base = std::env::temp_dir();
+        base.push(format!("pf-irq-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let net = base.join("net");
+        let proc_irq = base.join("proc_irq");
+        let msi = net.join("eth9").join("device").join("msi_irqs");
+        std::fs::create_dir_all(&msi).unwrap();
+        for (irq, aff) in irqs {
+            std::fs::write(msi.join(irq.to_string()), "").unwrap();
+            let d = proc_irq.join(irq.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("effective_affinity_list"), format!("{aff}\n")).unwrap();
+        }
+        (net, proc_irq)
+    }
+
+    /// The incident shape (primary, 2026-08-13): queue IRQs pinned
+    /// one-per-core, some landing exactly on the derived VPP cores.
+    /// Those — and only those — are conflicts.
+    #[test]
+    fn irq_on_a_vpp_core_is_a_conflict_and_others_are_not() {
+        let (net, proc_irq) = irq_fixture("overlap", &[(270, "11"), (261, "2"), (275, "16")]);
+        let got = nic_irq_conflicts(&net, &proc_irq, &["eth9".into()], &[10, 11, 16]).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                IrqConflict {
+                    iface: "eth9".into(),
+                    irq: 270,
+                    cpus: vec![11]
+                },
+                IrqConflict {
+                    iface: "eth9".into(),
+                    irq: 275,
+                    cpus: vec![16]
+                },
+            ]
+        );
+    }
+
+    /// A wildcard mask whose EFFECTIVE affinity is off the VPP cores is
+    /// not a conflict — the check asks where the IRQ fires, not where
+    /// it is permitted to.
+    #[test]
+    fn effective_affinity_decides_not_the_permitted_mask() {
+        let (net, proc_irq) = irq_fixture("effective", &[(300, "0")]);
+        let got = nic_irq_conflicts(&net, &proc_irq, &["eth9".into()], &[10, 11]).unwrap();
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// A port with no msi_irqs directory (fixture sysfs, non-MSI
+    /// device) contributes nothing rather than failing the attach.
+    #[test]
+    fn a_port_without_msi_irqs_is_skipped() {
+        let (net, proc_irq) = irq_fixture("absent", &[]);
+        let got = nic_irq_conflicts(&net, &proc_irq, &["eth-nonexistent".into()], &[1, 2]).unwrap();
+        assert!(got.is_empty());
+    }
 
     /// The reference fleet: 18 cores, `isolcpus=12` owned by
     /// unifi-core, four member ports at one worker each.

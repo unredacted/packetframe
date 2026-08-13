@@ -142,6 +142,11 @@ impl Host {
                     state_dir: base.join("state"),
                 },
                 sysfs_cpu: cpu,
+                // No entries: the fixture's ports have no msi_irqs
+                // directory either, so the IRQ-overlap check has
+                // nothing to inspect and passes — tests that WANT a
+                // conflict populate both sides (cores.rs unit tests).
+                proc_irq: base.join("proc_irq"),
                 api_socket,
                 startup_conf: base.join("startup.conf"),
             },
@@ -389,6 +394,65 @@ fn a_config_that_cannot_work_touches_nothing() {
     assert!(
         !host.paths.startup_conf.exists(),
         "a refused attach rendered a startup.conf"
+    );
+}
+
+/// The incident gate (primary, 2026-08-13): a NIC queue IRQ whose
+/// effective affinity lands on a derived VPP core refuses the attach —
+/// six hot pollers sharing CPUs with production rx-queue IRQs starved
+/// the box AND the VPP into a supervisor restart loop, and the only
+/// guard was an advice line in the attach log. Refusal happens in the
+/// pure phase: nothing may have been acquired.
+#[test]
+fn an_irq_on_a_vpp_core_refuses_the_attach() {
+    let fake = fake_vpp::Fake::start("bringup-irq");
+    let host = Host::new("irq", &[("eth4", "0002:07:00.0")], fake.path.clone());
+
+    // The fixture host: 18 online, cpu12 isolated ⇒ one worker lands
+    // on 17 (main on 16). Pin a queue IRQ of the member port there.
+    let msi = host
+        .paths
+        .sys
+        .sysfs_net
+        .join("eth4")
+        .join("device")
+        .join("msi_irqs");
+    fs::create_dir_all(&msi).unwrap();
+    fs::write(msi.join("270"), "").unwrap();
+    let d = host.paths.proc_irq.join("270");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("effective_affinity_list"), "17\n").unwrap();
+
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        None,
+        &McamBudget::default(),
+    )
+    .err()
+    .expect("must fail");
+    assert!(e.contains("NIC queue IRQ"), "{e}");
+    assert!(e.contains("irq 270"), "the refusal must name the IRQ: {e}");
+
+    // Pure-phase refusal: no VF, no reservation, no record.
+    assert!(host.state().is_none(), "a refused attach left a state file");
+    assert_eq!(
+        fs::read_to_string(
+            host.paths
+                .sys
+                .sysfs_net
+                .join("eth4")
+                .join("device")
+                .join("sriov_numvfs")
+        )
+        .unwrap()
+        .trim(),
+        "0",
+        "a refused attach created a VF"
     );
 }
 

@@ -13,13 +13,15 @@ use packetframe_common::probe::Capability;
 
 pub(crate) fn run(
     ports: &[String],
+    workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
 ) -> Vec<Capability> {
-    let mut caps = Vec::with_capacity(4 + ports.len());
+    let mut caps = Vec::with_capacity(5 + ports.len());
     caps.push(probe_iommu());
     caps.push(probe_vfio());
     caps.push(probe_hugepages());
+    caps.push(probe_irq_affinity(ports, workers));
     // Probe the binary the module will ACTUALLY exec. Probing the
     // defaults while the config names another path would report a pass
     // for an executable we never run (or a failure for one that
@@ -31,6 +33,62 @@ pub(crate) fn run(
     }
     caps.push(probe_steering_budget(ports, allowlist));
     caps
+}
+
+/// Do any NIC queue IRQs currently fire on the cores VPP would burn?
+///
+/// The probe that was missing before the first primary attach
+/// (2026-08-13): feasibility passed, and then six poll-mode workers
+/// landed on CPUs carrying production rx-queue IRQs — the exact overlap
+/// this reads off `/proc/irq` in seconds. Attach enforces the same
+/// check (`cores::nic_irq_conflicts`); this surfaces it before a
+/// maintenance window instead of during one.
+fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
+    use std::path::Path;
+    let name = "vpp.irq-affinity";
+    let map = match crate::cores::derive_from_sysfs(Path::new(crate::cores::SYSFS_CPU), workers) {
+        Ok(m) => m,
+        Err(e) => return Capability::unknown(name, format!("derive core map: {e}"), false),
+    };
+    let mut vpp_cores = vec![map.main];
+    vpp_cores.extend(&map.workers);
+    match crate::cores::nic_irq_conflicts(
+        Path::new("/sys/class/net"),
+        Path::new("/proc/irq"),
+        ports,
+        &vpp_cores,
+    ) {
+        Ok(c) if c.is_empty() => Capability::pass(
+            name,
+            format!(
+                "no NIC queue IRQ fires on the derived VPP cores (main {}, workers {:?})",
+                map.main, map.workers
+            ),
+            false,
+        ),
+        Ok(c) => {
+            let sample: Vec<String> = c
+                .iter()
+                .take(8)
+                .map(|x| format!("{} irq {} -> cpu {:?}", x.iface, x.irq, x.cpus))
+                .collect();
+            Capability::fail(
+                name,
+                format!(
+                    "{} NIC queue IRQ(s) fire on the derived VPP cores (main {}, workers \
+                     {:?}): {}{} — attach will refuse; move them first: `echo <cpu-list \
+                     outside the VPP cores> > /proc/irq/<N>/smp_affinity_list`",
+                    c.len(),
+                    map.main,
+                    map.workers,
+                    sample.join(", "),
+                    if c.len() > 8 { ", ..." } else { "" },
+                ),
+                false,
+            )
+        }
+        Err(e) => Capability::unknown(name, e, false),
+    }
 }
 
 /// Can the configured allowlist actually be steered?

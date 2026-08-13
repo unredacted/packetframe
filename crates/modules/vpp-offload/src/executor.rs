@@ -288,6 +288,16 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
             }
         }
     }
+    // Every failure goes to the JOURNAL, not only to the status
+    // snapshot. `last_failures` carries these on `packetframe status`,
+    // but a snapshot dies with the daemon — the first primary attach
+    // (2026-08-13) restart-looped through eight teardowns whose reasons
+    // existed only in status rows nobody captured, and the post-mortem
+    // had to be reconstructed from the VPP side of the conversation.
+    // The journal is the record that survives.
+    for (action, why) in &out.failures {
+        tracing::warn!(action = ?action, error = %why, "supervised action failed");
+    }
     out
 }
 
