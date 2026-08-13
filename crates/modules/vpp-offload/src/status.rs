@@ -302,6 +302,16 @@ pub struct StatusSnapshot {
     /// FIB is deliberately left forwarding, so this reads as Degraded
     /// with the reason, never as steered-but-broken.
     pub resync_deferred: Option<(u64, u64)>,
+    /// `Some((have, want))` while a FRESH convergence holds verify until
+    /// the completeness authority confirms the table: `have` is the
+    /// mirror's count now, `want` the authority's own count (`0` until
+    /// its first report). Routes install as the source loads — nothing
+    /// is being protected, unlike the adopted deferral — and on a
+    /// full-table feed this holds for the length of bird's dump
+    /// (~5 minutes on the primary, measured twice on 2026-08-13). An
+    /// operator watching `Syncing` for minutes needs the row to say
+    /// that is the designed path. See `runtime`'s `FreshHold`.
+    pub fresh_hold: Option<(u64, u64)>,
     /// See [`crate::runtime::RuntimeStatus::authority`].
     pub authority: crate::runtime::AuthorityPosture,
     pub ports: Vec<PortLink>,
@@ -368,6 +378,7 @@ impl StatusSnapshot {
             api,
             fib,
             None,
+            None,
             // No deferral in this shorthand, so the posture is unread;
             // Absent is the honest default rather than a claim.
             crate::runtime::AuthorityPosture::Absent,
@@ -398,6 +409,7 @@ impl StatusSnapshot {
         api: ApiHealth,
         fib: FibSync,
         resync_deferred: Option<(u64, u64)>,
+        fresh_hold: Option<(u64, u64)>,
         authority: crate::runtime::AuthorityPosture,
         ports: Vec<PortLink>,
         store_error: Option<String>,
@@ -422,6 +434,7 @@ impl StatusSnapshot {
             api,
             fib,
             resync_deferred,
+            fresh_hold,
             authority,
             ports,
             store_error,
@@ -835,6 +848,36 @@ impl StatusSnapshot {
                 HealthState::Unhealthy,
                 Some("traffic steered into an unverified FIB".into()),
             ),
+            // The FRESH counterpart of the deferral arm above, and
+            // AFTER the steered arm deliberately: a fresh hold is never
+            // steered (fresh spawns cannot be), so if the two ever
+            // coexist something upstream broke and the steered alarm is
+            // the one that must win. Unlike the adopted deferral nothing
+            // here is being protected — routes install as they arrive —
+            // so the row answers what an operator watching minutes of
+            // `Syncing` actually needs: this is the designed path, and
+            // here is what releases it (w10, 2026-08-13: ~5 minutes of
+            // hold behind bird's dump on the primary).
+            FibSync::NeverVerified if self.fresh_hold.is_some() => {
+                let (have, want) = self.fresh_hold.expect("checked above");
+                let msg = if want == 0 {
+                    format!(
+                        "fresh convergence: routes install as the source loads (mirror \
+                         holds {have}); verify waits for the completeness authority's \
+                         first report (require-table-complete). On a full-table feed \
+                         this holds for the length of bird's dump — minutes — by design"
+                    )
+                } else {
+                    format!(
+                        "fresh convergence: routes install as the source loads (mirror \
+                         holds {have} of the authority's {want}); verify runs once over \
+                         the complete table when the authority confirms it \
+                         (require-table-complete). On a full-table feed this holds for \
+                         the length of bird's dump — minutes — by design"
+                    )
+                };
+                (HealthState::Degraded, Some(msg))
+            }
             FibSync::NeverVerified => (HealthState::Degraded, Some("not yet verified".into())),
             FibSync::Failed { summary, .. } => (HealthState::Unhealthy, Some(summary.clone())),
             FibSync::Verified { sampled, .. } => {
@@ -2865,6 +2908,71 @@ mod tests {
             FibSync::from_outcome(&good, Duration::ZERO),
             FibSync::Verified { sampled: 64, .. }
         ));
+    }
+
+    /// The fresh hold reads as the designed path, not a fault.
+    ///
+    /// w10 (primary, 2026-08-13): five minutes of `Syncing` while the
+    /// #180 hold waited out bird's dump, with `packetframe status`
+    /// saying only "not yet verified" — the row an operator watches
+    /// during every fresh attach said nothing about WHY, for HOW LONG,
+    /// or that anything was progressing. The next shift babysits this
+    /// exact state; the row must carry the counts and name the release
+    /// condition, at Degraded, without paging.
+    #[test]
+    fn a_fresh_hold_names_the_designed_path_and_its_release() {
+        let led = ledger_with(23_107, 0, 0);
+        let mut snap = snap_of(
+            &ready_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            FibSync::NeverVerified,
+            ports_up(),
+        );
+        snap.fresh_hold = Some((23_107, 1_054_898));
+
+        let report = snap.report();
+        let fib = report
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_FIB)
+            .expect("the fib row always exists");
+        assert_eq!(
+            fib.state,
+            HealthState::Degraded,
+            "designed path, not a page"
+        );
+        let msg = fib.message.as_deref().expect("the hold explains itself");
+        assert!(
+            msg.contains("fresh convergence") && msg.contains("23107"),
+            "the row must say what is happening and how far along: {msg}"
+        );
+        assert!(
+            msg.contains("1054898") && msg.contains("require-table-complete"),
+            "and name the target and the release condition: {msg}"
+        );
+        assert_ne!(
+            report.overall,
+            HealthState::Unhealthy,
+            "a fresh attach converging behind a dump must never page"
+        );
+
+        // Before the authority's first report there is no honest
+        // target; the row must not print "of the authority's 0".
+        snap.fresh_hold = Some((23_107, 0));
+        let msg = snap
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|s| s.name == SUBSYS_FIB)
+            .and_then(|s| s.message)
+            .expect("still explains itself");
+        assert!(
+            msg.contains("first report") && !msg.contains("authority's 0"),
+            "no report yet is its own message, not a zero target: {msg}"
+        );
     }
 
     /// A vetoed deferral must not be described as waiting for quiet.
