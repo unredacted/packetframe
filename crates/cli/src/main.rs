@@ -352,7 +352,7 @@ fn main() -> ExitCode {
 }
 
 fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
-    let (bpffs_root, attach_ifaces, vpp_ports, vpp_binary, allowlist) = match &config {
+    let (bpffs_root, attach_ifaces, vpp_ports, vpp_workers, vpp_binary, allowlist) = match &config {
         Some(path) => match Config::from_file(path) {
             Ok(c) => {
                 if let Err(e) = c.validate_interfaces() {
@@ -365,12 +365,14 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 }
                 let ifaces = feasibility::attach_ifaces_from_config(&c);
                 let vpp_ports = feasibility::vpp_ports_from_config(&c);
+                let vpp_workers = feasibility::vpp_workers_from_config(&c);
                 let vpp_binary = feasibility::vpp_binary_from_config(&c);
                 let allowlist = feasibility::allowlist_from_config(&c);
                 (
                     c.global.bpffs_root,
                     ifaces,
                     vpp_ports,
+                    vpp_workers,
                     vpp_binary,
                     allowlist,
                 )
@@ -384,6 +386,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             std::path::PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             Vec::new(),
             Vec::new(),
+            0,
             None,
             Vec::new(),
         ),
@@ -393,6 +396,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         &bpffs_root,
         &attach_ifaces,
         &vpp_ports,
+        vpp_workers,
         vpp_binary.as_deref(),
         &allowlist,
         human,

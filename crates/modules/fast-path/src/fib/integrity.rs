@@ -21,7 +21,6 @@
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -419,18 +418,26 @@ async fn run_birdc_protocols(birdc: &std::path::Path) -> Result<usize, String> {
 const BIRDC_OUTPUT_CAP: usize = 1024 * 1024;
 
 async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let birdc = birdc.to_path_buf();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let args_display = format!("{args:?}");
-    let join = tokio::task::spawn_blocking(move || -> Result<BirdcOutput, String> {
-        // `Read` is in scope inside `read_capped` via its `R: Read`
-        // bound, no need to pull it in here.
+    // `tokio::process`, NOT `std::process` in `spawn_blocking`. The
+    // first shape put the timeout around the JoinHandle — but a blocking
+    // task cannot be cancelled, so a timeout dropped the handle and
+    // walked away from BOTH the parked thread and the child process. A
+    // bird slow enough to blow the 10s budget (observed on the primary
+    // 2026-08-13, under IRQ-contention load) left a birdc orphan that
+    // outlived the check, blocked daemon shutdown past systemd's
+    // stop-sigterm window, and got SIGKILLed by systemd alongside the
+    // daemon. `kill_on_drop` makes the timeout MEAN something: dropping
+    // this future — timeout, checker shutdown, daemon exit — kills the
+    // child.
+    let fut = async {
         use std::process::Stdio;
-        let mut child = Command::new(&birdc)
-            .args(&args)
+        let mut child = tokio::process::Command::new(birdc)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", birdc.display()))?;
         // SAFETY: `stdout`/`stderr` are Some because we configured
@@ -441,21 +448,21 @@ async fn run_birdc(birdc: &std::path::Path, args: &[&str]) -> Result<String, Str
         let mut stderr = child.stderr.take().expect("piped stderr");
         let mut stdout_buf = Vec::with_capacity(4096);
         let mut stderr_buf = Vec::with_capacity(1024);
-        let stdout_truncated = read_capped(&mut stdout, &mut stdout_buf, BIRDC_OUTPUT_CAP)
+        let stdout_truncated = read_capped_async(&mut stdout, &mut stdout_buf, BIRDC_OUTPUT_CAP)
+            .await
             .map_err(|e| format!("read birdc stdout: {e}"))?;
-        let _ = read_capped(&mut stderr, &mut stderr_buf, BIRDC_OUTPUT_CAP);
-        let status = child.wait().map_err(|e| format!("birdc wait: {e}"))?;
-        Ok(BirdcOutput {
+        let _ = read_capped_async(&mut stderr, &mut stderr_buf, BIRDC_OUTPUT_CAP).await;
+        let status = child.wait().await.map_err(|e| format!("birdc wait: {e}"))?;
+        Ok::<BirdcOutput, String>(BirdcOutput {
             status,
             stdout: stdout_buf,
             stderr: stderr_buf,
             stdout_truncated,
         })
-    });
-    let result = tokio::time::timeout(BIRDC_TIMEOUT, join)
+    };
+    let result = tokio::time::timeout(BIRDC_TIMEOUT, fut)
         .await
-        .map_err(|_| format!("birdc {args_display} exceeded {BIRDC_TIMEOUT:?}"))?
-        .map_err(|e| format!("birdc task join: {e}"))??;
+        .map_err(|_| format!("birdc {args_display} exceeded {BIRDC_TIMEOUT:?} (child killed)"))??;
     if !result.status.success() {
         return Err(format!(
             "birdc exit {}: stderr={}",
@@ -483,14 +490,20 @@ struct BirdcOutput {
 /// Read from `r` into `buf` up to `cap` bytes. Returns true when the
 /// reader had more data than the cap (the caller surfaces this as a
 /// hard error rather than parsing a runaway stream).
-fn read_capped<R: std::io::Read>(
+///
+/// Async twin of the original sync helper (replaced when `run_birdc`
+/// moved to `tokio::process` so a timed-out child gets killed instead
+/// of orphaned). Semantics preserved, including draining past the cap
+/// so the child's write end never blocks on a full pipe buffer.
+async fn read_capped_async<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> std::io::Result<bool> {
+    use tokio::io::AsyncReadExt;
     let mut chunk = [0u8; 4096];
     loop {
-        let n = match r.read(&mut chunk) {
+        let n = match r.read(&mut chunk).await {
             Ok(0) => return Ok(false),
             Ok(n) => n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -502,7 +515,7 @@ fn read_capped<R: std::io::Read>(
             // Drain the rest of the reader so the child's write end
             // doesn't block on a full pipe buffer once we return.
             let mut sink = [0u8; 4096];
-            while r.read(&mut sink).unwrap_or(0) > 0 {}
+            while r.read(&mut sink).await.unwrap_or(0) > 0 {}
             return Ok(true);
         }
         buf.extend_from_slice(&chunk[..n]);

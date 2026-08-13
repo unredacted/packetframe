@@ -56,6 +56,7 @@ running badly.
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
+- [IRQ affinity before attach](#irq-affinity-before-attach)
 - [Constraints worth knowing before you debug](#constraints-worth-knowing-before-you-debug)
 
 ## Architecture at a glance
@@ -946,14 +947,29 @@ anything.
 
 ### The offload restarts repeatedly
 
-`packetframe status` carries the reason on the failing subsystem, and it
-is **sticky** — retained across the empty backoff ticks that follow a
-failure, so a slow poll cannot miss it. Read it before touching
-anything; the counter of failures is not the reason.
+**Two places carry the reason; read both.** `packetframe status` holds
+it on the **`last-tick`** row — sticky, retained across the empty
+backoff ticks that follow a failure, so a slow poll cannot miss it. Do
+not grep status for only the subsystem names you expect: the 2026-08-13
+primary incident was diagnosed blind because the status reads filtered
+out exactly this row, and the reason died with the daemon. The
+**journal** now carries it permanently: every teardown logs
+`supervisor ordered VPP teardown` (WARN, with the triggering event and
+the state transition) and every failed step logs
+`supervised action failed` (WARN, with the action and its error) —
+`journalctl -u packetframe | grep -E "teardown|action failed"`
+reconstructs a loop after the fact. The counter of failures is not the
+reason.
 
 If the reason mentions a CRC or version mismatch, supervision has
 *ended* rather than looping: the binary API is permanently incompatible
 and no retry can fix it. The installed VPP is not the pinned one.
+
+If the box itself is degraded while the loop runs — climbing load,
+sluggish ssh, `birdc` timeouts in the fast-path integrity row — check
+NIC queue IRQ affinity against the VPP cores first (see
+[IRQ affinity before attach](#irq-affinity-before-attach)); on builds
+carrying the check, attach refuses this shape before it can start.
 
 ### A steer or unsteer that "cannot be confirmed"
 
@@ -1450,6 +1466,40 @@ adopting one is a deliberate two-repo sequence, and whether it needs a
 new packetframe release is answered by the `generated.rs` diff during
 the re-vendor. The full compatibility model and bump procedure:
 `crates/modules/vpp-offload/vpp-api/README.md`.
+
+## IRQ affinity before attach
+
+VPP workers are poll-mode: each one owns its CPU at 100% duty cycle
+from the moment it spawns. On the reference NIC every CPU carries an
+rx-queue IRQ (18 cores = 18 queues, no idle silicon), so without
+operator action some of those IRQs fire on the cores the module derives
+for VPP — and production softirq then fights hot pollers for the same
+CPUs. The first primary attach (2026-08-13) ran exactly that
+experiment, involuntarily: load ~10, management ssh dropped, `birdc`
+past its 10 s budget, and VPP itself starved into a supervisor restart
+loop. Traffic stayed on the eBPF tier throughout — the fallback design
+held — but the box was degraded until the daemon was stopped.
+
+So the overlap is a **checked precondition**: `packetframe feasibility`
+reports it (`vpp.irq-affinity`, listing each conflicting IRQ and the
+derived cores), and attach **refuses** while any member port's queue
+IRQ has its *effective* affinity on a VPP core. Effective, not
+permitted: a `0-17` wildcard mask still delivers to exactly one CPU,
+and that CPU either is or is not about to become a hot poller.
+
+Remediation, before the maintenance window:
+
+```bash
+# Which cores VPP will take: run feasibility, read vpp.irq-affinity —
+# it names main + workers. Then, for each conflicting IRQ it lists:
+echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list
+```
+
+Re-run feasibility until `vpp.irq-affinity` passes; then attach. The
+affinity write does not persist across reboot — a box that reboots
+into a VPP config re-runs the refusal, which is the reminder. (udapi
+provision cycles may also rewrite affinities; if attach starts refusing
+on a box that used to pass, that is the first place to look.)
 
 ## Constraints worth knowing before you debug
 

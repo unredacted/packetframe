@@ -607,7 +607,27 @@ impl Driver {
             }
             let mut next = Vec::new();
             for e in queue.drain(..) {
+                let prior = self.sup.state();
                 let actions = self.sup.on(e.clone());
+                // A kill order names its cause, in the journal, at the
+                // moment it is given. The supervisor SIGTERMed VPP eight
+                // times during the first primary attach (2026-08-13) and
+                // the journal carried only VPP's "received SIGTERM" —
+                // the daemon side said nothing, so the loop had to be
+                // diagnosed from process lifetimes. The event here IS
+                // the reason; pairing it with the transition makes every
+                // teardown self-explaining.
+                if actions
+                    .iter()
+                    .any(|a| matches!(a, crate::supervisor::Action::Kill))
+                {
+                    tracing::warn!(
+                        event = ?e,
+                        from_state = ?prior,
+                        to_state = ?self.sup.state(),
+                        "supervisor ordered VPP teardown — the event is the cause"
+                    );
+                }
                 applied.push(e);
                 // Re-arm from the supervisor's own view after EVERY
                 // transition, including ones with no budget — arming

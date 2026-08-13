@@ -52,6 +52,25 @@ pub fn vpp_ports_from_config(config: &Config) -> Vec<String> {
     ports
 }
 
+/// Total VPP workers the config asks for — the sum of every `port`
+/// line's `cores`. The IRQ-affinity probe needs it to derive the same
+/// core map attach would, so the probe and the attach refusal cannot
+/// disagree about which CPUs are at stake.
+pub fn vpp_workers_from_config(config: &Config) -> u32 {
+    let mut workers = 0u32;
+    for m in &config.modules {
+        if m.name != "vpp-offload" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::VppPort { cores, .. } = d {
+                workers += u32::from(*cores);
+            }
+        }
+    }
+    workers
+}
+
 /// The fast-path allowlist, as the steering probe needs it.
 ///
 /// It comes from the **fast-path** section, not vpp-offload's: steered
@@ -99,6 +118,7 @@ pub fn probe_and_render(
     bpffs_root: &Path,
     attach_ifaces: &[String],
     vpp_ports: &[String],
+    vpp_workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[IpPrefix],
     human: bool,
@@ -126,13 +146,17 @@ pub fn probe_and_render(
     // the module's attach enforces.
     #[cfg(feature = "vpp-offload")]
     if !vpp_ports.is_empty() {
-        for cap in packetframe_vpp_offload::run_feasibility_probes(vpp_ports, vpp_binary, allowlist)
-        {
+        for cap in packetframe_vpp_offload::run_feasibility_probes(
+            vpp_ports,
+            vpp_workers,
+            vpp_binary,
+            allowlist,
+        ) {
             report.capabilities.push(cap);
         }
     }
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = (vpp_ports, vpp_binary, allowlist);
+    let _ = (vpp_ports, vpp_workers, vpp_binary, allowlist);
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.
