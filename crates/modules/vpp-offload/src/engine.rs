@@ -599,30 +599,44 @@ impl ConvergenceEngine {
     /// `status::StatusSnapshot::nominal` requires a *passing verify*
     /// independently — so the window is bounded by something that does
     /// not trust this value.
+    ///
+    /// `in_use` is deliberately NOT the verify-time
+    /// [`crate::verify::DeadInterface::in_use`]: verify does not re-run
+    /// in steady state, so that copy ages exactly like the link flags —
+    /// but in the dangerous direction. Routes shifting ONTO a dark
+    /// member after the last verify are what turn "idle, carries
+    /// nothing" into a blackhole, and the neighbour ledger here is the
+    /// engine's own current bookkeeping (the same `active_egress_indices`
+    /// read that feeds the steer gate), so the health surface reads it
+    /// live rather than as a recording.
     pub fn port_links(&self) -> Vec<PortLink> {
         let dead = self
             .last_verify
             .as_ref()
             .map(|v| v.dead_interfaces.as_slice())
             .unwrap_or_default();
+        let active = self.active_egress_indices();
         self.attached
             .iter()
-            .map(
-                |p| match dead.iter().find(|d| d.sw_if_index == p.sw_if_index) {
+            .map(|p| {
+                let in_use = active.contains(&p.sw_if_index);
+                match dead.iter().find(|d| d.sw_if_index == p.sw_if_index) {
                     Some(d) => PortLink {
                         port: p.port.clone(),
                         sw_if_index: p.sw_if_index,
                         admin_up: d.admin_up,
                         link_up: d.link_up,
+                        in_use,
                     },
                     None => PortLink {
                         port: p.port.clone(),
                         sw_if_index: p.sw_if_index,
                         admin_up: true,
                         link_up: true,
+                        in_use,
                     },
-                },
-            )
+                }
+            })
             .collect()
     }
 
@@ -2044,6 +2058,21 @@ mod tests {
         assert!(
             !links[0].link_up,
             "a port verify found dead must not report as forwarding"
+        );
+        // `in_use` is the CURRENT neighbour ledger, not the verify-time
+        // recording — the dead entry above claims in_use and must not be
+        // believed while no neighbour lives on the port. Verify never
+        // re-runs in steady state, so a recording would miss routes
+        // shifting onto a dark member afterwards.
+        assert!(
+            !links[0].in_use,
+            "no neighbour lives on idx 3, so nothing can egress there now"
+        );
+        e.neighbours_installed
+            .insert((3, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))), [0; 6]);
+        assert!(
+            e.port_links()[0].in_use,
+            "a neighbour on the port means installed routes can egress it"
         );
     }
 

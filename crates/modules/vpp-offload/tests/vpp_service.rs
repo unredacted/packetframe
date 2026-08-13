@@ -1864,3 +1864,182 @@ fn a_first_steer_refused_by_the_fib_gate_is_still_remembered() {
         log.lock().unwrap()
     );
 }
+
+/// The shadow's designed steady state, end to end: steered on one
+/// member with the other member dark-and-idle — and a failure episode
+/// behind it that must CLEAR.
+///
+/// Both halves are measured defects from the 2026-08-14 shadow chaos
+/// test, not hypotheticals:
+///
+/// - **Severity ignored `in_use`.** A steered, verified VPP with five
+///   dark-idle members read `ports UNHEALTHY` — the module's worst
+///   verdict for a box forwarding everything correctly. The steer gate
+///   and verify already drew the line at `DeadInterface::in_use`; the
+///   status surface was the one consumer that did not.
+/// - **`last-tick` never cleared.** After the storm recovered
+///   unattended, `vpp-process` read healthy with zero consecutive
+///   failures while `last_failures` still carried the whole storm
+///   history: the release keyed on overall health returning to
+///   `Healthy`, and a dark-idle member pins overall at Degraded for as
+///   long as the cable is out — permanently, on this fleet. The episode
+///   predicate releases on observed recovery instead.
+#[test]
+fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
+    let fake = fake_vpp::Fake::start_behaving(
+        "svc-dark-idle",
+        fake_vpp::Behaviour {
+            dark_extra_ports: true,
+            ..Default::default()
+        },
+    );
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+    let allow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = std::sync::Arc::clone(&allow);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![
+                    PortAttach {
+                        port: "eth4".into(),
+                        pci_addr: "0002:07:00.1".into(),
+                        port_id: 0,
+                        num_rx_queues: 1,
+                        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    },
+                    // The dark member: the fake reports every port after
+                    // the first as admin-up but link-down, and no
+                    // neighbour lives on it, so nothing can egress there.
+                    PortAttach {
+                        port: "eth5".into(),
+                        pci_addr: "0002:07:00.2".into(),
+                        port_id: 0,
+                        num_rx_queues: 1,
+                        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
+                    },
+                ],
+                vec!["eth4".into(), "eth5".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(GatedSteer {
+                    log: spy,
+                    allow: gate,
+                }),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    // Converges to Ready despite the dark member: verify routes it
+    // through the idle (non-blocking) verdict.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not reach Ready; last state {:?}, report {:?}",
+            s.state,
+            s.report
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Seed the failure episode: a lever move whose steer the gate
+    // refuses. The refusal is remembered — `steer_intended` holds, so
+    // the episode is NOT over — and stays remembered until steering
+    // matches intent again.
+    let err = svc
+        .apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
+        .expect_err("the gate is closed");
+    assert!(err.contains("refusing to steer"), "{err}");
+    let seeded = svc.status().expect("published");
+    assert!(
+        seeded
+            .last_failures
+            .iter()
+            .any(|f| f.contains("refusing to steer")),
+        "the refused steer's reason must be retained: {:?}",
+        seeded.last_failures
+    );
+
+    // Recovery: the operator's retry succeeds and the module steers.
+    allow.store(true, std::sync::atomic::Ordering::SeqCst);
+    svc.apply_steering(vec![("eth4".into(), 0)], plan_for(2), true, true)
+        .expect("the lever turns once the gate opens");
+
+    // The regression, both defects at once. The episode reasons must
+    // clear even though the dark-idle member holds overall at Degraded
+    // forever — under the old release ("wait for Healthy") this loop
+    // never terminates — and the steered snapshot must read Degraded,
+    // not Unhealthy, while it does.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Steered && s.last_failures.is_empty() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failure episode never cleared: state {:?}, overall {:?}, last_failures \
+             {:?}",
+            s.state,
+            s.report.overall,
+            s.last_failures
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        settled.report.overall,
+        HealthState::Degraded,
+        "steered with a dark-idle member is Degraded at most — it deliberately carries \
+         nothing: {:?}",
+        settled.report
+    );
+    let ports = settled
+        .report
+        .subsystems
+        .iter()
+        .find(|x| x.name == "ports")
+        .expect("ports row");
+    assert_eq!(
+        ports.state,
+        HealthState::Degraded,
+        "{:?}",
+        settled.report.subsystems
+    );
+    let msg = ports.message.as_deref().unwrap_or_default();
+    assert!(
+        msg.contains("eth5") && msg.contains("idle") && msg.contains("steering is unaffected"),
+        "the row must name the dark member and say it carries nothing: {msg}"
+    );
+}

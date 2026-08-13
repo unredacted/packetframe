@@ -181,6 +181,16 @@ pub struct Behaviour {
     /// convergence would delete the connected and local routes VPP needs
     /// to resolve any adjacency at all.
     pub existing_routes: &'static [([u8; 4], u8, u32, bool)],
+    /// Report every member port created after the first as admin-up but
+    /// LINK-DOWN — the dark-idle member shape (the primary's uncabled
+    /// eth5, the shadow's five idle members under `steer-direction src`).
+    ///
+    /// Also makes `dev_create_port_if` hand out sequential indices
+    /// (`ASSIGNED_INDEX`, `ASSIGNED_INDEX + 1`, ...) so a second member
+    /// exists at all; without this flag every create returns
+    /// `ASSIGNED_INDEX` and the dump reports exactly one interface, which
+    /// is what every single-port test depends on.
+    pub dark_extra_ports: bool,
 }
 
 impl Fake {
@@ -281,6 +291,10 @@ fn serve(
     write_frame(sock, &payload);
 
     let mut routes_seen = 0usize;
+    // Ports created on THIS connection, for `dark_extra_ports`. Resets
+    // with the connection, exactly like `macs`: a fresh attach after a
+    // reconnect re-creates its ports and must land on the same indices.
+    let mut ports_created = 0u32;
 
     loop {
         let req = read_frame(sock)?;
@@ -302,10 +316,16 @@ fn serve(
                 .encode(&mut out);
             }
             "dev_create_port_if" => {
+                let idx = if behaviour.dark_extra_ports {
+                    ASSIGNED_INDEX + ports_created
+                } else {
+                    ASSIGNED_INDEX
+                };
+                ports_created += 1;
                 out = reply_head("dev_create_port_if_reply");
                 DevCreatePortIfReply {
                     context: ctx,
-                    sw_if_index: ASSIGNED_INDEX,
+                    sw_if_index: idx,
                     retval: 0,
                     error_string: String::new(),
                 }
@@ -478,6 +498,21 @@ fn serve(
                 }
                 det.encode(&mut d);
                 write_frame(sock, &d);
+                // Every extra created port reports admin-up but
+                // link-down: flags 1 = IF_STATUS_ADMIN_UP alone, the
+                // dark-member shape.
+                if behaviour.dark_extra_ports {
+                    for n in 1..ports_created {
+                        let idx = ASSIGNED_INDEX + n;
+                        let mut d = reply_head("sw_interface_details");
+                        let mut det = details(idx, &format!("octeon{n}/0"), 1, ctx);
+                        if let Some(m) = macs.get(&idx) {
+                            det.l2_address = *m;
+                        }
+                        det.encode(&mut d);
+                        write_frame(sock, &d);
+                    }
+                }
                 continue;
             }
             "sw_interface_set_mac_address" => {
