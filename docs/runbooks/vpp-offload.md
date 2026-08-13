@@ -1423,47 +1423,33 @@ module's own deltas.
 
 VPP is **not** bundled in packetframe's .deb — 100 MB against 1.3 MB,
 mismatched cadence, and independent rollback, which the failover design
-wants anyway. It ships on its own release tag from
-**github.com/unredacted/vpp-unifi** (the UniFi VPP build repo; this
-repo's `vpp/pin.toml` records which tag we consume), built from
-*unmodified* upstream source (no fd.io bullseye+arm64 package exists
-at any version).
+wants anyway. For UniFi gateways it ships on its own release tag from
+**github.com/unredacted/vpp-unifi**, built from *unmodified* upstream
+source (no fd.io bullseye+arm64 package exists at any version). Which
+release this build of packetframe was codegen'd against is recorded in
+`crates/modules/vpp-offload/vpp-api/SOURCE.json` (and printed into the
+hwtest bundle's `vpp-pin.txt` as a ready fetch line); the CRC handshake
+refuses any VPP that disagrees at attach.
 
-Pin: **v26.06**, `platform = "octeon9"`, tag
-`vpp-v26.06-octeon9-bullseye-arm64`. The platform is mandatory rather
-than tuned — it is the only shape that builds the native octeon driver,
-and DPDK PMDs inside VPP are measured-dead on this NIC at every version.
-
-Four traps, each of which has cost real time:
-
-```bash
-# 1. Mask the service BEFORE install: the deb's postinst starts VPP.
-systemctl mask vpp.service
-# (on a re-run, stop it first)
-systemctl stop vpp.service; systemctl mask vpp.service
-```
-
-```bash
-# 2. VPP_INSTALL_SKIP_SYSCTL=1 is MANDATORY on routers. The deb writes
-#    vm.nr_hugepages=1024 assuming 2 MB pages; on this 64K-page kernel
-#    the default pool is 512 MB, so that is a 512 GiB request.
-VPP_INSTALL_SKIP_SYSCTL=1 dpkg -i vpp_*.deb
-```
-
-```bash
-# 3. Extract to /root, never /tmp — /tmp is noexec on UniFi OS, and a
-#    binary there fails at execve with EACCES.
-```
-
-```bash
-# 4. Removing the vpp package UNBINDS the VF from vfio-pci. Re-bind
-#    after every purge or upgrade, or the next attach finds the VF on
-#    the kernel driver and refuses.
-```
+**Installing VPP on a gateway — including the four traps that have
+each cost real time (mask-before-install, `VPP_INSTALL_SKIP_SYSCTL=1`
+and the 64K-page hugepage reason, /tmp noexec, purge-unbinds-the-VF) —
+is documented once, in vpp-unifi's README.** It lives with the build
+so it cannot drift from what the packages actually do; this runbook
+owns what happens after `dpkg -i` succeeds.
 
 Upgrade is `detach → install → attach`. There is no cross-version
 adoption: the state file records the VPP version, and a mismatch is
 refused rather than adopted.
+
+The version in `SOURCE.json` is the *attested* VPP; the *compatible*
+set is anything whose CRCs match for the messages the module speaks,
+and the attach handshake decides that per box, loudly, before any
+route is programmed. A new VPP release changes nothing on its own —
+adopting one is a deliberate two-repo sequence, and whether it needs a
+new packetframe release is answered by the `generated.rs` diff during
+the re-vendor. The full compatibility model and bump procedure:
+`crates/modules/vpp-offload/vpp-api/README.md`.
 
 ## Constraints worth knowing before you debug
 

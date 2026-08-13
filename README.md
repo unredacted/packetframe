@@ -236,11 +236,14 @@ if VPP stops running.
 
 Steering is per-interface and off by default. You turn it on one
 interface at a time and turn it back off with a config reload, without
-restarting VPP. No VPP source lives in this repo: unmodified upstream
-VPP is built and published for UniFi gateways by
-[unredacted/vpp-unifi](https://github.com/unredacted/vpp-unifi), and
-[`vpp/pin.toml`](vpp/pin.toml) records which of its release tags this
-repo consumes.
+restarting VPP. No VPP source lives in this repo, and the module is
+not tied to any particular VPP build — it speaks the binary API and
+refuses, at attach, any VPP whose message CRCs disagree with the
+vendored API definitions
+([`crates/modules/vpp-offload/vpp-api/`](crates/modules/vpp-offload/vpp-api/),
+whose `SOURCE.json` names the release they came from). For UniFi
+gateways, unmodified upstream VPP is built and published by
+[unredacted/vpp-unifi](https://github.com/unredacted/vpp-unifi).
 
 The code is finished but has never run against a real VPP process or a
 real NIC. Read
@@ -376,10 +379,10 @@ packetframe/
 │   │   ├── probe/                    # diagnostic XDP probe
 │   │   │   └── bpf/                  # probe BPF program
 │   │   └── vpp-offload/              # second forwarding path (supervises VPP)
+│   │       └── vpp-api/              # vendored .api.json + SOURCE.json (the release they came from)
 │   └── tools/vpp-api-codegen/        # generates VPP binary-API structs from its .api.json
 ├── conf/example.conf                 # annotated reference config
 ├── docs/runbooks/                    # operational runbooks
-├── vpp/pin.toml                      # which published VPP artifact we consume (built by unredacted/vpp-unifi)
 └── .github/workflows/                # CI (fmt/clippy/test, cross-build, qemu-verifier, release)
 ```
 

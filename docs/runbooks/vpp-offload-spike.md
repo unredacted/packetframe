@@ -163,9 +163,12 @@ VPP in a clean `debian:bullseye` container on a native arm64 runner,
 where none of that applies, published as `.debs` under their own
 release tag. It runs when a gateway pin (`pins/efg.toml` there)
 changes, or on demand. This also makes the cn9k-tuned build a
-same-pipeline variant rather than a separate decision. This repo's
-`vpp/pin.toml` remains as the consumer record of which published tag
-packetframe is codegen'd and tested against.
+same-pipeline variant rather than a separate decision. On this repo's
+side, `crates/modules/vpp-offload/vpp-api/SOURCE.json` — the manifest
+of the release the vendored API definitions came from — is the single
+record of which published VPP packetframe is codegen'd and tested
+against; there is deliberately no separate pin file to fall out of
+sync with it.
 
 Version pins, mirroring the gate-0a two-era doctrine (the AF↔VF
 mailbox does not follow newer-is-better):
@@ -400,23 +403,25 @@ also exits 0 on CLI errors — same exit-code trap as ethtool.)
 
 ### Getting the build onto the shadow
 
-Derive the tag from the pin rather than typing a version — otherwise
-working the fallback ladder below re-downloads the build that just
-failed, which looks exactly like the fallback not working:
+Derive the tag from SOURCE.json rather than typing a version —
+otherwise working the fallback ladder below re-downloads the build
+that just failed, which looks exactly like the fallback not working.
+Deriving from provenance also guarantees the box gets the exact
+release the running binaries were codegen'd against:
 
 ```sh
 # From a checkout of this repo (workstation with `gh` authenticated;
 # scp to the shadow afterwards, or run on the box if it has both).
-ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
-plat=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
-repo=$(grep -E '^\s*repo\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
-gh release download "vpp-${ref}-${plat:-generic}-bullseye-arm64" \
-  --repo "${repo:?vpp/pin.toml names the publishing repo}" --dir /tmp/vpp
+src=crates/modules/vpp-offload/vpp-api/SOURCE.json
+ref=$(jq -r .vpp_ref "$src"); plat=$(jq -r .platform "$src")
+repo=$(jq -r .built_by "$src" | cut -d@ -f1)
+gh release download "vpp-${ref}-${plat}-bullseye-arm64" \
+  --repo "$repo" --dir /tmp/vpp
 ```
 
 (Builds published before 2026-08-12 live on unredacted/packetframe's
 release page; everything since publishes from unredacted/vpp-unifi,
-which is what the pin's `repo` field names.)
+which is what SOURCE.json's `built_by` names.)
 
 **The install-time libnl question is ANSWERED (2026-08-02, read from
 the built deb's control):** `vpp` depends on `libnl-3-200 (>= 3.2.7)`
@@ -522,8 +527,8 @@ tag/commit in the release manifest is the pin it generates against.
 **If the PMD fails the mailbox handshake**, the next rung of the
 fallback ladder is a pin edit in unredacted/vpp-unifi
 (`pins/efg.toml`), not an on-box rebuild: changing `ref` there re-runs
-the build workflow and publishes a new tag; then update this repo's
-`vpp/pin.toml` to consume it.
+the build workflow and publishes a new tag; then re-vendor the API
+bundle here (procedure: `crates/modules/vpp-offload/vpp-api/README.md`).
 
 ## 2. Stage resources + startup.conf
 
