@@ -221,8 +221,17 @@ pub struct Published {
     /// republishing each tick verbatim cleared this within ~50 ms while
     /// the service stayed in the same failed state for seconds — an
     /// operator polling status would essentially always miss it. Cleared
-    /// when the supervisor's consecutive-failure count returns to zero,
-    /// which it does only on a verified-healthy cycle.
+    /// when `crate::status::StatusSnapshot::failure_episode_over`
+    /// observes recovery: a verified-healthy cycle (zero consecutive
+    /// failures in `Ready`/`Steered`, passing verify, answering API)
+    /// with steering matching intent and no live fault retained on its
+    /// own row. Deliberately NOT "when health returns to `Healthy`",
+    /// which this clause used to say and the code used to do: a
+    /// dark-idle member port keeps the module honestly Degraded for as
+    /// long as the cable is out — permanently, on the primary — and
+    /// keying the clear on `Healthy` retained the full failure history
+    /// of a long-recovered storm forever (measured on the shadow,
+    /// 2026-08-14).
     ///
     /// Covers failures from injected events too (a `VerifyPassed` whose
     /// `Steer` was refused, a `VerifyFailed` whose teardown failed);
@@ -820,7 +829,8 @@ fn expire_verdict(
 /// bounded: `MAX_EPISODE_REASONS` distinct entries, deduplicated, because a
 /// long backoff loop would otherwise append the same spawn failure forever
 /// into a `Vec` published on every tick. The episode ends — and the list is
-/// cleared — when health returns to `Healthy`.
+/// cleared — when the published snapshot observes recovery
+/// ([`crate::status::StatusSnapshot::failure_episode_over`]).
 fn remember_failures(into: &mut Vec<String>, new: Vec<String>) {
     for reason in new {
         if into.len() >= MAX_EPISODE_REASONS {
@@ -1035,8 +1045,12 @@ fn run_loop(
         remember_failures(&mut last_failures, fmt_failures(&injected.outcome));
     }
 
-    // Returns the overall health it published, which is what decides
-    // whether a retained failure reason may finally be dropped.
+    // Returns whether the snapshot it published observed the failure
+    // episode to be over, which is what decides whether a retained
+    // failure reason may finally be dropped. The predicate lives on the
+    // snapshot (`failure_episode_over`), beside `nominal()`, so the
+    // surface that reports health and the condition that releases the
+    // reasons cannot drift apart.
     let publish = |driver: &Driver,
                    runtime: &Runtime,
                    last_verify: &Option<crate::verify::VerifyOutcome>,
@@ -1045,7 +1059,7 @@ fn run_loop(
                    teardown_failures: &[String],
                    resources_leaked: bool,
                    last_failures: &[String]|
-     -> packetframe_common::module::HealthState {
+     -> bool {
         let now = Instant::now();
         let rs = runtime.status();
         let fib = match (last_verify, last_verify_at) {
@@ -1082,7 +1096,7 @@ fn run_loop(
             },
         );
         let report = snap.report();
-        let overall = report.overall;
+        let episode_over = snap.failure_episode_over();
         let published = Published {
             report,
             metrics: crate::status::render_metrics(&snap, module),
@@ -1095,7 +1109,7 @@ fn run_loop(
             store_error: rs.store_error,
         };
         *shared.latest.lock().expect("status lock") = Some(published);
-        overall
+        episode_over
     };
 
     // First snapshot before the first tick; the handshake below is
@@ -1227,8 +1241,8 @@ fn run_loop(
         //
         // So it is sticky, and the release condition is an *observation*
         // of recovery: the reason is dropped only once the published
-        // health returns to `Healthy`. A newer failure supersedes an
-        // older one.
+        // snapshot reports the failure episode over. A newer failure
+        // supersedes an older one.
         //
         // The obvious release condition — the supervisor's own
         // consecutive-failure count reaching zero — is WRONG, and
@@ -1236,9 +1250,14 @@ fn run_loop(
         // as a supervisor failure (a failed canary must not cycle a VPP
         // that is forwarding fine), so `failures()` is already zero at
         // the moment the steer is refused, and keying on it wiped the
-        // reason on the very next tick. `Healthy` is the condition that
-        // actually covers every way this module can be unwell, because it
-        // is the same whitelist `nominal()` applies.
+        // reason on the very next tick. The opposite pole — published
+        // health returning to `Healthy` — is wrong the other way, and
+        // was measured being so (shadow, 2026-08-14): a dark-idle member
+        // keeps the module honestly Degraded indefinitely, so a box in
+        // its designed steady state retained the failure history of a
+        // fully-recovered storm forever. The condition that covers both
+        // is `StatusSnapshot::failure_episode_over`, defined beside
+        // `nominal()` and documented clause by clause against it.
         remember_failures(&mut last_failures, failures);
 
         // One call, one rule. See `expire_verdict`.
@@ -1281,7 +1300,7 @@ fn run_loop(
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
-        let overall = publish(
+        let episode_over = publish(
             &driver,
             &runtime,
             &last_verify,
@@ -1291,7 +1310,7 @@ fn run_loop(
             false,
             &last_failures,
         );
-        if overall == packetframe_common::module::HealthState::Healthy {
+        if episode_over {
             last_failures.clear();
         }
 

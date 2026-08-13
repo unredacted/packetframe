@@ -226,11 +226,29 @@ pub struct PortLink {
     pub sw_if_index: u32,
     pub admin_up: bool,
     pub link_up: bool,
+    /// Whether any installed route can egress here — the engine's
+    /// **current** neighbour bookkeeping, deliberately fresher than the
+    /// verify-time flags above. See [`crate::verify::DeadInterface`] for
+    /// the distinction this carries: a dark member nothing routes
+    /// through deliberately carries nothing (the primary's uncabled eth5
+    /// is permanent, by discipline), while a dark member with routes
+    /// egressing it is a blackhole the moment anything is steered.
+    /// Verify does not re-run in steady state, so keying this to the
+    /// last verify would miss routes shifting ONTO a dark member
+    /// afterwards — the direction that turns green gauges into a
+    /// blackhole.
+    pub in_use: bool,
 }
 
 impl PortLink {
     fn forwards(&self) -> bool {
         self.admin_up && self.link_up
+    }
+
+    /// Cannot forward, yet installed routes egress here: dropping
+    /// traffic if steered, one steer away from dropping it if not.
+    fn blackhole(&self) -> bool {
+        !self.forwards() && self.in_use
     }
 }
 
@@ -417,6 +435,11 @@ impl StatusSnapshot {
         self.ports.iter().filter(|p| !p.forwards()).collect()
     }
 
+    /// Ports that cannot forward AND that installed routes egress.
+    fn blackhole_ports(&self) -> Vec<&PortLink> {
+        self.ports.iter().filter(|p| p.blackhole()).collect()
+    }
+
     /// Whether traffic is diverted into a VPP that cannot forward it
     /// correctly. The worst condition the module can be in, and the
     /// reason `overall` is not simply the max of the subsystems.
@@ -432,11 +455,18 @@ impl StatusSnapshot {
         // report the safeguard as the module's worst fault for as long
         // as bird takes to reload.
         let fib_unverified = !self.fib.verified() && self.resync_deferred.is_none();
+        // BLACKHOLE ports, not dead ones — "under paths that resolve
+        // through it" was this comment's claim all along, and the code
+        // read every dark member as one. On the shadow (2026-08-14) a
+        // steered, verified VPP with five deliberately-idle dark members
+        // paged as the worst state in the system while forwarding
+        // everything correctly; verify itself already draws the line at
+        // `DeadInterface::in_use`.
         self.steered
             && (!self.state.has_process()
                 || matches!(self.api, ApiHealth::Silent { .. })
                 || fib_unverified
-                || !self.dead_ports().is_empty())
+                || !self.blackhole_ports().is_empty())
     }
 
     /// Structured report for `packetframe status`, circuit breakers and
@@ -547,6 +577,13 @@ impl StatusSnapshot {
             // Membership is all-or-nothing, so "no ports" is not a
             // vacuous pass — it means nothing was ever attached.
             && !self.ports.is_empty()
+            // ALL dead ports, idle ones included — deliberately stricter
+            // than `steered_but_broken`, which only counts blackholes. A
+            // dark-idle member is lost redundancy: real degradation, an
+            // honest Degraded, and the ports row says so — `overall`
+            // must not outrank its own subsystems. What a dark-idle
+            // member must NOT do is page (severity, above) or retain
+            // failure history forever ([`Self::failure_episode_over`]).
             && self.dead_ports().is_empty()
             // Steering wanted but absent: a broken rollout, not staging.
             && (self.steered || !self.steer_intended)
@@ -560,6 +597,60 @@ impl StatusSnapshot {
             // from bird's with every update it misses. Nothing restarts
             // over it by design, which is exactly why it must not read as
             // nominal.
+            && self.drain_error.is_none()
+    }
+
+    /// Whether the CURRENT failure episode is over — the release
+    /// condition for the retained failure reasons
+    /// ([`crate::service::Published::last_failures`], the `last-tick`
+    /// row).
+    ///
+    /// NOT [`Self::nominal`], deliberately, though it is nominal's
+    /// clauses minus the conditions that are not failures. Nominal is
+    /// "this module is doing its job with nothing worth a look"; this is
+    /// "the machinery that was failing has been observed working again".
+    /// The difference is the degradations that are designed, and
+    /// possibly permanent: a dark-idle member (the primary's uncabled
+    /// eth5 never comes up, by discipline) and a table withheld at
+    /// capacity keep the module honestly Degraded for as long as they
+    /// hold. The clear used to key on published health returning to
+    /// `Healthy`, and on the shadow (2026-08-14, post-storm) that meant
+    /// `vpp-process` read healthy with zero failures while `last-tick`
+    /// still carried the entire storm history — five dark-idle members
+    /// pinned overall at not-Healthy, so the clear could never fire on
+    /// the very posture the box is designed to hold.
+    ///
+    /// Every clause here is the recovery observation for a class of
+    /// retained reason:
+    /// - `Ready`/`Steered` with zero failures: the supervisor completed
+    ///   a verified-healthy cycle, releasing spawn/attach/teardown
+    ///   reasons. (`failures == 0` alone is NOT sufficient — a refused
+    ///   steer never increments it, which is why the next clause
+    ///   exists.)
+    /// - a passing verify and an answering API: verify summaries and
+    ///   wedge reasons describe a condition that is gone.
+    /// - steering matching intent: a refused steer's reason lives
+    ///   exactly as long as the want it left behind.
+    /// - no blackhole member: an in-use dark port is a live fault even
+    ///   when everything above recovered. Idle dark ports deliberately
+    ///   do not hold the episode open.
+    /// - no store or drain error: both are active failures with their
+    ///   own retained rows, and an episode that "ends" while they
+    ///   persist would drop reasons that may share their cause.
+    ///
+    /// What is deliberately absent: `counts.degraded()`. Withholding is
+    /// the designed response to a table that outgrew the box, not a
+    /// failure, and unresolvable routes cannot coexist with the passing
+    /// verify required above (`fib_correct` fails on them).
+    pub(crate) fn failure_episode_over(&self) -> bool {
+        !self.undead
+            && matches!(self.state, State::Ready | State::Steered)
+            && self.failures == 0
+            && self.fib.verified()
+            && matches!(self.api, ApiHealth::Answering { .. })
+            && (self.steered || !self.steer_intended)
+            && self.blackhole_ports().is_empty()
+            && self.store_error.is_none()
             && self.drain_error.is_none()
     }
 
@@ -1089,21 +1180,56 @@ impl StatusSnapshot {
                 Some(format!("{} member port(s) up", self.ports.len())),
             )
         } else {
-            // Membership is all-or-nothing: a down member port means
-            // every prefix whose best path egresses it is a blackhole
-            // once anything is steered, which is why this is Unhealthy
-            // while steered and Degraded otherwise.
+            // Severity consults BOTH facts about a dead member: whether
+            // it can forward, and whether anything routes through it.
+            // Membership is all-or-nothing, so every possible egress
+            // holds a VF — including ports that deliberately carry
+            // nothing (under `steer-direction src` an idle uplink's VF
+            // is permanently dark; the primary's eth5 is the motivating
+            // case). A dark member is a blackhole only when installed
+            // routes egress it, which is the same line verify draws at
+            // `DeadInterface::in_use`. The first cut escalated on
+            // link-down alone: the shadow steered healthy with five
+            // dark-idle members and read `ports UNHEALTHY` (2026-08-14)
+            // — a page for a box forwarding everything correctly, which
+            // is how alerts get muted.
             let names = dead
                 .iter()
-                .map(|p| format!("{} (admin_up={} link_up={})", p.port, p.admin_up, p.link_up))
+                .map(|p| {
+                    format!(
+                        "{} (admin_up={} link_up={}{})",
+                        p.port,
+                        p.admin_up,
+                        p.link_up,
+                        if p.in_use {
+                            "; ROUTES EGRESS HERE"
+                        } else {
+                            "; idle"
+                        }
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let st = if self.steered {
-                HealthState::Unhealthy
-            } else {
-                HealthState::Degraded
+            let (st, tail) = match (dead.iter().any(|p| p.in_use), self.steered) {
+                (true, true) => (
+                    HealthState::Unhealthy,
+                    "installed routes egress a member that cannot forward, and traffic is \
+                     steered — those paths are dropping",
+                ),
+                (true, false) => (
+                    HealthState::Degraded,
+                    "installed routes egress a member that cannot forward; a steer into \
+                     this would blackhole those paths, and verify refuses it while this \
+                     holds",
+                ),
+                (false, _) => (
+                    HealthState::Degraded,
+                    "no installed route egresses them, so they deliberately carry nothing \
+                     and steering is unaffected; link-up plus a steering retry brings one \
+                     back into service",
+                ),
             };
-            (st, Some(format!("down: {names}")))
+            (st, Some(format!("down: {names} — {tail}")))
         };
         SubsystemHealth {
             name: SUBSYS_PORTS.into(),
@@ -1424,15 +1550,31 @@ mod tests {
             sw_if_index: 3,
             admin_up: true,
             link_up: true,
+            in_use: true,
         }]
     }
 
+    /// A dark member nothing routes through — the common shape on this
+    /// fleet (the primary's uncabled eth5, the shadow's five idle
+    /// members under `steer-direction src`).
     fn port_down() -> Vec<PortLink> {
         vec![PortLink {
             port: "eth4".into(),
             sw_if_index: 3,
             admin_up: true,
             link_up: false,
+            in_use: false,
+        }]
+    }
+
+    /// A dark member that installed routes egress: the blackhole shape.
+    fn port_down_in_use() -> Vec<PortLink> {
+        vec![PortLink {
+            port: "eth4".into(),
+            sw_if_index: 3,
+            admin_up: true,
+            link_up: false,
+            in_use: true,
         }]
     }
 
@@ -2494,32 +2636,212 @@ mod tests {
     }
 
     /// A down member port blackholes every prefix whose best path
-    /// egresses it — but only once traffic is steered. Membership is
-    /// all-or-nothing, so this is the difference between an outage and a
-    /// staging problem.
+    /// egresses it — so the escalation to Unhealthy needs BOTH facts:
+    /// routes actually egress it (`in_use`) and traffic is steered.
+    /// Severity ignoring `in_use` is a measured defect, not a
+    /// hypothetical: the shadow steered healthy with five dark-idle
+    /// members (fib-synced verified, zero teardowns) and read `ports
+    /// UNHEALTHY` (2026-08-14) — a page for a box forwarding everything
+    /// correctly. A dark-idle member deliberately carries nothing;
+    /// verify already draws this exact line at `DeadInterface::in_use`.
     #[test]
-    fn a_down_member_port_escalates_only_when_steered() {
-        let steered = snap_of(
+    fn a_down_member_port_escalates_only_when_steered_and_in_use() {
+        let api = || ApiHealth::Answering {
+            silent_for: Duration::ZERO,
+        };
+        // The blackhole: steered, and installed routes egress the dark
+        // member. The one shape that pages.
+        let steered_blackhole = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            api(),
+            verified(1),
+            port_down_in_use(),
+        );
+        assert_eq!(steered_blackhole.report().overall, HealthState::Unhealthy);
+
+        // Steered with the dark member idle: the shadow's designed
+        // steady state under `steer-direction src`. Degraded at most.
+        let steered_idle = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            api(),
+            verified(1),
+            port_down(),
+        );
+        let r = steered_idle.report();
+        assert_eq!(
+            r.overall,
+            HealthState::Degraded,
+            "a dark-idle member deliberately carries nothing; steered traffic is unaffected"
+        );
+        let ports = r
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_PORTS)
+            .expect("ports row");
+        assert_eq!(ports.state, HealthState::Degraded);
+        let msg = ports.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("idle") && msg.contains("steering is unaffected"),
+            "the row must say the dark member carries nothing: {msg}"
+        );
+
+        // Unsteered, either way: a staging problem, not an outage.
+        for ports in [port_down(), port_down_in_use()] {
+            let staged = snap_of(
+                &ready_supervisor(),
+                &ledger_with(10, 0, 0),
+                api(),
+                verified(1),
+                ports,
+            );
+            assert_eq!(staged.report().overall, HealthState::Degraded);
+        }
+
+        // An in-use dark member names the risk even before a steer.
+        let staged_blackhole = snap_of(
+            &ready_supervisor(),
+            &ledger_with(10, 0, 0),
+            api(),
+            verified(1),
+            port_down_in_use(),
+        );
+        let r = staged_blackhole.report();
+        let ports = r
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_PORTS)
+            .expect("ports row");
+        let msg = ports.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("ROUTES EGRESS HERE"),
+            "an in-use dark member must be distinguishable from an idle one: {msg}"
+        );
+    }
+
+    /// The regression behind the stuck `last-tick` row (shadow,
+    /// 2026-08-14): after the L2-loop storm recovered unattended —
+    /// eleven teardowns, then Ready+steered with a verified FIB and
+    /// `failures == 0` — the retained failure reasons never cleared,
+    /// because the release keyed on published health returning to
+    /// `Healthy` and five dark-idle members pin overall at Degraded
+    /// indefinitely. That posture is the box's DESIGNED steady state
+    /// under `steer-direction src`, so "wait for Healthy" meant "never".
+    ///
+    /// The episode predicate must release exactly there, while the
+    /// overall verdict honestly stays Degraded.
+    #[test]
+    fn the_failure_episode_ends_despite_dark_idle_members() {
+        let mut ports = vec![PortLink {
+            port: "eth1".into(),
+            sw_if_index: 1,
+            admin_up: true,
+            link_up: true,
+            in_use: true,
+        }];
+        for (i, name) in ["eth0", "eth2", "eth3", "eth4", "eth5"].iter().enumerate() {
+            ports.push(PortLink {
+                port: (*name).into(),
+                sw_if_index: 2 + i as u32,
+                admin_up: true,
+                link_up: false,
+                in_use: false,
+            });
+        }
+        let s = snap_of(
             &steered_supervisor(),
             &ledger_with(10, 0, 0),
             ApiHealth::Answering {
                 silent_for: Duration::ZERO,
             },
-            verified(1),
-            port_down(),
+            verified(3),
+            ports,
         );
-        assert_eq!(steered.report().overall, HealthState::Unhealthy);
+        // The old release condition, shown never to fire here: the
+        // dark-idle members keep the module honestly Degraded for as
+        // long as the cables are out.
+        assert_eq!(s.report().overall, HealthState::Degraded);
+        assert!(
+            s.failure_episode_over(),
+            "a verified-healthy steered cycle must release retained failure reasons \
+             even though dark-idle members hold overall at Degraded"
+        );
+    }
 
-        let staged = snap_of(
+    /// The other pole, which is why the release was never simply
+    /// `failures() == 0`: a refused steer does not count as a supervisor
+    /// failure (a failed canary must not cycle a forwarding VPP), so the
+    /// count is already zero while the refusal is the live problem. The
+    /// episode stays open until steering matches intent.
+    #[test]
+    fn a_refused_steer_keeps_the_episode_open() {
+        let mut s = snap_of(
             &ready_supervisor(),
             &ledger_with(10, 0, 0),
             ApiHealth::Answering {
                 silent_for: Duration::ZERO,
             },
             verified(1),
-            port_down(),
+            ports_up(),
         );
-        assert_eq!(staged.report().overall, HealthState::Degraded);
+        assert_eq!(s.failures, 0);
+        // Steering wanted but absent — the posture a refused steer
+        // leaves behind.
+        s.steer_intended = true;
+        assert!(!s.steered);
+        assert!(
+            !s.failure_episode_over(),
+            "the refused steer's reason must outlive the tick while the want is unmet"
+        );
+
+        // ...and an in-use dark member is a live fault that holds it
+        // open even with everything else recovered.
+        let mut s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            port_down_in_use(),
+        );
+        assert!(!s.failure_episode_over());
+        // The same shape with the member idle releases.
+        s.ports = port_down();
+        assert!(s.failure_episode_over());
+    }
+
+    /// `failure_episode_over` is `nominal()` minus the non-failure
+    /// degradations, so nominal must always imply it — a snapshot that
+    /// reads Healthy while still retaining failure reasons would mean
+    /// the two whitelists drifted apart.
+    #[test]
+    fn nominal_implies_the_episode_is_over() {
+        for state in STATE_LABELS.map(|(s, _)| s) {
+            for ports in [ports_up(), port_down(), port_down_in_use(), Vec::new()] {
+                for fib in [FibSync::NeverVerified, verified(1)] {
+                    for sup in [steered_supervisor(), ready_supervisor()] {
+                        let mut s = snap_of(
+                            &sup,
+                            &ledger_with(4, 0, 0),
+                            ApiHealth::Answering {
+                                silent_for: Duration::ZERO,
+                            },
+                            fib.clone(),
+                            ports.clone(),
+                        );
+                        s.state = state;
+                        assert!(
+                            !s.nominal() || s.failure_episode_over(),
+                            "nominal but episode not over: state={state:?} fib={fib:?} \
+                             ports={:?}",
+                            s.ports
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// `FibSync` must not re-derive the pass criteria — if it did, the
@@ -3055,7 +3377,7 @@ mod tests {
         // Sweep the lifecycle against both port conditions and a
         // never-verified FIB, which is the shape that regressed.
         for state in STATE_LABELS.map(|(s, _)| s) {
-            for ports in [ports_up(), port_down(), Vec::new()] {
+            for ports in [ports_up(), port_down(), port_down_in_use(), Vec::new()] {
                 for fib in [FibSync::NeverVerified, verified(1)] {
                     for api in [
                         ApiHealth::NoProcess,
@@ -3110,6 +3432,7 @@ mod tests {
                 sw_if_index: 3,
                 admin_up: true,
                 link_up: true,
+                in_use: true,
             }],
         );
         let m = render_metrics(&s, "vpp-offload");
@@ -3143,6 +3466,7 @@ mod tests {
             sw_if_index: 4,
             admin_up: true,
             link_up: false,
+            in_use: false,
         });
         let m = render_metrics(&s, "vpp-offload");
         assert!(m.contains("port=\"eth4\",sw_if_index=\"3\"} 1"), "{m}");
