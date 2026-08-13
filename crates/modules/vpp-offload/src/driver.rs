@@ -367,7 +367,19 @@ impl Driver {
                     // Failing mid-resync is a convergence failure: the
                     // table is known-incomplete and nothing is forwarding
                     // through it yet.
-                    Err(_) if resyncing => {
+                    //
+                    // Logged HERE because this event produces no failed
+                    // action for the executor to log — the shadow repro
+                    // (2026-08-13) had three teardowns driven from this
+                    // path and the journal named the kill without its
+                    // cause, which is exactly the blindness the
+                    // teardown logging was added to end.
+                    Err(e) if resyncing => {
+                        tracing::warn!(
+                            error = %e,
+                            "resync drain failed; convergence failure — the supervisor \
+                             will tear down and retry"
+                        );
                         self.reconnect_wanted = true;
                         events.push(Event::ConvergenceFailed);
                     }

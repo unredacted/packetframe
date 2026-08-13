@@ -1276,6 +1276,33 @@ carrying that traffic; VPP still is.
   A box that adopts while steered under a vetoing authority has no fast
   rollback. Worth knowing before the canary rather than during it.
 
+### A member port with no link — degraded and steer-refused, never a restart
+
+`packetframe status` shows `fib-synced` carrying a verify line like:
+
+```text
+verify FIB OK, MEMBER(S) DARK — steering refused, no restart: 64/64 probes
+matched, unresolvable=0, withheld=0, octeon0/0 (idx 2) admin_up=true link_up=false
+```
+
+Read it as three separate facts. The FIB is **correct** (the probes
+matched). The named member(s) currently **cannot forward** (no link —
+a pulled cable, a dead SFP, a port that was never cabled). And the
+module's response is the designed one: reach `Ready`, keep the steer
+want, **refuse to steer** — every member is a possible egress, so a
+steered packet whose best path exits a dark port is dropped, not
+failed over — and do **not** restart, because a restart cannot plug in
+a cable. (The first build to meet this state restart-looped a VPP with
+a flawless FIB over three uncabled ports, every ~10 s, indefinitely —
+shadow repro 2026-08-13.)
+
+Remedy: restore link (or remove the port from membership — but
+membership is all-or-nothing across the fast-path attach set, so that
+means removing it from `attach` too). Recovery is automatic: the steer
+retry re-reads link state fresh from VPP on every attempt, so once the
+port has link the next retry steers. `packetframe reconfigure` asks
+immediately instead of waiting for the retry interval.
+
 ### A member port needs two things admin-up does not give it
 
 Both were found by tracing a live VPP on 2026-08-07, each hidden behind

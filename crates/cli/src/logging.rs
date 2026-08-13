@@ -40,9 +40,28 @@ use tracing_subscriber::{reload, EnvFilter, Registry};
 /// takes the whole filter with it — see the module docs on precedence.
 const BGPKIT_NLRI_NOISE: &str = "bgpkit_parser::parser::bgp::messages=error";
 
+/// Second upstream noise source, same treatment. `netlink_proto` emits
+/// `WARN netlink socket buffer full` once per dropped datagram on
+/// ENOBUFS — unbounded and identical: the shadow repro (2026-08-13)
+/// logged 25 copies in a quarter second while six ports came up under
+/// VPP churn. The event it describes is survivable by design: the
+/// neighbour resolver seeds from dumps and the kernel's own ARP
+/// lifecycle re-announces entries as they churn REACHABLE/STALE, so a
+/// dropped notification heals; the resolver's periodic stats line is
+/// the ongoing health signal. One copy would be worth keeping — a copy
+/// per datagram buries the WARNs that matter, which during that repro
+/// included the teardown reasons this build exists to surface.
+///
+/// Re-enable when debugging netlink loss:
+/// `RUST_LOG=info,netlink_proto=warn`.
+const NETLINK_ENOBUFS_NOISE: &str = "netlink_proto=error";
+
 /// The filter spec for a config-supplied level.
 fn spec_for(level: LogLevel) -> String {
-    format!("{},{BGPKIT_NLRI_NOISE}", level.as_str())
+    format!(
+        "{},{BGPKIT_NLRI_NOISE},{NETLINK_ENOBUFS_NOISE}",
+        level.as_str()
+    )
 }
 
 /// Where the live filter came from, which decides whether the config

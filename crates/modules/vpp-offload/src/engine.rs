@@ -305,10 +305,23 @@ impl Verdict {
     /// The supervisor event this verdict implies. Keeps the mapping in
     /// one place so a caller cannot pick `VerifyPassed` for an
     /// incomplete table.
+    ///
+    /// `VerifyFailed` — the restart-worthy verdict — fires only when
+    /// the FIB itself is wrong ([`VerifyOutcome::fib_correct`]): a
+    /// fresh resync rebuilds a wrong FIB, so teardown is a remedy.
+    /// Dark member interfaces route through `VerifyIncomplete` instead:
+    /// same destination as a withheld table — reach `Ready`, do NOT
+    /// steer, keep the want — because a restart cannot plug in a
+    /// cable. Mapping them to `VerifyFailed` turned three uncabled
+    /// shadow ports into an infinite kill-respawn loop over a flawless
+    /// FIB (repro 2026-08-13). The steer path re-checks link state
+    /// fresh at steer time, so recovery is the existing retry loop
+    /// noticing the cable came back, not a verify verdict going stale
+    /// in either direction.
     pub fn event(&self) -> crate::supervisor::Event {
-        if !self.outcome.passed() {
+        if !self.outcome.fib_correct() {
             crate::supervisor::Event::VerifyFailed
-        } else if self.may_steer {
+        } else if self.may_steer && self.outcome.dead_interfaces.is_empty() {
             crate::supervisor::Event::VerifyPassed
         } else {
             crate::supervisor::Event::VerifyIncomplete
@@ -442,6 +455,12 @@ pub struct ConvergenceEngine {
 
     phase: Option<Phase>,
     last_verify: Option<VerifyOutcome>,
+    /// Unit-test seam for [`Self::dead_members`]: the real scan needs a
+    /// live transport, which in-crate unit tests of the steer gate do
+    /// not have (the fake VPP lives in the integration-test crate).
+    /// `None` — the only production value — means "run the real scan".
+    #[cfg(test)]
+    pub(crate) test_dead_members: Option<Vec<crate::verify::DeadInterface>>,
     /// The last handshake failure, and whether it can ever succeed.
     ///
     /// `api_ready` returns a bool, which collapses "VPP has not opened
@@ -493,6 +512,8 @@ impl ConvergenceEngine {
             api_incompatible: false,
             phase: None,
             last_verify: None,
+            #[cfg(test)]
+            test_dead_members: None,
             verify_seed: 0,
         }
     }
@@ -1450,6 +1471,22 @@ impl ConvergenceEngine {
         }
     }
 
+    /// Every owned member interface that cannot forward right now,
+    /// from a fresh `sw_interface_dump`. The steer gate's read — see
+    /// [`crate::verify::dead_interface_scan`] for why it must be fresh
+    /// rather than the last verify's recorded outcome.
+    pub fn dead_members(&mut self) -> Result<Vec<crate::verify::DeadInterface>, EngineError> {
+        #[cfg(test)]
+        if let Some(dead) = &self.test_dead_members {
+            return Ok(dead.clone());
+        }
+        let Some(t) = self.transport.as_mut() else {
+            return Err(EngineError::NotConnected);
+        };
+        crate::verify::dead_interface_scan(t, &self.port_index.indices())
+            .map_err(EngineError::Transport)
+    }
+
     /// Abandon whatever convergence step is in flight.
     ///
     /// Only clears the engine's own view. The pending map is left
@@ -2023,6 +2060,60 @@ mod tests {
         };
         assert!(!wrong.outcome.passed());
         assert_eq!(wrong.event(), Event::VerifyFailed);
+    }
+
+    /// A dark member interface is not a wrong FIB, and must not reach
+    /// the restart-worthy verdict — a restart cannot plug in a cable.
+    /// Three uncabled shadow ports turned exactly this mapping into an
+    /// infinite kill-respawn loop over a flawless FIB (repro
+    /// 2026-08-13). It rides the `VerifyIncomplete` arm instead: reach
+    /// `Ready`, keep the want, do not steer — the steer path re-checks
+    /// link state fresh at steer time.
+    #[test]
+    fn a_dark_member_is_incomplete_not_failed() {
+        use crate::supervisor::Event;
+        use crate::verify::DeadInterface;
+
+        let dark = Verdict {
+            outcome: VerifyOutcome {
+                sampled: 64,
+                dead_interfaces: vec![DeadInterface {
+                    sw_if_index: 2,
+                    name: "octeon0/0".into(),
+                    admin_up: true,
+                    link_up: false,
+                }],
+                ..Default::default()
+            },
+            may_steer: true,
+        };
+        assert!(dark.outcome.fib_correct(), "the FIB itself is flawless");
+        assert!(
+            !dark.outcome.passed(),
+            "but a dark member must still block a steering pass"
+        );
+        assert_eq!(
+            dark.event(),
+            Event::VerifyIncomplete,
+            "dark members must not restart-loop a healthy VPP"
+        );
+
+        // Both at once: a wrong FIB wins — teardown IS the remedy for
+        // that half, whatever the cabling looks like.
+        let dark_and_wrong = Verdict {
+            outcome: VerifyOutcome {
+                sampled: 0,
+                dead_interfaces: vec![DeadInterface {
+                    sw_if_index: 2,
+                    name: "octeon0/0".into(),
+                    admin_up: true,
+                    link_up: false,
+                }],
+                ..Default::default()
+            },
+            may_steer: false,
+        };
+        assert_eq!(dark_and_wrong.event(), Event::VerifyFailed);
     }
 
     /// Leftovers from an aborted resync live only in the pending map —
