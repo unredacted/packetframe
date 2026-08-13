@@ -213,6 +213,18 @@ Traffic moves only when you say so. The module never steers on a first
 attach, and a reconfigure that did not change a `steer` flag will not
 either, so editing an unrelated line cannot divert traffic by accident.
 
+**Choose `steer-direction` before the first rung, not during it.** On a
+service edge — the reference fleet — the right value is `src`: outbound
+traffic (src ∈ the service prefix, arriving from the agg switches)
+rides VPP's full-table best path, and inbound stays on the eBPF tier,
+whose FDB-pin owns delivery to the bridge-attached hosts VPP has no
+path to. The default `both` is for pure transit, and dst-steering a
+service prefix diverts inbound flows into a FIB that cannot deliver
+them — every steered service flow would blackhole with all gauges
+green. The directive is hot-reloadable (the target is a reconcile), so
+getting it wrong is recoverable — but the recovery window is however
+long it takes to notice.
+
 Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
 resync: a restart would cost about 40 seconds with the offload down at
 every step, including the step meant to get traffic off a bad VPP
@@ -1275,6 +1287,42 @@ carrying that traffic; VPP still is.
 
   A box that adopts while steered under a vetoing authority has no fast
   rollback. Worth knowing before the canary rather than during it.
+
+### A member port with no link — reported always, blocking only when routes use it
+
+`packetframe status` shows `fib-synced` carrying a verify line naming
+every dark member, annotated one of two ways:
+
+```text
+..., octeon5/0 (idx 5) admin_up=true link_up=false (idle: no routes egress here; not blocking)
+```
+
+An **idle** dark member decides nothing. This is the normal state of a
+dark port — the BGP session that would produce its routes died with
+the link, so no installed route can egress it, and a steered packet
+cannot choose an egress no route names. The port shows here and in the
+`ports` row so it gets fixed, but steering proceeds and the offload is
+not held hostage to an uncabled port (the primary's eth5 shipped this
+way).
+
+```text
+verify FIB OK, IN-USE MEMBER(S) DARK — steering refused, no restart: 64/64
+probes matched, ..., octeon3/0 (idx 5) admin_up=true link_up=false CARRIES ROUTES
+```
+
+A dark member that **carries routes** — static routes pinned to it, or
+a link that died faster than its BGP session withdrew — is the real
+blackhole risk, and the response is the designed one: reach `Ready`,
+keep the steer want, **refuse to steer**, and do **not** restart,
+because a restart cannot plug in a cable. (The first build to meet
+this state restart-looped a VPP with a flawless FIB over three
+uncabled ports, every ~10 s, indefinitely — shadow repro 2026-08-13.)
+
+Remedy: restore link, or remove the routes that egress the dead port.
+Recovery is automatic either way: the steer retry re-reads link state
+AND usage fresh from VPP on every attempt, so the next retry after the
+fix steers. `packetframe reconfigure` asks immediately instead of
+waiting for the retry interval.
 
 ### A member port needs two things admin-up does not give it
 

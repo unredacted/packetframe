@@ -69,6 +69,16 @@ pub struct DeadInterface {
     pub name: String,
     pub admin_up: bool,
     pub link_up: bool,
+    /// Whether any installed route can actually egress here — the FIB
+    /// holds at least one static neighbour on this interface (counting
+    /// unacked ones, conservatively). This is what separates "a
+    /// blackhole is one steer away" from "a port is dark and nothing
+    /// routes through it": a dark port mostly CANNOT carry routes,
+    /// because the BGP session that would produce them died with the
+    /// link — the primary's uncabled eth5 is the motivating case. Only
+    /// `in_use` dark members block steering; idle ones degrade the
+    /// report and nothing else.
+    pub in_use: bool,
 }
 
 /// Result of one verify pass.
@@ -91,9 +101,11 @@ pub struct VerifyOutcome {
 }
 
 impl VerifyOutcome {
-    /// Pass criteria: at least one route was actually probed, nothing
-    /// sampled disagreed with the ledger, nothing is unresolvable, and
-    /// every owned interface can forward.
+    /// Whether the FIB itself agrees with the ledger: at least one
+    /// route was actually probed, nothing sampled disagreed, and the
+    /// nexthop-device mapping has no holes. This — and only this — is
+    /// the restart-worthy question: a wrong FIB is rebuilt by a fresh
+    /// resync, so teardown is a remedy.
     ///
     /// **`sampled == 0` fails.** An earlier version treated it as a
     /// vacuous pass, and a test asserted that as intended — which was
@@ -108,20 +120,46 @@ impl VerifyOutcome {
     /// mapping is wrong — a misconfiguration, not a capacity condition
     /// — and steering traffic into a FIB with known holes is how a
     /// deploy becomes an outage.
+    ///
+    /// `dead_interfaces` is deliberately NOT here. A member with no
+    /// link makes the dataplane unfit to take traffic — [`Self::passed`]
+    /// still fails on it, and steering still refuses — but the FIB is
+    /// not wrong and a restart cannot plug in a cable. Routing it
+    /// through the restart-worthy verdict turned three uncabled shadow
+    /// ports into an infinite kill-respawn loop (repro 2026-08-13,
+    /// after the first primary attach hid the same shape behind IRQ
+    /// starvation): every cycle rebuilt a flawless FIB, re-observed the
+    /// same dark ports, and died for it.
+    pub fn fib_correct(&self) -> bool {
+        self.sampled > 0 && self.mismatches.is_empty() && self.unresolvable == 0
+    }
+
+    /// Pass criteria for *steering*: the FIB is correct AND every dark
+    /// member is idle — no installed route can egress an interface
+    /// that cannot forward. The halves fail differently — see
+    /// [`Self::fib_correct`] and [`DeadInterface::in_use`] — and
+    /// `Verdict::event` is where the difference becomes a supervisor
+    /// decision.
     pub fn passed(&self) -> bool {
-        self.sampled > 0
-            && self.mismatches.is_empty()
-            && self.unresolvable == 0
-            && self.dead_interfaces.is_empty()
+        self.fib_correct() && !self.dead_interfaces.iter().any(|d| d.in_use)
     }
 
     /// One-line operator summary. Separates the two degraded counts,
     /// because "mapping is misconfigured" and "table outgrew the box"
-    /// are different pages at 03:00.
+    /// are different pages at 03:00 — and a third label for dark
+    /// members, because "the FIB is wrong" and "a cable is out" are
+    /// too: the first is restart-worthy, the second reads FAIL only if
+    /// you want an operator to bounce a healthy dataplane.
     pub fn summary(&self) -> String {
         let mut s = format!(
             "verify {}: {}/{} probes matched, unresolvable={}, withheld={}",
-            if self.passed() { "PASS" } else { "FAIL" },
+            if self.passed() {
+                "PASS"
+            } else if self.fib_correct() {
+                "FIB OK, IN-USE MEMBER(S) DARK — steering refused, no restart"
+            } else {
+                "FAIL"
+            },
             self.sampled.saturating_sub(self.mismatches.len()),
             self.sampled,
             self.unresolvable,
@@ -132,12 +170,75 @@ impl VerifyOutcome {
         }
         for d in &self.dead_interfaces {
             s.push_str(&format!(
-                ", {} (idx {}) admin_up={} link_up={}",
-                d.name, d.sw_if_index, d.admin_up, d.link_up
+                ", {} (idx {}) admin_up={} link_up={}{}",
+                d.name,
+                d.sw_if_index,
+                d.admin_up,
+                d.link_up,
+                if d.in_use {
+                    " CARRIES ROUTES"
+                } else {
+                    " (idle: no routes egress here; not blocking)"
+                }
             ));
         }
         s
     }
+}
+
+/// Every owned interface that cannot forward right now, from a fresh
+/// `sw_interface_dump`.
+///
+/// Shared between the verify pass and the steer gate — the second
+/// caller is the fix for the dark-member restart loop (shadow repro,
+/// 2026-08-13): verify routes dark members through the no-restart
+/// verdict, so the moment-of-steer check has to be its own, *fresh*
+/// read. Checking a recorded outcome instead would refuse a steer on a
+/// cable that was plugged back in an hour ago, or permit one on a
+/// cable pulled after the last verify.
+pub(crate) fn dead_interface_scan(
+    t: &mut Transport,
+    owned: &std::collections::HashSet<u32>,
+    active_egress: &std::collections::HashSet<u32>,
+) -> Result<Vec<DeadInterface>, TransportError> {
+    let mut dead = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for iface in crate::attach::interfaces(t)? {
+        if !owned.contains(&iface.sw_if_index) {
+            continue;
+        }
+        seen.insert(iface.sw_if_index);
+        let (admin_up, link_up) = (iface.admin_up(), iface.link_up());
+        if !admin_up || !link_up {
+            dead.push(DeadInterface {
+                in_use: active_egress.contains(&iface.sw_if_index),
+                sw_if_index: iface.sw_if_index,
+                name: iface.name,
+                admin_up,
+                link_up,
+            });
+        }
+    }
+    // An owned index that is ABSENT from the dump is not healthy by
+    // omission. Only iterating what the dump returned meant a port that
+    // disappeared after attach was invisible: if the random sample
+    // happened not to select a route through it, every probe matched and
+    // verification passed on a port that could not forward. Report each
+    // missing index as its own failure — nothing about it is up.
+    for idx in owned.iter().copied() {
+        if !seen.contains(&idx) {
+            dead.push(DeadInterface {
+                in_use: active_egress.contains(&idx),
+                sw_if_index: idx,
+                name: format!("<absent from VPP, idx {idx}>"),
+                admin_up: false,
+                link_up: false,
+            });
+        }
+    }
+    // Deterministic order so a failing scan reads the same twice.
+    dead.sort_by_key(|d| d.sw_if_index);
+    Ok(dead)
 }
 
 /// Deterministic sampler.
@@ -190,6 +291,7 @@ pub fn verify(
     t: &mut Transport,
     ledger: &RouteLedger,
     ports: &PortIndex,
+    active_egress: &std::collections::HashSet<u32>,
     sample_size: usize,
     seed: u64,
 ) -> Result<VerifyOutcome, TransportError> {
@@ -211,40 +313,7 @@ pub fn verify(
     // and we steer into an interface that forwards nothing. The runbook
     // treats link-up as the bring-up pass for exactly this reason;
     // `set_admin_up` only ever asserted the administrative flag.
-    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for iface in crate::attach::interfaces(t)? {
-        if !owned.contains(&iface.sw_if_index) {
-            continue;
-        }
-        seen.insert(iface.sw_if_index);
-        let (admin_up, link_up) = (iface.admin_up(), iface.link_up());
-        if !admin_up || !link_up {
-            out.dead_interfaces.push(DeadInterface {
-                sw_if_index: iface.sw_if_index,
-                name: iface.name,
-                admin_up,
-                link_up,
-            });
-        }
-    }
-    // An owned index that is ABSENT from the dump is not healthy by
-    // omission. Only iterating what the dump returned meant a port that
-    // disappeared after attach was invisible: if the random sample
-    // happened not to select a route through it, every probe matched and
-    // verification passed on a port that could not forward. Report each
-    // missing index as its own failure — nothing about it is up.
-    for idx in owned.iter().copied() {
-        if !seen.contains(&idx) {
-            out.dead_interfaces.push(DeadInterface {
-                sw_if_index: idx,
-                name: format!("<absent from VPP, idx {idx}>"),
-                admin_up: false,
-                link_up: false,
-            });
-        }
-    }
-    // Deterministic order so a failing verify reads the same twice.
-    out.dead_interfaces.sort_by_key(|d| d.sw_if_index);
+    out.dead_interfaces = dead_interface_scan(t, &owned, active_egress)?;
 
     for prefix in probes {
         let reply = t.request::<IpRouteLookup, IpRouteLookupReply>(IpRouteLookup {

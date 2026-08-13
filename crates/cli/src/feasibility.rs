@@ -8,7 +8,7 @@ use crate::scrub::scrub_for_terminal;
 use std::path::Path;
 
 use packetframe_common::{
-    config::{Config, ModuleDirective},
+    config::{Config, ModuleDirective, VppSteerDirection},
     fib::IpPrefix,
     probe::{run_iface_probes, run_probes, Capability, CapabilityStatus, FeasibilityReport},
 };
@@ -71,6 +71,21 @@ pub fn vpp_workers_from_config(config: &Config) -> u32 {
     workers
 }
 
+/// The configured steer direction, defaulting like the module does.
+pub fn vpp_steer_direction_from_config(config: &Config) -> VppSteerDirection {
+    for m in &config.modules {
+        if m.name != "vpp-offload" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::VppSteerDirection(dir) = d {
+                return *dir;
+            }
+        }
+    }
+    VppSteerDirection::default()
+}
+
 /// The fast-path allowlist, as the steering probe needs it.
 ///
 /// It comes from the **fast-path** section, not vpp-offload's: steered
@@ -114,12 +129,19 @@ pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
         })
 }
 
+/// The vpp-offload facts the probes need, grouped so the parameter
+/// list stops growing by one per directive (clippy agrees at eight).
+pub struct VppProbeInputs<'a> {
+    pub ports: &'a [String],
+    pub workers: u32,
+    pub binary: Option<&'a str>,
+    pub steer_direction: VppSteerDirection,
+}
+
 pub fn probe_and_render(
     bpffs_root: &Path,
     attach_ifaces: &[String],
-    vpp_ports: &[String],
-    vpp_workers: u32,
-    vpp_binary: Option<&str>,
+    vpp: &VppProbeInputs<'_>,
     allowlist: &[IpPrefix],
     human: bool,
 ) -> Rendered {
@@ -145,18 +167,19 @@ pub fn probe_and_render(
     // module. Non-required like the perf probes — feasibility informs,
     // the module's attach enforces.
     #[cfg(feature = "vpp-offload")]
-    if !vpp_ports.is_empty() {
+    if !vpp.ports.is_empty() {
         for cap in packetframe_vpp_offload::run_feasibility_probes(
-            vpp_ports,
-            vpp_workers,
-            vpp_binary,
+            vpp.ports,
+            vpp.workers,
+            vpp.binary,
             allowlist,
+            vpp.steer_direction,
         ) {
             report.capabilities.push(cap);
         }
     }
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = (vpp_ports, vpp_workers, vpp_binary, allowlist);
+    let _ = (vpp, allowlist);
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.

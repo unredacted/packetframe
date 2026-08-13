@@ -2290,6 +2290,74 @@ impl Effects for EffectsView {
                 ));
             }
         }
+        // The link gate, same chokepoint, same shape, FRESH read. The
+        // verify verdict deliberately routes dark members through
+        // `VerifyIncomplete` (a restart cannot plug in a cable — shadow
+        // repro 2026-08-13), which means nothing upstream of this point
+        // has refused them; a steer is the moment traffic would start
+        // dying on the dark port, so the check runs here, against what
+        // the interfaces report NOW rather than what the last verify
+        // recorded. Recovery is free: a refusal is `SteerFailed`, the
+        // want stays set, and the retry that runs after the cable comes
+        // back passes this gate. Same empty-target exception as the
+        // completeness gate, for the same reason: a reconcile that only
+        // removes rules diverts nothing.
+        //
+        // "Cannot read link state" refuses too. Steering is the one
+        // operation where "probably fine" and "verified fine" differ by
+        // a blackhole, and the transport being unable to answer an
+        // interfaces dump is not a state to divert traffic into.
+        if c.steer_diverts_traffic() {
+            match c.engine.dead_members() {
+                Ok(dead) => {
+                    // Only dark members that CARRY ROUTES block: a
+                    // steered packet can only die on an egress some
+                    // route names, and a dark port mostly has none —
+                    // its BGP session died with the link. An idle dark
+                    // port (the primary's uncabled eth5) degrades the
+                    // report and holds nothing hostage.
+                    let blocking: Vec<&crate::verify::DeadInterface> =
+                        dead.iter().filter(|d| d.in_use).collect();
+                    if !blocking.is_empty() {
+                        let names: Vec<String> = blocking
+                            .iter()
+                            .map(|d| {
+                                format!(
+                                    "{} (admin_up={} link_up={})",
+                                    d.name, d.admin_up, d.link_up
+                                )
+                            })
+                            .collect();
+                        let idle = dead.len() - blocking.len();
+                        return Err(format!(
+                            "refusing to steer: {} member interface(s) carry routes but \
+                             cannot forward: {}. A steered packet whose best path exits \
+                             a dark port is dropped, not failed over. Restore link/admin \
+                             on the port(s); the steer retries on its own at most every \
+                             {}s, or `packetframe reconfigure` asks immediately{}",
+                            names.len(),
+                            names.join(", "),
+                            crate::driver::STEER_RETRY_EVERY.as_secs(),
+                            if idle > 0 {
+                                format!(
+                                    " ({idle} further dark member(s) carry no routes \
+                                     and do not block)"
+                                )
+                            } else {
+                                String::new()
+                            }
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "refusing to steer: member link state could not be read from VPP \
+                         ({e}); cannot confirm every egress can forward, and a steered \
+                         miss is dropped rather than falling back"
+                    ));
+                }
+            }
+        }
         let outcome = c.steering.steer();
         c.record_steering();
         outcome
@@ -3552,6 +3620,9 @@ mod tests {
         );
         let handle = std::sync::Arc::new(TableCompleteness::new());
         rt.require_table_complete(handle.clone());
+        // This test exercises the COMPLETENESS gate; give the link gate
+        // a clean answer so the refusals below are the verdict's.
+        rt.core.borrow_mut().engine.test_dead_members = Some(Vec::new());
 
         let (_, mut fx) = rt.views();
         // Nothing published yet: unknown is not permission.
@@ -3756,7 +3827,148 @@ mod tests {
             "/usr/bin/vpp",
             "/tmp/startup.conf",
         );
+        // Completeness gate under test; link gate answered clean.
+        rt.core.borrow_mut().engine.test_dead_members = Some(Vec::new());
         let (_, mut fx) = rt.views();
         fx.steer().expect("no gate configured, no gate applied");
+    }
+
+    /// The link gate: a dark member refuses a diverting steer, an
+    /// unreadable link state refuses too, and an empty target is
+    /// exempt — its only job is removal.
+    ///
+    /// This is the second half of the dark-member fix (shadow repro
+    /// 2026-08-13): the verify verdict deliberately stops restarting
+    /// over dark members, so the steer gate is where traffic is
+    /// actually protected from them — with a FRESH read, which is what
+    /// lets the existing retry loop recover on its own once the cable
+    /// comes back.
+    #[test]
+    fn a_dark_member_refuses_a_diverting_steer_and_an_empty_target_is_exempt() {
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024)], true)),
+            configured: 1,
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+
+        // Unreadable link state (no transport, no test override):
+        // refusal, because "probably fine" and "verified fine" differ
+        // by a blackhole here.
+        {
+            let (_, mut fx) = rt.views();
+            let e = fx.steer().expect_err("unknown link state must refuse");
+            assert!(e.contains("link state could not be read"), "{e}");
+        }
+
+        // An IN-USE dark member: refusal that names the port and the
+        // way back.
+        rt.core.borrow_mut().engine.test_dead_members = Some(vec![crate::verify::DeadInterface {
+            in_use: true,
+            sw_if_index: 2,
+            name: "octeon0/0".into(),
+            admin_up: true,
+            link_up: false,
+        }]);
+        {
+            let (_, mut fx) = rt.views();
+            let e = fx.steer().expect_err("a dark member must refuse");
+            assert!(e.contains("octeon0/0"), "the port must be named: {e}");
+            assert!(
+                e.contains("link_up=false"),
+                "and its state, so the operator fixes the right thing: {e}"
+            );
+            assert!(
+                rt.core.borrow().steering.installed().is_empty(),
+                "a refused steer must not have touched the NIC"
+            );
+        }
+
+        // Link restored: the same call now goes through — the recovery
+        // path the retry loop drives after a cable comes back.
+        rt.core.borrow_mut().engine.test_dead_members = Some(Vec::new());
+        {
+            let (_, mut fx) = rt.views();
+            fx.steer().expect("clean links steer");
+            assert_eq!(rt.core.borrow().steering.installed().len(), 1);
+        }
+    }
+
+    /// An IDLE dark member — no installed route can egress it — must
+    /// not block a steer: holding five live ports hostage to one
+    /// uncabled one is the refusal this refinement removes (the
+    /// primary's eth5 is the motivating case). The dark port is still
+    /// reported — verify's summary and the ports row carry it — it
+    /// just decides nothing.
+    #[test]
+    fn an_idle_dark_member_does_not_block_a_steer() {
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024)], true)),
+            configured: 1,
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        rt.core.borrow_mut().engine.test_dead_members = Some(vec![crate::verify::DeadInterface {
+            in_use: false,
+            sw_if_index: 5,
+            name: "octeon5/0".into(),
+            admin_up: true,
+            link_up: false,
+        }]);
+        let (_, mut fx) = rt.views();
+        fx.steer()
+            .expect("an idle dark member must not hold the offload hostage");
+        assert_eq!(rt.core.borrow().steering.installed().len(), 1);
+    }
+
+    /// The empty-target exemption for the link gate specifically: a
+    /// reconcile that only removes rules must proceed with members
+    /// dark — it is the rollback direction, and refusing it would trap
+    /// traffic ON the dark dataplane.
+    #[test]
+    fn an_empty_target_unsteers_despite_dark_members() {
+        let steering = LedgerSteering {
+            // Empty target: nothing to install, removal only.
+            next: Some((Vec::new(), true)),
+            configured: 0,
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        // Members dark AND unreadable-by-default would both refuse a
+        // diverting steer; neither may block the removal direction.
+        rt.core.borrow_mut().engine.test_dead_members = Some(vec![crate::verify::DeadInterface {
+            in_use: true,
+            sw_if_index: 2,
+            name: "octeon0/0".into(),
+            admin_up: true,
+            link_up: false,
+        }]);
+        let (_, mut fx) = rt.views();
+        fx.steer()
+            .expect("an empty target diverts nothing and must not be link-gated");
     }
 }

@@ -16,6 +16,7 @@ pub(crate) fn run(
     workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
+    direction: packetframe_common::config::VppSteerDirection,
 ) -> Vec<Capability> {
     let mut caps = Vec::with_capacity(5 + ports.len());
     caps.push(probe_iommu());
@@ -31,7 +32,7 @@ pub(crate) fn run(
     for iface in ports {
         caps.push(probe_sriov(iface));
     }
-    caps.push(probe_steering_budget(ports, allowlist));
+    caps.push(probe_steering_budget(ports, allowlist, direction));
     caps
 }
 
@@ -115,6 +116,7 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 fn probe_steering_budget(
     ports: &[String],
     allowlist: &[packetframe_common::fib::IpPrefix],
+    direction: packetframe_common::config::VppSteerDirection,
 ) -> Capability {
     use crate::steer::{McamBudget, RuleSet};
 
@@ -123,7 +125,7 @@ fn probe_steering_budget(
         Err(e) => return Capability::fail("vpp.steering.budget", e, false),
     };
     let free = budget.free.len();
-    match RuleSet::plan(allowlist, budget) {
+    match RuleSet::plan(allowlist, budget, direction) {
         // Nothing to steer is a FAIL however it arose. The two ways there
         // read very differently to an operator, so they are named
         // separately — but neither may pass: a port that steers nothing
@@ -329,7 +331,7 @@ mod steering_probe_tests {
         // No ports: `for_ifaces` asks no NIC and yields the fallback
         // budget, so these stay tests of the ALLOWLIST logic — which is
         // what they were always about — on a host that has no rvu NIC.
-        let empty = probe_steering_budget(&[], &[]);
+        let empty = probe_steering_budget(&[], &[], Default::default());
         assert_eq!(empty.status, CapabilityStatus::Fail, "{empty:?}");
         assert!(
             empty.detail.contains("allowlist is empty"),
@@ -343,6 +345,7 @@ mod steering_probe_tests {
                 addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 prefix_len: 32,
             }],
+            Default::default(),
         );
         assert_eq!(v6_only.status, CapabilityStatus::Fail, "{v6_only:?}");
         assert!(
@@ -353,7 +356,7 @@ mod steering_probe_tests {
 
         // A steerable prefix passes, so the failures above are about
         // having nothing to steer rather than the probe always failing.
-        let ok = probe_steering_budget(&[], &[v4(0, 24)]);
+        let ok = probe_steering_budget(&[], &[v4(0, 24)], Default::default());
         assert_eq!(ok.status, CapabilityStatus::Pass, "{ok:?}");
     }
 }
