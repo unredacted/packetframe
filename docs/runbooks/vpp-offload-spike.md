@@ -156,12 +156,16 @@ Hence we build it ourselves — **in CI, not on the box.**
 >
 > Verified 2026-08-02 on the primary.
 
-`.github/workflows/vpp-build.yml` builds unmodified upstream VPP in a
-clean `debian:bullseye` container on a native arm64 runner, where none
-of that applies, and publishes `.debs` under their own release tag. It
-runs when `vpp/pin.toml` changes, or on demand. This also makes the
-cn9k-tuned build a same-pipeline variant rather than a separate
-decision.
+The VPP build lives in **github.com/unredacted/vpp-unifi** (it started
+as this repo's `vpp-build.yml` and moved out 2026-08-12 — the build is
+a property of UniFi hardware, not of packetframe): unmodified upstream
+VPP in a clean `debian:bullseye` container on a native arm64 runner,
+where none of that applies, published as `.debs` under their own
+release tag. It runs when a gateway pin (`pins/efg.toml` there)
+changes, or on demand. This also makes the cn9k-tuned build a
+same-pipeline variant rather than a separate decision. This repo's
+`vpp/pin.toml` remains as the consumer record of which published tag
+packetframe is codegen'd and tested against.
 
 Version pins, mirroring the gate-0a two-era doctrine (the AF↔VF
 mailbox does not follow newer-is-better):
@@ -405,9 +409,14 @@ failed, which looks exactly like the fallback not working:
 # scp to the shadow afterwards, or run on the box if it has both).
 ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
 plat=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
+repo=$(grep -E '^\s*repo\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
 gh release download "vpp-${ref}-${plat:-generic}-bullseye-arm64" \
-  --repo unredacted/packetframe --dir /tmp/vpp
+  --repo "${repo:?vpp/pin.toml names the publishing repo}" --dir /tmp/vpp
 ```
+
+(Builds published before 2026-08-12 live on unredacted/packetframe's
+release page; everything since publishes from unredacted/vpp-unifi,
+which is what the pin's `repo` field names.)
 
 **The install-time libnl question is ANSWERED (2026-08-02, read from
 the built deb's control):** `vpp` depends on `libnl-3-200 (>= 3.2.7)`
@@ -511,8 +520,10 @@ same release — that is slice 3's codegen input, and the exact
 tag/commit in the release manifest is the pin it generates against.
 
 **If the PMD fails the mailbox handshake**, the next rung of the
-fallback ladder is a `vpp/pin.toml` edit, not an on-box rebuild:
-changing `ref` re-runs the workflow and publishes a new tag.
+fallback ladder is a pin edit in unredacted/vpp-unifi
+(`pins/efg.toml`), not an on-box rebuild: changing `ref` there re-runs
+the build workflow and publishes a new tag; then update this repo's
+`vpp/pin.toml` to consume it.
 
 ## 2. Stage resources + startup.conf
 

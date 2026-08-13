@@ -1,0 +1,12 @@
+{
+  "vpp_ref": "v26.06",
+  "vpp_commit": "c3200b88dc46bd380f00a49ca3392a102cc1980b",
+  "platform": "octeon9",
+  "gateway": "efg",
+  "distro": "debian-bullseye",
+  "arch": "arm64",
+  "octeon_pmd": "dev_octeon,net_cn10k,net_cn20k,net_cn9k",
+  "patches": "none (upstream verbatim)",
+  "built_by": "unredacted/vpp-unifi@ace465ad2b670049caba22b4872a467ab774a8cf",
+  "workflow_run": "https://github.com/unredacted/vpp-unifi/actions/runs/31655421937"
+}
