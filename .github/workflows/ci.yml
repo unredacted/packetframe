@@ -96,12 +96,20 @@ jobs:
         #      (or a hand-edit of generated.rs) fails here.
         run: |
           set -euo pipefail
+          pin_repo=$(grep -E '^\s*repo\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
           pin_ref=$(grep -E '^\s*ref\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
           pin_platform=$(grep -E '^\s*platform\s*=' vpp/pin.toml | head -1 | cut -d'"' -f2)
           src_ref=$(jq -r '.vpp_ref' crates/modules/vpp-offload/vpp-api/SOURCE.json)
           src_platform=$(jq -r '.platform' crates/modules/vpp-offload/vpp-api/SOURCE.json)
-          if [ "$pin_ref" != "$src_ref" ] || [ "$pin_platform" != "$src_platform" ]; then
-            echo "::error::vpp/pin.toml says ${pin_ref}/${pin_platform} but the vendored API bundle came from ${src_ref}/${src_platform} — re-vendor vpp-api-json.tar.gz AND its release's manifest.json (as SOURCE.json) from the pinned release, then re-run the codegen"
+          # built_by is "<repo>@<workflow sha>"; the repo half is the
+          # provenance. Compared as well as ref/platform: a `repo`
+          # change is a change of who attests the artifact, and a
+          # bundle vendored from the old publisher must not silently
+          # vouch for a tag on the new one — same-named releases on
+          # different repos are not the same artifact.
+          src_repo=$(jq -r '.built_by' crates/modules/vpp-offload/vpp-api/SOURCE.json | cut -d'@' -f1)
+          if [ "$pin_repo" != "$src_repo" ] || [ "$pin_ref" != "$src_ref" ] || [ "$pin_platform" != "$src_platform" ]; then
+            echo "::error::vpp/pin.toml says ${pin_repo} ${pin_ref}/${pin_platform} but the vendored API bundle came from ${src_repo} ${src_ref}/${src_platform} — re-vendor vpp-api-json.tar.gz AND its release's manifest.json (as SOURCE.json) from the pinned release, then re-run the codegen"
             exit 1
           fi
           cargo run -q -p packetframe-vpp-api-codegen -- \
