@@ -108,6 +108,11 @@ pub struct VppOffloadConfig {
     /// check and forwards nothing, which is the failure this whole
     /// module is built to make impossible.
     pub loopback_address: Option<packetframe_common::config::Ipv4Prefix>,
+    /// Which packet side the MCAM rules match. Hot-reloadable: the
+    /// steering target is rebuilt from config on every reconfigure and
+    /// `steer` is a reconcile, so a change installs/removes exactly
+    /// the delta — including the rollback direction.
+    pub steer_direction: packetframe_common::config::VppSteerDirection,
 }
 
 /// Default sizing input when `expected-routes` is absent.
@@ -142,6 +147,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
+                ModuleDirective::VppSteerDirection(d) => out.steer_direction = *d,
                 _ => {}
             }
         }
@@ -517,7 +523,7 @@ fn steering_target(
         });
     }
     let budget = steer::McamBudget::for_ifaces(ports.iter().map(|(iface, _)| iface.as_str()))?;
-    let plan = steer::RuleSet::plan(allowlist, budget)?;
+    let plan = steer::RuleSet::plan(allowlist, budget, cfg.steer_direction)?;
     // `steer on` with nothing steerable is refused for the same reason
     // `bring_up` refuses it: steering would divert nothing while every
     // surface reported it on.
@@ -1160,14 +1166,15 @@ pub fn run_feasibility_probes(
     workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
+    direction: packetframe_common::config::VppSteerDirection,
 ) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        probe_linux::run(ports, workers, vpp_binary, allowlist)
+        probe_linux::run(ports, workers, vpp_binary, allowlist, direction)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ports, workers, vpp_binary, allowlist);
+        let _ = (ports, workers, vpp_binary, allowlist, direction);
         Vec::new()
     }
 }
@@ -1539,6 +1546,7 @@ mod tests {
             expected_routes: routes,
             hugepages: None,
             require_table_complete: true,
+            steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,

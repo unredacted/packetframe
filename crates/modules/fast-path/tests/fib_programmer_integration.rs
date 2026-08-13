@@ -1666,6 +1666,80 @@ fn the_sink_is_told_the_resolved_union_not_the_advertisements() {
     );
 }
 
+/// Local-ARP routes never reach the second tier as installs.
+///
+/// They describe LOCAL delivery — hosts behind the switch0 bridges —
+/// which VPP deliberately does not do (no VLAN subifs; this tier's
+/// FDB-pin owns that path). Announced, they would sit in the sink as
+/// routes whose nexthop device is a bridge: permanently unresolvable,
+/// failing every readback verify on exactly the boxes that use
+/// `local-prefix`. The shadow has none, so only this test and the
+/// primary can catch a regression.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn local_arp_routes_do_not_reach_the_sink_as_installs() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let local = IpPrefix::V4 {
+        addr: [23, 191, 200, 50],
+        prefix_len: 32,
+    };
+    let transit = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let host = IpAddr::V4(Ipv4Addr::new(23, 191, 200, 50));
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId::local_arp(33),
+                prefix: local,
+                nexthops: vec![host],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("apply local-arp Add");
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId(0x2222),
+                prefix: transit,
+                nexthops: vec![nh],
+                path_id: None,
+                local_pref: Some(100),
+            })
+            .await
+            .expect("apply BGP Add");
+    });
+
+    let calls = sink.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, SinkCall::Resolved(p, _) if *p == local)),
+        "a local-arp /32 must never be announced as installable: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, SinkCall::Resolved(p, _) if *p == transit)),
+        "the filter must not eat ordinary BGP routes: {calls:?}"
+    );
+    // The local-only commit announces as a WITHDRAWAL rather than
+    // going quiet — transition safety: a record whose BGP owners left
+    // while a local-ARP one remained has been announced before, and
+    // silence would leave the second tier holding its last BGP-era
+    // state forever. For a from-birth local record it is a designed
+    // no-op at the feed.
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, SinkCall::Withdrawn(p) if *p == local)),
+        "the local-only commit must withdraw, not go quiet: {calls:?}"
+    );
+}
+
 /// A withdrawal reaches the sink, and by the same path for every way a
 /// prefix can stop forwarding.
 ///

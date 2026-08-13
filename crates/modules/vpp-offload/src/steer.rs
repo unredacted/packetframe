@@ -56,6 +56,7 @@
 
 use std::net::Ipv4Addr;
 
+use packetframe_common::config::VppSteerDirection;
 use packetframe_common::fib::IpPrefix;
 
 /// One steering rule, before it becomes bytes.
@@ -174,8 +175,23 @@ impl Default for McamBudget {
     }
 }
 
-/// Source and destination — see [`RuleSet::plan`] for why both.
-const RULES_PER_PREFIX: usize = 2;
+/// The sides a configured [`VppSteerDirection`] matches.
+///
+/// `both` is right for pure-transit deployments where VPP can forward
+/// either direction of a flow. `src` is the service-edge shape:
+/// outbound (src in the service prefix) rides VPP full-table best
+/// path while inbound stays on the eBPF tier, whose FDB-pin owns
+/// local delivery — dst-steering inbound service traffic would divert
+/// it into a FIB with no path to the bridge-attached hosts it
+/// terminates on. Split-tier flow halves are safe under the
+/// stateless-transit invariant steering already requires.
+pub fn sides_for(direction: VppSteerDirection) -> &'static [Side] {
+    match direction {
+        VppSteerDirection::Src => &[Side::Src],
+        VppSteerDirection::Dst => &[Side::Dst],
+        VppSteerDirection::Both => &[Side::Src, Side::Dst],
+    }
+}
 
 /// How many prefixes in `allowlist` this NIC could steer at all.
 ///
@@ -194,20 +210,20 @@ pub fn steerable_count(allowlist: &[IpPrefix]) -> usize {
 }
 
 impl RuleSet {
-    /// Decide the rules for one port.
-    ///
-    /// Two per v4 prefix, source and destination, because the allowlist
-    /// names *networks we forward for* and traffic to them and from them
-    /// are both ours. Steering only one direction would send a flow's
-    /// two halves down different tiers, which is precisely the
-    /// asymmetric-path case that breaks PMTUD and anything stateful
-    /// downstream.
+    /// Decide the rules for one port: one per v4 prefix per configured
+    /// side (see [`sides_for`] for what each direction means and when
+    /// it is right).
     ///
     /// Fails rather than truncates when the budget cannot hold them all:
     /// a partially steered port forwards some allowlisted traffic
     /// through VPP and the rest through the kernel, which is a policy
     /// nobody chose.
-    pub fn plan(allowlist: &[IpPrefix], budget: McamBudget) -> Result<Self, String> {
+    pub fn plan(
+        allowlist: &[IpPrefix],
+        budget: McamBudget,
+        direction: VppSteerDirection,
+    ) -> Result<Self, String> {
+        let sides = sides_for(direction);
         // Partition first, then check capacity, then build. The order is
         // what makes the refusal's numbers true: counting as we go can
         // only ever report how far we got, which is the budget size — the
@@ -220,29 +236,29 @@ impl RuleSet {
             })
             .collect();
         let skipped_v6 = (allowlist.len() - steerable.len()) as u32;
-        let needed = steerable.len() * RULES_PER_PREFIX;
+        let needed = steerable.len() * sides.len();
 
         if needed > budget.free.len() {
             return Err(format!(
                 "the allowlist needs {needed} MCAM rule(s) ({} steerable prefix(es) × {} \
-                 directions) but only {} slot(s) are free on this NIC; steering part of the \
-                 allowlist would split it across both forwarding tiers, so none is installed. \
-                 The per-port ntuple table on this hardware holds 16 rules, so at two rules \
-                 per prefix the allowlist can carry at most 8 IPv4 prefixes",
+                 direction(s), `steer-direction {direction}`) but only {} slot(s) are free \
+                 on this NIC; steering part of the allowlist would split it across both \
+                 forwarding tiers, so none is installed. The per-port ntuple table on this \
+                 hardware holds 16 rules",
                 steerable.len(),
-                RULES_PER_PREFIX,
+                sides.len(),
                 budget.free.len()
             ));
         }
 
         let mut rules = Vec::with_capacity(needed);
         for (i, (addr, prefix_len)) in steerable.into_iter().enumerate() {
-            for (j, side) in [Side::Src, Side::Dst].into_iter().enumerate() {
+            for (j, side) in sides.iter().copied().enumerate() {
                 rules.push(SteerRule {
                     prefix: addr,
                     prefix_len,
                     side,
-                    location: budget.free[i * RULES_PER_PREFIX + j],
+                    location: budget.free[i * sides.len() + j],
                 });
             }
         }
@@ -279,7 +295,8 @@ mod tests {
             },
             v4(10, 88, 1, 0, 24),
         ];
-        let set = RuleSet::plan(&allow, McamBudget::default()).expect("fits");
+        let set =
+            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both).expect("fits");
 
         assert_eq!(set.skipped_v6, 1, "the v6 prefix is reported, not hidden");
         assert_eq!(set.rules.len(), 4, "two v4 prefixes, both directions");
@@ -314,7 +331,7 @@ mod tests {
         let budget = McamBudget {
             free: (0..5).rev().collect(),
         };
-        let e = RuleSet::plan(&allow, budget).expect_err("must refuse");
+        let e = RuleSet::plan(&allow, budget, VppSteerDirection::Both).expect_err("must refuse");
 
         assert!(
             e.contains("needs 8 MCAM rule(s)"),
@@ -336,6 +353,7 @@ mod tests {
             McamBudget {
                 free: (0..8).rev().collect(),
             },
+            VppSteerDirection::Both,
         )
         .expect("fits exactly");
         assert_eq!(ok.rules.len(), 8);
@@ -363,11 +381,64 @@ mod tests {
             McamBudget {
                 free: (0..3).rev().collect(),
             },
+            VppSteerDirection::Both,
         )
         .expect_err("must refuse");
         assert!(
             e.contains("needs 4 MCAM rule(s)") && e.contains("2 steerable prefix(es)"),
             "the v6 prefix is not steerable and must not inflate either number: {e}"
+        );
+    }
+
+    /// `steer-direction src` builds exactly one rule per prefix, all
+    /// Src-side, at half the budget cost of `both` — the service-edge
+    /// shape, where inbound stays on the eBPF tier because VPP has no
+    /// path to the bridge-attached hosts it terminates on.
+    #[test]
+    fn src_only_builds_one_rule_per_prefix() {
+        let allow = vec![v4(10, 0, 0, 0, 16), v4(10, 1, 0, 0, 16)];
+        let set =
+            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Src).expect("fits");
+        assert_eq!(set.rules.len(), 2, "{:?}", set.rules);
+        assert!(
+            set.rules.iter().all(|r| r.side == Side::Src),
+            "src-only must never emit a Dst rule: {:?}",
+            set.rules
+        );
+
+        let dst =
+            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Dst).expect("fits");
+        assert!(
+            dst.rules.iter().all(|r| r.side == Side::Dst),
+            "{:?}",
+            dst.rules
+        );
+
+        // Half the rules means twice the prefixes fit: a budget that
+        // refuses 2 prefixes under `both` takes them under `src`.
+        let tight = McamBudget {
+            free: (0..2).rev().collect(),
+        };
+        RuleSet::plan(&allow, tight.clone(), VppSteerDirection::Both)
+            .expect_err("two prefixes x two sides cannot fit two slots");
+        let fits = RuleSet::plan(&allow, tight, VppSteerDirection::Src).expect("fits src-only");
+        assert_eq!(fits.rules.len(), 2);
+    }
+
+    /// The refusal names the configured direction, so an operator
+    /// reading it knows which multiplier produced the number.
+    #[test]
+    fn the_refusal_names_the_direction() {
+        let allow = vec![v4(10, 0, 0, 0, 16), v4(10, 1, 0, 0, 16)];
+        let e = RuleSet::plan(
+            &allow,
+            McamBudget { free: vec![15] },
+            VppSteerDirection::Src,
+        )
+        .expect_err("must refuse");
+        assert!(
+            e.contains("1 direction(s)") && e.contains("steer-direction src"),
+            "{e}"
         );
     }
 
@@ -378,7 +449,8 @@ mod tests {
             addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             prefix_len: 32,
         }];
-        let set = RuleSet::plan(&allow, McamBudget::default()).expect("no rules is not an error");
+        let set = RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both)
+            .expect("no rules is not an error");
         assert!(set.rules.is_empty());
         assert_eq!(
             set.skipped_v6, 1,

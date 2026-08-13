@@ -201,6 +201,24 @@ pub enum ModuleDirective {
     /// compare against — the shadow has no bird of its own — and it
     /// means the operator owns the completeness judgement instead.
     VppRequireTableComplete(bool),
+    /// `steer-direction src|dst|both` — which side of the packet the
+    /// MCAM rules match, per allowlisted prefix.
+    ///
+    /// Default `both`, which is right for pure-transit deployments
+    /// where VPP can forward either direction of a flow. `src` is for
+    /// service-edge deployments: outbound traffic (src ∈ the service
+    /// prefix) rides VPP's full-table best path, while inbound
+    /// (dst ∈ prefix) stays on the eBPF tier — because inbound
+    /// terminates on bridge-attached hosts VPP has no path to (local
+    /// delivery is the fast-path FDB-pin's job), and dst-steering it
+    /// would blackhole every service flow. The split-tier flow halves
+    /// are safe under the stateless-transit invariant that steering
+    /// already requires — no different from ECMP asymmetry.
+    ///
+    /// Hot-reloadable: the steering target is rebuilt from config on
+    /// every `packetframe reconfigure`, and `steer` is a reconcile, so
+    /// a direction change installs/removes exactly the delta.
+    VppSteerDirection(VppSteerDirection),
     AllowPrefix4(Ipv4Prefix),
     AllowPrefix6(Ipv6Prefix),
     /// Connected/local prefix the operator wants packetframe to
@@ -621,6 +639,41 @@ pub enum DriverWorkaround {
     /// `Off` disables it entirely (correct once the kernel ships the
     /// upstream commit 04f647c8e456 fix).
     RvuNicpfHeadShift(ToggleAutoOnOff),
+}
+
+/// Which side of the packet MCAM steering rules match. See
+/// [`ModuleDirective::VppSteerDirection`] for the deployment reasoning.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VppSteerDirection {
+    Src,
+    Dst,
+    #[default]
+    Both,
+}
+
+impl FromStr for VppSteerDirection {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "src" => Ok(Self::Src),
+            "dst" => Ok(Self::Dst),
+            "both" => Ok(Self::Both),
+            other => Err(format!(
+                "steer-direction expects src|dst|both, got `{other}`"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for VppSteerDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Src => "src",
+            Self::Dst => "dst",
+            Self::Both => "both",
+        })
+    }
 }
 
 /// Tri-state on/off/auto toggle used by driver workarounds.
@@ -1990,6 +2043,10 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 _ => Err("require-table-complete expects on|off".to_string()),
             })
         }
+        "steer-direction" => parse_single_arg(line, rest, "steer-direction", |t| {
+            let d: VppSteerDirection = t.parse()?;
+            Ok(ModuleDirective::VppSteerDirection(d))
+        }),
         "hugepages" => parse_single_arg(line, rest, "hugepages", |t| {
             let n: u32 = t
                 .parse()
@@ -3030,6 +3087,29 @@ module fast-path
         // Naming an authority resolves it too.
         let ok2 = base.replace("integrity-authority none\n", "integrity-authority birdc\n");
         Config::parse(&ok2).unwrap().validate_vpp_offload().unwrap();
+    }
+
+    /// `steer-direction` parses its three values and rejects anything
+    /// else by name — a typo'd direction silently defaulting to `both`
+    /// would double the MCAM cost AND divert the inbound direction on
+    /// a service edge, which is the misconfiguration the directive
+    /// exists to prevent.
+    #[test]
+    fn steer_direction_parses_and_rejects() {
+        for (txt, want) in [
+            ("src", VppSteerDirection::Src),
+            ("dst", VppSteerDirection::Dst),
+            ("both", VppSteerDirection::Both),
+        ] {
+            let s = format!("module vpp-offload\n  steer-direction {txt}\n");
+            let c = Config::parse(&s).unwrap();
+            match &c.modules[0].directives[0] {
+                ModuleDirective::VppSteerDirection(d) => assert_eq!(*d, want),
+                other => panic!("expected VppSteerDirection, got {other:?}"),
+            }
+        }
+        let e = Config::parse("module vpp-offload\n  steer-direction inbound\n").unwrap_err();
+        assert!(format!("{e}").contains("expects src|dst|both"), "{e}");
     }
 
     #[test]

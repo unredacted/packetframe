@@ -1793,7 +1793,40 @@ impl FibProgrammer {
         // case free of an allocation on the route-install path.
         if let Some(sink) = self.route_sink.as_deref() {
             if let Some(rec) = self.lookup_mirror(&prefix) {
-                sink.route_resolved(prefix, &rec.nexthop_ips);
+                // Local-ARP /32s stay OFF the second tier. They
+                // describe LOCAL delivery — hosts behind the switch0
+                // bridges — which VPP deliberately does not do (no
+                // VLAN subifs; this tier's FDB-pin owns that path).
+                // Announcing them hands the sink routes whose nexthop
+                // device is a bridge: permanently `unresolvable`,
+                // which fails every readback verify — on exactly the
+                // boxes that use `local-prefix`. The shadow has none,
+                // so no shadow run could ever have caught it; found by
+                // tracing the primary's config (2026-08-14) before the
+                // second attach window rather than during it.
+                //
+                // Filtered here, at the single announce site, because
+                // this is also the only writer of the feed's mirror
+                // copy — so the resync diff inherits the same
+                // exclusion and the two paths cannot disagree.
+                let local_only = !rec.advertisements.is_empty()
+                    && rec
+                        .advertisements
+                        .keys()
+                        .all(|(p, _)| p.as_local_arp_ifindex().is_some());
+                if local_only {
+                    // A withdrawal, not silence. In the ordinary case
+                    // (a record that was local-ARP from birth) this is
+                    // a cheap no-op — the feed queues withdrawals for
+                    // prefixes it never saw, by design. But a record
+                    // whose BGP owners left while a local-ARP one
+                    // remained has been ANNOUNCED before, and going
+                    // quiet here would leave the second tier holding
+                    // its last BGP-era state forever.
+                    sink.route_withdrawn(prefix);
+                } else {
+                    sink.route_resolved(prefix, &rec.nexthop_ips);
+                }
             }
         }
         Ok(())

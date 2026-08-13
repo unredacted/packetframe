@@ -168,6 +168,7 @@ impl Host {
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.
             require_table_complete: false,
+            steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,

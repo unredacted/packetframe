@@ -213,6 +213,18 @@ Traffic moves only when you say so. The module never steers on a first
 attach, and a reconfigure that did not change a `steer` flag will not
 either, so editing an unrelated line cannot divert traffic by accident.
 
+**Choose `steer-direction` before the first rung, not during it.** On a
+service edge — the reference fleet — the right value is `src`: outbound
+traffic (src ∈ the service prefix, arriving from the agg switches)
+rides VPP's full-table best path, and inbound stays on the eBPF tier,
+whose FDB-pin owns delivery to the bridge-attached hosts VPP has no
+path to. The default `both` is for pure transit, and dst-steering a
+service prefix diverts inbound flows into a FIB that cannot deliver
+them — every steered service flow would blackhole with all gauges
+green. The directive is hot-reloadable (the target is a reconcile), so
+getting it wrong is recoverable — but the recovery window is however
+long it takes to notice.
+
 Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
 resync: a restart would cost about 40 seconds with the offload down at
 every step, including the step meant to get traffic off a bad VPP

@@ -1668,6 +1668,7 @@ impl crate::runtime::Steering for NtupleSteering {
 mod tests {
     use super::*;
     use crate::steer::{McamBudget, RuleSet};
+    use packetframe_common::config::VppSteerDirection;
     use packetframe_common::fib::IpPrefix;
     use std::net::Ipv4Addr;
 
@@ -1834,6 +1835,7 @@ mod tests {
                 },
             ],
             small,
+            VppSteerDirection::Both,
         )
         .expect_err("six rules cannot fit four slots");
         assert!(e.contains("only 4 slot(s) are free"), "{e}");
@@ -2084,7 +2086,7 @@ mod tests {
             addr: [198, 18, 0, 0],
             prefix_len: 24,
         }];
-        let fresh_plan = RuleSet::plan(&allow, budget).expect("fits");
+        let fresh_plan = RuleSet::plan(&allow, budget, VppSteerDirection::Both).expect("fits");
         for r in &fresh_plan.rules {
             assert!(
                 !inherited.iter().any(|(_, l)| *l == r.location),
@@ -3056,7 +3058,8 @@ mod tests {
             addr: [23, 191, 200, 0],
             prefix_len: 24,
         }];
-        let plan = RuleSet::plan(&allow, McamBudget::default()).expect("fits");
+        let plan =
+            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both).expect("fits");
         let mut s = steering(vec![("eth0".into(), 0)], plan);
         assert!(
             s.installed().is_empty(),
@@ -3105,7 +3108,7 @@ mod tests {
                 prefix_len: 24,
             })
             .collect();
-        RuleSet::plan(&allow, McamBudget::default()).expect("fits")
+        RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both).expect("fits")
     }
 
     /// The happy path, which had never executed anywhere.
