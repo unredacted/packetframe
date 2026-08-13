@@ -20,11 +20,16 @@
 #   1. vpp-unifi: edit the gateway pin, merge; CI builds, verifies and
 #      publishes the new tag (~45 min).
 #   2. here: update ref/platform below, re-vendor vpp-api-json.tar.gz
-#      from the new release into crates/modules/vpp-offload/vpp-api/,
-#      re-run the codegen and commit the result. CI's
-#      regenerate-and-diff job catches a wire-format change that this
-#      step missed; the transport's CRC handshake catches a router
-#      running a different VPP than this pin at attach time.
+#      from the new release into crates/modules/vpp-offload/vpp-api/
+#      TOGETHER WITH the release's manifest.json as SOURCE.json in the
+#      same directory, re-run the codegen and commit the result. CI
+#      enforces both halves: it refuses a pin whose ref/platform
+#      disagree with SOURCE.json (so a bump that forgets to re-vendor
+#      cannot merge — regenerating from a stale bundle would pass its
+#      own diff), and it regenerates from the vendored bundle and
+#      diffs generated.rs. The transport's CRC handshake remains the
+#      last line: a router running a different VPP than this pin is
+#      refused at attach time.
 # No cross-version adoption: upgrading a router is detach -> install
 # -> attach (see docs/runbooks/vpp-offload.md).
 
