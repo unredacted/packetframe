@@ -71,7 +71,8 @@ pub enum TransportError {
     /// a path nobody chose.
     #[error(
         "API mismatch for `{name}`: our definitions say {ours}, this VPP says {theirs}. \
-         The vpp/pin.toml release and the running binary disagree."
+         The running binary disagrees with the vendored API definitions \
+         (crates/modules/vpp-offload/vpp-api/SOURCE.json names the VPP release they came from)."
     )]
     CrcMismatch {
         name: &'static str,

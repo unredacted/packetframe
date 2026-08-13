@@ -14,7 +14,7 @@ PacketFrame is a modular eBPF data plane written in pure Rust (aya + aya-ebpf). 
 - `conf/example.conf`: reference config per SPEC.md §4.8
 - `docs/runbooks/custom-fib.md`: Option F operations runbook (healthy state, triage by symptom, cutover + rollback, Phase 4 config snippets)
 - `.github/workflows/`: `ci.yml` (fmt/clippy/test + 4× cross-build), `qemu-verifier.yml` (integration tests on 5.15 + 6.6 kernels), `release.yml` (tag-triggered tarballs), `hardware-artifacts.yml` (per-main-push aarch64 test-binary + CLI bundle for on-router runs)
-- `vpp/pin.toml`: consumer record only — VPP for UniFi gateways is built and published by github.com/unredacted/vpp-unifi; this file names the release tag packetframe is codegen'd/tested against (bump = vpp-unifi PR first, then this pin + re-vendor the api bundle)
+- `crates/modules/vpp-offload/vpp-api/`: vendored `.api.json` (the binary-API wire format) + `SOURCE.json`, the manifest of the release they came from. There is deliberately no separate pin file — the module is generic over VPPs (CRC handshake at attach), every fetch pointer derives from SOURCE.json, and CI byte-binds the bundle to its release. VPP for UniFi gateways is built by github.com/unredacted/vpp-unifi; bump procedure in that directory's README.md
 
 ## Build & test
 
