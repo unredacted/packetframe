@@ -22,6 +22,47 @@ Builds for our UniFi fleet publish from
 release that ships a `vpp-api-json.tar.gz` + `manifest.json` +
 `SHA256SUMS` in the same shape would do.
 
+## Version compatibility — what "works with" means
+
+The version in `SOURCE.json` is the **attested** VPP: the one these
+definitions verifiably came from. The **compatible** set is wider and
+defined operationally: any VPP whose CRCs for the whitelisted messages
+match — the handshake answers that per box, at attach, before a single
+route is programmed. Two consequences that are easy to miss:
+
+- **The whitelist is the contract, not the VPP release.** A new VPP
+  can change a hundred messages this module never speaks and remain
+  fully compatible; compatibility is defined over the ~36 messages the
+  module actually uses. This is why the vendored bundle stays a small
+  whitelist rather than the whole API surface — every vendored file
+  widens what counts as a breaking change.
+- **Incompatibility is loud and early, never adaptive.** One build of
+  packetframe speaks exactly one wire format. There is no version
+  negotiation and no "close enough": a mismatched CRC is refused by
+  message name at attach, so an old packetframe against a new VPP (or
+  vice versa) fails with a sentence naming the message, not with
+  mis-encoded routes.
+
+## When a new VPP version releases
+
+Nothing moves on its own — pins are release tags, and the fleet keeps
+running what it runs until someone performs the sequence below.
+Adopting a new version has exactly two possible shapes, distinguished
+by the `generated.rs` diff at step 3 of the re-vendor:
+
+- **No wire drift** (diff empty): the bump is pure paperwork.
+  Existing packetframe binaries already speak the new VPP — the
+  handshake passes with either side upgraded first.
+- **Wire drift** (diff shows moved fields / changed CRCs): the diff is
+  the review surface — it shows exactly which messages changed shape.
+  A new packetframe release is required, and existing binaries refuse
+  the new VPP by name at attach until it ships.
+
+Rollback in either direction is independent — old release tags stay
+published, and VPP's cadence is deliberately decoupled from
+packetframe's (this is why VPP was never bundled into packetframe's
+.deb).
+
 ## Re-vendoring (a VPP version bump)
 
 Order matters — the artifact must exist before this repo can bind to

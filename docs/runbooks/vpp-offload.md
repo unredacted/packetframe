@@ -1442,6 +1442,15 @@ Upgrade is `detach → install → attach`. There is no cross-version
 adoption: the state file records the VPP version, and a mismatch is
 refused rather than adopted.
 
+The version in `SOURCE.json` is the *attested* VPP; the *compatible*
+set is anything whose CRCs match for the messages the module speaks,
+and the attach handshake decides that per box, loudly, before any
+route is programmed. A new VPP release changes nothing on its own —
+adopting one is a deliberate two-repo sequence, and whether it needs a
+new packetframe release is answered by the `generated.rs` diff during
+the re-vendor. The full compatibility model and bump procedure:
+`crates/modules/vpp-offload/vpp-api/README.md`.
+
 ## Constraints worth knowing before you debug
 
 - **`packetframe feasibility` does not attach anything.** It used to,
