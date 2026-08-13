@@ -352,7 +352,33 @@ impl Driver {
                     // rather than assumed after issuing StartResync.
                     Ok(Drain::Idle) if resyncing => events.push(Event::SyncComplete),
                     Ok(Drain::Idle) => drain_proved_idle = true,
-                    Ok(Drain::More) => more_to_drain = true,
+                    // ACTIVE PROGRESS extends the deadline too, when it
+                    // happens during a resync. The phase budget exists
+                    // to catch a STALLED convergence, and `More` is
+                    // proof of the opposite: this tick pulled changes
+                    // and pushed them into VPP. Left unextended, the
+                    // budget races the FEED — the fresh trickle-resync
+                    // (#180) converges behind bird's multi-minute dump
+                    // by design, and w10 on the primary (2026-08-13)
+                    // spent its first two minutes returning `More` on
+                    // every tick (the dump outran the drain, so `Idle`
+                    // never came and the fresh hold never got to say
+                    // "deliberately waiting") until `PhaseTimedOut`
+                    // tore down a healthy, actively converging VPP at
+                    // ~117 s. The respawn survived only by accident:
+                    // it began from a mostly-loaded mirror and won the
+                    // race to `Idle`. A deadline cannot make bird dump
+                    // faster. What this does NOT weaken: a dead
+                    // transport takes the `Err` arms below, a silent
+                    // VPP is the wedge detector's measured job, and a
+                    // drain that stops moving stops extending — the
+                    // budget then runs out exactly as designed.
+                    Ok(Drain::More) => {
+                        if resyncing {
+                            self.sched.extend_phase(now, self.sup.phase());
+                        }
+                        more_to_drain = true;
+                    }
                     // Deliberate waiting, not progress and not
                     // completion. The phase deadline is pushed forward
                     // on every deferred tick so `CONVERGENCE_BUDGET`
@@ -827,6 +853,75 @@ mod tests {
     }
 
     // ---- The drain is incremental ----
+
+    /// Active progress must extend the phase deadline: the budget
+    /// exists to catch a STALLED convergence, and `Drain::More` is
+    /// proof of the opposite. w10 on the primary (2026-08-13) spent
+    /// the first two minutes of its fresh trickle-resync returning
+    /// `More` on every tick -- bird's dump outran the drain, `Idle`
+    /// never came, and the fresh hold never got a chance to extend --
+    /// so `PhaseTimedOut` tore down a healthy, actively converging
+    /// VPP at ~117 s. The respawn passed the window only by accident:
+    /// it restarted from a mostly-loaded mirror and won the race to
+    /// `Idle`. A deadline cannot make bird dump faster.
+    ///
+    /// The second half is the control: once progress stops
+    /// (`Verifying`, where the drain is excluded and this fake never
+    /// delivers a verdict), the same deadline still fires. Extending
+    /// on progress must not have disarmed the budget.
+    #[test]
+    fn a_resync_making_progress_outlives_the_budget_but_a_stall_does_not() {
+        use crate::supervisor::CONVERGENCE_BUDGET;
+
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            // `More` on every tick: the feed outruns the drain, which
+            // is what the front of a full-table dump looks like.
+            batches: usize::MAX,
+            ..Default::default()
+        };
+
+        d.inject(t0, Event::StartRequested, &mut fx);
+        let t = d.tick(t0, &mut w, &mut fx);
+        assert!(t.events.contains(&Event::ApiUp));
+        assert_eq!(d.state(), State::Syncing);
+
+        // Three budgets of wall clock, every tick progressing.
+        let step = Duration::from_secs(2);
+        let mut now = t0;
+        for _ in 0..(3 * CONVERGENCE_BUDGET.as_secs() / 2) {
+            now += step;
+            let t = d.tick(now, &mut w, &mut fx);
+            assert!(
+                !t.events.contains(&Event::PhaseTimedOut),
+                "a drain reporting More is progress, not a stall: {:?}",
+                t.events
+            );
+            assert_eq!(d.state(), State::Syncing);
+        }
+
+        // The dump ends; the drain empties; verify begins.
+        w.batches = 2;
+        now += step;
+        d.tick(now, &mut w, &mut fx);
+        now += step;
+        let t = d.tick(now, &mut w, &mut fx);
+        assert!(t.events.contains(&Event::SyncComplete), "{:?}", t.events);
+        assert_eq!(d.state(), State::Verifying);
+
+        // Control: no verdict arrives and nothing extends -- the
+        // budget must still fire.
+        now += CONVERGENCE_BUDGET + Duration::from_secs(1);
+        let t = d.tick(now, &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::PhaseTimedOut),
+            "the deadline must survive the extensions: {:?}",
+            t.events
+        );
+    }
 
     /// The reason `drain_batch` is bounded. A blocking full-table drain
     /// would hold the loop for the entire convergence budget, sending no
