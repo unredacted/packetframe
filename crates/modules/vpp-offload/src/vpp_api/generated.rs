@@ -39,6 +39,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "sw_interface_set_flags_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_mac_address", crc: "0xc536e7eb", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_mac_address_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_set_promisc", crc: "0xd40860d4", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_set_promisc_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "create_loopback", crc: "0x42bb5d22", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "create_loopback_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_add_del_address", crc: "0x5463d73b", context_offset: 6, client_index_prefix: true },
@@ -1233,6 +1235,79 @@ impl Decode for SwInterfaceSetMacAddressReply {
 
 impl Message for SwInterfaceSetMacAddressReply {
     const NAME: &'static str = "sw_interface_set_mac_address_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_promisc` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetPromisc {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub promisc_on: bool,
+}
+
+impl Encode for SwInterfaceSetPromisc {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.push(if self.promisc_on { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for SwInterfaceSetPromisc {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let promisc_on = d.bool()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            promisc_on,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetPromisc {
+    const NAME: &'static str = "sw_interface_set_promisc";
+    const CRC: &'static str = "0xd40860d4";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_promisc_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetPromiscReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for SwInterfaceSetPromiscReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceSetPromiscReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetPromiscReply {
+    const NAME: &'static str = "sw_interface_set_promisc_reply";
     const CRC: &'static str = "0xe8d4e804";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;

@@ -27,7 +27,8 @@ use crate::vpp_api::generated::{
     DevCreatePortIf, DevCreatePortIfReply, Prefix, SwInterfaceAddDelAddress,
     SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
     SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
+    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -280,6 +281,7 @@ pub fn attach_ports(
                 // that silently reverted would punt every steered frame
                 // while every counter stayed healthy.
                 set_mac(t, p, idx, p.pf_mac)?;
+                set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
                 out.push(AttachedPort {
                     port: p.port.clone(),
@@ -330,6 +332,7 @@ pub fn attach_ports(
         // resolve routes onto while every packet dies at
         // `ip4-not-enabled`.
         set_mac(t, p, sw_if_index, p.pf_mac)?;
+        set_promisc_on(t, p, sw_if_index)?;
         set_unnumbered(t, p, sw_if_index, loop_idx)?;
         out.push(AttachedPort {
             port: p.port.clone(),
@@ -688,6 +691,48 @@ fn set_unnumbered(
     if reply.retval != 0 {
         return Err(AttachError::Refused {
             step: "sw_interface_set_unnumbered",
+            port: p.port.clone(),
+            retval: reply.retval,
+            detail: String::new(),
+        });
+    }
+    Ok(())
+}
+
+/// Promiscuous mode on the member VF — a shared-LMAC VOTE, not a local
+/// flag, and the fix for the primary bridge-blackout (2026-08-14).
+///
+/// On this hardware the rvu AF keeps per-function rx-mode state and
+/// re-evaluates the channel's default MCAM entries — the AF-installed
+/// promisc + multicast catch-alls that forward to the KERNEL PF — on
+/// every rx-mode event from ANY function sharing the LMAC. VPP's octeon
+/// driver asserts promisc=off at port start (its default), which
+/// disabled those entries channel-wide: the bridge-member PF went deaf
+/// to every frame not addressed to its exact unicast MAC, service
+/// delivery died below the kernel (rx_drops flat — frames never reached
+/// the PF), and the kernel's own IFF_PROMISC flag stayed set the whole
+/// time, so nothing host-side looked wrong. Measured directly: NPC MCAM
+/// entries 2004/2005 on channel 0x800 flipped enabled yes->no at VPP
+/// interface-up; an rx-mode kick from the kernel side re-enabled them,
+/// and the next AF re-evaluation (bridge mcast churn arrives every few
+/// seconds) disabled them again — a war, not a fix.
+///
+/// Setting the VPP port promiscuous flips the VF's STORED vote, so
+/// every future re-evaluation — whoever triggers it — lands on
+/// enabled. The entries forward to the PF, not to us, so this does not
+/// divert bridge traffic into VPP; it stops VPP's default from
+/// un-forwarding it. Asserted on both the fresh and reuse paths for
+/// the same reason the MAC is: this is the reconcile point.
+fn set_promisc_on(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
+    let reply =
+        t.request::<SwInterfaceSetPromisc, SwInterfaceSetPromiscReply>(SwInterfaceSetPromisc {
+            context: 0,
+            sw_if_index,
+            promisc_on: true,
+        })?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_promisc",
             port: p.port.clone(),
             retval: reply.retval,
             detail: String::new(),
