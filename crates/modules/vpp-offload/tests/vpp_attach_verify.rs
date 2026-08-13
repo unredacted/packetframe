@@ -889,7 +889,7 @@ fn verify_passes_when_every_probe_finds_a_route_on_an_owned_interface() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(200);
 
-    let out = verify(&mut t, &ledger, &ports, 16, 42).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 16, 42).expect("verify");
     assert_eq!(out.sampled, 16);
     assert!(out.mismatches.is_empty(), "{:?}", out.mismatches);
     assert!(out.passed(), "{}", out.summary());
@@ -908,7 +908,7 @@ fn verify_fails_a_path_on_an_interface_we_do_not_own() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(50);
 
-    let out = verify(&mut t, &ledger, &ports, 8, 7).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 8, 7).expect("verify");
     assert!(!out.passed());
     assert_eq!(out.mismatches.len(), 8);
     assert!(
@@ -930,7 +930,7 @@ fn verify_fails_an_absent_route() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(50);
 
-    let out = verify(&mut t, &ledger, &ports, 4, 3).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 4, 3).expect("verify");
     assert!(!out.passed());
     assert!(
         out.mismatches
@@ -951,7 +951,7 @@ fn verify_fails_a_route_with_no_paths() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(50);
 
-    let out = verify(&mut t, &ledger, &ports, 4, 3).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 4, 3).expect("verify");
     assert!(!out.passed());
     assert!(
         out.mismatches
@@ -977,7 +977,7 @@ fn verify_fails_on_unresolvable_even_with_clean_probes() {
     // A route whose nexthops resolve nowhere.
     ledger.classify_resolved(v4(99, 99), 0);
 
-    let out = verify(&mut t, &ledger, &ports, 8, 11).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 8, 11).expect("verify");
     assert!(out.mismatches.is_empty(), "probes were clean");
     assert_eq!(out.unresolvable, 1);
     assert!(!out.passed(), "{}", out.summary());
@@ -998,7 +998,7 @@ fn an_empty_table_fails_rather_than_passing_vacuously() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(0);
 
-    let out = verify(&mut t, &ledger, &ports, 16, 5).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 16, 5).expect("verify");
     assert_eq!(out.sampled, 0);
     assert!(
         out.mismatches.is_empty(),
@@ -1032,7 +1032,9 @@ fn verify_fails_when_an_owned_interface_has_no_carrier() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(50);
 
-    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    // Routes egress idx 7 (the lookup behaviour says so), so the dark
+    // port is IN USE — the case that blocks steering.
+    let out = verify(&mut t, &ledger, &ports, &[7].into_iter().collect(), 8, 4).expect("verify");
     assert!(
         out.mismatches.is_empty(),
         "every route probe looks perfect: {:?}",
@@ -1040,6 +1042,7 @@ fn verify_fails_when_an_owned_interface_has_no_carrier() {
     );
     assert_eq!(out.dead_interfaces.len(), 1);
     assert_eq!(out.dead_interfaces[0].sw_if_index, 7);
+    assert!(out.dead_interfaces[0].in_use);
     assert!(out.dead_interfaces[0].admin_up);
     assert!(!out.dead_interfaces[0].link_up);
     assert!(!out.passed(), "{}", out.summary());
@@ -1064,7 +1067,8 @@ fn verify_fails_when_an_owned_interface_is_absent_from_vpp() {
     let (ledger, mut ports) = ledger_with(50);
     ports.insert("eth2", None, 9);
 
-    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    // The vanished port carries routes too — in use, so blocking.
+    let out = verify(&mut t, &ledger, &ports, &[7, 9].into_iter().collect(), 8, 4).expect("verify");
     assert!(
         out.mismatches.is_empty(),
         "every route probe still looks perfect: {:?}",
@@ -1072,6 +1076,7 @@ fn verify_fails_when_an_owned_interface_is_absent_from_vpp() {
     );
     assert_eq!(out.dead_interfaces.len(), 1, "{:?}", out.dead_interfaces);
     assert_eq!(out.dead_interfaces[0].sw_if_index, 9);
+    assert!(out.dead_interfaces[0].in_use);
     assert!(!out.dead_interfaces[0].admin_up);
     assert!(!out.dead_interfaces[0].link_up);
     assert!(!out.passed(), "{}", out.summary());
@@ -1096,7 +1101,7 @@ fn verify_ignores_link_state_on_interfaces_we_do_not_own() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(50);
 
-    let out = verify(&mut t, &ledger, &ports, 8, 4).expect("verify");
+    let out = verify(&mut t, &ledger, &ports, &Default::default(), 8, 4).expect("verify");
     assert!(out.dead_interfaces.is_empty(), "{:?}", out.dead_interfaces);
     assert!(out.passed(), "{}", out.summary());
 }
@@ -1114,8 +1119,8 @@ fn consecutive_passes_probe_different_routes() {
     let mut t = fake.connect();
     let (ledger, ports) = ledger_with(500);
 
-    let a = verify(&mut t, &ledger, &ports, 32, 1).expect("verify");
-    let b = verify(&mut t, &ledger, &ports, 32, 2).expect("verify");
+    let a = verify(&mut t, &ledger, &ports, &Default::default(), 32, 1).expect("verify");
+    let b = verify(&mut t, &ledger, &ports, &Default::default(), 32, 2).expect("verify");
     assert_eq!(a.sampled, 32);
     assert_eq!(b.sampled, 32);
     // 64 lookups total reached the socket across the two passes.

@@ -309,19 +309,31 @@ impl Verdict {
     /// `VerifyFailed` — the restart-worthy verdict — fires only when
     /// the FIB itself is wrong ([`VerifyOutcome::fib_correct`]): a
     /// fresh resync rebuilds a wrong FIB, so teardown is a remedy.
-    /// Dark member interfaces route through `VerifyIncomplete` instead:
-    /// same destination as a withheld table — reach `Ready`, do NOT
-    /// steer, keep the want — because a restart cannot plug in a
-    /// cable. Mapping them to `VerifyFailed` turned three uncabled
-    /// shadow ports into an infinite kill-respawn loop over a flawless
-    /// FIB (repro 2026-08-13). The steer path re-checks link state
-    /// fresh at steer time, so recovery is the existing retry loop
-    /// noticing the cable came back, not a verify verdict going stale
-    /// in either direction.
+    /// Dark member interfaces that CARRY ROUTES route through
+    /// `VerifyIncomplete` instead: same destination as a withheld
+    /// table — reach `Ready`, do NOT steer, keep the want — because a
+    /// restart cannot plug in a cable. Mapping them to `VerifyFailed`
+    /// turned three uncabled shadow ports into an infinite
+    /// kill-respawn loop over a flawless FIB (repro 2026-08-13).
+    ///
+    /// A dark member that is IDLE — no installed route can egress it,
+    /// which is the normal state of a dark port, since the BGP session
+    /// that would produce its routes died with the link — blocks
+    /// nothing: it shows in the summary and the ports row, and the
+    /// verdict is whatever the rest of the outcome earns. Refusing to
+    /// steer five live ports over one uncabled one would hold the
+    /// whole offload hostage to a port that poses no risk (the
+    /// primary's eth5 is the motivating case).
+    ///
+    /// The steer path re-checks link state AND usage fresh at steer
+    /// time, so recovery is the existing retry loop noticing the cable
+    /// came back, not a verify verdict going stale in either
+    /// direction.
     pub fn event(&self) -> crate::supervisor::Event {
+        let blocking_dark = self.outcome.dead_interfaces.iter().any(|d| d.in_use);
         if !self.outcome.fib_correct() {
             crate::supervisor::Event::VerifyFailed
-        } else if self.may_steer && self.outcome.dead_interfaces.is_empty() {
+        } else if self.may_steer && !blocking_dark {
             crate::supervisor::Event::VerifyPassed
         } else {
             crate::supervisor::Event::VerifyIncomplete
@@ -1449,8 +1461,16 @@ impl ConvergenceEngine {
         self.verify_seed = next_seed(self.verify_seed);
         let seed = self.verify_seed;
 
+        let active = self.active_egress_indices();
         let t = self.transport.as_mut().expect("checked just above");
-        match verify(t, &self.ledger, &self.port_index, DEFAULT_SAMPLE, seed) {
+        match verify(
+            t,
+            &self.ledger,
+            &self.port_index,
+            &active,
+            DEFAULT_SAMPLE,
+            seed,
+        ) {
             Ok(outcome) => {
                 self.last_verify = Some(outcome.clone());
                 self.phase = None;
@@ -1480,11 +1500,26 @@ impl ConvergenceEngine {
         if let Some(dead) = &self.test_dead_members {
             return Ok(dead.clone());
         }
+        let active = self.active_egress_indices();
         let Some(t) = self.transport.as_mut() else {
             return Err(EngineError::NotConnected);
         };
-        crate::verify::dead_interface_scan(t, &self.port_index.indices())
+        crate::verify::dead_interface_scan(t, &self.port_index.indices(), &active)
             .map_err(EngineError::Transport)
+    }
+
+    /// Interfaces at least one static neighbour lives on — the set of
+    /// egresses the FIB can actually choose, since every route the sink
+    /// installs resolves through a neighbour it installed. Unacked
+    /// neighbours count too: "VPP might hold an adjacency here" is
+    /// enough to treat the interface as in use, in the direction that
+    /// over-blocks rather than under-blocks a steer.
+    fn active_egress_indices(&self) -> std::collections::HashSet<u32> {
+        self.neighbours_installed
+            .keys()
+            .map(|(idx, _)| *idx)
+            .chain(self.neighbours_unacked.iter().map(|(idx, _)| *idx))
+            .collect()
     }
 
     /// Abandon whatever convergence step is in flight.
@@ -1995,6 +2030,7 @@ mod tests {
         e.last_verify = Some(VerifyOutcome {
             sampled: 64,
             dead_interfaces: vec![crate::verify::DeadInterface {
+                in_use: true,
                 sw_if_index: 3,
                 name: "octeon0/0".into(),
                 admin_up: true,
@@ -2082,6 +2118,7 @@ mod tests {
                     name: "octeon0/0".into(),
                     admin_up: true,
                     link_up: false,
+                    in_use: true,
                 }],
                 ..Default::default()
             },
@@ -2090,12 +2127,45 @@ mod tests {
         assert!(dark.outcome.fib_correct(), "the FIB itself is flawless");
         assert!(
             !dark.outcome.passed(),
-            "but a dark member must still block a steering pass"
+            "but an in-use dark member must still block a steering pass"
         );
         assert_eq!(
             dark.event(),
             Event::VerifyIncomplete,
-            "dark members must not restart-loop a healthy VPP"
+            "in-use dark members must not restart-loop a healthy VPP"
+        );
+
+        // An IDLE dark member — no route can egress it — blocks
+        // nothing: the whole offload must not be held hostage to an
+        // uncabled port with no routes (the primary's eth5).
+        let idle_dark = Verdict {
+            outcome: VerifyOutcome {
+                sampled: 64,
+                dead_interfaces: vec![DeadInterface {
+                    sw_if_index: 5,
+                    name: "octeon5/0".into(),
+                    admin_up: true,
+                    link_up: false,
+                    in_use: false,
+                }],
+                ..Default::default()
+            },
+            may_steer: true,
+        };
+        assert!(
+            idle_dark.outcome.passed(),
+            "{}",
+            idle_dark.outcome.summary()
+        );
+        assert_eq!(
+            idle_dark.event(),
+            Event::VerifyPassed,
+            "an idle dark member must not block the offload"
+        );
+        assert!(
+            idle_dark.outcome.summary().contains("idle"),
+            "but it must still be visible: {}",
+            idle_dark.outcome.summary()
         );
 
         // Both at once: a wrong FIB wins — teardown IS the remedy for
@@ -2108,6 +2178,7 @@ mod tests {
                     name: "octeon0/0".into(),
                     admin_up: true,
                     link_up: false,
+                    in_use: true,
                 }],
                 ..Default::default()
             },

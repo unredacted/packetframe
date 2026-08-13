@@ -69,6 +69,16 @@ pub struct DeadInterface {
     pub name: String,
     pub admin_up: bool,
     pub link_up: bool,
+    /// Whether any installed route can actually egress here — the FIB
+    /// holds at least one static neighbour on this interface (counting
+    /// unacked ones, conservatively). This is what separates "a
+    /// blackhole is one steer away" from "a port is dark and nothing
+    /// routes through it": a dark port mostly CANNOT carry routes,
+    /// because the BGP session that would produce them died with the
+    /// link — the primary's uncabled eth5 is the motivating case. Only
+    /// `in_use` dark members block steering; idle ones degrade the
+    /// report and nothing else.
+    pub in_use: bool,
 }
 
 /// Result of one verify pass.
@@ -124,12 +134,14 @@ impl VerifyOutcome {
         self.sampled > 0 && self.mismatches.is_empty() && self.unresolvable == 0
     }
 
-    /// Pass criteria for *steering*: the FIB is correct AND every owned
-    /// interface can forward. The two halves fail differently — see
-    /// [`Self::fib_correct`] — and `Verdict::event` is where the
-    /// difference becomes a supervisor decision.
+    /// Pass criteria for *steering*: the FIB is correct AND every dark
+    /// member is idle — no installed route can egress an interface
+    /// that cannot forward. The halves fail differently — see
+    /// [`Self::fib_correct`] and [`DeadInterface::in_use`] — and
+    /// `Verdict::event` is where the difference becomes a supervisor
+    /// decision.
     pub fn passed(&self) -> bool {
-        self.fib_correct() && self.dead_interfaces.is_empty()
+        self.fib_correct() && !self.dead_interfaces.iter().any(|d| d.in_use)
     }
 
     /// One-line operator summary. Separates the two degraded counts,
@@ -144,7 +156,7 @@ impl VerifyOutcome {
             if self.passed() {
                 "PASS"
             } else if self.fib_correct() {
-                "FIB OK, MEMBER(S) DARK — steering refused, no restart"
+                "FIB OK, IN-USE MEMBER(S) DARK — steering refused, no restart"
             } else {
                 "FAIL"
             },
@@ -158,8 +170,16 @@ impl VerifyOutcome {
         }
         for d in &self.dead_interfaces {
             s.push_str(&format!(
-                ", {} (idx {}) admin_up={} link_up={}",
-                d.name, d.sw_if_index, d.admin_up, d.link_up
+                ", {} (idx {}) admin_up={} link_up={}{}",
+                d.name,
+                d.sw_if_index,
+                d.admin_up,
+                d.link_up,
+                if d.in_use {
+                    " CARRIES ROUTES"
+                } else {
+                    " (idle: no routes egress here; not blocking)"
+                }
             ));
         }
         s
@@ -179,6 +199,7 @@ impl VerifyOutcome {
 pub(crate) fn dead_interface_scan(
     t: &mut Transport,
     owned: &std::collections::HashSet<u32>,
+    active_egress: &std::collections::HashSet<u32>,
 ) -> Result<Vec<DeadInterface>, TransportError> {
     let mut dead = Vec::new();
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -190,6 +211,7 @@ pub(crate) fn dead_interface_scan(
         let (admin_up, link_up) = (iface.admin_up(), iface.link_up());
         if !admin_up || !link_up {
             dead.push(DeadInterface {
+                in_use: active_egress.contains(&iface.sw_if_index),
                 sw_if_index: iface.sw_if_index,
                 name: iface.name,
                 admin_up,
@@ -206,6 +228,7 @@ pub(crate) fn dead_interface_scan(
     for idx in owned.iter().copied() {
         if !seen.contains(&idx) {
             dead.push(DeadInterface {
+                in_use: active_egress.contains(&idx),
                 sw_if_index: idx,
                 name: format!("<absent from VPP, idx {idx}>"),
                 admin_up: false,
@@ -268,6 +291,7 @@ pub fn verify(
     t: &mut Transport,
     ledger: &RouteLedger,
     ports: &PortIndex,
+    active_egress: &std::collections::HashSet<u32>,
     sample_size: usize,
     seed: u64,
 ) -> Result<VerifyOutcome, TransportError> {
@@ -289,7 +313,7 @@ pub fn verify(
     // and we steer into an interface that forwards nothing. The runbook
     // treats link-up as the bring-up pass for exactly this reason;
     // `set_admin_up` only ever asserted the administrative flag.
-    out.dead_interfaces = dead_interface_scan(t, &owned)?;
+    out.dead_interfaces = dead_interface_scan(t, &owned, active_egress)?;
 
     for prefix in probes {
         let reply = t.request::<IpRouteLookup, IpRouteLookupReply>(IpRouteLookup {
