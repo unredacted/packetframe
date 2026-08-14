@@ -20,6 +20,7 @@ pub mod fib;
 pub mod metrics;
 pub mod pin;
 pub mod registry;
+pub mod softnet;
 pub mod tc_links;
 
 #[cfg(target_os = "linux")]

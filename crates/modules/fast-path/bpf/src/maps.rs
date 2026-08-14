@@ -60,6 +60,16 @@ pub enum StatIdx {
     MatchedSrcOnly = 3,
     MatchedDstOnly = 4,
     MatchedBoth = 5,
+    /// Redirects the kernel ACCEPTED — not packets delivered to the
+    /// wire. Under generic XDP the frame still has to survive
+    /// `generic_xdp_tx()`, which silently drops it if the egress TX
+    /// queue is stopped (ring full): no counter on kernels < 5.18, no
+    /// qdisc, no tcpdump. Measured 6–8% of forwarded traffic lost
+    /// with this climbing normally (2026-08-13 w17, EFG under CPU
+    /// squeeze). The tc datapath does not share the caveat — its
+    /// redirect egresses through `dev_queue_xmit`, so qdisc stats see
+    /// its drops. Triage: docs/runbooks/generic-mode-performance.md,
+    /// "Silent TX drops under generic XDP".
     FwdOk = 6,
     FwdDryRun = 7,
     PassFragment = 8,

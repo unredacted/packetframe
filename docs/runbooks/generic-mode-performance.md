@@ -431,13 +431,87 @@ over the live pins.
 ### Counters that matter (`packetframe status`)
 
 - `rx_total` vs `fwd_ok`: your fast-path hit rate; the difference is traffic paying
-  full kernel-stack cost.
+  full kernel-stack cost. **Caveat:** `fwd_ok` counts redirects the kernel
+  *accepted*, not packets delivered — under generic XDP a frame can still die
+  silently after the count (see "Silent TX drops under generic XDP" below).
 - `pass_not_in_devmap`, `err_tail_call`: should be 0; non-zero means matched
   traffic silently falling back to the slow path.
 - `custom_fib_miss`: destinations the BGP feed doesn't cover (consider
   `fallback-default`).
 - `nexthop_seq_retry`, `custom_fib_no_neigh`: sustained growth means nexthop churn
   or unresolved neighbors, each such packet takes the slow path.
+
+## Silent TX drops under generic XDP (kernel < 5.18)
+
+The single hardest-to-see failure mode of this datapath, root-caused on the
+reference EFG across seven instrumented windows (2026-08-13, w12–w19, under
+VPP-coexistence CPU pressure): **generic XDP can drop forwarded packets with
+no counter, no qdisc stat, and no tcpdump visibility, while `fwd_ok` climbs
+normally.** If users report loss *through* the box and every surface you know
+how to read is clean, read this section before distrusting the reports.
+
+### The mechanism
+
+1. Something eats CPU on the cores that carry NIC softirqs (in the measured
+   case: VPP poll-mode workers; any sustained load works).
+2. The kernel starts truncating NAPI polls — `time_squeeze` in
+   `/proc/net/softnet_stat` rises (measured: 7/s baseline → 46/s during
+   loss).
+3. Truncated polls reap TX completions late, so the egress port's TX ring
+   fills faster than it drains.
+4. `generic_xdp_tx()` finds the TX queue stopped and **frees the frame
+   silently**. Kernels before 5.18 count this nowhere (5.18 added per-device
+   core-stats, where it appears as `tx_dropped` in `ip -s link`); 5.15
+   vendor kernels have nothing.
+
+`fwd_ok` is incremented when `bpf_redirect_map` *accepts* the frame — step 4
+happens after the count. The tc datapath is exempt: its redirect egresses
+through `dev_queue_xmit`, so the qdisc sees (and counts) its drops.
+
+### Why your instruments are blind
+
+- **tcpdump cannot see XDP-forwarded traffic in either direction.** On RX,
+  `do_xdp_generic` runs before packet taps; on TX, `generic_xdp_tx` calls
+  `netdev_start_xmit` directly, bypassing `dev_queue_xmit` — no taps, no
+  qdisc. A capture on the egress port during full-rate XDP forwarding shows
+  only kernel-path stragglers, and a *quiet* capture proves nothing.
+- **Qdisc counters are blind for the same reason** — do not use
+  `tc -s qdisc` deltas as evidence about XDP-forwarded volume.
+- **NIC counters look clean** because the frame is freed before it reaches
+  the driver.
+
+### Diagnosis
+
+1. **Watch `packetframe_softnet_time_squeeze_total`** (exported since this
+   finding) or by hand:
+   `awk '{s+=strtonum("0x"$3)} END {print s}' /proc/net/softnet_stat` — take
+   a delta over 10 s. A rising rate that correlates with reported loss is
+   the fingerprint.
+2. **Localize with mtr from outside**: the hop that answers with
+   kernel-generated TTL-exceeded (the box itself) stays clean while the next
+   hop (traffic forwarded *through* the box) shows loss — the drop is in the
+   forwarding path, not the wire or the far side.
+3. **Confirm by intervention** (there is no tracepoint on a vendor kernel
+   with no tracefs): grow the egress TX ring, e.g.
+   `ethtool -G ethX tx 32768`. If loss stops, the mechanism is confirmed —
+   **then put the ring back.** Measured: 8% loss → 0% at 32k, but average
+   RTT went to ~678 ms (classic bufferbloat). The ring is a diagnostic, not
+   a fix.
+
+### What actually fixes it
+
+Kernel knobs only choose where the CPU deficit surfaces — all three were
+measured on the EFG: stock settings → silent drops; big TX ring → ring
+bufferbloat; `netdev_budget`×4 (`budget_usecs` 80 ms) → `time_squeeze` goes
+to zero and loss mostly stops, but single NAPI rounds hog CPUs for up to
+80 ms and local-segment RTT bloats instead. The durable fixes remove the
+deficit:
+
+- **Remove the competing CPU load** (in the vpp-offload case: fewer staging
+  cores — see that runbook's coexistence section).
+- **Move traffic off generic XDP** — steer it into a hardware path
+  (vpp-offload's MCAM steering), or native XDP where the driver supports it
+  (not on this fleet's vendor kernel).
 
 ## Platform taxes on UniFi OS
 

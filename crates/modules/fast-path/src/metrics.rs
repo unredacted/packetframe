@@ -132,6 +132,43 @@ pub fn render_textfile(stats: &[u64], uptime_seconds: u64) -> String {
     out
 }
 
+/// Render host softirq-pressure counters from `/proc/net/softnet_stat`.
+///
+/// These are host-kernel counters, not packetframe's — exported here
+/// because `time_squeeze` is the only signal that moves in step with
+/// the silent generic-XDP TX drop mechanism (2026-08-13, w12–w19):
+/// the drop itself has no counter anywhere on a 5.15 kernel and is
+/// invisible to tcpdump and qdisc stats, so the early warning has to
+/// ride in the same scrape as `fwd_ok`. Keeping the `module` label
+/// matches every other series in the textfile; the HELP line carries
+/// the host-wide caveat.
+pub fn render_softnet(t: &crate::softnet::SoftnetTotals) -> String {
+    let mut out = String::with_capacity(1024);
+    let rows: [(&str, &str, u64); 3] = [
+        (
+            "packetframe_softnet_processed_total",
+            "softirq-processed packets summed across all CPUs (host-wide, /proc/net/softnet_stat)",
+            t.processed,
+        ),
+        (
+            "packetframe_softnet_dropped_total",
+            "softnet backlog drops summed across all CPUs (host-wide, /proc/net/softnet_stat)",
+            t.dropped,
+        ),
+        (
+            "packetframe_softnet_time_squeeze_total",
+            "NAPI polls truncated by netdev_budget/budget_usecs, summed across all CPUs; a rising rate under generic XDP is the early warning for silent TX drops (docs/runbooks/generic-mode-performance.md)",
+            t.time_squeeze,
+        ),
+    ];
+    for (metric, help, value) in rows {
+        let _ = writeln!(out, "# HELP {metric} {help}");
+        let _ = writeln!(out, "# TYPE {metric} counter");
+        let _ = writeln!(out, "{metric}{{module=\"fast-path\"}} {value}");
+    }
+    out
+}
+
 /// Render custom-FIB occupancy metrics as Prometheus gauges
 /// (Option F, Phase 3.8).
 ///
@@ -293,6 +330,26 @@ mod tests {
         let type_lines = body.lines().filter(|l| l.starts_with("# TYPE")).count();
         // COUNTER_NAMES.len() counters + 1 uptime gauge.
         assert_eq!(type_lines, COUNTER_NAMES.len() + 1);
+    }
+
+    #[test]
+    fn softnet_counters_render_all_three_with_headers() {
+        let t = crate::softnet::SoftnetTotals {
+            processed: 100,
+            dropped: 2,
+            time_squeeze: 46,
+            cpus: 18,
+        };
+        let body = render_softnet(&t);
+        assert!(body.contains("packetframe_softnet_processed_total{module=\"fast-path\"} 100"));
+        assert!(body.contains("packetframe_softnet_dropped_total{module=\"fast-path\"} 2"));
+        assert!(body.contains("packetframe_softnet_time_squeeze_total{module=\"fast-path\"} 46"));
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.starts_with("# TYPE") && l.ends_with("counter"))
+                .count(),
+            3
+        );
     }
 
     #[cfg(target_os = "linux")]

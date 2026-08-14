@@ -111,6 +111,15 @@ fn write_once(
     // handles that by emitting zeros + a `mode=\"kernel-fib\"` one-hot.
     let fib = packetframe_fast_path::fib_status_from_pin(bpffs_root);
     body.push_str(&packetframe_fast_path::metrics::render_fib_gauges(&fib));
+    // Host softirq pressure. `time_squeeze` is the one early signal
+    // for the silent generic-XDP TX drop mechanism (2026-08-13,
+    // w12–w19), which no packetframe counter, qdisc stat, or tcpdump
+    // can see. Best-effort: a read/parse failure loses this block for
+    // one tick, never the file.
+    match packetframe_fast_path::softnet::from_proc() {
+        Ok(t) => body.push_str(&packetframe_fast_path::metrics::render_softnet(&t)),
+        Err(e) => tracing::debug!(error = %e, "softnet_stat unavailable this tick"),
+    }
     // Whatever the loader last sampled from the modules. Appended rather
     // than merged: each module namespaces its own gauges
     // (`packetframe_vpp_*`), so there is nothing to reconcile — and a
