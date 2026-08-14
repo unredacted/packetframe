@@ -34,10 +34,10 @@ use packetframe_vpp_offload::vpp_api::generated::{
     CreateVlanSubifReply, DevAttachReply, DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor,
     IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump, IpRoute,
     IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
-    Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceDetails,
-    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetPromiscReply,
-    SwInterfaceSetUnnumberedReply, ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4,
-    FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddressReply,
+    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
+    SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -363,6 +363,14 @@ fn serve(
                     context: ctx,
                     retval: 0,
                     sw_if_index: idx,
+                }
+                .encode(&mut out);
+            }
+            "sw_interface_add_del_mac_address" => {
+                out = reply_head("sw_interface_add_del_mac_address_reply");
+                SwInterfaceAddDelMacAddressReply {
+                    context: ctx,
+                    retval: 0,
                 }
                 .encode(&mut out);
             }

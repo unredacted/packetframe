@@ -377,7 +377,8 @@ fn measured_convergence_against_a_real_vpp() {
                 pci_addr: pci.clone(),
                 port_id: 0,
                 num_rx_queues: 1,
-                answer_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                accept_macs: vec![],
                 vlans: vec![],
             })
             .collect(),

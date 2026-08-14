@@ -38,9 +38,9 @@ use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 use packetframe_vpp_offload::vpp_api::generated::{
     ControlPingReply, CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply, DevAttachReply,
     DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply, MessageTableEntry,
-    SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceDetails,
-    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetPromiscReply,
-    SwInterfaceSetUnnumberedReply, MESSAGE_META,
+    SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddressReply,
+    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
+    SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
 
@@ -344,6 +344,23 @@ impl Fake {
                         }
                         .encode(&mut out);
                     }
+                    "sw_interface_add_del_mac_address" => {
+                        // Payload: id(2) client_index(4) context(4)
+                        // sw_if_index(4) mac(6) is_add(1). Read by
+                        // offset — the generated request is encode-only.
+                        let idx = u32::from_be_bytes([req[10], req[11], req[12], req[13]]);
+                        let mac = &req[14..20];
+                        let _ = tx.send(format!(
+                            "secondary_mac idx={idx} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} add={}",
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], req[20]
+                        ));
+                        out = reply_head("sw_interface_add_del_mac_address_reply");
+                        SwInterfaceAddDelMacAddressReply {
+                            context: ctx,
+                            retval: 0,
+                        }
+                        .encode(&mut out);
+                    }
                     "sw_interface_set_promisc" => {
                         out = reply_head("sw_interface_set_promisc_reply");
                         SwInterfaceSetPromiscReply {
@@ -495,7 +512,8 @@ fn ports() -> Vec<PortAttach> {
         pci_addr: "0002:07:00.1".into(),
         port_id: 0,
         num_rx_queues: 1,
-        answer_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        accept_macs: vec![],
         vlans: vec![],
     }]
 }
@@ -850,6 +868,66 @@ fn a_recorded_interface_is_reused_not_re_attached() {
 /// reaches ip4-input, regardless of MAC or promisc. Each declared vlan
 /// must therefore get a dot1q subif, admin-up and unnumbered, before
 /// the port is announced attached.
+/// The two-window dmac story, asserted as a pair.
+///
+/// w21 needed the bridge's address accepted or classified frames punt;
+/// w22 proved it must NOT be the primary, because the primary is a
+/// hardware filter and moving it captured ~300 kpps of delivery with
+/// the steering lever off. So: primary stays the port's own, the
+/// bridge's arrives as a secondary.
+#[test]
+fn a_bridge_members_second_mac_is_added_not_substituted() {
+    let fake = Fake::start(
+        "secondary",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+    );
+    let mut t = fake.connect();
+    let mut p = ports();
+    p[0].accept_macs = vec![[0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7]];
+    attach_ports(&mut t, &p, &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
+
+    let seen = fake.observed();
+    assert!(
+        seen.contains(&"secondary_mac idx=7 mac=28:70:4e:47:69:c7 add=1".to_string()),
+        "the bridge address must be ADDED to the member: {seen:?}"
+    );
+    // And the primary is still the port's own — the readback the fake
+    // models would have caught a substitution, but assert the intent
+    // directly rather than through its absence.
+    let set_at = seen
+        .iter()
+        .position(|s| s == "sw_interface_set_mac_address");
+    let add_at = seen.iter().position(|s| s.starts_with("secondary_mac"));
+    assert!(set_at < add_at, "identity first, then acceptance: {seen:?}");
+}
+
+/// A plain L3 port asks for no secondary at all — one fewer thing to
+/// go wrong on the transit members, which never had this problem.
+#[test]
+fn a_port_with_no_accept_macs_sends_no_secondary() {
+    let fake = Fake::start(
+        "nosecondary",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+    );
+    let mut t = fake.connect();
+    attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
+    let seen = fake.observed();
+    assert!(
+        !seen.iter().any(|s| s.starts_with("secondary_mac")),
+        "{seen:?}"
+    );
+}
+
 #[test]
 fn declared_vlans_get_dot1q_subifs_up_and_unnumbered() {
     let fake = Fake::start(

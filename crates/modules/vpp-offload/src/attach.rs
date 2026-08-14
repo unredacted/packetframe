@@ -25,10 +25,11 @@ use packetframe_common::config::Ipv4Prefix;
 use crate::vpp_api::generated::{
     Address, AddressUnion, CreateLoopback, CreateLoopbackReply, CreateVlanSubif,
     CreateVlanSubifReply, DevAttach, DevAttachReply, DevCreatePortIf, DevCreatePortIfReply, Prefix,
-    SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceDump,
-    SwInterfaceSetFlags, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress,
-    SwInterfaceSetMacAddressReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
-    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
+    SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
+    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
+    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
+    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -72,18 +73,27 @@ pub struct PortAttach {
     pub port_id: u16,
     /// Receive queues, from the operator's `cores` promise.
     pub num_rx_queues: u16,
-    /// The MAC this member must **answer to** — the gateway address
-    /// hosts and peers actually put in their frames.
+    /// The member's PRIMARY MAC — always the PF's own address, from
+    /// `/sys/class/net/<port>/address`.
     ///
-    /// The VF's own MAC is never usable: MCAM redirects frames as the
-    /// wire carries them. For a plain L3 port that means the PF's MAC
-    /// (`/sys/class/net/<port>/address`); for a bridge-member port it
-    /// means the **bridge's** MAC — measured on the primary (w21,
-    /// 2026-08-14): answering to eth4's own address instead of
-    /// switch0's cost 7.17M subif-classified frames punted at
-    /// `ethernet-input` in 90 seconds. `bringup::answering_mac` makes
-    /// the choice from the sysfs `master` link.
-    pub answer_mac: [u8; 6],
+    /// The VF's factory MAC is not usable (MCAM redirects frames as
+    /// the wire carries them), and the bridge's MAC is not usable
+    /// *here*: on this NIC the primary is programmed into the VF's
+    /// hardware filter, so a bridge MAC in this field captures
+    /// delivery of every gateway-addressed frame even with steering
+    /// off — w22, 2026-08-14. Acceptance of other addresses belongs in
+    /// [`Self::accept_macs`].
+    pub pf_mac: [u8; 6],
+    /// Additional MACs this interface must **accept** frames for,
+    /// added as VPP secondary addresses.
+    ///
+    /// A bridge-member port's real audience addresses the *bridge's*
+    /// MAC (it is what ARP hands out), and a secondary entry is an
+    /// acceptance-list entry at `ethernet-input` — the node that
+    /// punted w21's 7.17M classified frames — rather than a hardware
+    /// filter. Empty for plain L3 ports and for a bridge that took its
+    /// MAC from this port.
+    pub accept_macs: Vec<[u8; 6]>,
     /// 802.1Q tags steered ingress arrives with on this port, from the
     /// operator's `vlans` declaration. One exact-match dot1q subif is
     /// created per id at attach; a tagged frame with no subif never
@@ -294,7 +304,8 @@ pub fn attach_ports(
                 // running VPP, and this is the reconcile point. A MAC
                 // that silently reverted would punt every steered frame
                 // while every counter stayed healthy.
-                set_mac(t, p, idx, p.answer_mac)?;
+                set_mac(t, p, idx, p.pf_mac)?;
+                set_accept_macs(t, p, idx)?;
                 set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
                 ensure_vlan_subifs(t, p, idx, loop_idx, &existing)?;
@@ -346,7 +357,8 @@ pub fn attach_ports(
         // to the sink before it can forward is a port the FIB will
         // resolve routes onto while every packet dies at
         // `ip4-not-enabled`.
-        set_mac(t, p, sw_if_index, p.answer_mac)?;
+        set_mac(t, p, sw_if_index, p.pf_mac)?;
+        set_accept_macs(t, p, sw_if_index)?;
         set_promisc_on(t, p, sw_if_index)?;
         set_unnumbered(t, p, sw_if_index, loop_idx)?;
         // A freshly created parent cannot have subifs, so the dump
@@ -718,6 +730,55 @@ fn set_unnumbered(
     Ok(())
 }
 
+/// Add every [`PortAttach::accept_macs`] entry as a VPP secondary MAC.
+///
+/// This is the acceptance half of the dmac story, and it is separate
+/// from [`set_mac`] on purpose. `sw_interface_set_mac_address` moves
+/// the interface's identity — and on this NIC that identity is a
+/// hardware filter, so pointing it at the bridge's address made the VF
+/// receive gateway traffic the MCAM had never steered (w22,
+/// 2026-08-14: ~300 kpps with the lever off). A secondary address adds
+/// an entry to the acceptance list `ethernet-input` consults, which is
+/// exactly the check that punted w21's classified frames, and adds
+/// nothing to what the NIC delivers.
+///
+/// Idempotent by VPP's own semantics: adding an address the interface
+/// already holds is a no-op, which is what makes this safe on the
+/// adoption path.
+///
+/// **Unverified by readback**, unlike the primary: no whitelisted dump
+/// reports an interface's secondary addresses. If the octeon driver
+/// turns out to program secondaries into hardware after all, the
+/// symptom is w22's — traffic arriving unsteered — and the rung-0
+/// leak check in the runbook is what catches it.
+fn set_accept_macs(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
+    for mac in &p.accept_macs {
+        let reply = t.request::<SwInterfaceAddDelMacAddress, SwInterfaceAddDelMacAddressReply>(
+            SwInterfaceAddDelMacAddress {
+                context: 0,
+                sw_if_index,
+                addr: *mac,
+                is_add: 1,
+            },
+        )?;
+        if reply.retval != 0 {
+            return Err(AttachError::Refused {
+                step: "sw_interface_add_del_mac_address",
+                port: p.port.clone(),
+                retval: reply.retval,
+                detail: hex_mac(mac),
+            });
+        }
+        tracing::info!(
+            port = %p.port,
+            secondary_mac = %hex_mac(mac),
+            "secondary MAC accepted — frames addressed to the bridge now classify instead \
+             of punting, without moving what the NIC delivers"
+        );
+    }
+    Ok(())
+}
+
 /// Create (or re-adopt) one exact-match dot1q subif per declared vlan.
 ///
 /// Why this exists: MCAM steering diverts frames as the wire carries
@@ -872,7 +933,8 @@ mod tests {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            answer_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
             vlans: vec![],
         };
         assert_eq!(format!("pci/{}", p.pci_addr), "pci/0002:07:00.1");

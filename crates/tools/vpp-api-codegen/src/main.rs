@@ -103,6 +103,18 @@ const MESSAGES: &[&str] = &[
     "sw_interface_add_del_address_reply",
     "sw_interface_set_unnumbered",
     "sw_interface_set_unnumbered_reply",
+    //   SECONDARY acceptance MACs. The member's PRIMARY MAC must stay
+    //   its own PF address: on this NIC the primary is programmed into
+    //   the VF's hardware filter, so setting it to the bridge's MAC
+    //   made the VF capture delivery of every frame addressed to the
+    //   gateway — measured on the primary 2026-08-14 (w22), ~300 kpps
+    //   arriving with the steering lever OFF, which silently voids the
+    //   staging state the whole rollout ladder rests on. A secondary
+    //   address is an acceptance-list entry consulted at
+    //   `ethernet-input`, which is where the dmac check that punted
+    //   w21's 7.17M frames actually lives.
+    "sw_interface_add_del_mac_address",
+    "sw_interface_add_del_mac_address_reply",
     //   Trunk-port ingress arrives 802.1Q-tagged, and a tagged frame
     //   with no matching subinterface never reaches ip4-input — it is
     //   punted at ethernet-input regardless of MAC or promisc state.
