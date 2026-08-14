@@ -90,8 +90,8 @@ pub const MODULE_NAME: &str = "vpp-offload";
 /// Parsed view of the module's section, extracted once at load.
 #[derive(Debug, Clone, Default)]
 pub struct VppOffloadConfig {
-    /// (iface, cores, steer) in config order.
-    pub ports: Vec<(String, u16, bool)>,
+    /// (iface, cores, steer, vlans) in config order.
+    pub ports: Vec<(String, u16, bool, Vec<u16>)>,
     pub vpp_binary: Option<String>,
     pub expected_routes: u64,
     pub hugepages: Option<u32>,
@@ -140,8 +140,11 @@ impl VppOffloadConfig {
                     iface,
                     cores,
                     steer,
+                    vlans,
                     ..
-                } => out.ports.push((iface.clone(), *cores, *steer)),
+                } => out
+                    .ports
+                    .push((iface.clone(), *cores, *steer, vlans.clone())),
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
@@ -202,17 +205,24 @@ impl VppOffloadConfig {
         // Ports are compared as (iface, cores) IN ORDER. Order matters
         // as much as membership: it decides which VF is created on which
         // PF, and `acquire` refuses to adopt across a change to either.
-        let old_ports: Vec<(&str, u16)> = self
+        // `vlans` is in the restart-only set with iface and cores: the
+        // dot1q subifs are created at attach, and a reload that claimed
+        // to add one would leave steered tagged ingress punting at
+        // ethernet-input (the w20 blackhole) while reporting OK.
+        let old_ports: Vec<(&str, u16, &[u16])> = self
             .ports
             .iter()
-            .map(|(i, c, _)| (i.as_str(), *c))
+            .map(|(i, c, _, v)| (i.as_str(), *c, v.as_slice()))
             .collect();
-        let new_ports: Vec<(&str, u16)> =
-            new.ports.iter().map(|(i, c, _)| (i.as_str(), *c)).collect();
+        let new_ports: Vec<(&str, u16, &[u16])> = new
+            .ports
+            .iter()
+            .map(|(i, c, _, v)| (i.as_str(), *c, v.as_slice()))
+            .collect();
         if old_ports != new_ports {
             return Err(format!(
-                "the `port` lines changed ({old_ports:?} → {new_ports:?}); VF and worker \
-                 topology is fixed when VPP starts, so this needs a restart \
+                "the `port` lines changed ({old_ports:?} → {new_ports:?}); VF, worker and \
+                 subinterface topology is fixed when VPP starts, so this needs a restart \
                  (`packetframe detach --all`, then start). Only `steer on|off` can change \
                  under a running VPP"
             ));
@@ -282,7 +292,7 @@ impl VppOffloadConfig {
     pub fn total_workers(&self) -> u32 {
         self.ports
             .iter()
-            .map(|(_, cores, _)| u32::from(*cores))
+            .map(|(_, cores, _, _)| u32::from(*cores))
             .sum()
     }
 }
@@ -378,8 +388,8 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     // ended up, which this snapshot cannot see.
     let mut rolled_back: Vec<&str> = Vec::new();
     let mut turned_on: Vec<&str> = Vec::new();
-    for (iface, _, was) in &old.ports {
-        let Some((_, _, now)) = new.ports.iter().find(|(i, _, _)| i == iface) else {
+    for (iface, _, was, _) in &old.ports {
+        let Some((_, _, now, _)) = new.ports.iter().find(|(i, _, _, _)| i == iface) else {
             continue;
         };
         match (was, now) {
@@ -471,8 +481,8 @@ fn ifaces_to_query<'a>(
     }
     cfg.ports
         .iter()
-        .filter(|(_, _, steer)| *steer)
-        .map(|(iface, _, _)| iface.as_str())
+        .filter(|(_, _, steer, _)| *steer)
+        .map(|(iface, _, _, _)| iface.as_str())
         .collect()
 }
 
@@ -509,8 +519,8 @@ fn steering_target(
     let ports: Vec<(String, u32)> = cfg
         .ports
         .iter()
-        .filter(|(_, _, steer)| *steer)
-        .map(|(iface, _, _)| (iface.clone(), 0u32))
+        .filter(|(_, _, steer, _)| *steer)
+        .map(|(iface, _, _, _)| (iface.clone(), 0u32))
         .collect();
     let want_steer = !ports.is_empty();
     if !want_steer {
@@ -1010,8 +1020,8 @@ impl Module for VppOffloadModule {
             .cfg
             .ports
             .iter()
-            .map(|(_, _, steer)| *steer)
-            .ne(new.ports.iter().map(|(_, _, steer)| *steer));
+            .map(|(_, _, steer, _)| *steer)
+            .ne(new.ports.iter().map(|(_, _, steer, _)| *steer));
         attached
             .service
             .apply_steering(target.ports, target.plan, target.want_steer, lever_moved)
@@ -1247,7 +1257,10 @@ mod tests {
     #[test]
     fn nothing_steerable_means_no_nic_is_asked() {
         let cfg = VppOffloadConfig {
-            ports: vec![("eth4".into(), 1, true), ("eth5".into(), 1, false)],
+            ports: vec![
+                ("eth4".into(), 1, true, vec![]),
+                ("eth5".into(), 1, false, vec![]),
+            ],
             ..VppOffloadConfig::default()
         };
         let v6_only = [packetframe_common::fib::IpPrefix::V6 {
@@ -1540,7 +1553,7 @@ mod tests {
         VppOffloadConfig {
             ports: ports
                 .iter()
-                .map(|(i, c, s)| (i.to_string(), *c, *s))
+                .map(|(i, c, s)| (i.to_string(), *c, *s, vec![]))
                 .collect(),
             vpp_binary: None,
             expected_routes: routes,
@@ -1639,6 +1652,7 @@ mod tests {
                     iface: "eth4".into(),
                     cores: 1,
                     steer: false,
+                    vlans: vec![],
                     line: 1,
                 },
                 ModuleDirective::VppRequireTableComplete(require),
@@ -1871,6 +1885,24 @@ mod tests {
         let before = cfg(&[("eth4", 1, false), ("eth5", 1, false)], 1_600_000);
         let after = cfg(&[("eth5", 1, false), ("eth4", 1, false)], 1_600_000);
         assert!(before.restart_only_delta(&after).is_err());
+    }
+
+    /// Subifs are created at attach; a reload that claimed to add a
+    /// vlan would report OK while steered tagged ingress kept punting
+    /// at ethernet-input — the w20 blackhole with a green reconfigure
+    /// on top.
+    #[test]
+    fn changing_a_ports_vlans_is_a_restart() {
+        let mut before = cfg(&[("eth4", 1, false)], 1_600_000);
+        before.ports[0].3 = vec![88, 1337];
+        let mut after = before.clone();
+        after.ports[0].3 = vec![1337];
+        let e = before.restart_only_delta(&after).expect_err("must refuse");
+        assert!(e.contains("subinterface"), "{e}");
+        // Same list, only the lever moved: not a restart.
+        let mut steered = before.clone();
+        steered.ports[0].2 = true;
+        assert!(before.restart_only_delta(&steered).is_ok());
     }
 
     /// The shared allowlist is a window, not a copy.

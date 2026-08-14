@@ -161,15 +161,25 @@ pub enum ModuleDirective {
     },
     // --- vpp-offload module (phase 4). Directive namespace is shared
     // across module sections; these names are vpp-offload's. ---
-    /// `port <iface> cores <n> steer on|off` — VPP forwarding-domain
-    /// membership for one physical port (VF + vfio + VPP interface,
-    /// usable as egress) plus its steering state. Membership is
-    /// all-or-nothing across the domain (a steered packet's best path
-    /// may egress any port); `steer` is the per-port canary lever.
+    /// `port <iface> cores <n> steer on|off [vlans <id>[,<id>...]]` —
+    /// VPP forwarding-domain membership for one physical port (VF +
+    /// vfio + VPP interface, usable as egress) plus its steering
+    /// state. Membership is all-or-nothing across the domain (a
+    /// steered packet's best path may egress any port); `steer` is
+    /// the per-port canary lever.
+    ///
+    /// `vlans` declares the 802.1Q tags steered ingress arrives with
+    /// on a trunk port; the module creates a matching dot1q
+    /// subinterface per id at attach. Without it, every tagged frame
+    /// the MCAM diverts is punted at VPP's ethernet-input before any
+    /// routing — measured on the primary 2026-08-14 (w20): 8.7M
+    /// frames in two minutes, all punted, zero forwarded. Untagged
+    /// ingress (an access port, or the PVID) needs no declaration.
     VppPort {
         iface: String,
         cores: u16,
         steer: bool,
+        vlans: Vec<u16>,
         line: usize,
     },
     /// `vpp-binary <path>` — override the probed VPP binary path.
@@ -1983,12 +1993,12 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         }),
         // --- vpp-offload directives (phase 4) ---
         "port" => {
-            // port <iface> cores <n> steer on|off
+            // port <iface> cores <n> steer on|off [vlans <id>[,<id>...]]
             let iface = rest
                 .next()
                 .ok_or_else(|| ConfigError::parse(line, "port requires an interface"))?;
             validate_iface_name(line, "port", iface)?;
-            let usage = "port takes: <iface> cores <n> steer on|off";
+            let usage = "port takes: <iface> cores <n> steer on|off [vlans <id>[,<id>...]]";
             if rest.next() != Some("cores") {
                 return Err(ConfigError::parse(line, usage));
             }
@@ -2008,6 +2018,30 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 Some("off") => false,
                 _ => return Err(ConfigError::parse(line, "steer expects on|off")),
             };
+            let mut vlans: Vec<u16> = Vec::new();
+            match rest.next() {
+                None => {}
+                Some("vlans") => {
+                    let csv = rest.next().ok_or_else(|| {
+                        ConfigError::parse(line, "vlans requires a comma-separated id list")
+                    })?;
+                    for tok in csv.split(',') {
+                        let vid: u16 = tok.parse().map_err(|_| {
+                            ConfigError::parse(line, "vlans ids must be integers 1-4094")
+                        })?;
+                        // 0 is priority-tagged, 4095 reserved; neither
+                        // names a subinterface anything can classify to.
+                        if !(1..=4094).contains(&vid) {
+                            return Err(ConfigError::parse(line, "vlans ids must be 1-4094"));
+                        }
+                        if vlans.contains(&vid) {
+                            return Err(ConfigError::parse(line, "duplicate vlan id"));
+                        }
+                        vlans.push(vid);
+                    }
+                }
+                Some(_) => return Err(ConfigError::parse(line, usage)),
+            }
             if rest.next().is_some() {
                 return Err(ConfigError::parse(line, usage));
             }
@@ -2015,6 +2049,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 iface: iface.to_string(),
                 cores,
                 steer,
+                vlans,
                 line,
             })
         }
@@ -3141,6 +3176,37 @@ module fast-path
             "module vpp-offload\n  port eth4 cores 1 steer maybe\n",
             "module vpp-offload\n  port eth4 cores 1 steer on extra\n",
             "module vpp-offload\n  port eth4 steer on cores 1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    /// The `vlans` tail exists because of w20 on the primary
+    /// (2026-08-14): steering a trunk port without dot1q subifs
+    /// punted 8.7M frames in two minutes. A port line without it
+    /// still parses — untagged ports need no declaration.
+    #[test]
+    fn vpp_port_vlans_parse() {
+        let s = "module vpp-offload\n  port eth4 cores 1 steer off vlans 88,1337\n";
+        let c = Config::parse(s).unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppPort { vlans, .. } => assert_eq!(vlans, &[88, 1337]),
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        // No vlans clause → empty list, not an error.
+        let c = Config::parse("module vpp-offload\n  port eth4 cores 1 steer off\n").unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppPort { vlans, .. } => assert!(vlans.is_empty()),
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        for bad in [
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans 0\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans 4095\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans 88,88\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans 88,\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans 88 99\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off tags 88\n",
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
         }

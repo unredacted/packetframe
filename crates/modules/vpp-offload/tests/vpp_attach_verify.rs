@@ -21,7 +21,9 @@ use packetframe_vpp_offload::attach::{attach_ports, AttachError, AttachMode, Por
 use packetframe_vpp_offload::fib_sync::{to_prefix, PortIndex};
 use packetframe_vpp_offload::sink::{Capacity, RouteLedger};
 use packetframe_vpp_offload::verify::{verify, Mismatch};
-use packetframe_vpp_offload::vpp_api::codec::{peek_msg_id, Encode, SOCKCLNT_CREATE_MSG_ID};
+use packetframe_vpp_offload::vpp_api::codec::{
+    peek_msg_id, Decode, Decoder, Encode, SOCKCLNT_CREATE_MSG_ID,
+};
 /// The loopback index the fake hands out. Attach unnumbers every member
 /// to it; these tests care that the call is made, not what the index is.
 const TEST_LOOP_IDX: u32 = 9;
@@ -34,10 +36,11 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
-    ControlPingReply, CreateLoopbackReply, DevAttachReply, DevCreatePortIfReply, FibPath, IpRoute,
-    IpRouteLookupReply, MessageTableEntry, SockclntCreateReply, SwInterfaceAddDelAddressReply,
-    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply, MESSAGE_META,
+    ControlPingReply, CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply, DevAttachReply,
+    DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply, MessageTableEntry,
+    SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceDetails,
+    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetPromiscReply,
+    SwInterfaceSetUnnumberedReply, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
 
@@ -309,6 +312,30 @@ impl Fake {
                         }
                         .encode(&mut out);
                     }
+                    "create_vlan_subif" => {
+                        let mut d = Decoder::new(&req);
+                        let r = CreateVlanSubif::decode(&mut d).expect("decodes as a subif op");
+                        let idx = 100 + r.vlan_id;
+                        // Registered in the dump like a real subif, so a
+                        // reuse pass can find it by its VPP-given name.
+                        let parent = ifaces
+                            .iter()
+                            .find(|(i, _, _)| *i == r.sw_if_index)
+                            .map(|(_, n, _)| n.clone())
+                            .unwrap_or_else(|| "octeon0/0".into());
+                        ifaces.push((idx, format!("{parent}.{}", r.vlan_id), 3));
+                        let _ = tx.send(format!(
+                            "create_vlan_subif vlan={} parent={}",
+                            r.vlan_id, r.sw_if_index
+                        ));
+                        out = reply_head("create_vlan_subif_reply");
+                        CreateVlanSubifReply {
+                            context: ctx,
+                            retval: 0,
+                            sw_if_index: idx,
+                        }
+                        .encode(&mut out);
+                    }
                     "sw_interface_set_flags" => {
                         out = reply_head("sw_interface_set_flags_reply");
                         SwInterfaceSetFlagsReply {
@@ -469,6 +496,7 @@ fn ports() -> Vec<PortAttach> {
         port_id: 0,
         num_rx_queues: 1,
         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        vlans: vec![],
     }]
 }
 
@@ -814,6 +842,99 @@ fn a_recorded_interface_is_reused_not_re_attached() {
         seen.contains(&"sw_interface_set_promisc".to_string()),
         "{seen:?}"
     );
+}
+
+/// w20 on the primary (2026-08-14): the first steer of a trunk port
+/// delivered 8.7M tagged frames in two minutes and VPP punted every
+/// one at ethernet-input — a tagged frame with no matching subif never
+/// reaches ip4-input, regardless of MAC or promisc. Each declared vlan
+/// must therefore get a dot1q subif, admin-up and unnumbered, before
+/// the port is announced attached.
+#[test]
+fn declared_vlans_get_dot1q_subifs_up_and_unnumbered() {
+    let fake = Fake::start(
+        "vlans",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+    );
+    let mut t = fake.connect();
+    let mut p = ports();
+    p[0].vlans = vec![88, 1337];
+    let got = attach_ports(&mut t, &p, &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].sw_if_index, 7, "the parent index is unchanged");
+
+    let seen = fake.observed();
+    // Which vid landed on which parent — the detail events the fake
+    // records from the decoded wire, so a swapped field would show.
+    assert!(
+        seen.contains(&"create_vlan_subif vlan=88 parent=7".to_string()),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&"create_vlan_subif vlan=1337 parent=7".to_string()),
+        "{seen:?}"
+    );
+    // Each subif is brought up and unnumbered after creation: the tail
+    // of the message stream is create/up/unnumbered per vid, in
+    // declaration order. A subif left down or without IPv4 classifies
+    // frames only to drop them one node later.
+    let tail: Vec<&str> = seen.iter().map(|s| s.as_str()).rev().take(8).collect();
+    let expect_tail: Vec<&str> = vec![
+        "sw_interface_set_unnumbered",
+        "sw_interface_set_flags",
+        "create_vlan_subif vlan=1337 parent=7",
+        "create_vlan_subif",
+        "sw_interface_set_unnumbered",
+        "sw_interface_set_flags",
+        "create_vlan_subif vlan=88 parent=7",
+        "create_vlan_subif",
+    ];
+    assert_eq!(tail, expect_tail, "full stream: {seen:?}");
+}
+
+/// On adoption the subifs already exist — VPP names them
+/// `<parent>.<vid>` — and creating a duplicate vid is a refusal that
+/// would cycle a healthy, possibly steered VPP. Found ones are
+/// re-asserted (up + unnumbered, the same reconcile the parent gets),
+/// not recreated.
+#[test]
+fn adopted_subifs_are_reused_not_recreated() {
+    let fake = Fake::start_with(
+        "vlanadopt",
+        AttachBehaviour::default(),
+        LookupBehaviour::Missing,
+        vec![
+            (7, "octeon0/0".into(), 3),
+            (107, "octeon0/0.1337".into(), 3),
+        ],
+    );
+    let mut t = fake.connect();
+    let mut p = ports();
+    p[0].vlans = vec![1337];
+    let known = vec![("eth3".to_string(), 7u32)];
+    let got = attach_ports(&mut t, &p, &known, AttachMode::Adopted, TEST_LOOP_IDX).expect("adopt");
+    assert_eq!(got[0].sw_if_index, 7);
+
+    let seen = fake.observed();
+    assert!(
+        !seen.iter().any(|s| s.starts_with("create_vlan_subif")),
+        "must not create a duplicate subif for a vid VPP already has: {seen:?}"
+    );
+    // Parent and subif each get the reconcile: two ups, two unnumbered.
+    let ups = seen
+        .iter()
+        .filter(|s| *s == "sw_interface_set_flags")
+        .count();
+    let unnum = seen
+        .iter()
+        .filter(|s| *s == "sw_interface_set_unnumbered")
+        .count();
+    assert_eq!((ups, unnum), (2, 2), "{seen:?}");
 }
 
 /// A recorded index VPP no longer has must be refused, not silently
