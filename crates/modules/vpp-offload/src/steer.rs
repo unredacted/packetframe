@@ -69,6 +69,8 @@ pub struct SteerRule {
     pub side: Side,
     /// MCAM slot. Assigned by [`RuleSet::plan`], not by the driver.
     pub location: u32,
+    /// Where a match goes: into VPP, or back to the kernel.
+    pub action: RuleAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,44 @@ pub enum Side {
     Src,
     Dst,
 }
+
+/// What a matching packet's fate is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    /// Redirect to VPP's VF — the steering rules proper.
+    Divert,
+    /// Deliver to the kernel (PF queue 0) — the exemptions, installed
+    /// at HIGHER MCAM priority than any `Divert` rule so
+    /// locally-terminating traffic never enters a dataplane that
+    /// cannot deliver it.
+    ///
+    /// Why these exist, measured (w23, 2026-08-14): with `src`
+    /// steering live, 110,917 packets in five minutes — the box's own
+    /// service-monitoring replies, unicast DHCP renewals to the
+    /// gateway, service-net→router management — matched the src rules
+    /// and died at VPP's `null-node`, and 3,200 multicast frames
+    /// (IGMP among them) were RPF-dropped instead of reaching the
+    /// kernel bridge. The kernel is the only correct owner of that
+    /// traffic; a `Keep` rule is how it stays there.
+    ///
+    /// `ring_cookie` 0 = PF queue 0 (`otx2_add_flow_msg`: a cookie
+    /// with no VF bits becomes `NIX_RX_ACTIONOP_UCAST` toward the PF).
+    /// One queue instead of RSS is an accepted cost for this traffic
+    /// class — it is control-plane volume, not transit.
+    Keep,
+}
+
+/// Exemptions every steered port carries regardless of config: IPv4
+/// broadcast and multicast. Both are subnet-operational traffic the
+/// kernel must see (DHCP DISCOVER answers, IGMP membership for the
+/// bridge's snooping) and neither can ever be forwarded by VPP's
+/// unicast FIB. Router-address exemptions are the operator's
+/// (`steer-exempt`) because only the operator knows which addresses
+/// terminate locally.
+pub const BUILTIN_EXEMPTS: [(Ipv4Addr, u8); 2] = [
+    (Ipv4Addr::new(255, 255, 255, 255), 32),
+    (Ipv4Addr::new(224, 0, 0, 0), 4),
+];
 
 /// What steering *should* look like for a port, derived from the
 /// allowlist.
@@ -220,6 +260,7 @@ impl RuleSet {
     /// nobody chose.
     pub fn plan(
         allowlist: &[IpPrefix],
+        exempts: &[packetframe_common::config::Ipv4Prefix],
         budget: McamBudget,
         direction: VppSteerDirection,
     ) -> Result<Self, String> {
@@ -236,21 +277,47 @@ impl RuleSet {
             })
             .collect();
         let skipped_v6 = (allowlist.len() - steerable.len()) as u32;
-        let needed = steerable.len() * sides.len();
+        // Nothing to divert means nothing to exempt FROM — an all-v6
+        // allowlist plans no rules at all rather than exemptions that
+        // guard against a diversion that cannot happen.
+        if steerable.is_empty() {
+            return Ok(RuleSet {
+                rules: Vec::new(),
+                skipped_v6,
+            });
+        }
+        let keeps: Vec<(Ipv4Addr, u8)> = BUILTIN_EXEMPTS
+            .iter()
+            .copied()
+            .chain(exempts.iter().map(|p| (p.addr, p.prefix_len)))
+            .collect();
+        let diverts = steerable.len() * sides.len();
+        let needed = diverts + keeps.len();
 
         if needed > budget.free.len() {
             return Err(format!(
-                "the allowlist needs {needed} MCAM rule(s) ({} steerable prefix(es) × {} \
-                 direction(s), `steer-direction {direction}`) but only {} slot(s) are free \
-                 on this NIC; steering part of the allowlist would split it across both \
-                 forwarding tiers, so none is installed. The per-port ntuple table on this \
-                 hardware holds 16 rules",
+                "steering needs {needed} MCAM rule(s) ({} steerable prefix(es) × {} \
+                 direction(s), `steer-direction {direction}`, plus {} kernel exemption(s): \
+                 2 built-in [broadcast, multicast] + {} `steer-exempt`) but only {} slot(s) \
+                 are free on this NIC; steering part of the allowlist would split it across \
+                 both forwarding tiers, so none is installed. The per-port ntuple table on \
+                 this hardware holds 16 rules",
                 steerable.len(),
                 sides.len(),
+                keeps.len(),
+                exempts.len(),
                 budget.free.len()
             ));
         }
 
+        // Slot assignment carries the PRIORITY, so it is not free-form:
+        // lower loc = lower MCAM entry index = matched first (v5.15
+        // otx2_flows.c keeps flow_ent[] ascending and indexes it by
+        // location). Divert rules take the budget's front (highest
+        // locs, clear of vendor rules, as ever); Keep rules take the
+        // BACK — the lowest free locs — so every exemption outranks
+        // every diversion by construction. A `free` list sorted
+        // highest-first makes front ≥ back unconditionally.
         let mut rules = Vec::with_capacity(needed);
         for (i, (addr, prefix_len)) in steerable.into_iter().enumerate() {
             for (j, side) in sides.iter().copied().enumerate() {
@@ -259,8 +326,18 @@ impl RuleSet {
                     prefix_len,
                     side,
                     location: budget.free[i * sides.len() + j],
+                    action: RuleAction::Divert,
                 });
             }
+        }
+        for (k, (addr, prefix_len)) in keeps.into_iter().enumerate() {
+            rules.push(SteerRule {
+                prefix: addr,
+                prefix_len,
+                side: Side::Dst,
+                location: budget.free[budget.free.len() - 1 - k],
+                action: RuleAction::Keep,
+            });
         }
         Ok(RuleSet { rules, skipped_v6 })
     }
@@ -295,20 +372,98 @@ mod tests {
             },
             v4(10, 88, 1, 0, 24),
         ];
-        let set =
-            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both).expect("fits");
+        let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
+            .expect("fits");
 
         assert_eq!(set.skipped_v6, 1, "the v6 prefix is reported, not hidden");
-        assert_eq!(set.rules.len(), 4, "two v4 prefixes, both directions");
+        assert_eq!(
+            set.rules.len(),
+            6,
+            "two v4 prefixes x both directions, plus the two built-in exemptions"
+        );
         assert_eq!(
             set.rules.iter().filter(|r| r.side == Side::Src).count(),
             2,
             "one source rule per v4 prefix"
         );
+        let diverts: Vec<u32> = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Divert)
+            .map(|r| r.location)
+            .collect();
+        let keeps: Vec<u32> = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Keep)
+            .map(|r| r.location)
+            .collect();
         assert_eq!(
-            set.locations(),
+            diverts,
             vec![15, 14, 13, 12],
-            "the highest free slots on a 16-entry table, consecutive so teardown can find them"
+            "diversions take the highest free slots, clear of vendor rules, as ever"
+        );
+        assert_eq!(
+            keeps,
+            vec![0, 1],
+            "exemptions take the LOWEST free slots — lower loc is higher MCAM priority, so \
+             every exemption outranks every diversion"
+        );
+    }
+
+    /// The two invariants the exemptions exist for: they outrank every
+    /// diversion (lower slot = higher priority on this NIC), and the
+    /// operator's `steer-exempt` entries ride alongside the built-ins.
+    #[test]
+    fn exemptions_outrank_diversions_and_include_the_operators() {
+        use packetframe_common::config::Ipv4Prefix;
+        let allow = vec![v4(23, 191, 200, 0, 24)];
+        let exempts = vec![Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(23, 191, 200, 1),
+            prefix_len: 32,
+        }];
+        let set = RuleSet::plan(
+            &allow,
+            &exempts,
+            McamBudget::default(),
+            VppSteerDirection::Src,
+        )
+        .expect("fits");
+        let max_keep = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Keep)
+            .map(|r| r.location)
+            .max()
+            .expect("keeps exist");
+        let min_divert = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Divert)
+            .map(|r| r.location)
+            .min()
+            .expect("diverts exist");
+        assert!(
+            max_keep < min_divert,
+            "every exemption must outrank every diversion: keep max {max_keep} vs divert \
+             min {min_divert}"
+        );
+        // Built-ins + the operator's router address, all Keep, all Dst.
+        let keep_prefixes: Vec<(std::net::Ipv4Addr, u8)> = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Keep)
+            .map(|r| {
+                assert_eq!(r.side, Side::Dst, "an exemption matches destinations");
+                (r.prefix, r.prefix_len)
+            })
+            .collect();
+        assert!(keep_prefixes.contains(&(std::net::Ipv4Addr::new(255, 255, 255, 255), 32)));
+        assert!(keep_prefixes.contains(&(std::net::Ipv4Addr::new(224, 0, 0, 0), 4)));
+        assert!(
+            keep_prefixes.contains(&(std::net::Ipv4Addr::new(23, 191, 200, 1), 32)),
+            "the operator's gateway exemption is the one that rescues DHCP renews and \
+             monitoring replies (w23: 110,917 blackholed in five minutes without it)"
         );
     }
 
@@ -331,32 +486,34 @@ mod tests {
         let budget = McamBudget {
             free: (0..5).rev().collect(),
         };
-        let e = RuleSet::plan(&allow, budget, VppSteerDirection::Both).expect_err("must refuse");
+        let e =
+            RuleSet::plan(&allow, &[], budget, VppSteerDirection::Both).expect_err("must refuse");
 
         assert!(
-            e.contains("needs 8 MCAM rule(s)"),
-            "must name the TRUE requirement, not how far it got: {e}"
+            e.contains("needs 10 MCAM rule(s)"),
+            "must name the TRUE requirement — diversions AND exemptions: {e}"
         );
         assert!(
-            !e.contains("6 MCAM"),
-            "reporting budget+1 tells the operator to try a size that also fails: {e}"
+            e.contains("2 built-in"),
+            "the built-in exemptions are part of the arithmetic the operator sizes from: {e}"
         );
         assert!(
             e.contains("none is installed"),
             "the message must say the port is left unsteered: {e}"
         );
 
-        // One more slot and the same allowlist fits, so the refusal is
+        // Enough slots and the same allowlist fits, so the refusal is
         // about the budget and not about the allowlist's shape.
         let ok = RuleSet::plan(
             &allow,
+            &[],
             McamBudget {
-                free: (0..8).rev().collect(),
+                free: (0..10).rev().collect(),
             },
             VppSteerDirection::Both,
         )
         .expect("fits exactly");
-        assert_eq!(ok.rules.len(), 8);
+        assert_eq!(ok.rules.len(), 10);
     }
 
     /// The refusal counts STEERABLE prefixes, not every line in the
@@ -378,6 +535,7 @@ mod tests {
         ];
         let e = RuleSet::plan(
             &allow,
+            &[],
             McamBudget {
                 free: (0..3).rev().collect(),
             },
@@ -385,7 +543,7 @@ mod tests {
         )
         .expect_err("must refuse");
         assert!(
-            e.contains("needs 4 MCAM rule(s)") && e.contains("2 steerable prefix(es)"),
+            e.contains("needs 6 MCAM rule(s)") && e.contains("2 steerable prefix(es)"),
             "the v6 prefix is not steerable and must not inflate either number: {e}"
         );
     }
@@ -397,32 +555,44 @@ mod tests {
     #[test]
     fn src_only_builds_one_rule_per_prefix() {
         let allow = vec![v4(10, 0, 0, 0, 16), v4(10, 1, 0, 0, 16)];
-        let set =
-            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Src).expect("fits");
-        assert_eq!(set.rules.len(), 2, "{:?}", set.rules);
+        let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Src)
+            .expect("fits");
+        assert_eq!(
+            set.rules.len(),
+            4,
+            "2 src diverts + 2 built-in keeps: {:?}",
+            set.rules
+        );
         assert!(
-            set.rules.iter().all(|r| r.side == Side::Src),
-            "src-only must never emit a Dst rule: {:?}",
+            set.rules
+                .iter()
+                .filter(|r| r.action == RuleAction::Divert)
+                .all(|r| r.side == Side::Src),
+            "src-only must never DIVERT on a Dst match: {:?}",
             set.rules
         );
 
-        let dst =
-            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Dst).expect("fits");
+        let dst = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Dst)
+            .expect("fits");
         assert!(
-            dst.rules.iter().all(|r| r.side == Side::Dst),
+            dst.rules
+                .iter()
+                .filter(|r| r.action == RuleAction::Divert)
+                .all(|r| r.side == Side::Dst),
             "{:?}",
             dst.rules
         );
 
-        // Half the rules means twice the prefixes fit: a budget that
+        // Half the divert rules means more prefixes fit: a budget that
         // refuses 2 prefixes under `both` takes them under `src`.
         let tight = McamBudget {
-            free: (0..2).rev().collect(),
+            free: (0..4).rev().collect(),
         };
-        RuleSet::plan(&allow, tight.clone(), VppSteerDirection::Both)
-            .expect_err("two prefixes x two sides cannot fit two slots");
-        let fits = RuleSet::plan(&allow, tight, VppSteerDirection::Src).expect("fits src-only");
-        assert_eq!(fits.rules.len(), 2);
+        RuleSet::plan(&allow, &[], tight.clone(), VppSteerDirection::Both)
+            .expect_err("four diverts + two keeps cannot fit four slots");
+        let fits =
+            RuleSet::plan(&allow, &[], tight, VppSteerDirection::Src).expect("fits src-only");
+        assert_eq!(fits.rules.len(), 4);
     }
 
     /// The refusal names the configured direction, so an operator
@@ -432,6 +602,7 @@ mod tests {
         let allow = vec![v4(10, 0, 0, 0, 16), v4(10, 1, 0, 0, 16)];
         let e = RuleSet::plan(
             &allow,
+            &[],
             McamBudget { free: vec![15] },
             VppSteerDirection::Src,
         )
@@ -449,9 +620,13 @@ mod tests {
             addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             prefix_len: 32,
         }];
-        let set = RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both)
+        let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
             .expect("no rules is not an error");
-        assert!(set.rules.is_empty());
+        assert!(
+            set.rules.is_empty(),
+            "nothing to divert means nothing to exempt from — no keeps either: {:?}",
+            set.rules
+        );
         assert_eq!(
             set.skipped_v6, 1,
             "the operator has to be able to see that steering covers none of their allowlist"

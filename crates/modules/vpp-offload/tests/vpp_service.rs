@@ -1384,6 +1384,7 @@ fn plan_for(count: u8) -> packetframe_vpp_offload::steer::RuleSet {
     let allow: Vec<IpPrefix> = (0..count).map(|i| fake_vpp::v4(0, i)).collect();
     packetframe_vpp_offload::steer::RuleSet::plan(
         &allow,
+        &[],
         packetframe_vpp_offload::steer::McamBudget::default(),
         Default::default(),
     )
@@ -1482,9 +1483,9 @@ fn an_operator_can_steer_and_unsteer_a_converged_service() {
     assert_eq!(
         seen,
         vec![
-            "retarget 1 ports, 4 rules".to_string(),
+            "retarget 1 ports, 6 rules".to_string(),
             "steer".into(),
-            "retarget 0 ports, 4 rules".into(),
+            "retarget 0 ports, 6 rules".into(),
             "unsteer".into(),
         ],
         "the target is recorded BEFORE the reconcile, or Steer installs the old rules"
@@ -1654,7 +1655,7 @@ fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
     let seen = log.lock().unwrap().clone();
     assert_eq!(
         seen,
-        vec!["retarget 1 ports, 4 rules".to_string()],
+        vec!["retarget 1 ports, 6 rules".to_string()],
         "the target is updated and nothing else — a steer here would divert traffic as a \
          side effect of editing something unrelated"
     );
