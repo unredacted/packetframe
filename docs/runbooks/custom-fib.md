@@ -66,7 +66,9 @@ Indicators that the custom-FIB path is working:
   to it (misses indicate prefixes that arrived in XDP before bird
   announced them, or prefixes in the allowlist that bird doesn't cover).
 - `fwd_ok` climbs (the shared success counter; custom and kernel FIB
-  both increment it on redirect).
+  both increment it on redirect **acceptance** — under generic XDP the
+  kernel can still drop the frame silently after the count; see
+  `generic-mode-performance.md`, "Silent TX drops under generic XDP").
 - `pass_no_neigh` stays below ~0.01% of matched traffic after the
   first few seconds (first-packet ARP is expected; sustained-high
   means a nexthop is genuinely unreachable or the neighbor resolver

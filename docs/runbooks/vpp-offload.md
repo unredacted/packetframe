@@ -274,6 +274,13 @@ at least an hour, and through a udapi provision cycle if one is due.
 Nothing is diverted in this state: VPP is up, its FIB is synced and
 verified, and every packet is still on the XDP path.
 
+**Schedule this rung off-peak.** Rung 0 is the maximum-cost state: all
+of VPP's poll-mode CPU tax with zero forwarding benefit, and at traffic
+peak that tax has caused real user-visible loss on the kernel path (see
+the coexistence-squeeze section). Plan the rung-0 soak and the first
+steer inside one quiet window rather than soaking unsteered through a
+peak.
+
 **Rung 1 — one port.** Flip the least important port to `steer on`,
 SIGHUP, and confirm:
 
@@ -300,6 +307,13 @@ Then watch actual traffic, not counters: PMTUD in particular. A DF
 packet larger than the MTU through a steered path must come back as a
 correctly-sourced frag-needed. A silent PMTUD blackhole is a week of
 customer debugging.
+
+A successful steer also has a host-side signature worth confirming:
+the steered flows leave generic XDP, so the rate of
+`packetframe_softnet_time_squeeze_total` should fall (or at worst
+hold) as traffic moves — it must never rise on a steer. VPP's own
+interface counters (`show interface` via the CLI socket) turning over
+at line rate on the member VF is the positive half of the same check.
 
 **Rung 2..N — one port at a time**, with a soak between each. There is
 no prize for going faster; the failure you are looking for is the one
@@ -1088,6 +1102,9 @@ Be precise about this when reasoning about an incident.
 | Fresh six-port attach on the PRIMARY, behind bird's live dump | **~5 min in `Syncing` (held), then one verify** | 2026-08-13, w9 + w10: the #180 hold engaged at have≈23k and released at have≈1,055k; w10 verified PASS 64/64 on the release. This is the number to expect on every primary fresh attach — the 40.32 s row above is a resync from an already-loaded mirror, a different situation. |
 | Load while VPP runs, six workers | **~+7 load permanent** (poll mode), ~22 total during convergence vs ~6 baseline | 2026-08-13 w10. See the load note below. |
 | `reconfigure` (lever move) | **0.215 s** | 2026-08-11, exit 0, writes `OK <ns>` to `last-reconfigure.timestamp`. |
+| Coexistence squeeze, unsteered at evening peak | `time_squeeze` 7/s → 46/s; **6–8% loss** through the box; every counter clean | 2026-08-13 w13/w17, six workers, steering off. See the coexistence-squeeze section. |
+| TX-ring intervention (eth3 4096 → 32768) | loss 0/500 — but avg RTT **678 ms** (bufferbloat) | 2026-08-13 w18. Proof of the silent-drop mechanism, **not a fix**; ring restored. |
+| `netdev_budget` ×4 (300→1200, usecs 20000→80000) | `time_squeeze` → 0; loss 1%; local-segment RTT >100 ms on 22% of pings | 2026-08-13 w19. The deficit moved into 80 ms softirq rounds; settings restored. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**
@@ -1139,6 +1156,50 @@ IRQs moved off them pre-attach), and w10's own counters showed the
 eBPF tier matching and forwarding normally throughout
 (`matched_v4` ≈ `rx_total`, `fwd_ok` climbing). Whether ~7 hot cores
 buy enough forwarding is exactly what the steering canary measures.
+
+Do not stop reading at "the counters are fine", though — the next
+section is about exactly the loss those counters cannot see.
+
+### Loss and latency through the box while VPP runs unsteered — the coexistence squeeze
+
+Root-caused 2026-08-13 (w12–w19) after three windows of "every counter
+is clean but users see loss". Symptom set, at traffic peak, with VPP
+attached and **steering off**:
+
+- packet loss (measured 6–8%) and multi-hundred-ms latency for traffic
+  forwarded *through* the box, reported from outside;
+- load average far above the ~+7 poll-mode floor;
+- every packetframe counter normal, `fwd_ok` climbing, VPP counters
+  near zero, NIC error counters zero.
+
+The mechanism is **not VPP malfunctioning — it is VPP's poll cores
+starving the kernel path that still carries 100% of the traffic.** At
+the staging rung nothing is steered, so all forwarding is generic XDP
+on the CPUs that remain; the squeeze truncates NAPI polls, the egress
+TX ring fills, and `generic_xdp_tx` drops frames **silently** — no
+counter on this 5.15 kernel, invisible to tcpdump and qdisc stats by
+construction, and counted as success by `fwd_ok` (which increments at
+redirect *acceptance*). Full mechanism, diagnosis steps, and why every
+instrument is blind: `docs/runbooks/generic-mode-performance.md`,
+"Silent TX drops under generic XDP".
+
+What to do about it, in order:
+
+1. **Recognize it**: watch `packetframe_softnet_time_squeeze_total`
+   (exported since this finding). Baseline on the reference EFG is
+   ~7/s; the loss windows ran ~46/s.
+2. **Do not reach for kernel knobs as a fix.** All three were
+   measured; each just relocates the deficit (drops → ring bufferbloat
+   → 80 ms softirq rounds). They are diagnostics.
+3. **Shorten the unsteered window.** The staging state is
+   maximum-cost-zero-benefit by design — all of VPP's CPU tax, none of
+   its forwarding. Schedule attaches and soaks off-peak, and treat
+   time-at-rung-0 as a cost to budget, not a neutral holding state.
+4. **The durable fixes** are fewer VPP cores while unsteered (design
+   change, tracked) and climbing to the steered rungs — steering moves
+   allowlisted traffic onto VPP's hardware path *and* removes its XDP
+   cost from the squeezed CPUs, which is the intended end state, not a
+   workaround.
 
 ### A planned restart looks Degraded for 40-80 seconds. Do not page on it.
 

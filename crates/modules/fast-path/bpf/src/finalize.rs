@@ -124,6 +124,9 @@ pub fn finalize(ctx: XdpContext) -> u32 {
 
     match REDIRECT_DEVMAP.redirect(egress_ifindex, 0) {
         Ok(_) => {
+            // Acceptance, not delivery: on the generic-XDP path the
+            // kernel can still drop this frame in generic_xdp_tx()
+            // with no counter (< 5.18). See StatIdx::FwdOk's doc.
             bump(stats, StatIdx::FwdOk);
             xdp_action::XDP_REDIRECT
         }
