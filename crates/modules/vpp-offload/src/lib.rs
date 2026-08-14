@@ -1185,14 +1185,29 @@ pub fn run_feasibility_probes(
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
     direction: packetframe_common::config::VppSteerDirection,
+    steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        probe_linux::run(ports, workers, vpp_binary, allowlist, direction)
+        probe_linux::run(
+            ports,
+            workers,
+            vpp_binary,
+            allowlist,
+            direction,
+            steer_exempts,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ports, workers, vpp_binary, allowlist, direction);
+        let _ = (
+            ports,
+            workers,
+            vpp_binary,
+            allowlist,
+            direction,
+            steer_exempts,
+        );
         Vec::new()
     }
 }

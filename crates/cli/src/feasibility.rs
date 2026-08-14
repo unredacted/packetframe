@@ -115,6 +115,25 @@ pub fn allowlist_from_config(config: &Config) -> Vec<IpPrefix> {
     out
 }
 
+/// The `steer-exempt` entries, so the budget probe counts the same
+/// arithmetic attach enforces: diversions + built-ins + exemptions.
+/// A probe that omitted them would pass a config attach refuses,
+/// two slots short.
+pub fn vpp_steer_exempts_from_config(
+    config: &Config,
+) -> Vec<packetframe_common::config::Ipv4Prefix> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::VppSteerExempt(p) => Some(*p),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The `vpp-binary` override from a `vpp-offload` section, if set, so
 /// feasibility probes the executable the module will actually run.
 pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
@@ -136,6 +155,7 @@ pub struct VppProbeInputs<'a> {
     pub workers: u32,
     pub binary: Option<&'a str>,
     pub steer_direction: VppSteerDirection,
+    pub steer_exempts: &'a [packetframe_common::config::Ipv4Prefix],
 }
 
 pub fn probe_and_render(
@@ -174,6 +194,7 @@ pub fn probe_and_render(
             vpp.binary,
             allowlist,
             vpp.steer_direction,
+            vpp.steer_exempts,
         ) {
             report.capabilities.push(cap);
         }
