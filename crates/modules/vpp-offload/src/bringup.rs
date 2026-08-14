@@ -112,10 +112,38 @@ pub struct Attached {
 /// redirects frames addressed to the PF, so the PF's MAC is what the VPP
 /// interface must answer to — and what it must source on tx, so the
 /// frame leaves the same LMAC and the upstream switch sees no move.
-fn pf_mac(sysfs_net: &Path, iface: &str) -> Result<[u8; 6], String> {
-    let path = sysfs_net.join(iface).join("address");
+/// The MAC this member must answer to.
+///
+/// Hosts address their gateway by the MAC ARP gave them, and on a
+/// bridge-member port that is the **bridge's** MAC, not the port's
+/// own. Measured on the primary (w21, 2026-08-14): with the VF
+/// answering to eth4's own address (`…:ca`), 7.17M subif-classified
+/// frames punted at `ethernet-input` because every one was addressed
+/// to switch0's `…:c7` — the fix one octet away. A port enslaved to a
+/// bridge answers to its master's address; a plain L3 port (the
+/// transit members, whose peers ARP the port address directly)
+/// answers to its own.
+fn answering_mac(sysfs_net: &Path, iface: &str) -> Result<[u8; 6], String> {
+    let master = sysfs_net.join(iface).join("master").join("address");
+    if master.exists() {
+        let mac = parse_mac_file(&master)?;
+        tracing::info!(
+            iface,
+            master_mac = %format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ),
+            "bridge-member port answers to its master's MAC — that is the gateway address \
+             hosts ARP"
+        );
+        return Ok(mac);
+    }
+    parse_mac_file(&sysfs_net.join(iface).join("address"))
+}
+
+fn parse_mac_file(path: &Path) -> Result<[u8; 6], String> {
     let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let parts: Vec<&str> = text.trim().split(':').collect();
     if parts.len() != 6 {
         return Err(format!(
@@ -520,7 +548,7 @@ fn finish(
                 pci_addr: p.vf_pci.clone(),
                 port_id: 0,
                 num_rx_queues: p.cores,
-                pf_mac: pf_mac(&paths.sys.sysfs_net, &p.iface)?,
+                answer_mac: answering_mac(&paths.sys.sysfs_net, &p.iface)?,
                 // From the config, not the state file: vlans are a
                 // declaration about the port's ingress, not an acquired
                 // resource, and `restart_only_delta` already pins them
@@ -895,6 +923,49 @@ fn finish(
 /// ran on every deployment, including the ones that set it off precisely
 /// because their `birdc` answers for the wrong bird. Found on the shadow,
 /// where `off` was set and the steer was refused anyway.
+#[cfg(test)]
+mod answering_mac_tests {
+    use super::*;
+
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("pf-mac-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("eth4")).unwrap();
+        p
+    }
+
+    /// The w21 defect (2026-08-14): hosts ARP their gateway and get the
+    /// BRIDGE's MAC; a VF answering to the port's own address punted
+    /// 7.17M subif-classified frames in 90 s.
+    #[test]
+    fn a_bridge_member_answers_to_its_masters_mac() {
+        let net = fixture("master");
+        std::fs::write(net.join("eth4/address"), "28:70:4e:47:69:ca\n").unwrap();
+        std::fs::create_dir_all(net.join("eth4/master")).unwrap();
+        std::fs::write(net.join("eth4/master/address"), "28:70:4e:47:69:c7\n").unwrap();
+        let mac = answering_mac(&net, "eth4").unwrap();
+        assert_eq!(mac, [0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7]);
+        let _ = std::fs::remove_dir_all(&net);
+    }
+
+    #[test]
+    fn a_plain_l3_port_answers_to_its_own() {
+        let net = fixture("plain");
+        std::fs::write(net.join("eth4/address"), "28:70:4e:47:69:ca\n").unwrap();
+        assert_eq!(answering_mac(&net, "eth4").unwrap()[5], 0xca);
+        let _ = std::fs::remove_dir_all(&net);
+    }
+
+    #[test]
+    fn a_garbage_address_file_is_an_error() {
+        let net = fixture("garbage");
+        std::fs::write(net.join("eth4/address"), "not-a-mac\n").unwrap();
+        assert!(answering_mac(&net, "eth4").is_err());
+        let _ = std::fs::remove_dir_all(&net);
+    }
+}
+
 #[cfg(test)]
 mod completeness_gate_tests {
     use super::*;
