@@ -217,7 +217,7 @@ pub fn bring_up(
     // make an allowlist of more than eight v4 prefixes refuse to *attach*
     // — on a config whose ports are all `steer off`, where no rule would
     // ever be installed and the refusal decides nothing.
-    let wants_steer = cfg.ports.iter().any(|(_, _, steer)| *steer);
+    let wants_steer = cfg.ports.iter().any(|(_, _, steer, _)| *steer);
     let steer_plan = if wants_steer {
         // An allowlist with nothing steerable in it is a config error,
         // and settling that needs no NIC — so it is settled BEFORE the
@@ -247,8 +247,8 @@ pub fn bring_up(
     let steer_ports: Vec<(String, u32)> = cfg
         .ports
         .iter()
-        .filter(|(_, _, steer)| *steer)
-        .map(|(iface, _, _)| (iface.clone(), 0u32))
+        .filter(|(_, _, steer, _)| *steer)
+        .map(|(iface, _, _, _)| (iface.clone(), 0u32))
         .collect();
     // Every member port, unfiltered, so removal can attribute a
     // location's occupant on a port this config leaves unsteered. That
@@ -260,7 +260,7 @@ pub fn bring_up(
     let member_ports: Vec<(String, u32)> = cfg
         .ports
         .iter()
-        .map(|(iface, _, _)| (iface.clone(), 0u32))
+        .map(|(iface, _, _, _)| (iface.clone(), 0u32))
         .collect();
     let steering = NtupleSteering::new(member_ports, steer_ports, steer_plan);
 
@@ -276,7 +276,7 @@ pub fn bring_up(
     // management ssh dropped, birdc past its budget, and VPP itself
     // starved into a supervisor restart loop. Still pure/read-only —
     // a refused config must cost no sysfs writes.
-    let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _)| i.clone()).collect();
+    let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _, _)| i.clone()).collect();
     let mut vpp_cores = vec![core_map.main];
     vpp_cores.extend(&core_map.workers);
     let conflicts = cores::nic_irq_conflicts(
@@ -369,7 +369,7 @@ pub fn bring_up(
     let ports: Vec<(String, u16)> = cfg
         .ports
         .iter()
-        .map(|(iface, cores, _)| (iface.clone(), *cores))
+        .map(|(iface, cores, _, _)| (iface.clone(), *cores))
         .collect();
     // Mandatory, and checked in the pure phase so a config that cannot
     // forward costs no VF and no hugepage reservation.
@@ -390,6 +390,14 @@ pub fn bring_up(
     // and a hugepage reservation that only the state file knows about —
     // recoverable by `detach --all`, but an attach that leaves the box
     // changed after reporting failure is how leaks become normal.
+    // The vlans each member's steered ingress arrives tagged with —
+    // config, not acquisition state, so it rides beside `state` rather
+    // than inside it.
+    let port_vlans: Vec<(String, Vec<u16>)> = cfg
+        .ports
+        .iter()
+        .map(|(iface, _, _, vlans)| (iface.clone(), vlans.clone()))
+        .collect();
     match finish(
         paths,
         source,
@@ -402,6 +410,7 @@ pub fn bring_up(
         completeness,
         feed_session,
         loopback,
+        &port_vlans,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -473,6 +482,7 @@ fn finish(
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     loopback: packetframe_common::config::Ipv4Prefix,
+    port_vlans: &[(String, Vec<u16>)],
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -511,6 +521,15 @@ fn finish(
                 port_id: 0,
                 num_rx_queues: p.cores,
                 pf_mac: pf_mac(&paths.sys.sysfs_net, &p.iface)?,
+                // From the config, not the state file: vlans are a
+                // declaration about the port's ingress, not an acquired
+                // resource, and `restart_only_delta` already pins them
+                // to the config the state was acquired under.
+                vlans: port_vlans
+                    .iter()
+                    .find(|(i, _)| *i == p.iface)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -882,7 +901,7 @@ mod completeness_gate_tests {
 
     fn cfg(require: bool) -> VppOffloadConfig {
         VppOffloadConfig {
-            ports: vec![("eth1".into(), 1, false)],
+            ports: vec![("eth1".into(), 1, false, vec![])],
             vpp_binary: None,
             expected_routes: 1_600_000,
             hugepages: None,

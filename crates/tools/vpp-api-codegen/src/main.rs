@@ -103,6 +103,15 @@ const MESSAGES: &[&str] = &[
     "sw_interface_add_del_address_reply",
     "sw_interface_set_unnumbered",
     "sw_interface_set_unnumbered_reply",
+    //   Trunk-port ingress arrives 802.1Q-tagged, and a tagged frame
+    //   with no matching subinterface never reaches ip4-input — it is
+    //   punted at ethernet-input regardless of MAC or promisc state.
+    //   Measured on the primary 2026-08-14 (w20): the first steer of
+    //   eth4 (a switch0 trunk) delivered 8.7M frames in two minutes
+    //   and VPP punted every one; `create_vlan_subif` (exact-match
+    //   dot1q) is what gives those frames an interface to classify to.
+    "create_vlan_subif",
+    "create_vlan_subif_reply",
     // Interface discovery + link state. `sw_interface_dump` is a DUMP:
     // it streams `sw_interface_details` and is terminated by trailing a
     // `control_ping`. Two jobs neither of which is optional — adoption

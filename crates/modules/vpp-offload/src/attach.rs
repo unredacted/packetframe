@@ -23,12 +23,12 @@
 use packetframe_common::config::Ipv4Prefix;
 
 use crate::vpp_api::generated::{
-    Address, AddressUnion, CreateLoopback, CreateLoopbackReply, DevAttach, DevAttachReply,
-    DevCreatePortIf, DevCreatePortIfReply, Prefix, SwInterfaceAddDelAddress,
-    SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
-    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
-    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    Address, AddressUnion, CreateLoopback, CreateLoopbackReply, CreateVlanSubif,
+    CreateVlanSubifReply, DevAttach, DevAttachReply, DevCreatePortIf, DevCreatePortIfReply, Prefix,
+    SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceDump,
+    SwInterfaceSetFlags, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress,
+    SwInterfaceSetMacAddressReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
+    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -78,6 +78,14 @@ pub struct PortAttach {
     /// to the PF, so the interface must answer to that address or punt
     /// every one of them.
     pub pf_mac: [u8; 6],
+    /// 802.1Q tags steered ingress arrives with on this port, from the
+    /// operator's `vlans` declaration. One exact-match dot1q subif is
+    /// created per id at attach; a tagged frame with no subif never
+    /// reaches ip4-input — it is punted at ethernet-input regardless
+    /// of MAC or promisc. Measured on the primary (w20, 2026-08-14):
+    /// the first steer of a trunk port punted 8.7M frames in two
+    /// minutes with every gauge green. Empty for untagged ports.
+    pub vlans: Vec<u16>,
 }
 
 /// A port VPP has accepted, with the index FIB paths must reference.
@@ -283,6 +291,7 @@ pub fn attach_ports(
                 set_mac(t, p, idx, p.pf_mac)?;
                 set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
+                ensure_vlan_subifs(t, p, idx, loop_idx, &existing)?;
                 out.push(AttachedPort {
                     port: p.port.clone(),
                     dev_index: None,
@@ -334,6 +343,10 @@ pub fn attach_ports(
         set_mac(t, p, sw_if_index, p.pf_mac)?;
         set_promisc_on(t, p, sw_if_index)?;
         set_unnumbered(t, p, sw_if_index, loop_idx)?;
+        // A freshly created parent cannot have subifs, so the dump
+        // taken before this pass is still the right reuse authority:
+        // it can only say "not found", and every vid gets created.
+        ensure_vlan_subifs(t, p, sw_if_index, loop_idx, &existing)?;
         out.push(AttachedPort {
             port: p.port.clone(),
             dev_index: Some(dev_index),
@@ -699,6 +712,87 @@ fn set_unnumbered(
     Ok(())
 }
 
+/// Create (or re-adopt) one exact-match dot1q subif per declared vlan.
+///
+/// Why this exists: MCAM steering diverts frames as the wire carries
+/// them, and on a trunk port that is 802.1Q-tagged. A tagged frame
+/// with no matching subinterface never reaches `ip4-input` — VPP
+/// punts it at `ethernet-input` before any MAC, promisc or FIB logic
+/// runs. w20 on the primary (2026-08-14) measured the consequence:
+/// the first steer of eth4 delivered 8.7M frames in two minutes and
+/// every one was punted, with zero `ip4`, zero tx, and every health
+/// surface green.
+///
+/// Each subif gets the same treatment as its parent — admin-up and
+/// unnumbered to the loopback — so classified frames route with the
+/// same adjacencies. MAC and promisc are the parent's; a subif has
+/// neither of its own.
+///
+/// Reuse: on an adopted VPP the subifs already exist, and creating a
+/// duplicate vid is a refusal. VPP names them `<parent>.<vid>`, so the
+/// pre-pass dump identifies them by name; found ones are re-asserted
+/// (up + unnumbered — the reconcile point, same as the parent's), and
+/// only missing ones are created.
+fn ensure_vlan_subifs(
+    t: &mut Transport,
+    p: &PortAttach,
+    parent_idx: u32,
+    loop_idx: u32,
+    existing: &[Interface],
+) -> Result<(), AttachError> {
+    if p.vlans.is_empty() {
+        return Ok(());
+    }
+    let parent_name = existing
+        .iter()
+        .find(|i| i.sw_if_index == parent_idx)
+        .map(|i| i.name.clone());
+    for &vid in &p.vlans {
+        let reused = parent_name.as_deref().and_then(|parent| {
+            let want = format!("{parent}.{vid}");
+            existing
+                .iter()
+                .find(|i| i.name == want)
+                .map(|i| i.sw_if_index)
+        });
+        let sub_idx = match reused {
+            Some(idx) => idx,
+            None => {
+                let reply =
+                    t.request::<CreateVlanSubif, CreateVlanSubifReply>(CreateVlanSubif {
+                        context: 0,
+                        sw_if_index: parent_idx,
+                        vlan_id: u32::from(vid),
+                    })?;
+                if reply.retval != 0 {
+                    return Err(AttachError::Refused {
+                        step: "create_vlan_subif",
+                        port: p.port.clone(),
+                        retval: reply.retval,
+                        detail: format!("vlan {vid}"),
+                    });
+                }
+                if reply.sw_if_index == 0 {
+                    return Err(AttachError::LocalZero {
+                        port: format!("{}.{vid}", p.port),
+                    });
+                }
+                reply.sw_if_index
+            }
+        };
+        set_admin_up(t, p, sub_idx)?;
+        set_unnumbered(t, p, sub_idx, loop_idx)?;
+        tracing::info!(
+            port = %p.port,
+            vlan = vid,
+            sw_if_index = sub_idx,
+            reused = reused.is_some(),
+            "dot1q subif ready — tagged steered ingress classifies to ip4 instead of punting"
+        );
+    }
+    Ok(())
+}
+
 /// Promiscuous mode on the member VF — a shared-LMAC VOTE, not a local
 /// flag, and the fix for the primary bridge-blackout (2026-08-14).
 ///
@@ -773,6 +867,7 @@ mod tests {
             port_id: 0,
             num_rx_queues: 1,
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            vlans: vec![],
         };
         assert_eq!(format!("pci/{}", p.pci_addr), "pci/0002:07:00.1");
     }

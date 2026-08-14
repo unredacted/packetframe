@@ -234,6 +234,19 @@ green. The directive is hot-reloadable (the target is a reconcile), so
 getting it wrong is recoverable — but the recovery window is however
 long it takes to notice.
 
+**Declare `vlans` on every trunk port before it steers.** `src` being
+the right direction does not make the port ready: on a trunk (a
+bridge/switch0 member carrying tagged VLANs), steered ingress arrives
+802.1Q-tagged, and a tagged frame with no matching dot1q subif in VPP
+is punted at `ethernet-input` before any MAC, promisc or FIB logic —
+the exact all-gauges-green blackhole described above, from the other
+side. Measured on the primary (2026-08-14, w20): the first steer of
+eth4 punted 8.7M frames in two minutes, zero forwarded. The `vlans`
+list on the port line is what creates the subifs, it must name every
+VID the steered prefixes ride (on the reference fleet, eth4 needs
+`vlans 88,1337` — one per service bridge), and it is restart-only:
+declare it before the attach, not at the rung.
+
 Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
 resync: a restart would cost about 40 seconds with the offload down at
 every step, including the step meant to get traffic off a bad VPP
@@ -860,6 +873,34 @@ still running (`pgrep -a vpp`) and whether MCAM still points at its VF
 forwarded by an unsupervised process — restart packetframe, which will
 **adopt** it rather than restarting it.
 
+### Steered traffic reaches VPP and vanishes — `punt` climbing, no `ip4`, no tx
+
+```bash
+vppctl -s /run/packetframe/vpp/api.sock.cli show interface
+```
+
+The fingerprint: the steered member's `rx packets` climbing at traffic
+rate, `punt` climbing with it, **no `ip4` counter row at all**, and no
+tx anywhere. The frames are real and delivered — VPP is refusing them
+at `ethernet-input`, before routing. Two causes, in likelihood order:
+
+1. **Tagged ingress with no dot1q subif** — the port is a trunk and its
+   `vlans` list is missing or incomplete. This is w20 on the primary
+   (2026-08-14): 8.7M frames punted in two minutes, every health
+   surface green, the steered prefix's return path dead. Fix: unsteer
+   (the lever, seconds), add `vlans <id>[,<id>...]` to the port line,
+   restart into it (the list is restart-only), re-steer.
+2. **MAC mismatch** — shows as `drops` rather than `punt`, and the
+   attach's readback should have caught it. If the gateway MAC hosts
+   ARP is a *bridge's* MAC rather than the member PF's, the readback
+   verified the wrong target; compare `ip -d link show <bridge>`
+   against `/sys/class/net/<port>/address`.
+
+The user-visible symptom while this runs is total loss for the steered
+flow class only — everything unsteered keeps working, which is what
+distinguishes it from the coexistence squeeze (partial loss, all
+classes).
+
 ### Steering is on but traffic is not arriving at VPP
 
 Check the NIC's ledger against ours. Ours is
@@ -1105,6 +1146,7 @@ Be precise about this when reasoning about an incident.
 | Coexistence squeeze, unsteered at evening peak | `time_squeeze` 7/s → 46/s; **6–8% loss** through the box; every counter clean | 2026-08-13 w13/w17, six workers, steering off. See the coexistence-squeeze section. |
 | TX-ring intervention (eth3 4096 → 32768) | loss 0/500 — but avg RTT **678 ms** (bufferbloat) | 2026-08-13 w18. Proof of the silent-drop mechanism, **not a fix**; ring restored. |
 | `netdev_budget` ×4 (300→1200, usecs 20000→80000) | `time_squeeze` → 0; loss 1%; local-segment RTT >100 ms on 22% of pings | 2026-08-13 w19. The deficit moved into 80 ms softirq rounds; settings restored. |
+| First steer on the primary (eth4, `src`, trunk, no subifs) | MCAM+VF+VPP rx flawless at ~72 kpps; **8.7M frames punted in 2 min, zero forwarded** | 2026-08-14 w20. Tagged ingress, no dot1q subif → punt at ethernet-input. The `vlans` port directive exists because of this window. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**
@@ -1714,6 +1756,15 @@ affinity write does not persist across reboot — a box that reboots
 into a VPP config re-runs the refusal, which is the reminder. (udapi
 provision cycles may also rewrite affinities; if attach starts refusing
 on a box that used to pass, that is the first place to look.)
+
+**`ethtool -G` resets it too.** Resizing a ring tears down and
+rebuilds the port's queues, and the driver re-spreads the rebuilt
+queues' IRQs across all CPUs — silently undoing the pinning. Measured
+on the primary (2026-08-14): a diagnostic ring resize on eth3 the
+previous evening put all seven of its queue IRQs back on the VPP
+cores, and the next attach refused fifteen times under systemd
+auto-restart until the operator re-pinned. Any window harness that
+touches ring sizes should re-assert IRQ affinity as a pre-flight step.
 
 ## Constraints worth knowing before you debug
 

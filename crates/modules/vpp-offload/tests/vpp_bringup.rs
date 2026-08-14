@@ -159,7 +159,7 @@ impl Host {
         VppOffloadConfig {
             ports: ports
                 .iter()
-                .map(|(i, c, s)| (i.to_string(), *c, *s))
+                .map(|(i, c, s)| (i.to_string(), *c, *s, vec![]))
                 .collect(),
             vpp_binary: Some(self.vpp_binary.to_string_lossy().into_owned()),
             expected_routes: 1_600_000,

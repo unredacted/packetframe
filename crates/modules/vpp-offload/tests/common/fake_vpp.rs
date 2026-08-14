@@ -30,18 +30,24 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
-    Address, AddressUnion, ControlPingReply, CreateLoopbackReply, DevAttachReply,
-    DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
-    IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
-    IpRouteLookupReply, MessageTableEntry, Prefix, SockclntCreateReply,
-    SwInterfaceAddDelAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
-    SwInterfaceSetMacAddressReply, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply,
-    ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    Address, AddressUnion, ControlPingReply, CreateLoopbackReply, CreateVlanSubif,
+    CreateVlanSubifReply, DevAttachReply, DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor,
+    IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump, IpRoute,
+    IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
+    Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceDetails,
+    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetPromiscReply,
+    SwInterfaceSetUnnumberedReply, ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4,
+    FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
 /// install onto *this*, learned from VPP, never onto a guess.
 pub const ASSIGNED_INDEX: u32 = 3;
+
+/// Base index for `create_vlan_subif` replies — far from
+/// `ASSIGNED_INDEX` so a test confusing a subif with a member port
+/// would show it.
+pub const SUBIF_BASE: u32 = 100;
 
 /// The index the fake's `create_loopback` hands out. Distinct from
 /// `ASSIGNED_INDEX` so a test crossing the two would show it.
@@ -295,6 +301,7 @@ fn serve(
     // with the connection, exactly like `macs`: a fresh attach after a
     // reconnect re-creates its ports and must land on the same indices.
     let mut ports_created = 0u32;
+    let mut subifs_created = 0u32;
 
     loop {
         let req = read_frame(sock)?;
@@ -336,6 +343,26 @@ fn serve(
                 SwInterfaceSetFlagsReply {
                     context: ctx,
                     retval: 0,
+                }
+                .encode(&mut out);
+            }
+            "create_vlan_subif" => {
+                let mut d = Decoder::new(&req);
+                let r = CreateVlanSubif::decode(&mut d).expect("decodes as a vlan subif op");
+                let idx = SUBIF_BASE + subifs_created;
+                subifs_created += 1;
+                // A second, detailed event on top of the generic name
+                // sent above, so a test can assert WHICH vid landed on
+                // WHICH parent, not just that something did.
+                let _ = tx.send(Event::Msg(format!(
+                    "create_vlan_subif vlan={} parent={}",
+                    r.vlan_id, r.sw_if_index
+                )));
+                out = reply_head("create_vlan_subif_reply");
+                CreateVlanSubifReply {
+                    context: ctx,
+                    retval: 0,
+                    sw_if_index: idx,
                 }
                 .encode(&mut out);
             }
