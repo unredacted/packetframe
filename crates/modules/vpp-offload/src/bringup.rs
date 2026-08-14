@@ -105,40 +105,58 @@ pub struct Attached {
     pub adopted_process: bool,
 }
 
-/// The PF's MAC, from `/sys/class/net/<iface>/address`.
+/// The MACs this member holds: its own PF address as **primary**, plus
+/// the bridge master's as a **secondary acceptance** address when the
+/// port is enslaved.
 ///
-/// Read here rather than asked of VPP, because VPP cannot know it: the
-/// interface it owns is the **VF**, which has its own address. MCAM
-/// redirects frames addressed to the PF, so the PF's MAC is what the VPP
-/// interface must answer to — and what it must source on tx, so the
-/// frame leaves the same LMAC and the upstream switch sees no move.
-/// The MAC this member must answer to.
+/// Two hardware windows produced this split, and both halves are
+/// load-bearing:
 ///
-/// Hosts address their gateway by the MAC ARP gave them, and on a
-/// bridge-member port that is the **bridge's** MAC, not the port's
-/// own. Measured on the primary (w21, 2026-08-14): with the VF
-/// answering to eth4's own address (`…:ca`), 7.17M subif-classified
-/// frames punted at `ethernet-input` because every one was addressed
-/// to switch0's `…:c7` — the fix one octet away. A port enslaved to a
-/// bridge answers to its master's address; a plain L3 port (the
-/// transit members, whose peers ARP the port address directly)
-/// answers to its own.
-fn answering_mac(sysfs_net: &Path, iface: &str) -> Result<[u8; 6], String> {
+/// - **The secondary is why frames route.** Hosts address their
+///   gateway by the MAC ARP gave them, which on a bridge member is the
+///   *bridge's*. w21 (2026-08-14): with the VF holding only eth4's own
+///   `…:ca`, 7.17M subif-classified frames punted at `ethernet-input`
+///   in 90 s against switch0's `…:c7`.
+/// - **The primary must stay the port's own.** The primary is
+///   programmed into the VF's hardware filter, so making it the
+///   bridge's MAC did not merely grant acceptance — it captured
+///   *delivery* of every frame addressed to the gateway. w22
+///   (2026-08-14): ~300 kpps arrived on the VF **with the steering
+///   lever off**, from attach onward, which voids the unsteered
+///   staging state the entire rollout ladder rests on, carried traffic
+///   into a FIB that had not finished converging, and blackholed the
+///   trunk's undeclared VLANs. MCAM must remain the only thing that
+///   diverts traffic.
+///
+/// A plain L3 port (the transit members, whose peers ARP the port
+/// address directly) has no master and gets no secondary.
+fn port_macs(sysfs_net: &Path, iface: &str) -> Result<([u8; 6], Vec<[u8; 6]>), String> {
+    let own = parse_mac_file(&sysfs_net.join(iface).join("address"))?;
     let master = sysfs_net.join(iface).join("master").join("address");
-    if master.exists() {
-        let mac = parse_mac_file(&master)?;
-        tracing::info!(
-            iface,
-            master_mac = %format!(
-                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-            ),
-            "bridge-member port answers to its master's MAC — that is the gateway address \
-             hosts ARP"
-        );
-        return Ok(mac);
+    if !master.exists() {
+        return Ok((own, Vec::new()));
     }
-    parse_mac_file(&sysfs_net.join(iface).join("address"))
+    let bridge = parse_mac_file(&master)?;
+    // A bridge that took its MAC from this very port needs no second
+    // entry, and adding a duplicate is a refusal on some drivers.
+    if bridge == own {
+        return Ok((own, Vec::new()));
+    }
+    tracing::info!(
+        iface,
+        bridge_mac = %hex_mac(&bridge),
+        "bridge-member port accepts its master's MAC as a SECONDARY address — that is the \
+         gateway address hosts ARP. The primary stays the port's own: on this NIC the \
+         primary is a hardware filter, and moving it captures delivery even unsteered"
+    );
+    Ok((own, vec![bridge]))
+}
+
+fn hex_mac(m: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    )
 }
 
 fn parse_mac_file(path: &Path) -> Result<[u8; 6], String> {
@@ -543,12 +561,14 @@ fn finish(
         .ports
         .iter()
         .map(|p| {
+            let (pf_mac, accept_macs) = port_macs(&paths.sys.sysfs_net, &p.iface)?;
             Ok(PortAttach {
                 port: p.iface.clone(),
                 pci_addr: p.vf_pci.clone(),
                 port_id: 0,
                 num_rx_queues: p.cores,
-                answer_mac: answering_mac(&paths.sys.sysfs_net, &p.iface)?,
+                pf_mac,
+                accept_macs,
                 // From the config, not the state file: vlans are a
                 // declaration about the port's ingress, not an acquired
                 // resource, and `restart_only_delta` already pins them
@@ -924,8 +944,11 @@ fn finish(
 /// because their `birdc` answers for the wrong bird. Found on the shadow,
 /// where `off` was set and the steer was refused anyway.
 #[cfg(test)]
-mod answering_mac_tests {
+mod port_mac_tests {
     use super::*;
+
+    const OWN: [u8; 6] = [0x28, 0x70, 0x4e, 0x47, 0x69, 0xca];
+    const BRIDGE: [u8; 6] = [0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7];
 
     fn fixture(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -935,25 +958,58 @@ mod answering_mac_tests {
         p
     }
 
-    /// The w21 defect (2026-08-14): hosts ARP their gateway and get the
-    /// BRIDGE's MAC; a VF answering to the port's own address punted
-    /// 7.17M subif-classified frames in 90 s.
-    #[test]
-    fn a_bridge_member_answers_to_its_masters_mac() {
-        let net = fixture("master");
+    fn enslaved(tag: &str, bridge: &str) -> std::path::PathBuf {
+        let net = fixture(tag);
         std::fs::write(net.join("eth4/address"), "28:70:4e:47:69:ca\n").unwrap();
         std::fs::create_dir_all(net.join("eth4/master")).unwrap();
-        std::fs::write(net.join("eth4/master/address"), "28:70:4e:47:69:c7\n").unwrap();
-        let mac = answering_mac(&net, "eth4").unwrap();
-        assert_eq!(mac, [0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7]);
+        std::fs::write(net.join("eth4/master/address"), format!("{bridge}\n")).unwrap();
+        net
+    }
+
+    /// Both hardware findings in one assertion, and the ORDER of the
+    /// pair is the whole point.
+    ///
+    /// w21: hosts ARP their gateway and get the BRIDGE's MAC, so
+    /// without acceptance of it, 7.17M classified frames punted in
+    /// 90 s. w22: making that same address the PRIMARY moved the VF's
+    /// hardware filter, and ~300 kpps arrived with steering OFF —
+    /// unsteered staging silently voided. So: own address primary,
+    /// bridge address accepted alongside it.
+    #[test]
+    fn a_bridge_member_keeps_its_own_primary_and_accepts_the_bridges() {
+        let net = enslaved("master", "28:70:4e:47:69:c7");
+        let (primary, accept) = port_macs(&net, "eth4").unwrap();
+        assert_eq!(
+            primary, OWN,
+            "the primary is a hardware filter — it must not move"
+        );
+        assert_eq!(
+            accept,
+            vec![BRIDGE],
+            "the bridge address is accepted, not assumed"
+        );
         let _ = std::fs::remove_dir_all(&net);
     }
 
     #[test]
-    fn a_plain_l3_port_answers_to_its_own() {
+    fn a_plain_l3_port_has_no_secondary() {
         let net = fixture("plain");
         std::fs::write(net.join("eth4/address"), "28:70:4e:47:69:ca\n").unwrap();
-        assert_eq!(answering_mac(&net, "eth4").unwrap()[5], 0xca);
+        let (primary, accept) = port_macs(&net, "eth4").unwrap();
+        assert_eq!(primary, OWN);
+        assert!(accept.is_empty(), "no master, nothing extra to accept");
+        let _ = std::fs::remove_dir_all(&net);
+    }
+
+    /// A Linux bridge usually adopts the lowest member's MAC, so the
+    /// two files often hold the SAME address — adding it as a
+    /// secondary would be a duplicate, which some drivers refuse.
+    #[test]
+    fn a_bridge_wearing_this_ports_mac_adds_nothing() {
+        let net = enslaved("same", "28:70:4e:47:69:ca");
+        let (primary, accept) = port_macs(&net, "eth4").unwrap();
+        assert_eq!(primary, OWN);
+        assert!(accept.is_empty(), "same address — no second entry");
         let _ = std::fs::remove_dir_all(&net);
     }
 
@@ -961,7 +1017,7 @@ mod answering_mac_tests {
     fn a_garbage_address_file_is_an_error() {
         let net = fixture("garbage");
         std::fs::write(net.join("eth4/address"), "not-a-mac\n").unwrap();
-        assert!(answering_mac(&net, "eth4").is_err());
+        assert!(port_macs(&net, "eth4").is_err());
         let _ = std::fs::remove_dir_all(&net);
     }
 }
