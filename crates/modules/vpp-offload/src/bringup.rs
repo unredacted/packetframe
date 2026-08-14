@@ -152,6 +152,83 @@ fn port_macs(sysfs_net: &Path, iface: &str) -> Result<([u8; 6], Vec<[u8; 6]>), S
     Ok((own, vec![bridge]))
 }
 
+/// Refuse a `loopback-address` the kernel already holds.
+///
+/// VPP's arp node answers requests targeting its loopback's address,
+/// sourcing the member VF's MAC. If that address is a LIVE kernel
+/// address — the gateway, in the reference incident — two responders
+/// fight over it and hosts learn whichever answered last. Measured on
+/// the primary (w22, 2026-08-14): loop0 held 23.191.200.1, the
+/// br1337 gateway, and VPP sent 105 ARP replies in 27 minutes against
+/// the kernel's. The address VPP needs is *announced but unassigned*:
+/// routable from outside (ICMP sourcing, PMTUD) with no other claimant
+/// (no ARP war, no steered traffic terminating inside VPP).
+///
+/// The decision is split from the `getifaddrs` read so the refusal
+/// text and the match are testable without owning the host's
+/// interfaces.
+fn loopback_collision(
+    loopback: std::net::Ipv4Addr,
+    owned: &[(String, std::net::Ipv4Addr)],
+) -> Option<String> {
+    owned
+        .iter()
+        .find(|(_, a)| *a == loopback)
+        .map(|(ifname, _)| {
+            format!(
+                "`loopback-address {loopback}/32` is an address the kernel already holds (on \
+             {ifname}). VPP answers ARP for its loopback's address, so sharing a live \
+             kernel address starts a responder war over it — hosts learn whichever MAC \
+             answered last (measured on the primary 2026-08-14, w22: 105 competing \
+             replies for the gateway). Pick an announced-but-unassigned host address in \
+             the same prefix instead, outside any DHCP pool"
+            )
+        })
+}
+
+/// Every IPv4 address the kernel currently holds, with the interface
+/// that holds it (for the refusal message).
+///
+/// Degrades OPEN on a `getifaddrs` failure: an empty list skips the
+/// collision check rather than refusing every attach — a guard against
+/// one specific misconfiguration must not become a new way for a
+/// healthy box to fail to start.
+fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates the list; freed below on every path
+    // that saw a zero return.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: walking the list getifaddrs returned, until null.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: ifa_addr is non-null and points at a sockaddr for
+            // this entry; only read further when the family says INET.
+            let family = unsafe { i32::from((*ifa.ifa_addr).sa_family) };
+            if family == libc::AF_INET {
+                // SAFETY: AF_INET guarantees sockaddr_in layout.
+                let raw = unsafe {
+                    (*(ifa.ifa_addr as *const libc::sockaddr_in))
+                        .sin_addr
+                        .s_addr
+                };
+                let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((name, std::net::Ipv4Addr::from(u32::from_be(raw))));
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: the list came from a successful getifaddrs.
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
+
 fn hex_mac(m: &[u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -429,6 +506,9 @@ pub fn bring_up(
                 .into(),
         );
     };
+    if let Some(err) = loopback_collision(loopback.addr, &kernel_v4_addrs()) {
+        return Err(err);
+    }
 
     let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
 
@@ -943,6 +1023,41 @@ fn finish(
 /// ran on every deployment, including the ones that set it off precisely
 /// because their `birdc` answers for the wrong bird. Found on the shadow,
 /// where `off` was set and the steer was refused anyway.
+#[cfg(test)]
+mod loopback_collision_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn a_kernel_owned_address_is_refused_naming_the_interface() {
+        let owned = vec![
+            ("lo".to_string(), Ipv4Addr::new(127, 0, 0, 1)),
+            ("br1337".to_string(), Ipv4Addr::new(23, 191, 200, 1)),
+        ];
+        let err = loopback_collision(Ipv4Addr::new(23, 191, 200, 1), &owned)
+            .expect("the w22 config must be refused");
+        assert!(err.contains("br1337"), "{err}");
+        assert!(err.contains("responder war"), "{err}");
+    }
+
+    #[test]
+    fn an_unassigned_address_in_the_same_prefix_passes() {
+        let owned = vec![("br1337".to_string(), Ipv4Addr::new(23, 191, 200, 1))];
+        assert!(loopback_collision(Ipv4Addr::new(23, 191, 200, 254), &owned).is_none());
+    }
+
+    /// Every host has 127.0.0.1, so this smoke-tests the real
+    /// `getifaddrs` read on whatever runs the suite.
+    #[test]
+    fn the_kernel_address_read_sees_the_loopback() {
+        let owned = kernel_v4_addrs();
+        assert!(
+            owned.iter().any(|(_, a)| *a == Ipv4Addr::new(127, 0, 0, 1)),
+            "getifaddrs returned {owned:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod port_mac_tests {
     use super::*;
