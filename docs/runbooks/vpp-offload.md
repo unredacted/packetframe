@@ -893,6 +893,23 @@ still running (`pgrep -a vpp`) and whether MCAM still points at its VF
 forwarded by an unsupervised process — restart packetframe, which will
 **adopt** it rather than restarting it.
 
+### Hosts flap between two MACs for the gateway, or duplicate-address warnings appear
+
+VPP's arp node answers requests targeting its loopback's address,
+sourcing the member VF's MAC. If `loopback-address` is a **live kernel
+address** — the gateway being the worst case — VPP and the kernel both
+answer, hosts learn whichever replied last, and traffic oscillates
+between two delivery paths. Measured on the primary (2026-08-14, w22):
+loop0 held the br1337 gateway and VPP sent 105 competing replies in
+27 minutes.
+
+Attach now refuses a kernel-owned `loopback-address` outright. The fix
+is one line: point it at an announced-but-unassigned host address in
+the same prefix (outside any DHCP pool), then restart into it —
+`loopback-address` is restart-only. Nothing else changes: ICMP/PMTUD
+sourcing works from any routable address, and members unnumber to it
+identically.
+
 ### Steered traffic reaches VPP and vanishes — `punt` climbing, no `ip4`, no tx
 
 ```bash
