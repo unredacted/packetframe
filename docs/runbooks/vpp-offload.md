@@ -880,21 +880,27 @@ vppctl -s /run/packetframe/vpp/api.sock.cli show interface
 ```
 
 The fingerprint: the steered member's `rx packets` climbing at traffic
-rate, `punt` climbing with it, **no `ip4` counter row at all**, and no
-tx anywhere. The frames are real and delivered — VPP is refusing them
-at `ethernet-input`, before routing. Two causes, in likelihood order:
+rate, `punt` climbing with it, and no meaningful `ip4` or tx anywhere.
+The frames are real and delivered — VPP is refusing them at
+`ethernet-input`, before routing. Both causes have now been measured
+on the primary, one window apart, and the counters tell them apart:
 
-1. **Tagged ingress with no dot1q subif** — the port is a trunk and its
-   `vlans` list is missing or incomplete. This is w20 on the primary
-   (2026-08-14): 8.7M frames punted in two minutes, every health
-   surface green, the steered prefix's return path dead. Fix: unsteer
-   (the lever, seconds), add `vlans <id>[,<id>...]` to the port line,
-   restart into it (the list is restart-only), re-steer.
-2. **MAC mismatch** — shows as `drops` rather than `punt`, and the
-   attach's readback should have caught it. If the gateway MAC hosts
-   ARP is a *bridge's* MAC rather than the member PF's, the readback
-   verified the wrong target; compare `ip -d link show <bridge>`
-   against `/sys/class/net/<port>/address`.
+1. **Tagged ingress with no dot1q subif** — no subif rows in
+   `show interface` at all, every frame punted against the parent.
+   This is w20 (2026-08-14): 8.7M frames punted in two minutes, every
+   health surface green, the steered prefixes' return path dead. Fix:
+   unsteer (the lever, seconds), add `vlans <id>[,<id>...]` to the
+   port line, restart into it (the list is restart-only), re-steer.
+2. **Wrong answering MAC** — the subif's `rx packets` climbs at
+   traffic rate (classification works) while `punt` accrues against
+   the **parent** and the subif's `ip4` stays a rounding error. This
+   is w21 (2026-08-14): 7.17M frames in 90 s, because the VF answered
+   to eth4's own `…:ca` while hosts ARP their gateway and send to
+   switch0's `…:c7`. On a bridge-member port the answering MAC must be
+   the **bridge master's**, which `answering_mac` now derives from the
+   sysfs `master` link; if this fingerprint appears anyway, compare
+   `ip link show <bridge>` against what `show hardware` says the
+   member answers to.
 
 The user-visible symptom while this runs is total loss for the steered
 flow class only — everything unsteered keeps working, which is what
@@ -1147,6 +1153,7 @@ Be precise about this when reasoning about an incident.
 | TX-ring intervention (eth3 4096 → 32768) | loss 0/500 — but avg RTT **678 ms** (bufferbloat) | 2026-08-13 w18. Proof of the silent-drop mechanism, **not a fix**; ring restored. |
 | `netdev_budget` ×4 (300→1200, usecs 20000→80000) | `time_squeeze` → 0; loss 1%; local-segment RTT >100 ms on 22% of pings | 2026-08-13 w19. The deficit moved into 80 ms softirq rounds; settings restored. |
 | First steer on the primary (eth4, `src`, trunk, no subifs) | MCAM+VF+VPP rx flawless at ~72 kpps; **8.7M frames punted in 2 min, zero forwarded** | 2026-08-14 w20. Tagged ingress, no dot1q subif → punt at ethernet-input. The `vlans` port directive exists because of this window. |
+| Second steer (subifs present, VF answering to the port's own MAC) | subif classified 7.19M frames in 90 s (**punt-at-VLAN-layer gone**); 7.17M then punted on dmac — hosts address switch0's `…:c7`, the VF held eth4's `…:ca` | 2026-08-14 w21. Auto-aborted by the harness's 90 s blackhole guard. `answering_mac` (bridge master's address) exists because of this window. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**

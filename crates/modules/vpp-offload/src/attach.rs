@@ -72,12 +72,18 @@ pub struct PortAttach {
     pub port_id: u16,
     /// Receive queues, from the operator's `cores` promise.
     pub num_rx_queues: u16,
-    /// The **PF's** MAC, read from `/sys/class/net/<port>/address`.
+    /// The MAC this member must **answer to** — the gateway address
+    /// hosts and peers actually put in their frames.
     ///
-    /// The VF's own MAC is not usable: MCAM redirects frames addressed
-    /// to the PF, so the interface must answer to that address or punt
-    /// every one of them.
-    pub pf_mac: [u8; 6],
+    /// The VF's own MAC is never usable: MCAM redirects frames as the
+    /// wire carries them. For a plain L3 port that means the PF's MAC
+    /// (`/sys/class/net/<port>/address`); for a bridge-member port it
+    /// means the **bridge's** MAC — measured on the primary (w21,
+    /// 2026-08-14): answering to eth4's own address instead of
+    /// switch0's cost 7.17M subif-classified frames punted at
+    /// `ethernet-input` in 90 seconds. `bringup::answering_mac` makes
+    /// the choice from the sysfs `master` link.
+    pub answer_mac: [u8; 6],
     /// 802.1Q tags steered ingress arrives with on this port, from the
     /// operator's `vlans` declaration. One exact-match dot1q subif is
     /// created per id at attach; a tagged frame with no subif never
@@ -288,7 +294,7 @@ pub fn attach_ports(
                 // running VPP, and this is the reconcile point. A MAC
                 // that silently reverted would punt every steered frame
                 // while every counter stayed healthy.
-                set_mac(t, p, idx, p.pf_mac)?;
+                set_mac(t, p, idx, p.answer_mac)?;
                 set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
                 ensure_vlan_subifs(t, p, idx, loop_idx, &existing)?;
@@ -340,7 +346,7 @@ pub fn attach_ports(
         // to the sink before it can forward is a port the FIB will
         // resolve routes onto while every packet dies at
         // `ip4-not-enabled`.
-        set_mac(t, p, sw_if_index, p.pf_mac)?;
+        set_mac(t, p, sw_if_index, p.answer_mac)?;
         set_promisc_on(t, p, sw_if_index)?;
         set_unnumbered(t, p, sw_if_index, loop_idx)?;
         // A freshly created parent cannot have subifs, so the dump
@@ -866,7 +872,7 @@ mod tests {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            answer_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             vlans: vec![],
         };
         assert_eq!(format!("pci/{}", p.pci_addr), "pci/0002:07:00.1");
