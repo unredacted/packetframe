@@ -1095,6 +1095,7 @@ fn run_loop(
                 stray: rs.steer_stray,
                 unreadable: rs.steer_audit_error.clone(),
             },
+            rs.shadowed_routes,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

@@ -277,6 +277,7 @@ fn completeness_gate(
 /// On any failure after acquisition, everything acquired is released
 /// before returning — a failed attach must leave the box as it found it,
 /// or say precisely what it could not hand back.
+#[allow(clippy::too_many_arguments)]
 pub fn bring_up(
     cfg: &VppOffloadConfig,
     paths: &AttachPaths,
@@ -285,6 +286,7 @@ pub fn bring_up(
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     budget: &McamBudget,
+    local_routes: &[crate::LocalRoute],
 ) -> Result<Attached, String> {
     // `require-table-complete on` with nothing publishing completeness
     // is refused at attach rather than discovered at the first canary
@@ -542,6 +544,7 @@ pub fn bring_up(
         feed_session,
         loopback,
         &port_vlans,
+        local_routes,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -614,6 +617,7 @@ fn finish(
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     loopback: packetframe_common::config::Ipv4Prefix,
     port_vlans: &[(String, Vec<u16>)],
+    local_routes: &[crate::LocalRoute],
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -853,6 +857,7 @@ fn finish(
     // (see `service`), which is also why the resource owner is built in
     // here rather than passed in: it shares one record between the
     // identity store and the release seam through an `Rc`.
+    let local_routes = local_routes.to_vec();
     let factory: LoopFactory = Box::new(move || {
         let engine = ConvergenceEngine::new(
             api_socket_path,
@@ -862,7 +867,8 @@ fn finish(
             FamilyPolicy::V4Only,
             loopback,
         )
-        .with_recorded_indices(recorded);
+        .with_recorded_indices(recorded)
+        .with_local_routes(local_routes);
         // Counted before the record moves into the owner: the log line
         // below needs it, and reaching for it afterwards is what the
         // borrow checker just refused.
@@ -1154,6 +1160,7 @@ mod completeness_gate_tests {
             hugepages: None,
             require_table_complete: require,
             steer_exempts: vec![],
+            local_routes: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

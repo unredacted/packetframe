@@ -165,6 +165,7 @@ impl Host {
             expected_routes: 1_600_000,
             hugepages: None,
             steer_exempts: vec![],
+            local_routes: vec![],
             // These fixtures have no route authority to compare
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.
@@ -208,6 +209,7 @@ fn a_fresh_attach_acquires_renders_and_supervises() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .expect("bring-up");
 
@@ -328,6 +330,7 @@ fn a_config_that_cannot_work_touches_nothing() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("must fail");
@@ -344,6 +347,7 @@ fn a_config_that_cannot_work_touches_nothing() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("must fail");
@@ -365,6 +369,7 @@ fn a_config_that_cannot_work_touches_nothing() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("must fail");
@@ -434,6 +439,7 @@ fn an_irq_on_a_vpp_core_refuses_the_attach() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("must fail");
@@ -479,6 +485,7 @@ fn a_failure_after_acquisition_releases_what_it_took() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("must fail");
@@ -589,6 +596,7 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("steer on with nothing steerable must be refused");
@@ -616,6 +624,7 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     );
     assert!(
         ok.is_ok(),
@@ -653,6 +662,7 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .expect("first attach");
     drop(attached);
@@ -684,6 +694,7 @@ fn an_incomplete_recorded_identity_refuses_rather_than_spawning() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("an unverifiable identity must refuse");
@@ -736,6 +747,7 @@ fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .expect("first attach");
     drop(attached);
@@ -769,6 +781,7 @@ fn steering_rules_from_a_dead_vpp_are_not_left_unaccounted() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .expect("second attach");
     drop(attached);
@@ -809,6 +822,7 @@ fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .expect("first attach");
     drop(attached);
@@ -837,6 +851,7 @@ fn a_recorded_ledger_withholds_the_vf_until_the_rules_are_confirmed_gone() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .expect("attach");
     let report = attached.service.stop();
@@ -879,6 +894,7 @@ fn requiring_completeness_with_no_publisher_is_refused_at_attach() {
         None,
         None,
         &McamBudget::default(),
+        &[],
     )
     .err()
     .expect("must refuse");

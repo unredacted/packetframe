@@ -1468,6 +1468,7 @@ impl Runtime {
             steer_missing: c.steer_missing,
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
+            shadowed_routes: c.engine.shadowed_routes(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1615,6 +1616,9 @@ pub struct RuntimeStatus {
     pub steer_stray: usize,
     /// Why the last steering audit could not read the NIC, if so.
     pub steer_audit_error: Option<String>,
+    /// Mirror prefixes a `local-route` is currently suppressing. See
+    /// [`crate::engine::ConvergenceEngine::shadowed_routes`].
+    pub shadowed_routes: u64,
 }
 
 impl Core {

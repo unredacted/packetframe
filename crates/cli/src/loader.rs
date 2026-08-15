@@ -325,6 +325,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 // from that section. The loader is the only place that
                 // sees both.
                 m.set_allowlist(allowlist.clone());
+                // The `local-route` ↔ `local-prefix` join — the kernel
+                // device each mirrored neighbour set comes from. Only
+                // the loader sees both sections; the module refuses to
+                // attach if config promises local routes it was never
+                // handed.
+                match crate::feasibility::vpp_local_routes_from_config(&config) {
+                    Ok(lr) => m.set_local_routes(lr),
+                    Err(e) => return Err(RunError::Startup(e)),
+                }
                 if let Some(c) = &completeness {
                     m.set_completeness(c.clone());
                 }

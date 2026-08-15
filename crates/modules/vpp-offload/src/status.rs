@@ -340,6 +340,14 @@ pub struct StatusSnapshot {
     /// engine is not draining, a backlog there means VPP is not
     /// accepting.
     pub source_backlog: u64,
+    /// Mirror prefixes a `local-route` is currently suppressing —
+    /// routes the mirror carries that VPP deliberately does not,
+    /// because local delivery owns their footprint. Informational, not
+    /// a degradation: non-zero is the DESIGNED state on a service edge
+    /// (the reference primary expects exactly its poisoned host
+    /// route). Surfaced so a mirror change inside a local prefix is
+    /// visible rather than silently absorbed.
+    pub shadowed_routes: u64,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -392,6 +400,7 @@ impl StatusSnapshot {
             // and every caller of this form is a path with no steering
             // ledger to audit against.
             SteerAudit::default(),
+            0,
         )
     }
 
@@ -417,6 +426,7 @@ impl StatusSnapshot {
         source_backlog: u64,
         steer_configured: bool,
         audit: SteerAudit,
+        shadowed_routes: u64,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -440,6 +450,7 @@ impl StatusSnapshot {
             store_error,
             drain_error,
             source_backlog,
+            shadowed_routes,
         }
     }
 
@@ -1441,6 +1452,17 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             "packetframe_vpp_routes{{module=\"{module}\",state=\"{label}\"}} {value}"
         );
     }
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_shadowed_routes",
+        "mirror prefixes a local-route currently suppresses (local delivery owns them)",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_shadowed_routes{{module=\"{module}\"}} {}",
+        snap.shadowed_routes
+    );
 
     gauge(
         &mut out,

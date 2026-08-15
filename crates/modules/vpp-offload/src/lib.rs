@@ -120,6 +120,29 @@ pub struct VppOffloadConfig {
     /// `steer` is a reconcile, so a change installs/removes exactly
     /// the delta — including the rollback direction.
     pub steer_direction: packetframe_common::config::VppSteerDirection,
+    /// `(prefix, port, vlan)` per `local-route` line, in config order —
+    /// the section's own view, used for the restart-only comparison.
+    /// The loader-resolved form (with the kernel bridge device joined
+    /// in from fast-path's `local-prefix`) is [`LocalRoute`], installed
+    /// via [`VppOffloadModule::set_local_routes`]. Restart-only: the
+    /// attached route and the subif it lands on are attach-time work.
+    pub local_routes: Vec<(packetframe_common::config::Ipv4Prefix, String, u16)>,
+}
+
+/// One `local-route`, resolved for the engine: the config triple plus
+/// the kernel device whose neighbours mirror onto the subif.
+///
+/// `kernel_dev` is not in the module's own section — it is the `via`
+/// of the fast-path `local-prefix` covering `prefix` (validation
+/// guarantees exactly that cover exists). The loader performs the join
+/// because `Module` methods only see their own section; same reason
+/// the allowlist is a handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRoute {
+    pub prefix: packetframe_common::config::Ipv4Prefix,
+    pub port: String,
+    pub vlan: u16,
+    pub kernel_dev: String,
 }
 
 /// Default sizing input when `expected-routes` is absent.
@@ -159,6 +182,12 @@ impl VppOffloadConfig {
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
                 ModuleDirective::VppSteerExempt(p) => out.steer_exempts.push(*p),
                 ModuleDirective::VppSteerDirection(d) => out.steer_direction = *d,
+                ModuleDirective::VppLocalRoute {
+                    prefix,
+                    iface,
+                    vlan,
+                    ..
+                } => out.local_routes.push((*prefix, iface.clone(), *vlan)),
                 _ => {}
             }
         }
@@ -263,6 +292,14 @@ impl VppOffloadConfig {
                 "`vpp-binary` changed ({:?} → {:?}); the running VPP is the one that was \
                  spawned — restart to apply",
                 self.vpp_binary, new.vpp_binary
+            ));
+        }
+        if self.local_routes != new.local_routes {
+            return Err(format!(
+                "the `local-route` lines changed ({:?} → {:?}); the attached route, its \
+                 subif, and the neighbour-mirror wiring are installed at attach — restart \
+                 to apply",
+                self.local_routes, new.local_routes
             ));
         }
         // Restart-only for a different reason than everything above:
@@ -596,6 +633,9 @@ pub struct VppOffloadModule {
     /// held. `packetframe detach --all` retries, so that is the likely
     /// path, not a hypothetical one.
     teardown_failure: Option<String>,
+    /// Loader-resolved `local-route` set (config triple + kernel bridge
+    /// device). See [`Self::set_local_routes`].
+    local_routes: Vec<LocalRoute>,
 }
 
 impl VppOffloadModule {
@@ -611,6 +651,7 @@ impl VppOffloadModule {
             attached: None,
             teardown_pending: None,
             teardown_failure: None,
+            local_routes: Vec::new(),
         }
     }
 
@@ -645,6 +686,18 @@ impl VppOffloadModule {
     /// for why a snapshot is wrong on exactly the SIGHUP path.
     pub fn set_allowlist(&mut self, allowlist: std::sync::Arc<SharedAllowlist>) {
         self.allowlist = allowlist;
+    }
+
+    /// Hand the module its resolved `local-route` set.
+    ///
+    /// A setter for the same reason the allowlist is one: the kernel
+    /// bridge device each prefix's neighbours mirror from is the `via`
+    /// of the fast-path `local-prefix` covering it, and only the loader
+    /// sees both sections. A plain Vec rather than a shared handle
+    /// because `local-route` is restart-only — there is no SIGHUP path
+    /// that could make a snapshot stale.
+    pub fn set_local_routes(&mut self, routes: Vec<LocalRoute>) {
+        self.local_routes = routes;
     }
 
     /// Hand the module the route mirror's completeness handle.
@@ -944,6 +997,24 @@ impl Module for VppOffloadModule {
             Ok(b) => b,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
         };
+        // The loader resolves `local-route` against fast-path's
+        // `local-prefix` and hands the result to `set_local_routes`.
+        // A section carrying lines the module was never handed means
+        // that wiring is missing — refused loudly here rather than
+        // attaching a VPP that silently skips the delivery this config
+        // exists to provide (the published-is-not-read class).
+        if self.cfg.local_routes.len() != self.local_routes.len() {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!(
+                    "config declares {} local-route line(s) but the loader resolved {} — \
+                     set_local_routes was not wired; refusing to attach without the local \
+                     delivery the config promises",
+                    self.cfg.local_routes.len(),
+                    self.local_routes.len()
+                ),
+            ));
+        }
         let attached = match bringup::bring_up(
             &self.cfg,
             &paths,
@@ -952,6 +1023,7 @@ impl Module for VppOffloadModule {
             self.completeness.clone(),
             self.feed_session.clone(),
             &budget,
+            &self.local_routes,
         ) {
             Ok(a) => a,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
@@ -1583,6 +1655,7 @@ mod tests {
             hugepages: None,
             require_table_complete: true,
             steer_exempts: vec![],
+            local_routes: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -1677,6 +1750,7 @@ mod tests {
                     cores: 1,
                     steer: false,
                     vlans: vec![],
+                    direction: None,
                     line: 1,
                 },
                 ModuleDirective::VppRequireTableComplete(require),
@@ -1897,6 +1971,23 @@ mod tests {
             .restart_only_delta(&binary)
             .expect_err("vpp-binary")
             .contains("`vpp-binary` changed"));
+
+        // local-route: the attached route and its subif are installed
+        // at attach, so an edited line must refuse the reload — a
+        // reconfigure that reported OK while VPP kept delivering the
+        // old footprint would be the silent-divergence shape above.
+        let mut lr = base.clone();
+        lr.local_routes.push((
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(23, 191, 200, 0),
+                prefix_len: 24,
+            },
+            "eth4".into(),
+            1337,
+        ));
+        let e = base.restart_only_delta(&lr).expect_err("local-route");
+        assert!(e.contains("`local-route` lines changed"), "{e}");
+        assert!(e.contains("restart"), "{e}");
     }
 
     /// A reordered port list is a change, not a permutation.

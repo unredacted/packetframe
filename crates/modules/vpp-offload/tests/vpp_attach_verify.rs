@@ -945,6 +945,15 @@ fn declared_vlans_get_dot1q_subifs_up_and_unnumbered() {
     let got = attach_ports(&mut t, &p, &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].sw_if_index, 7, "the parent index is unchanged");
+    // The indices VPP assigned come back on the port, in declaration
+    // order — this is what `local-route` attached routes and the
+    // neighbour mirror reference, so dropping them on the floor (the
+    // pre-B1 behaviour) would be a silent regression here.
+    assert_eq!(
+        got[0].subifs,
+        vec![(88, 188), (1337, 1437)],
+        "each subif's (vid, sw_if_index) as the fake assigned them (100 + vid)"
+    );
 
     let seen = fake.observed();
     // Which vid landed on which parent — the detail events the fake
@@ -997,6 +1006,11 @@ fn adopted_subifs_are_reused_not_recreated() {
     let known = vec![("eth3".to_string(), 7u32)];
     let got = attach_ports(&mut t, &p, &known, AttachMode::Adopted, TEST_LOOP_IDX).expect("adopt");
     assert_eq!(got[0].sw_if_index, 7);
+    assert_eq!(
+        got[0].subifs,
+        vec![(1337, 107)],
+        "an adopted subif reports the index from the dump, not a fresh one"
+    );
 
     let seen = fake.observed();
     assert!(

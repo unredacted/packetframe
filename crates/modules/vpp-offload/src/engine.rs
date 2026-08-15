@@ -47,8 +47,9 @@ use crate::sink::{Capacity, NexthopMap, PendingMap, RouteLedger, SinkCounts};
 use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
 use crate::vpp_api::generated::{
-    IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump,
-    IpRoute, IpRouteDetails, IpRouteDump, IpTable, ADDRESS_IP4, ADDRESS_IP6,
+    FibPath, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails,
+    IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteDump,
+    IpTable, ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE, FIB_API_PATH_NH_PROTO_IP4,
     FIB_API_PATH_TYPE_NORMAL,
 };
 use crate::vpp_api::{Transport, TransportError};
@@ -272,6 +273,11 @@ pub struct ResyncPlan {
     /// Prefixes the ledger holds that the source no longer advertises.
     /// Non-zero after any outage during which routes were withdrawn.
     pub withdrawals: u64,
+    /// Mirror prefixes suppressed by a `local-route` this walk. Logged
+    /// so an operator reading the resync line can see the shadowing
+    /// working (the reference primary expects exactly its poisoned
+    /// host route here).
+    pub shadowed: u64,
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -387,6 +393,14 @@ pub enum EngineError {
         nexthop: IpAddr,
         retval: i32,
     },
+    /// A `local-route` attached route could not be installed. Fatal to
+    /// the attach rather than skippable: this prefix's delivery is the
+    /// declared reason the config steers at all, and dst steering may
+    /// be counting on it.
+    AttachedRouteFailed {
+        prefix: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -399,6 +413,11 @@ impl std::fmt::Display for EngineError {
                 f,
                 "VPP refused the static neighbour for {nexthop} (retval {retval}); \
                  every route through it would blackhole"
+            ),
+            Self::AttachedRouteFailed { prefix, detail } => write!(
+                f,
+                "the attached route for local-route {prefix} could not be installed \
+                 ({detail}); steered traffic to it would die at null-node"
             ),
         }
     }
@@ -422,6 +441,20 @@ pub struct ConvergenceEngine {
     transport: Option<Transport>,
 
     ports: Vec<PortAttach>,
+    /// Locally terminated prefixes VPP delivers itself: an attached
+    /// route onto the named port's dot1q subif, kernel neighbours on
+    /// the backing bridge mirrored as static neighbours, and the BGP
+    /// mirror's view INSIDE each prefix shadowed (skipped at resync
+    /// and in deltas). Restart-only config, resolved by the loader
+    /// against fast-path's `local-prefix` for the kernel device.
+    local_routes: Vec<crate::LocalRoute>,
+    /// Mirror prefixes currently suppressed by a `local-route` — kept
+    /// as a set so health can report a count that means "routes the
+    /// mirror carries that VPP deliberately does not", not a
+    /// monotonically growing skip tally. Entries leave when the mirror
+    /// withdraws them. Survives reconnects: it describes the mirror,
+    /// not the process.
+    shadowed: HashSet<IpPrefix>,
     /// The address the loopback holds; every member is unnumbered to it.
     loopback: packetframe_common::config::Ipv4Prefix,
     /// The loopback's index once created. `None` until the first attach
@@ -532,6 +565,8 @@ impl ConvergenceEngine {
             api_socket: api_socket.into(),
             transport: None,
             ports,
+            local_routes: Vec::new(),
+            shadowed: HashSet::new(),
             loopback,
             loop_index: None,
             recorded_indices: Vec::new(),
@@ -561,27 +596,49 @@ impl ConvergenceEngine {
         self
     }
 
-    // NOTE: there is deliberately no `add_vlan` here, even though
-    // [`NexthopMap`] supports VLAN nexthops.
-    //
-    // Teaching the mapping to return `NexthopTarget::Subif` is only half
-    // of it: FIB paths need the sub-interface's OWN `sw_if_index`, and
-    // nothing creates or discovers one. The generated API whitelist has
-    // no sub-interface message at all, so `PortIndex` could never gain a
-    // `(port, Some(vid))` entry — `build_paths` would return `None` for
-    // every route through that VLAN, the drainer would defer all of them
-    // forever, and the resync would burn the whole convergence budget
-    // installing nothing.
-    //
-    // An affordance that silently produces a permanently-deferred table
-    // is worse than a missing one, so it is missing. Re-enabling it means
-    // adding a sub-interface create message to the whitelist, calling it
-    // during attach, and recording the index VPP assigns.
-    //
-    // Not currently needed: the gate-0b nexthop histogram found exactly
-    // two egress devices across the whole table and no VLAN nexthops —
-    // the br1337/FDB-pin topology is a connected-route concern, not a BGP
-    // nexthop one.
+    /// Declare the locally terminated prefixes this engine delivers.
+    ///
+    /// This is the ONLY caller of [`NexthopMap::add_vlan`], and the
+    /// preconditions the old NOTE here demanded now hold by
+    /// construction: `create_vlan_subif` is whitelisted, attach creates
+    /// the subifs from the same config that names them here, and
+    /// `attach_devices` records the indices VPP assigns into
+    /// [`PortIndex`] under `(port, Some(vid))` — so a `Subif` target
+    /// resolves instead of deferring its routes forever. Registered at
+    /// construction because the VLAN policy is static config;
+    /// `forget_devices` deliberately keeps it.
+    pub fn with_local_routes(mut self, routes: Vec<crate::LocalRoute>) -> Self {
+        for lr in &routes {
+            self.nexthops
+                .add_vlan(lr.kernel_dev.clone(), lr.port.clone(), lr.vlan);
+        }
+        self.local_routes = routes;
+        self
+    }
+
+    /// Whether the mirror's view of `p` is suppressed by a local-route.
+    ///
+    /// The kernel tier delivers to bridge hosts BEFORE its FIB lookup,
+    /// so a mirrored route inside a locally delivered prefix describes
+    /// what bird would do, not what the box does — the reference
+    /// primary carries a service host route as `unreachable` in bird,
+    /// which the kernel path never consults and VPP would faithfully
+    /// blackhole with. Local delivery comes from the attached route +
+    /// neighbour mirror instead.
+    fn shadows(&self, p: &IpPrefix) -> bool {
+        let IpPrefix::V4 { addr, prefix_len } = p else {
+            return false;
+        };
+        self.local_routes.iter().any(|lr| {
+            lr.prefix.prefix_len <= *prefix_len
+                && lr.prefix.contains_addr(std::net::Ipv4Addr::from(*addr))
+        })
+    }
+
+    /// How many mirror prefixes a `local-route` is currently shadowing.
+    pub fn shadowed_routes(&self) -> u64 {
+        self.shadowed.len() as u64
+    }
 
     pub fn counts(&self) -> SinkCounts {
         self.ledger.counts()
@@ -855,8 +912,98 @@ impl ConvergenceEngine {
         // Only now, with VPP's own indices in hand.
         for p in &attached {
             self.port_index.insert(p.port.clone(), None, p.sw_if_index);
+            for &(vid, idx) in &p.subifs {
+                self.port_index.insert(p.port.clone(), Some(vid), idx);
+            }
         }
         self.attached = attached;
+        self.install_attached_routes()
+    }
+
+    /// Install one attached route per `local-route`, straight onto the
+    /// subif — deliberately OUTSIDE the pending/ledger path.
+    ///
+    /// These are module-owned topology, not mirror state: the resync
+    /// diff withdraws whatever the ledger holds that the source no
+    /// longer advertises, and an attached route is never advertised by
+    /// the source, so entering the ledger would get it withdrawn on
+    /// the very next resync. Not entering it is also what exempts it
+    /// from adoption's shape test (a nexthop-less route never looks
+    /// self-installed) — a restart over a live VPP re-sends it, and
+    /// VPP treats the identical add as an update.
+    ///
+    /// The nexthop-less NORMAL path on the subif is VPP's attached
+    /// route: dst inside the prefix resolves via the interface, with
+    /// per-host adjacencies coming from the mirrored static
+    /// neighbours (VPP never ARPs; a never-seen host drops here where
+    /// the kernel would ARP-queue — documented, service hosts are
+    /// static).
+    fn install_attached_routes(&mut self) -> Result<(), EngineError> {
+        if self.local_routes.is_empty() {
+            return Ok(());
+        }
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        for lr in &self.local_routes {
+            let target = crate::sink::NexthopTarget::Subif {
+                port: lr.port.clone(),
+                vlan: lr.vlan,
+            };
+            let Some(sw_if_index) = self.port_index.get(&target) else {
+                // Config guarantees the port declares this vlan, and
+                // attach just created every declared subif — a miss
+                // here is an ordering bug, not an operator error, and
+                // installing onto index 0 would route the prefix to
+                // local0.
+                return Err(EngineError::AttachedRouteFailed {
+                    prefix: format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
+                    detail: format!("no subif index for {}.{}", lr.port, lr.vlan),
+                });
+            };
+            let prefix = IpPrefix::V4 {
+                addr: lr.prefix.network().octets(),
+                prefix_len: lr.prefix.prefix_len,
+            };
+            let mut path = FibPath {
+                sw_if_index,
+                table_id: 0,
+                rpf_id: 0,
+                weight: 1,
+                preference: 0,
+                r#type: FIB_API_PATH_TYPE_NORMAL,
+                flags: FIB_API_PATH_FLAG_NONE,
+                proto: FIB_API_PATH_NH_PROTO_IP4,
+                nh: Default::default(),
+                n_labels: 0,
+                label_stack: Default::default(),
+            };
+            // Zero nexthop = attached: resolve via the interface.
+            path.nh = Default::default();
+            let reply: IpRouteAddDelReply = t.request(IpRouteAddDel {
+                context: 0,
+                is_add: true,
+                is_multipath: false,
+                route: IpRoute {
+                    table_id: 0,
+                    stats_index: 0,
+                    prefix: crate::fib_sync::to_prefix(prefix),
+                    n_paths: 1,
+                    paths: vec![path],
+                },
+            })?;
+            if reply.retval != 0 {
+                return Err(EngineError::AttachedRouteFailed {
+                    prefix: format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
+                    detail: format!("retval {}", reply.retval),
+                });
+            }
+            tracing::info!(
+                prefix = %format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
+                port = %lr.port,
+                vlan = lr.vlan,
+                sw_if_index,
+                "attached route installed — VPP delivers this prefix itself"
+            );
+        }
         Ok(())
     }
 
@@ -1301,6 +1448,17 @@ impl ConvergenceEngine {
             }
         }
         for (prefix, nhs) in changes.routes {
+            // Shadowed by a local-route: the mirror's view inside a
+            // locally delivered prefix never reaches the pending map,
+            // on the delta path exactly as at resync. The set tracks
+            // presence so health can count what is being suppressed.
+            if self.shadows(&prefix) {
+                match nhs {
+                    Some(_) => self.shadowed.insert(prefix),
+                    None => self.shadowed.remove(&prefix),
+                };
+                continue;
+            }
             match nhs {
                 Some(v) => self.pending.upsert(prefix, v),
                 None => self.pending.withdraw(prefix),
@@ -1411,7 +1569,19 @@ impl ConvergenceEngine {
         // alternative is an add-only resync that black-holes withdrawn
         // routes.
         let mut seen: HashSet<IpPrefix> = HashSet::with_capacity(1 << 20);
+        // Rebuilt from this walk, so a prefix the mirror dropped while
+        // we were not looking leaves the count too.
+        self.shadowed.clear();
         src.for_each_route(&mut |prefix, nexthops| {
+            if self.shadows(&prefix) {
+                // Deliberately NOT in `seen`: if the ledger holds a
+                // stale install of a shadowed prefix (a pre-local-route
+                // run, or adoption), the withdrawal loop below is what
+                // cleans it out of VPP.
+                self.shadowed.insert(prefix);
+                plan.shadowed += 1;
+                return;
+            }
             self.pending.upsert(prefix, nexthops.to_vec());
             seen.insert(prefix);
             plan.upserts += 1;
@@ -1442,6 +1612,16 @@ impl ConvergenceEngine {
         // Anything parked at the high-water mark gets another chance:
         // withdrawals in this same plan may have freed the headroom.
         self.pending.release_withheld();
+        if plan.shadowed > 0 {
+            // The operator-visible proof the shadowing is doing its
+            // job — the reference primary expects exactly its poisoned
+            // host route here, and a jump in this number is a mirror
+            // change worth reading about in `packetframe status`.
+            tracing::info!(
+                shadowed = plan.shadowed,
+                "local-route shadowing suppressed mirror routes this resync"
+            );
+        }
         plan
     }
 
@@ -1790,6 +1970,7 @@ mod tests {
             port: "eth4".into(),
             dev_index: Some(0),
             sw_if_index: 3,
+            subifs: vec![],
         });
         let m = mirror(4);
         e.begin_resync(&m);
@@ -2062,6 +2243,7 @@ mod tests {
             port: "eth4".into(),
             dev_index: Some(0),
             sw_if_index: 3,
+            subifs: vec![],
         });
         // No verify yet: nothing contradicts, so it reads up — bounded by
         // `nominal()` independently requiring a passing verify.

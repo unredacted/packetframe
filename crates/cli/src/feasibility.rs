@@ -134,6 +134,69 @@ pub fn vpp_steer_exempts_from_config(
         .collect()
 }
 
+/// The `local-route` lines joined with the fast-path `local-prefix`
+/// that covers each one — the join only the loader can perform, since
+/// `Module` methods see one section. The covering prefix's `via` is the
+/// kernel bridge device whose neighbours mirror onto the subif; the
+/// longest cover wins, matching every other most-specific rule in the
+/// config. `validate_vpp_offload` guarantees a cover exists, so the
+/// error arm is a programming-order guard (extractor called on an
+/// unvalidated config), not an operator surface.
+///
+/// Gated like [`crate::loader`]'s `feed_wiring` — its only caller is
+/// the Linux module-wiring path, and a laxer gate reads as dead code on
+/// every other build.
+#[cfg(all(target_os = "linux", feature = "fast-path", feature = "vpp-offload"))]
+pub fn vpp_local_routes_from_config(
+    config: &Config,
+) -> Result<Vec<packetframe_vpp_offload::LocalRoute>, String> {
+    let covers: Vec<(&packetframe_common::config::Ipv4Prefix, &String)> = config
+        .modules
+        .iter()
+        .filter(|m| m.name == "fast-path")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::LocalPrefix { cidr, iface, .. } => Some((cidr, iface)),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for d in config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| &m.directives)
+    {
+        if let ModuleDirective::VppLocalRoute {
+            prefix,
+            iface,
+            vlan,
+            ..
+        } = d
+        {
+            let kernel_dev = covers
+                .iter()
+                .filter(|(c, _)| c.contains_prefix(prefix))
+                .max_by_key(|(c, _)| c.prefix_len)
+                .map(|(_, i)| (*i).clone())
+                .ok_or_else(|| {
+                    format!(
+                        "local-route {}/{} matches no fast-path local-prefix — \
+                         validate_vpp_offload should have refused this config",
+                        prefix.addr, prefix.prefix_len
+                    )
+                })?;
+            out.push(packetframe_vpp_offload::LocalRoute {
+                prefix: *prefix,
+                port: iface.clone(),
+                vlan: *vlan,
+                kernel_dev,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// The `vpp-binary` override from a `vpp-offload` section, if set, so
 /// feasibility probes the executable the module will actually run.
 pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
