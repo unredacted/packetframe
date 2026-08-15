@@ -1628,8 +1628,7 @@ mod steered {
         }
         fn retarget(
             &mut self,
-            _ports: Vec<(String, u32)>,
-            _plan: packetframe_vpp_offload::steer::RuleSet,
+            _targets: Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)>,
         ) {
         }
     }
@@ -2728,8 +2727,7 @@ fn the_retry_does_not_steer_into_a_table_with_known_holes() {
         }
         fn retarget(
             &mut self,
-            _ports: Vec<(String, u32)>,
-            _plan: packetframe_vpp_offload::steer::RuleSet,
+            _targets: Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)>,
         ) {
         }
     }
@@ -2857,8 +2855,7 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
         }
         fn retarget(
             &mut self,
-            _ports: Vec<(String, u32)>,
-            _plan: packetframe_vpp_offload::steer::RuleSet,
+            _targets: Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)>,
         ) {
         }
     }

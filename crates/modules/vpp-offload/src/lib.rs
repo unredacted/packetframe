@@ -78,7 +78,7 @@ pub mod vpp_api;
 #[cfg(target_os = "linux")]
 mod probe_linux;
 
-use packetframe_common::config::ModuleDirective;
+use packetframe_common::config::{ModuleDirective, VppSteerDirection};
 use packetframe_common::module::{
     Attachment, HealthCtx, HealthReport, HookUse, LoaderCtx, MetricsWriter, Module, ModuleConfig,
     ModuleError, ModuleResult,
@@ -90,8 +90,11 @@ pub const MODULE_NAME: &str = "vpp-offload";
 /// Parsed view of the module's section, extracted once at load.
 #[derive(Debug, Clone, Default)]
 pub struct VppOffloadConfig {
-    /// (iface, cores, steer, vlans) in config order.
-    pub ports: Vec<(String, u16, bool, Vec<u16>)>,
+    /// One entry per `port` line, in config order. The direction is
+    /// the per-port override; `None` defers to the global
+    /// `steer_direction`. Hot like the steer flag — rules reconcile on
+    /// reconfigure.
+    pub ports: Vec<PortLine>,
     pub vpp_binary: Option<String>,
     pub expected_routes: u64,
     pub hugepages: Option<u32>,
@@ -145,6 +148,9 @@ pub struct LocalRoute {
     pub kernel_dev: String,
 }
 
+/// One parsed `port` line: `(iface, cores, steer, vlans, direction)`.
+pub type PortLine = (String, u16, bool, Vec<u16>, Option<VppSteerDirection>);
+
 /// Default sizing input when `expected-routes` is absent.
 ///
 /// Measured 2026-08-02 on the reference fleet: ~1.30M nexthops across
@@ -171,10 +177,11 @@ impl VppOffloadConfig {
                     cores,
                     steer,
                     vlans,
+                    direction,
                     ..
                 } => out
                     .ports
-                    .push((iface.clone(), *cores, *steer, vlans.clone())),
+                    .push((iface.clone(), *cores, *steer, vlans.clone(), *direction)),
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
@@ -249,12 +256,12 @@ impl VppOffloadConfig {
         let old_ports: Vec<(&str, u16, &[u16])> = self
             .ports
             .iter()
-            .map(|(i, c, _, v)| (i.as_str(), *c, v.as_slice()))
+            .map(|(i, c, _, v, _)| (i.as_str(), *c, v.as_slice()))
             .collect();
         let new_ports: Vec<(&str, u16, &[u16])> = new
             .ports
             .iter()
-            .map(|(i, c, _, v)| (i.as_str(), *c, v.as_slice()))
+            .map(|(i, c, _, v, _)| (i.as_str(), *c, v.as_slice()))
             .collect();
         if old_ports != new_ports {
             return Err(format!(
@@ -337,7 +344,7 @@ impl VppOffloadConfig {
     pub fn total_workers(&self) -> u32 {
         self.ports
             .iter()
-            .map(|(_, cores, _, _)| u32::from(*cores))
+            .map(|(_, cores, _, _, _)| u32::from(*cores))
             .sum()
     }
 }
@@ -433,8 +440,8 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
     // ended up, which this snapshot cannot see.
     let mut rolled_back: Vec<&str> = Vec::new();
     let mut turned_on: Vec<&str> = Vec::new();
-    for (iface, _, was, _) in &old.ports {
-        let Some((_, _, now, _)) = new.ports.iter().find(|(i, _, _, _)| i == iface) else {
+    for (iface, _, was, _, _) in &old.ports {
+        let Some((_, _, now, _, _)) = new.ports.iter().find(|(i, _, _, _, _)| i == iface) else {
             continue;
         };
         match (was, now) {
@@ -526,18 +533,21 @@ fn ifaces_to_query<'a>(
     }
     cfg.ports
         .iter()
-        .filter(|(_, _, steer, _)| *steer)
-        .map(|(iface, _, _, _)| iface.as_str())
+        .filter(|(_, _, steer, _, _)| *steer)
+        .map(|(iface, _, _, _, _)| iface.as_str())
         .collect()
 }
 
 /// What steering should look like for a config + allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteeringTarget {
-    /// `(PF iface, VF index)` for every port configured `steer on`.
-    pub ports: Vec<(String, u32)>,
-    /// The rules those ports should hold. Empty when nothing steers.
-    pub plan: steer::RuleSet,
+    /// `(PF iface, VF index, rules)` for every port configured
+    /// `steer on`. Per-port rule sets because direction is per-port —
+    /// the bidirectional service edge steers `src` on the trunk and
+    /// `dst` on the transits, and each side's rules differ. Ports
+    /// sharing a direction share one planned set (same slot numbers on
+    /// every NIC; slots are per-interface, so that costs nothing).
+    pub targets: Vec<(String, u32, steer::RuleSet)>,
     /// Whether traffic should be diverted once the target is in place.
     pub want_steer: bool,
 }
@@ -561,38 +571,61 @@ fn steering_target(
     allowlist: &[packetframe_common::fib::IpPrefix],
 ) -> Result<SteeringTarget, String> {
     // VF 0 because `acquire` creates exactly one per PF.
-    let ports: Vec<(String, u32)> = cfg
+    let ports: Vec<(String, u32, VppSteerDirection)> = cfg
         .ports
         .iter()
-        .filter(|(_, _, steer, _)| *steer)
-        .map(|(iface, _, _, _)| (iface.clone(), 0u32))
+        .filter(|(_, _, steer, _, _)| *steer)
+        .map(|(iface, _, _, _, dir)| (iface.clone(), 0u32, dir.unwrap_or(cfg.steer_direction)))
         .collect();
-    let want_steer = !ports.is_empty();
-    if !want_steer {
+    if ports.is_empty() {
         // Nothing to install and nothing that reads a plan. An empty
         // target is also the truthful one: no port steers.
         return Ok(SteeringTarget {
-            ports,
-            plan: steer::RuleSet::default(),
+            targets: Vec::new(),
             want_steer: false,
         });
     }
-    let budget = steer::McamBudget::for_ifaces(ports.iter().map(|(iface, _)| iface.as_str()))?;
-    let plan = steer::RuleSet::plan(allowlist, &cfg.steer_exempts, budget, cfg.steer_direction)?;
+    let budget = steer::McamBudget::for_ifaces(ports.iter().map(|(iface, _, _)| iface.as_str()))?;
+    // One plan per DISTINCT effective direction, all drawn from the
+    // shared free-slot intersection so a location number names the
+    // same slot on every steering port. Locations are per-interface,
+    // so ports of different directions reusing the same numbers do
+    // not collide — and each port's budget requirement is its OWN
+    // plan's size, not the union's.
+    let mut plans: Vec<(VppSteerDirection, steer::RuleSet)> = Vec::new();
+    for (_, _, d) in &ports {
+        if !plans.iter().any(|(pd, _)| pd == d) {
+            plans.push((
+                *d,
+                steer::RuleSet::plan(allowlist, &cfg.steer_exempts, budget.clone(), *d)?,
+            ));
+        }
+    }
     // `steer on` with nothing steerable is refused for the same reason
     // `bring_up` refuses it: steering would divert nothing while every
-    // surface reported it on.
-    if plan.rules.is_empty() {
+    // surface reported it on. All plans share the allowlist, so one
+    // empty means all empty.
+    if plans.iter().all(|(_, p)| p.rules.is_empty()) {
+        let skipped = plans.first().map_or(0, |(_, p)| p.skipped_v6);
         return Err(format!(
             "port(s) are configured `steer on`, but the allowlist produces no steerable \
-             rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this NIC). \
-             Steering would divert nothing while reporting Healthy",
-            plan.skipped_v6
+             rules ({skipped} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this \
+             NIC). Steering would divert nothing while reporting Healthy"
         ));
     }
+    let targets = ports
+        .into_iter()
+        .map(|(iface, vf, d)| {
+            let plan = plans
+                .iter()
+                .find(|(pd, _)| *pd == d)
+                .map(|(_, p)| p.clone())
+                .expect("every port's direction was planned above");
+            (iface, vf, plan)
+        })
+        .collect();
     Ok(SteeringTarget {
-        ports,
-        plan,
+        targets,
         want_steer: true,
     })
 }
@@ -1100,11 +1133,11 @@ impl Module for VppOffloadModule {
             .cfg
             .ports
             .iter()
-            .map(|(_, _, steer, _)| *steer)
-            .ne(new.ports.iter().map(|(_, _, steer, _)| *steer));
+            .map(|(_, _, steer, _, _)| *steer)
+            .ne(new.ports.iter().map(|(_, _, steer, _, _)| *steer));
         attached
             .service
-            .apply_steering(target.ports, target.plan, target.want_steer, lever_moved)
+            .apply_steering(target.targets, target.want_steer, lever_moved)
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Recorded only after the change landed. A `cfg` updated ahead of
         // the apply would make the NEXT reconfigure diff against a target
@@ -1256,7 +1289,7 @@ pub fn run_feasibility_probes(
     workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
-    direction: packetframe_common::config::VppSteerDirection,
+    directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
@@ -1266,7 +1299,7 @@ pub fn run_feasibility_probes(
             workers,
             vpp_binary,
             allowlist,
-            direction,
+            directions,
             steer_exempts,
         )
     }
@@ -1277,7 +1310,7 @@ pub fn run_feasibility_probes(
             workers,
             vpp_binary,
             allowlist,
-            direction,
+            directions,
             steer_exempts,
         );
         Vec::new()
@@ -1353,8 +1386,8 @@ mod tests {
     fn nothing_steerable_means_no_nic_is_asked() {
         let cfg = VppOffloadConfig {
             ports: vec![
-                ("eth4".into(), 1, true, vec![]),
-                ("eth5".into(), 1, false, vec![]),
+                ("eth4".into(), 1, true, vec![], None),
+                ("eth5".into(), 1, false, vec![], None),
             ],
             ..VppOffloadConfig::default()
         };
@@ -1648,7 +1681,7 @@ mod tests {
         VppOffloadConfig {
             ports: ports
                 .iter()
-                .map(|(i, c, s)| (i.to_string(), *c, *s, vec![]))
+                .map(|(i, c, s)| (i.to_string(), *c, *s, vec![], None))
                 .collect(),
             vpp_binary: None,
             expected_routes: routes,
@@ -2081,14 +2114,60 @@ mod tests {
         // budget it does not spend.
         let off = cfg(&[("eth4", 1, false)], 1_600_000);
         let t = steering_target(&off, &allow).expect("rollback must be possible");
-        assert!(t.ports.is_empty() && !t.want_steer);
-        assert!(
-            t.plan.rules.is_empty(),
-            "and it carries an empty target, which is what no port steering means"
-        );
+        assert!(t.targets.is_empty() && !t.want_steer);
     }
 
     /// A `steer on` port with a v6-only allowlist is refused, not
+    /// The bidirectional service edge: per-port `direction` yields
+    /// per-port plans — src diverts on the trunk, dst diverts on the
+    /// transit — with the built-in Keep exemptions on both, drawn from
+    /// one shared free-slot intersection.
+    #[test]
+    fn per_port_direction_yields_per_port_plans() {
+        use crate::steer::{RuleAction, Side};
+        let mut on = cfg(&[("eth3", 1, true), ("eth4", 1, true)], 1_600_000);
+        on.ports[0].4 = Some(packetframe_common::config::VppSteerDirection::Dst);
+        on.ports[1].4 = Some(packetframe_common::config::VppSteerDirection::Src);
+        let allow = vec![packetframe_common::fib::IpPrefix::V4 {
+            addr: [23, 191, 200, 0],
+            prefix_len: 24,
+        }];
+        let t = steering_target(&on, &allow).expect("both plans fit");
+        assert!(t.want_steer);
+        assert_eq!(t.targets.len(), 2);
+        let plan_of = |iface: &str| {
+            &t.targets
+                .iter()
+                .find(|(i, _, _)| i == iface)
+                .expect("port present")
+                .2
+        };
+        let (eth3, eth4) = (plan_of("eth3"), plan_of("eth4"));
+        let diverts = |p: &steer::RuleSet| {
+            p.rules
+                .iter()
+                .filter(|r| r.action == RuleAction::Divert)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let d3 = diverts(eth3);
+        let d4 = diverts(eth4);
+        assert_eq!(d3.len(), 1, "dst = one divert per prefix: {d3:?}");
+        assert_eq!(d4.len(), 1, "src = one divert per prefix: {d4:?}");
+        assert!(d3.iter().all(|r| r.side == Side::Dst), "{d3:?}");
+        assert!(d4.iter().all(|r| r.side == Side::Src), "{d4:?}");
+        for (name, plan) in [("eth3", eth3), ("eth4", eth4)] {
+            assert_eq!(
+                plan.rules
+                    .iter()
+                    .filter(|r| r.action == RuleAction::Keep)
+                    .count(),
+                2,
+                "{name} must carry the built-in broadcast+multicast keeps"
+            );
+        }
+    }
+
     /// silently accepted as steering nothing.
     #[test]
     fn steer_on_with_nothing_steerable_is_refused() {

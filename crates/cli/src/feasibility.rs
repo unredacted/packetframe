@@ -71,19 +71,43 @@ pub fn vpp_workers_from_config(config: &Config) -> u32 {
     workers
 }
 
-/// The configured steer direction, defaulting like the module does.
-pub fn vpp_steer_direction_from_config(config: &Config) -> VppSteerDirection {
+/// The DISTINCT effective steer directions of the steering ports —
+/// each port's `direction` tail falling back to the global, exactly as
+/// the module derives its per-port plans, so the budget probe runs the
+/// same arithmetic attach enforces. Falls back to the global default
+/// when nothing steers yet (the staging state), so the probe still
+/// reports what the first canary step would install.
+pub fn vpp_steer_directions_from_config(config: &Config) -> Vec<VppSteerDirection> {
+    let mut global = VppSteerDirection::default();
+    let mut ports: Vec<(bool, Option<VppSteerDirection>)> = Vec::new();
     for m in &config.modules {
         if m.name != "vpp-offload" {
             continue;
         }
         for d in &m.directives {
-            if let ModuleDirective::VppSteerDirection(dir) = d {
-                return *dir;
+            match d {
+                ModuleDirective::VppSteerDirection(dir) => global = *dir,
+                ModuleDirective::VppPort {
+                    steer, direction, ..
+                } => ports.push((*steer, *direction)),
+                _ => {}
             }
         }
     }
-    VppSteerDirection::default()
+    let mut out: Vec<VppSteerDirection> = Vec::new();
+    for (steer, dir) in &ports {
+        if !steer {
+            continue;
+        }
+        let d = dir.unwrap_or(global);
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    if out.is_empty() {
+        out.push(global);
+    }
+    out
 }
 
 /// The fast-path allowlist, as the steering probe needs it.
@@ -217,7 +241,7 @@ pub struct VppProbeInputs<'a> {
     pub ports: &'a [String],
     pub workers: u32,
     pub binary: Option<&'a str>,
-    pub steer_direction: VppSteerDirection,
+    pub steer_directions: &'a [VppSteerDirection],
     pub steer_exempts: &'a [packetframe_common::config::Ipv4Prefix],
 }
 
@@ -256,7 +280,7 @@ pub fn probe_and_render(
             vpp.workers,
             vpp.binary,
             allowlist,
-            vpp.steer_direction,
+            vpp.steer_directions,
             vpp.steer_exempts,
         ) {
             report.capabilities.push(cap);

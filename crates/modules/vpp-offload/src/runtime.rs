@@ -397,7 +397,7 @@ pub trait Steering {
     /// Splitting it that way keeps one routine — `steer` — responsible
     /// for every rule that ever reaches the NIC, so a reconfigure cannot
     /// grow its own, subtly different, installation path.
-    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet);
+    fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>);
     /// How many ports the CONFIG asks to steer, whether or not any rule
     /// is installed.
     ///
@@ -446,7 +446,7 @@ impl Steering for SteeringUnavailable {
     fn installed(&self) -> Vec<(String, u32)> {
         Vec::new()
     }
-    fn retarget(&mut self, _ports: Vec<(String, u32)>, _plan: crate::steer::RuleSet) {}
+    fn retarget(&mut self, _targets: Vec<(String, u32, crate::steer::RuleSet)>) {}
 }
 
 /// Everything both trait views share.
@@ -1297,8 +1297,8 @@ impl Runtime {
     /// follow it with the supervisor event that reconciles the NIC, and
     /// the supervision loop is the only caller precisely so that the two
     /// cannot be separated.
-    pub fn retarget(&self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
-        self.core.borrow_mut().retarget(ports, plan);
+    pub fn retarget(&self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
+        self.core.borrow_mut().retarget(targets);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1747,8 +1747,8 @@ impl Core {
     /// `reconfigure` republishes status the moment it returns — so an
     /// operator who had just been told the steer was refused could read
     /// `steering healthy` in the same breath (review finding).
-    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
-        self.steering.retarget(ports, plan);
+    fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
+        self.steering.retarget(targets);
         self.last_steer_audit = None;
     }
 
@@ -3428,7 +3428,7 @@ mod tests {
         fn installed(&self) -> Vec<(String, u32)> {
             self.rules.clone()
         }
-        fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+        fn retarget(&mut self, _: Vec<(String, u32, crate::steer::RuleSet)>) {}
     }
 
     /// Every ledger the store was handed, in order.
@@ -3579,7 +3579,7 @@ mod tests {
             fn installed(&self) -> Vec<(String, u32)> {
                 vec![("eth4".into(), 1024), ("eth4".into(), 1025)]
             }
-            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+            fn retarget(&mut self, _: Vec<(String, u32, crate::steer::RuleSet)>) {}
         }
 
         let rt = Runtime::new(
@@ -3647,7 +3647,7 @@ mod tests {
             fn installed(&self) -> Vec<(String, u32)> {
                 vec![("eth4".into(), 1024)]
             }
-            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+            fn retarget(&mut self, _: Vec<(String, u32, crate::steer::RuleSet)>) {}
         }
 
         let rt = Runtime::new(
@@ -3667,7 +3667,7 @@ mod tests {
              would pass whether or not retarget invalidates anything"
         );
 
-        rt.retarget(vec![("eth4".into(), 0)], crate::steer::RuleSet::default());
+        rt.retarget(vec![("eth4".into(), 0, crate::steer::RuleSet::default())]);
         assert_eq!(
             rt.status().steer_missing,
             1,

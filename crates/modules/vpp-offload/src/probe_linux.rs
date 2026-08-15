@@ -16,7 +16,7 @@ pub(crate) fn run(
     workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
-    direction: packetframe_common::config::VppSteerDirection,
+    directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Vec<Capability> {
     let mut caps = Vec::with_capacity(5 + ports.len());
@@ -36,7 +36,7 @@ pub(crate) fn run(
     caps.push(probe_steering_budget(
         ports,
         allowlist,
-        direction,
+        directions,
         steer_exempts,
     ));
     caps
@@ -122,33 +122,60 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 fn probe_steering_budget(
     ports: &[String],
     allowlist: &[packetframe_common::fib::IpPrefix],
-    direction: packetframe_common::config::VppSteerDirection,
+    directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Capability {
-    use crate::steer::{McamBudget, RuleSet};
+    use crate::steer::{McamBudget, RuleAction, RuleSet};
 
     let budget = match McamBudget::for_ifaces(ports.iter().map(String::as_str)) {
         Ok(b) => b,
         Err(e) => return Capability::fail("vpp.steering.budget", e, false),
     };
     let free = budget.free.len();
-    // The same arithmetic attach enforces: diversions + the built-in
-    // exemptions + the operator's. A probe that omitted the exemptions
-    // would pass a config attach then refuses, two-plus slots short.
-    match RuleSet::plan(allowlist, steer_exempts, budget, direction) {
-        // Nothing to steer is a FAIL however it arose. The two ways there
-        // read very differently to an operator, so they are named
-        // separately — but neither may pass: a port that steers nothing
-        // diverts no traffic while every other line in this report, and
-        // the module's own health, says the offload is fine.
-        Ok(set) if set.rules.is_empty() => Capability::fail(
+    // One plan per distinct effective direction — the SAME derivation
+    // attach and reconfigure perform, so this probe cannot pass a
+    // config they refuse. The old single-direction form also reported
+    // "rules / 2 steerable prefixes", which was wrong everywhere
+    // except `both` with no exemptions: rule counts include the Keep
+    // rules, and src/dst plans carry one divert per prefix, not two.
+    // Counted from the rules' own actions now.
+    let mut details = Vec::with_capacity(directions.len());
+    let mut skipped_v6 = 0u64;
+    let mut any_rules = false;
+    for direction in directions {
+        match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction) {
+            Ok(set) => {
+                skipped_v6 = set.skipped_v6;
+                if !set.rules.is_empty() {
+                    any_rules = true;
+                }
+                let diverts = set
+                    .rules
+                    .iter()
+                    .filter(|r| r.action == RuleAction::Divert)
+                    .count();
+                details.push(format!(
+                    "direction {direction}: {} rule(s) ({diverts} divert + {} keep)",
+                    set.rules.len(),
+                    set.rules.len() - diverts,
+                ));
+            }
+            Err(e) => return Capability::fail("vpp.steering.budget", e, false),
+        }
+    }
+    // Nothing to steer is a FAIL however it arose. The two ways there
+    // read very differently to an operator, so they are named
+    // separately — but neither may pass: a port that steers nothing
+    // diverts no traffic while every other line in this report, and
+    // the module's own health, says the offload is fine.
+    if !any_rules {
+        return Capability::fail(
             "vpp.steering.budget",
-            if set.skipped_v6 > 0 {
+            if skipped_v6 > 0 {
                 format!(
-                    "none of the allowlist can be steered: all {} prefix(es) are IPv6, and \
-                     `ip6` ntuple is rejected by this NIC's AF (gate 0b round 4). The offload \
-                     would forward nothing while reporting healthy",
-                    set.skipped_v6
+                    "none of the allowlist can be steered: all {skipped_v6} prefix(es) are \
+                     IPv6, and `ip6` ntuple is rejected by this NIC's AF (gate 0b round 4). \
+                     The offload would forward nothing while reporting healthy"
                 )
             } else {
                 "the fast-path allowlist is empty, so there is nothing to steer. Steered \
@@ -157,27 +184,21 @@ fn probe_steering_budget(
                     .to_string()
             },
             false,
-        ),
-        Ok(set) => {
-            let detail = format!(
-                "{} rule(s) for {} steerable prefix(es); the NIC reports {} free slot(s){}",
-                set.rules.len(),
-                set.rules.len() / 2,
-                free,
-                if set.skipped_v6 > 0 {
-                    format!(
-                        "; {} IPv6 prefix(es) NOT steerable on this NIC and left on the \
-                         kernel path",
-                        set.skipped_v6
-                    )
-                } else {
-                    String::new()
-                }
-            );
-            Capability::pass("vpp.steering.budget", detail, false)
-        }
-        Err(e) => Capability::fail("vpp.steering.budget", e, false),
+        );
     }
+    let detail = format!(
+        "{}; the NIC reports {free} free slot(s){}",
+        details.join("; "),
+        if skipped_v6 > 0 {
+            format!(
+                "; {skipped_v6} IPv6 prefix(es) NOT steerable on this NIC and left on the \
+                 kernel path"
+            )
+        } else {
+            String::new()
+        }
+    );
+    Capability::pass("vpp.steering.budget", detail, false)
 }
 
 /// An SMMU registered in /sys/class/iommu is the difference between
