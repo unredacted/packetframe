@@ -53,6 +53,7 @@ running badly.
 - [Everyday inspection commands](#everyday-inspection-commands)
 - [The canary ladder](#the-canary-ladder)
 - [Rollback](#rollback)
+- [Bidirectional offload: local-route and direction dst](#bidirectional-offload-local-route-and-direction-dst)
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
@@ -467,6 +468,121 @@ If `fib-synced` shows the deferral persisting on a box that SHOULD
 release: check the feed session actually started (`BGP client
 connected` + at least one UPDATE in the log), then check the mirror
 count against the floor in the health text.
+
+## Bidirectional offload: local-route and direction dst
+
+The pieces that carry the offload from `steer-direction src` staging
+to both directions. Three config facts, then the surfaces that watch
+them.
+
+### local-route: VPP delivers a prefix instead of forwarding it
+
+```
+module vpp-offload
+  port eth4 cores 1 steer on vlans 88,1337
+  local-route 23.191.200.0/24 port eth4 vlan 1337
+```
+
+One line does three things at attach:
+
+1. **An attached route** for the prefix onto the port's dot1q subif —
+   `show ip fib 23.191.200.0/24` shows the subif adjacency, not a
+   drop. Installed outside the route ledger (module-owned topology,
+   like the loopback), so resyncs never withdraw it.
+2. **The neighbour mirror**: kernel neighbours on the backing bridge
+   (the `via` of the covering fast-path `local-prefix`) become VPP
+   static neighbours on the subif. VPP never ARPs — a host the kernel
+   has never resolved drops in VPP where the kernel would ARP-queue.
+   Service hosts are static; if one ever matters, ping it from the
+   router once.
+3. **Shadowing**: mirror routes INSIDE the prefix are skipped, at
+   resync and in deltas. The kernel tier delivers to bridge hosts
+   before its FIB lookup, so bird's view inside a local prefix (the
+   reference primary carries a service host route as `unreachable`)
+   describes what bird would do, not what the box does.
+   `packetframe_vpp_shadowed_routes` counts what is currently
+   suppressed — on the reference primary the expected value is
+   exactly its poisoned host route, and a JUMP in it is a mirror
+   change worth reading about.
+
+Validation refuses: a port the section does not declare, a vlan
+missing from the port's `vlans` list, a prefix outside every
+fast-path `local-prefix` (tier agreement — a failover must not change
+what is delivered), and overlapping declarations. Restart-only; the
+reload names it.
+
+### direction dst: steering inbound
+
+Per-port, because the bidirectional service edge is asymmetric by
+nature:
+
+```
+  port eth4 cores 1 steer on vlans 88,1337 direction src   # outbound rides VPP
+  port eth3 cores 1 steer on direction dst                 # inbound rides VPP
+```
+
+A dst rule diverts inbound INTO VPP, so `direction dst` (and the
+global `both` default) refuses to load unless every steerable local
+prefix is fully covered by `local-route` lines — an uncovered address
+would blackhole 100% of its inbound the moment the port steers (the
+w20 shape), and that is a load-time refusal, not a canary discovery.
+Pure transit needs no local-routes: dst-steered traffic for a
+non-local prefix forwards via the full table.
+
+Each direction gets its own rule plan; `packetframe feasibility`
+itemises them per direction (divert + keep counts against the free
+slots). The exemptions install on every steered port, so
+internet→gateway traffic stays kernel-side on the transit ports too.
+
+### The FDB tripwire
+
+`local-route` names THE port a VLAN's hosts sit behind. If a host
+moves behind another member of the same bridge, the kernel follows it
+and VPP does not — so a per-minute AF_BRIDGE scan compares the
+kernel's FDB against the declarations and degrades health with the
+host named:
+
+```
+fdb: degraded — the kernel bridge FDB contradicts local-route:
+  02:...:07 vlan 1337 learned on eth5 (local-route declares eth4)
+```
+
+`packetframe_vpp_fdb_misplaced` carries the count. Remedies, in
+order: move the host back; fix the declaration; or the topology has
+outgrown single-port delivery and needs per-host subif selection
+(B3 v2 — scoped, deliberately unbuilt until this fires).
+
+### Dashboards under-count steered traffic — where it went
+
+The moment a port steers, UniFi's port graphs (and anything else
+reading kernel netdev counters) drop by roughly the steered share:
+steered ingress is diverted to the VF before the PF counter
+increments, and VPP's egress leaves through the egress port's VF,
+which the PF counters never see. Measured on the primary (w25,
+2026-08-15): eth3's kernel tx fell to ~211 kB/s while `octeon3/0`
+carried ~261 MB/s — same wire, different ledger.
+
+The counters to trust while steered: `packetframe_vpp_*` gauges and
+`vppctl show interface` for the offloaded share; kernel counters for
+the exempt/kernel-side residual. Two-sample rate check:
+
+```sh
+vppctl -s /run/packetframe/vpp/api.sock.cli show interface \
+  | tr -d '\r' | awk '/^octeon/{i=$1} /tx bytes/{print i, $NF}'
+# wait 10s, run again; delta/10 = B/s per VPP interface
+```
+
+### The null-drop gauge
+
+`packetframe_vpp_null_drops` is VPP's own null-node counter, sampled
+over the binary API every 60 s (absent until the first sample, and
+after any read trouble — absent is "cannot read", never "zero").
+What it counts on the reference primary: replies to spoofed/bogon
+sources — traffic the kernel also dropped, just less visibly
+(~370 pps steady in w23/w24). The steady residual is
+correct-by-design; a CHANGE in its rate after a config or mirror
+change is the signal, and with local-routes in place a large step up
+usually means something local stopped being delivered.
 
 ## Triage by symptom
 
