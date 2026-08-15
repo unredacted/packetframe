@@ -352,49 +352,60 @@ fn main() -> ExitCode {
 }
 
 fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
-    let (bpffs_root, attach_ifaces, vpp_ports, vpp_workers, vpp_binary, allowlist, vpp_dir) =
-        match &config {
-            Some(path) => match Config::from_file(path) {
-                Ok(c) => {
-                    if let Err(e) = c.validate_interfaces() {
-                        eprintln!("config interface check failed: {e}");
-                        return ExitCode::from(EXIT_STARTUP_ERROR);
-                    }
-                    if let Err(e) = c.validate_vpp_offload() {
-                        eprintln!("vpp-offload config check failed: {e}");
-                        return ExitCode::from(EXIT_STARTUP_ERROR);
-                    }
-                    let ifaces = feasibility::attach_ifaces_from_config(&c);
-                    let vpp_ports = feasibility::vpp_ports_from_config(&c);
-                    let vpp_workers = feasibility::vpp_workers_from_config(&c);
-                    let vpp_binary = feasibility::vpp_binary_from_config(&c);
-                    let allowlist = feasibility::allowlist_from_config(&c);
-                    let vpp_dir = feasibility::vpp_steer_direction_from_config(&c);
-                    (
-                        c.global.bpffs_root,
-                        ifaces,
-                        vpp_ports,
-                        vpp_workers,
-                        vpp_binary,
-                        allowlist,
-                        vpp_dir,
-                    )
-                }
-                Err(e) => {
-                    eprintln!("config parse error: {e}");
+    let (
+        bpffs_root,
+        attach_ifaces,
+        vpp_ports,
+        vpp_workers,
+        vpp_binary,
+        allowlist,
+        vpp_dir,
+        vpp_exempts,
+    ) = match &config {
+        Some(path) => match Config::from_file(path) {
+            Ok(c) => {
+                if let Err(e) = c.validate_interfaces() {
+                    eprintln!("config interface check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);
                 }
-            },
-            None => (
-                std::path::PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
-                Vec::new(),
-                Vec::new(),
-                0,
-                None,
-                Vec::new(),
-                Default::default(),
-            ),
-        };
+                if let Err(e) = c.validate_vpp_offload() {
+                    eprintln!("vpp-offload config check failed: {e}");
+                    return ExitCode::from(EXIT_STARTUP_ERROR);
+                }
+                let ifaces = feasibility::attach_ifaces_from_config(&c);
+                let vpp_ports = feasibility::vpp_ports_from_config(&c);
+                let vpp_workers = feasibility::vpp_workers_from_config(&c);
+                let vpp_binary = feasibility::vpp_binary_from_config(&c);
+                let allowlist = feasibility::allowlist_from_config(&c);
+                let vpp_dir = feasibility::vpp_steer_direction_from_config(&c);
+                let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
+                (
+                    c.global.bpffs_root,
+                    ifaces,
+                    vpp_ports,
+                    vpp_workers,
+                    vpp_binary,
+                    allowlist,
+                    vpp_dir,
+                    vpp_exempts,
+                )
+            }
+            Err(e) => {
+                eprintln!("config parse error: {e}");
+                return ExitCode::from(EXIT_STARTUP_ERROR);
+            }
+        },
+        None => (
+            std::path::PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
+            Vec::new(),
+            Vec::new(),
+            0,
+            None,
+            Vec::new(),
+            Default::default(),
+            Vec::new(),
+        ),
+    };
 
     let report = feasibility::probe_and_render(
         &bpffs_root,
@@ -404,6 +415,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             workers: vpp_workers,
             binary: vpp_binary.as_deref(),
             steer_direction: vpp_dir,
+            steer_exempts: &vpp_exempts,
         },
         &allowlist,
         human,

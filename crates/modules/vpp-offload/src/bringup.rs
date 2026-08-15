@@ -357,7 +357,12 @@ pub fn bring_up(
                 allowlist.len() - steerable
             ));
         }
-        RuleSet::plan(allowlist, budget.clone(), cfg.steer_direction)?
+        RuleSet::plan(
+            allowlist,
+            &cfg.steer_exempts,
+            budget.clone(),
+            cfg.steer_direction,
+        )?
     } else {
         RuleSet::default()
     };
@@ -1148,6 +1153,7 @@ mod completeness_gate_tests {
             expected_routes: 1_600_000,
             hugepages: None,
             require_table_complete: require,
+            steer_exempts: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

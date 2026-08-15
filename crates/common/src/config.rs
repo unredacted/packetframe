@@ -204,6 +204,20 @@ pub enum ModuleDirective {
     /// it is also what sources ICMP, so PMTUD's frag-needed is only
     /// correct if an operator chose it deliberately.
     VppLoopbackAddress(Ipv4Prefix),
+    /// `steer-exempt <ip>/<len>` — a destination whose traffic stays on
+    /// the kernel path while steering is on, installed as a
+    /// higher-priority MCAM rule delivering to the PF. Repeatable.
+    ///
+    /// For the addresses that terminate ON this router: the gateway
+    /// IPs of steered service VLANs above all. Without them,
+    /// src-steered traffic destined to the router — monitoring
+    /// replies, unicast DHCP renewals, management from the service
+    /// net — matches the steer rules and dies in VPP, which has no
+    /// local delivery. Measured on the primary (w23, 2026-08-14):
+    /// 110,917 such packets blackholed in five steered minutes.
+    /// Broadcast and multicast exemptions are built in and need no
+    /// directive.
+    VppSteerExempt(Ipv4Prefix),
     /// `require-table-complete on|off` — whether a first steer waits
     /// for the route mirror to be confirmed converged against bird.
     ///
@@ -1171,9 +1185,31 @@ impl Config {
                 0,
                 "module vpp-offload has `port` lines but no `loopback-address`; member ports \
                  are unnumbered to a loopback and forward nothing without it — and do so \
-                 while reporting healthy. Add e.g. `loopback-address 198.51.100.1/32` \
-                 (an address this router owns; it also sources ICMP, so PMTUD depends on it)",
+                 while reporting healthy. Add e.g. `loopback-address 198.51.100.254/32` \
+                 (announced but UNASSIGNED: routable so ICMP/PMTUD works, held by no \
+                 kernel interface — VPP answers ARP for it, and a live address starts a \
+                 responder war; attach refuses one)",
             ));
+        }
+
+        // Duplicate exemptions are refused for the same reason
+        // duplicate ports are: each consumes an MCAM slot from a
+        // 16-per-port budget, so a pasted-twice line silently halves
+        // the room the refusal arithmetic reports.
+        let mut exempts: Vec<&Ipv4Prefix> = Vec::new();
+        for d in &vpp.directives {
+            if let ModuleDirective::VppSteerExempt(p) = d {
+                if exempts.iter().any(|e| **e == *p) {
+                    return Err(ConfigError::parse(
+                        0,
+                        format!(
+                            "duplicate `steer-exempt {}/{}` in module vpp-offload",
+                            p.addr, p.prefix_len
+                        ),
+                    ));
+                }
+                exempts.push(p);
+            }
         }
 
         let Some(fp) = fast_path else {
@@ -2070,6 +2106,12 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .parse()
                 .map_err(|e: String| format!("loopback-address: {e}"))?;
             Ok(ModuleDirective::VppLoopbackAddress(p))
+        }),
+        "steer-exempt" => parse_single_arg(line, rest, "steer-exempt", |t| {
+            let p: Ipv4Prefix = t
+                .parse()
+                .map_err(|e: String| format!("steer-exempt: {e}"))?;
+            Ok(ModuleDirective::VppSteerExempt(p))
         }),
         "require-table-complete" => {
             parse_single_arg(line, rest, "require-table-complete", |t| match t {
@@ -3179,6 +3221,39 @@ module fast-path
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
         }
+    }
+
+    /// `steer-exempt` exists because of w23 on the primary
+    /// (2026-08-14): 110,917 locally-terminating packets blackholed in
+    /// five steered minutes — traffic whose destination is the router
+    /// itself has to stay on the kernel path.
+    #[test]
+    fn steer_exempt_parses_and_duplicates_are_refused() {
+        let s = "module vpp-offload\n  steer-exempt 23.191.200.1/32\n  steer-exempt 10.88.1.1/32\n";
+        let c = Config::parse(s).unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppSteerExempt(p) => {
+                assert_eq!(p.addr, std::net::Ipv4Addr::new(23, 191, 200, 1));
+                assert_eq!(p.prefix_len, 32);
+            }
+            other => panic!("expected VppSteerExempt, got {other:?}"),
+        }
+        assert!(Config::parse("module vpp-offload\n  steer-exempt not-an-ip\n").is_err());
+
+        // The duplicate refusal needs a full valid section around it,
+        // because validate_vpp_offload runs after parse.
+        let dup = "module fast-path\n  attach eth4 generic\n  allow-prefix 10.0.0.0/8\n\
+                   module vpp-offload\n  loopback-address 198.51.100.254/32\n\
+                   port eth4 cores 1 steer off\n\
+                   steer-exempt 10.88.1.1/32\n  steer-exempt 10.88.1.1/32\n";
+        let e = Config::parse(dup)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(
+            format!("{e}").contains("duplicate `steer-exempt 10.88.1.1/32`"),
+            "{e}"
+        );
     }
 
     /// The `vlans` tail exists because of w20 on the primary

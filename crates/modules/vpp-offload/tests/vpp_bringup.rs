@@ -164,6 +164,7 @@ impl Host {
             vpp_binary: Some(self.vpp_binary.to_string_lossy().into_owned()),
             expected_routes: 1_600_000,
             hugepages: None,
+            steer_exempts: vec![],
             // These fixtures have no route authority to compare
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.

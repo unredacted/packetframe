@@ -253,7 +253,14 @@ pub fn mask_for(prefix_len: u8) -> u32 {
 fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
     let mut fs = RxFlowSpec {
         flow_type: IP_USER_FLOW,
-        ring_cookie: ring_cookie(vf_index),
+        // Divert → the VF's cookie. Keep → 0, which the driver encodes
+        // as NIX_RX_ACTIONOP_UCAST toward PF queue 0 — the kernel path.
+        // The exemption rules' whole job is that second arm; see
+        // `RuleAction::Keep` for the measured traffic it rescues.
+        ring_cookie: match rule.action {
+            crate::steer::RuleAction::Divert => ring_cookie(vf_index),
+            crate::steer::RuleAction::Keep => 0,
+        },
         location: rule.location,
         ..RxFlowSpec::default()
     };
@@ -687,6 +694,22 @@ pub(super) mod sys {
         })
     }
 
+    /// Every `(iface, loc, ring_cookie)` the NIC holds — the cookie is
+    /// what separates a diversion (VF) from an exemption (kernel), so
+    /// the exemption tests assert on it.
+    pub(crate) fn rules_with_cookies() -> Vec<(String, u32, u64)> {
+        NIC.with(|n| {
+            let mut v: Vec<(String, u32, u64)> = n
+                .borrow()
+                .rules
+                .iter()
+                .map(|((i, l), fs)| (i.clone(), *l, fs.ring_cookie))
+                .collect();
+            v.sort();
+            v
+        })
+    }
+
     pub(super) fn ethtool(iface: &str, req: &mut Rxnfc) -> Result<(), std::io::Error> {
         NIC.with(|n| {
             let mut nic = n.borrow_mut();
@@ -973,9 +996,42 @@ impl NtupleSteering {
             Some(vf) if ring_cookie_vf(got.ring_cookie) == ring_cookie_vf(ring_cookie(vf)) => {
                 Ok(Occupant::IntoOurVf)
             }
+            // A cookie whose VF field is zero is a kernel-delivery rule
+            // — which is what our own EXEMPTIONS are. Cookie alone
+            // cannot separate ours from a stranger's, so the stored
+            // spec is compared against the exemption this ledger's plan
+            // put at this slot: a match (same match fields, same mask,
+            // same cookie) is ours to delete, mask-for-mask. Without
+            // this arm every `Keep` rule read as `Elsewhere` and
+            // survived unsteer — gateway traffic pinned to PF queue 0
+            // by rules nothing would ever remove (caught by
+            // `exemptions_install_with_cookie_zero_and_clear_on_unsteer`
+            // the day the exemptions were written).
+            Some(vf)
+                if ring_cookie_vf(got.ring_cookie) == 0
+                    && self
+                        .planned_keep_at(iface, loc)
+                        .is_some_and(|rule| audit_matches(&flow_spec(&rule, vf), &got)) =>
+            {
+                Ok(Occupant::IntoOurVf)
+            }
             Some(_) => Ok(Occupant::Elsewhere(got.ring_cookie)),
             None => Ok(Occupant::Unattributable),
         }
+    }
+
+    /// The `Keep` rule the outgoing install placed at this slot, if any
+    /// — the spec [`Self::occupant`] compares a cookie-zero occupant
+    /// against before claiming it.
+    fn planned_keep_at(&self, iface: &str, loc: u32) -> Option<crate::steer::SteerRule> {
+        let (ports, plan) = self.installed_as.as_ref()?;
+        if !ports.iter().any(|(i, _)| i == iface) {
+            return None;
+        }
+        plan.rules
+            .iter()
+            .find(|r| r.location == loc && r.action == crate::steer::RuleAction::Keep)
+            .copied()
     }
 
     /// Remove `victims`, **keeping whatever would not come out**.
@@ -1678,6 +1734,7 @@ mod tests {
             prefix_len: 24,
             side,
             location: loc,
+            action: crate::steer::RuleAction::Divert,
         }
     }
 
@@ -1834,10 +1891,11 @@ mod tests {
                     prefix_len: 24,
                 },
             ],
+            &[],
             small,
             VppSteerDirection::Both,
         )
-        .expect_err("six rules cannot fit four slots");
+        .expect_err("eight rules cannot fit four slots");
         assert!(e.contains("only 4 slot(s) are free"), "{e}");
 
         // Rules already in the table are excluded, not overwritten —
@@ -2073,8 +2131,14 @@ mod tests {
         use crate::runtime::Steering as _;
         sys::reset();
 
-        // The previous daemon: installs at the top of the table.
-        let mut before = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 18, 0, 0]]));
+        // The previous daemon: a FULL install — diversions at the top
+        // of the table, exemptions at the bottom — because that is what
+        // any real predecessor leaves behind, and the audit must
+        // account for inherited keeps as readily as inherited diverts.
+        let mut before = steering(
+            vec![("eth0".into(), 0)],
+            plan_with_keeps(&[[198, 18, 0, 0]]),
+        );
         before.steer().expect("first run installs");
         let inherited = before.installed();
         assert!(!inherited.is_empty());
@@ -2086,7 +2150,7 @@ mod tests {
             addr: [198, 18, 0, 0],
             prefix_len: 24,
         }];
-        let fresh_plan = RuleSet::plan(&allow, budget, VppSteerDirection::Both).expect("fits");
+        let fresh_plan = RuleSet::plan(&allow, &[], budget, VppSteerDirection::Both).expect("fits");
         for r in &fresh_plan.rules {
             assert!(
                 !inherited.iter().any(|(_, l)| *l == r.location),
@@ -3058,8 +3122,8 @@ mod tests {
             addr: [23, 191, 200, 0],
             prefix_len: 24,
         }];
-        let plan =
-            RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both).expect("fits");
+        let plan = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
+            .expect("fits");
         let mut s = steering(vec![("eth0".into(), 0)], plan);
         assert!(
             s.installed().is_empty(),
@@ -3100,7 +3164,20 @@ mod tests {
         NtupleSteering::new(ports.clone(), ports, plan)
     }
 
+    /// The DIVERSION half of a plan only. These tests assert reconcile
+    /// mechanics slot-by-slot, and the built-in exemptions ride the
+    /// same ledger through the same code paths — their flow-through
+    /// has its own test (`exemptions_install_with_cookie_zero_and_
+    /// clear_on_unsteer`), so carrying them here would only smear two
+    /// extra slots across every assertion below.
     fn plan_for(prefixes: &[[u8; 4]]) -> RuleSet {
+        let mut set = plan_with_keeps(prefixes);
+        set.rules
+            .retain(|r| r.action == crate::steer::RuleAction::Divert);
+        set
+    }
+
+    fn plan_with_keeps(prefixes: &[[u8; 4]]) -> RuleSet {
         let allow: Vec<IpPrefix> = prefixes
             .iter()
             .map(|a| IpPrefix::V4 {
@@ -3108,7 +3185,51 @@ mod tests {
                 prefix_len: 24,
             })
             .collect();
-        RuleSet::plan(&allow, McamBudget::default(), VppSteerDirection::Both).expect("fits")
+        RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both).expect("fits")
+    }
+
+    /// The exemptions' whole journey: planned at the LOW slots, encoded
+    /// with `ring_cookie` 0 (PF queue 0 — the kernel), installed by the
+    /// same steer that installs the diversions, and gone after unsteer.
+    /// w23 measured why they exist: 110,917 locally-terminating packets
+    /// blackholed in five steered minutes without them.
+    #[test]
+    fn exemptions_install_with_cookie_zero_and_clear_on_unsteer() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_with_keeps(&[[23, 191, 200, 0]]);
+        let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
+        s.steer().expect("steer");
+
+        let nic = sys::rules_with_cookies();
+        assert_eq!(
+            nic.len(),
+            plan.rules.len(),
+            "every planned rule lands: {nic:?}"
+        );
+        for r in &plan.rules {
+            let stored = nic
+                .iter()
+                .find(|(_, loc, _)| *loc == r.location)
+                .unwrap_or_else(|| panic!("rule at loc {} missing from NIC", r.location));
+            let want_cookie = match r.action {
+                crate::steer::RuleAction::Divert => ring_cookie(0),
+                crate::steer::RuleAction::Keep => 0,
+            };
+            assert_eq!(
+                stored.2, want_cookie,
+                "loc {}: an exemption must land on the kernel (cookie 0), a diversion on \
+                 the VF — swapped cookies are the w22 capture with extra steps",
+                r.location
+            );
+        }
+
+        s.unsteer().expect("unsteer");
+        assert!(
+            sys::rules().is_empty(),
+            "exemptions are torn down with the diversions — a Keep rule left behind \
+             pins gateway traffic to PF queue 0 forever"
+        );
     }
 
     /// The happy path, which had never executed anywhere.

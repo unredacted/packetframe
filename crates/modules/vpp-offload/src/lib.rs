@@ -108,6 +108,13 @@ pub struct VppOffloadConfig {
     /// check and forwards nothing, which is the failure this whole
     /// module is built to make impossible.
     pub loopback_address: Option<packetframe_common::config::Ipv4Prefix>,
+    /// Destinations that stay on the kernel path while steering is on
+    /// (`steer-exempt`, repeatable) — installed as higher-priority
+    /// MCAM rules toward the PF. Broadcast and multicast are built in;
+    /// these are the operator's additions, the router's own service
+    /// addresses above all. Hot-reloadable like the allowlist: the
+    /// plan is rebuilt on every reconfigure.
+    pub steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
     /// Which packet side the MCAM rules match. Hot-reloadable: the
     /// steering target is rebuilt from config on every reconfigure and
     /// `steer` is a reconcile, so a change installs/removes exactly
@@ -150,6 +157,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
+                ModuleDirective::VppSteerExempt(p) => out.steer_exempts.push(*p),
                 ModuleDirective::VppSteerDirection(d) => out.steer_direction = *d,
                 _ => {}
             }
@@ -533,7 +541,7 @@ fn steering_target(
         });
     }
     let budget = steer::McamBudget::for_ifaces(ports.iter().map(|(iface, _)| iface.as_str()))?;
-    let plan = steer::RuleSet::plan(allowlist, budget, cfg.steer_direction)?;
+    let plan = steer::RuleSet::plan(allowlist, &cfg.steer_exempts, budget, cfg.steer_direction)?;
     // `steer on` with nothing steerable is refused for the same reason
     // `bring_up` refuses it: steering would divert nothing while every
     // surface reported it on.
@@ -1177,14 +1185,29 @@ pub fn run_feasibility_probes(
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
     direction: packetframe_common::config::VppSteerDirection,
+    steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        probe_linux::run(ports, workers, vpp_binary, allowlist, direction)
+        probe_linux::run(
+            ports,
+            workers,
+            vpp_binary,
+            allowlist,
+            direction,
+            steer_exempts,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ports, workers, vpp_binary, allowlist, direction);
+        let _ = (
+            ports,
+            workers,
+            vpp_binary,
+            allowlist,
+            direction,
+            steer_exempts,
+        );
         Vec::new()
     }
 }
@@ -1559,6 +1582,7 @@ mod tests {
             expected_routes: routes,
             hugepages: None,
             require_table_complete: true,
+            steer_exempts: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -1958,7 +1982,8 @@ mod tests {
         // Steering ON is refused, and names the true requirement.
         let on = cfg(&[("eth4", 1, true)], 1_600_000);
         let e = steering_target(&on, &allow).expect_err("cannot fit");
-        assert!(e.contains("600 MCAM rule(s)"), "{e}");
+        // 600 diversions plus the two built-in kernel exemptions.
+        assert!(e.contains("602 MCAM rule(s)"), "{e}");
 
         // Steering OFF succeeds with the same allowlist. This is the
         // assertion that matters: the rollback path must not consult a

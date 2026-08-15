@@ -348,6 +348,25 @@ hold) as traffic moves — it must never rise on a steer. VPP's own
 interface counters (`show interface` via the CLI socket) turning over
 at line rate on the member VF is the positive half of the same check.
 
+**Declare `steer-exempt` for every locally-terminating address before
+any steer that outlives a short canary.** A `src` steer diverts by
+source alone, so traffic from the service prefix **to the router
+itself** — the box's own monitoring replies, unicast DHCP renewals,
+management SSH from the service net — is diverted into a dataplane
+with no local delivery and dies at `null-node` while every gauge stays
+green. Measured on the primary (2026-08-14, w23): 110,917 packets in
+five steered minutes, plus 3,200 multicast frames (IGMP among them)
+RPF-dropped away from the kernel bridge's snooping. The exemptions are
+higher-priority MCAM rules that deliver matches to the kernel instead:
+broadcast and multicast are built in; each gateway IP of a steered
+VLAN needs a `steer-exempt` line. Budget math per steered port on this
+hardware: 16 slots = (steerable v4 prefixes × directions) diversions
++ 2 built-ins + your `steer-exempt` entries; the refusal message
+itemises exactly this. While steered, `ethtool -n <port>` shows the
+exemptions at the LOW locations and the diversions at the high ones —
+lower location is higher MCAM priority, which is what makes an
+exemption win.
+
 **Rung 2..N — one port at a time**, with a soak between each. There is
 no prize for going faster; the failure you are looking for is the one
 that only shows up under real traffic.
@@ -1192,6 +1211,7 @@ Be precise about this when reasoning about an incident.
 | First steer on the primary (eth4, `src`, trunk, no subifs) | MCAM+VF+VPP rx flawless at ~72 kpps; **8.7M frames punted in 2 min, zero forwarded** | 2026-08-14 w20. Tagged ingress, no dot1q subif → punt at ethernet-input. The `vlans` port directive exists because of this window. |
 | Second steer (subifs present, VF answering to the port's own MAC) | subif classified 7.19M frames in 90 s (**punt-at-VLAN-layer gone**); 7.17M then punted on dmac — hosts address switch0's `…:c7`, the VF held eth4's `…:ca` | 2026-08-14 w21. Auto-aborted by the harness's 90 s blackhole guard. The secondary-MAC acceptance exists because of this window. |
 | Third steer (bridge MAC as the member's PRIMARY) | VPP forwarded **~500M packets in 27 min**, split by best path (266M eth3, 236k eth2), zero loop, no drops on the forwarding path — **but ~300 kpps arrived from ATTACH, with the lever off** | 2026-08-14 w22. Forwarding quality proven; staging isolation broken. The primary MAC is a hardware filter on this NIC, so it must stay the port's own — acceptance belongs in secondary addresses. Undeclared trunk VLANs (`unknown vlan` 180k) were blackholed for the window. |
+| Fourth steer (secondary MAC + `.254` loopback — the clean pass) | Leak gate ~50 pps noise (lever off); 95.9M rx / 95.8M tx at +300 s; ARP replies **zero**; steered minutes ~0.1% remote loss vs 4–7%/min on the unsteered rung-0 stretch of the same window | 2026-08-14 w23. Rung 1 validated; **the steered path beat the XDP path by >10× under coexistence**. Residual: 110,917 locally-terminating packets blackholed in 5 min — the number `steer-exempt` exists to zero. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**
