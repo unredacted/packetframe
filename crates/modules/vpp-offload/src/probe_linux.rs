@@ -132,6 +132,17 @@ fn probe_steering_budget(
         Err(e) => return Capability::fail("vpp.steering.budget", e, false),
     };
     let free = budget.free.len();
+    // No directions handed in = plan the global default, exactly as
+    // the CLI extractor falls back when nothing steers yet. Without
+    // this an empty slice would skip planning entirely and misreport
+    // every allowlist as empty — caught by this probe's own test the
+    // day the parameter became a list.
+    let default_dir = [packetframe_common::config::VppSteerDirection::default()];
+    let directions = if directions.is_empty() {
+        &default_dir[..]
+    } else {
+        directions
+    };
     // One plan per distinct effective direction — the SAME derivation
     // attach and reconfigure perform, so this probe cannot pass a
     // config they refuse. The old single-direction form also reported
