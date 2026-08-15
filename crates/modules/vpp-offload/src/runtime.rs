@@ -527,6 +527,16 @@ struct Core {
     /// Same real-clock pacing argument as `last_steer_audit`: a
     /// metrics poll, not a supervision deadline.
     last_null_sample: Option<std::time::Instant>,
+    /// The bridge-FDB tripwire, installed by bringup when local-routes
+    /// exist (Linux only). `None` everywhere else — tests, non-Linux,
+    /// configs with no local delivery — and silent there on purpose,
+    /// like the rx-mode kick: a missing scan is visible by its absent
+    /// log lines, not impersonated by a stub.
+    fdb_watch: Option<Box<dyn crate::fdb::FdbWatch>>,
+    last_fdb_scan: Option<std::time::Instant>,
+    /// The last completed scan's findings; kept across a failed scan
+    /// (an unreadable kernel is not evidence the hosts moved back).
+    fdb_misplaced: Vec<String>,
     steer_missing: usize,
     /// Rules still steering a port the config asks to leave unsteered,
     /// as of the last audit. Its own count because it points the other
@@ -1233,6 +1243,9 @@ impl Runtime {
                 rx_kick: Box::new(NoKick),
                 last_steer_audit: None,
                 last_null_sample: None,
+                fdb_watch: None,
+                last_fdb_scan: None,
+                fdb_misplaced: Vec::new(),
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1292,6 +1305,13 @@ impl Runtime {
     /// Install the kernel rx-mode kick. The attach wiring installs the
     /// ioctl-backed [`AllmultiKick`] on Linux; everything else keeps
     /// [`NoKick`]. See [`RxModeKick`] for why this exists.
+    /// Install the bridge-FDB tripwire. Same wiring rule as the
+    /// rx-mode kick: bringup installs the real one on Linux when
+    /// local-routes exist, and nothing pretends elsewhere.
+    pub fn fdb_watch(&self, w: Box<dyn crate::fdb::FdbWatch>) {
+        self.core.borrow_mut().fdb_watch = Some(w);
+    }
+
     pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
         self.core.borrow_mut().rx_kick = k;
     }
@@ -1449,6 +1469,31 @@ impl Runtime {
                 c.last_null_sample = Some(now);
                 c.engine.sample_null_drops();
             }
+            let due = c
+                .last_fdb_scan
+                .is_none_or(|t| now.duration_since(t) >= FDB_SCAN_EVERY);
+            if due && c.fdb_watch.is_some() {
+                c.last_fdb_scan = Some(now);
+                let result = c.fdb_watch.as_mut().expect("checked above").misplaced();
+                match result {
+                    Ok(found) => {
+                        if !found.is_empty() && c.fdb_misplaced != found {
+                            tracing::warn!(
+                                hosts = ?found,
+                                "service-VLAN host(s) are behind a different member port \
+                                 than their local-route declares; VPP is delivering their \
+                                 prefix to the declared port. Move the host back, fix the \
+                                 declaration, or this topology needs per-host delivery \
+                                 (B3 v2)"
+                            );
+                        }
+                        c.fdb_misplaced = found;
+                    }
+                    // Keep the previous verdict: an unreadable kernel
+                    // is not evidence the hosts moved back.
+                    Err(e) => tracing::debug!(error = %e, "bridge-FDB scan failed"),
+                }
+            }
         }
         let c = self.core.borrow();
         // ONE reading, used for both the verdict and the question of
@@ -1486,6 +1531,7 @@ impl Runtime {
             steer_audit_error: c.steer_audit_error.clone(),
             shadowed_routes: c.engine.shadowed_routes(),
             null_drops: c.engine.null_drops(),
+            fdb_misplaced: c.fdb_misplaced.clone(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1529,6 +1575,12 @@ const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 /// invisible next to the liveness ping while still giving Prometheus a
 /// usable rate.
 const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
+
+/// How often the bridge-FDB tripwire scans for hosts behind a port
+/// other than their `local-route` declaration. One netlink dump; a
+/// moved host is a provisioning-scale event, so a minute of latency
+/// on the tripwire costs nothing.
+const FDB_SCAN_EVERY: Duration = Duration::from_secs(60);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -1646,6 +1698,10 @@ pub struct RuntimeStatus {
     pub shadowed_routes: u64,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
+    /// Hosts the bridge FDB places behind a different port than their
+    /// `local-route` declares, one line each. Empty = the tripwire is
+    /// quiet (or not installed).
+    pub fdb_misplaced: Vec<String>,
 }
 
 impl Core {

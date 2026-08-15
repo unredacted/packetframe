@@ -870,6 +870,12 @@ fn finish(
     // identity store and the release seam through an `Rc`.
     let local_routes = local_routes.to_vec();
     let factory: LoopFactory = Box::new(move || {
+        // The FDB tripwire's declarations, cloned out before the engine
+        // consumes the resolved set.
+        let fdb_declared: Vec<(u16, String)> = local_routes
+            .iter()
+            .map(|lr| (lr.vlan, lr.port.clone()))
+            .collect();
         let engine = ConvergenceEngine::new(
             api_socket_path,
             port_attach,
@@ -908,6 +914,18 @@ fn finish(
         // log is itself the diagnostic.
         #[cfg(target_os = "linux")]
         runtime.rx_mode_kick(Box::new(crate::runtime::AllmultiKick));
+        // The B3 v1 tripwire: installed exactly when local-routes exist,
+        // because it scans for hosts contradicting THEIR declarations —
+        // no declarations, nothing to contradict. Linux-only like the
+        // kick, and silent when absent for the same reason.
+        #[cfg(target_os = "linux")]
+        if !fdb_declared.is_empty() {
+            runtime.fdb_watch(Box::new(crate::fdb::KernelFdbWatch {
+                declared: fdb_declared,
+            }));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = fdb_declared;
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is

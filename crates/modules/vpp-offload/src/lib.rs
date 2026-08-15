@@ -58,6 +58,7 @@ pub mod cores;
 pub mod driver;
 pub mod engine;
 pub mod executor;
+pub mod fdb;
 pub mod feed;
 pub mod fib_sync;
 pub mod liveness;

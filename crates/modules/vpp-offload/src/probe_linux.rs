@@ -140,7 +140,7 @@ fn probe_steering_budget(
     // rules, and src/dst plans carry one divert per prefix, not two.
     // Counted from the rules' own actions now.
     let mut details = Vec::with_capacity(directions.len());
-    let mut skipped_v6 = 0u64;
+    let mut skipped_v6 = 0u32;
     let mut any_rules = false;
     for direction in directions {
         match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction) {
