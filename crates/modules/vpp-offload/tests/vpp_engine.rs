@@ -1605,3 +1605,30 @@ fn a_stale_install_inside_the_local_prefix_is_withdrawn() {
         "the stale in-prefix install must be withdrawn from VPP: {deletes:?}"
     );
 }
+
+/// The null-drop sample end to end: `cli_inband` over the real socket,
+/// VPP's text parsed, the total cached — and absent again once the
+/// process the counters lived in is gone.
+#[test]
+fn null_drops_sample_over_cli_inband() {
+    let fake = Fake::start_behaving(
+        "null-drops",
+        Behaviour {
+            show_errors: "   Count            Node            Reason        Severity\n\
+                          117015         null-node       blackholed packets   error\n\
+                          52755       ethernet-input     unknown vlan         error\n",
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    assert_eq!(e.null_drops(), None, "absent until sampled");
+    e.sample_null_drops();
+    assert_eq!(e.null_drops(), Some(117_015));
+    e.on_process_gone();
+    assert_eq!(
+        e.null_drops(),
+        None,
+        "the counters died with the process; a stale total would read as quiet"
+    );
+}

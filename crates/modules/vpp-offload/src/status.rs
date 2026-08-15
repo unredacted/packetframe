@@ -348,6 +348,14 @@ pub struct StatusSnapshot {
     /// route). Surfaced so a mirror change inside a local prefix is
     /// visible rather than silently absorbed.
     pub shadowed_routes: u64,
+    /// Cumulative null-node drops from VPP's own error counters,
+    /// sampled over `cli_inband`. `None` until a sample succeeds —
+    /// absent rather than 0, so a broken read path cannot impersonate
+    /// a quiet dataplane. What it counts on the reference primary:
+    /// replies to spoofed/bogon sources, traffic the kernel also
+    /// dropped, just less visibly (~370 pps in w23/w24). A CHANGE in
+    /// its rate is the signal; the steady residual is designed.
+    pub null_drops: Option<u64>,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -401,6 +409,7 @@ impl StatusSnapshot {
             // ledger to audit against.
             SteerAudit::default(),
             0,
+            None,
         )
     }
 
@@ -427,6 +436,7 @@ impl StatusSnapshot {
         steer_configured: bool,
         audit: SteerAudit,
         shadowed_routes: u64,
+        null_drops: Option<u64>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -451,6 +461,7 @@ impl StatusSnapshot {
             drain_error,
             source_backlog,
             shadowed_routes,
+            null_drops,
         }
     }
 
@@ -1451,6 +1462,15 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             out,
             "packetframe_vpp_routes{{module=\"{module}\",state=\"{label}\"}} {value}"
         );
+    }
+
+    if let Some(n) = snap.null_drops {
+        gauge(
+            &mut out,
+            "packetframe_vpp_null_drops",
+            "cumulative VPP null-node drops (undeliverable traffic; absent until sampled)",
+        );
+        let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
     }
 
     gauge(
@@ -3206,6 +3226,28 @@ mod tests {
         // The boolean is still emitted — "not verified" is a fact worth
         // scraping.
         assert!(m.contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"));
+    }
+
+    /// Same convention for the null-drop counter: absent until a
+    /// sample succeeded, so a broken read path cannot impersonate a
+    /// quiet dataplane — and present with the sampled total after.
+    #[test]
+    fn the_null_drop_gauge_is_absent_until_sampled() {
+        let mut s = snap_of(
+            &Supervisor::new(),
+            &ledger_with(0, 0, 0),
+            ApiHealth::NoProcess,
+            FibSync::NeverVerified,
+            Vec::new(),
+        );
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_null_drops"), "{m}");
+        s.null_drops = Some(117_015);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_null_drops{module=\"vpp-offload\"} 117015"),
+            "{m}"
+        );
     }
 
     #[test]

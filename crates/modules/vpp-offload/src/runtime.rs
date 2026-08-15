@@ -523,6 +523,10 @@ struct Core {
     /// When the NIC was last audited against the steering ledger, and
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
+    /// When the null-drop counter was last sampled over `cli_inband`.
+    /// Same real-clock pacing argument as `last_steer_audit`: a
+    /// metrics poll, not a supervision deadline.
+    last_null_sample: Option<std::time::Instant>,
     steer_missing: usize,
     /// Rules still steering a port the config asks to leave unsteered,
     /// as of the last audit. Its own count because it points the other
@@ -1228,6 +1232,7 @@ impl Runtime {
                 fresh_hold: None,
                 rx_kick: Box::new(NoKick),
                 last_steer_audit: None,
+                last_null_sample: None,
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1434,6 +1439,17 @@ impl Runtime {
                 }
             }
         }
+        {
+            let mut c = self.core.borrow_mut();
+            let now = std::time::Instant::now();
+            let due = c
+                .last_null_sample
+                .is_none_or(|t| now.duration_since(t) >= NULL_DROPS_EVERY);
+            if due && c.engine.is_connected() {
+                c.last_null_sample = Some(now);
+                c.engine.sample_null_drops();
+            }
+        }
         let c = self.core.borrow();
         // ONE reading, used for both the verdict and the question of
         // whether it has been seen before: asking twice could pair a
@@ -1469,6 +1485,7 @@ impl Runtime {
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
             shadowed_routes: c.engine.shadowed_routes(),
+            null_drops: c.engine.null_drops(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1504,6 +1521,14 @@ impl Runtime {
 /// hardware limit — on the shadow it went two minutes and would have
 /// gone indefinitely.
 const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
+
+/// How often to read VPP's error counters for the null-drop gauge.
+///
+/// One `cli_inband "show errors"` round trip on the API socket, which
+/// shares VPP's main thread with the route batches — 60 s keeps it
+/// invisible next to the liveness ping while still giving Prometheus a
+/// usable rate.
+const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -1619,6 +1644,8 @@ pub struct RuntimeStatus {
     /// Mirror prefixes a `local-route` is currently suppressing. See
     /// [`crate::engine::ConvergenceEngine::shadowed_routes`].
     pub shadowed_routes: u64,
+    /// Cumulative null-node drops as last sampled, absent until read.
+    pub null_drops: Option<u64>,
 }
 
 impl Core {

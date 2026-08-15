@@ -142,6 +142,20 @@ const MESSAGES: &[&str] = &[
     "dev_create_port_if_reply",
     "dev_remove_port_if",
     "dev_remove_port_if_reply",
+    //   The one CLI-text message, for METRICS ONLY — never forwarding
+    //   decisions. VPP keeps error counters in the stats segment,
+    //   which has no binary-API reader and whose shared-memory parser
+    //   this module deliberately does not build; `cli_inband "show
+    //   errors"` is the one sanctioned way to read them over the
+    //   socket. The consumer is the null-node drop gauge (user
+    //   decision 2026-08-15: a visibility surface for the ~370 pps
+    //   undeliverable-reply residual ships BEFORE always-on), and its
+    //   parse failure degrades the gauge to absent, never the
+    //   dataplane. verify.rs records the same message as owed for
+    //   `show ip fib summary`; this vendors vlib.api.json and pays
+    //   that debt's entry fee.
+    "cli_inband",
+    "cli_inband_reply",
 ];
 
 const FILES: &[&str] = &[
@@ -155,6 +169,7 @@ const FILES: &[&str] = &[
     "ethernet_types",
     "interface_types",
     "mfib_types",
+    "vlib",
 ];
 
 /// One field of a message or composite type.

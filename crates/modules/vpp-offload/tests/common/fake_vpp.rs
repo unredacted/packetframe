@@ -30,7 +30,7 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
-    Address, AddressUnion, ControlPingReply, CreateLoopbackReply, CreateVlanSubif,
+    Address, AddressUnion, CliInbandReply, ControlPingReply, CreateLoopbackReply, CreateVlanSubif,
     CreateVlanSubifReply, DevAttachReply, DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor,
     IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump, IpRoute,
     IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
@@ -126,6 +126,10 @@ pub struct Fake {
 /// How the fake misbehaves.
 #[derive(Clone, Copy, Default)]
 pub struct Behaviour {
+    /// What `cli_inband "show errors"` answers. Empty is a legitimate
+    /// VPP answer (no counters yet), so the default keeps the
+    /// null-drop gauge absent-or-zero without special-casing.
+    pub show_errors: &'static str,
     /// Drop the connection after this many route ops.
     pub hangup_after: Option<usize>,
     /// Reject this many *deletes* with a non-zero retval before
@@ -601,6 +605,17 @@ fn serve(
                 SwInterfaceSetUnnumberedReply {
                     context: ctx,
                     retval: 0,
+                }
+                .encode(&mut out);
+                write_frame(sock, &out);
+                continue;
+            }
+            "cli_inband" => {
+                let mut out = reply_head("cli_inband_reply");
+                CliInbandReply {
+                    context: ctx,
+                    retval: 0,
+                    reply: behaviour.show_errors.to_string(),
                 }
                 .encode(&mut out);
                 write_frame(sock, &out);

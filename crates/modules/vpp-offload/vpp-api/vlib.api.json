@@ -1,0 +1,530 @@
+{
+    "module": "vlib",
+    "types": [
+        [
+            "thread_data",
+            [
+                "u32",
+                "id"
+            ],
+            [
+                "string",
+                "name",
+                64
+            ],
+            [
+                "string",
+                "type",
+                64
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "u32",
+                "cpu_id"
+            ],
+            [
+                "u32",
+                "core"
+            ],
+            [
+                "u32",
+                "cpu_socket"
+            ],
+            {
+                "comment": "/** \\brief thread data\n    @param id - thread index\n    @param name - thread name i.e. vpp_main or vpp_wk_0\n    @param type - thread type i.e. workers or stats\n    @param pid - thread Process Id\n    @param cpu_id - thread pinned to cpu.\n    \"CPUs or Logical cores are the number of physical cores times\n    the number of threads that can run on each core through\n    the use of hyperthreading.\" (from unix.stackexchange.com)\n    @param core - thread pinned to actual physical core.\n    @param cpu_socket - thread is running on which cpu socket.\n*/"
+            }
+        ]
+    ],
+    "messages": [
+        [
+            "cli",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u64",
+                "cmd_in_shmem"
+            ],
+            {
+                "crc": "0x23bfbfff",
+                "options": {},
+                "comment": "/** \\brief Process a vpe parser cli string request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param cmd_in_shmem - pointer to cli command string\n*/"
+            }
+        ],
+        [
+            "cli_inband",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "cmd",
+                0
+            ],
+            {
+                "crc": "0xf8377302",
+                "options": {}
+            }
+        ],
+        [
+            "cli_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u64",
+                "reply_in_shmem"
+            ],
+            {
+                "crc": "0x06d68297",
+                "options": {},
+                "comment": "/** \\brief vpe parser cli string response\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for request\n    @param reply_in_shmem - Reply string from cli processing if any\n*/"
+            }
+        ],
+        [
+            "cli_inband_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "string",
+                "reply",
+                0
+            ],
+            {
+                "crc": "0x05879051",
+                "options": {}
+            }
+        ],
+        [
+            "get_node_index",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "node_name",
+                64
+            ],
+            {
+                "crc": "0xf1984c64",
+                "options": {},
+                "comment": "/** \\brief Get node index using name request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param node_name[] - name of the node\n*/"
+            }
+        ],
+        [
+            "get_node_index_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "node_index"
+            ],
+            {
+                "crc": "0xa8600b89",
+                "options": {},
+                "comment": "/** \\brief Get node index using name request\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for the request\n    @param node_index - index of the desired node if found, else ~0\n*/"
+            }
+        ],
+        [
+            "add_node_next",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "node_name",
+                64
+            ],
+            [
+                "string",
+                "next_name",
+                64
+            ],
+            {
+                "crc": "0x2457116d",
+                "options": {},
+                "comment": "/** \\brief Set the next node for a given node request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param node_name[] - node to add the next node to\n    @param next_name[] - node to add as the next node\n*/"
+            }
+        ],
+        [
+            "add_node_next_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "next_index"
+            ],
+            {
+                "crc": "0x2ed75f32",
+                "options": {},
+                "comment": "/** \\brief IP Set the next node for a given node response\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for the add next node request\n    @param next_index - the index of the next node if success, else ~0\n*/"
+            }
+        ],
+        [
+            "show_threads",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief show_threads display the information about vpp\n    threads running on system along with their process id,\n    cpu id, physical core and cpu socket.\n*/"
+            }
+        ],
+        [
+            "show_threads_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "vl_api_thread_data_t",
+                "thread_data",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xefd78e83",
+                "options": {},
+                "comment": "/** \\brief show_threads_reply\n    @param context - returned sender context, to match reply w/ request\n    @param retval - return code\n    @param count - number of threads in thread_data array\n    @param thread_data - array of thread data\n*/"
+            }
+        ],
+        [
+            "get_node_graph",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "get_node_graph_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u64",
+                "reply_in_shmem"
+            ],
+            {
+                "crc": "0x06d68297",
+                "options": {}
+            }
+        ],
+        [
+            "get_next_index",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "node_name",
+                64
+            ],
+            [
+                "string",
+                "next_name",
+                64
+            ],
+            {
+                "crc": "0x2457116d",
+                "options": {},
+                "comment": "/** \\brief Query relative index via node names\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param node_name - name of node to find relative index from\n    @param next_name - next node from node_name to find relative index of\n*/"
+            }
+        ],
+        [
+            "get_next_index_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "next_index"
+            ],
+            {
+                "crc": "0x2ed75f32",
+                "options": {},
+                "comment": "/** \\brief Reply for get next node index\n    @param context - sender context which was passed in the request\n    @param retval - return value\n    @param next_index - index of the next_node\n*/"
+            }
+        ],
+        [
+            "get_f64_endian_value",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "f64",
+                "f64_one",
+                {
+                    "default": 1.0
+                }
+            ],
+            {
+                "crc": "0x809fcd44",
+                "options": {},
+                "comment": "/** \\brief f64 types are not standardized across the wire. Sense wire format in each direction by sending the f64 value 1.0.\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param f64_one - The constant of 1.0.  If you send a different value, expect an rv=VNET_API_ERROR_API_ENDIAN_FAILED.\n*/"
+            }
+        ],
+        [
+            "get_f64_endian_value_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "retval"
+            ],
+            [
+                "f64",
+                "f64_one_result"
+            ],
+            {
+                "crc": "0x7e02e404",
+                "options": {},
+                "comment": "/** \\brief get_f64_endian_value reply message\n    @param context - sender context which was passed in the request\n    @param retval - return value - VNET_API_ERROR_API_ENDIAN_FAILED if f64_one != 1.0\n    @param f64_one_result - The value of 'f64 1.0'\n*/"
+            }
+        ],
+        [
+            "get_f64_increment_by_one",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "f64",
+                "f64_value",
+                {
+                    "default": 1.0
+                }
+            ],
+            {
+                "crc": "0xb64f027e",
+                "options": {},
+                "comment": "/** \\brief Verify f64 wire format by sending a value and receiving the value + 1.0\n    @param client_index - opaque cookie to identify the sender.\n    @param context - sender context, to match reply w/ request.\n    @param f64_value - The value you want to test.  Default: 1.0.\n*/"
+            }
+        ],
+        [
+            "get_f64_increment_by_one_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "retval"
+            ],
+            [
+                "f64",
+                "f64_value"
+            ],
+            {
+                "crc": "0xd25dbaa3",
+                "options": {},
+                "comment": "/** \\brief get_f64_increment_by_one reply\n    @param client_index - opaque cookie to identify the sender.\n    @param context - sender context, to match reply w/ request.\n    @param f64_value - The input f64_value incremented by 1.0.\n*/"
+            }
+        ]
+    ],
+    "unions": [],
+    "enums": [],
+    "enumflags": [],
+    "services": {
+        "cli": {
+            "reply": "cli_reply"
+        },
+        "cli_inband": {
+            "reply": "cli_inband_reply"
+        },
+        "get_node_index": {
+            "reply": "get_node_index_reply"
+        },
+        "add_node_next": {
+            "reply": "add_node_next_reply"
+        },
+        "show_threads": {
+            "reply": "show_threads_reply"
+        },
+        "get_node_graph": {
+            "reply": "get_node_graph_reply"
+        },
+        "get_next_index": {
+            "reply": "get_next_index_reply"
+        },
+        "get_f64_endian_value": {
+            "reply": "get_f64_endian_value_reply"
+        },
+        "get_f64_increment_by_one": {
+            "reply": "get_f64_increment_by_one_reply"
+        }
+    },
+    "options": {
+        "version": "1.0.0"
+    },
+    "aliases": {},
+    "vl_api_version": "0x9a9e84e4",
+    "imports": [],
+    "counters": [],
+    "paths": []
+}

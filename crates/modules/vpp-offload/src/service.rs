@@ -1094,6 +1094,7 @@ fn run_loop(
                 unreadable: rs.steer_audit_error.clone(),
             },
             rs.shadowed_routes,
+            rs.null_drops,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

@@ -47,10 +47,10 @@ use crate::sink::{Capacity, NexthopMap, PendingMap, RouteLedger, SinkCounts};
 use crate::status::PortLink;
 use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
 use crate::vpp_api::generated::{
-    FibPath, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails,
-    IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteDump,
-    IpTable, ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE, FIB_API_PATH_NH_PROTO_IP4,
-    FIB_API_PATH_TYPE_NORMAL,
+    CliInband, CliInbandReply, FibPath, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
+    IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
+    IpRouteDump, IpTable, ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE,
+    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -403,6 +403,22 @@ pub enum EngineError {
     },
 }
 
+/// Sum the `Count` column of `show errors` rows whose node is
+/// `null-node` — VPP's "matched a drop route / nothing to deliver to"
+/// counter, the residual the w23/w24 windows measured at ~370 pps of
+/// replies to spoofed and bogon sources. Column positions only
+/// (count, node, reason...), so a reason with spaces parses fine; any
+/// line that does not shape up is skipped rather than guessed at.
+pub(crate) fn parse_null_drops(text: &str) -> u64 {
+    text.lines()
+        .filter_map(|line| {
+            let mut tok = line.split_whitespace();
+            let count = tok.next()?.parse::<u64>().ok()?;
+            (tok.next()? == "null-node").then_some(count)
+        })
+        .sum()
+}
+
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -542,6 +558,15 @@ pub struct ConvergenceEngine {
     last_api_error: Option<String>,
     api_incompatible: bool,
 
+    /// Cumulative null-node drops as VPP last reported them over
+    /// `cli_inband "show errors"`. `None` until the first successful
+    /// sample and after any trouble — absent rather than 0, like the
+    /// freshness gauges, because a gauge that reads 0 while the read
+    /// path is broken hides exactly the change it exists to surface.
+    /// Metrics only; nothing here feeds a forwarding or supervision
+    /// decision.
+    null_drops: Option<u64>,
+
     /// Advanced once per verify so each pass samples a different set.
     ///
     /// Counter-derived rather than drawn from the OS, for the reason
@@ -585,6 +610,7 @@ impl ConvergenceEngine {
             last_verify: None,
             #[cfg(test)]
             test_dead_members: None,
+            null_drops: None,
             verify_seed: 0,
         }
     }
@@ -638,6 +664,44 @@ impl ConvergenceEngine {
     /// How many mirror prefixes a `local-route` is currently shadowing.
     pub fn shadowed_routes(&self) -> u64 {
         self.shadowed.len() as u64
+    }
+
+    /// The last sampled null-node drop total, if any.
+    pub fn null_drops(&self) -> Option<u64> {
+        self.null_drops
+    }
+
+    /// Sample VPP's error counters and cache the null-node total.
+    ///
+    /// Metrics only, so every failure degrades the gauge to absent and
+    /// none escalates: a counter read must not be able to restart a
+    /// forwarding VPP. A transport error still drops the socket — the
+    /// reply may be partly read, and every other path here refuses to
+    /// leave a poisoned stream looking healthy to `api_ready`.
+    pub fn sample_null_drops(&mut self) {
+        self.arm_timeout();
+        let Some(t) = self.transport.as_mut() else {
+            self.null_drops = None;
+            return;
+        };
+        match t.request::<CliInband, CliInbandReply>(CliInband {
+            context: 0,
+            cmd: "show errors".into(),
+        }) {
+            Ok(r) if r.retval == 0 => self.null_drops = Some(parse_null_drops(&r.reply)),
+            Ok(r) => {
+                tracing::debug!(
+                    retval = r.retval,
+                    "`show errors` refused; the null-drop gauge goes absent"
+                );
+                self.null_drops = None;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "`show errors` failed; the null-drop gauge goes absent");
+                self.disconnect();
+                self.null_drops = None;
+            }
+        }
     }
 
     pub fn counts(&self) -> SinkCounts {
@@ -1763,6 +1827,9 @@ impl ConvergenceEngine {
     pub fn on_process_gone(&mut self) {
         self.disconnect();
         self.attached.clear();
+        // The counters died with the process; a stale total would read
+        // as "no new drops" across a restart that reset it to zero.
+        self.null_drops = None;
         self.port_index = PortIndex::default();
         // The state file's recorded indices belong to the dead instance
         // too. Keeping them meant the replacement process was handed
@@ -2231,6 +2298,21 @@ mod tests {
             crate::liveness::PING_BUDGET,
             "a steered resync forwards the whole time and cannot afford it"
         );
+    }
+
+    /// The `show errors` parser: column-positional, null-node rows
+    /// summed, everything malformed skipped rather than guessed at.
+    /// The sample text is the w24 forensics shape.
+    #[test]
+    fn null_drop_parsing_sums_null_node_rows_only() {
+        let text =
+            "   Count                    Node                  Reason               Severity\n\
+                    117015               null-node             blackholed packets         error\n\
+                    12                   null-node             blackholed packets         error\n\
+                    52755             ethernet-input           unknown vlan               error\n\
+                    not-a-count          null-node             garbage                    error\n";
+        assert_eq!(parse_null_drops(text), 117_027);
+        assert_eq!(parse_null_drops(""), 0);
     }
 
     /// Link state must come from an observation. An earlier version

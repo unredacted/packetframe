@@ -61,6 +61,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "dev_create_port_if_reply", crc: "0x243c2374", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "dev_remove_port_if", crc: "0x529cb13f", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "dev_remove_port_if_reply", crc: "0xc8d74455", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "cli_inband", crc: "0xf8377302", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "cli_inband_reply", crc: "0x05879051", context_offset: 2, client_index_prefix: false },
 ];
 
 // enum address_family : u8
@@ -2271,6 +2273,81 @@ impl Decode for DevRemovePortIfReply {
 impl Message for DevRemovePortIfReply {
     const NAME: &'static str = "dev_remove_port_if_reply";
     const CRC: &'static str = "0xc8d74455";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `cli_inband` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CliInband {
+    pub context: u32,
+    pub cmd: String,
+}
+
+impl Encode for CliInband {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.cmd.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.cmd.as_bytes());
+    }
+}
+
+impl Decode for CliInband {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let cmd = d.string_var()?;
+        Ok(Self {
+            context,
+            cmd,
+        })
+    }
+}
+
+impl Message for CliInband {
+    const NAME: &'static str = "cli_inband";
+    const CRC: &'static str = "0xf8377302";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `cli_inband_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CliInbandReply {
+    pub context: u32,
+    pub retval: i32,
+    pub reply: String,
+}
+
+impl Encode for CliInbandReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+        buf.extend_from_slice(&(self.reply.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.reply.as_bytes());
+    }
+}
+
+impl Decode for CliInbandReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        let reply = d.string_var()?;
+        Ok(Self {
+            context,
+            retval,
+            reply,
+        })
+    }
+}
+
+impl Message for CliInbandReply {
+    const NAME: &'static str = "cli_inband_reply";
+    const CRC: &'static str = "0x05879051";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }
