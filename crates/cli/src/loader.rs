@@ -325,6 +325,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 // from that section. The loader is the only place that
                 // sees both.
                 m.set_allowlist(allowlist.clone());
+                // The `local-route` ↔ `local-prefix` join — the kernel
+                // device each mirrored neighbour set comes from. Only
+                // the loader sees both sections; the module refuses to
+                // attach if config promises local routes it was never
+                // handed.
+                match crate::feasibility::vpp_local_routes_from_config(&config) {
+                    Ok(lr) => m.set_local_routes(lr),
+                    Err(e) => return Err(RunError::Startup(e)),
+                }
                 if let Some(c) = &completeness {
                     m.set_completeness(c.clone());
                 }
@@ -1694,7 +1703,6 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
         flatten_steer_rules, group_steer_rules, ResourceState,
     };
     use packetframe_vpp_offload::runtime::{Steering as _, TERM_GRACE};
-    use packetframe_vpp_offload::steer::RuleSet;
 
     let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
         return Ok(()); // nothing was ever acquired
@@ -1740,7 +1748,7 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
             .iter()
             .map(|p| (p.iface.clone(), 0u32))
             .collect();
-        let mut steering = NtupleSteering::new(members, Vec::new(), RuleSet::default());
+        let mut steering = NtupleSteering::new(members, Vec::new());
         steering.adopt_installed(recorded);
         if let Err(e) = steering.unsteer() {
             // Write back what is STILL in the NIC before refusing. The rules

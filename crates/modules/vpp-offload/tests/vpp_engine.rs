@@ -1349,3 +1349,286 @@ fn the_neighbours_adj_fib_is_never_adopted_or_withdrawn() {
         "no withdrawal may reach VPP, least of all the adj-fib: {deletes:?}"
     );
 }
+
+// ------------------------------------------------------------------
+// B1: local delivery. A `local-route` produces three engine behaviours
+// — an attached route onto the subif at attach, shadowing of the
+// mirror's view inside the prefix (resync AND deltas), and bridge
+// neighbours mirrored onto the subif index. Forwarding is w26's job on
+// hardware; what these prove is that the right messages, and ONLY the
+// right messages, reach the wire.
+
+use fake_vpp::SUBIF_BASE;
+use packetframe_vpp_offload::LocalRoute;
+
+fn local_route() -> LocalRoute {
+    LocalRoute {
+        prefix: packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(23, 191, 200, 0),
+            prefix_len: 24,
+        },
+        port: "eth4".into(),
+        vlan: 1337,
+        kernel_dev: "br1337".into(),
+    }
+}
+
+/// A prefix inside the local-route's footprint.
+fn svc(last: u8, len: u8) -> IpPrefix {
+    IpPrefix::V4 {
+        addr: [23, 191, 200, last],
+        prefix_len: len,
+    }
+}
+
+fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
+    ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            vlans: vec![1337],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_local_routes(vec![local_route()])
+}
+
+/// The attached route goes out at attach, onto the SUBIF's index — a
+/// path on the parent would transmit untagged and die on the trunk —
+/// and the mirror's view inside the prefix never reaches the wire.
+#[test]
+fn a_local_route_installs_attached_and_shadows_the_mirror() {
+    let fake = Fake::start("local-route");
+    let mut e = engine_with_local_route(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+
+    let at_attach: Vec<WireRoute> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        at_attach.len(),
+        1,
+        "exactly the attached route: {at_attach:?}"
+    );
+    let r = &at_attach[0];
+    assert!(r.is_add);
+    assert_eq!((r.addr, r.len), ([23, 191, 200, 0], 24));
+    assert_eq!(
+        r.path_indices,
+        vec![SUBIF_BASE],
+        "the attached route must land on the subif, not the parent"
+    );
+
+    // The mirror carries the poisoned host route (bird's `unreachable`
+    // /32, the reference primary's shape) plus three transit routes.
+    let m = Mirror {
+        routes: vec![svc(7, 32), v4(0, 0), v4(0, 1), v4(0, 2)],
+    };
+    let plan = e.begin_resync(&m);
+    assert_eq!(plan.upserts, 3);
+    assert_eq!(plan.shadowed, 1);
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 3);
+    assert_eq!(e.shadowed_routes(), 1);
+    let after: Vec<WireRoute> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        after.iter().all(|r| r.addr != [23, 191, 200, 7]),
+        "the shadowed host route must never reach the wire: {after:?}"
+    );
+}
+
+/// Kernel neighbours on the backing bridge become static neighbours on
+/// the subif — the mapping `local-route` registers is what turns the
+/// device name the feed reports into the subif's own index.
+#[test]
+fn a_bridge_neighbour_mirrors_onto_the_subif() {
+    struct BridgeNeigh;
+    impl RouteSource for BridgeNeigh {
+        fn for_each_route(&self, _visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(IpAddr::V4(Ipv4Addr::new(23, 191, 200, 7)), "br1337", MAC);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let fake = Fake::start("bridge-neigh");
+    let mut e = engine_with_local_route(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&BridgeNeigh);
+    e.program_neighbours(&BridgeNeigh).expect("neighbours");
+
+    let neighbours: Vec<(u32, [u8; 6], bool)> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Neighbour {
+                sw_if_index,
+                mac,
+                is_add,
+                ..
+            } => Some((sw_if_index, mac, is_add)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        neighbours
+            .iter()
+            .any(|&(idx, mac, add)| idx == SUBIF_BASE && mac == MAC && add),
+        "the bridge host's neighbour must be programmed on the subif index: {neighbours:?}"
+    );
+}
+
+/// The delta door shadows exactly like the resync door — w-series
+/// history says every filter with two entrances eventually takes a
+/// finding through the second one.
+#[test]
+fn the_delta_path_shadows_local_prefix_routes_too() {
+    use std::cell::RefCell;
+    struct Deltas(RefCell<Vec<packetframe_vpp_offload::engine::RouteChange>>);
+    impl RouteSource for Deltas {
+        fn for_each_route(&self, _visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, _visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+        fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+            packetframe_vpp_offload::engine::SourceChanges {
+                routes: self.0.borrow_mut().drain(..).collect(),
+                neighbours: Vec::new(),
+            }
+        }
+        fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+            self.0.borrow_mut().extend(changes.routes);
+        }
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let fake = Fake::start("delta-shadow");
+    let mut e = engine_with_local_route(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+
+    let src = Deltas(RefCell::new(vec![
+        (svc(9, 32), Some(vec![nh()])),
+        (v4(1, 0), Some(vec![nh()])),
+    ]));
+    let n = e.apply_changes(&src, 100).expect("apply");
+    assert_eq!(n, 2);
+    assert_eq!(e.shadowed_routes(), 1, "the in-prefix delta is suppressed");
+    assert_eq!(
+        e.pending().len(),
+        1,
+        "only the transit route may reach the pending map"
+    );
+
+    // A withdrawal of the shadowed prefix leaves the count, not a
+    // stale entry.
+    src.0.borrow_mut().push((svc(9, 32), None));
+    e.apply_changes(&src, 100).expect("apply withdraw");
+    assert_eq!(e.shadowed_routes(), 0);
+}
+
+/// A stale install INSIDE the local prefix — a pre-local-route run's
+/// leftover, arriving via adoption — is withdrawn by the resync diff:
+/// shadowed prefixes are deliberately absent from `seen`, so the
+/// ledger-driven withdrawal loop is what cleans VPP.
+#[test]
+fn a_stale_install_inside_the_local_prefix_is_withdrawn() {
+    let fake = Fake::start_behaving(
+        "stale-shadowed",
+        Behaviour {
+            existing_routes: &[([23, 191, 200, 7], 32, ASSIGNED_INDEX, true)],
+            ..Default::default()
+        },
+    );
+    let mut e = engine_with_local_route(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let adopted = e.adopt_vpp_fib().expect("adopt");
+    assert_eq!(adopted, 1, "the stale route looks self-installed");
+
+    // The mirror still carries it (bird does not stop advertising just
+    // because we started shadowing) — and it must STILL be withdrawn.
+    let m = Mirror {
+        routes: vec![svc(7, 32)],
+    };
+    let plan = e.begin_resync(&m);
+    assert_eq!(plan.shadowed, 1);
+    assert_eq!(plan.withdrawals, 1);
+    drain_to_empty(&mut e);
+    let deletes: Vec<WireRoute> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) if !r.is_add => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        deletes.iter().any(|r| r.addr == [23, 191, 200, 7]),
+        "the stale in-prefix install must be withdrawn from VPP: {deletes:?}"
+    );
+}
+
+/// The null-drop sample end to end: `cli_inband` over the real socket,
+/// VPP's text parsed, the total cached — and absent again once the
+/// process the counters lived in is gone.
+#[test]
+fn null_drops_sample_over_cli_inband() {
+    let fake = Fake::start_behaving(
+        "null-drops",
+        Behaviour {
+            show_errors: "   Count            Node            Reason        Severity\n\
+                          117015         null-node       blackholed packets   error\n\
+                          52755       ethernet-input     unknown vlan         error\n",
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    assert_eq!(e.null_drops(), None, "absent until sampled");
+    e.sample_null_drops();
+    assert_eq!(e.null_drops(), Some(117_015));
+    e.on_process_gone();
+    assert_eq!(
+        e.null_drops(),
+        None,
+        "the counters died with the process; a stale total would read as quiet"
+    );
+}

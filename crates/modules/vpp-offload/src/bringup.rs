@@ -277,6 +277,7 @@ fn completeness_gate(
 /// On any failure after acquisition, everything acquired is released
 /// before returning — a failed attach must leave the box as it found it,
 /// or say precisely what it could not hand back.
+#[allow(clippy::too_many_arguments)]
 pub fn bring_up(
     cfg: &VppOffloadConfig,
     paths: &AttachPaths,
@@ -285,6 +286,7 @@ pub fn bring_up(
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     budget: &McamBudget,
+    local_routes: &[crate::LocalRoute],
 ) -> Result<Attached, String> {
     // `require-table-complete on` with nothing publishing completeness
     // is refused at attach rather than discovered at the first canary
@@ -340,8 +342,8 @@ pub fn bring_up(
     // make an allowlist of more than eight v4 prefixes refuse to *attach*
     // — on a config whose ports are all `steer off`, where no rule would
     // ever be installed and the refusal decides nothing.
-    let wants_steer = cfg.ports.iter().any(|(_, _, steer, _)| *steer);
-    let steer_plan = if wants_steer {
+    let wants_steer = cfg.ports.iter().any(|(_, _, steer, _, _)| *steer);
+    if wants_steer {
         // An allowlist with nothing steerable in it is a config error,
         // and settling that needs no NIC — so it is settled BEFORE the
         // table query. Otherwise the operator's answer is whatever the
@@ -357,27 +359,38 @@ pub fn bring_up(
                 allowlist.len() - steerable
             ));
         }
-        RuleSet::plan(
-            allowlist,
-            &cfg.steer_exempts,
-            budget.clone(),
-            cfg.steer_direction,
-        )?
-    } else {
-        RuleSet::default()
-    };
+    }
 
     // Only the ports the operator asked to steer. `steer off` is the
     // designed staging state and the rollback landing zone, so a port
     // left off must get no rules at all — not rules that happen to be
     // unused. VF 0 because `acquire` creates exactly one per PF and
-    // reads it back through `virtfn0`.
-    let steer_ports: Vec<(String, u32)> = cfg
-        .ports
-        .iter()
-        .filter(|(_, _, steer, _)| *steer)
-        .map(|(iface, _, _, _)| (iface.clone(), 0u32))
-        .collect();
+    // reads it back through `virtfn0`. One planned rule set per
+    // DISTINCT effective direction (per-port `direction` falling back
+    // to the global), all drawn from the shared free-slot intersection
+    // — the same derivation `steering_target` performs on reconfigure,
+    // and it must stay the same arithmetic or attach and reload would
+    // disagree about what fits.
+    let mut steer_plans: Vec<(packetframe_common::config::VppSteerDirection, RuleSet)> = Vec::new();
+    let mut steer_targets: Vec<(String, u32, RuleSet)> = Vec::new();
+    for (iface, _, steer, _, dir) in &cfg.ports {
+        if !steer {
+            continue;
+        }
+        let d = dir.unwrap_or(cfg.steer_direction);
+        if !steer_plans.iter().any(|(pd, _)| *pd == d) {
+            steer_plans.push((
+                d,
+                RuleSet::plan(allowlist, &cfg.steer_exempts, budget.clone(), d)?,
+            ));
+        }
+        let plan = steer_plans
+            .iter()
+            .find(|(pd, _)| *pd == d)
+            .map(|(_, p)| p.clone())
+            .expect("planned above");
+        steer_targets.push((iface.clone(), 0u32, plan));
+    }
     // Every member port, unfiltered, so removal can attribute a
     // location's occupant on a port this config leaves unsteered. That
     // is not a hypothetical: a restart whose config turned a port off
@@ -388,9 +401,9 @@ pub fn bring_up(
     let member_ports: Vec<(String, u32)> = cfg
         .ports
         .iter()
-        .map(|(iface, _, _, _)| (iface.clone(), 0u32))
+        .map(|(iface, _, _, _, _)| (iface.clone(), 0u32))
         .collect();
-    let steering = NtupleSteering::new(member_ports, steer_ports, steer_plan);
+    let steering = NtupleSteering::new(member_ports, steer_targets);
 
     let workers = cfg.total_workers();
     let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;
@@ -404,7 +417,7 @@ pub fn bring_up(
     // management ssh dropped, birdc past its budget, and VPP itself
     // starved into a supervisor restart loop. Still pure/read-only —
     // a refused config must cost no sysfs writes.
-    let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _, _)| i.clone()).collect();
+    let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _, _, _)| i.clone()).collect();
     let mut vpp_cores = vec![core_map.main];
     vpp_cores.extend(&core_map.workers);
     let conflicts = cores::nic_irq_conflicts(
@@ -497,7 +510,7 @@ pub fn bring_up(
     let ports: Vec<(String, u16)> = cfg
         .ports
         .iter()
-        .map(|(iface, cores, _, _)| (iface.clone(), *cores))
+        .map(|(iface, cores, _, _, _)| (iface.clone(), *cores))
         .collect();
     // Mandatory, and checked in the pure phase so a config that cannot
     // forward costs no VF and no hugepage reservation.
@@ -527,7 +540,7 @@ pub fn bring_up(
     let port_vlans: Vec<(String, Vec<u16>)> = cfg
         .ports
         .iter()
-        .map(|(iface, _, _, vlans)| (iface.clone(), vlans.clone()))
+        .map(|(iface, _, _, vlans, _)| (iface.clone(), vlans.clone()))
         .collect();
     match finish(
         paths,
@@ -542,6 +555,7 @@ pub fn bring_up(
         feed_session,
         loopback,
         &port_vlans,
+        local_routes,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -614,6 +628,7 @@ fn finish(
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     loopback: packetframe_common::config::Ipv4Prefix,
     port_vlans: &[(String, Vec<u16>)],
+    local_routes: &[crate::LocalRoute],
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -853,7 +868,14 @@ fn finish(
     // (see `service`), which is also why the resource owner is built in
     // here rather than passed in: it shares one record between the
     // identity store and the release seam through an `Rc`.
+    let local_routes = local_routes.to_vec();
     let factory: LoopFactory = Box::new(move || {
+        // The FDB tripwire's declarations, cloned out before the engine
+        // consumes the resolved set.
+        let fdb_declared: Vec<(u16, String)> = local_routes
+            .iter()
+            .map(|lr| (lr.vlan, lr.port.clone()))
+            .collect();
         let engine = ConvergenceEngine::new(
             api_socket_path,
             port_attach,
@@ -862,7 +884,8 @@ fn finish(
             FamilyPolicy::V4Only,
             loopback,
         )
-        .with_recorded_indices(recorded);
+        .with_recorded_indices(recorded)
+        .with_local_routes(local_routes);
         // Counted before the record moves into the owner: the log line
         // below needs it, and reaching for it afterwards is what the
         // borrow checker just refused.
@@ -891,6 +914,18 @@ fn finish(
         // log is itself the diagnostic.
         #[cfg(target_os = "linux")]
         runtime.rx_mode_kick(Box::new(crate::runtime::AllmultiKick));
+        // The B3 v1 tripwire: installed exactly when local-routes exist,
+        // because it scans for hosts contradicting THEIR declarations —
+        // no declarations, nothing to contradict. Linux-only like the
+        // kick, and silent when absent for the same reason.
+        #[cfg(target_os = "linux")]
+        if !fdb_declared.is_empty() {
+            runtime.fdb_watch(Box::new(crate::fdb::KernelFdbWatch {
+                declared: fdb_declared,
+            }));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = fdb_declared;
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is
@@ -1148,12 +1183,13 @@ mod completeness_gate_tests {
 
     fn cfg(require: bool) -> VppOffloadConfig {
         VppOffloadConfig {
-            ports: vec![("eth1".into(), 1, false, vec![])],
+            ports: vec![("eth1".into(), 1, false, vec![], None)],
             vpp_binary: None,
             expected_routes: 1_600_000,
             hugepages: None,
             require_table_complete: require,
             steer_exempts: vec![],
+            local_routes: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

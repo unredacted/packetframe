@@ -359,7 +359,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         vpp_workers,
         vpp_binary,
         allowlist,
-        vpp_dir,
+        vpp_dirs,
         vpp_exempts,
     ) = match &config {
         Some(path) => match Config::from_file(path) {
@@ -377,7 +377,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 let vpp_workers = feasibility::vpp_workers_from_config(&c);
                 let vpp_binary = feasibility::vpp_binary_from_config(&c);
                 let allowlist = feasibility::allowlist_from_config(&c);
-                let vpp_dir = feasibility::vpp_steer_direction_from_config(&c);
+                let vpp_dirs = feasibility::vpp_steer_directions_from_config(&c);
                 let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
                 (
                     c.global.bpffs_root,
@@ -386,7 +386,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     vpp_workers,
                     vpp_binary,
                     allowlist,
-                    vpp_dir,
+                    vpp_dirs,
                     vpp_exempts,
                 )
             }
@@ -402,7 +402,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             0,
             None,
             Vec::new(),
-            Default::default(),
+            Vec::new(),
             Vec::new(),
         ),
     };
@@ -414,7 +414,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             ports: &vpp_ports,
             workers: vpp_workers,
             binary: vpp_binary.as_deref(),
-            steer_direction: vpp_dir,
+            steer_directions: &vpp_dirs,
             steer_exempts: &vpp_exempts,
         },
         &allowlist,

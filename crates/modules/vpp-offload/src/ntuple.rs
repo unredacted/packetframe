@@ -906,13 +906,17 @@ pub struct NtupleSteering {
     /// the set of PFs and their VFs cannot move under a running module,
     /// and `retarget` must not touch this.
     members: Vec<(String, u32)>,
-    /// `(PF iface, VF index)` for every port configured `steer on`.
+    /// `(PF iface, VF index, rules)` for every port configured
+    /// `steer on`.
     ///
     /// A list because steering is per-port — it is the canary lever, and
     /// the rollout turns it one port at a time — and because each PF
     /// steers into *its own* VF, so the ring_cookie differs per entry.
-    ports: Vec<(String, u32)>,
-    plan: RuleSet,
+    /// The rules ride per-port too, because direction is per-port: the
+    /// bidirectional service edge installs `src` rules on the trunk and
+    /// `dst` rules on the transits, and every routine below asks "what
+    /// does THIS port hold" rather than assuming one shared plan.
+    targets: Vec<(String, u32, RuleSet)>,
     /// `(iface, location)` currently installed. Per-iface because the
     /// same location number exists on every PF, and removing one from
     /// the wrong interface would leave traffic steered while reporting
@@ -942,7 +946,7 @@ pub struct NtupleSteering {
     /// `None` after a restart: the state file records locations, not
     /// what they were installed to hold, so ownership falls back to
     /// occupancy — see the non-member arm of `missing_from_nic`.
-    installed_as: Option<(Vec<(String, u32)>, RuleSet)>,
+    installed_as: Option<Vec<(String, u32, RuleSet)>>,
 }
 
 impl NtupleSteering {
@@ -952,11 +956,10 @@ impl NtupleSteering {
     /// that know the acquisition, and a `steering.set_members(..)` one
     /// of them forgets is precisely how `adopt_installed` shipped with
     /// no caller at all (#127).
-    pub fn new(members: Vec<(String, u32)>, ports: Vec<(String, u32)>, plan: RuleSet) -> Self {
+    pub fn new(members: Vec<(String, u32)>, targets: Vec<(String, u32, RuleSet)>) -> Self {
         Self {
             members,
-            ports,
-            plan,
+            targets,
             installed: Vec::new(),
             installed_as: None,
         }
@@ -974,13 +977,22 @@ impl NtupleSteering {
         let found = self
             .members
             .iter()
-            .chain(self.ports.iter())
-            .find(|(i, _)| i == iface);
-        if let Some((_, vf)) = found {
-            return Some(*vf);
+            .find(|(i, _)| i == iface)
+            .map(|(_, v)| *v)
+            .or_else(|| {
+                self.targets
+                    .iter()
+                    .find(|(i, _, _)| i == iface)
+                    .map(|(_, v, _)| *v)
+            });
+        if let Some(vf) = found {
+            return Some(vf);
         }
-        let (ports, _) = self.installed_as.as_ref()?;
-        ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v)
+        let installed_as = self.installed_as.as_ref()?;
+        installed_as
+            .iter()
+            .find(|(i, _, _)| i == iface)
+            .map(|(_, v, _)| *v)
     }
 
     /// Read a ledger location and decide what removal owes it.
@@ -1024,10 +1036,8 @@ impl NtupleSteering {
     /// — the spec [`Self::occupant`] compares a cookie-zero occupant
     /// against before claiming it.
     fn planned_keep_at(&self, iface: &str, loc: u32) -> Option<crate::steer::SteerRule> {
-        let (ports, plan) = self.installed_as.as_ref()?;
-        if !ports.iter().any(|(i, _)| i == iface) {
-            return None;
-        }
+        let installed_as = self.installed_as.as_ref()?;
+        let (_, _, plan) = installed_as.iter().find(|(i, _, _)| i == iface)?;
         plan.rules
             .iter()
             .find(|r| r.location == loc && r.action == crate::steer::RuleAction::Keep)
@@ -1249,12 +1259,13 @@ impl NtupleSteering {
         got: &RxFlowSpec,
         consumed: &mut std::collections::HashMap<String, Vec<bool>>,
     ) -> bool {
-        let Some((ports, plan)) = &self.installed_as else {
+        let Some(installed_as) = &self.installed_as else {
             return false;
         };
-        let Some(vf) = ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v) else {
+        let Some((_, vf, plan)) = installed_as.iter().find(|(i, _, _)| i == iface) else {
             return false;
         };
+        let vf = *vf;
         let taken = consumed
             .entry(iface.to_string())
             .or_insert_with(|| vec![false; plan.rules.len()]);
@@ -1279,9 +1290,9 @@ impl NtupleSteering {
 
     /// What the NIC should hold, from the current ports and plan.
     fn desired(&self) -> Vec<(String, u32)> {
-        let mut out = Vec::with_capacity(self.ports.len() * self.plan.rules.len());
-        for (iface, _) in &self.ports {
-            for rule in &self.plan.rules {
+        let mut out = Vec::new();
+        for (iface, _, plan) in &self.targets {
+            for rule in &plan.rules {
                 out.push((iface.clone(), rule.location));
             }
         }
@@ -1291,7 +1302,7 @@ impl NtupleSteering {
 
 impl crate::runtime::Steering for NtupleSteering {
     fn configured_ports(&self) -> usize {
-        self.ports.len()
+        self.targets.len()
     }
 
     fn steer(&mut self) -> Result<SteerOutcome, String> {
@@ -1314,7 +1325,11 @@ impl crate::runtime::Steering for NtupleSteering {
         // that as a clean "nothing steered" would retire the want and
         // hide a broken allowlist behind the same line a deliberate
         // `steer off` prints.
-        if !self.ports.is_empty() && self.plan.rules.is_empty() {
+        if self
+            .targets
+            .iter()
+            .any(|(_, _, plan)| plan.rules.is_empty())
+        {
             return Err(
                 "nothing to steer: the allowlist produced no rules for this NIC (see \
                  `packetframe feasibility`, capability `vpp.steering.budget`)"
@@ -1355,8 +1370,8 @@ impl crate::runtime::Steering for NtupleSteering {
             ));
         }
 
-        for (iface, vf_index) in &self.ports {
-            for rule in &self.plan.rules {
+        for (iface, vf_index, plan) in &self.targets {
+            for rule in &plan.rules {
                 if let Err(e) = insert(iface, rule, *vf_index) {
                     // All-or-nothing. A partially steered port divides
                     // traffic between the tiers along a line nobody chose,
@@ -1397,7 +1412,7 @@ impl crate::runtime::Steering for NtupleSteering {
         // intent that never reached the NIC must not overwrite this —
         // that is what made a second refused reconfigure disown rules
         // that were really there.
-        self.installed_as = Some((self.ports.clone(), self.plan.clone()));
+        self.installed_as = Some(self.targets.clone());
         // From the LEDGER, not from `ports.is_empty()`. The ledger is
         // the postcondition the caller acts on — it is what
         // `steering_in_place` reads and what the state file records —
@@ -1474,7 +1489,11 @@ impl crate::runtime::Steering for NtupleSteering {
 
         for (iface, loc) in &self.installed {
             // `None` = the current target does not steer this port.
-            let member = self.ports.iter().find(|(i, _)| i == iface).map(|(_, v)| *v);
+            let member = self
+                .targets
+                .iter()
+                .find(|(i, _, _)| i == iface)
+                .map(|(_, v, plan)| (*v, plan));
             let mut check = Rxnfc {
                 cmd: ETHTOOL_GRXCLSRULE,
                 fs: RxFlowSpec {
@@ -1517,16 +1536,16 @@ impl crate::runtime::Steering for NtupleSteering {
                     }
                 }
                 Ok(()) => {
-                    let vf = member.expect("the arm above takes the non-member case");
+                    let (vf, plan) = member.expect("the arm above takes the non-member case");
                     let taken = consumed
                         .entry(iface.as_str())
-                        .or_insert_with(|| vec![false; self.plan.rules.len()]);
+                        .or_insert_with(|| vec![false; plan.rules.len()]);
                     // Candidates are stamped with the location being
                     // CHECKED, not the one planned: `matches` compares
                     // `location`, and on an adopted start the planner
                     // chose different slots by construction, so an
                     // unstamped expectation can never match.
-                    let found = self.plan.rules.iter().enumerate().position(|(i, r)| {
+                    let found = plan.rules.iter().enumerate().position(|(i, r)| {
                         !taken[i]
                             && audit_matches(
                                 &RxFlowSpec {
@@ -1616,10 +1635,9 @@ impl crate::runtime::Steering for NtupleSteering {
         // Only reachable with a non-empty ledger — the caller skips the
         // audit otherwise — so this cannot fire on a port that has simply
         // never steered.
-        for (iface, vf) in &self.ports {
+        for (iface, vf, plan) in &self.targets {
             let taken = consumed.get(iface.as_str());
-            let homeless: Vec<&SteerRule> = self
-                .plan
+            let homeless: Vec<&SteerRule> = plan
                 .rules
                 .iter()
                 .enumerate()
@@ -1714,9 +1732,8 @@ impl crate::runtime::Steering for NtupleSteering {
         self.installed.clone()
     }
 
-    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: RuleSet) {
-        self.ports = ports;
-        self.plan = plan;
+    fn retarget(&mut self, targets: Vec<(String, u32, RuleSet)>) {
+        self.targets = targets;
     }
 }
 
@@ -1963,7 +1980,7 @@ mod tests {
         );
 
         // Every port `steer off`.
-        s.retarget(Vec::new(), RuleSet::default());
+        s.retarget(Vec::new());
         assert_eq!(
             s.steer()
                 .expect("an empty target is reconcilable, not a fault"),
@@ -1977,6 +1994,56 @@ mod tests {
                 .is_empty(),
             "the rules must be gone from the NIC, not merely forgotten by the ledger"
         );
+    }
+
+    /// Mixed directions install each port's OWN rules — src diverts on
+    /// one iface, dst diverts on the other — audit clean under the
+    /// per-port plans, and unsteer clears both NICs. The shape w27
+    /// steers: `src` on the service trunk, `dst` on a transit.
+    #[test]
+    fn mixed_direction_targets_install_each_ports_own_rules() {
+        use crate::runtime::Steering as _;
+        use crate::steer::McamBudget;
+        use packetframe_common::config::VppSteerDirection;
+        use packetframe_common::fib::IpPrefix;
+        sys::reset();
+
+        let allow = [IpPrefix::V4 {
+            addr: [23, 191, 200, 0],
+            prefix_len: 24,
+        }];
+        let src = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Src)
+            .expect("src plan");
+        let dst = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Dst)
+            .expect("dst plan");
+        let mut s = NtupleSteering::new(
+            vec![("eth0".into(), 0), ("eth1".into(), 0)],
+            vec![
+                ("eth0".into(), 0, dst.clone()),
+                ("eth1".into(), 0, src.clone()),
+            ],
+        );
+        assert_eq!(s.steer().expect("installs"), SteerOutcome::Steered);
+        // Each NIC holds exactly its own plan's rule count — not the
+        // union's, which is what a shared plan would have installed.
+        for (iface, plan) in [("eth0", &dst), ("eth1", &src)] {
+            assert_eq!(
+                sys::rule_table(iface).expect("fake answers").occupied.len(),
+                plan.rules.len(),
+                "{iface} must hold its own direction's rules only"
+            );
+        }
+        let audit = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(audit.missing, Vec::new(), "{:?}", audit.missing);
+        assert_eq!(audit.stray, Vec::new(), "{:?}", audit.stray);
+
+        s.unsteer().expect("clears both");
+        for iface in ["eth0", "eth1"] {
+            assert!(
+                sys::rule_table(iface).expect("fake").occupied.is_empty(),
+                "{iface} must be clean after unsteer"
+            );
+        }
     }
 
     /// A rule the NIC will not delete still refuses, even under an
@@ -1996,7 +2063,7 @@ mod tests {
         let stuck: Vec<u32> = s.installed().iter().map(|(_, loc)| *loc).collect();
         sys::wedge_delete(&stuck);
 
-        s.retarget(Vec::new(), RuleSet::default());
+        s.retarget(Vec::new());
         let e = s
             .steer()
             .expect_err("a rule that would not come out is still steering");
@@ -2314,7 +2381,7 @@ mod tests {
         assert_eq!(a.stray, Vec::new(), "both ports are in the target");
 
         // `steer off` on eth1, and the reconciling steer never runs.
-        s.retarget(vec![("eth0".into(), 0)], plan);
+        s.retarget(uniform(vec![("eth0".into(), 0)], plan));
 
         let a = s.missing_from_nic().expect("read the NIC");
         assert_eq!(
@@ -2401,7 +2468,7 @@ mod tests {
             plan_for(&[[198, 18, 0, 0], [203, 0, 113, 0]]),
         );
         live.adopt_installed(inherited);
-        live.retarget(vec![("eth0".into(), 0)], one);
+        live.retarget(uniform(vec![("eth0".into(), 0)], one));
         let a = live.missing_from_nic().expect("read the NIC");
         assert_eq!(a.missing, Vec::new(), "{:?}", a.missing);
         assert_eq!(a.stray.len(), owed, "{:?}", a.stray);
@@ -2467,7 +2534,7 @@ mod tests {
         // outgoing target is known. Same two facts.
         let mut live = steering(vec![("eth0".into(), 0)], plan_for(&[A, B]));
         live.adopt_installed(inherited);
-        live.retarget(vec![("eth0".into(), 0)], plan_for(&[B, C]));
+        live.retarget(uniform(vec![("eth0".into(), 0)], plan_for(&[B, C])));
         let a = live.missing_from_nic().expect("read the NIC");
         assert_eq!(a.missing.len(), per_prefix, "{:?}", a.missing);
         assert_eq!(a.stray.len(), per_prefix, "{:?}", a.stray);
@@ -2501,8 +2568,10 @@ mod tests {
         // Two reconfigures, neither reconciled — the supervisor refused
         // both at the completeness gate, so `steer` never ran again and
         // the NIC still holds A.
-        s.retarget(vec![("eth0".into(), 0)], plan_for(&[B]));
-        s.retarget(vec![("eth0".into(), 0)], plan_for(&[C]));
+        let c_plan = plan_for(&[C]);
+        let c_rules = c_plan.rules.len();
+        s.retarget(uniform(vec![("eth0".into(), 0)], plan_for(&[B])));
+        s.retarget(uniform(vec![("eth0".into(), 0)], c_plan));
 
         let a = s.missing_from_nic().expect("read the NIC");
         assert_eq!(
@@ -2515,7 +2584,7 @@ mod tests {
         );
         assert_eq!(
             a.missing.len(),
-            s.plan.rules.len(),
+            c_rules,
             "and C, which was never installed, is still absent: {:?}",
             a.missing
         );
@@ -2549,7 +2618,7 @@ mod tests {
         assert!(eth1.len() >= 2, "the fixture needs two rules on eth1");
 
         // `steer off` on eth1, reconcile refused — the round-13 state.
-        s.retarget(vec![("eth0".into(), 0)], plan);
+        s.retarget(uniform(vec![("eth0".into(), 0)], plan));
         assert_eq!(
             s.missing_from_nic().expect("read").stray.len(),
             eth1.len(),
@@ -2817,7 +2886,10 @@ mod tests {
 
         // Down to one prefix: 13 and 12 are stale. Somebody else takes 13
         // while the daemon is not looking.
-        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.retarget(uniform(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0]]),
+        ));
         sys::replace_behind_back("eth0", 13);
         s.steer().expect("reconciles");
 
@@ -3035,8 +3107,7 @@ mod tests {
         // not a steering target, and nothing was installed this process.
         let mut after = NtupleSteering::new(
             vec![("eth0".into(), 0), ("eth1".into(), 0)],
-            vec![("eth0".into(), 0)],
-            plan,
+            uniform(vec![("eth0".into(), 0)], plan),
         );
         after.adopt_installed(inherited);
         assert!(
@@ -3080,7 +3151,7 @@ mod tests {
         let inherited = before.installed();
 
         // No ports at all: the shape a caller with only a location list has.
-        let mut blind = NtupleSteering::new(Vec::new(), Vec::new(), RuleSet::default());
+        let mut blind = NtupleSteering::new(Vec::new(), Vec::new());
         blind.adopt_installed(inherited);
         blind.unsteer().expect("removes what the ledger names");
         assert!(sys::rules().is_empty());
@@ -3161,7 +3232,16 @@ mod tests {
     /// The cases that differ pass the two lists explicitly, because that
     /// difference is the thing under test.
     fn steering(ports: Vec<(String, u32)>, plan: RuleSet) -> NtupleSteering {
-        NtupleSteering::new(ports.clone(), ports, plan)
+        NtupleSteering::new(ports.clone(), uniform(ports, plan))
+    }
+
+    /// Pair every port with one shared rule set — the pre-per-port
+    /// shape, which is what most of these fixtures mean.
+    fn uniform(ports: Vec<(String, u32)>, plan: RuleSet) -> Vec<(String, u32, RuleSet)> {
+        ports
+            .into_iter()
+            .map(|(i, v)| (i, v, plan.clone()))
+            .collect()
     }
 
     /// The DIVERSION half of a plan only. These tests assert reconcile
@@ -3315,7 +3395,10 @@ mod tests {
         assert_eq!(sys::rules().len(), 4);
 
         // Down to one prefix: slots 13/12 are no longer wanted.
-        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.retarget(uniform(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0]]),
+        ));
         s.steer().expect("reconciles");
 
         assert_eq!(
@@ -3346,7 +3429,10 @@ mod tests {
         s.steer().expect("installs four");
 
         sys::wedge_delete(&[13]);
-        s.retarget(vec![("eth0".into(), 0)], plan_for(&[[10, 0, 0, 0]]));
+        s.retarget(uniform(
+            vec![("eth0".into(), 0)],
+            plan_for(&[[10, 0, 0, 0]]),
+        ));
         let e = s.steer().expect_err("must refuse");
 
         assert!(
@@ -3506,7 +3592,7 @@ mod tests {
         // 2. `steer off` on every port, `packetframe reconfigure` — and
         //    the NIC refuses to delete what it holds.
         sys::wedge_delete(&steered_locs);
-        fx.0.retarget(Vec::new(), RuleSet::default());
+        fx.0.retarget(Vec::new());
         settle(&mut sup, &mut fx, Event::UnsteerRequested);
         assert!(
             sup.is_steered(),

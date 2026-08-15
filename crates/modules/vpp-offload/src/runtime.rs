@@ -397,7 +397,7 @@ pub trait Steering {
     /// Splitting it that way keeps one routine — `steer` — responsible
     /// for every rule that ever reaches the NIC, so a reconfigure cannot
     /// grow its own, subtly different, installation path.
-    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet);
+    fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>);
     /// How many ports the CONFIG asks to steer, whether or not any rule
     /// is installed.
     ///
@@ -446,7 +446,7 @@ impl Steering for SteeringUnavailable {
     fn installed(&self) -> Vec<(String, u32)> {
         Vec::new()
     }
-    fn retarget(&mut self, _ports: Vec<(String, u32)>, _plan: crate::steer::RuleSet) {}
+    fn retarget(&mut self, _targets: Vec<(String, u32, crate::steer::RuleSet)>) {}
 }
 
 /// Everything both trait views share.
@@ -523,6 +523,20 @@ struct Core {
     /// When the NIC was last audited against the steering ledger, and
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
+    /// When the null-drop counter was last sampled over `cli_inband`.
+    /// Same real-clock pacing argument as `last_steer_audit`: a
+    /// metrics poll, not a supervision deadline.
+    last_null_sample: Option<std::time::Instant>,
+    /// The bridge-FDB tripwire, installed by bringup when local-routes
+    /// exist (Linux only). `None` everywhere else — tests, non-Linux,
+    /// configs with no local delivery — and silent there on purpose,
+    /// like the rx-mode kick: a missing scan is visible by its absent
+    /// log lines, not impersonated by a stub.
+    fdb_watch: Option<Box<dyn crate::fdb::FdbWatch>>,
+    last_fdb_scan: Option<std::time::Instant>,
+    /// The last completed scan's findings; kept across a failed scan
+    /// (an unreadable kernel is not evidence the hosts moved back).
+    fdb_misplaced: Vec<String>,
     steer_missing: usize,
     /// Rules still steering a port the config asks to leave unsteered,
     /// as of the last audit. Its own count because it points the other
@@ -1228,6 +1242,10 @@ impl Runtime {
                 fresh_hold: None,
                 rx_kick: Box::new(NoKick),
                 last_steer_audit: None,
+                last_null_sample: None,
+                fdb_watch: None,
+                last_fdb_scan: None,
+                fdb_misplaced: Vec::new(),
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1287,6 +1305,13 @@ impl Runtime {
     /// Install the kernel rx-mode kick. The attach wiring installs the
     /// ioctl-backed [`AllmultiKick`] on Linux; everything else keeps
     /// [`NoKick`]. See [`RxModeKick`] for why this exists.
+    /// Install the bridge-FDB tripwire. Same wiring rule as the
+    /// rx-mode kick: bringup installs the real one on Linux when
+    /// local-routes exist, and nothing pretends elsewhere.
+    pub fn fdb_watch(&self, w: Box<dyn crate::fdb::FdbWatch>) {
+        self.core.borrow_mut().fdb_watch = Some(w);
+    }
+
     pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
         self.core.borrow_mut().rx_kick = k;
     }
@@ -1297,8 +1322,8 @@ impl Runtime {
     /// follow it with the supervisor event that reconciles the NIC, and
     /// the supervision loop is the only caller precisely so that the two
     /// cannot be separated.
-    pub fn retarget(&self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
-        self.core.borrow_mut().retarget(ports, plan);
+    pub fn retarget(&self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
+        self.core.borrow_mut().retarget(targets);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1434,6 +1459,42 @@ impl Runtime {
                 }
             }
         }
+        {
+            let mut c = self.core.borrow_mut();
+            let now = std::time::Instant::now();
+            let due = c
+                .last_null_sample
+                .is_none_or(|t| now.duration_since(t) >= NULL_DROPS_EVERY);
+            if due && c.engine.is_connected() {
+                c.last_null_sample = Some(now);
+                c.engine.sample_null_drops();
+            }
+            let due = c
+                .last_fdb_scan
+                .is_none_or(|t| now.duration_since(t) >= FDB_SCAN_EVERY);
+            if due && c.fdb_watch.is_some() {
+                c.last_fdb_scan = Some(now);
+                let result = c.fdb_watch.as_mut().expect("checked above").misplaced();
+                match result {
+                    Ok(found) => {
+                        if !found.is_empty() && c.fdb_misplaced != found {
+                            tracing::warn!(
+                                hosts = ?found,
+                                "service-VLAN host(s) are behind a different member port \
+                                 than their local-route declares; VPP is delivering their \
+                                 prefix to the declared port. Move the host back, fix the \
+                                 declaration, or this topology needs per-host delivery \
+                                 (B3 v2)"
+                            );
+                        }
+                        c.fdb_misplaced = found;
+                    }
+                    // Keep the previous verdict: an unreadable kernel
+                    // is not evidence the hosts moved back.
+                    Err(e) => tracing::debug!(error = %e, "bridge-FDB scan failed"),
+                }
+            }
+        }
         let c = self.core.borrow();
         // ONE reading, used for both the verdict and the question of
         // whether it has been seen before: asking twice could pair a
@@ -1468,6 +1529,9 @@ impl Runtime {
             steer_missing: c.steer_missing,
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
+            shadowed_routes: c.engine.shadowed_routes(),
+            null_drops: c.engine.null_drops(),
+            fdb_misplaced: c.fdb_misplaced.clone(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1503,6 +1567,20 @@ impl Runtime {
 /// hardware limit — on the shadow it went two minutes and would have
 /// gone indefinitely.
 const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
+
+/// How often to read VPP's error counters for the null-drop gauge.
+///
+/// One `cli_inband "show errors"` round trip on the API socket, which
+/// shares VPP's main thread with the route batches — 60 s keeps it
+/// invisible next to the liveness ping while still giving Prometheus a
+/// usable rate.
+const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
+
+/// How often the bridge-FDB tripwire scans for hosts behind a port
+/// other than their `local-route` declaration. One netlink dump; a
+/// moved host is a provisioning-scale event, so a minute of latency
+/// on the tripwire costs nothing.
+const FDB_SCAN_EVERY: Duration = Duration::from_secs(60);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -1615,6 +1693,15 @@ pub struct RuntimeStatus {
     pub steer_stray: usize,
     /// Why the last steering audit could not read the NIC, if so.
     pub steer_audit_error: Option<String>,
+    /// Mirror prefixes a `local-route` is currently suppressing. See
+    /// [`crate::engine::ConvergenceEngine::shadowed_routes`].
+    pub shadowed_routes: u64,
+    /// Cumulative null-node drops as last sampled, absent until read.
+    pub null_drops: Option<u64>,
+    /// Hosts the bridge FDB places behind a different port than their
+    /// `local-route` declares, one line each. Empty = the tripwire is
+    /// quiet (or not installed).
+    pub fdb_misplaced: Vec<String>,
 }
 
 impl Core {
@@ -1743,8 +1830,8 @@ impl Core {
     /// `reconfigure` republishes status the moment it returns — so an
     /// operator who had just been told the steer was refused could read
     /// `steering healthy` in the same breath (review finding).
-    fn retarget(&mut self, ports: Vec<(String, u32)>, plan: crate::steer::RuleSet) {
-        self.steering.retarget(ports, plan);
+    fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
+        self.steering.retarget(targets);
         self.last_steer_audit = None;
     }
 
@@ -3424,7 +3511,7 @@ mod tests {
         fn installed(&self) -> Vec<(String, u32)> {
             self.rules.clone()
         }
-        fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+        fn retarget(&mut self, _: Vec<(String, u32, crate::steer::RuleSet)>) {}
     }
 
     /// Every ledger the store was handed, in order.
@@ -3575,7 +3662,7 @@ mod tests {
             fn installed(&self) -> Vec<(String, u32)> {
                 vec![("eth4".into(), 1024), ("eth4".into(), 1025)]
             }
-            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+            fn retarget(&mut self, _: Vec<(String, u32, crate::steer::RuleSet)>) {}
         }
 
         let rt = Runtime::new(
@@ -3643,7 +3730,7 @@ mod tests {
             fn installed(&self) -> Vec<(String, u32)> {
                 vec![("eth4".into(), 1024)]
             }
-            fn retarget(&mut self, _: Vec<(String, u32)>, _: crate::steer::RuleSet) {}
+            fn retarget(&mut self, _: Vec<(String, u32, crate::steer::RuleSet)>) {}
         }
 
         let rt = Runtime::new(
@@ -3663,7 +3750,7 @@ mod tests {
              would pass whether or not retarget invalidates anything"
         );
 
-        rt.retarget(vec![("eth4".into(), 0)], crate::steer::RuleSet::default());
+        rt.retarget(vec![("eth4".into(), 0, crate::steer::RuleSet::default())]);
         assert_eq!(
             rt.status().steer_missing,
             1,

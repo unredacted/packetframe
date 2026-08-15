@@ -60,6 +60,8 @@ pub const SUBSYS_PORTS: &str = "ports";
 /// Reported only when a persist failed; see
 /// [`StatusSnapshot::store_error`].
 pub const SUBSYS_STATE_FILE: &str = "state-file";
+/// Only present when the bridge-FDB tripwire has findings.
+pub const SUBSYS_FDB: &str = "fdb";
 /// Subsystem name for the cross-tier route feed.
 pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
 
@@ -340,6 +342,30 @@ pub struct StatusSnapshot {
     /// engine is not draining, a backlog there means VPP is not
     /// accepting.
     pub source_backlog: u64,
+    /// Mirror prefixes a `local-route` is currently suppressing —
+    /// routes the mirror carries that VPP deliberately does not,
+    /// because local delivery owns their footprint. Informational, not
+    /// a degradation: non-zero is the DESIGNED state on a service edge
+    /// (the reference primary expects exactly its poisoned host
+    /// route). Surfaced so a mirror change inside a local prefix is
+    /// visible rather than silently absorbed.
+    pub shadowed_routes: u64,
+    /// Cumulative null-node drops from VPP's own error counters,
+    /// sampled over `cli_inband`. `None` until a sample succeeds —
+    /// absent rather than 0, so a broken read path cannot impersonate
+    /// a quiet dataplane. What it counts on the reference primary:
+    /// replies to spoofed/bogon sources, traffic the kernel also
+    /// dropped, just less visibly (~370 pps in w23/w24). A CHANGE in
+    /// its rate is the signal; the steady residual is designed.
+    pub null_drops: Option<u64>,
+    /// Hosts the bridge FDB places behind a different member port than
+    /// their `local-route` declares, one line each. Non-empty is a
+    /// topology contradiction: the kernel delivers those hosts via a
+    /// port VPP is not delivering their prefix to, so steered inbound
+    /// for them is going to the wrong wire. Degraded, host named — the
+    /// v1 tripwire whose firing is what makes per-host delivery (v2)
+    /// real work instead of speculation.
+    pub fdb_misplaced: Vec<String>,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -392,6 +418,9 @@ impl StatusSnapshot {
             // and every caller of this form is a path with no steering
             // ledger to audit against.
             SteerAudit::default(),
+            0,
+            None,
+            Vec::new(),
         )
     }
 
@@ -417,6 +446,9 @@ impl StatusSnapshot {
         source_backlog: u64,
         steer_configured: bool,
         audit: SteerAudit,
+        shadowed_routes: u64,
+        null_drops: Option<u64>,
+        fdb_misplaced: Vec<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -440,6 +472,9 @@ impl StatusSnapshot {
             store_error,
             drain_error,
             source_backlog,
+            shadowed_routes,
+            null_drops,
+            fdb_misplaced,
         }
     }
 
@@ -507,6 +542,20 @@ impl StatusSnapshot {
                      source and {} queued for VPP. Retried every tick — the offload is forwarding \
                      a table that is behind bird, not a wrong one.",
                     self.source_backlog, self.pending_ops
+                )),
+                last_success_age_seconds: None,
+            });
+        }
+        if !self.fdb_misplaced.is_empty() {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_FDB.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "the kernel bridge FDB contradicts local-route: {} — steered inbound \
+                     for these hosts egresses the declared port, not the one the kernel \
+                     learned them on. Move the host, fix the declaration, or this \
+                     topology needs per-host delivery (B3 v2)",
+                    self.fdb_misplaced.join("; ")
                 )),
                 last_success_age_seconds: None,
             });
@@ -611,6 +660,11 @@ impl StatusSnapshot {
             // over it by design, which is exactly why it must not read as
             // nominal.
             && self.drain_error.is_none()
+            // A host the FDB places behind an undeclared port is being
+            // delivered to the wrong wire by VPP right now. Detection
+            // only — the remedy is the operator's — but it must not
+            // read as healthy while it stands.
+            && self.fdb_misplaced.is_empty()
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -1441,6 +1495,37 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             "packetframe_vpp_routes{{module=\"{module}\",state=\"{label}\"}} {value}"
         );
     }
+
+    if let Some(n) = snap.null_drops {
+        gauge(
+            &mut out,
+            "packetframe_vpp_null_drops",
+            "cumulative VPP null-node drops (undeliverable traffic; absent until sampled)",
+        );
+        let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
+    }
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_fdb_misplaced",
+        "hosts the bridge FDB places behind a different port than their local-route declares",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_fdb_misplaced{{module=\"{module}\"}} {}",
+        snap.fdb_misplaced.len()
+    );
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_shadowed_routes",
+        "mirror prefixes a local-route currently suppresses (local delivery owns them)",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_shadowed_routes{{module=\"{module}\"}} {}",
+        snap.shadowed_routes
+    );
 
     gauge(
         &mut out,
@@ -3184,6 +3269,73 @@ mod tests {
         // The boolean is still emitted — "not verified" is a fact worth
         // scraping.
         assert!(m.contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"));
+    }
+
+    /// The FDB tripwire: quiet = no subsystem row (nothing for an
+    /// operator to learn to ignore); firing = Degraded with the host
+    /// named on the report AND the gauge counting it, together.
+    #[test]
+    fn a_misplaced_fdb_host_degrades_and_is_named_on_both_surfaces() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        assert!(
+            !s.report().subsystems.iter().any(|x| x.name == SUBSYS_FDB),
+            "quiet tripwire must add no row"
+        );
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_fdb_misplaced{module=\"vpp-offload\"} 0"),
+            "{m}"
+        );
+
+        s.fdb_misplaced =
+            vec!["02:00:00:00:00:07 vlan 1337 learned on eth5 (local-route declares eth4)".into()];
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FDB)
+            .expect("the tripwire row");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message.as_deref().unwrap_or("").contains("eth5"),
+            "{row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_fdb_misplaced{module=\"vpp-offload\"} 1"),
+            "{m}"
+        );
+    }
+
+    /// Same convention for the null-drop counter: absent until a
+    /// sample succeeded, so a broken read path cannot impersonate a
+    /// quiet dataplane — and present with the sampled total after.
+    #[test]
+    fn the_null_drop_gauge_is_absent_until_sampled() {
+        let mut s = snap_of(
+            &Supervisor::new(),
+            &ledger_with(0, 0, 0),
+            ApiHealth::NoProcess,
+            FibSync::NeverVerified,
+            Vec::new(),
+        );
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_null_drops"), "{m}");
+        s.null_drops = Some(117_015);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_null_drops{module=\"vpp-offload\"} 117015"),
+            "{m}"
+        );
     }
 
     #[test]

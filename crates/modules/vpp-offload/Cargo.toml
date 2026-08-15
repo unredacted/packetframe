@@ -16,3 +16,11 @@ serde_json = { workspace = true }
 # macOS dev loop too, and one implementation of it beats a cfg-split pair
 # that can disagree.
 libc = { workspace = true }
+
+# B3 v1's bridge-FDB tripwire: one blocking AF_BRIDGE dump per minute.
+# The same message crates fast-path's resolver decodes with, minus
+# rtnetlink — this crate has no async runtime to park a connection on.
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = { workspace = true }
+netlink-packet-route = { workspace = true }
+netlink-sys = "0.8"

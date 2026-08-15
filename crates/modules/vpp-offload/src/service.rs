@@ -154,9 +154,9 @@ pub struct SteeringRequest {
     /// Matched against the answer so a caller cannot collect the result
     /// of somebody else's request — or of its own previous one.
     seq: u64,
-    /// `(PF iface, VF index)` for every port now configured `steer on`.
-    pub ports: Vec<(String, u32)>,
-    pub plan: crate::steer::RuleSet,
+    /// `(PF iface, VF index, rules)` for every port now configured
+    /// `steer on` — per-port rules because direction is per-port.
+    pub targets: Vec<(String, u32, crate::steer::RuleSet)>,
     /// Whether traffic should be diverted once the target is in place.
     /// False is the rollback landing zone, not an error.
     pub want_steer: bool,
@@ -608,8 +608,7 @@ impl SupervisionService {
     /// happen, which is what they need to know.
     pub fn apply_steering(
         &self,
-        ports: Vec<(String, u32)>,
-        plan: crate::steer::RuleSet,
+        targets: Vec<(String, u32, crate::steer::RuleSet)>,
         want_steer: bool,
         lever_moved: bool,
     ) -> Result<(), String> {
@@ -623,8 +622,7 @@ impl SupervisionService {
             .expect("steering lock")
             .replace(SteeringRequest {
                 seq,
-                ports,
-                plan,
+                targets,
                 want_steer,
                 lever_moved,
             });
@@ -877,7 +875,7 @@ fn apply_steering(
              next successful convergence"
         ));
     }
-    runtime.retarget(req.ports.clone(), req.plan.clone());
+    runtime.retarget(req.targets.clone());
 
     let steered = driver.supervisor().is_steered();
     // INTENDED, not steered. The two differ in exactly the case an
@@ -1095,6 +1093,9 @@ fn run_loop(
                 stray: rs.steer_stray,
                 unreadable: rs.steer_audit_error.clone(),
             },
+            rs.shadowed_routes,
+            rs.null_drops,
+            rs.fdb_misplaced,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

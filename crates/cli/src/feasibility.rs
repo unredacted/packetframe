@@ -71,19 +71,43 @@ pub fn vpp_workers_from_config(config: &Config) -> u32 {
     workers
 }
 
-/// The configured steer direction, defaulting like the module does.
-pub fn vpp_steer_direction_from_config(config: &Config) -> VppSteerDirection {
+/// The DISTINCT effective steer directions of the steering ports —
+/// each port's `direction` tail falling back to the global, exactly as
+/// the module derives its per-port plans, so the budget probe runs the
+/// same arithmetic attach enforces. Falls back to the global default
+/// when nothing steers yet (the staging state), so the probe still
+/// reports what the first canary step would install.
+pub fn vpp_steer_directions_from_config(config: &Config) -> Vec<VppSteerDirection> {
+    let mut global = VppSteerDirection::default();
+    let mut ports: Vec<(bool, Option<VppSteerDirection>)> = Vec::new();
     for m in &config.modules {
         if m.name != "vpp-offload" {
             continue;
         }
         for d in &m.directives {
-            if let ModuleDirective::VppSteerDirection(dir) = d {
-                return *dir;
+            match d {
+                ModuleDirective::VppSteerDirection(dir) => global = *dir,
+                ModuleDirective::VppPort {
+                    steer, direction, ..
+                } => ports.push((*steer, *direction)),
+                _ => {}
             }
         }
     }
-    VppSteerDirection::default()
+    let mut out: Vec<VppSteerDirection> = Vec::new();
+    for (steer, dir) in &ports {
+        if !steer {
+            continue;
+        }
+        let d = dir.unwrap_or(global);
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    if out.is_empty() {
+        out.push(global);
+    }
+    out
 }
 
 /// The fast-path allowlist, as the steering probe needs it.
@@ -134,6 +158,69 @@ pub fn vpp_steer_exempts_from_config(
         .collect()
 }
 
+/// The `local-route` lines joined with the fast-path `local-prefix`
+/// that covers each one — the join only the loader can perform, since
+/// `Module` methods see one section. The covering prefix's `via` is the
+/// kernel bridge device whose neighbours mirror onto the subif; the
+/// longest cover wins, matching every other most-specific rule in the
+/// config. `validate_vpp_offload` guarantees a cover exists, so the
+/// error arm is a programming-order guard (extractor called on an
+/// unvalidated config), not an operator surface.
+///
+/// Gated like [`crate::loader`]'s `feed_wiring` — its only caller is
+/// the Linux module-wiring path, and a laxer gate reads as dead code on
+/// every other build.
+#[cfg(all(target_os = "linux", feature = "fast-path", feature = "vpp-offload"))]
+pub fn vpp_local_routes_from_config(
+    config: &Config,
+) -> Result<Vec<packetframe_vpp_offload::LocalRoute>, String> {
+    let covers: Vec<(&packetframe_common::config::Ipv4Prefix, &String)> = config
+        .modules
+        .iter()
+        .filter(|m| m.name == "fast-path")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::LocalPrefix { cidr, iface, .. } => Some((cidr, iface)),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for d in config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| &m.directives)
+    {
+        if let ModuleDirective::VppLocalRoute {
+            prefix,
+            iface,
+            vlan,
+            ..
+        } = d
+        {
+            let kernel_dev = covers
+                .iter()
+                .filter(|(c, _)| c.contains_prefix(prefix))
+                .max_by_key(|(c, _)| c.prefix_len)
+                .map(|(_, i)| (*i).clone())
+                .ok_or_else(|| {
+                    format!(
+                        "local-route {}/{} matches no fast-path local-prefix — \
+                         validate_vpp_offload should have refused this config",
+                        prefix.addr, prefix.prefix_len
+                    )
+                })?;
+            out.push(packetframe_vpp_offload::LocalRoute {
+                prefix: *prefix,
+                port: iface.clone(),
+                vlan: *vlan,
+                kernel_dev,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// The `vpp-binary` override from a `vpp-offload` section, if set, so
 /// feasibility probes the executable the module will actually run.
 pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
@@ -154,7 +241,7 @@ pub struct VppProbeInputs<'a> {
     pub ports: &'a [String],
     pub workers: u32,
     pub binary: Option<&'a str>,
-    pub steer_direction: VppSteerDirection,
+    pub steer_directions: &'a [VppSteerDirection],
     pub steer_exempts: &'a [packetframe_common::config::Ipv4Prefix],
 }
 
@@ -193,7 +280,7 @@ pub fn probe_and_render(
             vpp.workers,
             vpp.binary,
             allowlist,
-            vpp.steer_direction,
+            vpp.steer_directions,
             vpp.steer_exempts,
         ) {
             report.capabilities.push(cap);

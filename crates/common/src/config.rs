@@ -175,11 +175,18 @@ pub enum ModuleDirective {
     /// routing — measured on the primary 2026-08-14 (w20): 8.7M
     /// frames in two minutes, all punted, zero forwarded. Untagged
     /// ingress (an access port, or the PVID) needs no declaration.
+    ///
+    /// `direction` overrides the global `steer-direction` for this
+    /// port's rules. The split a service-edge box wants: `src` on the
+    /// service trunk (outbound rides VPP), `dst` on the transit ports
+    /// (inbound rides VPP once `local-route` delivery exists). Absent
+    /// = the global setting.
     VppPort {
         iface: String,
         cores: u16,
         steer: bool,
         vlans: Vec<u16>,
+        direction: Option<VppSteerDirection>,
         line: usize,
     },
     /// `vpp-binary <path>` — override the probed VPP binary path.
@@ -230,19 +237,46 @@ pub enum ModuleDirective {
     ///
     /// Default `both`, which is right for pure-transit deployments
     /// where VPP can forward either direction of a flow. `src` is for
-    /// service-edge deployments: outbound traffic (src ∈ the service
-    /// prefix) rides VPP's full-table best path, while inbound
-    /// (dst ∈ prefix) stays on the eBPF tier — because inbound
-    /// terminates on bridge-attached hosts VPP has no path to (local
-    /// delivery is the fast-path FDB-pin's job), and dst-steering it
-    /// would blackhole every service flow. The split-tier flow halves
-    /// are safe under the stateless-transit invariant that steering
-    /// already requires — no different from ECMP asymmetry.
+    /// service-edge deployments staging toward bidirectional: outbound
+    /// (src ∈ the service prefix) rides VPP's full-table best path
+    /// while inbound stays on the eBPF tier. Steering `dst` (or the
+    /// `both` default) toward locally terminated prefixes additionally
+    /// requires `local-route` coverage — VPP must be able to DELIVER
+    /// what a dst rule diverts, and validation refuses the config
+    /// otherwise rather than letting a canary discover the blackhole.
+    /// The split-tier flow halves are safe under the stateless-transit
+    /// invariant that steering already requires — no different from
+    /// ECMP asymmetry. Per-port override: the `direction` tail on a
+    /// `port` line.
     ///
     /// Hot-reloadable: the steering target is rebuilt from config on
     /// every `packetframe reconfigure`, and `steer` is a reconcile, so
     /// a direction change installs/removes exactly the delta.
     VppSteerDirection(VppSteerDirection),
+    /// `local-route <v4-cidr> port <iface> vlan <vid>` — a locally
+    /// terminated prefix VPP must DELIVER, not forward: an attached
+    /// route onto the member port's dot1q subinterface, with kernel
+    /// neighbours on the backing bridge mirrored as VPP static
+    /// neighbours. Repeatable; restart-only.
+    ///
+    /// Two things hang off it. First, delivery: without it, steered
+    /// traffic destined to the prefix dies in VPP (`null-node`), which
+    /// is why dst-direction steering refuses to load unless every
+    /// steerable local prefix has one. Second, shadowing: the route
+    /// mirror's BGP view of the prefix is SKIPPED — the kernel tier
+    /// delivers to bridge hosts before its FIB lookup, so a mirrored
+    /// route inside a local prefix (the reference primary carries a
+    /// host route as `unreachable` in bird) would blackhole in VPP
+    /// what the kernel delivers fine. The prefix must match a
+    /// fast-path `local-prefix` (same tier-agreement philosophy as
+    /// the membership rule; the kernel bridge device comes from its
+    /// `via`), and the port must declare the vlan in its `vlans`.
+    VppLocalRoute {
+        prefix: Ipv4Prefix,
+        iface: String,
+        vlan: u16,
+        line: usize,
+    },
     AllowPrefix4(Ipv4Prefix),
     AllowPrefix6(Ipv6Prefix),
     /// Connected/local prefix the operator wants packetframe to
@@ -1220,6 +1254,82 @@ impl Config {
             ));
         };
 
+        // local-route structural rules. These hold whether or not
+        // anything steers: the attached route and neighbour mirror are
+        // installed at attach, so a broken declaration is a broken
+        // attach, not a broken canary.
+        let mut local_routes: Vec<(&Ipv4Prefix, usize)> = Vec::new();
+        for d in &vpp.directives {
+            if let ModuleDirective::VppLocalRoute {
+                prefix,
+                iface,
+                vlan,
+                line,
+            } = d
+            {
+                for (p, _) in &local_routes {
+                    if p.contains_prefix(prefix) || prefix.contains_prefix(p) {
+                        return Err(ConfigError::parse(
+                            *line,
+                            format!(
+                                "local-route {}/{} duplicates or overlaps local-route {}/{}: \
+                                 one attached route owns a prefix",
+                                prefix.addr, prefix.prefix_len, p.addr, p.prefix_len
+                            ),
+                        ));
+                    }
+                }
+                let port_vlans = vpp.directives.iter().find_map(|d| match d {
+                    ModuleDirective::VppPort {
+                        iface: pi, vlans, ..
+                    } if pi == iface => Some(vlans),
+                    _ => None,
+                });
+                let Some(port_vlans) = port_vlans else {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "local-route names port `{iface}` but module vpp-offload has no \
+                             `port {iface}` line"
+                        ),
+                    ));
+                };
+                if !port_vlans.contains(vlan) {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "local-route {}/{}: `port {iface}` does not declare vlan {vlan} \
+                             in its `vlans` list — the dot1q subinterface the attached \
+                             route lands on is created from that list",
+                            prefix.addr, prefix.prefix_len
+                        ),
+                    ));
+                }
+                // Tier agreement: the fallback tier must also deliver
+                // this prefix locally (fast-path `local-prefix`), both
+                // so a failover cannot change what is delivered and
+                // because the kernel bridge device the neighbour
+                // mirror watches comes from that directive's `via`.
+                let covered = fp.directives.iter().any(|d| {
+                    matches!(d, ModuleDirective::LocalPrefix { cidr, .. }
+                        if cidr.contains_prefix(prefix))
+                });
+                if !covered {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "local-route {}/{} is not inside any fast-path `local-prefix`: \
+                             local delivery must agree across tiers, and the kernel bridge \
+                             device for neighbour mirroring comes from \
+                             `local-prefix ... via <dev>`",
+                            prefix.addr, prefix.prefix_len
+                        ),
+                    ));
+                }
+                local_routes.push((prefix, *line));
+            }
+        }
+
         // `require-table-complete on` demands a completeness authority,
         // and `integrity-authority none` declares there is none. The two
         // together are a config that can never permit a first steer: the
@@ -1288,6 +1398,94 @@ impl Config {
                              possible egress port before any ingress is steered \
                              (missing members blackhole destinations whose best path \
                              egresses them)"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // dst-direction coverage. A dst rule steers inbound INTO VPP;
+        // for a locally terminated prefix VPP can only deliver it via
+        // a `local-route`. An uncovered local prefix would blackhole
+        // 100% of its inbound the moment the port steers (w20 shape),
+        // so it is refused at load, not discovered at a canary. Pure
+        // transit needs nothing here: a dst-steered packet for a
+        // non-local prefix is forwarded via the full table.
+        let global_dir = vpp
+            .directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::VppSteerDirection(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let dst_port = vpp.directives.iter().find_map(|d| match d {
+            ModuleDirective::VppPort {
+                iface,
+                steer: true,
+                direction,
+                ..
+            } if matches!(
+                direction.unwrap_or(global_dir),
+                VppSteerDirection::Dst | VppSteerDirection::Both
+            ) =>
+            {
+                Some(iface)
+            }
+            _ => None,
+        });
+        if let Some(dst_port) = dst_port {
+            let allow4: Vec<&Ipv4Prefix> = fp
+                .directives
+                .iter()
+                .filter_map(|d| match d {
+                    ModuleDirective::AllowPrefix4(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            // Half-open u64 ranges so /0 and broadcast+1 don't wrap.
+            let range = |p: &Ipv4Prefix| -> (u64, u64) {
+                let start = u64::from(u32::from(p.network()));
+                (start, start + (1u64 << (32 - p.prefix_len)))
+            };
+            for d in &fp.directives {
+                let ModuleDirective::LocalPrefix { cidr, line, .. } = d else {
+                    continue;
+                };
+                let steerable = allow4
+                    .iter()
+                    .any(|a| a.contains_prefix(cidr) || cidr.contains_prefix(a));
+                if !steerable {
+                    continue;
+                }
+                // Covered = the local-route set tiles the whole prefix
+                // (structural rules above guarantee each is inside it
+                // or disjoint from it, and that they don't overlap).
+                let (lp_start, lp_end) = range(cidr);
+                let mut pieces: Vec<(u64, u64)> = local_routes
+                    .iter()
+                    .filter(|(p, _)| cidr.contains_prefix(p))
+                    .map(|(p, _)| range(p))
+                    .collect();
+                pieces.sort_unstable();
+                let mut cursor = lp_start;
+                for (s, e) in pieces {
+                    if s > cursor {
+                        break;
+                    }
+                    cursor = cursor.max(e);
+                }
+                if cursor < lp_end {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "`port {dst_port}` steers direction dst but local prefix {}/{} \
+                             (steerable via the allowlist) is not fully covered by \
+                             vpp-offload `local-route` lines: inbound steered to an \
+                             uncovered address would blackhole in VPP, which has no \
+                             local delivery for it. Add `local-route {}/{} port <iface> \
+                             vlan <vid>` (or steer that port `direction src`)",
+                            cidr.addr, cidr.prefix_len, cidr.addr, cidr.prefix_len
                         ),
                     ));
                 }
@@ -2034,7 +2232,8 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .next()
                 .ok_or_else(|| ConfigError::parse(line, "port requires an interface"))?;
             validate_iface_name(line, "port", iface)?;
-            let usage = "port takes: <iface> cores <n> steer on|off [vlans <id>[,<id>...]]";
+            let usage = "port takes: <iface> cores <n> steer on|off [vlans <id>[,<id>...]] \
+                         [direction src|dst|both]";
             if rest.next() != Some("cores") {
                 return Err(ConfigError::parse(line, usage));
             }
@@ -2055,30 +2254,39 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 _ => return Err(ConfigError::parse(line, "steer expects on|off")),
             };
             let mut vlans: Vec<u16> = Vec::new();
-            match rest.next() {
-                None => {}
-                Some("vlans") => {
-                    let csv = rest.next().ok_or_else(|| {
-                        ConfigError::parse(line, "vlans requires a comma-separated id list")
+            let mut direction: Option<VppSteerDirection> = None;
+            let mut tail = rest.next();
+            if tail == Some("vlans") {
+                let csv = rest.next().ok_or_else(|| {
+                    ConfigError::parse(line, "vlans requires a comma-separated id list")
+                })?;
+                for tok in csv.split(',') {
+                    let vid: u16 = tok.parse().map_err(|_| {
+                        ConfigError::parse(line, "vlans ids must be integers 1-4094")
                     })?;
-                    for tok in csv.split(',') {
-                        let vid: u16 = tok.parse().map_err(|_| {
-                            ConfigError::parse(line, "vlans ids must be integers 1-4094")
-                        })?;
-                        // 0 is priority-tagged, 4095 reserved; neither
-                        // names a subinterface anything can classify to.
-                        if !(1..=4094).contains(&vid) {
-                            return Err(ConfigError::parse(line, "vlans ids must be 1-4094"));
-                        }
-                        if vlans.contains(&vid) {
-                            return Err(ConfigError::parse(line, "duplicate vlan id"));
-                        }
-                        vlans.push(vid);
+                    // 0 is priority-tagged, 4095 reserved; neither
+                    // names a subinterface anything can classify to.
+                    if !(1..=4094).contains(&vid) {
+                        return Err(ConfigError::parse(line, "vlans ids must be 1-4094"));
                     }
+                    if vlans.contains(&vid) {
+                        return Err(ConfigError::parse(line, "duplicate vlan id"));
+                    }
+                    vlans.push(vid);
                 }
-                Some(_) => return Err(ConfigError::parse(line, usage)),
+                tail = rest.next();
             }
-            if rest.next().is_some() {
+            if tail == Some("direction") {
+                let tok = rest
+                    .next()
+                    .ok_or_else(|| ConfigError::parse(line, "direction expects src|dst|both"))?;
+                let d: VppSteerDirection = tok
+                    .parse()
+                    .map_err(|e: String| ConfigError::parse(line, e))?;
+                direction = Some(d);
+                tail = rest.next();
+            }
+            if tail.is_some() {
                 return Err(ConfigError::parse(line, usage));
             }
             Ok(ModuleDirective::VppPort {
@@ -2086,6 +2294,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 cores,
                 steer,
                 vlans,
+                direction,
                 line,
             })
         }
@@ -2107,6 +2316,39 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .map_err(|e: String| format!("loopback-address: {e}"))?;
             Ok(ModuleDirective::VppLoopbackAddress(p))
         }),
+        "local-route" => {
+            // local-route <v4-cidr> port <iface> vlan <vid>
+            let usage = "local-route takes: <v4-cidr> port <iface> vlan <vid>";
+            let cidr_tok = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
+            if rest.next() != Some("port") {
+                return Err(ConfigError::parse(line, usage));
+            }
+            let iface = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
+            validate_iface_name(line, "local-route", iface)?;
+            if rest.next() != Some("vlan") {
+                return Err(ConfigError::parse(line, usage));
+            }
+            let vid: u16 = rest
+                .next()
+                .ok_or_else(|| ConfigError::parse(line, usage))?
+                .parse()
+                .map_err(|_| ConfigError::parse(line, "vlan id must be an integer 1-4094"))?;
+            if !(1..=4094).contains(&vid) {
+                return Err(ConfigError::parse(line, "vlan id must be 1-4094"));
+            }
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(line, usage));
+            }
+            let prefix: Ipv4Prefix = cidr_tok
+                .parse()
+                .map_err(|e: String| ConfigError::parse(line, format!("local-route: {e}")))?;
+            Ok(ModuleDirective::VppLocalRoute {
+                prefix,
+                iface: iface.to_string(),
+                vlan: vid,
+                line,
+            })
+        }
         "steer-exempt" => parse_single_arg(line, rest, "steer-exempt", |t| {
             let p: Ipv4Prefix = t
                 .parse()
@@ -3285,6 +3527,209 @@ module fast-path
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
         }
+    }
+
+    #[test]
+    fn vpp_port_direction_parses() {
+        // With and without a vlans clause; absent = None (global wins).
+        let s = "module vpp-offload\n  port eth3 cores 1 steer off direction dst\n\
+                 port eth4 cores 1 steer off vlans 88,1337 direction src\n\
+                 port eth5 cores 1 steer off\n";
+        let c = Config::parse(s).unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppPort { direction, .. } => {
+                assert_eq!(*direction, Some(VppSteerDirection::Dst));
+            }
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        match &c.modules[0].directives[1] {
+            ModuleDirective::VppPort {
+                vlans, direction, ..
+            } => {
+                assert_eq!(vlans, &[88, 1337]);
+                assert_eq!(*direction, Some(VppSteerDirection::Src));
+            }
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        match &c.modules[0].directives[2] {
+            ModuleDirective::VppPort { direction, .. } => assert_eq!(*direction, None),
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        for bad in [
+            "module vpp-offload\n  port eth3 cores 1 steer off direction\n",
+            "module vpp-offload\n  port eth3 cores 1 steer off direction inbound\n",
+            // direction must follow vlans, not precede it
+            "module vpp-offload\n  port eth3 cores 1 steer off direction dst vlans 88\n",
+            "module vpp-offload\n  port eth3 cores 1 steer off direction dst extra\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn local_route_parses_and_rejects_malformed() {
+        let s = "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 1337\n";
+        let c = Config::parse(s).unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppLocalRoute {
+                prefix,
+                iface,
+                vlan,
+                ..
+            } => {
+                assert_eq!(prefix.addr, std::net::Ipv4Addr::new(23, 191, 200, 0));
+                assert_eq!(prefix.prefix_len, 24);
+                assert_eq!(iface, "eth4");
+                assert_eq!(*vlan, 1337);
+            }
+            other => panic!("expected VppLocalRoute, got {other:?}"),
+        }
+        for bad in [
+            "module vpp-offload\n  local-route\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 0\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 4095\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24 vlan 1337 port eth4\n",
+            "module vpp-offload\n  local-route not-a-cidr port eth4 vlan 1337\n",
+            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 1337 x\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    /// The structural rules hold with steering off everywhere: the
+    /// attached route and neighbour mirror install at attach, so a
+    /// broken declaration is a broken attach.
+    #[test]
+    fn local_route_cross_validation() {
+        let base = "module fast-path\n  attach eth4 generic\n  local-prefix 23.191.200.0/24 via br1337\n\n\
+                    module vpp-offload\n  loopback-address 198.51.100.254/32\n";
+
+        // Happy: port declares the vlan, prefix inside the local-prefix.
+        let good = format!(
+            "{base}  port eth4 cores 1 steer off vlans 1337\n  \
+             local-route 23.191.200.0/24 port eth4 vlan 1337\n"
+        );
+        Config::parse(&good)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap();
+
+        // Port named by the local-route has no port line.
+        let no_port = format!(
+            "{base}  port eth4 cores 1 steer off vlans 1337\n  \
+             local-route 23.191.200.0/24 port eth9 vlan 1337\n"
+        );
+        let e = Config::parse(&no_port)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(format!("{e}").contains("no `port eth9` line"), "{e}");
+
+        // The port exists but does not declare the vlan.
+        let no_vlan = format!(
+            "{base}  port eth4 cores 1 steer off vlans 88\n  \
+             local-route 23.191.200.0/24 port eth4 vlan 1337\n"
+        );
+        let e = Config::parse(&no_vlan)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(format!("{e}").contains("does not declare vlan 1337"), "{e}");
+
+        // Not inside any fast-path local-prefix: tier disagreement.
+        let no_lp = format!(
+            "{base}  port eth4 cores 1 steer off vlans 1337\n  \
+             local-route 198.18.0.0/24 port eth4 vlan 1337\n"
+        );
+        let e = Config::parse(&no_lp)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(format!("{e}").contains("local-prefix"), "{e}");
+
+        // Overlapping local-routes: refused.
+        let overlap = format!(
+            "{base}  port eth4 cores 1 steer off vlans 88,1337\n  \
+             local-route 23.191.200.0/24 port eth4 vlan 1337\n  \
+             local-route 23.191.200.0/25 port eth4 vlan 88\n"
+        );
+        let e = Config::parse(&overlap)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(format!("{e}").contains("overlaps"), "{e}");
+    }
+
+    /// dst steering into VPP without local delivery for a steerable
+    /// local prefix is a 100%-inbound blackhole (the w20 shape), so it
+    /// is a load-time refusal. Pure transit needs no local-routes.
+    #[test]
+    fn dst_direction_requires_local_route_coverage() {
+        let fp = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+                  attach eth4 generic\n  allow-prefix 23.191.200.0/24\n  \
+                  local-prefix 23.191.200.0/24 via br1337\n\n";
+        let vpp_base = "module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
+                        port eth3 cores 1 steer on direction dst\n";
+
+        // dst steering, steerable local prefix, no local-route: refused.
+        let uncovered = format!("{fp}{vpp_base}  port eth4 cores 1 steer off vlans 1337\n");
+        let e = Config::parse(&uncovered)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(format!("{e}").contains("not fully covered"), "{e}");
+
+        // Same but covered: valid.
+        let covered = format!(
+            "{fp}{vpp_base}  port eth4 cores 1 steer off vlans 1337\n  \
+             local-route 23.191.200.0/24 port eth4 vlan 1337\n"
+        );
+        Config::parse(&covered)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap();
+
+        // Partial tiling: one /25 present, the other missing → refused;
+        // both present → the pair covers the /24 and it is valid.
+        let half = format!(
+            "{fp}{vpp_base}  port eth4 cores 1 steer off vlans 88,1337\n  \
+             local-route 23.191.200.0/25 port eth4 vlan 1337\n"
+        );
+        assert!(Config::parse(&half)
+            .unwrap()
+            .validate_vpp_offload()
+            .is_err());
+        let tiled = format!(
+            "{fp}{vpp_base}  port eth4 cores 1 steer off vlans 88,1337\n  \
+             local-route 23.191.200.0/25 port eth4 vlan 1337\n  \
+             local-route 23.191.200.128/25 port eth4 vlan 88\n"
+        );
+        Config::parse(&tiled)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap();
+
+        // src steering never needs coverage.
+        let src = format!(
+            "{fp}module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
+             port eth3 cores 1 steer on direction src\n  port eth4 cores 1 steer off\n"
+        );
+        Config::parse(&src).unwrap().validate_vpp_offload().unwrap();
+
+        // dst steering with no local prefix in the allowlist's path
+        // (pure transit): nothing to cover, valid. The global default
+        // direction (`both`) triggers coverage exactly like `dst`.
+        let transit = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+                       allow-prefix 198.18.0.0/15\n\n\
+                       module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
+                       port eth3 cores 1 steer on\n";
+        Config::parse(transit)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap();
     }
 
     #[test]

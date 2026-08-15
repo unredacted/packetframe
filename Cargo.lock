@@ -762,6 +762,9 @@ name = "packetframe-vpp-offload"
 version = "0.2.7"
 dependencies = [
  "libc",
+ "netlink-packet-core",
+ "netlink-packet-route",
+ "netlink-sys",
  "packetframe-common",
  "serde",
  "serde_json",

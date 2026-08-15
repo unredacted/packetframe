@@ -218,13 +218,14 @@ impl Default for McamBudget {
 /// The sides a configured [`VppSteerDirection`] matches.
 ///
 /// `both` is right for pure-transit deployments where VPP can forward
-/// either direction of a flow. `src` is the service-edge shape:
-/// outbound (src in the service prefix) rides VPP full-table best
-/// path while inbound stays on the eBPF tier, whose FDB-pin owns
-/// local delivery — dst-steering inbound service traffic would divert
-/// it into a FIB with no path to the bridge-attached hosts it
-/// terminates on. Split-tier flow halves are safe under the
-/// stateless-transit invariant steering already requires.
+/// either direction of a flow. `src` is the service-edge staging
+/// shape: outbound (src in the service prefix) rides VPP full-table
+/// best path while inbound stays on the eBPF tier. `dst` steers
+/// inbound, which is loadable only with `local-route` coverage of
+/// steerable local prefixes — VPP must be able to DELIVER what a dst
+/// rule diverts, and config validation refuses otherwise. Split-tier
+/// flow halves are safe under the stateless-transit invariant
+/// steering already requires.
 pub fn sides_for(direction: VppSteerDirection) -> &'static [Side] {
     match direction {
         VppSteerDirection::Src => &[Side::Src],

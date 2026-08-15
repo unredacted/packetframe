@@ -113,6 +113,12 @@ pub struct AttachedPort {
     /// report a device index, and nothing downstream needs it).
     pub dev_index: Option<u32>,
     pub sw_if_index: u32,
+    /// `(vlan id, sw_if_index)` for every dot1q subinterface this
+    /// port carries, created or adopted — in `vlans` declaration
+    /// order. These are what `local-route` attached routes and the
+    /// bridge neighbour mirror reference: a FIB path on the PARENT
+    /// index would transmit untagged and die on the trunk.
+    pub subifs: Vec<(u16, u32)>,
 }
 
 #[derive(Debug)]
@@ -308,11 +314,12 @@ pub fn attach_ports(
                 set_accept_macs(t, p, idx)?;
                 set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
-                ensure_vlan_subifs(t, p, idx, loop_idx, &existing)?;
+                let subifs = ensure_vlan_subifs(t, p, idx, loop_idx, &existing)?;
                 out.push(AttachedPort {
                     port: p.port.clone(),
                     dev_index: None,
                     sw_if_index: idx,
+                    subifs,
                 });
                 continue;
             }
@@ -364,11 +371,12 @@ pub fn attach_ports(
         // A freshly created parent cannot have subifs, so the dump
         // taken before this pass is still the right reuse authority:
         // it can only say "not found", and every vid gets created.
-        ensure_vlan_subifs(t, p, sw_if_index, loop_idx, &existing)?;
+        let subifs = ensure_vlan_subifs(t, p, sw_if_index, loop_idx, &existing)?;
         out.push(AttachedPort {
             port: p.port.clone(),
             dev_index: Some(dev_index),
             sw_if_index,
+            subifs,
         });
     }
     Ok(out)
@@ -806,10 +814,11 @@ fn ensure_vlan_subifs(
     parent_idx: u32,
     loop_idx: u32,
     existing: &[Interface],
-) -> Result<(), AttachError> {
+) -> Result<Vec<(u16, u32)>, AttachError> {
     if p.vlans.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut out = Vec::with_capacity(p.vlans.len());
     let parent_name = existing
         .iter()
         .find(|i| i.sw_if_index == parent_idx)
@@ -856,8 +865,9 @@ fn ensure_vlan_subifs(
             reused = reused.is_some(),
             "dot1q subif ready — tagged steered ingress classifies to ip4 instead of punting"
         );
+        out.push((vid, sub_idx));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Promiscuous mode on the member VF — a shared-LMAC VOTE, not a local
