@@ -356,6 +356,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         bpffs_root,
         attach_ifaces,
         vpp_ports,
+        vpp_steer_ports,
         vpp_workers,
         vpp_binary,
         allowlist,
@@ -374,6 +375,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 }
                 let ifaces = feasibility::attach_ifaces_from_config(&c);
                 let vpp_ports = feasibility::vpp_ports_from_config(&c);
+                let vpp_steer_ports = feasibility::vpp_steer_ports_from_config(&c);
                 let vpp_workers = feasibility::vpp_workers_from_config(&c);
                 let vpp_binary = feasibility::vpp_binary_from_config(&c);
                 let allowlist = feasibility::allowlist_from_config(&c);
@@ -383,6 +385,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     c.global.bpffs_root,
                     ifaces,
                     vpp_ports,
+                    vpp_steer_ports,
                     vpp_workers,
                     vpp_binary,
                     allowlist,
@@ -399,6 +402,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             std::path::PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             0,
             None,
             Vec::new(),
@@ -412,6 +416,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         &attach_ifaces,
         &feasibility::VppProbeInputs {
             ports: &vpp_ports,
+            steer_ports: &vpp_steer_ports,
             workers: vpp_workers,
             binary: vpp_binary.as_deref(),
             steer_directions: &vpp_dirs,

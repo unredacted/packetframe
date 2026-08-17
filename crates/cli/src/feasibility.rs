@@ -71,6 +71,30 @@ pub fn vpp_workers_from_config(config: &Config) -> u32 {
     workers
 }
 
+/// The ports configured `steer on` — the set whose NICs the budget
+/// probe queries, mirroring attach's `ifaces_to_query` so the two
+/// cannot disagree (a down idle member must not fail the probe for a
+/// config attach accepts).
+pub fn vpp_steer_ports_from_config(config: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in &config.modules {
+        if m.name != "vpp-offload" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::VppPort {
+                iface, steer: true, ..
+            } = d
+            {
+                if !out.contains(iface) {
+                    out.push(iface.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The DISTINCT effective steer directions of the steering ports —
 /// each port's `direction` tail falling back to the global, exactly as
 /// the module derives its per-port plans, so the budget probe runs the
@@ -239,6 +263,7 @@ pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
 /// list stops growing by one per directive (clippy agrees at eight).
 pub struct VppProbeInputs<'a> {
     pub ports: &'a [String],
+    pub steer_ports: &'a [String],
     pub workers: u32,
     pub binary: Option<&'a str>,
     pub steer_directions: &'a [VppSteerDirection],
@@ -277,6 +302,7 @@ pub fn probe_and_render(
     if !vpp.ports.is_empty() {
         for cap in packetframe_vpp_offload::run_feasibility_probes(
             vpp.ports,
+            vpp.steer_ports,
             vpp.workers,
             vpp.binary,
             allowlist,
