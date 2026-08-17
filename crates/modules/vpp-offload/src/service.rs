@@ -157,6 +157,12 @@ pub struct SteeringRequest {
     /// `(PF iface, VF index, rules)` for every port now configured
     /// `steer on` — per-port rules because direction is per-port.
     pub targets: Vec<(String, u32, crate::steer::RuleSet)>,
+    /// The reloaded `steer-exempt` set, for the drift tripwire. It
+    /// rides the steering request because it IS part of the steering
+    /// config — the same directive produces both the Keep rules and
+    /// the scan's notion of what is covered, and letting them travel
+    /// separately is how the watcher ended up frozen at attach.
+    pub exempts: Vec<packetframe_common::config::Ipv4Prefix>,
     /// Whether traffic should be diverted once the target is in place.
     /// False is the rollback landing zone, not an error.
     pub want_steer: bool,
@@ -609,6 +615,7 @@ impl SupervisionService {
     pub fn apply_steering(
         &self,
         targets: Vec<(String, u32, crate::steer::RuleSet)>,
+        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
         want_steer: bool,
         lever_moved: bool,
     ) -> Result<(), String> {
@@ -623,6 +630,7 @@ impl SupervisionService {
             .replace(SteeringRequest {
                 seq,
                 targets,
+                exempts,
                 want_steer,
                 lever_moved,
             });
@@ -876,6 +884,7 @@ fn apply_steering(
         ));
     }
     runtime.retarget(req.targets.clone());
+    runtime.set_drift_exempts(req.exempts.clone());
 
     let steered = driver.supervisor().is_steered();
     // INTENDED, not steered. The two differ in exactly the case an

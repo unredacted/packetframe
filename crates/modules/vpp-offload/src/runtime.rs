@@ -1343,6 +1343,11 @@ impl Runtime {
         self.core.borrow_mut().retarget(targets);
     }
 
+    /// Hand the exemption tripwire a reloaded exemption set.
+    pub fn set_drift_exempts(&self, exempts: Vec<packetframe_common::config::Ipv4Prefix>) {
+        self.core.borrow_mut().set_drift_exempts(exempts);
+    }
+
     /// The two trait views the driver's tick takes.
     pub fn views(&self) -> (ObserveView, EffectsView) {
         (
@@ -1884,6 +1889,24 @@ impl Core {
     fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
         self.steering.retarget(targets);
         self.last_steer_audit = None;
+    }
+
+    /// Hand the exemption tripwire the reloaded `steer-exempt` set.
+    ///
+    /// Called from the same place as `retarget` and for the same
+    /// reason the audit is invalidated there: the scan's verdict was
+    /// computed against the OLD config the moment this one is
+    /// accepted. Also clears the scan clock, so the next status poll
+    /// re-reads rather than serving a verdict about a config that no
+    /// longer exists — the operator who just added the exemption the
+    /// health line asked for should not have to wait out a minute of
+    /// it still complaining.
+    fn set_drift_exempts(&mut self, exempts: Vec<packetframe_common::config::Ipv4Prefix>) {
+        if let Some(w) = self.drift_watch.as_mut() {
+            w.set_exempts(exempts);
+            self.last_drift_scan = None;
+            self.drift_uncovered.clear();
+        }
     }
 
     /// Whether a steer against the current target would divert traffic

@@ -36,9 +36,12 @@ use packetframe_common::config::Ipv4Prefix;
 pub struct KernelRoute {
     /// Destination prefix. A default route is `0.0.0.0/0`.
     pub prefix: Ipv4Prefix,
-    /// Output device name, or `None` for routes with no oif (which
-    /// this check ignores — nothing to compare against).
-    pub oif: Option<String>,
+    /// Output device name(s). More than one for a multipath route —
+    /// ECMP encodes its nexthops in `RTA_MULTIPATH` rather than
+    /// `RTA_OIF`, and a route read as having no device at all would
+    /// be skipped silently (review finding). Empty means the kernel
+    /// named no interface, which this check has nothing to say about.
+    pub oifs: Vec<String>,
     /// Routing table id, for the operator-facing message: "table 100"
     /// is how they will find it again.
     pub table: u32,
@@ -46,6 +49,14 @@ pub struct KernelRoute {
     /// unreachable, prohibit). VPP dropping the same packet is
     /// equivalent behaviour, so these are not findings.
     pub drops: bool,
+    /// `RTN_LOCAL`: an address the kernel TERMINATES rather than a
+    /// path it forwards over. Its `oif` names the interface that owns
+    /// the address, which is not an egress VPP could take — so device
+    /// reachability says nothing about it and must not be consulted
+    /// (review finding: the local class this scan exists to cover was
+    /// being skipped precisely because those addresses sit on member
+    /// ports and bridges).
+    pub local: bool,
 }
 
 /// What VPP can actually egress, from config: member ports and the
@@ -66,31 +77,91 @@ impl VppReach {
     }
 }
 
+/// Which destinations steering can actually divert into VPP.
+///
+/// `Any` — some port matches on SOURCE, so a steered host's packet
+/// reaches VPP whatever it is addressed to, and every kernel path is
+/// at risk. `OnlyDst(prefixes)` — every steering port matches on
+/// destination, so only packets addressed inside the allowlist are
+/// diverted at all, and demanding an MCAM slot for a path no packet
+/// can reach would spend a scarce resource on nothing (review
+/// finding).
+#[derive(Debug, Clone)]
+pub enum Divertible<'a> {
+    Any,
+    OnlyDst(&'a [packetframe_common::fib::IpPrefix]),
+}
+
+impl Divertible<'_> {
+    /// Can a packet for `prefix` be diverted into VPP at all?
+    ///
+    /// OVERLAP, not containment: a dst rule for one address inside a
+    /// route's prefix is enough to send traffic for that route into
+    /// VPP, so the route is at risk even though the allowlist does
+    /// not cover all of it.
+    fn reaches(&self, prefix: &Ipv4Prefix) -> bool {
+        match self {
+            Self::Any => true,
+            Self::OnlyDst(allow) => allow.iter().any(|a| {
+                let packetframe_common::fib::IpPrefix::V4 { addr, prefix_len } = a else {
+                    return false;
+                };
+                let a = Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::from(*addr),
+                    prefix_len: *prefix_len,
+                };
+                a.contains_prefix(prefix) || prefix.contains_prefix(&a)
+            }),
+        }
+    }
+}
+
 /// A kernel path VPP cannot take that nothing exempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uncovered {
     pub prefix: Ipv4Prefix,
     pub oif: String,
     pub table: u32,
+    /// A terminated address rather than a forwarding path — the
+    /// message says so, because the remedy reads differently.
+    pub local: bool,
 }
 
 impl std::fmt::Display for Uncovered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}/{} via {} (table {})",
-            self.prefix.addr, self.prefix.prefix_len, self.oif, self.table
-        )
+        if self.local {
+            write!(
+                f,
+                "{}/{} terminates on {} (table {}, the router's own address)",
+                self.prefix.addr, self.prefix.prefix_len, self.oif, self.table
+            )
+        } else {
+            write!(
+                f,
+                "{}/{} via {} (table {})",
+                self.prefix.addr, self.prefix.prefix_len, self.oif, self.table
+            )
+        }
     }
 }
 
 /// The pure half: which kernel routes would blackhole under steering.
 ///
-/// A route is a finding iff it egresses a device VPP cannot use, the
-/// kernel does not drop it itself, and no `steer-exempt` covers its
-/// prefix. Deliberately NOT filtered by the allowlist: with source
-/// steering, which packets get diverted is decided by where they came
-/// FROM, so any destination a steered host can reach is at risk.
+/// A route is a finding iff steering can divert traffic for it, the
+/// kernel does not drop it itself, VPP has no way to deliver it, and
+/// no `steer-exempt` covers its prefix.
+///
+/// "No way to deliver it" is two different questions:
+///
+/// - a FORWARDED route is unreachable when none of its nexthop
+///   devices is a member port or a `local-route` bridge. Multipath
+///   counts as reachable if ANY path is, because VPP installs the
+///   paths it can resolve and forwards over those;
+/// - a LOCAL route is an address the kernel terminates. VPP has no
+///   local delivery at all, so device reachability is irrelevant and
+///   asking it is the bug this arm exists to fix — the w23 blackhole
+///   was traffic to a gateway address sitting on a bridge that this
+///   scan would otherwise have called covered.
 ///
 /// Coverage is by prefix containment, and an exempt must contain the
 /// route — not merely overlap it. A `/32` exemption does not cover the
@@ -101,14 +172,27 @@ pub fn uncovered_paths(
     routes: &[KernelRoute],
     reach: &VppReach,
     exempts: &[Ipv4Prefix],
+    divertible: &Divertible<'_>,
 ) -> Vec<Uncovered> {
     let mut out = Vec::new();
     for r in routes {
-        if r.drops {
+        if r.drops || !divertible.reaches(&r.prefix) {
             continue;
         }
-        let Some(oif) = &r.oif else { continue };
-        if reach.covers_device(oif) {
+        let Some(oif) = r.oifs.first() else { continue };
+        if r.local {
+            // Only the segments whose hosts steering diverts. A
+            // transit port's own address is reachable from a steered
+            // host only by a route that would itself be a finding,
+            // and reporting every address on the box would demand
+            // more exemptions than the 16-slot budget holds — an
+            // alarm with no available remedy is one operators learn
+            // to ignore. Documented in the runbook, with the
+            // null-drop gauge as the backstop for the rest.
+            if !reach.local_devices.iter().any(|d| d == oif) {
+                continue;
+            }
+        } else if r.oifs.iter().any(|d| reach.covers_device(d)) {
             continue;
         }
         // Built-in exemptions cover these on every steered port.
@@ -128,6 +212,7 @@ pub fn uncovered_paths(
             prefix: r.prefix,
             oif: oif.clone(),
             table: r.table,
+            local: r.local,
         });
     }
     out.sort_by_key(|u| (u.prefix.prefix_len, u32::from(u.prefix.addr)));
@@ -142,23 +227,48 @@ pub trait DriftWatch {
     /// hold. `Err` = the kernel would not answer; the caller keeps its
     /// previous verdict.
     fn uncovered(&mut self) -> Result<Vec<String>, String>;
+
+    /// Adopt a reloaded exemption set. Called from the same place the
+    /// steering target is retargeted, so the scan judges the config
+    /// the operator just applied rather than the one at attach.
+    fn set_exempts(&mut self, exempts: Vec<Ipv4Prefix>);
 }
 
 /// The production scan: dump every IPv4 route in every table, compare.
 #[cfg(target_os = "linux")]
 pub struct KernelDriftWatch {
     pub reach: VppReach,
+    /// The CURRENT exemptions. `steer-exempt` is hot-reloadable, so
+    /// this is refreshed on every accepted reconfigure — a watcher
+    /// frozen at attach would call a newly-unexempted path covered
+    /// (the blackhole this exists to catch) and, worse, keep
+    /// reporting a path the operator had just exempted BECAUSE the
+    /// health message told them to (review finding).
     pub exempts: Vec<Ipv4Prefix>,
+    /// Whether steering can divert anything, or only allowlisted
+    /// destinations. Config-derived and restart-only, like the port
+    /// directions it comes from.
+    pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
 }
 
 #[cfg(target_os = "linux")]
 impl DriftWatch for KernelDriftWatch {
     fn uncovered(&mut self) -> Result<Vec<String>, String> {
         let routes = dump_routes()?;
-        Ok(uncovered_paths(&routes, &self.reach, &self.exempts)
-            .into_iter()
-            .map(|u| u.to_string())
-            .collect())
+        let divertible = match &self.dst_only {
+            Some(allow) => Divertible::OnlyDst(allow),
+            None => Divertible::Any,
+        };
+        Ok(
+            uncovered_paths(&routes, &self.reach, &self.exempts, &divertible)
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect(),
+        )
+    }
+
+    fn set_exempts(&mut self, exempts: Vec<Ipv4Prefix>) {
+        self.exempts = exempts;
     }
 }
 
@@ -224,12 +334,21 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                 NetlinkPayload::Error(e) => return Err(format!("netlink error: {e}")),
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
                     let mut dst: Option<std::net::Ipv4Addr> = None;
-                    let mut oif: Option<u32> = None;
+                    let mut oifs: Vec<u32> = Vec::new();
                     let mut table = u32::from(m.header.table);
                     for attr in &m.attributes {
                         match attr {
                             RouteAttribute::Destination(RouteAddress::Inet(a)) => dst = Some(*a),
-                            RouteAttribute::Oif(i) => oif = Some(*i),
+                            RouteAttribute::Oif(i) => oifs.push(*i),
+                            // ECMP puts its nexthops HERE and leaves
+                            // RTA_OIF unset, so a route read only for
+                            // RTA_OIF looks device-less and gets
+                            // skipped — an all-tunnel ECMP route would
+                            // blackhole under a clean health surface
+                            // (review finding).
+                            RouteAttribute::MultiPath(hops) => {
+                                oifs.extend(hops.iter().map(|h| h.interface_index))
+                            }
                             // RTA_TABLE carries ids past the u8 header
                             // field — policy tables live up there.
                             RouteAttribute::Table(t) => table = *t,
@@ -242,17 +361,21 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             addr: dst.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                             prefix_len: m.header.destination_prefix_length,
                         },
-                        oif: oif.map(|i| {
-                            names
-                                .entry(i)
-                                .or_insert_with(|| crate::fdb::ifname(i))
-                                .clone()
-                        }),
+                        oifs: oifs
+                            .into_iter()
+                            .map(|i| {
+                                names
+                                    .entry(i)
+                                    .or_insert_with(|| crate::fdb::ifname(i))
+                                    .clone()
+                            })
+                            .collect(),
                         table,
                         drops: matches!(
                             m.header.kind,
                             RouteType::BlackHole | RouteType::Unreachable | RouteType::Prohibit
                         ),
+                        local: m.header.kind == RouteType::Local,
                     });
                 }
                 _ => {}
@@ -278,9 +401,10 @@ mod tests {
     fn route(prefix: Ipv4Prefix, oif: &str) -> KernelRoute {
         KernelRoute {
             prefix,
-            oif: Some(oif.to_string()),
+            oifs: vec![oif.to_string()],
             table: 100,
             drops: false,
+            local: false,
         }
     }
 
@@ -289,6 +413,10 @@ mod tests {
             members: vec!["eth3".into(), "eth4".into()],
             local_devices: vec!["br1337".into()],
         }
+    }
+
+    fn find(routes: &[KernelRoute], exempts: &[Ipv4Prefix]) -> Vec<Uncovered> {
+        uncovered_paths(routes, &reach(), exempts, &Divertible::Any)
     }
 
     /// The w26 shape: tunnel-bound routes are findings, and only the
@@ -302,65 +430,144 @@ mod tests {
             route(p(23, 191, 200, 0, 24), "br1337"), // local delivery: fine
             route(p(10, 0, 0, 0, 8), "eth4"),       // member: fine
         ];
-        let found = uncovered_paths(&routes, &reach(), &[]);
+        let found = find(&routes, &[]);
         assert_eq!(found.len(), 2, "{found:?}");
-        assert!(found.iter().any(|u| u.oif == "vti64"));
+        assert!(found.iter().all(|u| u.oif == "vti64"));
 
-        // Exempting both silences it.
         let exempts = [p(23, 191, 201, 0, 24), p(23, 191, 200, 2, 32)];
-        assert!(uncovered_paths(&routes, &reach(), &exempts).is_empty());
+        assert!(find(&routes, &exempts).is_empty());
     }
 
     /// Containment, not overlap: a /32 exemption inside a /24 route
-    /// does NOT cover the /24. Reporting it as handled because one
-    /// host is exempted is the silent-hole shape this exists to end.
+    /// does NOT cover the /24.
     #[test]
     fn an_exemption_must_contain_the_route_not_merely_overlap_it() {
         let routes = vec![route(p(23, 191, 201, 0, 24), "vti64")];
-        let too_narrow = [p(23, 191, 201, 5, 32)];
         assert_eq!(
-            uncovered_paths(&routes, &reach(), &too_narrow).len(),
+            find(&routes, &[p(23, 191, 201, 5, 32)]).len(),
             1,
             "a /32 inside the route must not silence the /24"
         );
-        // The other direction is genuine cover.
-        let wide = [p(23, 191, 0, 0, 16)];
-        assert!(uncovered_paths(&routes, &reach(), &wide).is_empty());
+        assert!(find(&routes, &[p(23, 191, 0, 0, 16)]).is_empty());
     }
 
     /// Routes the kernel drops itself are not findings: VPP dropping
-    /// the same packet is the same outcome, one hop earlier. The
-    /// reference primary's bird carries a service host as
-    /// `unreachable`, and flagging it would be permanent noise.
+    /// the same packet is the same outcome, one hop earlier.
     #[test]
     fn routes_the_kernel_itself_drops_are_not_findings() {
         let mut blackhole = route(p(198, 18, 0, 0, 15), "vti64");
         blackhole.drops = true;
         let mut no_oif = route(p(203, 0, 113, 0, 24), "vti64");
-        no_oif.oif = None;
-        let found = uncovered_paths(&[blackhole, no_oif], &reach(), &[]);
-        assert!(found.is_empty(), "{found:?}");
+        no_oif.oifs.clear();
+        assert!(find(&[blackhole, no_oif], &[]).is_empty());
     }
 
     /// Broadcast and multicast are exempted on every steered port
-    /// without a directive, so the scan must not demand config for
-    /// what is already handled.
+    /// without a directive.
     #[test]
     fn the_built_in_exemptions_count_as_cover() {
         let routes = vec![
             route(p(224, 0, 0, 0, 4), "vti64"),
             route(p(255, 255, 255, 255, 32), "vti64"),
         ];
-        assert!(uncovered_paths(&routes, &reach(), &[]).is_empty());
+        assert!(find(&routes, &[]).is_empty());
+    }
+
+    /// A LOCAL route is an address the kernel terminates, so device
+    /// reachability says nothing about it — VPP has no local delivery
+    /// at any interface. Skipping these because their oif is a member
+    /// or bridge is exactly how the w23 class (110,917 packets to a
+    /// gateway address in five minutes) would go unreported by a scan
+    /// whose docs claimed to cover it (review finding).
+    #[test]
+    fn a_local_address_on_a_service_bridge_is_a_finding_despite_the_device() {
+        let mut gw = route(p(23, 191, 200, 1, 32), "br1337");
+        gw.local = true;
+        gw.table = 255;
+        let found = find(&[gw.clone()], &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].local);
+        assert!(
+            found[0].to_string().contains("terminates on br1337"),
+            "the message must read as termination, not a path: {}",
+            found[0]
+        );
+        // And the exemption an operator would add silences it.
+        assert!(find(&[gw], &[p(23, 191, 200, 1, 32)]).is_empty());
+    }
+
+    /// Local addresses NOT on a steered segment are deliberately out
+    /// of scope: the 16-slot budget cannot hold an exemption for every
+    /// address on the box, and an alarm with no available remedy is
+    /// one operators learn to ignore. Documented, with the null-drop
+    /// gauge as the backstop.
+    #[test]
+    fn local_addresses_off_the_steered_segments_are_out_of_scope() {
+        let mut transit = route(p(194, 110, 60, 51, 32), "eth3");
+        transit.local = true;
+        let mut loopback = route(p(127, 0, 0, 1, 32), "lo");
+        loopback.local = true;
+        assert!(find(&[transit, loopback], &[]).is_empty());
+    }
+
+    /// ECMP encodes nexthops in RTA_MULTIPATH, leaving RTA_OIF unset.
+    /// A route read only for RTA_OIF looks device-less and is skipped
+    /// — so an all-tunnel ECMP route would blackhole under a clean
+    /// health surface (review finding). Any reachable path makes the
+    /// route deliverable, because VPP installs the paths it can
+    /// resolve and forwards over those.
+    #[test]
+    fn a_multipath_route_is_judged_by_all_its_nexthops() {
+        let all_tunnel = KernelRoute {
+            prefix: p(198, 51, 100, 0, 24),
+            oifs: vec!["vti64".into(), "wg0".into()],
+            table: 254,
+            drops: false,
+            local: false,
+        };
+        assert_eq!(find(&[all_tunnel], &[]).len(), 1);
+
+        let mixed = KernelRoute {
+            prefix: p(198, 51, 100, 0, 24),
+            oifs: vec!["vti64".into(), "eth3".into()],
+            table: 254,
+            drops: false,
+            local: false,
+        };
+        assert!(
+            find(&[mixed], &[]).is_empty(),
+            "one resolvable path is enough for VPP to forward the prefix"
+        );
+    }
+
+    /// Under dst-only steering the NIC diverts only packets addressed
+    /// inside the allowlist, so a path outside it can never enter VPP
+    /// and must not cost an exemption slot (review finding). Any src
+    /// rule anywhere restores the everything-is-at-risk scope.
+    #[test]
+    fn dst_only_steering_scopes_the_scan_to_divertible_destinations() {
+        use packetframe_common::fib::IpPrefix;
+        let allow = [IpPrefix::V4 {
+            addr: [23, 191, 200, 0],
+            prefix_len: 24,
+        }];
+        let routes = vec![
+            route(p(23, 191, 200, 2, 32), "vti64"), // inside the allowlist
+            route(p(198, 51, 100, 0, 24), "vti64"), // outside it
+        ];
+        let scoped = uncovered_paths(&routes, &reach(), &[], &Divertible::OnlyDst(&allow));
+        assert_eq!(scoped.len(), 1, "{scoped:?}");
+        assert_eq!(scoped[0].prefix.addr, Ipv4Addr::new(23, 191, 200, 2));
+
+        // A src rule anywhere means any destination can be diverted.
+        assert_eq!(find(&routes, &[]).len(), 2);
     }
 
     /// The operator-facing line names the three things needed to act:
     /// what, out of where, and which table to look in.
     #[test]
     fn a_finding_names_prefix_device_and_table() {
-        let mut r = route(p(23, 191, 201, 0, 24), "vti64");
-        r.table = 100;
-        let found = uncovered_paths(&[r], &reach(), &[]);
+        let found = find(&[route(p(23, 191, 201, 0, 24), "vti64")], &[]);
         let line = found[0].to_string();
         assert!(line.contains("23.191.201.0/24"), "{line}");
         assert!(line.contains("vti64"), "{line}");

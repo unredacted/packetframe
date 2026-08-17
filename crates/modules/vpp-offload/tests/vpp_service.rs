@@ -1332,7 +1332,7 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
     }
 
     // The operator turns the lever; the steer is refused.
-    svc.apply_steering(uniform1(plan_for(2)), true, true)
+    svc.apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect_err("the refusal is the operator's answer");
     assert_eq!(
         svc.status().expect("published").state,
@@ -1346,7 +1346,7 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
     // steer's own reason, and one that took the staging early return
     // answers Ok having done nothing at all.
     let again = svc
-        .apply_steering(uniform1(plan_for(2)), true, false)
+        .apply_steering(uniform1(plan_for(2)), Vec::new(), true, false)
         .expect_err(
             "an unchanged-config reconfigure over a refused steer must re-attempt it; \
              reporting Ok while doing nothing is worse than refusing, because the \
@@ -1360,7 +1360,7 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
     // And with the blocker gone it lands, without waiting out the
     // module's own retry interval.
     allow.store(true, std::sync::atomic::Ordering::SeqCst);
-    svc.apply_steering(uniform1(plan_for(2)), true, false)
+    svc.apply_steering(uniform1(plan_for(2)), Vec::new(), true, false)
         .expect("the retry is accepted");
     assert_eq!(
         svc.status().expect("published").state,
@@ -1468,7 +1468,7 @@ fn an_operator_can_steer_and_unsteer_a_converged_service() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    svc.apply_steering(uniform1(plan_for(2)), true, true)
+    svc.apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect("the canary lever must turn without a restart");
     assert_eq!(
         svc.status().expect("published").state,
@@ -1478,7 +1478,7 @@ fn an_operator_can_steer_and_unsteer_a_converged_service() {
 
     // Rollback: membership stays, the FIB stays synced, traffic returns
     // to the fallback tier.
-    svc.apply_steering(Vec::new(), false, true)
+    svc.apply_steering(Vec::new(), Vec::new(), false, true)
         .expect("rollback");
     assert_eq!(svc.status().expect("published").state, State::Ready);
 
@@ -1552,7 +1552,7 @@ fn a_steering_change_before_convergence_is_refused() {
     .expect("service starts");
 
     let e = svc
-        .apply_steering(uniform1(plan_for(2)), true, true)
+        .apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect_err("must refuse before convergence");
     assert!(
         e.contains("not converged"),
@@ -1647,7 +1647,7 @@ fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
 
     // `steer on` is in the config (ports is non-empty, want_steer true)
     // but the flag did not move in this reconfigure.
-    svc.apply_steering(uniform1(plan_for(2)), true, false)
+    svc.apply_steering(uniform1(plan_for(2)), Vec::new(), true, false)
         .expect("a target update is not an error");
 
     assert_eq!(
@@ -1665,7 +1665,7 @@ fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
 
     // And the operator turning the lever on the very next reconfigure
     // still works, so this withholds rather than latches.
-    svc.apply_steering(uniform1(plan_for(2)), true, true)
+    svc.apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect("the lever still turns");
     // NOT polled, deliberately: the loop publishes before it answers
     // the caller, so a returned `apply_steering` means the window
@@ -1756,7 +1756,7 @@ fn an_allowlist_change_under_live_steering_is_always_reconciled() {
 
     // The lever did NOT move — only the allowlist did.
     log.lock().unwrap().clear();
-    svc.apply_steering(uniform1(plan_for(1)), true, false)
+    svc.apply_steering(uniform1(plan_for(1)), Vec::new(), true, false)
         .expect("a live port must be reconciled");
 
     let seen = log.lock().unwrap().clone();
@@ -1865,7 +1865,7 @@ fn a_first_steer_refused_by_the_fib_gate_is_still_remembered() {
 
     // The operator turns the lever into an incomplete table.
     let err = svc
-        .apply_steering(uniform1(plan_for(2)), true, true)
+        .apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect_err("an incomplete FIB is not one to divert traffic into");
     assert!(err.contains("refusing the first steer"), "{err}");
     assert!(
@@ -2015,7 +2015,7 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
     // the episode is NOT over — and stays remembered until steering
     // matches intent again.
     let err = svc
-        .apply_steering(uniform1(plan_for(2)), true, true)
+        .apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect_err("the gate is closed");
     assert!(err.contains("refusing to steer"), "{err}");
     let seeded = svc.status().expect("published");
@@ -2030,7 +2030,7 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
 
     // Recovery: the operator's retry succeeds and the module steers.
     allow.store(true, std::sync::atomic::Ordering::SeqCst);
-    svc.apply_steering(uniform1(plan_for(2)), true, true)
+    svc.apply_steering(uniform1(plan_for(2)), Vec::new(), true, true)
         .expect("the lever turns once the gate opens");
 
     // The regression, both defects at once. The episode reasons must

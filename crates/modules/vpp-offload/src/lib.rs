@@ -1139,7 +1139,12 @@ impl Module for VppOffloadModule {
             .ne(new.ports.iter().map(|(_, _, steer, _, _)| *steer));
         attached
             .service
-            .apply_steering(target.targets, target.want_steer, lever_moved)
+            .apply_steering(
+                target.targets,
+                new.steer_exempts.clone(),
+                target.want_steer,
+                lever_moved,
+            )
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Recorded only after the change landed. A `cfg` updated ahead of
         // the apply would make the NEXT reconfigure diff against a target

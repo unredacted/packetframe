@@ -403,6 +403,26 @@ pub fn bring_up(
         .iter()
         .map(|(iface, _, _, _, _)| (iface.clone(), 0u32))
         .collect();
+    // Can steering divert anything, or only allowlisted destinations?
+    // Derived from CONFIG rather than from the lever, so the answer
+    // does not change under an operator turning a port on: if every
+    // port this config could ever steer matches on dst, a path
+    // outside the allowlist can never enter VPP and demanding an
+    // exemption slot for it would spend a scarce resource on nothing.
+    // Any src (or `both`) port anywhere means any destination is
+    // reachable — the conservative default, including when the config
+    // declares no direction at all.
+    let dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>> = {
+        let mut all_dst = !cfg.ports.is_empty();
+        for (_, _, _, _, dir) in &cfg.ports {
+            if dir.unwrap_or(cfg.steer_direction)
+                != packetframe_common::config::VppSteerDirection::Dst
+            {
+                all_dst = false;
+            }
+        }
+        all_dst.then(|| allowlist.to_vec())
+    };
     let steering = NtupleSteering::new(member_ports, steer_targets);
 
     let workers = cfg.total_workers();
@@ -557,6 +577,7 @@ pub fn bring_up(
         &port_vlans,
         local_routes,
         &cfg.steer_exempts,
+        dst_only_scope,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -631,6 +652,7 @@ fn finish(
     port_vlans: &[(String, Vec<u16>)],
     local_routes: &[crate::LocalRoute],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+    dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>>,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -948,9 +970,10 @@ fn finish(
         runtime.drift_watch(Box::new(crate::drift::KernelDriftWatch {
             reach: drift_reach,
             exempts: drift_exempts,
+            dst_only: dst_only_scope,
         }));
         #[cfg(not(target_os = "linux"))]
-        let _ = (drift_reach, drift_exempts);
+        let _ = (drift_reach, drift_exempts, dst_only_scope);
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is

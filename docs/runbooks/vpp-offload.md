@@ -639,19 +639,41 @@ what `ip route show table <n>` needs to find it again. The remedy is
 one `steer-exempt` per path (one MCAM slot each — check the budget
 line in `packetframe feasibility`), or leaving that port unsteered.
 
-What it deliberately does NOT report: routes the kernel itself drops
-(blackhole, unreachable, prohibit — VPP dropping the same packet is
-the same outcome), paths out member ports or the bridges
-`local-route` delivers into, and the built-in broadcast/multicast
-exemptions. It DOES include the local table, because traffic to the
-router's own addresses dies in VPP the same way — that is the w23
-blackhole (110,917 packets in five minutes), and a check that only
-looked at forwarding would have missed the first instance of the very
-class it exists for.
+What it reports, and what it deliberately does not:
+
+- **Forwarded routes** are findings when NO nexthop device is a
+  member port or a `local-route` bridge. Multipath is judged across
+  every nexthop (ECMP hides its devices in `RTA_MULTIPATH`, not
+  `RTA_OIF`); one resolvable path is enough for VPP to forward the
+  prefix, so only an all-unreachable route is reported.
+- **Local addresses** — the router's own, which VPP cannot deliver to
+  at all — are findings on the **steered segments** (the
+  `local-route` bridges). That is the w23 class: 110,917 packets to a
+  gateway address in five minutes. Device reachability is deliberately
+  NOT consulted for these, since the interface named on a local route
+  owns the address rather than being a path.
+- **Out of scope, on purpose:** local addresses elsewhere (transit
+  port IPs, mgmt, loopback). The 16-slot MCAM budget cannot hold an
+  exemption for every address on the box, and an alarm with no
+  available remedy is one operators learn to ignore. The null-drop
+  gauge is the backstop for that remainder.
+- **Not reported:** routes the kernel itself drops (blackhole,
+  unreachable, prohibit — VPP dropping the same packet is the same
+  outcome), and the built-in broadcast/multicast exemptions.
+- **Under `direction dst` on every steering port**, the scan is scoped
+  to destinations the allowlist can actually divert: a path no packet
+  can reach must not cost an exemption slot. Any `src` or `both` port
+  anywhere restores the full scope, because a source-matched packet
+  reaches VPP whatever it is addressed to.
 
 Coverage is by containment, not overlap: a `/32` exemption does not
 silence the `/24` around it. That asymmetry is deliberate — treating
 one exempted host as covering its whole prefix is how a hole hides.
+
+`steer-exempt` is hot-reloadable, and so is this: an accepted
+`packetframe reconfigure` hands the scan the new exemption set and
+re-runs it, so adding the exemption the health line asked for clears
+the line on the next status poll rather than a minute later.
 
 It is detection only. Deriving the exemptions automatically was
 considered and rejected for v1: it would change forwarding without an
