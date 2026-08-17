@@ -680,6 +680,14 @@ evaluating the rest would mean reimplementing the kernel's rule walk,
 where a permissive mistake re-opens the hole. Over-reporting is the
 safe direction and the scan stays on that side of it.
 
+**On a VRF host the table filter switches itself off.** An l3mdev
+rule carries table id 0 and resolves to a VRF's table per packet, so
+the enumeration cannot be complete — filtering by the tables that ARE
+named would drop every VRF route and report clean while steered
+traffic blackholed. A host with one gets no table filtering at all
+(the behaviour before the filter existed), and so does a rule dump
+that fails or comes back empty.
+
 Everything the scan judges against is hot: `steer-exempt`, the
 allowlist, and both direction knobs are rebuilt on `packetframe
 reconfigure`, and the scan's copy is replaced in the same step (then

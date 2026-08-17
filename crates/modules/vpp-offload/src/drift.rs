@@ -318,7 +318,7 @@ impl DriftWatch for KernelDriftWatch {
         // scan costs the blackhole.
         let tables = dump_rule_tables().unwrap_or_else(|e| {
             tracing::debug!(error = %e, "policy-rule dump failed; not filtering by table");
-            Vec::new()
+            None
         });
         let divertible = match &self.dst_only {
             Some(allow) => Divertible::OnlyDst(allow),
@@ -328,7 +328,7 @@ impl DriftWatch for KernelDriftWatch {
             reach: &self.reach,
             exempts: &self.exempts,
             divertible,
-            selected_tables: (!tables.is_empty()).then_some(tables.as_slice()),
+            selected_tables: tables.as_deref(),
         };
         Ok(uncovered_paths(&routes, &scope)
             .into_iter()
@@ -460,12 +460,28 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
     Ok(out)
 }
 
-/// The table ids some policy rule can select.
+/// The table ids some policy rule can select, or `None` when they
+/// cannot be enumerated safely and NOTHING may be filtered.
 ///
 /// One `RTM_GETRULE` dump. See [`Scope::selected_tables`] for what
 /// this models and, more importantly, what it deliberately does not.
+///
+/// `None` has two producers, and both are the safe direction:
+///
+/// - **an l3mdev rule** (`from all lookup [l3mdev-table]`), which
+///   carries table id 0 and resolves to a VRF's table at forwarding
+///   time. Its tables are not in the rule set at all, so filtering by
+///   what IS there would drop every VRF route — and a tunnel route in
+///   an active VRF would go unreported while steered traffic
+///   blackholed (review finding). Mapping l3mdev to its VRF tables
+///   means enumerating VRF devices and their table ids; until that
+///   exists, a host with one gets no filtering, which is exactly the
+///   behaviour before the filter was added.
+/// - **an empty result.** Filtering by an empty set would skip every
+///   route and report a permanently clean scan, which is the failure
+///   this whole module exists to prevent.
 #[cfg(target_os = "linux")]
-pub fn dump_rule_tables() -> Result<Vec<u32>, String> {
+pub fn dump_rule_tables() -> Result<Option<Vec<u32>>, String> {
     use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
     use netlink_packet_route::rule::{RuleAttribute, RuleMessage};
     use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
@@ -513,8 +529,13 @@ pub fn dump_rule_tables() -> Result<Vec<u32>, String> {
                     // exactly as RTA_TABLE does for routes.
                     let mut table = u32::from(m.header.table);
                     for attr in &m.attributes {
-                        if let RuleAttribute::Table(t) = attr {
-                            table = *t;
+                        match attr {
+                            RuleAttribute::Table(t) => table = *t,
+                            // The VRF case: this rule names no table
+                            // of its own and picks one per packet, so
+                            // the enumeration cannot be complete.
+                            RuleAttribute::L3MDev(true) => return Ok(None),
+                            _ => {}
                         }
                     }
                     if table != 0 && !out.contains(&table) {
@@ -526,7 +547,9 @@ pub fn dump_rule_tables() -> Result<Vec<u32>, String> {
             offset += len;
         }
     }
-    Ok(out)
+    // Empty means "no rule named a table", which cannot be used to
+    // filter — see this function's doc.
+    Ok((!out.is_empty()).then_some(out))
 }
 
 #[cfg(test)]
@@ -747,9 +770,30 @@ mod tests {
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].table, 100);
-        // Unknown rule set (dump failed) filters nothing: losing the
-        // narrowing costs noise, losing the scan costs the blackhole.
+        // Unknown rule set filters nothing: losing the narrowing
+        // costs noise, losing the scan costs the blackhole. This is
+        // the arm an l3mdev (VRF) rule takes — its tables resolve per
+        // packet and are absent from the rule set, so filtering by
+        // what IS there would drop every VRF route and report clean
+        // while steered traffic blackholed (review finding). Same arm
+        // for a failed dump, and for an empty enumeration, which
+        // would otherwise skip every route on the box.
         assert_eq!(find(&routes, &[]).len(), 2);
+        let empty_selection: [u32; 0] = [];
+        let blind = uncovered_paths(
+            &routes,
+            &Scope {
+                reach: &reach(),
+                exempts: &[],
+                divertible: Divertible::Any,
+                selected_tables: Some(&empty_selection),
+            },
+        );
+        assert!(
+            blind.is_empty(),
+            "an empty selection filters everything — which is why the dump returns None \
+             for it rather than an empty Vec: {blind:?}"
+        );
     }
 
     /// The scope derivation is shared by attach and reconfigure, so a
