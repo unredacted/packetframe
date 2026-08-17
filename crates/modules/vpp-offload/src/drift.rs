@@ -72,6 +72,20 @@ pub struct KernelRoute {
     /// is counted and reported as a gap in the scan's own coverage
     /// rather than silently dropped or guessed at.
     pub via_nexthop_object: bool,
+    /// The route carries a LIGHTWEIGHT ENCAPSULATION action —
+    /// `ip route ... encap mpls|seg6|ip|xfrm ... dev eth3` — named
+    /// here by its kernel type for the operator-facing message.
+    ///
+    /// This one is nastier than a tunnel device, because the `oif` is
+    /// an ORDINARY device: a member port, usually. Read for
+    /// reachability alone the route looks perfectly coverable, so the
+    /// scan would call it clean while the mirror — which encodes
+    /// prefix, nexthop and interface, and has nowhere to put a label
+    /// stack or a segment list — forwarded the packet bare out the
+    /// same port. Bare is not a slower path, it is a different
+    /// destination (review finding). The encapsulation is a property
+    /// of the PATH, so a multipath hop carrying one counts too.
+    pub encap: Option<String>,
 }
 
 /// What VPP can actually egress, from config: member ports and the
@@ -242,6 +256,12 @@ pub enum Uncovered {
         /// than a forwarding path — the message says so, because the
         /// remedy reads differently.
         kernel_delivers: bool,
+        /// The lightweight-encapsulation type this path applies, when
+        /// it applies one. Present means the finding is about what
+        /// the kernel puts ON the packet, not where it sends it, so
+        /// the message must not read "via a device VPP does not own"
+        /// — VPP very likely owns it, which is the trap.
+        encap: Option<String>,
     },
     /// Routes using nexthop objects, whose devices this scan cannot
     /// see. Reported so the operator knows the coverage is partial
@@ -273,11 +293,27 @@ impl Uncovered {
 impl std::fmt::Display for Uncovered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Encapsulation first: it is true of a path whatever the
+            // route type, and its remedy is the one an operator would
+            // never reach from a reachability message.
+            Self::Path {
+                prefix,
+                oif,
+                table,
+                encap: Some(kind),
+                ..
+            } => write!(
+                f,
+                "{}/{} via {oif} (table {table}) applies {kind} encapsulation — VPP's mirror \
+                 carries no encap action, so steered packets would leave {oif} bare",
+                prefix.addr, prefix.prefix_len
+            ),
             Self::Path {
                 prefix,
                 oif,
                 table,
                 kernel_delivers: true,
+                ..
             } => write!(
                 f,
                 "{}/{} is delivered by the kernel on {oif} (table {table}) — an address or \
@@ -289,6 +325,7 @@ impl std::fmt::Display for Uncovered {
                 oif,
                 table,
                 kernel_delivers: false,
+                ..
             } => write!(
                 f,
                 "{}/{} via {oif} (table {table})",
@@ -358,20 +395,27 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
-        if r.kernel_delivers {
-            // Only the segments whose hosts steering diverts. A
-            // transit port's own address is reachable from a steered
-            // host only by a route that would itself be a finding,
-            // and reporting every address on the box would demand
-            // more exemptions than the 16-slot budget holds — an
-            // alarm with no available remedy is one operators learn
-            // to ignore. Documented in the runbook, with the
-            // null-drop gauge as the backstop for the rest.
-            if !reach.local_devices.iter().any(|d| d == oif) {
+        // A lightweight-encap path is unreproducible REGARDLESS of
+        // which device it leaves by, so both reachability arms below
+        // are skipped for it — they would clear the route on the
+        // strength of an `oif` that is not the problem.
+        if r.encap.is_none() {
+            if r.kernel_delivers {
+                // Only the segments whose hosts steering diverts. A
+                // transit port's own address is reachable from a
+                // steered host only by a route that would itself be a
+                // finding, and reporting every address on the box
+                // would demand more exemptions than the 16-slot
+                // budget holds — an alarm with no available remedy is
+                // one operators learn to ignore. Documented in the
+                // runbook, with the null-drop gauge as the backstop
+                // for the rest.
+                if !reach.local_devices.iter().any(|d| d == oif) {
+                    continue;
+                }
+            } else if r.oifs.iter().any(|d| reach.covers_device(d)) {
                 continue;
             }
-        } else if r.oifs.iter().any(|d| reach.covers_device(d)) {
-            continue;
         }
         // Built-in exemptions cover these on every steered port.
         if crate::steer::BUILTIN_EXEMPTS.iter().any(|(addr, len)| {
@@ -391,6 +435,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
             oif: oif.clone(),
             table: r.table,
             kernel_delivers: r.kernel_delivers,
+            encap: r.encap.clone(),
         });
     }
     out.sort_by_key(|u| match u {
@@ -675,7 +720,9 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
     use netlink_packet_core::{
         NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
     };
-    use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteType};
+    use netlink_packet_route::route::{
+        RouteAddress, RouteAttribute, RouteLwEnCapType, RouteMessage, RouteType,
+    };
     use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
     // The `kind()` accessor for an unparsed attribute. Same crate
     // the message types come from, already a direct dependency.
@@ -684,6 +731,30 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
 
     /// `RTA_NH_ID` — see [`KernelRoute::via_nexthop_object`].
     const RTA_NH_ID: u16 = 30;
+
+    /// The kernel's name for a lightweight-encap action, for the
+    /// operator's message. `None` is the overwhelming majority and is
+    /// not an encapsulation — the kernel emits `RTA_ENCAP_TYPE` on
+    /// plain routes too.
+    fn encap_name(t: RouteLwEnCapType) -> Option<String> {
+        Some(match t {
+            RouteLwEnCapType::None => return None,
+            RouteLwEnCapType::Mpls => "MPLS".to_string(),
+            RouteLwEnCapType::Ip => "IP-in-IP".to_string(),
+            RouteLwEnCapType::Ila => "ILA".to_string(),
+            RouteLwEnCapType::Ip6 => "IPv6 tunnel".to_string(),
+            RouteLwEnCapType::Seg6 => "SRv6".to_string(),
+            RouteLwEnCapType::Seg6Local => "SRv6-local".to_string(),
+            RouteLwEnCapType::Bpf => "BPF".to_string(),
+            RouteLwEnCapType::Rpl => "RPL".to_string(),
+            RouteLwEnCapType::Ioam6 => "IOAM6".to_string(),
+            RouteLwEnCapType::Xfrm => "XFRM".to_string(),
+            // The enum is `#[non_exhaustive]` and the kernel adds
+            // types; an unrecognised one is still an encap action
+            // and must still be reported, by number.
+            other => format!("encap type {}", u16::from(other)),
+        })
+    }
 
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
     socket
@@ -744,11 +815,20 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                     let mut dst: Option<std::net::Ipv4Addr> = None;
                     let mut oifs: Vec<u32> = Vec::new();
                     let mut nexthop_object = false;
+                    let mut encap: Option<String> = None;
                     let mut table = u32::from(m.header.table);
                     for attr in &m.attributes {
                         match attr {
                             RouteAttribute::Destination(RouteAddress::Inet(a)) => dst = Some(*a),
                             RouteAttribute::Oif(i) => oifs.push(*i),
+                            // `RTA_ENCAP_TYPE`: the route hands the
+                            // packet to a lightweight tunnel before it
+                            // leaves. See `KernelRoute::encap` for why
+                            // the ordinary `oif` makes this the
+                            // quietest failure in the dump.
+                            RouteAttribute::EncapType(t) => {
+                                encap = encap.take().or_else(|| encap_name(*t))
+                            }
                             // ECMP puts its nexthops HERE and leaves
                             // RTA_OIF unset, so a route read only for
                             // RTA_OIF looks device-less and gets
@@ -756,7 +836,21 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             // blackhole under a clean health surface
                             // (review finding).
                             RouteAttribute::MultiPath(hops) => {
-                                oifs.extend(hops.iter().map(|h| h.interface_index))
+                                oifs.extend(hops.iter().map(|h| h.interface_index));
+                                // Encapsulation is per PATH, and ECMP
+                                // puts each path's attributes here. A
+                                // route with one plain path and one
+                                // encapped path is reported: VPP would
+                                // install both and hash traffic into
+                                // the one it cannot reproduce.
+                                encap = encap.take().or_else(|| {
+                                    hops.iter().flat_map(|h| h.attributes.iter()).find_map(|a| {
+                                        match a {
+                                            RouteAttribute::EncapType(t) => encap_name(*t),
+                                            _ => None,
+                                        }
+                                    })
+                                });
                             }
                             // RTA_TABLE carries ids past the u8 header
                             // field — policy tables live up there.
@@ -797,6 +891,7 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             RouteType::Local | RouteType::Broadcast | RouteType::Anycast
                         ),
                         via_nexthop_object: nexthop_object,
+                        encap,
                     });
                 }
                 _ => {}
@@ -935,6 +1030,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            encap: None,
         }
     }
 
@@ -1092,6 +1188,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            encap: None,
         };
         assert_eq!(find(&[all_tunnel], &[]).len(), 1);
 
@@ -1102,11 +1199,56 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            encap: None,
         };
         assert!(
             find(&[mixed], &[]).is_empty(),
             "one resolvable path is enough for VPP to forward the prefix"
         );
+    }
+
+    /// A lightweight-encap route (`ip route ... encap mpls 100 dev
+    /// eth3`) leaves by an ORDINARY device — a member port, here — so
+    /// every reachability test in this scan passes it, and the mirror,
+    /// which has nowhere to put a label stack, would forward the
+    /// packet bare out the same port (review finding). The device is
+    /// not the hazard; the action is.
+    #[test]
+    fn an_encapsulating_route_is_a_finding_even_out_a_member_port() {
+        let mut mpls = route(p(203, 0, 113, 0, 24), "eth3");
+        mpls.encap = Some("MPLS".into());
+        let found = find(std::slice::from_ref(&mpls), &[]);
+        assert_eq!(
+            found.len(),
+            1,
+            "a member-port oif must not clear an encap action: {found:?}"
+        );
+        let msg = found[0].to_string();
+        assert!(
+            msg.contains("MPLS") && msg.contains("bare"),
+            "the message must name the action, not the reachability: {msg}"
+        );
+        // And an exemption still silences it — exempted traffic never
+        // reaches VPP, so there is nothing to misforward.
+        assert!(find(&[mpls], &[p(203, 0, 113, 0, 24)]).is_empty());
+    }
+
+    /// Encapsulation is a property of a PATH, so an ECMP route with
+    /// one plain member path and one encapped path is still a finding:
+    /// VPP installs both and hashes traffic into the one it cannot
+    /// reproduce. The any-path-reachable rule must not clear it.
+    #[test]
+    fn one_encapped_path_in_an_ecmp_group_is_enough() {
+        let mixed = KernelRoute {
+            prefix: p(203, 0, 113, 0, 24),
+            oifs: vec!["eth3".into(), "eth4".into()],
+            table: 254,
+            drops: false,
+            kernel_delivers: false,
+            via_nexthop_object: false,
+            encap: Some("SRv6".into()),
+        };
+        assert_eq!(find(&[mixed], &[]).len(), 1);
     }
 
     /// Under dst-only steering the NIC diverts only packets addressed
@@ -1292,6 +1434,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: true,
+            encap: None,
         };
         let found = find(&[opaque.clone(), opaque.clone()], &[]);
         assert_eq!(found.len(), 1, "one summary, not one per route: {found:?}");

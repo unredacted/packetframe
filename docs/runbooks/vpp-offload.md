@@ -669,6 +669,16 @@ What it reports, and what it deliberately does not:
   exemption for every address on the box, and an alarm with no
   available remedy is one operators learn to ignore. The null-drop
   gauge is the backstop for that remainder.
+- **Lightweight-encap routes** (`ip route ... encap mpls|seg6|ip ...
+  dev eth3`) are findings **whatever device they leave by**, including
+  a member port. The mirror carries prefix, nexthop and interface, and
+  has nowhere to put a label stack or a segment list, so VPP would send
+  the packet bare out the same port — a different destination, not a
+  slower path. The message names the action (`applies MPLS
+  encapsulation`) rather than the device, because the device is
+  usually fine and reading it as a reachability problem sends the
+  operator the wrong way. MPLS and SRv6 deployments see this one;
+  bird's classic routes do not.
 - **Not reported:** routes the kernel itself drops (blackhole,
   unreachable, prohibit — VPP dropping the same packet is the same
   outcome), and the built-in broadcast/multicast exemptions.
