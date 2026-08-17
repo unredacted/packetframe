@@ -57,6 +57,16 @@ pub struct KernelRoute {
     /// being skipped precisely because those addresses sit on member
     /// ports and bridges).
     pub local: bool,
+    /// The route names a NEXTHOP OBJECT (`ip route ... nhid N`,
+    /// `RTA_NH_ID`) instead of carrying its devices inline. Those
+    /// routes are opaque here: the vendored netlink crate does not
+    /// parse the attribute, and resolving it means a second
+    /// `RTM_GETNEXTHOP` dump this module does not have. Left as a
+    /// device-less route it would be SKIPPED — a tunnel-backed nhid
+    /// route blackholing under a clean scan (review finding) — so it
+    /// is counted and reported as a gap in the scan's own coverage
+    /// rather than silently dropped or guessed at.
+    pub via_nexthop_object: bool,
 }
 
 /// What VPP can actually egress, from config: member ports and the
@@ -212,31 +222,65 @@ pub struct Scope<'a> {
     pub selected_tables: Option<&'a [u32]>,
 }
 
-/// A kernel path VPP cannot take that nothing exempts.
+/// A kernel path VPP cannot take that nothing exempts — or, for
+/// [`Uncovered::Opaque`], a count of routes this scan could not judge
+/// at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Uncovered {
-    pub prefix: Ipv4Prefix,
-    pub oif: String,
-    pub table: u32,
-    /// A terminated address rather than a forwarding path — the
-    /// message says so, because the remedy reads differently.
-    pub local: bool,
+pub enum Uncovered {
+    Path {
+        prefix: Ipv4Prefix,
+        oif: String,
+        table: u32,
+        /// A terminated address rather than a forwarding path — the
+        /// message says so, because the remedy reads differently.
+        local: bool,
+    },
+    /// Routes using nexthop objects, whose devices this scan cannot
+    /// see. Reported so the operator knows the coverage is partial
+    /// rather than believing a quiet scan means a clean box.
+    Opaque(usize),
+}
+
+impl Uncovered {
+    /// The table this finding sits in, for tests and log context.
+    /// `None` for the coverage-gap summary, which names no route.
+    pub fn table(&self) -> Option<u32> {
+        match self {
+            Self::Path { table, .. } => Some(*table),
+            Self::Opaque(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Uncovered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.local {
-            write!(
+        match self {
+            Self::Path {
+                prefix,
+                oif,
+                table,
+                local: true,
+            } => write!(
                 f,
-                "{}/{} terminates on {} (table {}, the router's own address)",
-                self.prefix.addr, self.prefix.prefix_len, self.oif, self.table
-            )
-        } else {
-            write!(
+                "{}/{} terminates on {oif} (table {table}, the router's own address)",
+                prefix.addr, prefix.prefix_len
+            ),
+            Self::Path {
+                prefix,
+                oif,
+                table,
+                local: false,
+            } => write!(
                 f,
-                "{}/{} via {} (table {})",
-                self.prefix.addr, self.prefix.prefix_len, self.oif, self.table
-            )
+                "{}/{} via {oif} (table {table})",
+                prefix.addr, prefix.prefix_len
+            ),
+            Self::Opaque(n) => write!(
+                f,
+                "{n} route(s) use nexthop objects (`ip route ... nhid`) whose devices this \
+                 scan cannot read, so it cannot tell whether VPP can take them — inspect \
+                 with `ip nexthop show` and exempt any that leave via a tunnel"
+            ),
         }
     }
 }
@@ -267,7 +311,20 @@ impl std::fmt::Display for Uncovered {
 pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncovered> {
     let reach = scope.reach;
     let mut out = Vec::new();
+    // Routes whose devices this scan cannot see at all. Counted
+    // across the whole dump and reported once, because the answer is
+    // "this scan does not cover N of your routes", not N separate
+    // hazards — and flooding a finding per route would make an
+    // nhid-using box's tripwire unreadable, which is how an alarm
+    // stops being read.
+    let mut opaque = 0usize;
     for r in routes {
+        if r.via_nexthop_object && r.oifs.is_empty() && !r.drops {
+            if scope.divertible.reaches(&r.prefix) && !scope.covers(&r.prefix) {
+                opaque += 1;
+            }
+            continue;
+        }
         if r.drops || !scope.divertible.reaches(&r.prefix) {
             continue;
         }
@@ -304,15 +361,21 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
         if scope.covers(&r.prefix) {
             continue;
         }
-        out.push(Uncovered {
+        out.push(Uncovered::Path {
             prefix: r.prefix,
             oif: oif.clone(),
             table: r.table,
             local: r.local,
         });
     }
-    out.sort_by_key(|u| (u.prefix.prefix_len, u32::from(u.prefix.addr)));
+    out.sort_by_key(|u| match u {
+        Uncovered::Path { prefix, .. } => (prefix.prefix_len, u32::from(prefix.addr)),
+        Uncovered::Opaque(_) => (u8::MAX, u32::MAX),
+    });
     out.dedup();
+    if opaque > 0 {
+        out.push(Uncovered::Opaque(opaque));
+    }
     out
 }
 
@@ -410,7 +473,13 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
     };
     use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteType};
     use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+    // The `kind()` accessor for an unparsed attribute. Same crate
+    // the message types come from, already a direct dependency.
+    use netlink_packet_core::Nla as _;
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+    /// `RTA_NH_ID` — see [`KernelRoute::via_nexthop_object`].
+    const RTA_NH_ID: u16 = 30;
 
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
     socket
@@ -470,6 +539,7 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
                     let mut dst: Option<std::net::Ipv4Addr> = None;
                     let mut oifs: Vec<u32> = Vec::new();
+                    let mut nexthop_object = false;
                     let mut table = u32::from(m.header.table);
                     for attr in &m.attributes {
                         match attr {
@@ -487,6 +557,14 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             // RTA_TABLE carries ids past the u8 header
                             // field — policy tables live up there.
                             RouteAttribute::Table(t) => table = *t,
+                            // RTA_NH_ID (30). The vendored crate does
+                            // not parse it — the constant is commented
+                            // out in its source — so it lands here,
+                            // and a route carrying it names its
+                            // devices nowhere this scan can read.
+                            RouteAttribute::Other(nla) if nla.kind() == RTA_NH_ID => {
+                                nexthop_object = true
+                            }
                             _ => {}
                         }
                     }
@@ -511,6 +589,7 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             RouteType::BlackHole | RouteType::Unreachable | RouteType::Prohibit
                         ),
                         local: m.header.kind == RouteType::Local,
+                        via_nexthop_object: nexthop_object,
                     });
                 }
                 _ => {}
@@ -648,6 +727,7 @@ mod tests {
             table: 100,
             drops: false,
             local: false,
+            via_nexthop_object: false,
         }
     }
 
@@ -683,7 +763,7 @@ mod tests {
         ];
         let found = find(&routes, &[]);
         assert_eq!(found.len(), 2, "{found:?}");
-        assert!(found.iter().all(|u| u.oif == "vti64"));
+        assert!(found.iter().all(|u| u.to_string().contains("via vti64")));
 
         let exempts = [p(23, 191, 201, 0, 24), p(23, 191, 200, 2, 32)];
         assert!(find(&routes, &exempts).is_empty());
@@ -737,7 +817,7 @@ mod tests {
         gw.table = 255;
         let found = find(&[gw.clone()], &[]);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].local);
+        assert!(matches!(found[0], Uncovered::Path { local: true, .. }));
         assert!(
             found[0].to_string().contains("terminates on br1337"),
             "the message must read as termination, not a path: {}",
@@ -775,6 +855,7 @@ mod tests {
             table: 254,
             drops: false,
             local: false,
+            via_nexthop_object: false,
         };
         assert_eq!(find(&[all_tunnel], &[]).len(), 1);
 
@@ -784,6 +865,7 @@ mod tests {
             table: 254,
             drops: false,
             local: false,
+            via_nexthop_object: false,
         };
         assert!(
             find(&[mixed], &[]).is_empty(),
@@ -816,7 +898,10 @@ mod tests {
             },
         );
         assert_eq!(scoped.len(), 1, "{scoped:?}");
-        assert_eq!(scoped[0].prefix.addr, Ipv4Addr::new(23, 191, 200, 2));
+        assert!(
+            scoped[0].to_string().contains("23.191.200.2/32"),
+            "{scoped:?}"
+        );
 
         // A src rule anywhere means any destination can be diverted.
         assert_eq!(find(&routes, &[]).len(), 2);
@@ -846,7 +931,7 @@ mod tests {
             },
         );
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].table, 100);
+        assert_eq!(found[0].table(), Some(100));
         // Unknown rule set filters nothing: losing the narrowing
         // costs noise, losing the scan costs the blackhole. This is
         // the arm an l3mdev (VRF) rule takes — its tables resolve per
@@ -954,6 +1039,34 @@ mod tests {
             },
         );
         assert_eq!(any.len(), 1, "{any:?}");
+    }
+
+    /// A route using a nexthop object names its devices nowhere this
+    /// scan can read. Left as a device-less route it would be SKIPPED
+    /// — a tunnel-backed nhid route blackholing under a clean scan
+    /// (review finding) — so the scan reports its own blind spot
+    /// instead, once, rather than flooding a finding per route or
+    /// guessing at reachability.
+    #[test]
+    fn routes_via_nexthop_objects_are_reported_as_a_coverage_gap() {
+        let opaque = KernelRoute {
+            prefix: p(198, 51, 100, 0, 24),
+            oifs: Vec::new(),
+            table: 254,
+            drops: false,
+            local: false,
+            via_nexthop_object: true,
+        };
+        let found = find(&[opaque.clone(), opaque.clone()], &[]);
+        assert_eq!(found.len(), 1, "one summary, not one per route: {found:?}");
+        assert_eq!(found[0], Uncovered::Opaque(2));
+        let line = found[0].to_string();
+        assert!(line.contains("nhid"), "{line}");
+        assert!(line.contains("ip nexthop show"), "names the tool: {line}");
+
+        // An exemption covering it makes it a non-issue, exactly as
+        // for a route whose device we CAN see.
+        assert!(find(&[opaque], &[p(198, 51, 100, 0, 24)]).is_empty());
     }
 
     /// The operator-facing line names the three things needed to act:

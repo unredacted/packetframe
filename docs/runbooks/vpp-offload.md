@@ -673,6 +673,13 @@ Coverage is by containment, not overlap: a `/32` exemption does not
 silence the `/24` around it. That asymmetry is deliberate — treating
 one exempted host as covering its whole prefix is how a hole hides.
 
+One thing it reports about ITSELF: routes installed with **nexthop
+objects** (`ip route ... nhid N`) name their devices in a structure
+this scan does not read, so it says so — one line naming the count
+and `ip nexthop show` — rather than skipping them silently or
+guessing. bird's classic routes are unaffected; FRR deployments and
+large ECMP setups are the ones that will see it.
+
 Two more things it does not treat as active paths: a route in a table
 NO policy rule names (an unreferenced VRF or auxiliary table cannot be
 consulted by any packet, so it must not cost an exemption slot), and —

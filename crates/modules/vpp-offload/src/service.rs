@@ -929,6 +929,18 @@ fn apply_steering(
         // effect of editing something else is precisely the decision this
         // module is not allowed to make.
         if !intended && !req.lever_moved {
+            // No effect will run, so nothing will commit the staged
+            // scope — and if the NIC holds no rules there are no old
+            // exemptions for the scan to be describing. Committing
+            // here is what keeps the tripwire PREDICTIVE before the
+            // first canary: a newly allowlisted tunnel prefix should
+            // be named while the port is still unsteered, which is
+            // the whole point of scanning before traffic moves
+            // (review finding). With rules installed, the old config
+            // is what the NIC has and the scope waits for a steer.
+            if !runtime.steering_rules_installed() {
+                runtime.commit_drift_scope();
+            }
             return Ok(());
         }
         // The same gate the automatic path uses, and applied on the same

@@ -1373,6 +1373,22 @@ impl Runtime {
     }
 
     /// Hand the exemption tripwire a reloaded exemption set.
+    /// Whether the NIC holds any steering rule right now.
+    ///
+    /// Read by the reconfigure path to decide whether a request that
+    /// installs nothing may still commit its drift scope: with no
+    /// rules installed there are no old exemptions to describe, so the
+    /// staged config IS what a scan should judge.
+    pub fn steering_rules_installed(&self) -> bool {
+        !self.core.borrow().steering.installed().is_empty()
+    }
+
+    /// Adopt the staged scope now — for the path where the request
+    /// performs no steering action at all.
+    pub fn commit_drift_scope(&self) {
+        self.core.borrow_mut().commit_drift_scope();
+    }
+
     pub fn stage_drift_scope(
         &self,
         exempts: Vec<packetframe_common::config::Ipv4Prefix>,
