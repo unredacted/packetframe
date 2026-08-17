@@ -128,7 +128,7 @@ fn probe_steering_budget(
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Capability {
-    use crate::steer::{McamBudget, RuleAction, RuleSet};
+    use crate::steer::McamBudget;
 
     let name = "vpp.steering.budget";
     // The ALLOWLIST question first, because it needs no NIC — the same
@@ -156,37 +156,60 @@ fn probe_steering_budget(
         );
     }
 
-    // Which NICs to ask. Steering ports when any port steers — the set
-    // attach's `ifaces_to_query` uses, so probe and refusal cannot
-    // disagree. In the STAGING state, where every port is `steer off`,
-    // the candidates are the members: the first canary step can pick
-    // any of them, and that state is where feasibility is actually run.
+    // Which NICs to ask, and how strictly.
     //
-    // Falling back to `McamBudget::default()` there instead — which is
-    // what an empty candidate list produces — would report a synthetic
-    // 16-slot table as though a NIC had answered, so a canary NIC with
-    // occupied slots passed here and failed at the lever (review
-    // finding on this PR). The fallback constant is for planning
-    // arithmetic with no hardware in reach, never for claiming a
-    // budget fits.
-    let candidates: &[String] = if steer_ports.is_empty() {
-        member_ports
-    } else {
-        steer_ports
-    };
+    // Ports that STEER get exactly attach's treatment: the same set
+    // `ifaces_to_query` uses, read through the same strict
+    // `for_ifaces`, so an unreadable steering port fails here for the
+    // reason it will fail there. Leniency on that path would let
+    // feasibility PASS a configuration attach refuses (review finding
+    // on this PR) — the probe may be softer than attach about ports
+    // attach has nothing to say about, and never about the ones it
+    // does.
+    if !steer_ports.is_empty() {
+        let budget = match McamBudget::for_ifaces(steer_ports.iter().map(String::as_str)) {
+            Ok(b) => b,
+            Err(e) => {
+                return Capability::fail(
+                    name,
+                    format!(
+                        "{e} — this port is configured `steer on`, so attach will refuse the \
+                         same way; check `ip -br link`, an administratively DOWN port answers \
+                         like this"
+                    ),
+                    false,
+                )
+            }
+        };
+        return plan_and_report(
+            name,
+            budget,
+            steer_ports.iter().map(String::as_str).collect(),
+            Vec::new(),
+            false,
+            allowlist,
+            directions,
+            steer_exempts,
+        );
+    }
 
-    // Read LENIENTLY, unlike attach: a member that cannot answer is
-    // skipped and named rather than failing the whole probe. That is
-    // the difference in stakes — attach must refuse a port it is about
-    // to steer into, while this is a pre-flight report, and an
-    // administratively DOWN idle member (the reference primary's
-    // uncabled eth5, whose driver refuses `get_rxnfc` while
-    // `!netif_running`) must not hide the arithmetic for the ports
-    // that did answer.
+    // STAGING: every port is `steer off`, which is the state
+    // feasibility is usually run in and the state the first canary
+    // step starts from. The candidates are the members — any of them
+    // could be the port the operator turns on — and here the read IS
+    // lenient: an administratively DOWN idle member (the reference
+    // primary's uncabled eth5) must not hide the arithmetic for the
+    // ports that answered, because attach is not querying it either.
+    //
+    // What must NOT happen is the empty-candidate fallback: with no
+    // NIC read at all, `McamBudget::for_ifaces` yields its synthetic
+    // 16-slot table, and reporting PASS on that constant let a canary
+    // NIC with occupied slots pass here and fail at the lever (review
+    // finding). No reading, no verdict.
     let mut budget: Option<McamBudget> = None;
     let mut consulted: Vec<&str> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    for iface in candidates {
+    for iface in member_ports {
         match crate::ntuple::rule_table(iface) {
             Ok(table) => {
                 let next = McamBudget::from_table(&table);
@@ -209,17 +232,16 @@ fn probe_steering_budget(
             Err(e) => skipped.push(format!("{iface} ({e})")),
         }
     }
-    // No NIC answered: UNKNOWN, never Pass. The arithmetic below would
-    // be a statement about a table nobody read.
     let Some(budget) = budget else {
         return Capability::unknown(
             name,
             if skipped.is_empty() {
-                "no candidate steering port to query".to_string()
+                "no candidate port to query, so the MCAM budget is unknown rather than proven"
+                    .to_string()
             } else {
                 format!(
-                    "no candidate steering port could be read ({}), so the MCAM budget is \
-                     unknown rather than proven; check `ip -br link` — a port that is \
+                    "no candidate port could be read ({}), so the MCAM budget is unknown \
+                     rather than proven; check `ip -br link` — a port that is \
                      administratively DOWN answers this way",
                     skipped.join(", ")
                 )
@@ -227,6 +249,35 @@ fn probe_steering_budget(
             false,
         );
     };
+    plan_and_report(
+        name,
+        budget,
+        consulted,
+        skipped,
+        true,
+        allowlist,
+        directions,
+        steer_exempts,
+    )
+}
+
+/// Plan every configured direction against `budget` and render the
+/// verdict. Split out so the strict (steering-port) and lenient
+/// (staging-member) paths above cannot drift in their arithmetic —
+/// only in which NICs they are willing to proceed without.
+#[allow(clippy::too_many_arguments)]
+fn plan_and_report(
+    name: &'static str,
+    budget: crate::steer::McamBudget,
+    consulted: Vec<&str>,
+    skipped: Vec<String>,
+    staging: bool,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+    directions: &[packetframe_common::config::VppSteerDirection],
+    steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+) -> Capability {
+    use crate::steer::{RuleAction, RuleSet};
+
     let free = budget.free.len();
 
     // No directions handed in = plan the global default, exactly as
@@ -270,7 +321,7 @@ fn probe_steering_budget(
         "{}; {} free slot(s) across {} {}{}{}",
         details.join("; "),
         free,
-        if steer_ports.is_empty() {
+        if staging {
             "candidate member port(s) (staging: no port steers yet)"
         } else {
             "steering port(s)"
@@ -479,38 +530,95 @@ mod steering_probe_tests {
         );
     }
 
-    /// A budget nobody read is UNKNOWN, never a pass.
+    /// A budget nobody read is UNKNOWN, never a pass — and an
+    /// unreadable port the config STEERS is a failure, because attach
+    /// refuses it.
     ///
-    /// The regression this guards is subtle enough to have shipped
-    /// once: when every port is `steer off` — the rung-0 staging state
-    /// feasibility is actually run in — a steering-ports-only query
-    /// asks no NIC, and `McamBudget::for_ifaces` answers with the
-    /// synthetic fallback table. The probe then reported PASS on a
-    /// 16-slot constant, so a canary NIC whose slots were occupied
-    /// passed here and failed at the lever (review finding, PR #191).
-    /// Unreadable hardware and absent hardware must both degrade the
-    /// verdict, not the arithmetic.
+    /// Both halves shipped wrong once. The staging state (every port
+    /// `steer off`, which is where feasibility is actually run) asked
+    /// no NIC, so `McamBudget::for_ifaces` handed back its synthetic
+    /// 16-slot table and the probe passed on a constant — a canary NIC
+    /// with occupied slots passed here and failed at the lever. Then
+    /// the leniency that fixed the down-idle-member case was applied
+    /// to steering ports too, where attach's `for_ifaces` returns on
+    /// the first error, so feasibility could PASS a config attach
+    /// refuses. Both are review findings on PR #191.
+    ///
+    /// `wedge_table` is what makes this testable: under `cfg(test)`
+    /// the in-memory NIC accepts every interface name, so a bogus name
+    /// proves nothing — the earlier version of this test asserted
+    /// Unknown against a fake that answered happily, and CI caught it.
     #[test]
-    fn a_budget_no_nic_answered_is_unknown_not_pass() {
-        // A steerable allowlist, so the allowlist arm cannot be what
-        // decides this — and no candidate port anywhere, which on a
-        // dev host is also what every named port amounts to.
-        for (members, steerers) in [
-            (&[][..], &[][..]),
-            (&["definitely-not-a-nic".to_string()][..], &[][..]),
-        ] {
-            let cap =
-                probe_steering_budget(members, steerers, &[v4(0, 24)], Default::default(), &[]);
-            assert_eq!(
-                cap.status,
-                CapabilityStatus::Unknown,
-                "a budget derived from no NIC reading must not pass: {cap:?}"
-            );
-            assert!(
-                !cap.detail.contains("free slot(s) across"),
-                "and must not report slot arithmetic it never measured: {}",
-                cap.detail
-            );
-        }
+    fn what_the_budget_probe_may_claim_about_nics_it_could_not_read() {
+        use crate::ntuple::sys;
+        let steerable = [v4(0, 24)];
+        let dirs: &[packetframe_common::config::VppSteerDirection] = Default::default();
+
+        // 1. No candidate anywhere: nothing was measured, so nothing
+        //    is claimed.
+        sys::reset();
+        let none = probe_steering_budget(&[], &[], &steerable, dirs, &[]);
+        assert_eq!(none.status, CapabilityStatus::Unknown, "{none:?}");
+        assert!(
+            !none.detail.contains("free slot(s) across"),
+            "must not report arithmetic it never measured: {}",
+            none.detail
+        );
+
+        // 2. Staging, and every member refuses its table: still
+        //    Unknown, and it names them.
+        sys::reset();
+        sys::wedge_table(&["eth4", "eth5"]);
+        let all_dark = probe_steering_budget(
+            &["eth4".to_string(), "eth5".to_string()],
+            &[],
+            &steerable,
+            dirs,
+            &[],
+        );
+        assert_eq!(all_dark.status, CapabilityStatus::Unknown, "{all_dark:?}");
+        assert!(all_dark.detail.contains("eth4"), "{}", all_dark.detail);
+
+        // 3. Staging with ONE dark idle member: the readable port's
+        //    arithmetic still lands — this is the down-eth5 case the
+        //    leniency exists for — and the skipped port is named
+        //    rather than silently dropped.
+        sys::reset();
+        sys::wedge_table(&["eth5"]);
+        let partial = probe_steering_budget(
+            &["eth4".to_string(), "eth5".to_string()],
+            &[],
+            &steerable,
+            dirs,
+            &[],
+        );
+        assert_eq!(partial.status, CapabilityStatus::Pass, "{partial:?}");
+        assert!(
+            partial.detail.contains("NOT consulted") && partial.detail.contains("eth5"),
+            "the port that did not answer must be named: {}",
+            partial.detail
+        );
+
+        // 4. The same dark port, but the config STEERS it: attach
+        //    would refuse, so this must not pass.
+        sys::reset();
+        sys::wedge_table(&["eth5"]);
+        let steered_dark = probe_steering_budget(
+            &["eth4".to_string(), "eth5".to_string()],
+            &["eth4".to_string(), "eth5".to_string()],
+            &steerable,
+            dirs,
+            &[],
+        );
+        assert_eq!(
+            steered_dark.status,
+            CapabilityStatus::Fail,
+            "an unreadable STEERING port must fail, as attach will: {steered_dark:?}"
+        );
+        assert!(
+            steered_dark.detail.contains("attach will refuse"),
+            "and say why: {}",
+            steered_dark.detail
+        );
     }
 }

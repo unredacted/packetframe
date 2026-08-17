@@ -542,6 +542,11 @@ pub(super) mod sys {
         /// otherwise refusing MCAM.
         uninsertable: Vec<u32>,
         unreadable: Vec<u32>,
+        /// Interfaces whose whole TABLE cannot be read — the shape an
+        /// administratively DOWN port has (`otx2_get_rxnfc` gates on
+        /// `netif_running`, so the driver answers EOPNOTSUPP for the
+        /// table as a whole, not for a location).
+        unreadable_tables: Vec<String>,
         /// How many locations this fake offers. Defaults to the measured
         /// hardware size rather than to zero, so a test that forgets to
         /// set it gets a plausible NIC instead of one with no table.
@@ -555,6 +560,7 @@ pub(super) mod sys {
                 undeletable: Vec::new(),
                 uninsertable: Vec::new(),
                 unreadable: Vec::new(),
+                unreadable_tables: Vec::new(),
                 table_size: super::FALLBACK_TABLE_SIZE,
             }
         }
@@ -586,6 +592,20 @@ pub(super) mod sys {
         NIC.with(|n| n.borrow_mut().unreadable = locations.to_vec());
     }
 
+    /// Make `GRXCLSRLALL` fail for these interfaces — a port that is
+    /// administratively down, which is the condition the steering
+    /// budget probe has to tell apart from a port with no free slots.
+    ///
+    /// Its only caller lives behind the Linux gate (`probe_linux`), so
+    /// every other host reads it as dead — the same `cfg_attr` the
+    /// loader uses for the same reason.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn wedge_table(ifaces: &[&str]) {
+        NIC.with(|n| {
+            n.borrow_mut().unreadable_tables = ifaces.iter().map(|s| s.to_string()).collect()
+        });
+    }
+
     pub(crate) fn set_table_size(size: u32) {
         NIC.with(|n| n.borrow_mut().table_size = size);
     }
@@ -599,6 +619,11 @@ pub(super) mod sys {
     pub(in crate::ntuple) fn rule_table(iface: &str) -> Result<super::RuleTable, String> {
         NIC.with(|n| {
             let nic = n.borrow();
+            if nic.unreadable_tables.iter().any(|i| i == iface) {
+                return Err(format!(
+                    "counting ntuple rules of {iface}: Operation not supported (os error 95)"
+                ));
+            }
             let mut occupied: Vec<u32> = nic
                 .rules
                 .keys()
