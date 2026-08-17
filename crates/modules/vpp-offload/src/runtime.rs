@@ -560,6 +560,19 @@ struct Core {
         Vec<packetframe_common::config::Ipv4Prefix>,
         Option<Vec<packetframe_common::fib::IpPrefix>>,
     )>,
+    /// Set when a steering change failed PARTWAY and left rules on
+    /// the NIC, so neither the old exemption set nor the new one
+    /// describes what is installed.
+    ///
+    /// `NtupleSteering::steer` rolls back a partial install, and a
+    /// rollback that itself fails deliberately keeps those rules in
+    /// the ledger — they are still diverting traffic. The scope gate
+    /// is `is_ok()`, so the watcher stayed on the old exemptions
+    /// while a surviving divert rule blackholed a prefix the
+    /// reconfigure had just unexempted (review finding). There is no
+    /// correct set to adopt in that state, so the scan says it does
+    /// not know rather than answering from either one.
+    drift_scope_stale: Option<String>,
     /// Why the last scan could not read the kernel, if it could not.
     ///
     /// Its own field for the same reason `steer_audit_error` is: a
@@ -1286,6 +1299,7 @@ impl Runtime {
                 last_drift_scan: None,
                 drift_uncovered: Vec::new(),
                 drift_unreadable: None,
+                drift_scope_stale: None,
                 pending_drift_scope: None,
                 steer_missing: 0,
                 steer_stray: 0,
@@ -1635,6 +1649,7 @@ impl Runtime {
             fdb_misplaced: c.fdb_misplaced.clone(),
             drift_uncovered: c.drift_uncovered.clone(),
             drift_unreadable: c.drift_unreadable.clone(),
+            drift_scope_stale: c.drift_scope_stale.clone(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1818,6 +1833,8 @@ pub struct RuntimeStatus {
     pub drift_uncovered: Vec<String>,
     /// Why the last drift scan could not read the kernel, if so.
     pub drift_unreadable: Option<String>,
+    /// Why the scan cannot say which exemptions the NIC holds, if so.
+    pub drift_scope_stale: Option<String>,
 }
 
 impl Core {
@@ -1971,6 +1988,20 @@ impl Core {
         }
     }
 
+    /// A steering change failed. If it left rules installed while a
+    /// new scope was waiting, the NIC now holds some of one config
+    /// and some of another and the scan must say so — see
+    /// [`Self::drift_scope_stale`].
+    fn note_partial_steer(&mut self) {
+        if self.pending_drift_scope.is_some() && !self.steering.installed().is_empty() {
+            self.drift_scope_stale = Some(
+                "a steering change failed partway and left rules installed, so the \
+                 exemptions the NIC holds are neither the old set nor the new one"
+                    .into(),
+            );
+        }
+    }
+
     /// Adopt the staged scope, if any — called where a steering action
     /// has just succeeded, so the watcher only ever describes rules
     /// the NIC took.
@@ -1980,6 +2011,9 @@ impl Core {
         };
         if let Some(w) = self.drift_watch.as_mut() {
             w.set_scope(exempts, dst_only);
+            // Whatever ambiguity a failed reconcile left is settled:
+            // the NIC just took this scope.
+            self.drift_scope_stale = None;
             // Re-read on the next poll rather than serving a verdict
             // about a config that no longer exists. The findings go
             // with it; the READ failure does not, because whether the
@@ -2709,6 +2743,8 @@ impl Effects for EffectsView {
         // never when the NIC refused.
         if outcome.is_ok() {
             c.commit_drift_scope();
+        } else {
+            c.note_partial_steer();
         }
         outcome
     }
@@ -2833,6 +2869,8 @@ impl Effects for EffectsView {
         // never when the NIC refused.
         if outcome.is_ok() {
             c.commit_drift_scope();
+        } else {
+            c.note_partial_steer();
         }
         outcome
     }

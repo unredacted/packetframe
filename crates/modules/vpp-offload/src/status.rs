@@ -388,6 +388,11 @@ pub struct StatusSnapshot {
     /// Degraded on its own: a safety check that cannot run must not
     /// be indistinguishable from one that ran and found nothing.
     pub drift_unreadable: Option<String>,
+    /// Why the scan cannot say which exemptions the NIC holds — a
+    /// steering change that failed partway and left rules installed.
+    /// Degraded for the same reason an unreadable scan is: neither
+    /// answer it could give would be true.
+    pub drift_scope_stale: Option<String>,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -445,6 +450,7 @@ impl StatusSnapshot {
             Vec::new(),
             Vec::new(),
             None,
+            None,
         )
     }
 
@@ -475,6 +481,7 @@ impl StatusSnapshot {
         fdb_misplaced: Vec<String>,
         drift_uncovered: Vec<String>,
         drift_unreadable: Option<String>,
+        drift_scope_stale: Option<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -503,6 +510,7 @@ impl StatusSnapshot {
             fdb_misplaced,
             drift_uncovered,
             drift_unreadable,
+            drift_scope_stale,
         }
     }
 
@@ -574,7 +582,19 @@ impl StatusSnapshot {
                 last_success_age_seconds: None,
             });
         }
-        if self.drift_uncovered.is_empty() {
+        if let Some(why) = &self.drift_scope_stale {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "{why}, so the exemption tripwire cannot judge them — a surviving \
+                     divert rule may be blackholing a prefix this config exempts. \
+                     `packetframe reconfigure` reconciles the NIC and settles it; \
+                     `ethtool -n <port>` shows what is actually installed"
+                )),
+                last_success_age_seconds: None,
+            });
+        } else if self.drift_uncovered.is_empty() {
             if let Some(why) = &self.drift_unreadable {
                 subsystems.push(SubsystemHealth {
                     name: SUBSYS_EXEMPT_DRIFT.into(),
@@ -729,6 +749,8 @@ impl StatusSnapshot {
             // And a tripwire that cannot read the kernel is not a
             // quiet tripwire.
             && self.drift_unreadable.is_none()
+            // Nor is one that cannot tell which config the NIC holds.
+            && self.drift_scope_stale.is_none()
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -1576,7 +1598,7 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
     // blind, which is the failure this whole module exists to catch
     // (review finding). `absent()` is the alarm for that case; the
     // health report carries the reason.
-    if snap.drift_unreadable.is_none() {
+    if snap.drift_unreadable.is_none() && snap.drift_scope_stale.is_none() {
         gauge(
             &mut out,
             "packetframe_vpp_exempt_drift",
@@ -3394,6 +3416,42 @@ mod tests {
         assert_ne!(report.overall, HealthState::Healthy);
         assert!(render_metrics(&s, "vpp-offload")
             .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 1"));
+    }
+
+    /// A steering change that failed partway leaves the NIC holding
+    /// some of one config and some of another, so the tripwire says
+    /// it cannot judge rather than answering from either set — a
+    /// surviving divert rule may be blackholing a prefix the new
+    /// config exempts (review finding).
+    #[test]
+    fn a_partial_steer_makes_the_tripwire_say_it_cannot_judge() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        s.drift_scope_stale =
+            Some("a steering change failed partway and left rules installed".into());
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("the tripwire must say something");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message.as_deref().unwrap_or("").contains("reconfigure"),
+            "and name the remedy: {row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+        assert!(
+            !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),
+            "a count from either config would be a claim the scan cannot make"
+        );
     }
 
     /// A tripwire that cannot read the kernel is Degraded, not quiet.

@@ -690,6 +690,14 @@ evaluating the rest would mean reimplementing the kernel's rule walk,
 where a permissive mistake re-opens the hole. Over-reporting is the
 safe direction and the scan stays on that side of it.
 
+An `exempt-drift` row also appears when a steering change **failed
+partway and left rules installed** — the NIC then holds some of one
+config and some of another, so the tripwire says it cannot judge
+rather than answering from either set (a surviving divert rule may be
+blackholing a prefix the new config exempts). `packetframe
+reconfigure` reconciles and settles it; `ethtool -n <port>` shows what
+is actually installed.
+
 An `exempt-drift` row also appears when the scan **cannot read** the
 kernel (netlink refused, or a dump came back interrupted). That is
 Degraded too, and deliberately: a check that never ran must not look

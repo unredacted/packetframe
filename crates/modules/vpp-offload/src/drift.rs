@@ -319,17 +319,23 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
     // stops being read.
     let mut opaque = 0usize;
     for r in routes {
-        if r.via_nexthop_object && r.oifs.is_empty() && !r.drops {
-            if scope.divertible.reaches(&r.prefix) && !scope.covers(&r.prefix) {
-                opaque += 1;
-            }
-            continue;
-        }
         if r.drops || !scope.divertible.reaches(&r.prefix) {
             continue;
         }
         // A table no policy rule names is inert for every packet.
+        // BEFORE the opaque branch below, not after: an nhid route
+        // parked in an unreferenced VRF is no more reachable than a
+        // readable one, and counting it would send the operator to
+        // inspect nexthops for traffic that cannot exist (review
+        // finding — this filter, bypassed by a branch added two
+        // rounds after it).
         if scope.selected_tables.is_some_and(|t| !t.contains(&r.table)) {
+            continue;
+        }
+        if r.via_nexthop_object && r.oifs.is_empty() {
+            if !scope.covers(&r.prefix) {
+                opaque += 1;
+            }
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
@@ -1066,7 +1072,25 @@ mod tests {
 
         // An exemption covering it makes it a non-issue, exactly as
         // for a route whose device we CAN see.
-        assert!(find(&[opaque], &[p(198, 51, 100, 0, 24)]).is_empty());
+        assert!(find(std::slice::from_ref(&opaque), &[p(198, 51, 100, 0, 24)]).is_empty());
+
+        // And a table no rule selects silences it for the same reason
+        // it silences a readable route: no packet can use it, so
+        // nobody should be sent to inspect nexthops for it (review
+        // finding — this branch bypassed the filter).
+        let mut parked = opaque;
+        parked.table = 4242;
+        let selected = [254u32, 255];
+        let scoped = uncovered_paths(
+            &[parked],
+            &Scope {
+                reach: &reach(),
+                exempts: &[],
+                divertible: Divertible::Any,
+                selected_tables: Some(&selected),
+            },
+        );
+        assert!(scoped.is_empty(), "{scoped:?}");
     }
 
     /// The operator-facing line names the three things needed to act:

@@ -1131,6 +1131,7 @@ fn run_loop(
             rs.fdb_misplaced,
             rs.drift_uncovered,
             rs.drift_unreadable,
+            rs.drift_scope_stale,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();
