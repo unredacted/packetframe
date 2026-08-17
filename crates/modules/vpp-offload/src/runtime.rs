@@ -2091,14 +2091,20 @@ impl Core {
     /// has just succeeded, so the watcher only ever describes rules
     /// the NIC took.
     fn commit_drift_scope(&mut self) {
+        // A successful steering action means the NIC now holds what
+        // the current target asks for — including, on the adoption
+        // path, rules that were INHERITED and have just been
+        // reconciled. That settles the staleness whether or not a
+        // scope was staged: startup adoption stages none, so gating
+        // this on `pending` left every adopted restart permanently
+        // Degraded with the gauge absent until an unrelated
+        // reconfigure happened along (review finding).
+        self.drift_scope_stale = None;
         let Some((exempts, dst_only)) = self.pending_drift_scope.take() else {
             return;
         };
         if let Some(s) = self.drift_scanner.as_ref() {
             s.set_scope(exempts, dst_only);
-            // Whatever ambiguity a failed reconcile left is settled:
-            // the NIC just took this scope.
-            self.drift_scope_stale = None;
             // The findings described the OLD config, so they go —
             // the scanner republishes against the new one on its next
             // pass. The READ failure does not go with them: whether

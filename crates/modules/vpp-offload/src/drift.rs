@@ -452,6 +452,15 @@ struct ScannerInbox {
     /// A scope waiting to be adopted. Only the newest matters — an
     /// older pending scope is superseded, not queued.
     pending: Option<ScopeUpdate>,
+    /// Which scope the pending (or last adopted) one IS. Lives HERE,
+    /// under the same lock as `pending`, because the two must move
+    /// together: an atomic bumped outside the lock let the worker
+    /// adopt nothing, read the incremented counter, and stamp a scan
+    /// of the OLD exemptions as belonging to the NEW scope — the
+    /// stale-result check would then accept it as current and publish
+    /// a clean verdict over a path the new config had just stopped
+    /// exempting (review finding). One lock, one truth.
+    generation: u64,
     stop: bool,
 }
 
@@ -491,26 +500,26 @@ struct ScannerInbox {
 pub struct DriftScanner {
     latest: std::sync::Arc<std::sync::Mutex<Option<StampedResult>>>,
     inbox: std::sync::Arc<(std::sync::Mutex<ScannerInbox>, std::sync::Condvar)>,
-    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DriftScanner {
     /// Start scanning every `every`, beginning immediately.
     pub fn spawn(mut watch: Box<dyn DriftWatch + Send>, every: std::time::Duration) -> Self {
-        use std::sync::atomic::Ordering;
         let latest: std::sync::Arc<std::sync::Mutex<Option<StampedResult>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let inbox = std::sync::Arc::new((
             std::sync::Mutex::new(ScannerInbox::default()),
             std::sync::Condvar::new(),
         ));
-        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (l, ib, gen) = (latest.clone(), inbox.clone(), generation.clone());
+        let (l, ib) = (latest.clone(), inbox.clone());
         let handle = std::thread::Builder::new()
             .name("pf-drift-scan".into())
             .spawn(move || loop {
-                {
+                // Adopt and stamp under ONE lock hold, so
+                // `scanned_under` names exactly the scope the watcher
+                // is about to scan with.
+                let scanned_under = {
                     let mut inbox = ib.0.lock().expect("drift inbox lock");
                     if inbox.stop {
                         return;
@@ -518,10 +527,8 @@ impl DriftScanner {
                     if let Some((exempts, dst_only)) = inbox.pending.take() {
                         watch.set_scope(exempts, dst_only);
                     }
-                }
-                // Read AFTER adopting: this is the generation the pass
-                // about to run actually judges under.
-                let scanned_under = gen.load(Ordering::SeqCst);
+                    inbox.generation
+                };
                 let result = watch.uncovered();
                 *l.lock().expect("drift result lock") = Some((scanned_under, result));
 
@@ -544,7 +551,6 @@ impl DriftScanner {
         Self {
             latest,
             inbox,
-            generation,
             handle,
         }
     }
@@ -561,7 +567,7 @@ impl DriftScanner {
 
     /// The scope generation currently in force.
     pub fn generation(&self) -> u64 {
-        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+        self.inbox.0.lock().expect("drift inbox lock").generation
     }
 
     /// Hand the scanner a scope to adopt, and wake it to re-scan now.
@@ -570,9 +576,11 @@ impl DriftScanner {
         exempts: Vec<Ipv4Prefix>,
         dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     ) {
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut inbox = self.inbox.0.lock().expect("drift inbox lock");
+        // Both under the lock the worker adopts and stamps under, so
+        // there is no window where the counter has moved and the
+        // scope has not.
+        inbox.generation += 1;
         inbox.pending = Some((exempts, dst_only));
         self.inbox.1.notify_all();
     }
@@ -1318,6 +1326,75 @@ mod tests {
             },
         );
         assert!(scoped.is_empty(), "{scoped:?}");
+    }
+
+    /// The scanner's scope hand-off is atomic: a result is stamped
+    /// with the scope it actually scanned under, never one that
+    /// arrived mid-pass.
+    ///
+    /// A bare counter bumped outside the inbox lock let the worker
+    /// adopt nothing, read the incremented value, and stamp a scan of
+    /// the OLD exemptions as the NEW scope's — which the loop would
+    /// then accept as current (review finding). This drives the seam
+    /// directly rather than racing threads, which is the part that
+    /// can actually be asserted.
+    #[test]
+    fn a_result_is_stamped_with_the_scope_it_scanned_under() {
+        use std::sync::{Arc, Mutex};
+
+        /// Records the scope in force at each `uncovered()` call.
+        struct Recorder {
+            seen: Arc<Mutex<Vec<usize>>>,
+            exempts: usize,
+        }
+        impl DriftWatch for Recorder {
+            fn uncovered(&mut self) -> Result<DriftFindings, String> {
+                self.seen.lock().unwrap().push(self.exempts);
+                Ok(DriftFindings::default())
+            }
+            fn set_scope(
+                &mut self,
+                exempts: Vec<Ipv4Prefix>,
+                _dst: Option<Vec<packetframe_common::fib::IpPrefix>>,
+            ) {
+                self.exempts = exempts.len();
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scanner = DriftScanner::spawn(
+            Box::new(Recorder {
+                seen: seen.clone(),
+                exempts: 0,
+            }),
+            std::time::Duration::from_millis(50),
+        );
+        // Generation starts at zero and only a hand-off moves it.
+        assert_eq!(scanner.generation(), 0);
+        scanner.set_scope(vec![p(10, 0, 0, 0, 8)], None);
+        assert_eq!(scanner.generation(), 1, "the hand-off bumps it");
+
+        // Whatever the worker publishes, its stamp is a generation
+        // that existed, and the newest one is eventually reported.
+        let mut stamped_current = false;
+        for _ in 0..200 {
+            if let Some((gen, _)) = scanner.take_result() {
+                assert!(gen <= scanner.generation(), "no stamp from the future");
+                if gen == 1 {
+                    stamped_current = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            stamped_current,
+            "a scan under the new scope must be published"
+        );
+        assert!(
+            seen.lock().unwrap().contains(&1),
+            "and it must have scanned with the new exemptions"
+        );
     }
 
     /// The operator-facing line names the three things needed to act:
