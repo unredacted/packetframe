@@ -153,8 +153,10 @@ fn ifindex(name: &str) -> Option<u32> {
     }
 }
 
+/// `if_indextoname`, shared with [`crate::drift`]'s route dump — both
+/// turn kernel ifindexes into the names an operator reads.
 #[cfg(target_os = "linux")]
-fn ifname(index: u32) -> String {
+pub(crate) fn ifname(index: u32) -> String {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     // SAFETY: `buf` is IF_NAMESIZE bytes as the contract requires.
     let ret = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };
@@ -163,6 +165,44 @@ fn ifname(index: u32) -> String {
     }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+/// Bound how long ONE `recv` on a dump socket may block, shared with
+/// [`crate::drift`]'s route dump.
+///
+/// Netlink has no cancellation, so an unbounded receive is a thread
+/// that never settles: on the supervision loop that is a liveness
+/// stall, and on the scan thread it is a teardown that can never
+/// complete. The kernel produces dump batches promptly — 5 s is orders
+/// of magnitude past any real one — so a timeout here means something
+/// is wrong, and the caller's error path (scan unreadable, gauge
+/// absent) already says so honestly. A monitoring read must never be
+/// able to wedge anything, including itself (review finding).
+#[cfg(target_os = "linux")]
+pub(crate) fn bound_recv(socket: &netlink_sys::Socket) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    let tv = libc::timeval {
+        tv_sec: 5,
+        tv_usec: 0,
+    };
+    // SAFETY: `socket` owns the fd for the call, and `tv` is a
+    // `timeval` of exactly the length passed.
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            std::ptr::addr_of!(tv).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(format!(
+            "netlink SO_RCVTIMEO: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -195,6 +235,9 @@ pub fn dump_bridge_fdb() -> Result<Vec<FdbEntry>, String> {
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    // This dump runs ON the supervision loop, so an unbounded receive
+    // would stall liveness, wedge detection and `steer off` alike.
+    bound_recv(&socket)?;
     socket
         .bind_auto()
         .map_err(|e| format!("netlink bind: {e}"))?;

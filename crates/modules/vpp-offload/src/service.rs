@@ -157,6 +157,17 @@ pub struct SteeringRequest {
     /// `(PF iface, VF index, rules)` for every port now configured
     /// `steer on` — per-port rules because direction is per-port.
     pub targets: Vec<(String, u32, crate::steer::RuleSet)>,
+    /// The reloaded `steer-exempt` set, for the drift tripwire. It
+    /// rides the steering request because it IS part of the steering
+    /// config — the same directive produces both the Keep rules and
+    /// the scan's notion of what is covered, and letting them travel
+    /// separately is how the watcher ended up frozen at attach.
+    pub exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+    /// The diversion scope the same reconfigure produced — see
+    /// [`crate::drift::divertible_scope`]. Travels with the exemptions
+    /// because freezing either half re-opens the hole the tripwire
+    /// closes.
+    pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     /// Whether traffic should be diverted once the target is in place.
     /// False is the rollback landing zone, not an error.
     pub want_steer: bool,
@@ -609,6 +620,8 @@ impl SupervisionService {
     pub fn apply_steering(
         &self,
         targets: Vec<(String, u32, crate::steer::RuleSet)>,
+        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
         want_steer: bool,
         lever_moved: bool,
     ) -> Result<(), String> {
@@ -623,6 +636,8 @@ impl SupervisionService {
             .replace(SteeringRequest {
                 seq,
                 targets,
+                exempts,
+                dst_only,
                 want_steer,
                 lever_moved,
             });
@@ -876,6 +891,12 @@ fn apply_steering(
         ));
     }
     runtime.retarget(req.targets.clone());
+    // STAGED here, committed where a steering action succeeds. The
+    // NIC has the previous rules until then — and this request may
+    // never reach one synchronously: a deferred first steer is
+    // retried by the driver on its own, with nobody replaying this
+    // function (review finding).
+    runtime.stage_drift_scope(req.exempts.clone(), req.dst_only.clone());
 
     let steered = driver.supervisor().is_steered();
     // INTENDED, not steered. The two differ in exactly the case an
@@ -908,6 +929,18 @@ fn apply_steering(
         // effect of editing something else is precisely the decision this
         // module is not allowed to make.
         if !intended && !req.lever_moved {
+            // No effect will run, so nothing will commit the staged
+            // scope — and if the NIC holds no rules there are no old
+            // exemptions for the scan to be describing. Committing
+            // here is what keeps the tripwire PREDICTIVE before the
+            // first canary: a newly allowlisted tunnel prefix should
+            // be named while the port is still unsteered, which is
+            // the whole point of scanning before traffic moves
+            // (review finding). With rules installed, the old config
+            // is what the NIC has and the scope waits for a steer.
+            if !runtime.steering_rules_installed() {
+                runtime.commit_drift_scope();
+            }
             return Ok(());
         }
         // The same gate the automatic path uses, and applied on the same
@@ -1096,6 +1129,11 @@ fn run_loop(
             rs.shadowed_routes,
             rs.null_drops,
             rs.fdb_misplaced,
+            rs.drift_uncovered,
+            rs.drift_routes,
+            rs.drift_pending,
+            rs.drift_unreadable,
+            rs.drift_scope_stale,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

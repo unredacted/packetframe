@@ -168,6 +168,8 @@ current value without a mapping table:
 | `packetframe_vpp_fib_verified` | `0` while steered |
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
+| `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
+| `packetframe_vpp_fdb_misplaced` | `> 0` — a service-VLAN host sits behind a port its `local-route` does not declare |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
 | `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
 
@@ -613,6 +615,140 @@ bird-managed and DYNAMIC — a new host route at the remote site
 re-opens the hole silently until the exempt list catches up. Until an
 automated drift check ships, the null-drop gauge's RATE is the
 tripwire: re-profile on any step change.
+
+### The exemption tripwire (`exempt-drift`)
+
+The rule above is only as good as the exemption list staying complete,
+and the sets that produce it are edited by routing daemons — bird
+announces a remote host route and the hole re-opens with nobody
+touching packetframe. So it is watched on a clock rather than
+validated once: every 60 s the module dumps the kernel's IPv4 routes
+across all tables and reports any path VPP cannot take that no
+`steer-exempt` covers.
+
+```
+exempt-drift: degraded — kernel path(s) VPP cannot take, with no
+  `steer-exempt` covering them: 23.191.201.0/24 via vti64 (table 100)
+  — steered traffic for these dies at VPP's default route instead of
+  falling back to the kernel that would deliver it.
+```
+
+The scan runs on its **own thread**, not the supervision loop: a full
+route dump on a DFZ-carrying box walks a million prefixes, and the
+loop it would otherwise sit on is the one that answers liveness
+pings, wedge detection and steering changes — including the `steer
+off` an operator reaches for when something is wrong. Monitoring must
+never be able to delay the thing it monitors, so the loop only ever
+reads a completed result. **Detach does not wait for it either:** a
+dump in flight is abandoned rather than joined, because a netlink dump
+cannot be cancelled and a monitoring scan holds none of the resources
+a detach must release. A `detach` that reported "resources may still
+be held" while only a scan remained would be a false alarm about the
+one thing that alarm must stay trustworthy for.
+
+`packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`,
+and on `absent()` while the module is attached** — the gauge is
+omitted rather than zeroed whenever the scan cannot read the kernel,
+so a dashboard cannot mistake a blind check for a clean one.
+Each finding names the prefix, the device, and the table, which is
+what `ip route show table <n>` needs to find it again. The remedy is
+one `steer-exempt` per path (one MCAM slot each — check the budget
+line in `packetframe feasibility`), or leaving that port unsteered.
+
+What it reports, and what it deliberately does not:
+
+- **Forwarded routes** are findings when NO nexthop device is a
+  member port or a `local-route` bridge. Multipath is judged across
+  every nexthop (ECMP hides its devices in `RTA_MULTIPATH`, not
+  `RTA_OIF`); one resolvable path is enough for VPP to forward the
+  prefix, so only an all-unreachable route is reported.
+- **Kernel-delivered destinations** — the router's own addresses, and
+  a segment's directed broadcast (`.255`), neither of which VPP can
+  reproduce — are findings on the **steered segments** (the
+  `local-route` bridges). That is the w23 class: 110,917 packets to a
+  gateway address in five minutes. Device reachability is deliberately
+  NOT consulted for these, since the interface named on a local route
+  owns the address rather than being a path.
+- **Out of scope, on purpose:** local addresses elsewhere (transit
+  port IPs, mgmt, loopback). The 16-slot MCAM budget cannot hold an
+  exemption for every address on the box, and an alarm with no
+  available remedy is one operators learn to ignore. The null-drop
+  gauge is the backstop for that remainder.
+- **Lightweight-encap routes** (`ip route ... encap mpls|seg6|ip ...
+  dev eth3`) are findings **whatever device they leave by**, including
+  a member port. The mirror carries prefix, nexthop and interface, and
+  has nowhere to put a label stack or a segment list, so VPP would send
+  the packet bare out the same port — a different destination, not a
+  slower path. The message names the action (`applies MPLS
+  encapsulation`) rather than the device, because the device is
+  usually fine and reading it as a reachability problem sends the
+  operator the wrong way. MPLS and SRv6 deployments see this one;
+  bird's classic routes do not.
+- **Not reported:** routes the kernel itself drops (blackhole,
+  unreachable, prohibit — VPP dropping the same packet is the same
+  outcome), and the built-in broadcast/multicast exemptions.
+- **Under `direction dst` on every steering port**, the scan is scoped
+  to destinations the allowlist can actually divert: a path no packet
+  can reach must not cost an exemption slot. Any `src` or `both` port
+  anywhere restores the full scope, because a source-matched packet
+  reaches VPP whatever it is addressed to.
+
+Coverage is by containment, not overlap: a `/32` exemption does not
+silence the `/24` around it. That asymmetry is deliberate — treating
+one exempted host as covering its whole prefix is how a hole hides.
+
+One thing it reports about ITSELF: routes installed with **nexthop
+objects** (`ip route ... nhid N`) name their devices in a structure
+this scan does not read, so it says so — one line naming the count
+and `ip nexthop show` — rather than skipping them silently or
+guessing. bird's classic routes are unaffected; FRR deployments and
+large ECMP setups are the ones that will see it.
+
+Two more things it does not treat as active paths: a route in a table
+NO policy rule names (an unreferenced VRF or auxiliary table cannot be
+consulted by any packet, so it must not cost an exemption slot), and —
+under dst-only steering — anything outside the allowlist. Only table
+SELECTION is modelled, never the finer rule predicates (fwmark, iif,
+from/to): "no rule names this table" is unconditionally true, while
+evaluating the rest would mean reimplementing the kernel's rule walk,
+where a permissive mistake re-opens the hole. Over-reporting is the
+safe direction and the scan stays on that side of it.
+
+An `exempt-drift` row also appears when a steering change **failed
+partway and left rules installed** — the NIC then holds some of one
+config and some of another, so the tripwire says it cannot judge
+rather than answering from either set (a surviving divert rule may be
+blackholing a prefix the new config exempts). `packetframe
+reconfigure` reconciles and settles it; `ethtool -n <port>` shows what
+is actually installed.
+
+An `exempt-drift` row also appears when the scan **cannot read** the
+kernel (netlink refused, or a dump came back interrupted). That is
+Degraded too, and deliberately: a check that never ran must not look
+like one that ran and found nothing — the same rule as the null-drop
+gauge being absent rather than zero. The scan retries every minute,
+so a row that persists means the read itself needs looking at.
+
+**On a VRF host the table filter switches itself off.** An l3mdev
+rule carries table id 0 and resolves to a VRF's table per packet, so
+the enumeration cannot be complete — filtering by the tables that ARE
+named would drop every VRF route and report clean while steered
+traffic blackholed. A host with one gets no table filtering at all
+(the behaviour before the filter existed), and so does a rule dump
+that fails or comes back empty.
+
+Everything the scan judges against is hot: `steer-exempt`, the
+allowlist, and both direction knobs are rebuilt on `packetframe
+reconfigure`, and the scan's copy is replaced in the same step (then
+re-run immediately). So adding the exemption the health line asked
+for clears the line on the next status poll rather than a minute
+later — and flipping a port to `src`, or widening the allowlist,
+widens what the scan watches at the same instant it widens what the
+NIC diverts.
+
+It is detection only. Deriving the exemptions automatically was
+considered and rejected for v1: it would change forwarding without an
+operator asking and could exhaust the 16-slot budget silently.
 
 ### The null-drop gauge
 

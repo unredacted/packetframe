@@ -55,6 +55,7 @@ pub mod acquire;
 pub mod attach;
 pub mod bringup;
 pub mod cores;
+pub mod drift;
 pub mod driver;
 pub mod engine;
 pub mod executor;
@@ -1138,7 +1139,17 @@ impl Module for VppOffloadModule {
             .ne(new.ports.iter().map(|(_, _, steer, _, _)| *steer));
         attached
             .service
-            .apply_steering(target.targets, target.want_steer, lever_moved)
+            .apply_steering(
+                target.targets,
+                new.steer_exempts.clone(),
+                // The SAME derivation attach uses, run against the
+                // config just accepted — allowlist and directions are
+                // both hot, so a scope captured at attach goes stale
+                // the moment either moves.
+                drift::divertible_scope(&new.ports, new.steer_direction, &self.allowlist.get()),
+                target.want_steer,
+                lever_moved,
+            )
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Recorded only after the change landed. A `cfg` updated ahead of
         // the apply would make the NEXT reconfigure diff against a target

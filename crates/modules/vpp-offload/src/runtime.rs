@@ -534,6 +534,71 @@ struct Core {
     /// log lines, not impersonated by a stub.
     fdb_watch: Option<Box<dyn crate::fdb::FdbWatch>>,
     last_fdb_scan: Option<std::time::Instant>,
+    /// The exemption tripwire: kernel paths VPP cannot take that no
+    /// `steer-exempt` covers. Installed on Linux whenever steering is
+    /// configured at all — the hole it finds opens the moment a port
+    /// steers, and an operator wants it named BEFORE that.
+    /// The scan runs on its own thread — see [`crate::drift::DriftScanner`]
+    /// for why a full route dump must never sit on this loop.
+    drift_scanner: Option<crate::drift::DriftScanner>,
+    /// Last completed scan's findings, kept across a failed scan (an
+    /// unreadable kernel is not evidence the routes went away).
+    drift_uncovered: Vec<String>,
+    /// How many ROUTES those findings stand for. Tracked beside the
+    /// lines because the nexthop-object summary is one line for many
+    /// routes, and the gauge must count routes.
+    drift_routes: usize,
+    /// The scope generation the retained findings were scanned under,
+    /// and whether that is still the current one. A million-route
+    /// dump takes seconds, so "attached but not yet scanned" is a
+    /// real window an operator can steer inside — and an empty
+    /// finding list there is not a clean verdict, it is no verdict
+    /// (review finding).
+    drift_result_gen: Option<u64>,
+    /// A scanner exists and has not yet reported on the CURRENT
+    /// scope. False when no scanner is installed — nothing to wait
+    /// for — and false once a current-generation verdict lands.
+    drift_pending: bool,
+    /// A drift scope the config asked for that the NIC has not taken
+    /// yet.
+    ///
+    /// Staged rather than applied, because the scan judges what the
+    /// NIC is BELIEVED TO HOLD and a reconfigure's rules do not reach
+    /// it until a steer succeeds. Committing at request time hid a
+    /// path whose exemption had been refused; committing only on the
+    /// synchronous success then missed the OTHER door — a first steer
+    /// deferred by the FIB gate is retried automatically by the
+    /// driver, installs the new rules with nobody replaying the
+    /// request, and would have left the watcher on the old exemptions
+    /// (both review findings). It is committed at the places every
+    /// steering action goes through, whichever path asked for it.
+    pending_drift_scope: Option<(
+        Vec<packetframe_common::config::Ipv4Prefix>,
+        Option<Vec<packetframe_common::fib::IpPrefix>>,
+    )>,
+    /// Set when a steering change failed PARTWAY and left rules on
+    /// the NIC, so neither the old exemption set nor the new one
+    /// describes what is installed.
+    ///
+    /// `NtupleSteering::steer` rolls back a partial install, and a
+    /// rollback that itself fails deliberately keeps those rules in
+    /// the ledger — they are still diverting traffic. The scope gate
+    /// is `is_ok()`, so the watcher stayed on the old exemptions
+    /// while a surviving divert rule blackholed a prefix the
+    /// reconfigure had just unexempted (review finding). There is no
+    /// correct set to adopt in that state, so the scan says it does
+    /// not know rather than answering from either one.
+    drift_scope_stale: Option<String>,
+    /// Why the last scan could not read the kernel, if it could not.
+    ///
+    /// Its own field for the same reason `steer_audit_error` is: a
+    /// check that cannot run must not be indistinguishable from one
+    /// that ran and found nothing. Without it a permanently broken
+    /// netlink read published an empty finding list, no health row and
+    /// a zero gauge — the newest safety check presenting as clean
+    /// while blind, which is the shape it exists to catch (review
+    /// finding). Same rule as the null-drop gauge's absent-not-zero.
+    drift_unreadable: Option<String>,
     /// The last completed scan's findings; kept across a failed scan
     /// (an unreadable kernel is not evidence the hosts moved back).
     fdb_misplaced: Vec<String>,
@@ -1246,6 +1311,14 @@ impl Runtime {
                 fdb_watch: None,
                 last_fdb_scan: None,
                 fdb_misplaced: Vec::new(),
+                drift_scanner: None,
+                drift_uncovered: Vec::new(),
+                drift_routes: 0,
+                drift_result_gen: None,
+                drift_pending: false,
+                drift_unreadable: None,
+                drift_scope_stale: None,
+                pending_drift_scope: None,
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1312,6 +1385,32 @@ impl Runtime {
         self.core.borrow_mut().fdb_watch = Some(w);
     }
 
+    /// Install the exemption tripwire. Same wiring rule as the others.
+    pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch + Send>) {
+        self.core.borrow_mut().drift_scanner =
+            Some(crate::drift::DriftScanner::spawn(w, DRIFT_SCAN_EVERY));
+    }
+
+    /// Declare that the NIC holds rules INHERITED from a previous
+    /// process, so the tripwire is judging a config it cannot assume
+    /// matches them.
+    ///
+    /// The watcher is built from the config on disk, and a restart
+    /// that adopts a live VPP re-adopts whatever rules the last
+    /// process installed — which the operator may have edited the
+    /// config away from in between. An exemption added while the
+    /// daemon was down would then suppress a path the inherited
+    /// divert rule still sends into VPP (review finding). The first
+    /// successful steer reconciles the NIC to the current target and
+    /// clears this.
+    pub fn note_inherited_steering(&self) {
+        self.core.borrow_mut().drift_scope_stale = Some(
+            "steering rules were inherited from a previous process and have not been \
+             reconciled with the running config yet"
+                .into(),
+        );
+    }
+
     pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
         self.core.borrow_mut().rx_kick = k;
     }
@@ -1324,6 +1423,31 @@ impl Runtime {
     /// cannot be separated.
     pub fn retarget(&self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
         self.core.borrow_mut().retarget(targets);
+    }
+
+    /// Hand the exemption tripwire a reloaded exemption set.
+    /// Whether the NIC holds any steering rule right now.
+    ///
+    /// Read by the reconfigure path to decide whether a request that
+    /// installs nothing may still commit its drift scope: with no
+    /// rules installed there are no old exemptions to describe, so the
+    /// staged config IS what a scan should judge.
+    pub fn steering_rules_installed(&self) -> bool {
+        !self.core.borrow().steering.installed().is_empty()
+    }
+
+    /// Adopt the staged scope now — for the path where the request
+    /// performs no steering action at all.
+    pub fn commit_drift_scope(&self) {
+        self.core.borrow_mut().commit_drift_scope();
+    }
+
+    pub fn stage_drift_scope(
+        &self,
+        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    ) {
+        self.core.borrow_mut().stage_drift_scope(exempts, dst_only);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1469,6 +1593,74 @@ impl Runtime {
                 c.last_null_sample = Some(now);
                 c.engine.sample_null_drops();
             }
+            // A COMPLETED result, if the scanner finished a pass
+            // since the last look. Never a scan performed here: this
+            // is the thread that answers pings, stops and steering
+            // requests, and a 1.05M-prefix dump on it would delay all
+            // three (review finding).
+            // A COMPLETED result, and only one scanned under the
+            // CURRENT scope: a pass already in flight when a
+            // reconfigure landed is answering about the exemptions
+            // that were in force when it started, and publishing that
+            // as the new config's verdict is how a newly blackholed
+            // path would read as covered (review finding).
+            let fresh = c.drift_scanner.as_ref().and_then(|s| {
+                let current = s.generation();
+                match s.take_result() {
+                    Some((gen, r)) if gen == current => Some(r),
+                    Some((gen, _)) => {
+                        tracing::debug!(
+                            scanned_under = gen,
+                            current,
+                            "discarding a drift result about a superseded scope"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            });
+            // Whether a verdict about the CURRENT config exists at
+            // all. Until one does — the first pass after attach, or
+            // after a scope change — the tripwire has nothing to say
+            // and must not say `0`.
+            if let Some(s) = c.drift_scanner.as_ref() {
+                let current = s.generation();
+                if fresh.is_some() {
+                    c.drift_result_gen = Some(current);
+                }
+                // PENDING, not "unscanned": a deployment with no
+                // tripwire installed at all (non-Linux, or a config
+                // the loader gave no watcher) is not waiting for
+                // anything, and degrading it would report a missing
+                // feature as a broken one.
+                c.drift_pending = c.drift_result_gen != Some(current);
+            }
+            if let Some(result) = fresh {
+                match result {
+                    Ok(found) => {
+                        if !found.lines.is_empty() && c.drift_uncovered != found.lines {
+                            tracing::warn!(
+                                paths = ?found,
+                                "kernel path(s) VPP cannot take are not covered by any \
+                                 `steer-exempt`; steered traffic for them dies at VPP's \
+                                 default route instead of falling back to the kernel. Add \
+                                 a steer-exempt for each, or stop steering the port"
+                            );
+                        }
+                        c.drift_routes = found.routes;
+                        c.drift_uncovered = found.lines;
+                        c.drift_unreadable = None;
+                    }
+                    // The previous findings stand — an unreadable
+                    // kernel is not evidence the routes went away —
+                    // but the failure is published, so a scan that
+                    // never succeeds cannot pass for a quiet one.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "route-drift scan failed");
+                        c.drift_unreadable = Some(e);
+                    }
+                }
+            }
             let due = c
                 .last_fdb_scan
                 .is_none_or(|t| now.duration_since(t) >= FDB_SCAN_EVERY);
@@ -1532,6 +1724,11 @@ impl Runtime {
             shadowed_routes: c.engine.shadowed_routes(),
             null_drops: c.engine.null_drops(),
             fdb_misplaced: c.fdb_misplaced.clone(),
+            drift_uncovered: c.drift_uncovered.clone(),
+            drift_routes: c.drift_routes,
+            drift_pending: c.drift_pending,
+            drift_unreadable: c.drift_unreadable.clone(),
+            drift_scope_stale: c.drift_scope_stale.clone(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1581,6 +1778,15 @@ const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
 /// moved host is a provisioning-scale event, so a minute of latency
 /// on the tripwire costs nothing.
 const FDB_SCAN_EVERY: Duration = Duration::from_secs(60);
+
+/// How often to check the kernel's routes against the exemptions.
+///
+/// One route dump per minute. The sets this watches are edited by
+/// routing daemons, not by hand — the reference primary's tunnel host
+/// routes come from bird — so the interesting change arrives without
+/// anyone touching packetframe, which is the whole argument for
+/// scanning on a clock rather than at config load.
+const DRIFT_SCAN_EVERY: Duration = Duration::from_secs(60);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -1702,6 +1908,18 @@ pub struct RuntimeStatus {
     /// `local-route` declares, one line each. Empty = the tripwire is
     /// quiet (or not installed).
     pub fdb_misplaced: Vec<String>,
+    /// Kernel paths VPP cannot take that no `steer-exempt` covers.
+    pub drift_uncovered: Vec<String>,
+    /// How many routes those findings stand for — the gauge's value.
+    pub drift_routes: usize,
+    /// A scan is outstanding for the CURRENT configuration — the
+    /// tripwire has no verdict yet, which is not the same as a clean
+    /// one. False when no tripwire is installed.
+    pub drift_pending: bool,
+    /// Why the last drift scan could not read the kernel, if so.
+    pub drift_unreadable: Option<String>,
+    /// Why the scan cannot say which exemptions the NIC holds, if so.
+    pub drift_scope_stale: Option<String>,
 }
 
 impl Core {
@@ -1833,6 +2051,68 @@ impl Core {
     fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
         self.steering.retarget(targets);
         self.last_steer_audit = None;
+    }
+
+    /// Hand the exemption tripwire the reloaded `steer-exempt` set.
+    ///
+    /// Called from the same place as `retarget` and for the same
+    /// reason the audit is invalidated there: the scan's verdict was
+    /// computed against the OLD config the moment this one is
+    /// accepted. Also clears the scan clock, so the next status poll
+    /// re-reads rather than serving a verdict about a config that no
+    /// longer exists — the operator who just added the exemption the
+    /// health line asked for should not have to wait out a minute of
+    /// it still complaining.
+    fn stage_drift_scope(
+        &mut self,
+        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    ) {
+        if self.drift_scanner.is_some() {
+            self.pending_drift_scope = Some((exempts, dst_only));
+        }
+    }
+
+    /// A steering change failed. If it left rules installed while a
+    /// new scope was waiting, the NIC now holds some of one config
+    /// and some of another and the scan must say so — see
+    /// [`Self::drift_scope_stale`].
+    fn note_partial_steer(&mut self) {
+        if self.pending_drift_scope.is_some() && !self.steering.installed().is_empty() {
+            self.drift_scope_stale = Some(
+                "a steering change failed partway and left rules installed, so the \
+                 exemptions the NIC holds are neither the old set nor the new one"
+                    .into(),
+            );
+        }
+    }
+
+    /// Adopt the staged scope, if any — called where a steering action
+    /// has just succeeded, so the watcher only ever describes rules
+    /// the NIC took.
+    fn commit_drift_scope(&mut self) {
+        // A successful steering action means the NIC now holds what
+        // the current target asks for — including, on the adoption
+        // path, rules that were INHERITED and have just been
+        // reconciled. That settles the staleness whether or not a
+        // scope was staged: startup adoption stages none, so gating
+        // this on `pending` left every adopted restart permanently
+        // Degraded with the gauge absent until an unrelated
+        // reconfigure happened along (review finding).
+        self.drift_scope_stale = None;
+        let Some((exempts, dst_only)) = self.pending_drift_scope.take() else {
+            return;
+        };
+        if let Some(s) = self.drift_scanner.as_ref() {
+            s.set_scope(exempts, dst_only);
+            // The findings described the OLD config, so they go —
+            // the scanner republishes against the new one on its next
+            // pass. The READ failure does not go with them: whether
+            // the kernel answers has nothing to do with which config
+            // we are judging.
+            self.drift_uncovered.clear();
+            self.drift_routes = 0;
+        }
     }
 
     /// Whether a steer against the current target would divert traffic
@@ -2525,6 +2805,12 @@ impl Effects for EffectsView {
         let mut c = self.core.borrow_mut();
         let outcome = c.steering.unsteer();
         c.record_steering();
+        // A confirmed removal is the config taking effect too: nothing
+        // is diverted, so the scan turns predictive, and it should
+        // predict from the config the operator just applied.
+        if outcome.is_ok() {
+            c.commit_drift_scope();
+        }
         outcome
     }
 
@@ -2542,6 +2828,15 @@ impl Effects for EffectsView {
         let mut c = self.core.borrow_mut();
         let outcome = c.steering.steer();
         c.record_steering();
+        // One of the places every steer passes through — the
+        // operator's reconfigure and the driver's automatic retry
+        // alike — so the staged scope lands whichever asked, and
+        // never when the NIC refused.
+        if outcome.is_ok() {
+            c.commit_drift_scope();
+        } else {
+            c.note_partial_steer();
+        }
         outcome
     }
 
@@ -2659,6 +2954,15 @@ impl Effects for EffectsView {
         }
         let outcome = c.steering.steer();
         c.record_steering();
+        // One of the places every steer passes through — the
+        // operator's reconfigure and the driver's automatic retry
+        // alike — so the staged scope lands whichever asked, and
+        // never when the NIC refused.
+        if outcome.is_ok() {
+            c.commit_drift_scope();
+        } else {
+            c.note_partial_steer();
+        }
         outcome
     }
 

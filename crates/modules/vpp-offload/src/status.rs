@@ -62,6 +62,8 @@ pub const SUBSYS_PORTS: &str = "ports";
 pub const SUBSYS_STATE_FILE: &str = "state-file";
 /// Only present when the bridge-FDB tripwire has findings.
 pub const SUBSYS_FDB: &str = "fdb";
+/// Only present when the exemption tripwire has findings.
+pub const SUBSYS_EXEMPT_DRIFT: &str = "exempt-drift";
 /// Subsystem name for the cross-tier route feed.
 pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
 
@@ -374,6 +376,34 @@ pub struct StatusSnapshot {
     /// v1 tripwire whose firing is what makes per-host delivery (v2)
     /// real work instead of speculation.
     pub fdb_misplaced: Vec<String>,
+    /// Kernel paths VPP cannot take (tunnels, and the router's own
+    /// addresses) that no `steer-exempt` covers — steered traffic for
+    /// them dies at VPP's default route where the kernel would have
+    /// delivered it. Degraded, path named: this is the shape that
+    /// blackholed inter-site traffic for three weeks before anything
+    /// looked (w26), and the sets that produce it are edited by
+    /// routing daemons, so it is watched rather than validated once.
+    pub drift_uncovered: Vec<String>,
+    /// How many kernel routes the findings stand for — what the gauge
+    /// publishes. Distinct from `drift_uncovered.len()`, since the
+    /// nexthop-object summary is one line for many routes.
+    pub drift_routes: usize,
+    /// A scan is outstanding for the CURRENT configuration: the
+    /// tripwire has no verdict yet, which must not be rendered as a
+    /// clean one — a full route dump takes seconds, and an operator
+    /// can reach the first steer inside that window believing the
+    /// predictive scan already ran. False when no tripwire is
+    /// installed, since nothing is being waited for.
+    pub drift_pending: bool,
+    /// Why the drift scan could not read the kernel, if it could not.
+    /// Degraded on its own: a safety check that cannot run must not
+    /// be indistinguishable from one that ran and found nothing.
+    pub drift_unreadable: Option<String>,
+    /// Why the scan cannot say which exemptions the NIC holds — a
+    /// steering change that failed partway and left rules installed.
+    /// Degraded for the same reason an unreadable scan is: neither
+    /// answer it could give would be true.
+    pub drift_scope_stale: Option<String>,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -429,6 +459,13 @@ impl StatusSnapshot {
             0,
             None,
             Vec::new(),
+            Vec::new(),
+            0,
+            // The shorthand has no scanner behind it, so nothing is
+            // outstanding.
+            false,
+            None,
+            None,
         )
     }
 
@@ -457,6 +494,11 @@ impl StatusSnapshot {
         shadowed_routes: u64,
         null_drops: Option<u64>,
         fdb_misplaced: Vec<String>,
+        drift_uncovered: Vec<String>,
+        drift_routes: usize,
+        drift_pending: bool,
+        drift_unreadable: Option<String>,
+        drift_scope_stale: Option<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -483,6 +525,11 @@ impl StatusSnapshot {
             shadowed_routes,
             null_drops,
             fdb_misplaced,
+            drift_uncovered,
+            drift_routes,
+            drift_pending,
+            drift_unreadable,
+            drift_scope_stale,
         }
     }
 
@@ -551,6 +598,69 @@ impl StatusSnapshot {
                      a table that is behind bird, not a wrong one.",
                     self.source_backlog, self.pending_ops
                 )),
+                last_success_age_seconds: None,
+            });
+        }
+        if let Some(why) = &self.drift_scope_stale {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "{why}, so the exemption tripwire cannot judge them — a surviving \
+                     divert rule may be blackholing a prefix this config exempts. \
+                     `packetframe reconfigure` reconciles the NIC and settles it; \
+                     `ethtool -n <port>` shows what is actually installed"
+                )),
+                last_success_age_seconds: None,
+            });
+        } else if !self.drift_uncovered.is_empty() {
+            // The read failure travels WITH the findings when both
+            // exist. The runtime deliberately retains findings across
+            // a failed scan (an unreadable kernel is not evidence the
+            // routes went away), and presenting them alone reads as
+            // current — while a route added since could be invisible
+            // and a named one already gone (review finding).
+            let stale = self.drift_unreadable.as_ref().map(|why| {
+                format!(
+                    ". NOTE: the latest scan could not read the kernel ({why}), so this list                      is the last good one — newly added routes are invisible and a named one                      may already be gone"
+                )
+            });
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "kernel path(s) VPP cannot take, with no `steer-exempt` covering them: \
+                     {} — steered traffic for these dies at VPP's default route instead of \
+                     falling back to the kernel that would deliver it. Add a `steer-exempt` \
+                     per path (each costs one MCAM slot), or leave the port unsteered{}",
+                    self.drift_uncovered.join("; "),
+                    stale.unwrap_or_default()
+                )),
+                last_success_age_seconds: None,
+            });
+        } else if let Some(why) = &self.drift_unreadable {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "the exemption tripwire could not read the kernel's routes ({why}), so \
+                     it is not watching for paths VPP cannot take — an uncovered one would \
+                     blackhole steered traffic unreported. The scan retries every minute; a \
+                     persistent failure needs looking at"
+                )),
+                last_success_age_seconds: None,
+            });
+        } else if self.drift_pending {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(
+                    "the exemption tripwire has not finished a scan for this configuration \
+                     yet — on a full-table box the route dump takes seconds, and an empty \
+                     finding list before it lands is no verdict rather than a clean one. It \
+                     clears itself; a first steer is worth holding until it does"
+                        .into(),
+                ),
                 last_success_age_seconds: None,
             });
         }
@@ -673,6 +783,17 @@ impl StatusSnapshot {
             // only — the remedy is the operator's — but it must not
             // read as healthy while it stands.
             && self.fdb_misplaced.is_empty()
+            // An uncovered kernel path is traffic that will vanish the
+            // moment the port steers — and did, for three weeks,
+            // under a health surface that said Healthy throughout.
+            && self.drift_uncovered.is_empty()
+            // And a tripwire that cannot read the kernel is not a
+            // quiet tripwire.
+            && self.drift_unreadable.is_none()
+            // Nor is one that cannot tell which config the NIC holds,
+            // nor one that has not yet looked at this config at all.
+            && self.drift_scope_stale.is_none()
+            && !self.drift_pending
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -1511,6 +1632,26 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             "cumulative VPP null-node drops (undeliverable traffic; absent until sampled)",
         );
         let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
+    }
+
+    // ABSENT while the scan cannot read the kernel, never zero — the
+    // same rule as the freshness gauges and the null-drop counter. A
+    // dashboard alarming on `> 0` would read a retained (or
+    // never-populated) count as proof of health while the check was
+    // blind, which is the failure this whole module exists to catch
+    // (review finding). `absent()` is the alarm for that case; the
+    // health report carries the reason.
+    if snap.drift_unreadable.is_none() && snap.drift_scope_stale.is_none() && !snap.drift_pending {
+        gauge(
+            &mut out,
+            "packetframe_vpp_exempt_drift",
+            "kernel paths VPP cannot take that no steer-exempt covers (steered = blackholed)",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_exempt_drift{{module=\"{module}\"}} {}",
+            snap.drift_routes
+        );
     }
 
     gauge(
@@ -3277,6 +3418,208 @@ mod tests {
         // The boolean is still emitted — "not verified" is a fact worth
         // scraping.
         assert!(m.contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"));
+    }
+
+    /// The exemption tripwire: quiet = no row, firing = Degraded with
+    /// the path named on the report AND counted on the gauge. Both
+    /// surfaces or neither — a Degraded report beside a healthy gauge
+    /// is how the store-error bug hid, and this is the same shape.
+    #[test]
+    fn an_uncovered_kernel_path_degrades_and_is_named_on_both_surfaces() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        assert!(
+            !s.report()
+                .subsystems
+                .iter()
+                .any(|x| x.name == SUBSYS_EXEMPT_DRIFT),
+            "a quiet tripwire adds no row"
+        );
+        assert!(render_metrics(&s, "vpp-offload")
+            .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0"));
+
+        s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        s.drift_routes = 1;
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("the tripwire row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.as_deref().unwrap_or("");
+        assert!(msg.contains("vti64"), "{msg}");
+        assert!(msg.contains("steer-exempt"), "and names the remedy: {msg}");
+        assert_ne!(report.overall, HealthState::Healthy);
+        assert!(render_metrics(&s, "vpp-offload")
+            .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 1"));
+
+        // The gauge counts ROUTES, not lines. The nexthop-object
+        // summary is ONE line standing for many routes, and deriving
+        // the gauge from the line count published `1` however much of
+        // the table the scan could not see — undercounting exactly
+        // the blind portion it exists to report (review finding).
+        s.drift_uncovered = vec!["7 route(s) use nexthop objects ...".into()];
+        s.drift_routes = 7;
+        assert!(
+            render_metrics(&s, "vpp-offload")
+                .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 7"),
+            "one line standing for seven routes must publish 7"
+        );
+    }
+
+    /// A scan that has not finished is not a clean scan.
+    ///
+    /// The route dump moved off the supervision loop, which created a
+    /// window: attached, scanner still walking a million prefixes,
+    /// findings empty. Rendering that as a quiet tripwire would let an
+    /// operator take the first steer believing the predictive scan
+    /// already ran (review finding). A deployment with NO tripwire is
+    /// a different thing and must not degrade.
+    #[test]
+    fn a_scan_that_has_not_finished_is_not_a_clean_one() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        // No tripwire installed: nothing outstanding, nothing to say.
+        assert!(!s.drift_pending);
+        assert_eq!(s.report().overall, HealthState::Healthy);
+
+        s.drift_pending = true;
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("a pending scan must be visible");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("has not finished a scan"),
+            "{row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+        assert!(
+            !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),
+            "and publishes no count it has not earned"
+        );
+    }
+
+    /// A steering change that failed partway leaves the NIC holding
+    /// some of one config and some of another, so the tripwire says
+    /// it cannot judge rather than answering from either set — a
+    /// surviving divert rule may be blackholing a prefix the new
+    /// config exempts (review finding).
+    #[test]
+    fn a_partial_steer_makes_the_tripwire_say_it_cannot_judge() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        s.drift_scope_stale =
+            Some("a steering change failed partway and left rules installed".into());
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("the tripwire must say something");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message.as_deref().unwrap_or("").contains("reconfigure"),
+            "and name the remedy: {row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+        assert!(
+            !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),
+            "a count from either config would be a claim the scan cannot make"
+        );
+    }
+
+    /// A tripwire that cannot read the kernel is Degraded, not quiet.
+    /// Same rule as the null-drop gauge's absent-not-zero: a check
+    /// that never ran must not be indistinguishable from one that ran
+    /// and found nothing (review finding).
+    #[test]
+    fn a_drift_scan_that_cannot_read_the_kernel_is_not_a_clean_one() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        // Findings RETAINED across a failed scan must say they are
+        // stale — presenting the last good list as current hides both
+        // a route added since and one already gone (review finding).
+        let mut both = s.clone();
+        both.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        both.drift_routes = 1;
+        both.drift_unreadable = Some("netlink recv: EIO".into());
+        let msg = both
+            .report()
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .and_then(|r| r.message.clone())
+            .unwrap_or_default();
+        assert!(msg.contains("vti64"), "the findings are still named: {msg}");
+        assert!(msg.contains("last good one"), "and marked stale: {msg}");
+
+        s.drift_unreadable = Some("netlink socket: permission denied".into());
+        assert!(
+            !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),
+            "a blind scan must not publish a count a dashboard would read as clean"
+        );
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("an unreadable scan must still say something");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("could not read"),
+            "{row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+
+        // Findings outrank the read failure: when the scan DID run and
+        // found something, that is the more actionable line.
+        s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        let report = s.report();
+        let rows: Vec<_> = report
+            .subsystems
+            .iter()
+            .filter(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .collect();
+        assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
+        assert!(rows[0].message.as_deref().unwrap_or("").contains("vti64"));
     }
 
     /// The FDB tripwire: quiet = no subsystem row (nothing for an
