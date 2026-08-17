@@ -437,6 +437,104 @@ pub trait DriftWatch {
     );
 }
 
+/// The scan, running on its OWN thread.
+///
+/// A full `RTM_GETROUTE` dump on the reference primary walks ~1.05M
+/// prefixes — parsed and allocated one message at a time — and the
+/// supervision loop it used to run on is the same thread that answers
+/// liveness pings, wedge detection, stop requests and steering
+/// changes. A dump that outran the 3 s steering budget would time out
+/// an operator's `steer off`: the rollback lever, blocked by a
+/// monitoring scan (review finding). Monitoring must never be able to
+/// delay the thing it monitors.
+///
+/// So the scan lives here: one thread, its own cadence, publishing
+/// COMPLETED results into a slot the loop reads without blocking. The
+/// loop's only cost is a mutex it never contends for more than the
+/// length of a `Vec` clone.
+/// The exemptions and diversion scope a scan judges against, as the
+/// loop hands them over.
+pub type ScopeUpdate = (
+    Vec<Ipv4Prefix>,
+    Option<Vec<packetframe_common::fib::IpPrefix>>,
+);
+
+pub struct DriftScanner {
+    latest: std::sync::Arc<std::sync::Mutex<Option<Result<DriftFindings, String>>>>,
+    /// A scope the loop staged for the scanner to adopt before its
+    /// next pass. `Mutex` rather than a channel because only the
+    /// newest one matters — an older pending scope is superseded, not
+    /// queued.
+    scope: std::sync::Arc<std::sync::Mutex<Option<ScopeUpdate>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DriftScanner {
+    /// Start scanning every `every`, beginning immediately.
+    pub fn spawn(mut watch: Box<dyn DriftWatch + Send>, every: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering;
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let scope = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (l, sc, st) = (latest.clone(), scope.clone(), stop.clone());
+        let handle = std::thread::Builder::new()
+            .name("pf-drift-scan".into())
+            .spawn(move || {
+                while !st.load(Ordering::Relaxed) {
+                    if let Some((exempts, dst_only)) = sc.lock().expect("drift scope lock").take() {
+                        watch.set_scope(exempts, dst_only);
+                    }
+                    let result = watch.uncovered();
+                    *l.lock().expect("drift result lock") = Some(result);
+                    // Chunked so a teardown is not waiting out a full
+                    // interval; the loop's own stop path joins this.
+                    let mut slept = std::time::Duration::ZERO;
+                    while slept < every && !st.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        slept += std::time::Duration::from_millis(100);
+                    }
+                }
+            })
+            .ok();
+        Self {
+            latest,
+            scope,
+            stop,
+            handle,
+        }
+    }
+
+    /// The newest COMPLETED result, if the scanner has finished a pass
+    /// since the last look. `None` means nothing new — the caller
+    /// keeps whatever it had.
+    pub fn take_result(&self) -> Option<Result<DriftFindings, String>> {
+        self.latest.lock().expect("drift result lock").take()
+    }
+
+    /// Hand the scanner a scope to adopt before its next pass.
+    pub fn set_scope(
+        &self,
+        exempts: Vec<Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    ) {
+        *self.scope.lock().expect("drift scope lock") = Some((exempts, dst_only));
+    }
+}
+
+impl Drop for DriftScanner {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            // The thread checks the flag every 100 ms between passes,
+            // but a pass in flight runs to completion — a netlink dump
+            // has no cancellation, and abandoning the thread with the
+            // socket open is worse than waiting for it.
+            let _ = h.join();
+        }
+    }
+}
+
 /// The production scan: dump every IPv4 route in every table, compare.
 #[cfg(target_os = "linux")]
 pub struct KernelDriftWatch {

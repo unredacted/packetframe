@@ -601,22 +601,18 @@ impl StatusSnapshot {
                 )),
                 last_success_age_seconds: None,
             });
-        } else if self.drift_uncovered.is_empty() {
-            if let Some(why) = &self.drift_unreadable {
-                subsystems.push(SubsystemHealth {
-                    name: SUBSYS_EXEMPT_DRIFT.into(),
-                    state: HealthState::Degraded,
-                    message: Some(format!(
-                        "the exemption tripwire could not read the kernel's routes ({why}), \
-                         so it is not watching for paths VPP cannot take — an uncovered one \
-                         would blackhole steered traffic unreported. The scan retries every \
-                         minute; a persistent failure needs looking at"
-                    )),
-                    last_success_age_seconds: None,
-                });
-            }
-        }
-        if !self.drift_uncovered.is_empty() {
+        } else if !self.drift_uncovered.is_empty() {
+            // The read failure travels WITH the findings when both
+            // exist. The runtime deliberately retains findings across
+            // a failed scan (an unreadable kernel is not evidence the
+            // routes went away), and presenting them alone reads as
+            // current — while a route added since could be invisible
+            // and a named one already gone (review finding).
+            let stale = self.drift_unreadable.as_ref().map(|why| {
+                format!(
+                    ". NOTE: the latest scan could not read the kernel ({why}), so this list                      is the last good one — newly added routes are invisible and a named one                      may already be gone"
+                )
+            });
             subsystems.push(SubsystemHealth {
                 name: SUBSYS_EXEMPT_DRIFT.into(),
                 state: HealthState::Degraded,
@@ -624,8 +620,21 @@ impl StatusSnapshot {
                     "kernel path(s) VPP cannot take, with no `steer-exempt` covering them: \
                      {} — steered traffic for these dies at VPP's default route instead of \
                      falling back to the kernel that would deliver it. Add a `steer-exempt` \
-                     per path (each costs one MCAM slot), or leave the port unsteered",
-                    self.drift_uncovered.join("; ")
+                     per path (each costs one MCAM slot), or leave the port unsteered{}",
+                    self.drift_uncovered.join("; "),
+                    stale.unwrap_or_default()
+                )),
+                last_success_age_seconds: None,
+            });
+        } else if let Some(why) = &self.drift_unreadable {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "the exemption tripwire could not read the kernel's routes ({why}), so \
+                     it is not watching for paths VPP cannot take — an uncovered one would \
+                     blackhole steered traffic unreported. The scan retries every minute; a \
+                     persistent failure needs looking at"
                 )),
                 last_success_age_seconds: None,
             });
@@ -3490,6 +3499,23 @@ mod tests {
             verified(1),
             ports_up(),
         );
+        // Findings RETAINED across a failed scan must say they are
+        // stale — presenting the last good list as current hides both
+        // a route added since and one already gone (review finding).
+        let mut both = s.clone();
+        both.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        both.drift_routes = 1;
+        both.drift_unreadable = Some("netlink recv: EIO".into());
+        let msg = both
+            .report()
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .and_then(|r| r.message.clone())
+            .unwrap_or_default();
+        assert!(msg.contains("vti64"), "the findings are still named: {msg}");
+        assert!(msg.contains("last good one"), "and marked stale: {msg}");
+
         s.drift_unreadable = Some("netlink socket: permission denied".into());
         assert!(
             !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),

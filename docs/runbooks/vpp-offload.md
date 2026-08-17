@@ -633,6 +633,14 @@ exempt-drift: degraded — kernel path(s) VPP cannot take, with no
   falling back to the kernel that would deliver it.
 ```
 
+The scan runs on its **own thread**, not the supervision loop: a full
+route dump on a DFZ-carrying box walks a million prefixes, and the
+loop it would otherwise sit on is the one that answers liveness
+pings, wedge detection and steering changes — including the `steer
+off` an operator reaches for when something is wrong. Monitoring must
+never be able to delay the thing it monitors, so the loop only ever
+reads a completed result.
+
 `packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`,
 and on `absent()` while the module is attached** — the gauge is
 omitted rather than zeroed whenever the scan cannot read the kernel,

@@ -538,8 +538,9 @@ struct Core {
     /// `steer-exempt` covers. Installed on Linux whenever steering is
     /// configured at all — the hole it finds opens the moment a port
     /// steers, and an operator wants it named BEFORE that.
-    drift_watch: Option<Box<dyn crate::drift::DriftWatch>>,
-    last_drift_scan: Option<std::time::Instant>,
+    /// The scan runs on its own thread — see [`crate::drift::DriftScanner`]
+    /// for why a full route dump must never sit on this loop.
+    drift_scanner: Option<crate::drift::DriftScanner>,
     /// Last completed scan's findings, kept across a failed scan (an
     /// unreadable kernel is not evidence the routes went away).
     drift_uncovered: Vec<String>,
@@ -1299,8 +1300,7 @@ impl Runtime {
                 fdb_watch: None,
                 last_fdb_scan: None,
                 fdb_misplaced: Vec::new(),
-                drift_watch: None,
-                last_drift_scan: None,
+                drift_scanner: None,
                 drift_uncovered: Vec::new(),
                 drift_routes: 0,
                 drift_unreadable: None,
@@ -1373,8 +1373,9 @@ impl Runtime {
     }
 
     /// Install the exemption tripwire. Same wiring rule as the others.
-    pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch>) {
-        self.core.borrow_mut().drift_watch = Some(w);
+    pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch + Send>) {
+        self.core.borrow_mut().drift_scanner =
+            Some(crate::drift::DriftScanner::spawn(w, DRIFT_SCAN_EVERY));
     }
 
     /// Declare that the NIC holds rules INHERITED from a previous
@@ -1579,12 +1580,13 @@ impl Runtime {
                 c.last_null_sample = Some(now);
                 c.engine.sample_null_drops();
             }
-            let due = c
-                .last_drift_scan
-                .is_none_or(|t| now.duration_since(t) >= DRIFT_SCAN_EVERY);
-            if due && c.drift_watch.is_some() {
-                c.last_drift_scan = Some(now);
-                let result = c.drift_watch.as_mut().expect("checked above").uncovered();
+            // A COMPLETED result, if the scanner finished a pass
+            // since the last look. Never a scan performed here: this
+            // is the thread that answers pings, stops and steering
+            // requests, and a 1.05M-prefix dump on it would delay all
+            // three (review finding).
+            let result = c.drift_scanner.as_ref().and_then(|s| s.take_result());
+            if let Some(result) = result {
                 match result {
                     Ok(found) => {
                         if !found.lines.is_empty() && c.drift_uncovered != found.lines {
@@ -2012,7 +2014,7 @@ impl Core {
         exempts: Vec<packetframe_common::config::Ipv4Prefix>,
         dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     ) {
-        if self.drift_watch.is_some() {
+        if self.drift_scanner.is_some() {
             self.pending_drift_scope = Some((exempts, dst_only));
         }
     }
@@ -2038,17 +2040,16 @@ impl Core {
         let Some((exempts, dst_only)) = self.pending_drift_scope.take() else {
             return;
         };
-        if let Some(w) = self.drift_watch.as_mut() {
-            w.set_scope(exempts, dst_only);
+        if let Some(s) = self.drift_scanner.as_ref() {
+            s.set_scope(exempts, dst_only);
             // Whatever ambiguity a failed reconcile left is settled:
             // the NIC just took this scope.
             self.drift_scope_stale = None;
-            // Re-read on the next poll rather than serving a verdict
-            // about a config that no longer exists. The findings go
-            // with it; the READ failure does not, because whether the
-            // kernel answers has nothing to do with which config we
-            // are judging.
-            self.last_drift_scan = None;
+            // The findings described the OLD config, so they go —
+            // the scanner republishes against the new one on its next
+            // pass. The READ failure does not go with them: whether
+            // the kernel answers has nothing to do with which config
+            // we are judging.
             self.drift_uncovered.clear();
             self.drift_routes = 0;
         }
