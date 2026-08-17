@@ -163,6 +163,11 @@ pub struct SteeringRequest {
     /// the scan's notion of what is covered, and letting them travel
     /// separately is how the watcher ended up frozen at attach.
     pub exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+    /// The diversion scope the same reconfigure produced — see
+    /// [`crate::drift::divertible_scope`]. Travels with the exemptions
+    /// because freezing either half re-opens the hole the tripwire
+    /// closes.
+    pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     /// Whether traffic should be diverted once the target is in place.
     /// False is the rollback landing zone, not an error.
     pub want_steer: bool,
@@ -616,6 +621,7 @@ impl SupervisionService {
         &self,
         targets: Vec<(String, u32, crate::steer::RuleSet)>,
         exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
         want_steer: bool,
         lever_moved: bool,
     ) -> Result<(), String> {
@@ -631,6 +637,7 @@ impl SupervisionService {
                 seq,
                 targets,
                 exempts,
+                dst_only,
                 want_steer,
                 lever_moved,
             });
@@ -884,7 +891,7 @@ fn apply_steering(
         ));
     }
     runtime.retarget(req.targets.clone());
-    runtime.set_drift_exempts(req.exempts.clone());
+    runtime.set_drift_scope(req.exempts.clone(), req.dst_only.clone());
 
     let steered = driver.supervisor().is_steered();
     // INTENDED, not steered. The two differ in exactly the case an

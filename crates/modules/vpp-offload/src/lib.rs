@@ -1142,6 +1142,11 @@ impl Module for VppOffloadModule {
             .apply_steering(
                 target.targets,
                 new.steer_exempts.clone(),
+                // The SAME derivation attach uses, run against the
+                // config just accepted — allowlist and directions are
+                // both hot, so a scope captured at attach goes stale
+                // the moment either moves.
+                drift::divertible_scope(&new.ports, new.steer_direction, &self.allowlist.get()),
                 target.want_steer,
                 lever_moved,
             )

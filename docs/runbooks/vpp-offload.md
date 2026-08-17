@@ -670,10 +670,24 @@ Coverage is by containment, not overlap: a `/32` exemption does not
 silence the `/24` around it. That asymmetry is deliberate — treating
 one exempted host as covering its whole prefix is how a hole hides.
 
-`steer-exempt` is hot-reloadable, and so is this: an accepted
-`packetframe reconfigure` hands the scan the new exemption set and
-re-runs it, so adding the exemption the health line asked for clears
-the line on the next status poll rather than a minute later.
+Two more things it does not treat as active paths: a route in a table
+NO policy rule names (an unreferenced VRF or auxiliary table cannot be
+consulted by any packet, so it must not cost an exemption slot), and —
+under dst-only steering — anything outside the allowlist. Only table
+SELECTION is modelled, never the finer rule predicates (fwmark, iif,
+from/to): "no rule names this table" is unconditionally true, while
+evaluating the rest would mean reimplementing the kernel's rule walk,
+where a permissive mistake re-opens the hole. Over-reporting is the
+safe direction and the scan stays on that side of it.
+
+Everything the scan judges against is hot: `steer-exempt`, the
+allowlist, and both direction knobs are rebuilt on `packetframe
+reconfigure`, and the scan's copy is replaced in the same step (then
+re-run immediately). So adding the exemption the health line asked
+for clears the line on the next status poll rather than a minute
+later — and flipping a port to `src`, or widening the allowlist,
+widens what the scan watches at the same instant it widens what the
+NIC diverts.
 
 It is detection only. Deriving the exemptions automatically was
 considered and rejected for v1: it would change forwarding without an

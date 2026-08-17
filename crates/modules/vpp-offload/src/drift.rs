@@ -116,6 +116,57 @@ impl Divertible<'_> {
     }
 }
 
+/// Derive the diversion scope from config — the ONE place it is
+/// computed, called at attach and again on every accepted
+/// reconfigure.
+///
+/// A function rather than a value each caller builds, because the
+/// inputs are hot: the allowlist and both direction knobs are rebuilt
+/// on reconfigure, and a scope captured at attach goes stale the
+/// moment either changes — a dst-only deployment that adds an
+/// allow-prefix, or flips a port to `src`, starts diverting traffic
+/// the frozen scope tells the scan to ignore (review finding, and the
+/// same freeze the exemption set had one field over).
+///
+/// `None` = every destination is at risk: some port matches on
+/// source, or nothing steers yet, or the config declares no ports.
+/// The conservative answer is the default in all three.
+pub fn divertible_scope(
+    ports: &[crate::PortLine],
+    global: packetframe_common::config::VppSteerDirection,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+) -> Option<Vec<packetframe_common::fib::IpPrefix>> {
+    use packetframe_common::config::VppSteerDirection;
+    if ports.is_empty() {
+        return None;
+    }
+    ports
+        .iter()
+        .all(|(_, _, _, _, dir)| dir.unwrap_or(global) == VppSteerDirection::Dst)
+        .then(|| allowlist.to_vec())
+}
+
+/// Everything the comparison judges against, bundled so the parameter
+/// list stops growing by one per question asked.
+pub struct Scope<'a> {
+    pub reach: &'a VppReach,
+    pub exempts: &'a [Ipv4Prefix],
+    pub divertible: Divertible<'a>,
+    /// Tables some policy rule can select. `None` = the rule set could
+    /// not be read, so nothing is filtered.
+    ///
+    /// This models table SELECTION only, never the finer predicates —
+    /// fwmark, iif, from/to — deliberately. "A table no rule names
+    /// cannot be consulted by any packet" is unconditionally true, so
+    /// filtering on it cannot hide a real path; evaluating the rest
+    /// would mean reimplementing the kernel's rule walk, where a
+    /// permissive mistake re-opens exactly the hole this scan closes.
+    /// Over-reporting is the safe direction, and this takes only the
+    /// share of it that is provably noise (an unreferenced VRF or
+    /// auxiliary table — review finding).
+    pub selected_tables: Option<&'a [u32]>,
+}
+
 /// A kernel path VPP cannot take that nothing exempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uncovered {
@@ -168,15 +219,15 @@ impl std::fmt::Display for Uncovered {
 /// `/24` around it, and reporting the `/24` as handled because one
 /// host inside it is exempted would be the silent-hole shape all over
 /// again.
-pub fn uncovered_paths(
-    routes: &[KernelRoute],
-    reach: &VppReach,
-    exempts: &[Ipv4Prefix],
-    divertible: &Divertible<'_>,
-) -> Vec<Uncovered> {
+pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncovered> {
+    let reach = scope.reach;
     let mut out = Vec::new();
     for r in routes {
-        if r.drops || !divertible.reaches(&r.prefix) {
+        if r.drops || !scope.divertible.reaches(&r.prefix) {
+            continue;
+        }
+        // A table no policy rule names is inert for every packet.
+        if scope.selected_tables.is_some_and(|t| !t.contains(&r.table)) {
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
@@ -205,7 +256,7 @@ pub fn uncovered_paths(
         }) {
             continue;
         }
-        if exempts.iter().any(|e| e.contains_prefix(&r.prefix)) {
+        if scope.exempts.iter().any(|e| e.contains_prefix(&r.prefix)) {
             continue;
         }
         out.push(Uncovered {
@@ -228,10 +279,16 @@ pub trait DriftWatch {
     /// previous verdict.
     fn uncovered(&mut self) -> Result<Vec<String>, String>;
 
-    /// Adopt a reloaded exemption set. Called from the same place the
-    /// steering target is retargeted, so the scan judges the config
-    /// the operator just applied rather than the one at attach.
-    fn set_exempts(&mut self, exempts: Vec<Ipv4Prefix>);
+    /// Adopt a reloaded exemption set AND diversion scope. Called
+    /// from the same place the steering target is retargeted, so the
+    /// scan judges the config the operator just applied rather than
+    /// the one at attach. Both travel together because both come from
+    /// the same reconfigure and freezing either one re-opens the hole.
+    fn set_scope(
+        &mut self,
+        exempts: Vec<Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    );
 }
 
 /// The production scan: dump every IPv4 route in every table, compare.
@@ -255,20 +312,37 @@ pub struct KernelDriftWatch {
 impl DriftWatch for KernelDriftWatch {
     fn uncovered(&mut self) -> Result<Vec<String>, String> {
         let routes = dump_routes()?;
+        // A rule dump that fails filters nothing rather than failing
+        // the scan: the routes are the finding, the rules only narrow
+        // them, and losing the narrowing costs noise where losing the
+        // scan costs the blackhole.
+        let tables = dump_rule_tables().unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "policy-rule dump failed; not filtering by table");
+            Vec::new()
+        });
         let divertible = match &self.dst_only {
             Some(allow) => Divertible::OnlyDst(allow),
             None => Divertible::Any,
         };
-        Ok(
-            uncovered_paths(&routes, &self.reach, &self.exempts, &divertible)
-                .into_iter()
-                .map(|u| u.to_string())
-                .collect(),
-        )
+        let scope = Scope {
+            reach: &self.reach,
+            exempts: &self.exempts,
+            divertible,
+            selected_tables: (!tables.is_empty()).then_some(tables.as_slice()),
+        };
+        Ok(uncovered_paths(&routes, &scope)
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect())
     }
 
-    fn set_exempts(&mut self, exempts: Vec<Ipv4Prefix>) {
+    fn set_scope(
+        &mut self,
+        exempts: Vec<Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    ) {
         self.exempts = exempts;
+        self.dst_only = dst_only;
     }
 }
 
@@ -386,6 +460,75 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
     Ok(out)
 }
 
+/// The table ids some policy rule can select.
+///
+/// One `RTM_GETRULE` dump. See [`Scope::selected_tables`] for what
+/// this models and, more importantly, what it deliberately does not.
+#[cfg(target_os = "linux")]
+pub fn dump_rule_tables() -> Result<Vec<u32>, String> {
+    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+    use netlink_packet_route::rule::{RuleAttribute, RuleMessage};
+    use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+    use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+    let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    socket
+        .bind_auto()
+        .map_err(|e| format!("netlink bind: {e}"))?;
+    socket
+        .connect(&SocketAddr::new(0, 0))
+        .map_err(|e| format!("netlink connect: {e}"))?;
+
+    let mut rule = RuleMessage::default();
+    rule.header.family = AddressFamily::Inet;
+    let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetRule(rule));
+    msg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+    msg.header.sequence_number = 1;
+    msg.finalize();
+    let mut send_buf = vec![0u8; msg.header.length as usize];
+    msg.serialize(&mut send_buf);
+    socket
+        .send(&send_buf, 0)
+        .map_err(|e| format!("netlink send: {e}"))?;
+
+    let mut out: Vec<u32> = Vec::new();
+    let mut recv_buf = vec![0u8; 64 * 1024];
+    'dump: loop {
+        let n = socket
+            .recv(&mut &mut recv_buf[..], 0)
+            .map_err(|e| format!("netlink recv: {e}"))?;
+        let mut offset = 0usize;
+        while offset < n {
+            let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
+                .map_err(|e| format!("netlink parse: {e}"))?;
+            let len = pkt.header.length as usize;
+            if len == 0 {
+                break;
+            }
+            match pkt.payload {
+                NetlinkPayload::Done(_) => break 'dump,
+                NetlinkPayload::Error(e) => return Err(format!("netlink error: {e}")),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRule(m)) => {
+                    // FRA_TABLE carries ids past the u8 header field,
+                    // exactly as RTA_TABLE does for routes.
+                    let mut table = u32::from(m.header.table);
+                    for attr in &m.attributes {
+                        if let RuleAttribute::Table(t) = attr {
+                            table = *t;
+                        }
+                    }
+                    if table != 0 && !out.contains(&table) {
+                        out.push(table);
+                    }
+                }
+                _ => {}
+            }
+            offset += len;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +559,15 @@ mod tests {
     }
 
     fn find(routes: &[KernelRoute], exempts: &[Ipv4Prefix]) -> Vec<Uncovered> {
-        uncovered_paths(routes, &reach(), exempts, &Divertible::Any)
+        uncovered_paths(
+            routes,
+            &Scope {
+                reach: &reach(),
+                exempts,
+                divertible: Divertible::Any,
+                selected_tables: None,
+            },
+        )
     }
 
     /// The w26 shape: tunnel-bound routes are findings, and only the
@@ -555,12 +706,87 @@ mod tests {
             route(p(23, 191, 200, 2, 32), "vti64"), // inside the allowlist
             route(p(198, 51, 100, 0, 24), "vti64"), // outside it
         ];
-        let scoped = uncovered_paths(&routes, &reach(), &[], &Divertible::OnlyDst(&allow));
+        let scoped = uncovered_paths(
+            &routes,
+            &Scope {
+                reach: &reach(),
+                exempts: &[],
+                divertible: Divertible::OnlyDst(&allow),
+                selected_tables: None,
+            },
+        );
         assert_eq!(scoped.len(), 1, "{scoped:?}");
         assert_eq!(scoped[0].prefix.addr, Ipv4Addr::new(23, 191, 200, 2));
 
         // A src rule anywhere means any destination can be diverted.
         assert_eq!(find(&routes, &[]).len(), 2);
+    }
+
+    /// A table no policy rule names cannot be consulted by any
+    /// packet, so a tunnel route parked in an unreferenced VRF must
+    /// not cost an exemption slot (review finding). Only SELECTION is
+    /// modelled — fwmark/iif/from are not, because over-reporting is
+    /// the safe direction and a permissive mistake in a rule walk
+    /// re-opens the hole this scan closes.
+    #[test]
+    fn routes_in_tables_no_rule_selects_are_not_findings() {
+        let mut in_use = route(p(23, 191, 201, 0, 24), "vti64");
+        in_use.table = 100;
+        let mut orphan = route(p(198, 51, 100, 0, 24), "vti64");
+        orphan.table = 4242;
+        let routes = [in_use, orphan];
+        let selected = [100u32, 254, 255];
+        let found = uncovered_paths(
+            &routes,
+            &Scope {
+                reach: &reach(),
+                exempts: &[],
+                divertible: Divertible::Any,
+                selected_tables: Some(&selected),
+            },
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].table, 100);
+        // Unknown rule set (dump failed) filters nothing: losing the
+        // narrowing costs noise, losing the scan costs the blackhole.
+        assert_eq!(find(&routes, &[]).len(), 2);
+    }
+
+    /// The scope derivation is shared by attach and reconfigure, so a
+    /// hot allowlist or direction edit cannot leave the scan judging
+    /// the config from attach time (review finding).
+    #[test]
+    fn the_diversion_scope_follows_config_not_attach_time() {
+        use packetframe_common::config::VppSteerDirection as D;
+        use packetframe_common::fib::IpPrefix;
+        let allow = [IpPrefix::V4 {
+            addr: [23, 191, 200, 0],
+            prefix_len: 24,
+        }];
+        let port = |steer: bool, dir: Option<D>| ("eth4".to_string(), 1u16, steer, Vec::new(), dir);
+
+        // Every port dst → scoped to the allowlist.
+        let scoped = divertible_scope(&[port(true, Some(D::Dst))], D::Both, &allow);
+        assert_eq!(scoped.as_deref(), Some(&allow[..]));
+
+        // One src port anywhere → everything is at risk.
+        assert!(
+            divertible_scope(
+                &[port(true, Some(D::Dst)), port(false, Some(D::Src))],
+                D::Dst,
+                &allow
+            )
+            .is_none(),
+            "a src port makes any destination divertible"
+        );
+        // The global default applies to ports that declare nothing.
+        assert!(divertible_scope(&[port(true, None)], D::Both, &allow).is_none());
+        assert_eq!(
+            divertible_scope(&[port(true, None)], D::Dst, &allow).as_deref(),
+            Some(&allow[..])
+        );
+        // No ports at all: conservative.
+        assert!(divertible_scope(&[], D::Dst, &allow).is_none());
     }
 
     /// The operator-facing line names the three things needed to act:

@@ -1344,8 +1344,12 @@ impl Runtime {
     }
 
     /// Hand the exemption tripwire a reloaded exemption set.
-    pub fn set_drift_exempts(&self, exempts: Vec<packetframe_common::config::Ipv4Prefix>) {
-        self.core.borrow_mut().set_drift_exempts(exempts);
+    pub fn set_drift_scope(
+        &self,
+        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    ) {
+        self.core.borrow_mut().set_drift_scope(exempts, dst_only);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1901,9 +1905,13 @@ impl Core {
     /// longer exists — the operator who just added the exemption the
     /// health line asked for should not have to wait out a minute of
     /// it still complaining.
-    fn set_drift_exempts(&mut self, exempts: Vec<packetframe_common::config::Ipv4Prefix>) {
+    fn set_drift_scope(
+        &mut self,
+        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    ) {
         if let Some(w) = self.drift_watch.as_mut() {
-            w.set_exempts(exempts);
+            w.set_scope(exempts, dst_only);
             self.last_drift_scan = None;
             self.drift_uncovered.clear();
         }

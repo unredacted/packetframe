@@ -412,17 +412,7 @@ pub fn bring_up(
     // Any src (or `both`) port anywhere means any destination is
     // reachable — the conservative default, including when the config
     // declares no direction at all.
-    let dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>> = {
-        let mut all_dst = !cfg.ports.is_empty();
-        for (_, _, _, _, dir) in &cfg.ports {
-            if dir.unwrap_or(cfg.steer_direction)
-                != packetframe_common::config::VppSteerDirection::Dst
-            {
-                all_dst = false;
-            }
-        }
-        all_dst.then(|| allowlist.to_vec())
-    };
+    let dst_only_scope = crate::drift::divertible_scope(&cfg.ports, cfg.steer_direction, allowlist);
     let steering = NtupleSteering::new(member_ports, steer_targets);
 
     let workers = cfg.total_workers();
