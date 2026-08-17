@@ -405,10 +405,13 @@ pub enum EngineError {
 
 /// Sum the `Count` column of `show errors` rows whose node is
 /// `null-node` — VPP's "matched a drop route / nothing to deliver to"
-/// counter, the residual the w23/w24 windows measured at ~370 pps of
-/// replies to spoofed and bogon sources. Column positions only
-/// (count, node, reason...), so a reason with spaces parses fine; any
-/// line that does not shape up is skipped rather than guessed at.
+/// counter. The w26 destination profile split its steady rate into
+/// tunnel-bound traffic missing a `steer-exempt` (real loss — fixed
+/// by exempting) and a floor of traffic undeliverable on any path;
+/// the runbook's null-drop section carries the numbers. Column
+/// positions only (count, node, reason...), so a reason with spaces
+/// parses fine; any line that does not shape up is skipped rather
+/// than guessed at.
 pub(crate) fn parse_null_drops(text: &str) -> u64 {
     text.lines()
         .filter_map(|line| {

@@ -353,10 +353,18 @@ pub struct StatusSnapshot {
     /// Cumulative null-node drops from VPP's own error counters,
     /// sampled over `cli_inband`. `None` until a sample succeeds —
     /// absent rather than 0, so a broken read path cannot impersonate
-    /// a quiet dataplane. What it counts on the reference primary:
-    /// replies to spoofed/bogon sources, traffic the kernel also
-    /// dropped, just less visibly (~370 pps in w23/w24). A CHANGE in
-    /// its rate is the signal; the steady residual is designed.
+    /// a quiet dataplane.
+    ///
+    /// A CHANGE in its rate is the signal; the steady floor is
+    /// traffic undeliverable on any path (measured by destination
+    /// profile on the reference primary, w26b 2026-08-17: ~155 pps of
+    /// misdirected VPN/overlay, multicast and junk the kernel also
+    /// forwards-to-die upstream). This gauge's first week earned its
+    /// keep the hard way: the floor had been misread as harmless for
+    /// three windows while ~a third of it was tunnel-bound inter-site
+    /// traffic missing its `steer-exempt` — profile the destinations
+    /// before declaring any floor benign (runbook, "The null-drop
+    /// gauge").
     pub null_drops: Option<u64>,
     /// Hosts the bridge FDB places behind a different member port than
     /// their `local-route` declares, one line each. Non-empty is a

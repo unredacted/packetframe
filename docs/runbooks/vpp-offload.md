@@ -572,17 +572,73 @@ vppctl -s /run/packetframe/vpp/api.sock.cli show interface \
 # wait 10s, run again; delta/10 = B/s per VPP interface
 ```
 
+### Tunnel-bound destinations MUST be steer-exempted
+
+VPP owns member VFs and nothing else. Any destination the kernel
+forwards through a device VPP does not own — an IPSec VTI, WireGuard,
+any tunnel — has NO path in VPP: the mirror route resolves to no
+member and never installs, and a steered packet for it dies at the
+default route (a drop in VPP) instead of falling back to the kernel.
+The XDP tier PASSed these flows to the kernel, which encrypted and
+forwarded them; **steering removes that safety net**, and VPP cannot
+do IPSec, so the kernel path is these flows' permanent, correct home:
+one `steer-exempt` per tunnel-bound prefix.
+
+Found the hard way on the reference primary (w26, 2026-08-16): the
+inter-site IPSec (vti64) carried ord1's prefix plus seven host routes
+INSIDE mci1's own service /24, and every steered window since w23 had
+been silently dropping ~50+ pps of real inter-site traffic — a
+ONE-WAY blackhole (the reverse direction arrives as ESP on unsteered
+transit ports and kept working), invisible to every watchdog, visible
+only as a steady rate on VPP's default-route drop counter.
+
+Symptom: `show ip fib 0.0.0.0/0` drop counter climbing at a steady
+rate while steered; a service host cannot reach a remote-site address
+while the remote site can reach it. Diagnosis — profile real traffic
+and ask the KERNEL, not bird (policy rules are the oracle; bird's
+table misses policy routing entirely):
+
+```sh
+# what service hosts actually send (bridge SVIs see it untagged;
+# a filter without `vlan` sees NOTHING on the tagged trunk itself)
+timeout 60 tcpdump -ni br1337 "src net <svc>/24 and not dst net <svc>/24" \
+  | awk '{print $5}' | sed 's/\.[0-9]*:.*$//' | sort | uniq -c | sort -rn | head -25
+# the kernel's actual forwarding decision for a candidate dst
+ip r get <dst> from <svc-host> iif br1337
+```
+
+Anything resolving via a non-member device gets a `steer-exempt`.
+**The trap that remains:** tunnel host-route sets are often
+bird-managed and DYNAMIC — a new host route at the remote site
+re-opens the hole silently until the exempt list catches up. Until an
+automated drift check ships, the null-drop gauge's RATE is the
+tripwire: re-profile on any step change.
+
 ### The null-drop gauge
 
 `packetframe_vpp_null_drops` is VPP's own null-node counter, sampled
 over the binary API every 60 s (absent until the first sample, and
 after any read trouble — absent is "cannot read", never "zero").
-What it counts on the reference primary: replies to spoofed/bogon
-sources — traffic the kernel also dropped, just less visibly
-(~370 pps steady in w23/w24). The steady residual is
-correct-by-design; a CHANGE in its rate after a config or mirror
-change is the signal, and with local-routes in place a large step up
-usually means something local stopped being delivered.
+
+What the steady floor is on the reference primary — measured by
+destination profile, not assumed (w26b, 2026-08-17): **~155 pps of
+traffic that is undeliverable on ANY path** — service hosts'
+misdirected VPN/overlay packets (RFC1918, CGNAT space with no
+kernel route), SSDP multicast, benchmark space, address junk. The
+kernel forwards the same packets to transit where they die upstream,
+invisibly; VPP drops them locally and counts them. Same outcome, one
+hop earlier, with a number attached.
+
+How to read it: the FLOOR is expected and flat (~19k per 2-minute
+interval on the reference primary); the signal is a RATE CHANGE. A
+step UP after a config or routing change means something real joined
+the drop path — a tunnel-bound destination missing its exemption
+(section above) or, with local-routes in place, something local that
+stopped being delivered. History worth remembering: this counter's
+steady rate was misread as harmless for three windows ("spoofed
+replies, undeliverable by anyone") until the destination profile
+showed ~a third of it was live inter-site traffic. Profile before
+declaring a floor harmless.
 
 ## Triage by symptom
 
@@ -1328,6 +1384,8 @@ Be precise about this when reasoning about an incident.
 | Second steer (subifs present, VF answering to the port's own MAC) | subif classified 7.19M frames in 90 s (**punt-at-VLAN-layer gone**); 7.17M then punted on dmac — hosts address switch0's `…:c7`, the VF held eth4's `…:ca` | 2026-08-14 w21. Auto-aborted by the harness's 90 s blackhole guard. The secondary-MAC acceptance exists because of this window. |
 | Third steer (bridge MAC as the member's PRIMARY) | VPP forwarded **~500M packets in 27 min**, split by best path (266M eth3, 236k eth2), zero loop, no drops on the forwarding path — **but ~300 kpps arrived from ATTACH, with the lever off** | 2026-08-14 w22. Forwarding quality proven; staging isolation broken. The primary MAC is a hardware filter on this NIC, so it must stay the port's own — acceptance belongs in secondary addresses. Undeclared trunk VLANs (`unknown vlan` 180k) were blackholed for the window. |
 | Fourth steer (secondary MAC + `.254` loopback — the clean pass) | Leak gate ~50 pps noise (lever off); 95.9M rx / 95.8M tx at +300 s; ARP replies **zero**; steered minutes ~0.1% remote loss vs 4–7%/min on the unsteered rung-0 stretch of the same window | 2026-08-14 w23. Rung 1 validated; **the steered path beat the XDP path by >10× under coexistence**. Residual: 110,917 locally-terminating packets blackholed in 5 min — the number `steer-exempt` exists to zero. |
+| Fifth steer (exemptions live — w24) and hours-scale soaks (w25/w26) | w24: `rules-installed=6`, svc-pinger survived the steer for the first time, steered minutes ≈ zero remote loss. w25: 105 min steered, heap flat at 844.6M/2.5G across every snapshot, one daemon pid, SIGHUP auto-rollback exercised live. w26: full 2 h + the B1 delivery gate (`.7/32` via `octeon4/0.1337` before any steer) | 2026-08-14→16. The w25 SSH drop proved the trap rollback unattended; harnesses run detached since. |
+| The default-route drop counter under steering — decomposed by destination profile | Pre-exemption ~365 pps; **~50+ pps of it was live inter-site traffic** (vti64-bound: ord1's /24 + seven host routes inside the local /24), silently one-way-blackholed in EVERY steered window w23→w26; the remaining **~155 pps is the junk floor** (misdirected VPN/overlay to RFC1918/CGNAT, SSDP, bogons — dies on the kernel path too, upstream and invisibly) | 2026-08-16/17 w26/w26b. Exemptions zeroed the real-traffic share: w26b held 153–170 pps flat for 30 min with 14 rules, tcpdump proofs 5/5 on eth2 (inter-site) and 5/5 on vti64 (tunnel /32s) WHILE steered. The floor is expected; alarm on rate CHANGE. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
 **Published but never measured:**

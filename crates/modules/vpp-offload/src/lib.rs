@@ -1287,6 +1287,7 @@ impl Module for VppOffloadModule {
 /// non-required: feasibility output informs, attach enforces.
 pub fn run_feasibility_probes(
     ports: &[String],
+    steer_ports: &[String],
     workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
@@ -1297,6 +1298,7 @@ pub fn run_feasibility_probes(
     {
         probe_linux::run(
             ports,
+            steer_ports,
             workers,
             vpp_binary,
             allowlist,
@@ -1308,6 +1310,7 @@ pub fn run_feasibility_probes(
     {
         let _ = (
             ports,
+            steer_ports,
             workers,
             vpp_binary,
             allowlist,

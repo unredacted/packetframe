@@ -13,6 +13,7 @@ use packetframe_common::probe::Capability;
 
 pub(crate) fn run(
     ports: &[String],
+    steer_ports: &[String],
     workers: u32,
     vpp_binary: Option<&str>,
     allowlist: &[packetframe_common::fib::IpPrefix],
@@ -34,7 +35,7 @@ pub(crate) fn run(
         caps.push(probe_sriov(iface));
     }
     caps.push(probe_steering_budget(
-        ports,
+        steer_ports,
         allowlist,
         directions,
         steer_exempts,
@@ -120,14 +121,24 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 /// 1008 past the end of the table. A probe whose answer cannot disagree
 /// with the code it is probing is not a probe.
 fn probe_steering_budget(
-    ports: &[String],
+    steer_ports: &[String],
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Capability {
     use crate::steer::{McamBudget, RuleAction, RuleSet};
 
-    let budget = match McamBudget::for_ifaces(ports.iter().map(String::as_str)) {
+    // STEERING ports only — the same set attach queries
+    // (`ifaces_to_query`), so the probe and the refusal cannot
+    // disagree. Querying every member here made an administratively
+    // DOWN idle member (the reference primary's uncabled eth5, its
+    // driver refusing `get_rxnfc` while !netif_running) fail the
+    // probe for a config whose attach arithmetic was fine — a true
+    // statement about the wrong port. With no port steering, the
+    // fallback table is planned against, exactly as attach does for
+    // the staging state, and the detail says so rather than passing
+    // it off as a NIC reading.
+    let budget = match McamBudget::for_ifaces(steer_ports.iter().map(String::as_str)) {
         Ok(b) => b,
         Err(e) => return Capability::fail("vpp.steering.budget", e, false),
     };
@@ -198,8 +209,16 @@ fn probe_steering_budget(
         );
     }
     let detail = format!(
-        "{}; the NIC reports {free} free slot(s){}",
+        "{}; {}{}",
         details.join("; "),
+        if steer_ports.is_empty() {
+            format!(
+                "{free} free slot(s) in the FALLBACK table (no port steers yet; the \
+                 steering NICs are queried once one does)"
+            )
+        } else {
+            format!("the NIC reports {free} free slot(s)")
+        },
         if skipped_v6 > 0 {
             format!(
                 "; {skipped_v6} IPv6 prefix(es) NOT steerable on this NIC and left on the \
