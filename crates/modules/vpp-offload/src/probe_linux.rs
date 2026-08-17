@@ -35,6 +35,7 @@ pub(crate) fn run(
         caps.push(probe_sriov(iface));
     }
     caps.push(probe_steering_budget(
+        ports,
         steer_ports,
         allowlist,
         directions,
@@ -121,6 +122,7 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 /// 1008 past the end of the table. A probe whose answer cannot disagree
 /// with the code it is probing is not a probe.
 fn probe_steering_budget(
+    member_ports: &[String],
     steer_ports: &[String],
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
@@ -128,21 +130,105 @@ fn probe_steering_budget(
 ) -> Capability {
     use crate::steer::{McamBudget, RuleAction, RuleSet};
 
-    // STEERING ports only — the same set attach queries
-    // (`ifaces_to_query`), so the probe and the refusal cannot
-    // disagree. Querying every member here made an administratively
-    // DOWN idle member (the reference primary's uncabled eth5, its
-    // driver refusing `get_rxnfc` while !netif_running) fail the
-    // probe for a config whose attach arithmetic was fine — a true
-    // statement about the wrong port. With no port steering, the
-    // fallback table is planned against, exactly as attach does for
-    // the staging state, and the detail says so rather than passing
-    // it off as a NIC reading.
-    let budget = match McamBudget::for_ifaces(steer_ports.iter().map(String::as_str)) {
-        Ok(b) => b,
-        Err(e) => return Capability::fail("vpp.steering.budget", e, false),
+    let name = "vpp.steering.budget";
+    // The ALLOWLIST question first, because it needs no NIC — the same
+    // ordering `bring_up` documents and for the same reason: an
+    // operator who wrote `steer on` against a v6-only allowlist must
+    // read about their allowlist, not about whatever the ioctl said.
+    let steerable = crate::steer::steerable_count(allowlist);
+    if steerable == 0 {
+        return Capability::fail(
+            name,
+            if allowlist.is_empty() {
+                "the fast-path allowlist is empty, so there is nothing to steer. Steered \
+                 prefixes are inherited from fast-path's `allow-prefix`/`allow-prefix6`; \
+                 without any, the offload would forward nothing while reporting healthy"
+                    .to_string()
+            } else {
+                format!(
+                    "none of the allowlist can be steered: all {} prefix(es) are IPv6, and \
+                     `ip6` ntuple is rejected by this NIC's AF (gate 0b round 4). The \
+                     offload would forward nothing while reporting healthy",
+                    allowlist.len()
+                )
+            },
+            false,
+        );
+    }
+
+    // Which NICs to ask. Steering ports when any port steers — the set
+    // attach's `ifaces_to_query` uses, so probe and refusal cannot
+    // disagree. In the STAGING state, where every port is `steer off`,
+    // the candidates are the members: the first canary step can pick
+    // any of them, and that state is where feasibility is actually run.
+    //
+    // Falling back to `McamBudget::default()` there instead — which is
+    // what an empty candidate list produces — would report a synthetic
+    // 16-slot table as though a NIC had answered, so a canary NIC with
+    // occupied slots passed here and failed at the lever (review
+    // finding on this PR). The fallback constant is for planning
+    // arithmetic with no hardware in reach, never for claiming a
+    // budget fits.
+    let candidates: &[String] = if steer_ports.is_empty() {
+        member_ports
+    } else {
+        steer_ports
+    };
+
+    // Read LENIENTLY, unlike attach: a member that cannot answer is
+    // skipped and named rather than failing the whole probe. That is
+    // the difference in stakes — attach must refuse a port it is about
+    // to steer into, while this is a pre-flight report, and an
+    // administratively DOWN idle member (the reference primary's
+    // uncabled eth5, whose driver refuses `get_rxnfc` while
+    // `!netif_running`) must not hide the arithmetic for the ports
+    // that did answer.
+    let mut budget: Option<McamBudget> = None;
+    let mut consulted: Vec<&str> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for iface in candidates {
+        match crate::ntuple::rule_table(iface) {
+            Ok(table) => {
+                let next = McamBudget::from_table(&table);
+                budget = Some(match budget {
+                    None => next,
+                    // The intersection, as `for_ifaces` takes it: one
+                    // plan installs at the same locations on every
+                    // steering port, so a slot free on one and taken
+                    // on another is not a slot.
+                    Some(prev) => McamBudget {
+                        free: prev
+                            .free
+                            .into_iter()
+                            .filter(|loc| next.free.contains(loc))
+                            .collect(),
+                    },
+                });
+                consulted.push(iface.as_str());
+            }
+            Err(e) => skipped.push(format!("{iface} ({e})")),
+        }
+    }
+    // No NIC answered: UNKNOWN, never Pass. The arithmetic below would
+    // be a statement about a table nobody read.
+    let Some(budget) = budget else {
+        return Capability::unknown(
+            name,
+            if skipped.is_empty() {
+                "no candidate steering port to query".to_string()
+            } else {
+                format!(
+                    "no candidate steering port could be read ({}), so the MCAM budget is \
+                     unknown rather than proven; check `ip -br link` — a port that is \
+                     administratively DOWN answers this way",
+                    skipped.join(", ")
+                )
+            },
+            false,
+        );
     };
     let free = budget.free.len();
+
     // No directions handed in = plan the global default, exactly as
     // the CLI extractor falls back when nothing steers yet. Without
     // this an empty slice would skip planning entirely and misreport
@@ -156,21 +242,16 @@ fn probe_steering_budget(
     };
     // One plan per distinct effective direction — the SAME derivation
     // attach and reconfigure perform, so this probe cannot pass a
-    // config they refuse. The old single-direction form also reported
-    // "rules / 2 steerable prefixes", which was wrong everywhere
-    // except `both` with no exemptions: rule counts include the Keep
-    // rules, and src/dst plans carry one divert per prefix, not two.
-    // Counted from the rules' own actions now.
+    // config they refuse. Divert and Keep counted from the rules' own
+    // actions: the old `rules / 2` was right only for `both` with no
+    // exemptions, since rule counts include the Keep rules and src/dst
+    // plans carry one divert per prefix.
     let mut details = Vec::with_capacity(directions.len());
     let mut skipped_v6 = 0u32;
-    let mut any_rules = false;
     for direction in directions {
         match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction) {
             Ok(set) => {
                 skipped_v6 = set.skipped_v6;
-                if !set.rules.is_empty() {
-                    any_rules = true;
-                }
                 let diverts = set
                     .rules
                     .iter()
@@ -182,42 +263,23 @@ fn probe_steering_budget(
                     set.rules.len() - diverts,
                 ));
             }
-            Err(e) => return Capability::fail("vpp.steering.budget", e, false),
+            Err(e) => return Capability::fail(name, e, false),
         }
     }
-    // Nothing to steer is a FAIL however it arose. The two ways there
-    // read very differently to an operator, so they are named
-    // separately — but neither may pass: a port that steers nothing
-    // diverts no traffic while every other line in this report, and
-    // the module's own health, says the offload is fine.
-    if !any_rules {
-        return Capability::fail(
-            "vpp.steering.budget",
-            if skipped_v6 > 0 {
-                format!(
-                    "none of the allowlist can be steered: all {skipped_v6} prefix(es) are \
-                     IPv6, and `ip6` ntuple is rejected by this NIC's AF (gate 0b round 4). \
-                     The offload would forward nothing while reporting healthy"
-                )
-            } else {
-                "the fast-path allowlist is empty, so there is nothing to steer. Steered \
-                 prefixes are inherited from fast-path's `allow-prefix`/`allow-prefix6`; \
-                 without any, the offload would forward nothing while reporting healthy"
-                    .to_string()
-            },
-            false,
-        );
-    }
     let detail = format!(
-        "{}; {}{}",
+        "{}; {} free slot(s) across {} {}{}{}",
         details.join("; "),
+        free,
         if steer_ports.is_empty() {
-            format!(
-                "{free} free slot(s) in the FALLBACK table (no port steers yet; the \
-                 steering NICs are queried once one does)"
-            )
+            "candidate member port(s) (staging: no port steers yet)"
         } else {
-            format!("the NIC reports {free} free slot(s)")
+            "steering port(s)"
+        },
+        consulted.join(", "),
+        if skipped.is_empty() {
+            String::new()
+        } else {
+            format!("; NOT consulted: {}", skipped.join(", "))
         },
         if skipped_v6 > 0 {
             format!(
@@ -228,7 +290,7 @@ fn probe_steering_budget(
             String::new()
         }
     );
-    Capability::pass("vpp.steering.budget", detail, false)
+    Capability::pass(name, detail, false)
 }
 
 /// An SMMU registered in /sys/class/iommu is the difference between
@@ -389,10 +451,9 @@ mod steering_probe_tests {
     /// to declare an allowlist when a port asks to steer.
     #[test]
     fn an_allowlist_that_steers_nothing_never_passes() {
-        // No ports: `for_ifaces` asks no NIC and yields the fallback
-        // budget, so these stay tests of the ALLOWLIST logic — which is
-        // what they were always about — on a host that has no rvu NIC.
-        let empty = probe_steering_budget(&[], &[], Default::default(), &[]);
+        // The allowlist verdict needs no NIC and is reached before any
+        // ioctl, so these run on a host with no rvu hardware.
+        let empty = probe_steering_budget(&[], &[], &[], Default::default(), &[]);
         assert_eq!(empty.status, CapabilityStatus::Fail, "{empty:?}");
         assert!(
             empty.detail.contains("allowlist is empty"),
@@ -401,6 +462,7 @@ mod steering_probe_tests {
         );
 
         let v6_only = probe_steering_budget(
+            &[],
             &[],
             &[IpPrefix::V6 {
                 addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -415,10 +477,40 @@ mod steering_probe_tests {
             "and names the other: {}",
             v6_only.detail
         );
+    }
 
-        // A steerable prefix passes, so the failures above are about
-        // having nothing to steer rather than the probe always failing.
-        let ok = probe_steering_budget(&[], &[v4(0, 24)], Default::default(), &[]);
-        assert_eq!(ok.status, CapabilityStatus::Pass, "{ok:?}");
+    /// A budget nobody read is UNKNOWN, never a pass.
+    ///
+    /// The regression this guards is subtle enough to have shipped
+    /// once: when every port is `steer off` — the rung-0 staging state
+    /// feasibility is actually run in — a steering-ports-only query
+    /// asks no NIC, and `McamBudget::for_ifaces` answers with the
+    /// synthetic fallback table. The probe then reported PASS on a
+    /// 16-slot constant, so a canary NIC whose slots were occupied
+    /// passed here and failed at the lever (review finding, PR #191).
+    /// Unreadable hardware and absent hardware must both degrade the
+    /// verdict, not the arithmetic.
+    #[test]
+    fn a_budget_no_nic_answered_is_unknown_not_pass() {
+        // A steerable allowlist, so the allowlist arm cannot be what
+        // decides this — and no candidate port anywhere, which on a
+        // dev host is also what every named port amounts to.
+        for (members, steerers) in [
+            (&[][..], &[][..]),
+            (&["definitely-not-a-nic".to_string()][..], &[][..]),
+        ] {
+            let cap =
+                probe_steering_budget(members, steerers, &[v4(0, 24)], Default::default(), &[]);
+            assert_eq!(
+                cap.status,
+                CapabilityStatus::Unknown,
+                "a budget derived from no NIC reading must not pass: {cap:?}"
+            );
+            assert!(
+                !cap.detail.contains("free slot(s) across"),
+                "and must not report slot arithmetic it never measured: {}",
+                cap.detail
+            );
+        }
     }
 }
