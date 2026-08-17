@@ -168,6 +168,8 @@ current value without a mapping table:
 | `packetframe_vpp_fib_verified` | `0` while steered |
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
+| `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed |
+| `packetframe_vpp_fdb_misplaced` | `> 0` — a service-VLAN host sits behind a port its `local-route` does not declare |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
 | `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
 
@@ -613,6 +615,47 @@ bird-managed and DYNAMIC — a new host route at the remote site
 re-opens the hole silently until the exempt list catches up. Until an
 automated drift check ships, the null-drop gauge's RATE is the
 tripwire: re-profile on any step change.
+
+### The exemption tripwire (`exempt-drift`)
+
+The rule above is only as good as the exemption list staying complete,
+and the sets that produce it are edited by routing daemons — bird
+announces a remote host route and the hole re-opens with nobody
+touching packetframe. So it is watched on a clock rather than
+validated once: every 60 s the module dumps the kernel's IPv4 routes
+across all tables and reports any path VPP cannot take that no
+`steer-exempt` covers.
+
+```
+exempt-drift: degraded — kernel path(s) VPP cannot take, with no
+  `steer-exempt` covering them: 23.191.201.0/24 via vti64 (table 100)
+  — steered traffic for these dies at VPP's default route instead of
+  falling back to the kernel that would deliver it.
+```
+
+`packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`**.
+Each finding names the prefix, the device, and the table, which is
+what `ip route show table <n>` needs to find it again. The remedy is
+one `steer-exempt` per path (one MCAM slot each — check the budget
+line in `packetframe feasibility`), or leaving that port unsteered.
+
+What it deliberately does NOT report: routes the kernel itself drops
+(blackhole, unreachable, prohibit — VPP dropping the same packet is
+the same outcome), paths out member ports or the bridges
+`local-route` delivers into, and the built-in broadcast/multicast
+exemptions. It DOES include the local table, because traffic to the
+router's own addresses dies in VPP the same way — that is the w23
+blackhole (110,917 packets in five minutes), and a check that only
+looked at forwarding would have missed the first instance of the very
+class it exists for.
+
+Coverage is by containment, not overlap: a `/32` exemption does not
+silence the `/24` around it. That asymmetry is deliberate — treating
+one exempted host as covering its whole prefix is how a hole hides.
+
+It is detection only. Deriving the exemptions automatically was
+considered and rejected for v1: it would change forwarding without an
+operator asking and could exhaust the 16-slot budget silently.
 
 ### The null-drop gauge
 

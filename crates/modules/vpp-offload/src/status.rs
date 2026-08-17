@@ -62,6 +62,8 @@ pub const SUBSYS_PORTS: &str = "ports";
 pub const SUBSYS_STATE_FILE: &str = "state-file";
 /// Only present when the bridge-FDB tripwire has findings.
 pub const SUBSYS_FDB: &str = "fdb";
+/// Only present when the exemption tripwire has findings.
+pub const SUBSYS_EXEMPT_DRIFT: &str = "exempt-drift";
 /// Subsystem name for the cross-tier route feed.
 pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
 
@@ -374,6 +376,14 @@ pub struct StatusSnapshot {
     /// v1 tripwire whose firing is what makes per-host delivery (v2)
     /// real work instead of speculation.
     pub fdb_misplaced: Vec<String>,
+    /// Kernel paths VPP cannot take (tunnels, and the router's own
+    /// addresses) that no `steer-exempt` covers — steered traffic for
+    /// them dies at VPP's default route where the kernel would have
+    /// delivered it. Degraded, path named: this is the shape that
+    /// blackholed inter-site traffic for three weeks before anything
+    /// looked (w26), and the sets that produce it are edited by
+    /// routing daemons, so it is watched rather than validated once.
+    pub drift_uncovered: Vec<String>,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -429,6 +439,7 @@ impl StatusSnapshot {
             0,
             None,
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -457,6 +468,7 @@ impl StatusSnapshot {
         shadowed_routes: u64,
         null_drops: Option<u64>,
         fdb_misplaced: Vec<String>,
+        drift_uncovered: Vec<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -483,6 +495,7 @@ impl StatusSnapshot {
             shadowed_routes,
             null_drops,
             fdb_misplaced,
+            drift_uncovered,
         }
     }
 
@@ -550,6 +563,20 @@ impl StatusSnapshot {
                      source and {} queued for VPP. Retried every tick — the offload is forwarding \
                      a table that is behind bird, not a wrong one.",
                     self.source_backlog, self.pending_ops
+                )),
+                last_success_age_seconds: None,
+            });
+        }
+        if !self.drift_uncovered.is_empty() {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "kernel path(s) VPP cannot take, with no `steer-exempt` covering them: \
+                     {} — steered traffic for these dies at VPP's default route instead of \
+                     falling back to the kernel that would deliver it. Add a `steer-exempt` \
+                     per path (each costs one MCAM slot), or leave the port unsteered",
+                    self.drift_uncovered.join("; ")
                 )),
                 last_success_age_seconds: None,
             });
@@ -673,6 +700,10 @@ impl StatusSnapshot {
             // only — the remedy is the operator's — but it must not
             // read as healthy while it stands.
             && self.fdb_misplaced.is_empty()
+            // An uncovered kernel path is traffic that will vanish the
+            // moment the port steers — and did, for three weeks,
+            // under a health surface that said Healthy throughout.
+            && self.drift_uncovered.is_empty()
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -1512,6 +1543,17 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         );
         let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
     }
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_exempt_drift",
+        "kernel paths VPP cannot take that no steer-exempt covers (steered = blackholed)",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_exempt_drift{{module=\"{module}\"}} {}",
+        snap.drift_uncovered.len()
+    );
 
     gauge(
         &mut out,
@@ -3277,6 +3319,47 @@ mod tests {
         // The boolean is still emitted — "not verified" is a fact worth
         // scraping.
         assert!(m.contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"));
+    }
+
+    /// The exemption tripwire: quiet = no row, firing = Degraded with
+    /// the path named on the report AND counted on the gauge. Both
+    /// surfaces or neither — a Degraded report beside a healthy gauge
+    /// is how the store-error bug hid, and this is the same shape.
+    #[test]
+    fn an_uncovered_kernel_path_degrades_and_is_named_on_both_surfaces() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        assert!(
+            !s.report()
+                .subsystems
+                .iter()
+                .any(|x| x.name == SUBSYS_EXEMPT_DRIFT),
+            "a quiet tripwire adds no row"
+        );
+        assert!(render_metrics(&s, "vpp-offload")
+            .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0"));
+
+        s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("the tripwire row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.as_deref().unwrap_or("");
+        assert!(msg.contains("vti64"), "{msg}");
+        assert!(msg.contains("steer-exempt"), "and names the remedy: {msg}");
+        assert_ne!(report.overall, HealthState::Healthy);
+        assert!(render_metrics(&s, "vpp-offload")
+            .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 1"));
     }
 
     /// The FDB tripwire: quiet = no subsystem row (nothing for an

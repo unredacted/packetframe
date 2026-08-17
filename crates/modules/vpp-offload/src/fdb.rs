@@ -153,8 +153,10 @@ fn ifindex(name: &str) -> Option<u32> {
     }
 }
 
+/// `if_indextoname`, shared with [`crate::drift`]'s route dump — both
+/// turn kernel ifindexes into the names an operator reads.
 #[cfg(target_os = "linux")]
-fn ifname(index: u32) -> String {
+pub(crate) fn ifname(index: u32) -> String {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     // SAFETY: `buf` is IF_NAMESIZE bytes as the contract requires.
     let ret = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };

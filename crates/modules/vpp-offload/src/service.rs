@@ -1096,6 +1096,7 @@ fn run_loop(
             rs.shadowed_routes,
             rs.null_drops,
             rs.fdb_misplaced,
+            rs.drift_uncovered,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

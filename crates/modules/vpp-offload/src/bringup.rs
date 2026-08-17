@@ -556,6 +556,7 @@ pub fn bring_up(
         loopback,
         &port_vlans,
         local_routes,
+        &cfg.steer_exempts,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -629,6 +630,7 @@ fn finish(
     loopback: packetframe_common::config::Ipv4Prefix,
     port_vlans: &[(String, Vec<u16>)],
     local_routes: &[crate::LocalRoute],
+    steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -869,6 +871,7 @@ fn finish(
     // here rather than passed in: it shares one record between the
     // identity store and the release seam through an `Rc`.
     let local_routes = local_routes.to_vec();
+    let drift_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
         // The FDB tripwire's declarations, cloned out before the engine
         // consumes the resolved set.
@@ -876,6 +879,17 @@ fn finish(
             .iter()
             .map(|lr| (lr.vlan, lr.port.clone()))
             .collect();
+        // What VPP can egress, for the exemption tripwire: the member
+        // ports plus the kernel bridges `local-route` delivers into.
+        // Everything else the kernel routes through is a path VPP
+        // cannot take.
+        let drift_reach = crate::drift::VppReach {
+            members: members.clone(),
+            local_devices: local_routes
+                .iter()
+                .map(|lr| lr.kernel_dev.clone())
+                .collect(),
+        };
         let engine = ConvergenceEngine::new(
             api_socket_path,
             port_attach,
@@ -926,6 +940,17 @@ fn finish(
         }
         #[cfg(not(target_os = "linux"))]
         let _ = fdb_declared;
+        // The exemption tripwire, installed whenever this box could
+        // steer at all — the hole it names opens the instant a port
+        // does, so an operator wants it BEFORE the canary rather than
+        // after the traffic is gone.
+        #[cfg(target_os = "linux")]
+        runtime.drift_watch(Box::new(crate::drift::KernelDriftWatch {
+            reach: drift_reach,
+            exempts: drift_exempts,
+        }));
+        #[cfg(not(target_os = "linux"))]
+        let _ = (drift_reach, drift_exempts);
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is

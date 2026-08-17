@@ -534,6 +534,15 @@ struct Core {
     /// log lines, not impersonated by a stub.
     fdb_watch: Option<Box<dyn crate::fdb::FdbWatch>>,
     last_fdb_scan: Option<std::time::Instant>,
+    /// The exemption tripwire: kernel paths VPP cannot take that no
+    /// `steer-exempt` covers. Installed on Linux whenever steering is
+    /// configured at all — the hole it finds opens the moment a port
+    /// steers, and an operator wants it named BEFORE that.
+    drift_watch: Option<Box<dyn crate::drift::DriftWatch>>,
+    last_drift_scan: Option<std::time::Instant>,
+    /// Last completed scan's findings, kept across a failed scan (an
+    /// unreadable kernel is not evidence the routes went away).
+    drift_uncovered: Vec<String>,
     /// The last completed scan's findings; kept across a failed scan
     /// (an unreadable kernel is not evidence the hosts moved back).
     fdb_misplaced: Vec<String>,
@@ -1246,6 +1255,9 @@ impl Runtime {
                 fdb_watch: None,
                 last_fdb_scan: None,
                 fdb_misplaced: Vec::new(),
+                drift_watch: None,
+                last_drift_scan: None,
+                drift_uncovered: Vec::new(),
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1310,6 +1322,11 @@ impl Runtime {
     /// local-routes exist, and nothing pretends elsewhere.
     pub fn fdb_watch(&self, w: Box<dyn crate::fdb::FdbWatch>) {
         self.core.borrow_mut().fdb_watch = Some(w);
+    }
+
+    /// Install the exemption tripwire. Same wiring rule as the others.
+    pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch>) {
+        self.core.borrow_mut().drift_watch = Some(w);
     }
 
     pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
@@ -1470,6 +1487,28 @@ impl Runtime {
                 c.engine.sample_null_drops();
             }
             let due = c
+                .last_drift_scan
+                .is_none_or(|t| now.duration_since(t) >= DRIFT_SCAN_EVERY);
+            if due && c.drift_watch.is_some() {
+                c.last_drift_scan = Some(now);
+                let result = c.drift_watch.as_mut().expect("checked above").uncovered();
+                match result {
+                    Ok(found) => {
+                        if !found.is_empty() && c.drift_uncovered != found {
+                            tracing::warn!(
+                                paths = ?found,
+                                "kernel path(s) VPP cannot take are not covered by any \
+                                 `steer-exempt`; steered traffic for them dies at VPP's \
+                                 default route instead of falling back to the kernel. Add \
+                                 a steer-exempt for each, or stop steering the port"
+                            );
+                        }
+                        c.drift_uncovered = found;
+                    }
+                    Err(e) => tracing::debug!(error = %e, "route-drift scan failed"),
+                }
+            }
+            let due = c
                 .last_fdb_scan
                 .is_none_or(|t| now.duration_since(t) >= FDB_SCAN_EVERY);
             if due && c.fdb_watch.is_some() {
@@ -1532,6 +1571,7 @@ impl Runtime {
             shadowed_routes: c.engine.shadowed_routes(),
             null_drops: c.engine.null_drops(),
             fdb_misplaced: c.fdb_misplaced.clone(),
+            drift_uncovered: c.drift_uncovered.clone(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1581,6 +1621,15 @@ const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
 /// moved host is a provisioning-scale event, so a minute of latency
 /// on the tripwire costs nothing.
 const FDB_SCAN_EVERY: Duration = Duration::from_secs(60);
+
+/// How often to check the kernel's routes against the exemptions.
+///
+/// One route dump per minute. The sets this watches are edited by
+/// routing daemons, not by hand — the reference primary's tunnel host
+/// routes come from bird — so the interesting change arrives without
+/// anyone touching packetframe, which is the whole argument for
+/// scanning on a clock rather than at config load.
+const DRIFT_SCAN_EVERY: Duration = Duration::from_secs(60);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -1702,6 +1751,8 @@ pub struct RuntimeStatus {
     /// `local-route` declares, one line each. Empty = the tripwire is
     /// quiet (or not installed).
     pub fdb_misplaced: Vec<String>,
+    /// Kernel paths VPP cannot take that no `steer-exempt` covers.
+    pub drift_uncovered: Vec<String>,
 }
 
 impl Core {

@@ -55,6 +55,7 @@ pub mod acquire;
 pub mod attach;
 pub mod bringup;
 pub mod cores;
+pub mod drift;
 pub mod driver;
 pub mod engine;
 pub mod executor;
