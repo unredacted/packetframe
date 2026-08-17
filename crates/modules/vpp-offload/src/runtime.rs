@@ -543,6 +543,23 @@ struct Core {
     /// Last completed scan's findings, kept across a failed scan (an
     /// unreadable kernel is not evidence the routes went away).
     drift_uncovered: Vec<String>,
+    /// A drift scope the config asked for that the NIC has not taken
+    /// yet.
+    ///
+    /// Staged rather than applied, because the scan judges what the
+    /// NIC is BELIEVED TO HOLD and a reconfigure's rules do not reach
+    /// it until a steer succeeds. Committing at request time hid a
+    /// path whose exemption had been refused; committing only on the
+    /// synchronous success then missed the OTHER door — a first steer
+    /// deferred by the FIB gate is retried automatically by the
+    /// driver, installs the new rules with nobody replaying the
+    /// request, and would have left the watcher on the old exemptions
+    /// (both review findings). It is committed at the places every
+    /// steering action goes through, whichever path asked for it.
+    pending_drift_scope: Option<(
+        Vec<packetframe_common::config::Ipv4Prefix>,
+        Option<Vec<packetframe_common::fib::IpPrefix>>,
+    )>,
     /// Why the last scan could not read the kernel, if it could not.
     ///
     /// Its own field for the same reason `steer_audit_error` is: a
@@ -1269,6 +1286,7 @@ impl Runtime {
                 last_drift_scan: None,
                 drift_uncovered: Vec::new(),
                 drift_unreadable: None,
+                pending_drift_scope: None,
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1355,12 +1373,12 @@ impl Runtime {
     }
 
     /// Hand the exemption tripwire a reloaded exemption set.
-    pub fn set_drift_scope(
+    pub fn stage_drift_scope(
         &self,
         exempts: Vec<packetframe_common::config::Ipv4Prefix>,
         dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     ) {
-        self.core.borrow_mut().set_drift_scope(exempts, dst_only);
+        self.core.borrow_mut().stage_drift_scope(exempts, dst_only);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1927,11 +1945,23 @@ impl Core {
     /// longer exists — the operator who just added the exemption the
     /// health line asked for should not have to wait out a minute of
     /// it still complaining.
-    fn set_drift_scope(
+    fn stage_drift_scope(
         &mut self,
         exempts: Vec<packetframe_common::config::Ipv4Prefix>,
         dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     ) {
+        if self.drift_watch.is_some() {
+            self.pending_drift_scope = Some((exempts, dst_only));
+        }
+    }
+
+    /// Adopt the staged scope, if any — called where a steering action
+    /// has just succeeded, so the watcher only ever describes rules
+    /// the NIC took.
+    fn commit_drift_scope(&mut self) {
+        let Some((exempts, dst_only)) = self.pending_drift_scope.take() else {
+            return;
+        };
         if let Some(w) = self.drift_watch.as_mut() {
             w.set_scope(exempts, dst_only);
             // Re-read on the next poll rather than serving a verdict
@@ -2634,6 +2664,12 @@ impl Effects for EffectsView {
         let mut c = self.core.borrow_mut();
         let outcome = c.steering.unsteer();
         c.record_steering();
+        // A confirmed removal is the config taking effect too: nothing
+        // is diverted, so the scan turns predictive, and it should
+        // predict from the config the operator just applied.
+        if outcome.is_ok() {
+            c.commit_drift_scope();
+        }
         outcome
     }
 
@@ -2651,6 +2687,13 @@ impl Effects for EffectsView {
         let mut c = self.core.borrow_mut();
         let outcome = c.steering.steer();
         c.record_steering();
+        // One of the places every steer passes through — the
+        // operator's reconfigure and the driver's automatic retry
+        // alike — so the staged scope lands whichever asked, and
+        // never when the NIC refused.
+        if outcome.is_ok() {
+            c.commit_drift_scope();
+        }
         outcome
     }
 
@@ -2768,6 +2811,13 @@ impl Effects for EffectsView {
         }
         let outcome = c.steering.steer();
         c.record_steering();
+        // One of the places every steer passes through — the
+        // operator's reconfigure and the driver's automatic retry
+        // alike — so the staged scope lands whichever asked, and
+        // never when the NIC refused.
+        if outcome.is_ok() {
+            c.commit_drift_scope();
+        }
         outcome
     }
 

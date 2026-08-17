@@ -1569,16 +1569,25 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
     }
 
-    gauge(
-        &mut out,
-        "packetframe_vpp_exempt_drift",
-        "kernel paths VPP cannot take that no steer-exempt covers (steered = blackholed)",
-    );
-    let _ = writeln!(
-        out,
-        "packetframe_vpp_exempt_drift{{module=\"{module}\"}} {}",
-        snap.drift_uncovered.len()
-    );
+    // ABSENT while the scan cannot read the kernel, never zero — the
+    // same rule as the freshness gauges and the null-drop counter. A
+    // dashboard alarming on `> 0` would read a retained (or
+    // never-populated) count as proof of health while the check was
+    // blind, which is the failure this whole module exists to catch
+    // (review finding). `absent()` is the alarm for that case; the
+    // health report carries the reason.
+    if snap.drift_unreadable.is_none() {
+        gauge(
+            &mut out,
+            "packetframe_vpp_exempt_drift",
+            "kernel paths VPP cannot take that no steer-exempt covers (steered = blackholed)",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_exempt_drift{{module=\"{module}\"}} {}",
+            snap.drift_uncovered.len()
+        );
+    }
 
     gauge(
         &mut out,
@@ -3403,6 +3412,10 @@ mod tests {
             ports_up(),
         );
         s.drift_unreadable = Some("netlink socket: permission denied".into());
+        assert!(
+            !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),
+            "a blind scan must not publish a count a dashboard would read as clean"
+        );
         let report = s.report();
         let row = report
             .subsystems

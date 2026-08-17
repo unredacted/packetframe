@@ -168,7 +168,7 @@ current value without a mapping table:
 | `packetframe_vpp_fib_verified` | `0` while steered |
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
-| `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed |
+| `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
 | `packetframe_vpp_fdb_misplaced` | `> 0` — a service-VLAN host sits behind a port its `local-route` does not declare |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
 | `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
@@ -633,7 +633,10 @@ exempt-drift: degraded — kernel path(s) VPP cannot take, with no
   falling back to the kernel that would deliver it.
 ```
 
-`packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`**.
+`packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`,
+and on `absent()` while the module is attached** — the gauge is
+omitted rather than zeroed whenever the scan cannot read the kernel,
+so a dashboard cannot mistake a blind check for a clean one.
 Each finding names the prefix, the device, and the table, which is
 what `ip route show table <n>` needs to find it again. The remedy is
 one `steer-exempt` per path (one MCAM slot each — check the budget
