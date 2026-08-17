@@ -543,6 +543,16 @@ struct Core {
     /// Last completed scan's findings, kept across a failed scan (an
     /// unreadable kernel is not evidence the routes went away).
     drift_uncovered: Vec<String>,
+    /// Why the last scan could not read the kernel, if it could not.
+    ///
+    /// Its own field for the same reason `steer_audit_error` is: a
+    /// check that cannot run must not be indistinguishable from one
+    /// that ran and found nothing. Without it a permanently broken
+    /// netlink read published an empty finding list, no health row and
+    /// a zero gauge — the newest safety check presenting as clean
+    /// while blind, which is the shape it exists to catch (review
+    /// finding). Same rule as the null-drop gauge's absent-not-zero.
+    drift_unreadable: Option<String>,
     /// The last completed scan's findings; kept across a failed scan
     /// (an unreadable kernel is not evidence the hosts moved back).
     fdb_misplaced: Vec<String>,
@@ -1258,6 +1268,7 @@ impl Runtime {
                 drift_watch: None,
                 last_drift_scan: None,
                 drift_uncovered: Vec::new(),
+                drift_unreadable: None,
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1513,8 +1524,16 @@ impl Runtime {
                             );
                         }
                         c.drift_uncovered = found;
+                        c.drift_unreadable = None;
                     }
-                    Err(e) => tracing::debug!(error = %e, "route-drift scan failed"),
+                    // The previous findings stand — an unreadable
+                    // kernel is not evidence the routes went away —
+                    // but the failure is published, so a scan that
+                    // never succeeds cannot pass for a quiet one.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "route-drift scan failed");
+                        c.drift_unreadable = Some(e);
+                    }
                 }
             }
             let due = c
@@ -1581,6 +1600,7 @@ impl Runtime {
             null_drops: c.engine.null_drops(),
             fdb_misplaced: c.fdb_misplaced.clone(),
             drift_uncovered: c.drift_uncovered.clone(),
+            drift_unreadable: c.drift_unreadable.clone(),
             authority: authority_posture(
                 c.completeness.is_some(),
                 matches!(
@@ -1762,6 +1782,8 @@ pub struct RuntimeStatus {
     pub fdb_misplaced: Vec<String>,
     /// Kernel paths VPP cannot take that no `steer-exempt` covers.
     pub drift_uncovered: Vec<String>,
+    /// Why the last drift scan could not read the kernel, if so.
+    pub drift_unreadable: Option<String>,
 }
 
 impl Core {
@@ -1912,6 +1934,11 @@ impl Core {
     ) {
         if let Some(w) = self.drift_watch.as_mut() {
             w.set_scope(exempts, dst_only);
+            // Re-read on the next poll rather than serving a verdict
+            // about a config that no longer exists. The findings go
+            // with it; the READ failure does not, because whether the
+            // kernel answers has nothing to do with which config we
+            // are judging.
             self.last_drift_scan = None;
             self.drift_uncovered.clear();
         }

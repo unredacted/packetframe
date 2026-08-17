@@ -680,6 +680,13 @@ evaluating the rest would mean reimplementing the kernel's rule walk,
 where a permissive mistake re-opens the hole. Over-reporting is the
 safe direction and the scan stays on that side of it.
 
+An `exempt-drift` row also appears when the scan **cannot read** the
+kernel (netlink refused, or a dump came back interrupted). That is
+Degraded too, and deliberately: a check that never ran must not look
+like one that ran and found nothing — the same rule as the null-drop
+gauge being absent rather than zero. The scan retries every minute,
+so a row that persists means the read itself needs looking at.
+
 **On a VRF host the table filter switches itself off.** An l3mdev
 rule carries table id 0 and resolves to a VRF's table per packet, so
 the enumeration cannot be complete — filtering by the tables that ARE

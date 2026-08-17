@@ -92,6 +92,51 @@ pub enum Divertible<'a> {
     OnlyDst(&'a [packetframe_common::fib::IpPrefix]),
 }
 
+impl Scope<'_> {
+    /// Is every DIVERTIBLE packet for this route already exempted?
+    ///
+    /// Under `Any`, that is every address in the route, so the
+    /// exemption must contain the whole prefix. Under `OnlyDst` only
+    /// the route's intersection with the allowlist can be diverted at
+    /// all — an allowlisted `/32` inside a tunnel-backed `/24` puts
+    /// exactly one host at risk — so a `/32` exemption covering that
+    /// host covers the risk, and demanding one for the whole `/24`
+    /// would send the operator to install a broader rule than the
+    /// hazard warrants (review finding).
+    ///
+    /// Cover is tested against single exemptions, never their union: a
+    /// pair of `/25`s covering a `/24` between them still reports. That
+    /// under-approximates coverage, which over-reports, which is the
+    /// direction this scan is allowed to be wrong in.
+    fn covers(&self, route: &Ipv4Prefix) -> bool {
+        let covered = |p: &Ipv4Prefix| self.exempts.iter().any(|e| e.contains_prefix(p));
+        match &self.divertible {
+            Divertible::Any => covered(route),
+            Divertible::OnlyDst(allow) => allow
+                .iter()
+                .filter_map(|a| {
+                    let packetframe_common::fib::IpPrefix::V4 { addr, prefix_len } = a else {
+                        return None;
+                    };
+                    let a = Ipv4Prefix {
+                        addr: std::net::Ipv4Addr::from(*addr),
+                        prefix_len: *prefix_len,
+                    };
+                    // Two CIDRs that overlap are nested, so the
+                    // intersection is whichever is more specific.
+                    if a.contains_prefix(route) {
+                        Some(*route)
+                    } else if route.contains_prefix(&a) {
+                        Some(a)
+                    } else {
+                        None
+                    }
+                })
+                .all(|intersection| covered(&intersection)),
+        }
+    }
+}
+
 impl Divertible<'_> {
     /// Can a packet for `prefix` be diverted into VPP at all?
     ///
@@ -256,7 +301,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
         }) {
             continue;
         }
-        if scope.exempts.iter().any(|e| e.contains_prefix(&r.prefix)) {
+        if scope.covers(&r.prefix) {
             continue;
         }
         out.push(Uncovered {
@@ -360,7 +405,9 @@ impl DriftWatch for KernelDriftWatch {
 /// have missed the first instance of the very class it exists for.
 #[cfg(target_os = "linux")]
 pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
-    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+    use netlink_packet_core::{
+        NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
+    };
     use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteType};
     use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
@@ -402,6 +449,20 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
             let len = pkt.header.length as usize;
             if len == 0 {
                 break;
+            }
+            // The kernel sets NLM_F_DUMP_INTR when the table changed
+            // under the dump, which makes the result a mix of two
+            // states rather than a snapshot. On a box with a live BGP
+            // feed that is not rare, and a partial list fails the
+            // dangerous way: a missing route reads as "no such path"
+            // and a missing rule narrows the filter onto an active
+            // table. Refuse it; the caller keeps its previous verdict
+            // and the next scan is a minute away (review finding).
+            if pkt.header.flags & NLM_F_DUMP_INTR != 0 {
+                return Err("the kernel interrupted the dump (NLM_F_DUMP_INTR): the \
+                            table changed underneath it, so this result is not a \
+                            snapshot"
+                    .into());
             }
             match pkt.payload {
                 NetlinkPayload::Done(_) => break 'dump,
@@ -482,7 +543,9 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
 ///   this whole module exists to prevent.
 #[cfg(target_os = "linux")]
 pub fn dump_rule_tables() -> Result<Option<Vec<u32>>, String> {
-    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+    use netlink_packet_core::{
+        NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
+    };
     use netlink_packet_route::rule::{RuleAttribute, RuleMessage};
     use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
@@ -520,6 +583,20 @@ pub fn dump_rule_tables() -> Result<Option<Vec<u32>>, String> {
             let len = pkt.header.length as usize;
             if len == 0 {
                 break;
+            }
+            // The kernel sets NLM_F_DUMP_INTR when the table changed
+            // under the dump, which makes the result a mix of two
+            // states rather than a snapshot. On a box with a live BGP
+            // feed that is not rare, and a partial list fails the
+            // dangerous way: a missing route reads as "no such path"
+            // and a missing rule narrows the filter onto an active
+            // table. Refuse it; the caller keeps its previous verdict
+            // and the next scan is a minute away (review finding).
+            if pkt.header.flags & NLM_F_DUMP_INTR != 0 {
+                return Err("the kernel interrupted the dump (NLM_F_DUMP_INTR): the \
+                            table changed underneath it, so this result is not a \
+                            snapshot"
+                    .into());
             }
             match pkt.payload {
                 NetlinkPayload::Done(_) => break 'dump,
@@ -831,6 +908,52 @@ mod tests {
         );
         // No ports at all: conservative.
         assert!(divertible_scope(&[], D::Dst, &allow).is_none());
+    }
+
+    /// Under dst-only steering only the route's INTERSECTION with the
+    /// allowlist can be diverted, so an exemption covering that
+    /// intersection covers the whole hazard — demanding one for the
+    /// entire route would send the operator to install a broader rule
+    /// than the risk warrants (review finding).
+    #[test]
+    fn dst_only_coverage_is_judged_on_the_divertible_intersection() {
+        use packetframe_common::fib::IpPrefix;
+        // One host of a tunnel-backed /24 is allowlisted, so only that
+        // host can be diverted at all.
+        let allow = [IpPrefix::V4 {
+            addr: [23, 191, 201, 7],
+            prefix_len: 32,
+        }];
+        let routes = [route(p(23, 191, 201, 0, 24), "vti64")];
+        let scoped = |exempts: &[Ipv4Prefix]| {
+            uncovered_paths(
+                &routes,
+                &Scope {
+                    reach: &reach(),
+                    exempts,
+                    divertible: Divertible::OnlyDst(&allow),
+                    selected_tables: None,
+                },
+            )
+        };
+        assert_eq!(scoped(&[]).len(), 1, "uncovered: the /32 can be diverted");
+        assert!(
+            scoped(&[p(23, 191, 201, 7, 32)]).is_empty(),
+            "exempting the one divertible host covers the whole hazard"
+        );
+
+        // Under src steering the same /32 exemption is NOT enough:
+        // every address in the /24 can be diverted there.
+        let any = uncovered_paths(
+            &routes,
+            &Scope {
+                reach: &reach(),
+                exempts: &[p(23, 191, 201, 7, 32)],
+                divertible: Divertible::Any,
+                selected_tables: None,
+            },
+        );
+        assert_eq!(any.len(), 1, "{any:?}");
     }
 
     /// The operator-facing line names the three things needed to act:

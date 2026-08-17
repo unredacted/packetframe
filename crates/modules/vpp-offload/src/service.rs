@@ -891,7 +891,6 @@ fn apply_steering(
         ));
     }
     runtime.retarget(req.targets.clone());
-    runtime.set_drift_scope(req.exempts.clone(), req.dst_only.clone());
 
     let steered = driver.supervisor().is_steered();
     // INTENDED, not steered. The two differ in exactly the case an
@@ -1002,6 +1001,19 @@ fn apply_steering(
     // injected outcomes. Here they are also the operator's answer.
     let failures = fmt_failures(&tick.outcome);
     if failures.is_empty() {
+        // ONLY here. The drift scan judges what the NIC is believed to
+        // hold, and until the reconcile succeeds the NIC holds the
+        // PREVIOUS rules — including the previous exemptions. Teaching
+        // the watcher about a new exemption whose rule was refused
+        // makes it hide the one path still being diverted and
+        // blackholed, which is the failure this whole module exists to
+        // catch (review finding).
+        //
+        // Every earlier return in this function leaves the scope alone
+        // for the same reason: a refused first steer, a state that
+        // does not accept changes, and the staging early-return all
+        // end with the NIC exactly as it was.
+        runtime.set_drift_scope(req.exempts.clone(), req.dst_only.clone());
         Ok(())
     } else {
         Err(failures.join("; "))
@@ -1113,6 +1125,7 @@ fn run_loop(
             rs.null_drops,
             rs.fdb_misplaced,
             rs.drift_uncovered,
+            rs.drift_unreadable,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

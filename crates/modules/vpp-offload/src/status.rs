@@ -384,6 +384,10 @@ pub struct StatusSnapshot {
     /// looked (w26), and the sets that produce it are edited by
     /// routing daemons, so it is watched rather than validated once.
     pub drift_uncovered: Vec<String>,
+    /// Why the drift scan could not read the kernel, if it could not.
+    /// Degraded on its own: a safety check that cannot run must not
+    /// be indistinguishable from one that ran and found nothing.
+    pub drift_unreadable: Option<String>,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -440,6 +444,7 @@ impl StatusSnapshot {
             None,
             Vec::new(),
             Vec::new(),
+            None,
         )
     }
 
@@ -469,6 +474,7 @@ impl StatusSnapshot {
         null_drops: Option<u64>,
         fdb_misplaced: Vec<String>,
         drift_uncovered: Vec<String>,
+        drift_unreadable: Option<String>,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -496,6 +502,7 @@ impl StatusSnapshot {
             null_drops,
             fdb_misplaced,
             drift_uncovered,
+            drift_unreadable,
         }
     }
 
@@ -566,6 +573,21 @@ impl StatusSnapshot {
                 )),
                 last_success_age_seconds: None,
             });
+        }
+        if self.drift_uncovered.is_empty() {
+            if let Some(why) = &self.drift_unreadable {
+                subsystems.push(SubsystemHealth {
+                    name: SUBSYS_EXEMPT_DRIFT.into(),
+                    state: HealthState::Degraded,
+                    message: Some(format!(
+                        "the exemption tripwire could not read the kernel's routes ({why}), \
+                         so it is not watching for paths VPP cannot take — an uncovered one \
+                         would blackhole steered traffic unreported. The scan retries every \
+                         minute; a persistent failure needs looking at"
+                    )),
+                    last_success_age_seconds: None,
+                });
+            }
         }
         if !self.drift_uncovered.is_empty() {
             subsystems.push(SubsystemHealth {
@@ -704,6 +726,9 @@ impl StatusSnapshot {
             // moment the port steers — and did, for three weeks,
             // under a health surface that said Healthy throughout.
             && self.drift_uncovered.is_empty()
+            // And a tripwire that cannot read the kernel is not a
+            // quiet tripwire.
+            && self.drift_unreadable.is_none()
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -3360,6 +3385,51 @@ mod tests {
         assert_ne!(report.overall, HealthState::Healthy);
         assert!(render_metrics(&s, "vpp-offload")
             .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 1"));
+    }
+
+    /// A tripwire that cannot read the kernel is Degraded, not quiet.
+    /// Same rule as the null-drop gauge's absent-not-zero: a check
+    /// that never ran must not be indistinguishable from one that ran
+    /// and found nothing (review finding).
+    #[test]
+    fn a_drift_scan_that_cannot_read_the_kernel_is_not_a_clean_one() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        s.drift_unreadable = Some("netlink socket: permission denied".into());
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("an unreadable scan must still say something");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("could not read"),
+            "{row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+
+        // Findings outrank the read failure: when the scan DID run and
+        // found something, that is the more actionable line.
+        s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        let report = s.report();
+        let rows: Vec<_> = report
+            .subsystems
+            .iter()
+            .filter(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .collect();
+        assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
+        assert!(rows[0].message.as_deref().unwrap_or("").contains("vti64"));
     }
 
     /// The FDB tripwire: quiet = no subsystem row (nothing for an
