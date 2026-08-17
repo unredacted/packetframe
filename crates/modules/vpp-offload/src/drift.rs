@@ -437,6 +437,24 @@ pub trait DriftWatch {
     );
 }
 
+/// The exemptions and diversion scope a scan judges against, as the
+/// loop hands them over.
+pub type ScopeUpdate = (
+    Vec<Ipv4Prefix>,
+    Option<Vec<packetframe_common::fib::IpPrefix>>,
+);
+
+/// A completed pass and the scope generation it judged under.
+type StampedResult = (u64, Result<DriftFindings, String>);
+
+#[derive(Default)]
+struct ScannerInbox {
+    /// A scope waiting to be adopted. Only the newest matters — an
+    /// older pending scope is superseded, not queued.
+    pending: Option<ScopeUpdate>,
+    stop: bool,
+}
+
 /// The scan, running on its OWN thread.
 ///
 /// A full `RTM_GETROUTE` dump on the reference primary walks ~1.05M
@@ -449,24 +467,31 @@ pub trait DriftWatch {
 /// delay the thing it monitors.
 ///
 /// So the scan lives here: one thread, its own cadence, publishing
-/// COMPLETED results into a slot the loop reads without blocking. The
-/// loop's only cost is a mutex it never contends for more than the
-/// length of a `Vec` clone.
-/// The exemptions and diversion scope a scan judges against, as the
-/// loop hands them over.
-pub type ScopeUpdate = (
-    Vec<Ipv4Prefix>,
-    Option<Vec<packetframe_common::fib::IpPrefix>>,
-);
-
+/// COMPLETED results into a slot the loop reads without blocking.
+///
+/// ## Every result is stamped with the scope it judged
+///
+/// Moving the scan off-thread created two ways to publish an answer
+/// about the wrong configuration, and both hide a blackhole (review
+/// findings on the async version):
+///
+/// - a scan already IN FLIGHT when the loop commits a new scope
+///   finishes and publishes a verdict about the OLD exemptions;
+/// - the worker then sleeps out its interval before adopting the new
+///   one, so up to a minute passes with nothing re-examined.
+///
+/// The generation counter answers both. The loop bumps it when it
+/// hands over a scope; the worker stamps each result with the
+/// generation it actually scanned under; the loop discards any result
+/// whose stamp is stale. And a handover WAKES the worker, so the
+/// re-scan starts immediately rather than at the end of a sleep.
+/// Until a result for the current generation arrives, the tripwire
+/// reports that it has not scanned this configuration yet — never a
+/// clean zero it has not earned.
 pub struct DriftScanner {
-    latest: std::sync::Arc<std::sync::Mutex<Option<Result<DriftFindings, String>>>>,
-    /// A scope the loop staged for the scanner to adopt before its
-    /// next pass. `Mutex` rather than a channel because only the
-    /// newest one matters — an older pending scope is superseded, not
-    /// queued.
-    scope: std::sync::Arc<std::sync::Mutex<Option<ScopeUpdate>>>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<StampedResult>>>,
+    inbox: std::sync::Arc<(std::sync::Mutex<ScannerInbox>, std::sync::Condvar)>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -474,61 +499,95 @@ impl DriftScanner {
     /// Start scanning every `every`, beginning immediately.
     pub fn spawn(mut watch: Box<dyn DriftWatch + Send>, every: std::time::Duration) -> Self {
         use std::sync::atomic::Ordering;
-        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let scope = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (l, sc, st) = (latest.clone(), scope.clone(), stop.clone());
+        let latest: std::sync::Arc<std::sync::Mutex<Option<StampedResult>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let inbox = std::sync::Arc::new((
+            std::sync::Mutex::new(ScannerInbox::default()),
+            std::sync::Condvar::new(),
+        ));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (l, ib, gen) = (latest.clone(), inbox.clone(), generation.clone());
         let handle = std::thread::Builder::new()
             .name("pf-drift-scan".into())
-            .spawn(move || {
-                while !st.load(Ordering::Relaxed) {
-                    if let Some((exempts, dst_only)) = sc.lock().expect("drift scope lock").take() {
+            .spawn(move || loop {
+                {
+                    let mut inbox = ib.0.lock().expect("drift inbox lock");
+                    if inbox.stop {
+                        return;
+                    }
+                    if let Some((exempts, dst_only)) = inbox.pending.take() {
                         watch.set_scope(exempts, dst_only);
                     }
-                    let result = watch.uncovered();
-                    *l.lock().expect("drift result lock") = Some(result);
-                    // Chunked so a teardown is not waiting out a full
-                    // interval; the loop's own stop path joins this.
-                    let mut slept = std::time::Duration::ZERO;
-                    while slept < every && !st.load(Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        slept += std::time::Duration::from_millis(100);
-                    }
+                }
+                // Read AFTER adopting: this is the generation the pass
+                // about to run actually judges under.
+                let scanned_under = gen.load(Ordering::SeqCst);
+                let result = watch.uncovered();
+                *l.lock().expect("drift result lock") = Some((scanned_under, result));
+
+                let mut inbox = ib.0.lock().expect("drift inbox lock");
+                let mut waited = std::time::Duration::ZERO;
+                // Wake early for a new scope or a teardown; otherwise
+                // sleep out the interval in slices so a stop is not
+                // waiting on a full one.
+                while !inbox.stop && inbox.pending.is_none() && waited < every {
+                    let slice = std::time::Duration::from_millis(200);
+                    let (guard, _) = ib.1.wait_timeout(inbox, slice).expect("drift inbox wait");
+                    inbox = guard;
+                    waited += slice;
+                }
+                if inbox.stop {
+                    return;
                 }
             })
             .ok();
         Self {
             latest,
-            scope,
-            stop,
+            inbox,
+            generation,
             handle,
         }
     }
 
-    /// The newest COMPLETED result, if the scanner has finished a pass
-    /// since the last look. `None` means nothing new — the caller
-    /// keeps whatever it had.
-    pub fn take_result(&self) -> Option<Result<DriftFindings, String>> {
+    /// The newest COMPLETED result, if one has arrived since the last
+    /// look. `None` means nothing new — the caller keeps what it had.
+    ///
+    /// Returns the generation it was scanned under so the caller can
+    /// tell a verdict about the current configuration from one about
+    /// a superseded scope.
+    pub fn take_result(&self) -> Option<StampedResult> {
         self.latest.lock().expect("drift result lock").take()
     }
 
-    /// Hand the scanner a scope to adopt before its next pass.
+    /// The scope generation currently in force.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Hand the scanner a scope to adopt, and wake it to re-scan now.
     pub fn set_scope(
         &self,
         exempts: Vec<Ipv4Prefix>,
         dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     ) {
-        *self.scope.lock().expect("drift scope lock") = Some((exempts, dst_only));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut inbox = self.inbox.0.lock().expect("drift inbox lock");
+        inbox.pending = Some((exempts, dst_only));
+        self.inbox.1.notify_all();
     }
 }
 
 impl Drop for DriftScanner {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut inbox = self.inbox.0.lock().expect("drift inbox lock");
+            inbox.stop = true;
+            self.inbox.1.notify_all();
+        }
         if let Some(h) = self.handle.take() {
-            // The thread checks the flag every 100 ms between passes,
-            // but a pass in flight runs to completion — a netlink dump
-            // has no cancellation, and abandoning the thread with the
+            // A pass in flight runs to completion — a netlink dump has
+            // no cancellation, and abandoning the thread with its
             // socket open is worse than waiting for it.
             let _ = h.join();
         }

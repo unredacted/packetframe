@@ -548,6 +548,17 @@ struct Core {
     /// lines because the nexthop-object summary is one line for many
     /// routes, and the gauge must count routes.
     drift_routes: usize,
+    /// The scope generation the retained findings were scanned under,
+    /// and whether that is still the current one. A million-route
+    /// dump takes seconds, so "attached but not yet scanned" is a
+    /// real window an operator can steer inside — and an empty
+    /// finding list there is not a clean verdict, it is no verdict
+    /// (review finding).
+    drift_result_gen: Option<u64>,
+    /// A scanner exists and has not yet reported on the CURRENT
+    /// scope. False when no scanner is installed — nothing to wait
+    /// for — and false once a current-generation verdict lands.
+    drift_pending: bool,
     /// A drift scope the config asked for that the NIC has not taken
     /// yet.
     ///
@@ -1303,6 +1314,8 @@ impl Runtime {
                 drift_scanner: None,
                 drift_uncovered: Vec::new(),
                 drift_routes: 0,
+                drift_result_gen: None,
+                drift_pending: false,
                 drift_unreadable: None,
                 drift_scope_stale: None,
                 pending_drift_scope: None,
@@ -1585,8 +1598,44 @@ impl Runtime {
             // is the thread that answers pings, stops and steering
             // requests, and a 1.05M-prefix dump on it would delay all
             // three (review finding).
-            let result = c.drift_scanner.as_ref().and_then(|s| s.take_result());
-            if let Some(result) = result {
+            // A COMPLETED result, and only one scanned under the
+            // CURRENT scope: a pass already in flight when a
+            // reconfigure landed is answering about the exemptions
+            // that were in force when it started, and publishing that
+            // as the new config's verdict is how a newly blackholed
+            // path would read as covered (review finding).
+            let fresh = c.drift_scanner.as_ref().and_then(|s| {
+                let current = s.generation();
+                match s.take_result() {
+                    Some((gen, r)) if gen == current => Some(r),
+                    Some((gen, _)) => {
+                        tracing::debug!(
+                            scanned_under = gen,
+                            current,
+                            "discarding a drift result about a superseded scope"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            });
+            // Whether a verdict about the CURRENT config exists at
+            // all. Until one does — the first pass after attach, or
+            // after a scope change — the tripwire has nothing to say
+            // and must not say `0`.
+            if let Some(s) = c.drift_scanner.as_ref() {
+                let current = s.generation();
+                if fresh.is_some() {
+                    c.drift_result_gen = Some(current);
+                }
+                // PENDING, not "unscanned": a deployment with no
+                // tripwire installed at all (non-Linux, or a config
+                // the loader gave no watcher) is not waiting for
+                // anything, and degrading it would report a missing
+                // feature as a broken one.
+                c.drift_pending = c.drift_result_gen != Some(current);
+            }
+            if let Some(result) = fresh {
                 match result {
                     Ok(found) => {
                         if !found.lines.is_empty() && c.drift_uncovered != found.lines {
@@ -1677,6 +1726,7 @@ impl Runtime {
             fdb_misplaced: c.fdb_misplaced.clone(),
             drift_uncovered: c.drift_uncovered.clone(),
             drift_routes: c.drift_routes,
+            drift_pending: c.drift_pending,
             drift_unreadable: c.drift_unreadable.clone(),
             drift_scope_stale: c.drift_scope_stale.clone(),
             authority: authority_posture(
@@ -1862,6 +1912,10 @@ pub struct RuntimeStatus {
     pub drift_uncovered: Vec<String>,
     /// How many routes those findings stand for — the gauge's value.
     pub drift_routes: usize,
+    /// A scan is outstanding for the CURRENT configuration — the
+    /// tripwire has no verdict yet, which is not the same as a clean
+    /// one. False when no tripwire is installed.
+    pub drift_pending: bool,
     /// Why the last drift scan could not read the kernel, if so.
     pub drift_unreadable: Option<String>,
     /// Why the scan cannot say which exemptions the NIC holds, if so.

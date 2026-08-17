@@ -1131,6 +1131,7 @@ fn run_loop(
             rs.fdb_misplaced,
             rs.drift_uncovered,
             rs.drift_routes,
+            rs.drift_pending,
             rs.drift_unreadable,
             rs.drift_scope_stale,
         );

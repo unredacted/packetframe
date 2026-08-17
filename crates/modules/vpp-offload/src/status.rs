@@ -388,6 +388,13 @@ pub struct StatusSnapshot {
     /// publishes. Distinct from `drift_uncovered.len()`, since the
     /// nexthop-object summary is one line for many routes.
     pub drift_routes: usize,
+    /// A scan is outstanding for the CURRENT configuration: the
+    /// tripwire has no verdict yet, which must not be rendered as a
+    /// clean one — a full route dump takes seconds, and an operator
+    /// can reach the first steer inside that window believing the
+    /// predictive scan already ran. False when no tripwire is
+    /// installed, since nothing is being waited for.
+    pub drift_pending: bool,
     /// Why the drift scan could not read the kernel, if it could not.
     /// Degraded on its own: a safety check that cannot run must not
     /// be indistinguishable from one that ran and found nothing.
@@ -454,6 +461,9 @@ impl StatusSnapshot {
             Vec::new(),
             Vec::new(),
             0,
+            // The shorthand has no scanner behind it, so nothing is
+            // outstanding.
+            false,
             None,
             None,
         )
@@ -486,6 +496,7 @@ impl StatusSnapshot {
         fdb_misplaced: Vec<String>,
         drift_uncovered: Vec<String>,
         drift_routes: usize,
+        drift_pending: bool,
         drift_unreadable: Option<String>,
         drift_scope_stale: Option<String>,
     ) -> Self {
@@ -516,6 +527,7 @@ impl StatusSnapshot {
             fdb_misplaced,
             drift_uncovered,
             drift_routes,
+            drift_pending,
             drift_unreadable,
             drift_scope_stale,
         }
@@ -636,6 +648,19 @@ impl StatusSnapshot {
                      blackhole steered traffic unreported. The scan retries every minute; a \
                      persistent failure needs looking at"
                 )),
+                last_success_age_seconds: None,
+            });
+        } else if self.drift_pending {
+            subsystems.push(SubsystemHealth {
+                name: SUBSYS_EXEMPT_DRIFT.into(),
+                state: HealthState::Degraded,
+                message: Some(
+                    "the exemption tripwire has not finished a scan for this configuration \
+                     yet — on a full-table box the route dump takes seconds, and an empty \
+                     finding list before it lands is no verdict rather than a clean one. It \
+                     clears itself; a first steer is worth holding until it does"
+                        .into(),
+                ),
                 last_success_age_seconds: None,
             });
         }
@@ -765,8 +790,10 @@ impl StatusSnapshot {
             // And a tripwire that cannot read the kernel is not a
             // quiet tripwire.
             && self.drift_unreadable.is_none()
-            // Nor is one that cannot tell which config the NIC holds.
+            // Nor is one that cannot tell which config the NIC holds,
+            // nor one that has not yet looked at this config at all.
             && self.drift_scope_stale.is_none()
+            && !self.drift_pending
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -1614,7 +1641,7 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
     // blind, which is the failure this whole module exists to catch
     // (review finding). `absent()` is the alarm for that case; the
     // health report carries the reason.
-    if snap.drift_unreadable.is_none() && snap.drift_scope_stale.is_none() {
+    if snap.drift_unreadable.is_none() && snap.drift_scope_stale.is_none() && !snap.drift_pending {
         gauge(
             &mut out,
             "packetframe_vpp_exempt_drift",
@@ -3445,6 +3472,51 @@ mod tests {
             render_metrics(&s, "vpp-offload")
                 .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 7"),
             "one line standing for seven routes must publish 7"
+        );
+    }
+
+    /// A scan that has not finished is not a clean scan.
+    ///
+    /// The route dump moved off the supervision loop, which created a
+    /// window: attached, scanner still walking a million prefixes,
+    /// findings empty. Rendering that as a quiet tripwire would let an
+    /// operator take the first steer believing the predictive scan
+    /// already ran (review finding). A deployment with NO tripwire is
+    /// a different thing and must not degrade.
+    #[test]
+    fn a_scan_that_has_not_finished_is_not_a_clean_one() {
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        );
+        // No tripwire installed: nothing outstanding, nothing to say.
+        assert!(!s.drift_pending);
+        assert_eq!(s.report().overall, HealthState::Healthy);
+
+        s.drift_pending = true;
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT)
+            .expect("a pending scan must be visible");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("has not finished a scan"),
+            "{row:?}"
+        );
+        assert_ne!(report.overall, HealthState::Healthy);
+        assert!(
+            !render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"),
+            "and publishes no count it has not earned"
         );
     }
 
