@@ -639,7 +639,12 @@ loop it would otherwise sit on is the one that answers liveness
 pings, wedge detection and steering changes — including the `steer
 off` an operator reaches for when something is wrong. Monitoring must
 never be able to delay the thing it monitors, so the loop only ever
-reads a completed result.
+reads a completed result. **Detach does not wait for it either:** a
+dump in flight is abandoned rather than joined, because a netlink dump
+cannot be cancelled and a monitoring scan holds none of the resources
+a detach must release. A `detach` that reported "resources may still
+be held" while only a scan remained would be a false alarm about the
+one thing that alarm must stay trustworthy for.
 
 `packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`,
 and on `absent()` while the module is attached** — the gauge is

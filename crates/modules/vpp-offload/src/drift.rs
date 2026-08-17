@@ -631,19 +631,57 @@ impl DriftScanner {
     }
 }
 
+/// How long teardown waits for the scan thread before abandoning it.
+///
+/// A sleeping worker is woken by the stop notify and exits in
+/// microseconds, which is the overwhelmingly common case; this only
+/// has to be long enough to cover that wake.
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl Drop for DriftScanner {
+    /// Ask the scan to stop, wait briefly, and ABANDON it if a dump is
+    /// in flight.
+    ///
+    /// This runs on the supervision thread as it unwinds, AFTER the
+    /// real teardown has killed VPP, released the VF and published its
+    /// result — and `SupervisionService::stop()` gives that thread 900
+    /// ms to finish before it tells the operator the teardown is
+    /// incomplete and resources may still be held. A netlink dump has
+    /// no cancellation and takes seconds on a DFZ table, so joining it
+    /// unconditionally made a completed teardown report itself as an
+    /// unfinished one, over a monitoring scan holding nothing (review
+    /// finding).
+    ///
+    /// Abandoning is safe here in a way it would not be for the
+    /// resource owners: this thread holds a read-only netlink socket,
+    /// its watcher, and `Arc` clones of a result slot nobody reads any
+    /// more. It owns no VPP process, no VF, no hugepage reservation —
+    /// nothing whose lifetime a detach must account for — and the stop
+    /// flag is already set, so it exits the moment its dump returns.
+    /// (The previous comment here defended the join by calling the
+    /// open socket a reason to wait; that conflated a thread holding a
+    /// file descriptor with a thread holding the resources teardown
+    /// exists to release.) A bounded receive keeps "the moment its
+    /// dump returns" finite even if the kernel goes quiet.
     fn drop(&mut self) {
         {
             let mut inbox = self.inbox.0.lock().expect("drift inbox lock");
             inbox.stop = true;
             self.inbox.1.notify_all();
         }
-        if let Some(h) = self.handle.take() {
-            // A pass in flight runs to completion — a netlink dump has
-            // no cancellation, and abandoning the thread with its
-            // socket open is worse than waiting for it.
-            let _ = h.join();
+        let Some(h) = self.handle.take() else { return };
+        let deadline = std::time::Instant::now() + TEARDOWN_GRACE;
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        if h.is_finished() {
+            let _ = h.join();
+            return;
+        }
+        // Dropping the handle detaches the thread.
+        tracing::debug!(
+            "drift scan still in flight at teardown; detaching it rather than delaying detach"
+        );
     }
 }
 
@@ -757,6 +795,11 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
     }
 
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    // A receive that can block forever is a scan thread that never
+    // settles — and teardown abandons an in-flight scan rather than
+    // waiting on it, so "forever" would mean a thread and its socket
+    // held for the daemon's life.
+    crate::fdb::bound_recv(&socket)?;
     socket
         .bind_auto()
         .map_err(|e| format!("netlink bind: {e}"))?;
@@ -932,6 +975,7 @@ pub fn dump_rule_tables() -> Result<Option<Vec<u32>>, String> {
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    crate::fdb::bound_recv(&socket)?;
     socket
         .bind_auto()
         .map_err(|e| format!("netlink bind: {e}"))?;
@@ -1537,6 +1581,69 @@ mod tests {
         assert!(
             seen.lock().unwrap().contains(&1),
             "and it must have scanned with the new exemptions"
+        );
+    }
+
+    /// Teardown does not wait out a scan in flight.
+    ///
+    /// This drop runs on the supervision thread after the real
+    /// teardown is done, and `SupervisionService::stop()` gives that
+    /// thread 900 ms before it tells the operator resources may still
+    /// be held. A full route dump takes seconds, so joining it made a
+    /// finished teardown report itself unfinished (review finding).
+    #[test]
+    fn teardown_abandons_a_scan_in_flight_instead_of_waiting_for_it() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        /// Blocks inside `uncovered()` the way a real dump does, and
+        /// says when it has entered.
+        struct Blocking {
+            entered: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl DriftWatch for Blocking {
+            fn uncovered(&mut self) -> Result<DriftFindings, String> {
+                {
+                    let mut in_dump = self.entered.0.lock().unwrap();
+                    *in_dump = true;
+                    self.entered.1.notify_all();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                Ok(DriftFindings::default())
+            }
+            fn set_scope(
+                &mut self,
+                _e: Vec<Ipv4Prefix>,
+                _d: Option<Vec<packetframe_common::fib::IpPrefix>>,
+            ) {
+            }
+        }
+
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let scanner = DriftScanner::spawn(
+            Box::new(Blocking {
+                entered: entered.clone(),
+            }),
+            std::time::Duration::from_secs(60),
+        );
+        // Only meaningful once the worker is actually inside the dump.
+        let mut in_dump = entered.0.lock().unwrap();
+        while !*in_dump {
+            let (g, timed_out) = entered
+                .1
+                .wait_timeout(in_dump, std::time::Duration::from_secs(5))
+                .unwrap();
+            in_dump = g;
+            assert!(!timed_out.timed_out(), "the scan never started");
+        }
+        drop(in_dump);
+
+        let started = std::time::Instant::now();
+        drop(scanner);
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "teardown waited {waited:?} on a monitoring scan; the detach budget is 900 ms for \
+             the whole supervision thread"
         );
     }
 
