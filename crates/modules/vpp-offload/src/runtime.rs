@@ -543,6 +543,10 @@ struct Core {
     /// Last completed scan's findings, kept across a failed scan (an
     /// unreadable kernel is not evidence the routes went away).
     drift_uncovered: Vec<String>,
+    /// How many ROUTES those findings stand for. Tracked beside the
+    /// lines because the nexthop-object summary is one line for many
+    /// routes, and the gauge must count routes.
+    drift_routes: usize,
     /// A drift scope the config asked for that the NIC has not taken
     /// yet.
     ///
@@ -1298,6 +1302,7 @@ impl Runtime {
                 drift_watch: None,
                 last_drift_scan: None,
                 drift_uncovered: Vec::new(),
+                drift_routes: 0,
                 drift_unreadable: None,
                 drift_scope_stale: None,
                 pending_drift_scope: None,
@@ -1370,6 +1375,26 @@ impl Runtime {
     /// Install the exemption tripwire. Same wiring rule as the others.
     pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch>) {
         self.core.borrow_mut().drift_watch = Some(w);
+    }
+
+    /// Declare that the NIC holds rules INHERITED from a previous
+    /// process, so the tripwire is judging a config it cannot assume
+    /// matches them.
+    ///
+    /// The watcher is built from the config on disk, and a restart
+    /// that adopts a live VPP re-adopts whatever rules the last
+    /// process installed — which the operator may have edited the
+    /// config away from in between. An exemption added while the
+    /// daemon was down would then suppress a path the inherited
+    /// divert rule still sends into VPP (review finding). The first
+    /// successful steer reconciles the NIC to the current target and
+    /// clears this.
+    pub fn note_inherited_steering(&self) {
+        self.core.borrow_mut().drift_scope_stale = Some(
+            "steering rules were inherited from a previous process and have not been \
+             reconciled with the running config yet"
+                .into(),
+        );
     }
 
     pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
@@ -1562,7 +1587,7 @@ impl Runtime {
                 let result = c.drift_watch.as_mut().expect("checked above").uncovered();
                 match result {
                     Ok(found) => {
-                        if !found.is_empty() && c.drift_uncovered != found {
+                        if !found.lines.is_empty() && c.drift_uncovered != found.lines {
                             tracing::warn!(
                                 paths = ?found,
                                 "kernel path(s) VPP cannot take are not covered by any \
@@ -1571,7 +1596,8 @@ impl Runtime {
                                  a steer-exempt for each, or stop steering the port"
                             );
                         }
-                        c.drift_uncovered = found;
+                        c.drift_routes = found.routes;
+                        c.drift_uncovered = found.lines;
                         c.drift_unreadable = None;
                     }
                     // The previous findings stand — an unreadable
@@ -1648,6 +1674,7 @@ impl Runtime {
             null_drops: c.engine.null_drops(),
             fdb_misplaced: c.fdb_misplaced.clone(),
             drift_uncovered: c.drift_uncovered.clone(),
+            drift_routes: c.drift_routes,
             drift_unreadable: c.drift_unreadable.clone(),
             drift_scope_stale: c.drift_scope_stale.clone(),
             authority: authority_posture(
@@ -1831,6 +1858,8 @@ pub struct RuntimeStatus {
     pub fdb_misplaced: Vec<String>,
     /// Kernel paths VPP cannot take that no `steer-exempt` covers.
     pub drift_uncovered: Vec<String>,
+    /// How many routes those findings stand for — the gauge's value.
+    pub drift_routes: usize,
     /// Why the last drift scan could not read the kernel, if so.
     pub drift_unreadable: Option<String>,
     /// Why the scan cannot say which exemptions the NIC holds, if so.
@@ -2021,6 +2050,7 @@ impl Core {
             // are judging.
             self.last_drift_scan = None;
             self.drift_uncovered.clear();
+            self.drift_routes = 0;
         }
     }
 

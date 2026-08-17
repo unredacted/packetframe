@@ -384,6 +384,10 @@ pub struct StatusSnapshot {
     /// looked (w26), and the sets that produce it are edited by
     /// routing daemons, so it is watched rather than validated once.
     pub drift_uncovered: Vec<String>,
+    /// How many kernel routes the findings stand for — what the gauge
+    /// publishes. Distinct from `drift_uncovered.len()`, since the
+    /// nexthop-object summary is one line for many routes.
+    pub drift_routes: usize,
     /// Why the drift scan could not read the kernel, if it could not.
     /// Degraded on its own: a safety check that cannot run must not
     /// be indistinguishable from one that ran and found nothing.
@@ -449,6 +453,7 @@ impl StatusSnapshot {
             None,
             Vec::new(),
             Vec::new(),
+            0,
             None,
             None,
         )
@@ -480,6 +485,7 @@ impl StatusSnapshot {
         null_drops: Option<u64>,
         fdb_misplaced: Vec<String>,
         drift_uncovered: Vec<String>,
+        drift_routes: usize,
         drift_unreadable: Option<String>,
         drift_scope_stale: Option<String>,
     ) -> Self {
@@ -509,6 +515,7 @@ impl StatusSnapshot {
             null_drops,
             fdb_misplaced,
             drift_uncovered,
+            drift_routes,
             drift_unreadable,
             drift_scope_stale,
         }
@@ -1607,7 +1614,7 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         let _ = writeln!(
             out,
             "packetframe_vpp_exempt_drift{{module=\"{module}\"}} {}",
-            snap.drift_uncovered.len()
+            snap.drift_routes
         );
     }
 
@@ -3403,6 +3410,7 @@ mod tests {
             .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0"));
 
         s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        s.drift_routes = 1;
         let report = s.report();
         let row = report
             .subsystems
@@ -3416,6 +3424,19 @@ mod tests {
         assert_ne!(report.overall, HealthState::Healthy);
         assert!(render_metrics(&s, "vpp-offload")
             .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 1"));
+
+        // The gauge counts ROUTES, not lines. The nexthop-object
+        // summary is ONE line standing for many routes, and deriving
+        // the gauge from the line count published `1` however much of
+        // the table the scan could not see — undercounting exactly
+        // the blind portion it exists to report (review finding).
+        s.drift_uncovered = vec!["7 route(s) use nexthop objects ...".into()];
+        s.drift_routes = 7;
+        assert!(
+            render_metrics(&s, "vpp-offload")
+                .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 7"),
+            "one line standing for seven routes must publish 7"
+        );
     }
 
     /// A steering change that failed partway leaves the NIC holding

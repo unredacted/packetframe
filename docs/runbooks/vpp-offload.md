@@ -649,8 +649,9 @@ What it reports, and what it deliberately does not:
   every nexthop (ECMP hides its devices in `RTA_MULTIPATH`, not
   `RTA_OIF`); one resolvable path is enough for VPP to forward the
   prefix, so only an all-unreachable route is reported.
-- **Local addresses** — the router's own, which VPP cannot deliver to
-  at all — are findings on the **steered segments** (the
+- **Kernel-delivered destinations** — the router's own addresses, and
+  a segment's directed broadcast (`.255`), neither of which VPP can
+  reproduce — are findings on the **steered segments** (the
   `local-route` bridges). That is the w23 class: 110,917 packets to a
   gateway address in five minutes. Device reachability is deliberately
   NOT consulted for these, since the interface named on a local route

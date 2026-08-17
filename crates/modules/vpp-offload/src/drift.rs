@@ -49,14 +49,19 @@ pub struct KernelRoute {
     /// unreachable, prohibit). VPP dropping the same packet is
     /// equivalent behaviour, so these are not findings.
     pub drops: bool,
-    /// `RTN_LOCAL`: an address the kernel TERMINATES rather than a
-    /// path it forwards over. Its `oif` names the interface that owns
-    /// the address, which is not an egress VPP could take — so device
-    /// reachability says nothing about it and must not be consulted
-    /// (review finding: the local class this scan exists to cover was
+    /// The kernel DELIVERS this itself rather than forwarding over a
+    /// path — `RTN_LOCAL` (its own addresses), `RTN_BROADCAST` (the
+    /// segment's directed broadcast, `.255` on a service bridge) and
+    /// `RTN_ANYCAST`. The `oif` names the interface that owns the
+    /// address or segment, which is not an egress VPP could take, so
+    /// device reachability says nothing about these and must not be
+    /// consulted — the local class this scan exists to cover was
     /// being skipped precisely because those addresses sit on member
-    /// ports and bridges).
-    pub local: bool,
+    /// ports and bridges, and directed broadcast was being skipped
+    /// the same way one round later (both review findings). VPP has
+    /// no local delivery and cannot reproduce a broadcast, so
+    /// steered traffic to any of them dies unless exempted.
+    pub kernel_delivers: bool,
     /// The route names a NEXTHOP OBJECT (`ip route ... nhid N`,
     /// `RTA_NH_ID`) instead of carrying its devices inline. Those
     /// routes are opaque here: the vendored netlink crate does not
@@ -233,7 +238,10 @@ pub enum Uncovered {
         table: u32,
         /// A terminated address rather than a forwarding path — the
         /// message says so, because the remedy reads differently.
-        local: bool,
+        /// Kernel-owned delivery (an address or a broadcast) rather
+        /// than a forwarding path — the message says so, because the
+        /// remedy reads differently.
+        kernel_delivers: bool,
     },
     /// Routes using nexthop objects, whose devices this scan cannot
     /// see. Reported so the operator knows the coverage is partial
@@ -242,6 +250,16 @@ pub enum Uncovered {
 }
 
 impl Uncovered {
+    /// How many kernel routes this finding stands for — one, except
+    /// for the coverage-gap summary, which stands for as many as it
+    /// counted.
+    pub fn routes(&self) -> usize {
+        match self {
+            Self::Path { .. } => 1,
+            Self::Opaque(n) => *n,
+        }
+    }
+
     /// The table this finding sits in, for tests and log context.
     /// `None` for the coverage-gap summary, which names no route.
     pub fn table(&self) -> Option<u32> {
@@ -259,17 +277,18 @@ impl std::fmt::Display for Uncovered {
                 prefix,
                 oif,
                 table,
-                local: true,
+                kernel_delivers: true,
             } => write!(
                 f,
-                "{}/{} terminates on {oif} (table {table}, the router's own address)",
+                "{}/{} is delivered by the kernel on {oif} (table {table}) — an address or \
+                 broadcast VPP cannot reproduce",
                 prefix.addr, prefix.prefix_len
             ),
             Self::Path {
                 prefix,
                 oif,
                 table,
-                local: false,
+                kernel_delivers: false,
             } => write!(
                 f,
                 "{}/{} via {oif} (table {table})",
@@ -339,7 +358,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
-        if r.local {
+        if r.kernel_delivers {
             // Only the segments whose hosts steering diverts. A
             // transit port's own address is reachable from a steered
             // host only by a route that would itself be a finding,
@@ -371,7 +390,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
             prefix: r.prefix,
             oif: oif.clone(),
             table: r.table,
-            local: r.local,
+            kernel_delivers: r.kernel_delivers,
         });
     }
     out.sort_by_key(|u| match u {
@@ -387,11 +406,24 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
 
 /// The scan seam the runtime holds, mirroring [`crate::fdb::FdbWatch`]:
 /// a trait so tests record calls and non-Linux builds never pretend.
+/// What one scan concluded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriftFindings {
+    /// One line per finding, for the health surface.
+    pub lines: Vec<String>,
+    /// How many ROUTES those lines represent. Not `lines.len()`: the
+    /// nexthop-object summary is one line for `n` routes, and a gauge
+    /// derived from the line count published `1` however much of the
+    /// table the scan could not see — undercounting exactly the blind
+    /// portion it exists to report (review finding).
+    pub routes: usize,
+}
+
 pub trait DriftWatch {
-    /// One line per uncovered kernel path, empty when the exemptions
-    /// hold. `Err` = the kernel would not answer; the caller keeps its
-    /// previous verdict.
-    fn uncovered(&mut self) -> Result<Vec<String>, String>;
+    /// The scan's findings, empty when the exemptions hold. `Err` =
+    /// the kernel would not answer; the caller keeps its previous
+    /// verdict.
+    fn uncovered(&mut self) -> Result<DriftFindings, String>;
 
     /// Adopt a reloaded exemption set AND diversion scope. Called
     /// from the same place the steering target is retargeted, so the
@@ -424,7 +456,7 @@ pub struct KernelDriftWatch {
 
 #[cfg(target_os = "linux")]
 impl DriftWatch for KernelDriftWatch {
-    fn uncovered(&mut self) -> Result<Vec<String>, String> {
+    fn uncovered(&mut self) -> Result<DriftFindings, String> {
         let routes = dump_routes()?;
         // A rule dump that fails filters nothing rather than failing
         // the scan: the routes are the finding, the rules only narrow
@@ -444,10 +476,11 @@ impl DriftWatch for KernelDriftWatch {
             divertible,
             selected_tables: tables.as_deref(),
         };
-        Ok(uncovered_paths(&routes, &scope)
-            .into_iter()
-            .map(|u| u.to_string())
-            .collect())
+        let found = uncovered_paths(&routes, &scope);
+        Ok(DriftFindings {
+            routes: found.iter().map(Uncovered::routes).sum(),
+            lines: found.iter().map(Uncovered::to_string).collect(),
+        })
     }
 
     fn set_scope(
@@ -594,7 +627,10 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             m.header.kind,
                             RouteType::BlackHole | RouteType::Unreachable | RouteType::Prohibit
                         ),
-                        local: m.header.kind == RouteType::Local,
+                        kernel_delivers: matches!(
+                            m.header.kind,
+                            RouteType::Local | RouteType::Broadcast | RouteType::Anycast
+                        ),
                         via_nexthop_object: nexthop_object,
                     });
                 }
@@ -732,7 +768,7 @@ mod tests {
             oifs: vec![oif.to_string()],
             table: 100,
             drops: false,
-            local: false,
+            kernel_delivers: false,
             via_nexthop_object: false,
         }
     }
@@ -819,18 +855,47 @@ mod tests {
     #[test]
     fn a_local_address_on_a_service_bridge_is_a_finding_despite_the_device() {
         let mut gw = route(p(23, 191, 200, 1, 32), "br1337");
-        gw.local = true;
+        gw.kernel_delivers = true;
         gw.table = 255;
         let found = find(&[gw.clone()], &[]);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(matches!(found[0], Uncovered::Path { local: true, .. }));
+        assert!(matches!(
+            found[0],
+            Uncovered::Path {
+                kernel_delivers: true,
+                ..
+            }
+        ));
         assert!(
-            found[0].to_string().contains("terminates on br1337"),
+            found[0]
+                .to_string()
+                .contains("delivered by the kernel on br1337"),
             "the message must read as termination, not a path: {}",
             found[0]
         );
         // And the exemption an operator would add silences it.
         assert!(find(&[gw], &[p(23, 191, 200, 1, 32)]).is_empty());
+    }
+
+    /// A service bridge's directed broadcast (`.255`) is
+    /// `RTN_BROADCAST` with the bridge as its oif — kernel-owned
+    /// delivery VPP cannot reproduce, not a forwarding path — so the
+    /// device check must not wave it through just because the bridge
+    /// is a local device (review finding, one round after the same
+    /// thing was fixed for `RTN_LOCAL`).
+    #[test]
+    fn a_service_bridges_directed_broadcast_is_kernel_delivery_too() {
+        let mut bcast = route(p(23, 191, 200, 255, 32), "br1337");
+        bcast.kernel_delivers = true;
+        bcast.table = 255;
+        let found = find(std::slice::from_ref(&bcast), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].to_string().contains("delivered by the kernel"),
+            "{}",
+            found[0]
+        );
+        assert!(find(&[bcast], &[p(23, 191, 200, 255, 32)]).is_empty());
     }
 
     /// Local addresses NOT on a steered segment are deliberately out
@@ -841,9 +906,9 @@ mod tests {
     #[test]
     fn local_addresses_off_the_steered_segments_are_out_of_scope() {
         let mut transit = route(p(194, 110, 60, 51, 32), "eth3");
-        transit.local = true;
+        transit.kernel_delivers = true;
         let mut loopback = route(p(127, 0, 0, 1, 32), "lo");
-        loopback.local = true;
+        loopback.kernel_delivers = true;
         assert!(find(&[transit, loopback], &[]).is_empty());
     }
 
@@ -860,7 +925,7 @@ mod tests {
             oifs: vec!["vti64".into(), "wg0".into()],
             table: 254,
             drops: false,
-            local: false,
+            kernel_delivers: false,
             via_nexthop_object: false,
         };
         assert_eq!(find(&[all_tunnel], &[]).len(), 1);
@@ -870,7 +935,7 @@ mod tests {
             oifs: vec!["vti64".into(), "eth3".into()],
             table: 254,
             drops: false,
-            local: false,
+            kernel_delivers: false,
             via_nexthop_object: false,
         };
         assert!(
@@ -1060,12 +1125,17 @@ mod tests {
             oifs: Vec::new(),
             table: 254,
             drops: false,
-            local: false,
+            kernel_delivers: false,
             via_nexthop_object: true,
         };
         let found = find(&[opaque.clone(), opaque.clone()], &[]);
         assert_eq!(found.len(), 1, "one summary, not one per route: {found:?}");
         assert_eq!(found[0], Uncovered::Opaque(2));
+        assert_eq!(
+            found[0].routes(),
+            2,
+            "one LINE, but it stands for two routes — the gauge counts routes"
+        );
         let line = found[0].to_string();
         assert!(line.contains("nhid"), "{line}");
         assert!(line.contains("ip nexthop show"), "names the tool: {line}");

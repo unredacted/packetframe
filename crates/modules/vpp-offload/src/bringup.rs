@@ -962,6 +962,15 @@ fn finish(
             exempts: drift_exempts,
             dst_only: dst_only_scope,
         }));
+        // Rules from a previous process are adopted below, and the
+        // config on disk may have been edited while the daemon was
+        // down — an exemption added in that window would make the
+        // tripwire suppress a path the inherited rule still diverts.
+        // The watcher is told it cannot trust the match until a steer
+        // reconciles the NIC (review finding).
+        if inherited_rule_count > 0 {
+            runtime.note_inherited_steering();
+        }
         #[cfg(not(target_os = "linux"))]
         let _ = (drift_reach, drift_exempts, dst_only_scope);
         let initial = match adopted {

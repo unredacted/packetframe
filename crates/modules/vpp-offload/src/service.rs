@@ -1130,6 +1130,7 @@ fn run_loop(
             rs.null_drops,
             rs.fdb_misplaced,
             rs.drift_uncovered,
+            rs.drift_routes,
             rs.drift_unreadable,
             rs.drift_scope_stale,
         );
