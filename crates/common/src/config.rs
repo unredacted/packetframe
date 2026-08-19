@@ -2713,10 +2713,25 @@ fn parse_route_source<'a>(
                             format!("route-source bgp: bad listen address `{addr}`: {e}"),
                         )
                     })?;
-                if !parsed.is_ipv4() {
+                let std::net::IpAddr::V4(v4) = parsed else {
                     return Err(ConfigError::parse(
                         line,
                         "route-source bgp: `anyip` supports IPv4 listen addresses only",
+                    ));
+                };
+                // A phantom must be a concrete unicast host: the
+                // wildcard would install a meaningless `local
+                // 0.0.0.0/32` while binding every interface, and
+                // multicast/broadcast can never act as an FRR
+                // neighbor — the listener would retry forever.
+                if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!(
+                            "route-source bgp: `anyip` requires a concrete unicast listen \
+                             address, got `{v4}` (unspecified/multicast/broadcast cannot \
+                             be a phantom neighbor)"
+                        ),
                     ));
                 }
             }
@@ -4388,6 +4403,23 @@ module fast-path
                 assert!(message.contains("allow-remote"), "got: {message}");
             }
             other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_non_unicast_listen_errors() {
+        for addr in ["0.0.0.0", "224.0.0.9", "255.255.255.255"] {
+            let e = parse_module_body(&format!(
+                "  route-source bgp {addr}:1179 local-as 1 peer-as 1 \
+                 allow-remote peer-from 10.0.0.1/32 anyip\n"
+            ))
+            .unwrap_err();
+            match e {
+                ConfigError::Parse { message, .. } => {
+                    assert!(message.contains("unicast"), "addr {addr}: got {message}");
+                }
+                other => panic!("expected Parse for {addr}, got {other:?}"),
+            }
         }
     }
 
