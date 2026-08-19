@@ -769,6 +769,48 @@ fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
         })
 }
 
+/// Advisory exclusive lock serializing the anyip preflight and the
+/// unwind window across concurrent `packetframe run` invocations.
+/// Blocking by design: the loser of a double-start race waits out
+/// the winner's attach (bounded by settle times), then proceeds to
+/// adopt-and-fail cleanly on the winner's pins. The lock file lives
+/// in the state dir beside the pid file; flock is per-open-file, so
+/// dropping the returned handle releases it on every exit path.
+fn acquire_anyip_lock(state_dir: &Path) -> ModuleResult<std::fs::File> {
+    std::fs::create_dir_all(state_dir).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("anyip lock: create {}: {e}", state_dir.display()),
+        )
+    })?;
+    let path = state_dir.join("anyip.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("anyip lock: open {}: {e}", path.display()),
+            )
+        })?;
+    // SAFETY: valid fd from the just-opened File; flock has no other
+    // preconditions.
+    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            format!(
+                "anyip lock: flock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(f)
+}
+
 /// Removes the anyip route if `attach` unwinds between the preflight
 /// install and the `RouteController` taking ownership. Disarmed on
 /// success; a disarmed guard's Drop is a no-op. Best-effort removal:
@@ -1310,6 +1352,9 @@ pub fn attach(
     // installing (then unwinding) the route would be pure noise, and
     // failing attach on an address conflict would fail a mode the
     // conflict cannot affect.
+    // Declared BEFORE the guard so it drops AFTER it: any unwind
+    // removal happens while the lock is still held.
+    let mut _anyip_lock: Option<std::fs::File> = None;
     let mut anyip_guard = AnyipUnwindGuard::new(None);
     if matches!(
         forwarding_mode_from_cfg(cfg),
@@ -1317,6 +1362,15 @@ pub fn attach(
             | packetframe_common::config::ForwardingMode::Compare
     ) {
         if let Some(addr) = anyip_addr_from_cfg(cfg) {
+            // Serialize preflight→ownership across concurrent starts.
+            // Created-vs-Adopted alone cannot transfer ownership
+            // atomically: two clean starts could both preflight
+            // before either pins, the loser's unwind then deleting
+            // the route the winner is serving (review finding,
+            // PR #196). Under the flock — held for the rest of
+            // attach — the second start observes the first's
+            // completed route as Adopted and never arms deletion.
+            _anyip_lock = Some(acquire_anyip_lock(&state.state_dir)?);
             let outcome = crate::fib::anyip::ensure_local_route_blocking(addr)
                 .map_err(|e| ModuleError::other(MODULE_NAME, format!("anyip preflight: {e}")))?;
             // Arm the unwind only for a route THIS attach created. An
