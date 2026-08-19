@@ -24,8 +24,11 @@
 //! flushed (SYNs silently stop being delivered; review finding,
 //! PR #196), so only time-based replacement can heal that case.
 //! Replace semantics make every call idempotent. The controller
-//! calls [`remove_local_route`] during shutdown so the
-//! route's lifetime is a strict subset of the daemon's — no kernel
+//! calls [`remove_local_route`] during explicit shutdown AND from
+//! its `Drop` impl — the latter because the §8.5 preserve-attach
+//! exit (the normal `systemctl stop`) drops the controller without
+//! ever calling `shutdown()` — so the route's lifetime is a strict
+//! subset of the daemon's on every exit path short of SIGKILL — no kernel
 //! state survives that a restart doesn't recreate, which is the
 //! property that lets the operator's config file remain the single
 //! source of truth on fleets where hand-installed routes are

@@ -642,3 +642,44 @@ impl RouteController {
         self.prog_handle.clone()
     }
 }
+
+/// The §8.5 preserve-attach exit (SIGTERM/SIGINT) drops modules
+/// without calling `detach`, so [`RouteController::shutdown`] never
+/// runs on the *normal* stop path — and the AnyIP route survived
+/// every ordinary `systemctl stop` (review finding, PR #196). The
+/// pins are meant to outlive the process; the AnyIP route is not: it
+/// serves only this daemon's listener, a dead listener answers
+/// nothing on the phantom address anyway, and the next start with
+/// `anyip` re-installs it before the first bind. So Drop removes it.
+///
+/// Ordering matters: the runtime is torn down FIRST so the reconcile
+/// task cannot re-install the route between our removal and process
+/// exit; the removal then runs on a throwaway current-thread runtime.
+/// After an explicit `shutdown()` both fields are already `None` and
+/// this is a no-op. Drop runs on the daemon's signal-loop thread,
+/// never inside a tokio context, so `shutdown_timeout`/`block_on`
+/// here cannot panic on nested-runtime rules.
+impl Drop for RouteController {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return; // explicit shutdown() already ran
+        };
+        self.shutdown_token.cancel();
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        if let Some(addr) = self.anyip_addr.take() {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => {
+                    if let Err(e) = rt.block_on(crate::fib::anyip::remove_local_route(addr)) {
+                        warn!(error = %e, %addr, "anyip: route removal failed during drop");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, %addr, "anyip: no runtime for route removal during drop");
+                }
+            }
+        }
+    }
+}
