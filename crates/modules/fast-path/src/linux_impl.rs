@@ -608,6 +608,17 @@ pub struct ActiveState {
     /// it a reload that changes the authority returns OK and changes
     /// nothing — the checker keeps using the old one (review finding).
     pub integrity_authority: packetframe_common::config::IntegrityAuthoritySpec,
+    /// The `route-source` in force, as attach parsed it (`None` when
+    /// no feed is configured). Retained for the same reason
+    /// `integrity_authority` is: the spec is consumed once when the
+    /// `RouteController` is built, so a SIGHUP that edits it — the
+    /// listen address, the ASNs, `anyip` — has nothing to compare
+    /// against unless the attach-time answer is kept. Without this a
+    /// reload changing `anyip` returned OK while the reconcile task
+    /// kept recreating the old route and shutdown still deleted it:
+    /// accepted config contradicting live kernel state (review
+    /// finding, PR #196).
+    pub route_source_spec: Option<packetframe_common::config::RouteSourceSpec>,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -727,6 +738,19 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         route_controller: None,
         attach_settle_time: cfg.global.attach_settle_time,
         integrity_authority: integrity_authority_from_cfg(cfg),
+        route_source_spec: route_source_spec_from_cfg(cfg),
+    })
+}
+
+/// The `route-source` directive as written, if any. Shared by `load`
+/// (records the attach-time answer) and reconcile's restart-only
+/// guard (compares a SIGHUP's answer against it).
+pub fn route_source_spec_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> Option<packetframe_common::config::RouteSourceSpec> {
+    cfg.section.directives.iter().find_map(|d| match d {
+        ModuleDirective::RouteSource(spec) => Some(spec.clone()),
+        _ => None,
     })
 }
 
@@ -3493,6 +3517,7 @@ mod tests {
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::Birdc {
                 path: None,
             },
+            route_source_spec: None,
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();

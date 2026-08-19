@@ -76,6 +76,28 @@ fn refuse_integrity_authority_change(
         })
 }
 
+/// Restart-only guard for `route-source`. The controller consumes the
+/// spec once at attach; nothing about it — listen endpoint, ASNs,
+/// ACLs, `anyip` — is hot-applied, so a reload that edits it must be
+/// refused rather than reported OK and ignored. `anyip` is the sharp
+/// edge: post-"successful" reload with the flag removed, the
+/// reconcile task would keep recreating a kernel route the accepted
+/// config no longer declares, and shutdown would still delete it
+/// (review finding, PR #196).
+fn refuse_route_source_change(state: &ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    if state.route_controller.is_none() {
+        return Ok(());
+    }
+    let wanted = crate::linux_impl::route_source_spec_from_cfg(cfg);
+    if state.route_source_spec != wanted {
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            "`route-source` changed; the feed listener (and any anyip route it owns) is              built once at attach and cannot be hot-swapped — restart required:              systemctl stop packetframe && packetframe detach --all && systemctl start",
+        ));
+    }
+    Ok(())
+}
+
 /// Per-map count of entries added and removed during reconcile.
 #[derive(Default, Debug)]
 pub struct DeltaCount {
@@ -85,6 +107,7 @@ pub struct DeltaCount {
 
 pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
     refuse_integrity_authority_change(state, cfg)?;
+    refuse_route_source_change(state, cfg)?;
     reconcile_cfg(state, cfg)?;
     let v4 = reconcile_allow_v4(state, cfg)?;
     let v6 = reconcile_allow_v6(state, cfg)?;
