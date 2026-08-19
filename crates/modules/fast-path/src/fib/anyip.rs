@@ -265,7 +265,17 @@ async fn existing_local_table_entry(
     handle: &Handle,
     addr: Ipv4Addr,
 ) -> Result<Option<(RouteType, RouteProtocol)>, AnyipError> {
-    let filter = RouteMessageBuilder::<Ipv4Addr>::new().build();
+    // Destination-less GetRoute is an NLM_F_DUMP; without a table
+    // filter the kernel exports the ENTIRE v4 FIB — on a full-table
+    // edge that is 1M+ routes serialized and scanned every 30 s
+    // reconcile tick just to check one /32 (review finding, PR
+    // #196). Setting the header's table field makes 4.20+ kernels
+    // filter the dump to table local (hundreds of entries); the
+    // userspace re-check below keeps correctness on anything that
+    // ignores the filter.
+    let filter = RouteMessageBuilder::<Ipv4Addr>::new()
+        .table_id(LOCAL_TABLE)
+        .build();
     let mut routes = handle.route().get(filter).execute();
     while let Some(msg) = routes.try_next().await? {
         if msg.header.destination_prefix_length != 32 || u32::from(msg.header.table) != LOCAL_TABLE

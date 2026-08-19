@@ -1673,6 +1673,25 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
                 }
                 Cursor::Module(i) => {
                     let d = parse_module_directive(line, stripped)?;
+                    // The controller spawns at most one route source
+                    // and every consumer selects "the first" — a
+                    // second directive could silently diverge from
+                    // the first (the anyip preflight vs the
+                    // controller's selection, review finding on
+                    // PR #196). The runbook has always said "exactly
+                    // one route-source"; now the parser does too.
+                    if matches!(d, ModuleDirective::RouteSource(_))
+                        && modules[i]
+                            .directives
+                            .iter()
+                            .any(|e| matches!(e, ModuleDirective::RouteSource(_)))
+                    {
+                        return Err(ConfigError::parse(
+                            line,
+                            "duplicate `route-source` in one module section; exactly one \
+                             feed is supported per module",
+                        ));
+                    }
                     modules[i].directives.push(d);
                 }
             },
@@ -4366,6 +4385,24 @@ module fast-path
                 assert_eq!(peer_from.len(), 2);
             }
             other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_route_source_rejected() {
+        let e = parse_module_body(
+            "  route-source bmp 127.0.0.1:6543 require-loc-rib\n  \
+             route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("duplicate `route-source`"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 

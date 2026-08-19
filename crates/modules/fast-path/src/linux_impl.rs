@@ -743,21 +743,30 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 }
 
 /// The anyip phantom address, when `route-source bgp ... anyip` is
-/// configured. Config validation guarantees the address parses as
-/// concrete-unicast IPv4, so a parse failure here is a parser/coder
-/// disagreement, not an operator error.
+/// configured. Selects the FIRST `route-source` directive — the same
+/// one every other consumer selects — and answers for it alone; the
+/// parser rejects duplicates, so first-vs-matching can no longer
+/// diverge, but this helper must not be the place that reintroduces
+/// the split if that ever changes. Config validation guarantees the
+/// address parses as concrete-unicast IPv4, so a parse failure here
+/// is a parser/coder disagreement, not an operator error.
 fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
-    cfg.section.directives.iter().find_map(|d| match d {
-        ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
-            addr,
-            anyip: true,
-            ..
-        }) => Some(
-            addr.parse::<std::net::Ipv4Addr>()
-                .expect("config parser permits anyip on concrete IPv4 listens only"),
-        ),
-        _ => None,
-    })
+    cfg.section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::RouteSource(spec) => Some(spec),
+            _ => None,
+        })
+        .and_then(|spec| match spec {
+            packetframe_common::config::RouteSourceSpec::Bgp {
+                addr, anyip: true, ..
+            } => Some(
+                addr.parse::<std::net::Ipv4Addr>()
+                    .expect("config parser permits anyip on concrete IPv4 listens only"),
+            ),
+            _ => None,
+        })
 }
 
 /// Removes the anyip route if `attach` unwinds between the preflight
