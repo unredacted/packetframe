@@ -1317,9 +1317,18 @@ pub fn attach(
             | packetframe_common::config::ForwardingMode::Compare
     ) {
         if let Some(addr) = anyip_addr_from_cfg(cfg) {
-            crate::fib::anyip::ensure_local_route_blocking(addr)
+            let outcome = crate::fib::anyip::ensure_local_route_blocking(addr)
                 .map_err(|e| ModuleError::other(MODULE_NAME, format!("anyip preflight: {e}")))?;
-            anyip_guard = AnyipUnwindGuard::new(Some(addr));
+            // Arm the unwind only for a route THIS attach created. An
+            // adopted route may be serving a concurrently running
+            // daemon (e.g. a second `run` that will fail on the first
+            // one's pins moments from now) — unwinding it would break
+            // that daemon's live feed until its reconciler heals it
+            // (review finding, PR #196). An adopted-then-failed attach
+            // leaves the route exactly as orphaned as it found it.
+            if outcome == crate::fib::anyip::EnsureOutcome::Created {
+                anyip_guard = AnyipUnwindGuard::new(Some(addr));
+            }
         }
     }
 
@@ -2181,7 +2190,9 @@ fn populate_mutation_progs(ebpf: &mut Ebpf) -> ModuleResult<()> {
 }
 
 /// The parsed `forwarding-mode` directive (default `kernel-fib`).
-fn forwarding_mode_from_cfg(cfg: &ModuleConfig<'_>) -> packetframe_common::config::ForwardingMode {
+pub(crate) fn forwarding_mode_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> packetframe_common::config::ForwardingMode {
     cfg.section
         .directives
         .iter()

@@ -36,7 +36,9 @@ use std::os::fd::AsRawFd;
 use std::process::Command;
 
 use netlink_packet_route::route::RouteType;
-use packetframe_fast_path::fib::anyip::{ensure_local_route, remove_local_route, AnyipError};
+use packetframe_fast_path::fib::anyip::{
+    ensure_local_route, remove_local_route, AnyipError, EnsureOutcome,
+};
 
 // --- Test setup utilities (copied from tests/netns.rs) -----------------
 
@@ -185,10 +187,17 @@ fn anyip_route_lifecycle_makes_phantom_bindable() {
     // Ensure → bindable. Twice, because the controller re-ensures on
     // every listener retry and the second call must be a no-op, not
     // an EEXIST.
-    rt.block_on(ensure_local_route(PHANTOM)).expect("ensure #1");
+    let first = rt.block_on(ensure_local_route(PHANTOM)).expect("ensure #1");
+    assert_eq!(first, EnsureOutcome::Created, "first ensure creates");
     assert!(bindable(PHANTOM), "phantom bindable after ensure");
-    rt.block_on(ensure_local_route(PHANTOM))
+    let second = rt
+        .block_on(ensure_local_route(PHANTOM))
         .expect("ensure #2 (idempotent)");
+    assert_eq!(
+        second,
+        EnsureOutcome::Adopted,
+        "re-ensure adopts our own tagged route"
+    );
     assert!(bindable(PHANTOM), "phantom still bindable after re-ensure");
 
     // Remove → unbindable again. Twice, because shutdown's removal is

@@ -122,15 +122,28 @@ pub enum AnyipError {
     RouteKindConflict { addr: Ipv4Addr, kind: RouteType },
 }
 
+/// Whether [`ensure_local_route`] created the route or adopted one a
+/// previous daemon life left behind. Callers that clean up on
+/// failure must only clean up what they CREATED: unwinding an
+/// adopted route can yank it out from under a concurrently running
+/// daemon that owns it (review finding, PR #196).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    Created,
+    Adopted,
+}
+
 /// Ensure `local <addr>/32 dev lo` exists in the `local` table.
 ///
 /// Idempotent (`NLM_F_REPLACE`), so the controller can call it before
 /// every listener (re)start: a route someone flushed at runtime is
 /// healed on the next retry rather than requiring a daemon restart.
+/// Reports whether the route was [`EnsureOutcome::Created`] fresh or
+/// [`EnsureOutcome::Adopted`] from a previous daemon life.
 ///
 /// Fails with [`AnyipError::AddressOwned`] if any interface holds
 /// `addr` — see the module docs for why that is a hard refusal.
-pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
+pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
@@ -152,6 +165,7 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
     // must not clobber at all; this is the second line of defense
     // behind the directed-broadcast check above, driven by what the
     // routing table actually holds rather than address arithmetic.
+    let mut outcome = EnsureOutcome::Created;
     if let Some((kind, proto)) = existing_local_table_entry(&handle, addr).await? {
         if kind != RouteType::Local {
             return Err(AnyipError::RouteKindConflict { addr, kind });
@@ -159,6 +173,7 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
         if proto != ANYIP_ROUTE_PROTOCOL {
             return Err(AnyipError::RouteContested { addr, proto });
         }
+        outcome = EnsureOutcome::Adopted;
     }
 
     let lo = lo_ifindex(&handle).await?;
@@ -171,8 +186,8 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
         .protocol(ANYIP_ROUTE_PROTOCOL)
         .build();
     handle.route().add(route).replace().execute().await?;
-    info!(%addr, "anyip: local /32 ensured on lo (kernel AnyIP)");
-    Ok(())
+    info!(%addr, ?outcome, "anyip: local /32 ensured on lo (kernel AnyIP)");
+    Ok(outcome)
 }
 
 /// Remove the route [`ensure_local_route`] installed. Best-effort by
@@ -299,7 +314,7 @@ async fn existing_local_table_entry(
 /// attach preflight (a sync path that runs before the controller's
 /// runtime exists) and unwind/Drop cleanup. Each builds a throwaway
 /// current-thread runtime; both sites are cold one-shots.
-pub fn ensure_local_route_blocking(addr: Ipv4Addr) -> Result<(), AnyipError> {
+pub fn ensure_local_route_blocking(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

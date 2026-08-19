@@ -421,7 +421,10 @@ impl RouteController {
                         // operator error.
                         unreachable!("config parser permits anyip on IPv4 listens only");
                     };
-                    runtime.block_on(crate::fib::anyip::ensure_local_route(a))?;
+                    // Outcome (created vs adopted) is irrelevant here:
+                    // by contract the controller owns the route either
+                    // way once start() returns.
+                    let _ = runtime.block_on(crate::fib::anyip::ensure_local_route(a))?;
                     Some(a)
                 } else {
                     None

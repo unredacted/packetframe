@@ -98,6 +98,35 @@ fn refuse_route_source_change(state: &ActiveState, cfg: &ModuleConfig<'_>) -> Mo
     Ok(())
 }
 
+/// Restart-only guard for forwarding-mode changes that cross the
+/// controller boundary. The RouteController (and with it the BGP/BMP
+/// listener and any anyip route) is created only at attach, only for
+/// custom-fib/compare. A reload crossing that boundary in either
+/// direction produces runtime state a fresh start with the same
+/// config would not: custom→kernel leaves a live controller
+/// recreating an anyip route the config no longer implies; kernel→
+/// custom flips the data-plane flag with no controller to feed it
+/// (review finding, PR #196). Within the boundary — compare↔custom,
+/// the documented cutover flip — reload remains allowed.
+fn refuse_controller_boundary_change(
+    state: &ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<()> {
+    let controller_running = state.route_controller.is_some();
+    let wants_controller = matches!(
+        crate::linux_impl::forwarding_mode_from_cfg(cfg),
+        packetframe_common::config::ForwardingMode::CustomFib
+            | packetframe_common::config::ForwardingMode::Compare
+    );
+    if controller_running != wants_controller {
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            "`forwarding-mode` change crosses the route-controller boundary (kernel-fib              on one side, custom-fib/compare on the other); the controller and any anyip              route it owns are built once at attach — restart required:              systemctl stop packetframe && packetframe detach --all && systemctl start",
+        ));
+    }
+    Ok(())
+}
+
 /// Per-map count of entries added and removed during reconcile.
 #[derive(Default, Debug)]
 pub struct DeltaCount {
@@ -108,6 +137,7 @@ pub struct DeltaCount {
 pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
     refuse_integrity_authority_change(state, cfg)?;
     refuse_route_source_change(state, cfg)?;
+    refuse_controller_boundary_change(state, cfg)?;
     reconcile_cfg(state, cfg)?;
     let v4 = reconcile_allow_v4(state, cfg)?;
     let v6 = reconcile_allow_v6(state, cfg)?;
