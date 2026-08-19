@@ -1305,11 +1305,22 @@ pub fn attach(
     // here and controller ownership: any later attach failure
     // removes the route on unwind, so no kernel state outlives a
     // failed attach either.
+    // ... and only in the modes that will start a RouteController:
+    // under kernel-fib a route-source is dormant by design, so
+    // installing (then unwinding) the route would be pure noise, and
+    // failing attach on an address conflict would fail a mode the
+    // conflict cannot affect.
     let mut anyip_guard = AnyipUnwindGuard::new(None);
-    if let Some(addr) = anyip_addr_from_cfg(cfg) {
-        crate::fib::anyip::ensure_local_route_blocking(addr)
-            .map_err(|e| ModuleError::other(MODULE_NAME, format!("anyip preflight: {e}")))?;
-        anyip_guard = AnyipUnwindGuard::new(Some(addr));
+    if matches!(
+        forwarding_mode_from_cfg(cfg),
+        packetframe_common::config::ForwardingMode::CustomFib
+            | packetframe_common::config::ForwardingMode::Compare
+    ) {
+        if let Some(addr) = anyip_addr_from_cfg(cfg) {
+            crate::fib::anyip::ensure_local_route_blocking(addr)
+                .map_err(|e| ModuleError::other(MODULE_NAME, format!("anyip preflight: {e}")))?;
+            anyip_guard = AnyipUnwindGuard::new(Some(addr));
+        }
     }
 
     // v0.2.5: load `finalize` first so its FD is available for the

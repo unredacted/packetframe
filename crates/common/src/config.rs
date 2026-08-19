@@ -2888,6 +2888,23 @@ fn parse_endpoint(
             format!("route-source {kind_label}: bad port `{port_str}`: {e}"),
         )
     })?;
+    // Brackets are IPv6 endpoint syntax. A bracketed IPv4 —
+    // `[10.255.0.2]:1179` — passed every validation (they all strip
+    // brackets) but reached consumers with the brackets stored:
+    // SocketAddr parsing silently dropped the feed, and the anyip
+    // preflight panicked on an addr its own validator had accepted
+    // (review finding, PR #196). Reject the shape by name instead.
+    if let Some(inner) = addr.strip_prefix('[').and_then(|a| a.strip_suffix(']')) {
+        if inner.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: `{addr}` is a bracketed IPv4 address; \
+                     brackets are IPv6 syntax — write `{inner}:{port}`"
+                ),
+            ));
+        }
+    }
     Ok((addr.to_string(), port))
 }
 
@@ -4385,6 +4402,18 @@ module fast-path
                 assert_eq!(peer_from.len(), 2);
             }
             other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bracketed_ipv4_rejected() {
+        let e = parse_module_body("  route-source bgp [10.255.0.2]:1179 local-as 1 peer-as 1\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("bracketed IPv4"), "got: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 
