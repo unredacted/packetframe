@@ -17,8 +17,10 @@
 //!    survives our remove untouched — the protocol-scoped delete
 //!    cannot match it.
 //! 5. Directed broadcast: the .3 of a configured /30 is refused —
-//!    `Ipv4Addr::is_broadcast()` only knows 255.255.255.255, so the
-//!    gate reads the kernel's Broadcast address attribute instead.
+//!    `Ipv4Addr::is_broadcast()` only knows 255.255.255.255, so two
+//!    kernel-driven gates cover it: the IFA_BROADCAST address
+//!    attribute (when the address was added with a broadcast set)
+//!    and the kernel's broadcast route in table local (always).
 //!
 //! Runs inside its own netns so the routes and the veth address it
 //! creates never touch the host (qemu VM) tables. Same harness
@@ -33,6 +35,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::process::Command;
 
+use netlink_packet_route::route::RouteType;
 use packetframe_fast_path::fib::anyip::{ensure_local_route, remove_local_route, AnyipError};
 
 // --- Test setup utilities (copied from tests/netns.rs) -----------------
@@ -214,11 +217,20 @@ fn anyip_refuses_interface_owned_address() {
     }
 
     // Same netns, same /30: .3 is the directed broadcast of the
-    // veth's 192.0.2.1/30 — `is_broadcast()` can't see it, the
-    // kernel's Broadcast address attribute can.
+    // veth's 192.0.2.1/30 — `is_broadcast()` can't see it. Either
+    // defensive layer may fire depending on how the address was
+    // added: `ip addr add x/30` without `brd +` leaves the
+    // IFA_BROADCAST attribute unset (so the address walk misses it)
+    // while the kernel still installs the broadcast route (so the
+    // table probe catches it). Both are correct refusals of the
+    // same hazard.
     match rt.block_on(ensure_local_route(BCAST)) {
         Err(AnyipError::DirectedBroadcast { addr, .. }) => assert_eq!(addr, BCAST),
-        other => panic!("expected DirectedBroadcast for {BCAST}, got {other:?}"),
+        Err(AnyipError::RouteKindConflict { addr, kind }) => {
+            assert_eq!(addr, BCAST);
+            assert_eq!(kind, RouteType::Broadcast);
+        }
+        other => panic!("expected a broadcast refusal for {BCAST}, got {other:?}"),
     }
 }
 

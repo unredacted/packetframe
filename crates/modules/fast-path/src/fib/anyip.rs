@@ -285,6 +285,25 @@ async fn existing_local_table_entry(
     Ok(None)
 }
 
+/// Blocking wrappers for callers without a live tokio runtime: the
+/// attach preflight (a sync path that runs before the controller's
+/// runtime exists) and unwind/Drop cleanup. Each builds a throwaway
+/// current-thread runtime; both sites are cold one-shots.
+pub fn ensure_local_route_blocking(addr: Ipv4Addr) -> Result<(), AnyipError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(ensure_local_route(addr))
+}
+
+/// See [`ensure_local_route_blocking`].
+pub fn remove_local_route_blocking(addr: Ipv4Addr) -> Result<(), AnyipError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(remove_local_route(addr))
+}
+
 async fn lo_ifindex(handle: &Handle) -> Result<u32, AnyipError> {
     let mut links = handle.link().get().match_name("lo".to_string()).execute();
     match links.try_next().await? {

@@ -742,6 +742,54 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
     })
 }
 
+/// The anyip phantom address, when `route-source bgp ... anyip` is
+/// configured. Config validation guarantees the address parses as
+/// concrete-unicast IPv4, so a parse failure here is a parser/coder
+/// disagreement, not an operator error.
+fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
+    cfg.section.directives.iter().find_map(|d| match d {
+        ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
+            addr,
+            anyip: true,
+            ..
+        }) => Some(
+            addr.parse::<std::net::Ipv4Addr>()
+                .expect("config parser permits anyip on concrete IPv4 listens only"),
+        ),
+        _ => None,
+    })
+}
+
+/// Removes the anyip route if `attach` unwinds between the preflight
+/// install and the `RouteController` taking ownership. Disarmed on
+/// success; a disarmed guard's Drop is a no-op. Best-effort removal:
+/// the unwind path is already reporting the real error, and a
+/// leftover tagged route is adopted by the next successful start
+/// anyway — this just keeps kernel state from outliving the failed
+/// attach in the common case.
+struct AnyipUnwindGuard {
+    addr: Option<std::net::Ipv4Addr>,
+}
+
+impl AnyipUnwindGuard {
+    fn new(addr: Option<std::net::Ipv4Addr>) -> Self {
+        Self { addr }
+    }
+    fn disarm(&mut self) {
+        self.addr = None;
+    }
+}
+
+impl Drop for AnyipUnwindGuard {
+    fn drop(&mut self) {
+        if let Some(addr) = self.addr.take() {
+            if let Err(e) = crate::fib::anyip::remove_local_route_blocking(addr) {
+                warn!(error = %e, %addr, "anyip: unwind removal failed after attach error");
+            }
+        }
+    }
+}
+
 /// The `route-source` directive as written, if any. Shared by `load`
 /// (records the attach-time answer) and reconcile's restart-only
 /// guard (compares a SIGHUP's answer against it).
@@ -1236,6 +1284,25 @@ pub fn attach(
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 ) -> ModuleResult<Vec<Attachment>> {
+    // `anyip` preflight FIRST, before anything attaches or pins: the
+    // refusals inside it (interface-owned address, directed
+    // broadcast, contested route) are operator errors that must not
+    // cost a `detach --all`. When they fired inside
+    // `RouteController::start` — after the per-iface loop and
+    // `pin_program_and_maps` — the failed attach left orphaned pins
+    // and the next start was refused until a manual detach: the
+    // exact crash-loop §8.5's pin persistence is NOT meant to cause
+    // (review finding, PR #196). The guard covers the window between
+    // here and controller ownership: any later attach failure
+    // removes the route on unwind, so no kernel state outlives a
+    // failed attach either.
+    let mut anyip_guard = AnyipUnwindGuard::new(None);
+    if let Some(addr) = anyip_addr_from_cfg(cfg) {
+        crate::fib::anyip::ensure_local_route_blocking(addr)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("anyip preflight: {e}")))?;
+        anyip_guard = AnyipUnwindGuard::new(Some(addr));
+    }
+
     // v0.2.5: load `finalize` first so its FD is available for the
     // MUTATION_PROGS[0] population below. Order matters: fast_path's
     // tail_call into MUTATION_PROGS[0] must succeed on every packet
@@ -1720,6 +1787,9 @@ pub fn attach(
             info!("fib-cache enabled (destination cache in front of the FIB LPM)");
         }
         state.route_controller = Some(ctrl);
+        // The controller owns the anyip route from here (its
+        // shutdown/Drop removes it); the attach-scope guard must not.
+        anyip_guard.disarm();
         info!(
             ?forwarding,
             "RouteController started (NeighborResolver + FibProgrammer active)"
