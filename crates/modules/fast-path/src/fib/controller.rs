@@ -98,6 +98,16 @@ const LISTENER_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 /// log without being too loud.
 const LISTENER_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Cadence of the AnyIP reconcile task. The per-retry ensure in the
+/// listener loop only runs when `BgpListener::run` *exits*, and a
+/// flushed route doesn't make a bound listener exit — the socket
+/// stays bound, SYNs silently stop being delivered locally, and the
+/// session dies on hold-timer with nothing to restart the loop
+/// (review finding, PR #196). A periodic replace is the signal-free
+/// fix: one netlink round-trip every 30 s, idempotent, and the feed
+/// heals within one FRR connect-retry of the route coming back.
+const ANYIP_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
     #[error("tokio runtime build failed: {0}")]
@@ -346,6 +356,7 @@ impl RouteController {
                         backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
                     }
                 }));
+
                 integrity = Some(snapshot);
 
                 let loopback_only = listen.ip().is_loopback() && peer_acl.is_empty();
@@ -450,6 +461,10 @@ impl RouteController {
                         }
                         let listener = BgpListener::new(cfg.clone(), prog.clone(), shut.clone())
                             .with_stall_gate(stall.clone());
+                        // (The flushed-while-BOUND case is covered by
+                        // the reconcile task spawned below, not this
+                        // loop — a bound listener gives no exit signal
+                        // when the route disappears.)
                         match listener.run().await {
                             Ok(()) => return,
                             Err(e) => {
@@ -467,6 +482,27 @@ impl RouteController {
                         backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
                     }
                 }));
+
+                // AnyIP reconcile: heal the route while the listener
+                // is bound and healthy, which the retry loop above
+                // structurally cannot (see ANYIP_RECONCILE_INTERVAL).
+                // First tick fires immediately and is a no-op replace.
+                if let Some(a) = anyip_addr {
+                    let shut = shutdown_token.clone();
+                    tasks.push(runtime.spawn(async move {
+                        let mut tick = tokio::time::interval(ANYIP_RECONCILE_INTERVAL);
+                        loop {
+                            tokio::select! {
+                                _ = shut.cancelled() => return,
+                                _ = tick.tick() => {
+                                    if let Err(e) = crate::fib::anyip::ensure_local_route(a).await {
+                                        warn!(error = %e, addr = %a, "anyip: reconcile failed");
+                                    }
+                                }
+                            }
+                        }
+                    }));
+                }
                 integrity = Some(snapshot);
 
                 info!(

@@ -18,9 +18,13 @@
 //! `local` table).
 //!
 //! This module owns exactly that one route. The controller calls
-//! [`ensure_local_route`] before the listener's first bind and again
-//! before each retry (replace semantics make it idempotent and
-//! self-healing), and [`remove_local_route`] during shutdown so the
+//! [`ensure_local_route`] before the listener's first bind, before
+//! each listener retry, and on a periodic reconcile tick — the last
+//! because a *bound* listener emits no error when the route is
+//! flushed (SYNs silently stop being delivered; review finding,
+//! PR #196), so only time-based replacement can heal that case.
+//! Replace semantics make every call idempotent. The controller
+//! calls [`remove_local_route`] during shutdown so the
 //! route's lifetime is a strict subset of the daemon's — no kernel
 //! state survives that a restart doesn't recreate, which is the
 //! property that lets the operator's config file remain the single
