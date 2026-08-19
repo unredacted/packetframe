@@ -12,6 +12,10 @@
 //! 3. `remove_local_route` returns the address to unbindable, and a
 //!    second removal is success, not error (shutdown must never
 //!    wedge on a route someone else already cleaned up).
+//! 4. Ownership: a same-destination local route installed by
+//!    someone else (foreign route protocol) is refused at ensure and
+//!    survives our remove untouched — the protocol-scoped delete
+//!    cannot match it.
 //!
 //! Runs inside its own netns so the routes and the veth address it
 //! creates never touch the host (qemu VM) tables. Same harness
@@ -144,6 +148,9 @@ fn enter_netns(name: &str) -> File {
 const PHANTOM: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 /// The interface-owned address, for the refusal test.
 const OWNED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+/// TEST-NET-2 address for the contested-route test: pre-installed as
+/// a local /32 with a foreign protocol before ensure runs.
+const CONTESTED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
 
 fn bindable(addr: Ipv4Addr) -> bool {
     TcpListener::bind(SocketAddr::from((addr, 11790))).is_ok()
@@ -200,4 +207,49 @@ fn anyip_refuses_interface_owned_address() {
         Err(AnyipError::AddressOwned { addr, .. }) => assert_eq!(addr, OWNED),
         other => panic!("expected AddressOwned for {OWNED}, got {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn anyip_refuses_and_never_deletes_foreign_route() {
+    let names = Names::new("c");
+    let _guard = NetnsGuard::setup(&names);
+    let _ns_fd = enter_netns(&names.netns);
+
+    // A foreign owner's AnyIP route: same shape, different protocol
+    // (66 is iproute2-unassigned and != ANYIP_ROUTE_PROTOCOL's 199).
+    run(&[
+        "ip",
+        "route",
+        "add",
+        "local",
+        "198.51.100.9/32",
+        "dev",
+        "lo",
+        "table",
+        "local",
+        "proto",
+        "66",
+    ]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current-thread runtime");
+
+    // Ensure refuses the contested address instead of replacing it.
+    match rt.block_on(ensure_local_route(CONTESTED)) {
+        Err(AnyipError::RouteContested { addr, .. }) => assert_eq!(addr, CONTESTED),
+        other => panic!("expected RouteContested for {CONTESTED}, got {other:?}"),
+    }
+
+    // Remove is a no-op against the foreign route: the protocol-scoped
+    // delete can't match it, ESRCH is tolerated as success, and the
+    // route keeps delivering (still bindable = still present).
+    rt.block_on(remove_local_route(CONTESTED))
+        .expect("remove tolerates foreign route");
+    assert!(
+        bindable(CONTESTED),
+        "foreign local route must survive our remove untouched"
+    );
 }

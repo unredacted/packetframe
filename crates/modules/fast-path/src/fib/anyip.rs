@@ -36,7 +36,13 @@
 //! loopback IP (#188): an owned address means the operator pointed
 //! `anyip` at a real interface address, and FRR would reject the
 //! neighbor outright — better to fail attach loudly than converge
-//! into a feed that can never establish.
+//! into a feed that can never establish. It likewise refuses a
+//! same-destination local route installed by anything else: routes
+//! we install wear [`ANYIP_ROUTE_PROTOCOL`] as an ownership tag, so
+//! a crash-orphaned route from a previous daemon life is adopted
+//! silently while a foreign owner's route is neither replaced at
+//! startup nor deletable at shutdown (the kernel's protocol-scoped
+//! delete cannot match it).
 
 #![cfg(target_os = "linux")]
 
@@ -44,13 +50,34 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use futures::TryStreamExt;
 use netlink_packet_route::address::AddressAttribute;
-use netlink_packet_route::route::{RouteProtocol, RouteScope, RouteType};
+use netlink_packet_route::route::{
+    RouteAddress, RouteAttribute, RouteProtocol, RouteScope, RouteType,
+};
 use rtnetlink::{Handle, RouteMessageBuilder};
 use tracing::info;
 
 /// The kernel's `local` routing table, where type-`local` routes
 /// conventionally live (`ip route show table local`).
 const LOCAL_TABLE: u32 = 255;
+
+/// The route-protocol value that marks the AnyIP route as OURS.
+///
+/// This is the ownership tag that makes three behaviors possible at
+/// once (review finding, PR #196):
+/// - crash adoption: a route left behind by a SIGKILL'd daemon wears
+///   the tag, so the next start adopts it silently instead of
+///   refusing its own leftovers;
+/// - contested refusal: a `local <addr>/32` installed by anything
+///   else does NOT wear it, so [`ensure_local_route`] refuses rather
+///   than silently replacing another owner's route;
+/// - scoped delete: `RTM_DELROUTE` with a nonzero protocol only
+///   matches routes carrying that protocol, so shutdown removal is
+///   structurally unable to delete a route we don't own.
+///
+/// 199 is unassigned in iproute2's `rt_protos` (186 bgp, 187 isis,
+/// 188 ospf, 189 rip, 192 eigrp are the neighbors); `ip route show
+/// table local` renders it as `proto 199`.
+const ANYIP_ROUTE_PROTOCOL: RouteProtocol = RouteProtocol::Other(199);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnyipError {
@@ -67,6 +94,17 @@ pub enum AnyipError {
     AddressOwned { addr: Ipv4Addr, ifindex: u32 },
     #[error("interface `lo` not found via RTM_GETLINK")]
     NoLoopbackIface,
+    #[error(
+        "a `local {addr}/32` route already exists with protocol {proto:?}, \
+         installed by something other than packetframe; refusing to adopt \
+         or replace it — the anyip address must be exclusively ours \
+         (pick a different phantom address, or remove the foreign route's \
+         owner first)"
+    )]
+    RouteContested {
+        addr: Ipv4Addr,
+        proto: RouteProtocol,
+    },
 }
 
 /// Ensure `local <addr>/32 dev lo` exists in the `local` table.
@@ -84,6 +122,15 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
     if let Some(ifindex) = owning_ifindex(&handle, addr).await? {
         return Err(AnyipError::AddressOwned { addr, ifindex });
     }
+    // A pre-existing local /32 for this address is adopted only when
+    // it wears our protocol tag (a previous daemon life); any other
+    // protocol means another owner got here first, and replacing
+    // their route now means deleting it at our shutdown later.
+    if let Some(proto) = existing_local_route_protocol(&handle, addr).await? {
+        if proto != ANYIP_ROUTE_PROTOCOL {
+            return Err(AnyipError::RouteContested { addr, proto });
+        }
+    }
 
     let lo = lo_ifindex(&handle).await?;
     let route = RouteMessageBuilder::<Ipv4Addr>::new()
@@ -92,10 +139,7 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
         .table_id(LOCAL_TABLE)
         .scope(RouteScope::Host)
         .kind(RouteType::Local)
-        // `Static` rather than the kernel/boot defaults so `ip route
-        // show table local` visibly distinguishes our route from the
-        // kernel's own local entries.
-        .protocol(RouteProtocol::Static)
+        .protocol(ANYIP_ROUTE_PROTOCOL)
         .build();
     handle.route().add(route).replace().execute().await?;
     info!(%addr, "anyip: local /32 ensured on lo (kernel AnyIP)");
@@ -105,6 +149,11 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
 /// Remove the route [`ensure_local_route`] installed. Best-effort by
 /// contract: an already-absent route is success, not an error, so
 /// shutdown never fails on a route someone else already cleaned up.
+///
+/// The delete carries [`ANYIP_ROUTE_PROTOCOL`]; the kernel only
+/// matches routes with that protocol, so a same-destination route
+/// owned by anything else is unreachable from here — it survives as
+/// an ESRCH, which the tolerant arm below reports as success.
 pub async fn remove_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
@@ -116,7 +165,7 @@ pub async fn remove_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
         .table_id(LOCAL_TABLE)
         .scope(RouteScope::Host)
         .kind(RouteType::Local)
-        .protocol(RouteProtocol::Static)
+        .protocol(ANYIP_ROUTE_PROTOCOL)
         .build();
     match handle.route().del(route).execute().await {
         Ok(()) => {
@@ -150,6 +199,35 @@ async fn owning_ifindex(handle: &Handle, addr: Ipv4Addr) -> Result<Option<u32>, 
         });
         if owned {
             return Ok(Some(msg.header.index));
+        }
+    }
+    Ok(None)
+}
+
+/// The protocol of an existing `local <addr>/32` in the local table,
+/// or `None` when no such route exists. This is the ownership probe:
+/// the caller compares the result against [`ANYIP_ROUTE_PROTOCOL`].
+async fn existing_local_route_protocol(
+    handle: &Handle,
+    addr: Ipv4Addr,
+) -> Result<Option<RouteProtocol>, AnyipError> {
+    let filter = RouteMessageBuilder::<Ipv4Addr>::new().build();
+    let mut routes = handle.route().get(filter).execute();
+    while let Some(msg) = routes.try_next().await? {
+        if msg.header.kind != RouteType::Local
+            || msg.header.destination_prefix_length != 32
+            || u32::from(msg.header.table) != LOCAL_TABLE
+        {
+            continue;
+        }
+        let dst_matches = msg.attributes.iter().any(|attr| {
+            matches!(
+                attr,
+                RouteAttribute::Destination(RouteAddress::Inet(a)) if *a == addr
+            )
+        });
+        if dst_matches {
+            return Ok(Some(msg.header.protocol));
         }
     }
     Ok(None)
