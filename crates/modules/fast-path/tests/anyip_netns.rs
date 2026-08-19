@@ -16,6 +16,9 @@
 //!    someone else (foreign route protocol) is refused at ensure and
 //!    survives our remove untouched — the protocol-scoped delete
 //!    cannot match it.
+//! 5. Directed broadcast: the .3 of a configured /30 is refused —
+//!    `Ipv4Addr::is_broadcast()` only knows 255.255.255.255, so the
+//!    gate reads the kernel's Broadcast address attribute instead.
 //!
 //! Runs inside its own netns so the routes and the veth address it
 //! creates never touch the host (qemu VM) tables. Same harness
@@ -148,6 +151,8 @@ fn enter_netns(name: &str) -> File {
 const PHANTOM: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 /// The interface-owned address, for the refusal test.
 const OWNED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+/// The directed broadcast of the veth's 192.0.2.1/30.
+const BCAST: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 3);
 /// TEST-NET-2 address for the contested-route test: pre-installed as
 /// a local /32 with a foreign protocol before ensure runs.
 const CONTESTED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
@@ -206,6 +211,14 @@ fn anyip_refuses_interface_owned_address() {
     match rt.block_on(ensure_local_route(OWNED)) {
         Err(AnyipError::AddressOwned { addr, .. }) => assert_eq!(addr, OWNED),
         other => panic!("expected AddressOwned for {OWNED}, got {other:?}"),
+    }
+
+    // Same netns, same /30: .3 is the directed broadcast of the
+    // veth's 192.0.2.1/30 — `is_broadcast()` can't see it, the
+    // kernel's Broadcast address attribute can.
+    match rt.block_on(ensure_local_route(BCAST)) {
+        Err(AnyipError::DirectedBroadcast { addr, .. }) => assert_eq!(addr, BCAST),
+        other => panic!("expected DirectedBroadcast for {BCAST}, got {other:?}"),
     }
 }
 

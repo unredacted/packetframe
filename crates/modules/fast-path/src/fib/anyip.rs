@@ -108,6 +108,18 @@ pub enum AnyipError {
         addr: Ipv4Addr,
         proto: RouteProtocol,
     },
+    #[error(
+        "anyip address {addr} is the directed broadcast of a subnet on \
+         interface index {ifindex}; the kernel owns a broadcast route for \
+         it that a local /32 would clobber (in a /30 feed subnet the usable \
+         phantom is the OTHER host address, not .3)"
+    )]
+    DirectedBroadcast { addr: Ipv4Addr, ifindex: u32 },
+    #[error(
+        "a {kind:?} route for {addr}/32 already exists in the local table; \
+         refusing to replace a kernel-owned entry with an anyip local route"
+    )]
+    RouteKindConflict { addr: Ipv4Addr, kind: RouteType },
 }
 
 /// Ensure `local <addr>/32 dev lo` exists in the `local` table.
@@ -122,14 +134,28 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
-    if let Some(ifindex) = owning_ifindex(&handle, addr).await? {
-        return Err(AnyipError::AddressOwned { addr, ifindex });
+    match address_conflict(&handle, addr).await? {
+        Some(AddrConflict::Owned(ifindex)) => {
+            return Err(AnyipError::AddressOwned { addr, ifindex });
+        }
+        Some(AddrConflict::DirectedBroadcast(ifindex)) => {
+            return Err(AnyipError::DirectedBroadcast { addr, ifindex });
+        }
+        None => {}
     }
-    // A pre-existing local /32 for this address is adopted only when
-    // it wears our protocol tag (a previous daemon life); any other
-    // protocol means another owner got here first, and replacing
-    // their route now means deleting it at our shutdown later.
-    if let Some(proto) = existing_local_route_protocol(&handle, addr).await? {
+    // A pre-existing table-local entry for this /32 is adopted only
+    // when it is a `local` route wearing our protocol tag (a previous
+    // daemon life). A foreign-protocol local route means another
+    // owner got here first — replacing it now means deleting it at
+    // our shutdown later. A non-`local` kind (the kernel's own
+    // `broadcast` entry, an `anycast`, ...) is kernel-owned state we
+    // must not clobber at all; this is the second line of defense
+    // behind the directed-broadcast check above, driven by what the
+    // routing table actually holds rather than address arithmetic.
+    if let Some((kind, proto)) = existing_local_table_entry(&handle, addr).await? {
+        if kind != RouteType::Local {
+            return Err(AnyipError::RouteKindConflict { addr, kind });
+        }
         if proto != ANYIP_ROUTE_PROTOCOL {
             return Err(AnyipError::RouteContested { addr, proto });
         }
@@ -186,40 +212,63 @@ pub async fn remove_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
     }
 }
 
-/// The ifindex of whichever interface holds `addr`, if any. Both the
-/// `Address` and `Local` attributes are checked: point-to-point
+/// How `addr` collides with the host's interface addressing, if at
+/// all.
+enum AddrConflict {
+    /// Some interface holds the address itself.
+    Owned(u32),
+    /// The address is the directed broadcast of a subnet on this
+    /// interface. The kernel declares it via the `Broadcast` address
+    /// attribute, so no mask arithmetic is needed — and /31 and /32
+    /// subnets, which have no broadcast (RFC 3021), are handled for
+    /// free because the attribute is simply absent.
+    DirectedBroadcast(u32),
+}
+
+/// Walk the interface addresses once, checking `addr` against the
+/// `Address` and `Local` attributes (ownership — point-to-point
 /// interfaces carry the local address in `Local` with the peer in
-/// `Address`, and either shape means the address is owned.
-async fn owning_ifindex(handle: &Handle, addr: Ipv4Addr) -> Result<Option<u32>, AnyipError> {
+/// `Address`) and the `Broadcast` attribute (directed broadcast of a
+/// configured subnet, which `Ipv4Addr::is_broadcast()` cannot see:
+/// it only knows 255.255.255.255; review finding, PR #196).
+async fn address_conflict(
+    handle: &Handle,
+    addr: Ipv4Addr,
+) -> Result<Option<AddrConflict>, AnyipError> {
     let mut addrs = handle.address().get().execute();
     while let Some(msg) = addrs.try_next().await? {
-        let owned = msg.attributes.iter().any(|attr| {
-            matches!(
-                attr,
-                AddressAttribute::Address(IpAddr::V4(a)) | AddressAttribute::Local(IpAddr::V4(a))
-                    if *a == addr
-            )
-        });
-        if owned {
-            return Ok(Some(msg.header.index));
+        for attr in &msg.attributes {
+            match attr {
+                AddressAttribute::Address(IpAddr::V4(a))
+                | AddressAttribute::Local(IpAddr::V4(a))
+                    if *a == addr =>
+                {
+                    return Ok(Some(AddrConflict::Owned(msg.header.index)));
+                }
+                AddressAttribute::Broadcast(b) if *b == addr => {
+                    return Ok(Some(AddrConflict::DirectedBroadcast(msg.header.index)));
+                }
+                _ => {}
+            }
         }
     }
     Ok(None)
 }
 
-/// The protocol of an existing `local <addr>/32` in the local table,
-/// or `None` when no such route exists. This is the ownership probe:
-/// the caller compares the result against [`ANYIP_ROUTE_PROTOCOL`].
-async fn existing_local_route_protocol(
+/// The (kind, protocol) of an existing `<addr>/32` entry in the
+/// local table, or `None` when no such entry exists. This is the
+/// ownership probe: the caller adopts only `(Local,
+/// ANYIP_ROUTE_PROTOCOL)` and refuses everything else — a foreign
+/// `local` route, the kernel's own `broadcast` entry, or any other
+/// kind a replace would silently clobber.
+async fn existing_local_table_entry(
     handle: &Handle,
     addr: Ipv4Addr,
-) -> Result<Option<RouteProtocol>, AnyipError> {
+) -> Result<Option<(RouteType, RouteProtocol)>, AnyipError> {
     let filter = RouteMessageBuilder::<Ipv4Addr>::new().build();
     let mut routes = handle.route().get(filter).execute();
     while let Some(msg) = routes.try_next().await? {
-        if msg.header.kind != RouteType::Local
-            || msg.header.destination_prefix_length != 32
-            || u32::from(msg.header.table) != LOCAL_TABLE
+        if msg.header.destination_prefix_length != 32 || u32::from(msg.header.table) != LOCAL_TABLE
         {
             continue;
         }
@@ -230,7 +279,7 @@ async fn existing_local_route_protocol(
             )
         });
         if dst_matches {
-            return Ok(Some(msg.header.protocol));
+            return Ok(Some((msg.header.kind, msg.header.protocol)));
         }
     }
     Ok(None)
