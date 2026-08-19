@@ -18,6 +18,8 @@ pub mod types;
 pub mod integrity_status;
 
 #[cfg(target_os = "linux")]
+pub mod anyip;
+#[cfg(target_os = "linux")]
 pub mod controller;
 
 #[cfg(target_os = "linux")]

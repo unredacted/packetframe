@@ -639,6 +639,23 @@ pub enum RouteSourceSpec {
         /// real identity binding available in the absence of
         /// TCP-MD5 / TCP-AO.
         peer_ip: Option<std::net::IpAddr>,
+        /// When true, the controller installs a `local <addr>/32
+        /// dev lo` kernel route (AnyIP) before binding, and removes
+        /// it on shutdown. This makes a *phantom* listen address —
+        /// one no interface owns — bindable and locally deliverable.
+        ///
+        /// Exists for daemons that refuse to peer with an address
+        /// their host owns: FRR rejects `neighbor <addr>` for any
+        /// interface-owned address at config time ("Can not
+        /// configure the local system as neighbor") and cannot
+        /// complete a session over loopback (zebra treats 127/8 as
+        /// martian, so NHT never resolves and `nexthop_set` finds
+        /// no owning interface). The phantom address sidesteps both:
+        /// FRR sees an ordinary connected neighbor, packetframe
+        /// answers on it. Requires `allow-remote` (the address is
+        /// by definition not loopback) and is v4-only today, like
+        /// the router-id defaulting it composes with.
+        anyip: bool,
     },
 }
 
@@ -2588,11 +2605,16 @@ fn parse_route_source<'a>(
             let mut allow_remote = false;
             let mut peer_from: Vec<ipnet::IpNet> = Vec::new();
             let mut peer_ip: Option<std::net::IpAddr> = None;
+            let mut anyip = false;
             while let Some(key) = rest.next() {
                 // `allow-remote` is a no-value flag; everything
                 // else takes one argument.
                 if key == "allow-remote" {
                     allow_remote = true;
+                    continue;
+                }
+                if key == "anyip" {
+                    anyip = true;
                     continue;
                 }
                 let value = rest.next().ok_or_else(|| {
@@ -2648,7 +2670,7 @@ fn parse_route_source<'a>(
                         return Err(ConfigError::parse(
                             line,
                             format!(
-                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip)"
+                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip, anyip)"
                             ),
                         ));
                     }
@@ -2668,6 +2690,36 @@ fn parse_route_source<'a>(
                 !peer_from.is_empty(),
                 peer_ip.is_some(),
             )?;
+            // `anyip` describes a non-loopback phantom address, so it
+            // inherits allow-remote's obligations (a peer-from ACL on
+            // a routable listen). Checked after validate_listener_auth
+            // so the operator fixes auth-shape errors first and this
+            // one second, not interleaved.
+            if anyip && !allow_remote {
+                return Err(ConfigError::parse(
+                    line,
+                    "route-source bgp: `anyip` requires `allow-remote peer-from <cidr>` — \
+                     the phantom listen address is non-loopback by definition",
+                ));
+            }
+            if anyip {
+                let parsed = addr
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|e| {
+                        ConfigError::parse(
+                            line,
+                            format!("route-source bgp: bad listen address `{addr}`: {e}"),
+                        )
+                    })?;
+                if !parsed.is_ipv4() {
+                    return Err(ConfigError::parse(
+                        line,
+                        "route-source bgp: `anyip` supports IPv4 listen addresses only",
+                    ));
+                }
+            }
             Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bgp {
                 addr,
                 port,
@@ -2677,6 +2729,7 @@ fn parse_route_source<'a>(
                 allow_remote,
                 peer_from,
                 peer_ip,
+                anyip,
             }))
         }
         other => Err(ConfigError::parse(
@@ -4164,6 +4217,7 @@ module fast-path
                 allow_remote,
                 peer_from,
                 peer_ip,
+                anyip,
             } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 1179);
@@ -4173,6 +4227,7 @@ module fast-path
                 assert!(!allow_remote, "loopback default does not need opt-in");
                 assert!(peer_from.is_empty());
                 assert!(peer_ip.is_none());
+                assert!(!anyip, "anyip defaults off");
             }
             other => panic!("expected Bgp, got {other:?}"),
         }
@@ -4296,6 +4351,58 @@ module fast-path
                 assert_eq!(peer_from.len(), 2);
             }
             other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_parses() {
+        let s = "  route-source bgp 10.255.0.2:1179 local-as 401401 peer-as 401401 \
+                 allow-remote peer-from 10.255.0.1/32 anyip\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp {
+                addr,
+                allow_remote,
+                peer_from,
+                anyip,
+                ..
+            } => {
+                assert_eq!(addr, "10.255.0.2");
+                assert!(allow_remote);
+                assert_eq!(peer_from.len(), 1);
+                assert!(anyip);
+            }
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_without_allow_remote_errors() {
+        // `anyip` on a loopback listen is doubly wrong (a loopback
+        // address is never a phantom), and the allow-remote
+        // requirement is what rejects it.
+        let e = parse_module_body("  route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1 anyip\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("anyip"), "got: {message}");
+                assert!(message.contains("allow-remote"), "got: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_v6_listen_errors() {
+        let e = parse_module_body(
+            "  route-source bgp [2001:db8::2]:1179 local-as 1 peer-as 1 \
+             allow-remote peer-from 2001:db8::1/128 anyip\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("IPv4"), "got: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 

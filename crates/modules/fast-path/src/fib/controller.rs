@@ -76,6 +76,10 @@ pub enum RouteSourceConfig {
         /// accepted connection whose source IP differs is closed
         /// before the BGP OPEN exchange.
         expected_peer_ip: Option<IpAddr>,
+        /// Install a `local <listen>/32 dev lo` kernel route (AnyIP)
+        /// before binding, remove it on shutdown. See the `anyip`
+        /// module docs for the FRR pairing this exists for.
+        anyip: bool,
     },
 }
 
@@ -100,6 +104,8 @@ pub enum ControllerError {
     Runtime(#[from] std::io::Error),
     #[error("programmer setup failed: {0}")]
     Programmer(#[from] ProgrammerError),
+    #[error("anyip listen-address setup failed: {0}")]
+    Anyip(#[from] crate::fib::anyip::AnyipError),
 }
 
 pub struct RouteController {
@@ -123,6 +129,10 @@ pub struct RouteController {
     /// source, because the health surface says something different —
     /// "not attested by choice" versus "nothing to attest".
     authority_declared_none: bool,
+    /// `Some` when this controller installed an AnyIP local route for
+    /// the BGP listener; removed during `shutdown()` so the route's
+    /// lifetime never exceeds the daemon's.
+    anyip_addr: Option<Ipv4Addr>,
 }
 
 /// The external route feed and the authority the integrity checker
@@ -263,6 +273,7 @@ impl RouteController {
         // integrity checker spawns alongside any feed because both
         // depend on a live bird to cross-check against.
         let mut integrity: Option<SharedSnapshot> = None;
+        let mut anyip_installed: Option<Ipv4Addr> = None;
         match route_source {
             Some(RouteSourceConfig::Bmp {
                 listen,
@@ -353,6 +364,7 @@ impl RouteController {
                 router_id,
                 peer_acl,
                 expected_peer_ip,
+                anyip,
             }) => {
                 let snapshot = shared_snapshot();
                 // Spawn the checker only when a LOCAL authority is named.
@@ -381,6 +393,30 @@ impl RouteController {
                     tasks.push(runtime.spawn(async move { checker.run().await }));
                 }
 
+                // `anyip`: claim the phantom listen address before the
+                // first bind so a fresh start binds on attempt one
+                // instead of eating a backoff cycle. The ownership
+                // check inside `ensure_local_route` is the hard gate:
+                // an interface-owned address is an operator error the
+                // paired FRR would reject too, so attach fails loudly
+                // here rather than converging into a feed that can
+                // never establish (same shape as vpp-offload's
+                // refusal of a live loopback IP, #188).
+                let anyip_addr: Option<Ipv4Addr> = if anyip {
+                    let IpAddr::V4(a) = listen.ip() else {
+                        // Config parse rejects `anyip` on non-v4
+                        // listens; reaching here means the parser and
+                        // this code disagree, which is a bug, not an
+                        // operator error.
+                        unreachable!("config parser permits anyip on IPv4 listens only");
+                    };
+                    runtime.block_on(crate::fib::anyip::ensure_local_route(a))?;
+                    Some(a)
+                } else {
+                    None
+                };
+                anyip_installed = anyip_addr;
+
                 // v0.2.2: same retry-with-backoff pattern as BmpStation
                 // above. See that comment for rationale.
                 let mut cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
@@ -401,6 +437,17 @@ impl RouteController {
                 tasks.push(runtime.spawn(async move {
                     let mut backoff = LISTENER_BACKOFF_INITIAL;
                     loop {
+                        // Self-heal the AnyIP route on every listener
+                        // (re)start: a route flushed at runtime comes
+                        // back on the next retry instead of wedging
+                        // the feed until a daemon restart. Warn-only:
+                        // the bind below is the authoritative failure
+                        // signal and drives the same backoff.
+                        if let Some(a) = anyip_addr {
+                            if let Err(e) = crate::fib::anyip::ensure_local_route(a).await {
+                                warn!(error = %e, addr = %a, "anyip: re-ensure failed");
+                            }
+                        }
                         let listener = BgpListener::new(cfg.clone(), prog.clone(), shut.clone())
                             .with_stall_gate(stall.clone());
                         match listener.run().await {
@@ -468,6 +515,7 @@ impl RouteController {
                 integrity_authority,
                 packetframe_common::config::IntegrityAuthoritySpec::None
             ),
+            anyip_addr: anyip_installed,
         })
     }
 
@@ -515,6 +563,7 @@ impl RouteController {
     pub fn shutdown(mut self) {
         self.shutdown_token.cancel();
         if let Some(runtime) = self.runtime.take() {
+            let anyip_addr = self.anyip_addr.take();
             runtime.block_on(async {
                 for task in self.tasks.drain(..) {
                     match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
@@ -528,6 +577,15 @@ impl RouteController {
                                 SHUTDOWN_TIMEOUT.as_secs()
                             );
                         }
+                    }
+                }
+                // After the listener has drained: remove the AnyIP
+                // route this controller installed. Best-effort — an
+                // already-absent route is success — so shutdown never
+                // wedges on kernel state someone else cleaned up.
+                if let Some(a) = anyip_addr {
+                    if let Err(e) = crate::fib::anyip::remove_local_route(a).await {
+                        warn!(error = %e, addr = %a, "anyip: route removal failed during shutdown");
                     }
                 }
             });

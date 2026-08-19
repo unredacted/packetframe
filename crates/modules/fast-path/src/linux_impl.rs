@@ -1537,6 +1537,7 @@ pub fn attach(
                 router_id,
                 peer_from,
                 peer_ip,
+                anyip,
                 allow_remote: _,
             }) => {
                 let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
@@ -1555,6 +1556,7 @@ pub fn attach(
                     router_id: rid,
                     peer_acl: peer_from.clone(),
                     expected_peer_ip: *peer_ip,
+                    anyip: *anyip,
                 })
             }
             _ => None,
