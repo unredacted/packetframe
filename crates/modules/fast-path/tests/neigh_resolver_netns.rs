@@ -160,6 +160,23 @@ fn ns_run(netns: &str, cmd: &[&str]) {
     assert!(status.success(), "`ip {}` exited {status}", args.join(" "));
 }
 
+/// Like [`ns_run`] but captures stdout, for `ip neigh show` assertions.
+fn ns_capture(netns: &str, cmd: &[&str]) -> String {
+    let mut args = vec!["netns", "exec", netns];
+    args.extend_from_slice(cmd);
+    let out = Command::new("ip")
+        .args(&args)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn `ip {}`: {e}", args.join(" ")));
+    assert!(
+        out.status.success(),
+        "`ip {}` exited {}",
+        args.join(" "),
+        out.status
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Move the current thread into the netns and return the owned
 /// /var/run/netns/<name> fd. Dropping the fd after the test is fine
 /// the netns itself is torn down via `ip netns del` in NetnsGuard.
@@ -405,6 +422,95 @@ fn resolver_emits_gone_on_neigh_delete() {
             }
         }
         assert!(seen_gone, "expected NeighEvent::Gone for {expected_ip}");
+
+        shutdown.cancel();
+        drop(events_rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
+
+/// Regression: 2026-08-20 edge1-mci1 loopback poisoning. FRR's iBGP
+/// feed carries nexthops that are not neighbors at all — 0.0.0.0 for
+/// self-originated routes, and its update-source, an address the box
+/// itself owns. Both route-look-up to the loopback local route, and
+/// `issue_proactive_resolve` used to write `RTM_NEWNEIGH NUD_NONE`
+/// onto `lo` for them, replacing the kernel's implicit NUD_NOARP
+/// handling for that key: every subsequent locally-delivered packet
+/// to that address queued behind an ARP that can never resolve and
+/// was silently dropped (invisible to tcpdump — the drop is before
+/// the dev tap — and to `ip neigh show`, which hides NUD_NONE).
+///
+/// The guard: never probe an unspecified address, and only probe when
+/// the route lookup returns RTN_UNICAST. The control probe proves the
+/// guard didn't disable proactive resolve for real on-link nexthops.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn proactive_resolve_never_writes_loopback_neighbours() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    // lo up, so the local table has the exact shape of a real box
+    // (setup() leaves it down; the poison required live local routes).
+    ns_run(&names.netns, &["ip", "link", "set", "lo", "up"]);
+
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let (resolver, events_rx, resolve_handle) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver_task = tokio::spawn(resolver.run());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The two incident shapes, then a legitimate probe as control.
+        // None of the three is in the startup neigh dump, so all take
+        // the cache-miss path into issue_proactive_resolve.
+        resolve_handle.request_resolve(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        resolve_handle.request_resolve(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 254)));
+        resolve_handle.request_resolve(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)));
+
+        // Wait until the control probe materializes as a kernel
+        // neighbour entry on veth_a — `nud all` because the entry may
+        // still be in NONE/INCOMPLETE (nobody answers for .77).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let neigh = ns_capture(&netns, &["ip", "neigh", "show", "nud", "all"]);
+            if neigh
+                .lines()
+                .any(|l| l.starts_with("198.51.100.77 ") && l.contains(&veth_a))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control probe for 198.51.100.77 never created a neighbour entry \
+                 (guard too broad?); last dump:\n{neigh}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // With the control probe proven through, the incident shapes
+        // must have left the table — and `lo` — untouched.
+        let neigh = ns_capture(&netns, &["ip", "neigh", "show", "nud", "all"]);
+        for line in neigh.lines() {
+            assert!(
+                !line.contains(" dev lo "),
+                "proactive resolve wrote a loopback neighbour entry: {line}"
+            );
+            assert!(
+                !line.starts_with("0.0.0.0 "),
+                "proactive resolve probed the unspecified address: {line}"
+            );
+            assert!(
+                !line.starts_with("198.51.100.254 "),
+                "proactive resolve probed a box-owned address: {line}"
+            );
+        }
 
         shutdown.cancel();
         drop(events_rx);
