@@ -123,6 +123,51 @@ If the session is missing:
   bird hasn't logged a session-establishment failure: `journalctl
   -u bird | tail -50`
 
+### Feeding from FRR instead of bird (`anyip`)
+
+FRR cannot use the loopback pairing bird uses, for two reasons
+diagnosed on a live cutover (2026-08-19):
+
+- zebra treats 127/8 as martian: peer NHT never resolves (`show bgp
+  neighbor` reports `Last reset: ... No path to specified Neighbor`,
+  zero packets, zero log lines) and even with NHT satisfied,
+  `bgp_nexthop_set` finds no interface owning 127.0.0.1 and resets
+  the connection before OPEN.
+- FRR refuses `neighbor <addr>` for ANY address its host owns, at
+  config load: `% Can not configure the local system as neighbor`.
+
+So an FRR-fed packetframe listens on a **phantom address**: pick a
+small subnet on an interface that forwards nothing (a bridge with no
+member ports works), give FRR the gateway address, and point
+packetframe at the unused host address with `anyip`:
+
+```
+route-source bgp 10.255.0.2:1179 local-as 401401 peer-as 401401 \
+  allow-remote peer-from 10.255.0.1/32 anyip
+```
+
+`anyip` makes packetframe install `local 10.255.0.2/32 dev lo`
+(kernel AnyIP) before binding and remove it at shutdown, so the
+route's lifetime never exceeds the daemon's and no hand-installed
+kernel state is needed. The FRR side is an ordinary connected
+neighbor:
+
+```
+neighbor 10.255.0.2 remote-as <asn>
+neighbor 10.255.0.2 port 1179
+neighbor 10.255.0.2 update-source 10.255.0.1
+neighbor 10.255.0.2 timers connect 10
+```
+
+Startup refuses an `anyip` address some interface already owns —
+that shape can never establish (FRR would reject the neighbor), so
+failing attach loudly beats converging into a dead feed. Session
+liveness checks are the FRR flavors of the bird ones above:
+`vtysh -c 'show bgp neighbor 10.255.0.2'` should report Established,
+and `ss -Htnp state established "( sport = :1179 )"` one line.
+Remember `integrity-authority none` — there is no birdc to
+cross-check against and the default would fail blind every 300 s.
+
 ### Is a specific prefix forwarding through custom-fib?
 
 ```sh

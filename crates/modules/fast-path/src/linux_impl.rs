@@ -608,6 +608,17 @@ pub struct ActiveState {
     /// it a reload that changes the authority returns OK and changes
     /// nothing — the checker keeps using the old one (review finding).
     pub integrity_authority: packetframe_common::config::IntegrityAuthoritySpec,
+    /// The `route-source` in force, as attach parsed it (`None` when
+    /// no feed is configured). Retained for the same reason
+    /// `integrity_authority` is: the spec is consumed once when the
+    /// `RouteController` is built, so a SIGHUP that edits it — the
+    /// listen address, the ASNs, `anyip` — has nothing to compare
+    /// against unless the attach-time answer is kept. Without this a
+    /// reload changing `anyip` returned OK while the reconcile task
+    /// kept recreating the old route and shutdown still deleted it:
+    /// accepted config contradicting live kernel state (review
+    /// finding, PR #196).
+    pub route_source_spec: Option<packetframe_common::config::RouteSourceSpec>,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -727,6 +738,118 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         route_controller: None,
         attach_settle_time: cfg.global.attach_settle_time,
         integrity_authority: integrity_authority_from_cfg(cfg),
+        route_source_spec: route_source_spec_from_cfg(cfg),
+    })
+}
+
+/// The anyip phantom address, when `route-source bgp ... anyip` is
+/// configured. Selects the FIRST `route-source` directive — the same
+/// one every other consumer selects — and answers for it alone; the
+/// parser rejects duplicates, so first-vs-matching can no longer
+/// diverge, but this helper must not be the place that reintroduces
+/// the split if that ever changes. Config validation guarantees the
+/// address parses as concrete-unicast IPv4, so a parse failure here
+/// is a parser/coder disagreement, not an operator error.
+fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
+    cfg.section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::RouteSource(spec) => Some(spec),
+            _ => None,
+        })
+        .and_then(|spec| match spec {
+            packetframe_common::config::RouteSourceSpec::Bgp {
+                addr, anyip: true, ..
+            } => Some(
+                addr.parse::<std::net::Ipv4Addr>()
+                    .expect("config parser permits anyip on concrete IPv4 listens only"),
+            ),
+            _ => None,
+        })
+}
+
+/// Advisory exclusive lock serializing the anyip preflight and the
+/// unwind window across concurrent `packetframe run` invocations.
+/// Blocking by design: the loser of a double-start race waits out
+/// the winner's attach (bounded by settle times), then proceeds to
+/// adopt-and-fail cleanly on the winner's pins. The lock file lives
+/// in the state dir beside the pid file; flock is per-open-file, so
+/// dropping the returned handle releases it on every exit path.
+fn acquire_anyip_lock(state_dir: &Path) -> ModuleResult<std::fs::File> {
+    std::fs::create_dir_all(state_dir).map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("anyip lock: create {}: {e}", state_dir.display()),
+        )
+    })?;
+    let path = state_dir.join("anyip.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| {
+            ModuleError::other(
+                MODULE_NAME,
+                format!("anyip lock: open {}: {e}", path.display()),
+            )
+        })?;
+    // SAFETY: valid fd from the just-opened File; flock has no other
+    // preconditions.
+    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            format!(
+                "anyip lock: flock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(f)
+}
+
+/// Removes the anyip route if `attach` unwinds between the preflight
+/// install and the `RouteController` taking ownership. Disarmed on
+/// success; a disarmed guard's Drop is a no-op. Best-effort removal:
+/// the unwind path is already reporting the real error, and a
+/// leftover tagged route is adopted by the next successful start
+/// anyway — this just keeps kernel state from outliving the failed
+/// attach in the common case.
+struct AnyipUnwindGuard {
+    addr: Option<std::net::Ipv4Addr>,
+}
+
+impl AnyipUnwindGuard {
+    fn new(addr: Option<std::net::Ipv4Addr>) -> Self {
+        Self { addr }
+    }
+    fn disarm(&mut self) {
+        self.addr = None;
+    }
+}
+
+impl Drop for AnyipUnwindGuard {
+    fn drop(&mut self) {
+        if let Some(addr) = self.addr.take() {
+            if let Err(e) = crate::fib::anyip::remove_local_route_blocking(addr) {
+                warn!(error = %e, %addr, "anyip: unwind removal failed after attach error");
+            }
+        }
+    }
+}
+
+/// The `route-source` directive as written, if any. Shared by `load`
+/// (records the attach-time answer) and reconcile's restart-only
+/// guard (compares a SIGHUP's answer against it).
+pub fn route_source_spec_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> Option<packetframe_common::config::RouteSourceSpec> {
+    cfg.section.directives.iter().find_map(|d| match d {
+        ModuleDirective::RouteSource(spec) => Some(spec.clone()),
+        _ => None,
     })
 }
 
@@ -1212,6 +1335,57 @@ pub fn attach(
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
 ) -> ModuleResult<Vec<Attachment>> {
+    // `anyip` preflight FIRST, before anything attaches or pins: the
+    // refusals inside it (interface-owned address, directed
+    // broadcast, contested route) are operator errors that must not
+    // cost a `detach --all`. When they fired inside
+    // `RouteController::start` — after the per-iface loop and
+    // `pin_program_and_maps` — the failed attach left orphaned pins
+    // and the next start was refused until a manual detach: the
+    // exact crash-loop §8.5's pin persistence is NOT meant to cause
+    // (review finding, PR #196). The guard covers the window between
+    // here and controller ownership: any later attach failure
+    // removes the route on unwind, so no kernel state outlives a
+    // failed attach either.
+    // ... and only in the modes that will start a RouteController:
+    // under kernel-fib a route-source is dormant by design, so
+    // installing (then unwinding) the route would be pure noise, and
+    // failing attach on an address conflict would fail a mode the
+    // conflict cannot affect.
+    // Declared BEFORE the guard so it drops AFTER it: any unwind
+    // removal happens while the lock is still held.
+    let mut _anyip_lock: Option<std::fs::File> = None;
+    let mut anyip_guard = AnyipUnwindGuard::new(None);
+    if matches!(
+        forwarding_mode_from_cfg(cfg),
+        packetframe_common::config::ForwardingMode::CustomFib
+            | packetframe_common::config::ForwardingMode::Compare
+    ) {
+        if let Some(addr) = anyip_addr_from_cfg(cfg) {
+            // Serialize preflight→ownership across concurrent starts.
+            // Created-vs-Adopted alone cannot transfer ownership
+            // atomically: two clean starts could both preflight
+            // before either pins, the loser's unwind then deleting
+            // the route the winner is serving (review finding,
+            // PR #196). Under the flock — held for the rest of
+            // attach — the second start observes the first's
+            // completed route as Adopted and never arms deletion.
+            _anyip_lock = Some(acquire_anyip_lock(&state.state_dir)?);
+            let outcome = crate::fib::anyip::ensure_local_route_blocking(addr)
+                .map_err(|e| ModuleError::other(MODULE_NAME, format!("anyip preflight: {e}")))?;
+            // Arm the unwind only for a route THIS attach created. An
+            // adopted route may be serving a concurrently running
+            // daemon (e.g. a second `run` that will fail on the first
+            // one's pins moments from now) — unwinding it would break
+            // that daemon's live feed until its reconciler heals it
+            // (review finding, PR #196). An adopted-then-failed attach
+            // leaves the route exactly as orphaned as it found it.
+            if outcome == crate::fib::anyip::EnsureOutcome::Created {
+                anyip_guard = AnyipUnwindGuard::new(Some(addr));
+            }
+        }
+    }
+
     // v0.2.5: load `finalize` first so its FD is available for the
     // MUTATION_PROGS[0] population below. Order matters: fast_path's
     // tail_call into MUTATION_PROGS[0] must succeed on every packet
@@ -1537,6 +1711,7 @@ pub fn attach(
                 router_id,
                 peer_from,
                 peer_ip,
+                anyip,
                 allow_remote: _,
             }) => {
                 let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
@@ -1555,6 +1730,7 @@ pub fn attach(
                     router_id: rid,
                     peer_acl: peer_from.clone(),
                     expected_peer_ip: *peer_ip,
+                    anyip: *anyip,
                 })
             }
             _ => None,
@@ -1694,6 +1870,9 @@ pub fn attach(
             info!("fib-cache enabled (destination cache in front of the FIB LPM)");
         }
         state.route_controller = Some(ctrl);
+        // The controller owns the anyip route from here (its
+        // shutdown/Drop removes it); the attach-scope guard must not.
+        anyip_guard.disarm();
         info!(
             ?forwarding,
             "RouteController started (NeighborResolver + FibProgrammer active)"
@@ -2065,7 +2244,9 @@ fn populate_mutation_progs(ebpf: &mut Ebpf) -> ModuleResult<()> {
 }
 
 /// The parsed `forwarding-mode` directive (default `kernel-fib`).
-fn forwarding_mode_from_cfg(cfg: &ModuleConfig<'_>) -> packetframe_common::config::ForwardingMode {
+pub(crate) fn forwarding_mode_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> packetframe_common::config::ForwardingMode {
     cfg.section
         .directives
         .iter()
@@ -3491,6 +3672,7 @@ mod tests {
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::Birdc {
                 path: None,
             },
+            route_source_spec: None,
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();

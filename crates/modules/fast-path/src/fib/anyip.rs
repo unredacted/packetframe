@@ -1,0 +1,338 @@
+//! AnyIP phantom-listen support for `route-source bgp ... anyip`.
+//!
+//! Some routing daemons refuse to peer with any address their host
+//! owns: FRR rejects `neighbor <addr>` for every interface-owned
+//! address at config time ("Can not configure the local system as
+//! neighbor"), and cannot complete a session over loopback either
+//! (zebra treats 127/8 as martian, so peer NHT never resolves and
+//! `bgp_nexthop_set` finds no owning interface). bird has neither
+//! restriction, which is why the BgpListener's loopback default was
+//! sufficient until an FRR deployment appeared.
+//!
+//! The escape hatch is the kernel's AnyIP mechanism: a route of type
+//! `local` makes its destination bindable and locally deliverable
+//! without assigning the address to any interface. From FRR's view
+//! the phantom address is an ordinary connected neighbor; from the
+//! kernel's view packets to it are local traffic; from every other
+//! host's view it doesn't exist (the /32 lives only in this box's
+//! `local` table).
+//!
+//! This module owns exactly that one route. The controller calls
+//! [`ensure_local_route`] before the listener's first bind, before
+//! each listener retry, and on a periodic reconcile tick — the last
+//! because a *bound* listener emits no error when the route is
+//! flushed (SYNs silently stop being delivered; review finding,
+//! PR #196), so only time-based replacement can heal that case.
+//! Replace semantics make every call idempotent. The controller
+//! calls [`remove_local_route`] during explicit shutdown AND from
+//! its `Drop` impl — the latter because the §8.5 preserve-attach
+//! exit (the normal `systemctl stop`) drops the controller without
+//! ever calling `shutdown()` — so the route's lifetime is a strict
+//! subset of the daemon's on every exit path short of SIGKILL — no kernel
+//! state survives that a restart doesn't recreate, which is the
+//! property that lets the operator's config file remain the single
+//! source of truth on fleets where hand-installed routes are
+//! prohibited (they don't survive firmware upgrades).
+//!
+//! [`ensure_local_route`] refuses an address some interface already
+//! owns, for the same reason the vpp-offload loader refuses a live
+//! loopback IP (#188): an owned address means the operator pointed
+//! `anyip` at a real interface address, and FRR would reject the
+//! neighbor outright — better to fail attach loudly than converge
+//! into a feed that can never establish. It likewise refuses a
+//! same-destination local route installed by anything else: routes
+//! we install wear [`ANYIP_ROUTE_PROTOCOL`] as an ownership tag, so
+//! a crash-orphaned route from a previous daemon life is adopted
+//! silently while a foreign owner's route is neither replaced at
+//! startup nor deletable at shutdown (the kernel's protocol-scoped
+//! delete cannot match it).
+
+#![cfg(target_os = "linux")]
+
+use std::net::{IpAddr, Ipv4Addr};
+
+use futures::TryStreamExt;
+use netlink_packet_route::address::AddressAttribute;
+use netlink_packet_route::route::{
+    RouteAddress, RouteAttribute, RouteProtocol, RouteScope, RouteType,
+};
+use rtnetlink::{Handle, RouteMessageBuilder};
+use tracing::info;
+
+/// The kernel's `local` routing table, where type-`local` routes
+/// conventionally live (`ip route show table local`).
+const LOCAL_TABLE: u32 = 255;
+
+/// The route-protocol value that marks the AnyIP route as OURS.
+///
+/// This is the ownership tag that makes three behaviors possible at
+/// once (review finding, PR #196):
+/// - crash adoption: a route left behind by a SIGKILL'd daemon wears
+///   the tag, so the next start adopts it silently instead of
+///   refusing its own leftovers;
+/// - contested refusal: a `local <addr>/32` installed by anything
+///   else does NOT wear it, so [`ensure_local_route`] refuses rather
+///   than silently replacing another owner's route;
+/// - scoped delete: `RTM_DELROUTE` with a nonzero protocol only
+///   matches routes carrying that protocol, so shutdown removal is
+///   structurally unable to delete a route we don't own.
+///
+/// 199 is unassigned in iproute2's `rt_protos` (186 bgp, 187 isis,
+/// 188 ospf, 189 rip, 192 eigrp are the neighbors); `ip route show
+/// table local` renders it as `proto 199`.
+const ANYIP_ROUTE_PROTOCOL: RouteProtocol = RouteProtocol::Other(199);
+
+#[derive(Debug, thiserror::Error)]
+pub enum AnyipError {
+    #[error("netlink connection failed: {0}")]
+    Connection(#[from] std::io::Error),
+    #[error("netlink request failed: {0}")]
+    Request(#[from] rtnetlink::Error),
+    #[error(
+        "anyip address {addr} is already owned by interface index {ifindex}; \
+         a phantom listen address must not be assigned to any interface \
+         (FRR refuses interface-owned addresses as neighbors — pick an \
+         unassigned address, e.g. the unused host in the feed /30)"
+    )]
+    AddressOwned { addr: Ipv4Addr, ifindex: u32 },
+    #[error("interface `lo` not found via RTM_GETLINK")]
+    NoLoopbackIface,
+    #[error(
+        "a `local {addr}/32` route already exists with protocol {proto:?}, \
+         installed by something other than packetframe; refusing to adopt \
+         or replace it — the anyip address must be exclusively ours \
+         (pick a different phantom address, or remove the foreign route's \
+         owner first)"
+    )]
+    RouteContested {
+        addr: Ipv4Addr,
+        proto: RouteProtocol,
+    },
+    #[error(
+        "anyip address {addr} is the directed broadcast of a subnet on \
+         interface index {ifindex}; the kernel owns a broadcast route for \
+         it that a local /32 would clobber (in a /30 feed subnet the usable \
+         phantom is the OTHER host address, not .3)"
+    )]
+    DirectedBroadcast { addr: Ipv4Addr, ifindex: u32 },
+    #[error(
+        "a {kind:?} route for {addr}/32 already exists in the local table; \
+         refusing to replace a kernel-owned entry with an anyip local route"
+    )]
+    RouteKindConflict { addr: Ipv4Addr, kind: RouteType },
+}
+
+/// Whether [`ensure_local_route`] created the route or adopted one a
+/// previous daemon life left behind. Callers that clean up on
+/// failure must only clean up what they CREATED: unwinding an
+/// adopted route can yank it out from under a concurrently running
+/// daemon that owns it (review finding, PR #196).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    Created,
+    Adopted,
+}
+
+/// Ensure `local <addr>/32 dev lo` exists in the `local` table.
+///
+/// Idempotent (`NLM_F_REPLACE`), so the controller can call it before
+/// every listener (re)start: a route someone flushed at runtime is
+/// healed on the next retry rather than requiring a daemon restart.
+/// Reports whether the route was [`EnsureOutcome::Created`] fresh or
+/// [`EnsureOutcome::Adopted`] from a previous daemon life.
+///
+/// Fails with [`AnyipError::AddressOwned`] if any interface holds
+/// `addr` — see the module docs for why that is a hard refusal.
+pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
+    let (conn, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(conn);
+
+    match address_conflict(&handle, addr).await? {
+        Some(AddrConflict::Owned(ifindex)) => {
+            return Err(AnyipError::AddressOwned { addr, ifindex });
+        }
+        Some(AddrConflict::DirectedBroadcast(ifindex)) => {
+            return Err(AnyipError::DirectedBroadcast { addr, ifindex });
+        }
+        None => {}
+    }
+    // A pre-existing table-local entry for this /32 is adopted only
+    // when it is a `local` route wearing our protocol tag (a previous
+    // daemon life). A foreign-protocol local route means another
+    // owner got here first — replacing it now means deleting it at
+    // our shutdown later. A non-`local` kind (the kernel's own
+    // `broadcast` entry, an `anycast`, ...) is kernel-owned state we
+    // must not clobber at all; this is the second line of defense
+    // behind the directed-broadcast check above, driven by what the
+    // routing table actually holds rather than address arithmetic.
+    let mut outcome = EnsureOutcome::Created;
+    if let Some((kind, proto)) = existing_local_table_entry(&handle, addr).await? {
+        if kind != RouteType::Local {
+            return Err(AnyipError::RouteKindConflict { addr, kind });
+        }
+        if proto != ANYIP_ROUTE_PROTOCOL {
+            return Err(AnyipError::RouteContested { addr, proto });
+        }
+        outcome = EnsureOutcome::Adopted;
+    }
+
+    let lo = lo_ifindex(&handle).await?;
+    let route = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(addr, 32)
+        .output_interface(lo)
+        .table_id(LOCAL_TABLE)
+        .scope(RouteScope::Host)
+        .kind(RouteType::Local)
+        .protocol(ANYIP_ROUTE_PROTOCOL)
+        .build();
+    handle.route().add(route).replace().execute().await?;
+    info!(%addr, ?outcome, "anyip: local /32 ensured on lo (kernel AnyIP)");
+    Ok(outcome)
+}
+
+/// Remove the route [`ensure_local_route`] installed. Best-effort by
+/// contract: an already-absent route is success, not an error, so
+/// shutdown never fails on a route someone else already cleaned up.
+///
+/// The delete carries [`ANYIP_ROUTE_PROTOCOL`]; the kernel only
+/// matches routes with that protocol, so a same-destination route
+/// owned by anything else is unreachable from here — it survives as
+/// an ESRCH, which the tolerant arm below reports as success.
+pub async fn remove_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
+    let (conn, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(conn);
+
+    let lo = lo_ifindex(&handle).await?;
+    let route = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(addr, 32)
+        .output_interface(lo)
+        .table_id(LOCAL_TABLE)
+        .scope(RouteScope::Host)
+        .kind(RouteType::Local)
+        .protocol(ANYIP_ROUTE_PROTOCOL)
+        .build();
+    match handle.route().del(route).execute().await {
+        Ok(()) => {
+            info!(%addr, "anyip: local /32 removed");
+            Ok(())
+        }
+        // ESRCH/ENOENT: the route is already gone. That is the state
+        // we wanted; report success.
+        Err(rtnetlink::Error::NetlinkError(e))
+            if e.raw_code() == -libc::ESRCH || e.raw_code() == -libc::ENOENT =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// How `addr` collides with the host's interface addressing, if at
+/// all.
+enum AddrConflict {
+    /// Some interface holds the address itself.
+    Owned(u32),
+    /// The address is the directed broadcast of a subnet on this
+    /// interface. The kernel declares it via the `Broadcast` address
+    /// attribute, so no mask arithmetic is needed — and /31 and /32
+    /// subnets, which have no broadcast (RFC 3021), are handled for
+    /// free because the attribute is simply absent.
+    DirectedBroadcast(u32),
+}
+
+/// Walk the interface addresses once, checking `addr` against the
+/// `Address` and `Local` attributes (ownership — point-to-point
+/// interfaces carry the local address in `Local` with the peer in
+/// `Address`) and the `Broadcast` attribute (directed broadcast of a
+/// configured subnet, which `Ipv4Addr::is_broadcast()` cannot see:
+/// it only knows 255.255.255.255; review finding, PR #196).
+async fn address_conflict(
+    handle: &Handle,
+    addr: Ipv4Addr,
+) -> Result<Option<AddrConflict>, AnyipError> {
+    let mut addrs = handle.address().get().execute();
+    while let Some(msg) = addrs.try_next().await? {
+        for attr in &msg.attributes {
+            match attr {
+                AddressAttribute::Address(IpAddr::V4(a))
+                | AddressAttribute::Local(IpAddr::V4(a))
+                    if *a == addr =>
+                {
+                    return Ok(Some(AddrConflict::Owned(msg.header.index)));
+                }
+                AddressAttribute::Broadcast(b) if *b == addr => {
+                    return Ok(Some(AddrConflict::DirectedBroadcast(msg.header.index)));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The (kind, protocol) of an existing `<addr>/32` entry in the
+/// local table, or `None` when no such entry exists. This is the
+/// ownership probe: the caller adopts only `(Local,
+/// ANYIP_ROUTE_PROTOCOL)` and refuses everything else — a foreign
+/// `local` route, the kernel's own `broadcast` entry, or any other
+/// kind a replace would silently clobber.
+async fn existing_local_table_entry(
+    handle: &Handle,
+    addr: Ipv4Addr,
+) -> Result<Option<(RouteType, RouteProtocol)>, AnyipError> {
+    // Destination-less GetRoute is an NLM_F_DUMP; without a table
+    // filter the kernel exports the ENTIRE v4 FIB — on a full-table
+    // edge that is 1M+ routes serialized and scanned every 30 s
+    // reconcile tick just to check one /32 (review finding, PR
+    // #196). Setting the header's table field makes 4.20+ kernels
+    // filter the dump to table local (hundreds of entries); the
+    // userspace re-check below keeps correctness on anything that
+    // ignores the filter.
+    let filter = RouteMessageBuilder::<Ipv4Addr>::new()
+        .table_id(LOCAL_TABLE)
+        .build();
+    let mut routes = handle.route().get(filter).execute();
+    while let Some(msg) = routes.try_next().await? {
+        if msg.header.destination_prefix_length != 32 || u32::from(msg.header.table) != LOCAL_TABLE
+        {
+            continue;
+        }
+        let dst_matches = msg.attributes.iter().any(|attr| {
+            matches!(
+                attr,
+                RouteAttribute::Destination(RouteAddress::Inet(a)) if *a == addr
+            )
+        });
+        if dst_matches {
+            return Ok(Some((msg.header.kind, msg.header.protocol)));
+        }
+    }
+    Ok(None)
+}
+
+/// Blocking wrappers for callers without a live tokio runtime: the
+/// attach preflight (a sync path that runs before the controller's
+/// runtime exists) and unwind/Drop cleanup. Each builds a throwaway
+/// current-thread runtime; both sites are cold one-shots.
+pub fn ensure_local_route_blocking(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(ensure_local_route(addr))
+}
+
+/// See [`ensure_local_route_blocking`].
+pub fn remove_local_route_blocking(addr: Ipv4Addr) -> Result<(), AnyipError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(remove_local_route(addr))
+}
+
+async fn lo_ifindex(handle: &Handle) -> Result<u32, AnyipError> {
+    let mut links = handle.link().get().match_name("lo".to_string()).execute();
+    match links.try_next().await? {
+        Some(link) => Ok(link.header.index),
+        None => Err(AnyipError::NoLoopbackIface),
+    }
+}

@@ -639,6 +639,23 @@ pub enum RouteSourceSpec {
         /// real identity binding available in the absence of
         /// TCP-MD5 / TCP-AO.
         peer_ip: Option<std::net::IpAddr>,
+        /// When true, the controller installs a `local <addr>/32
+        /// dev lo` kernel route (AnyIP) before binding, and removes
+        /// it on shutdown. This makes a *phantom* listen address —
+        /// one no interface owns — bindable and locally deliverable.
+        ///
+        /// Exists for daemons that refuse to peer with an address
+        /// their host owns: FRR rejects `neighbor <addr>` for any
+        /// interface-owned address at config time ("Can not
+        /// configure the local system as neighbor") and cannot
+        /// complete a session over loopback (zebra treats 127/8 as
+        /// martian, so NHT never resolves and `nexthop_set` finds
+        /// no owning interface). The phantom address sidesteps both:
+        /// FRR sees an ordinary connected neighbor, packetframe
+        /// answers on it. Requires `allow-remote` (the address is
+        /// by definition not loopback) and is v4-only today, like
+        /// the router-id defaulting it composes with.
+        anyip: bool,
     },
 }
 
@@ -1656,6 +1673,25 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
                 }
                 Cursor::Module(i) => {
                     let d = parse_module_directive(line, stripped)?;
+                    // The controller spawns at most one route source
+                    // and every consumer selects "the first" — a
+                    // second directive could silently diverge from
+                    // the first (the anyip preflight vs the
+                    // controller's selection, review finding on
+                    // PR #196). The runbook has always said "exactly
+                    // one route-source"; now the parser does too.
+                    if matches!(d, ModuleDirective::RouteSource(_))
+                        && modules[i]
+                            .directives
+                            .iter()
+                            .any(|e| matches!(e, ModuleDirective::RouteSource(_)))
+                    {
+                        return Err(ConfigError::parse(
+                            line,
+                            "duplicate `route-source` in one module section; exactly one \
+                             feed is supported per module",
+                        ));
+                    }
                     modules[i].directives.push(d);
                 }
             },
@@ -2588,11 +2624,16 @@ fn parse_route_source<'a>(
             let mut allow_remote = false;
             let mut peer_from: Vec<ipnet::IpNet> = Vec::new();
             let mut peer_ip: Option<std::net::IpAddr> = None;
+            let mut anyip = false;
             while let Some(key) = rest.next() {
                 // `allow-remote` is a no-value flag; everything
                 // else takes one argument.
                 if key == "allow-remote" {
                     allow_remote = true;
+                    continue;
+                }
+                if key == "anyip" {
+                    anyip = true;
                     continue;
                 }
                 let value = rest.next().ok_or_else(|| {
@@ -2648,7 +2689,7 @@ fn parse_route_source<'a>(
                         return Err(ConfigError::parse(
                             line,
                             format!(
-                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip)"
+                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip, anyip)"
                             ),
                         ));
                     }
@@ -2668,6 +2709,51 @@ fn parse_route_source<'a>(
                 !peer_from.is_empty(),
                 peer_ip.is_some(),
             )?;
+            // `anyip` describes a non-loopback phantom address, so it
+            // inherits allow-remote's obligations (a peer-from ACL on
+            // a routable listen). Checked after validate_listener_auth
+            // so the operator fixes auth-shape errors first and this
+            // one second, not interleaved.
+            if anyip && !allow_remote {
+                return Err(ConfigError::parse(
+                    line,
+                    "route-source bgp: `anyip` requires `allow-remote peer-from <cidr>` — \
+                     the phantom listen address is non-loopback by definition",
+                ));
+            }
+            if anyip {
+                let parsed = addr
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|e| {
+                        ConfigError::parse(
+                            line,
+                            format!("route-source bgp: bad listen address `{addr}`: {e}"),
+                        )
+                    })?;
+                let std::net::IpAddr::V4(v4) = parsed else {
+                    return Err(ConfigError::parse(
+                        line,
+                        "route-source bgp: `anyip` supports IPv4 listen addresses only",
+                    ));
+                };
+                // A phantom must be a concrete unicast host: the
+                // wildcard would install a meaningless `local
+                // 0.0.0.0/32` while binding every interface, and
+                // multicast/broadcast can never act as an FRR
+                // neighbor — the listener would retry forever.
+                if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!(
+                            "route-source bgp: `anyip` requires a concrete unicast listen \
+                             address, got `{v4}` (unspecified/multicast/broadcast cannot \
+                             be a phantom neighbor)"
+                        ),
+                    ));
+                }
+            }
             Ok(ModuleDirective::RouteSource(RouteSourceSpec::Bgp {
                 addr,
                 port,
@@ -2677,6 +2763,7 @@ fn parse_route_source<'a>(
                 allow_remote,
                 peer_from,
                 peer_ip,
+                anyip,
             }))
         }
         other => Err(ConfigError::parse(
@@ -2801,6 +2888,23 @@ fn parse_endpoint(
             format!("route-source {kind_label}: bad port `{port_str}`: {e}"),
         )
     })?;
+    // Brackets are IPv6 endpoint syntax. A bracketed IPv4 —
+    // `[10.255.0.2]:1179` — passed every validation (they all strip
+    // brackets) but reached consumers with the brackets stored:
+    // SocketAddr parsing silently dropped the feed, and the anyip
+    // preflight panicked on an addr its own validator had accepted
+    // (review finding, PR #196). Reject the shape by name instead.
+    if let Some(inner) = addr.strip_prefix('[').and_then(|a| a.strip_suffix(']')) {
+        if inner.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-source {kind_label}: `{addr}` is a bracketed IPv4 address; \
+                     brackets are IPv6 syntax — write `{inner}:{port}`"
+                ),
+            ));
+        }
+    }
     Ok((addr.to_string(), port))
 }
 
@@ -4164,6 +4268,7 @@ module fast-path
                 allow_remote,
                 peer_from,
                 peer_ip,
+                anyip,
             } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 1179);
@@ -4173,6 +4278,7 @@ module fast-path
                 assert!(!allow_remote, "loopback default does not need opt-in");
                 assert!(peer_from.is_empty());
                 assert!(peer_ip.is_none());
+                assert!(!anyip, "anyip defaults off");
             }
             other => panic!("expected Bgp, got {other:?}"),
         }
@@ -4296,6 +4402,105 @@ module fast-path
                 assert_eq!(peer_from.len(), 2);
             }
             other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bracketed_ipv4_rejected() {
+        let e = parse_module_body("  route-source bgp [10.255.0.2]:1179 local-as 1 peer-as 1\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("bracketed IPv4"), "got: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_route_source_rejected() {
+        let e = parse_module_body(
+            "  route-source bmp 127.0.0.1:6543 require-loc-rib\n  \
+             route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(
+                    message.contains("duplicate `route-source`"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_parses() {
+        let s = "  route-source bgp 10.255.0.2:1179 local-as 401401 peer-as 401401 \
+                 allow-remote peer-from 10.255.0.1/32 anyip\n";
+        match extract_route_source(s) {
+            RouteSourceSpec::Bgp {
+                addr,
+                allow_remote,
+                peer_from,
+                anyip,
+                ..
+            } => {
+                assert_eq!(addr, "10.255.0.2");
+                assert!(allow_remote);
+                assert_eq!(peer_from.len(), 1);
+                assert!(anyip);
+            }
+            other => panic!("expected Bgp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_without_allow_remote_errors() {
+        // `anyip` on a loopback listen is doubly wrong (a loopback
+        // address is never a phantom), and the allow-remote
+        // requirement is what rejects it.
+        let e = parse_module_body("  route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1 anyip\n")
+            .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("anyip"), "got: {message}");
+                assert!(message.contains("allow-remote"), "got: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_non_unicast_listen_errors() {
+        for addr in ["0.0.0.0", "224.0.0.9", "255.255.255.255"] {
+            let e = parse_module_body(&format!(
+                "  route-source bgp {addr}:1179 local-as 1 peer-as 1 \
+                 allow-remote peer-from 10.0.0.1/32 anyip\n"
+            ))
+            .unwrap_err();
+            match e {
+                ConfigError::Parse { message, .. } => {
+                    assert!(message.contains("unicast"), "addr {addr}: got {message}");
+                }
+                other => panic!("expected Parse for {addr}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn route_source_bgp_anyip_v6_listen_errors() {
+        let e = parse_module_body(
+            "  route-source bgp [2001:db8::2]:1179 local-as 1 peer-as 1 \
+             allow-remote peer-from 2001:db8::1/128 anyip\n",
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Parse { message, .. } => {
+                assert!(message.contains("IPv4"), "got: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 
