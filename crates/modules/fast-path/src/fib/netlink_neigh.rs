@@ -35,7 +35,7 @@ use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{
     link::{LinkAttribute, LinkMessage},
     neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState},
-    route::RouteAttribute,
+    route::{RouteAttribute, RouteType},
     AddressFamily, RouteNetlinkMessage,
 };
 use rtnetlink::{
@@ -1369,6 +1369,15 @@ impl NetlinkNeighborResolver {
 /// the only cost of a proactive-resolve failure is one-packet latency
 /// on first forward.
 async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
+    // An unspecified nexthop (0.0.0.0 / ::) means "the route is
+    // self-originated" in every BGP dialect that emits it (FRR does,
+    // for locally-originated networks over iBGP). There is no
+    // neighbor to resolve, and the route lookup below would resolve
+    // it to the loopback local route — see the RTN_UNICAST guard.
+    if ip.is_unspecified() {
+        debug!(?ip, "proactive resolve: unspecified nexthop; skipping");
+        return;
+    }
     let (oif, plen) = match ip {
         IpAddr::V4(v4) => {
             let req = RouteMessageBuilder::<IpAddr>::new()
@@ -1417,6 +1426,17 @@ async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
 /// first route returned. Kernel answers via a stream; we only care
 /// about the first entry, subsequent entries for multipath routes
 /// are handled at the programmer level via ECMP groups.
+///
+/// Only an `RTN_UNICAST` result qualifies. Any other kind — local,
+/// broadcast, anycast — means the "nexthop" is an address this box
+/// itself answers for, so there is no neighbor to resolve and the
+/// OIF the kernel reports is `lo`. Writing an `RTM_NEWNEIGH
+/// NUD_NONE` there is not merely useless: it replaces the kernel's
+/// implicit NUD_NOARP handling for that key on the loopback device,
+/// queueing all subsequent local delivery for that address behind an
+/// ARP that can never resolve (2026-08-20 edge1-mci1 incident — the
+/// FRR feed carries nexthop 0.0.0.0 / update-source for
+/// self-originated routes, and each probe of one poisoned `lo`).
 async fn lookup_oif(
     handle: &Handle,
     msg: netlink_packet_route::route::RouteMessage,
@@ -1424,6 +1444,13 @@ async fn lookup_oif(
     let mut routes = handle.route().get(msg).execute();
     match routes.try_next().await {
         Ok(Some(route)) => {
+            if route.header.kind != RouteType::Unicast {
+                debug!(
+                    kind = ?route.header.kind,
+                    "proactive resolve: route is not unicast; no neighbor to resolve"
+                );
+                return None;
+            }
             for attr in route.attributes {
                 if let RouteAttribute::Oif(idx) = attr {
                     return Some(idx);
