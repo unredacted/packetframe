@@ -2078,9 +2078,12 @@ release this build of packetframe was codegen'd against is recorded in
 hwtest bundle's `vpp-pin.txt` as a ready fetch line); the CRC handshake
 refuses any VPP that disagrees at attach.
 
-**Installing VPP on a gateway — including the four traps that have
-each cost real time (mask-before-install, `VPP_INSTALL_SKIP_SYSCTL=1`
-and the 64K-page hugepage reason, /tmp noexec, purge-unbinds-the-VF) —
+**Installing VPP on a gateway — including the five traps that have
+each cost real time (mask-before-install; `VPP_INSTALL_SKIP_SYSCTL=1`
+and the 64K-page hugepage reason; deleting the `/etc/sysctl.d/80-vpp.conf`
+the deb ships, because the env var only skips install time while the
+file re-applies at EVERY boot and bricked the primary on 2026-08-21;
+/tmp noexec; purge-unbinds-the-VF) —
 is documented once, in vpp-unifi's README.** It lives with the build
 so it cannot drift from what the packages actually do; this runbook
 owns what happens after `dpkg -i` succeeds.

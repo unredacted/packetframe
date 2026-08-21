@@ -346,7 +346,14 @@ jobs:
 
             gh release download vpp-${VPP_REF}-${VPP_PLATFORM}-${VPP_DISTRO}-${VPP_ARCH} \\
               -R ${VPP_REPO} -D vpp/
-            sudo dpkg -i vpp/*.deb
+
+          then install per the "Installing on a gateway" section of
+          ${VPP_REPO}'s README — NOT a bare dpkg -i. The deb starts its
+          own service at install AND ships /etc/sysctl.d/80-vpp.conf,
+          a hugepage sysctl that re-applies on every boot (512 GiB on a
+          64K-page kernel; it bricked a 64 GB router on 2026-08-21).
+          The README sequence masks the service, skips the install-time
+          sysctl, and deletes the shipped file.
 
           Only needed for \`module vpp-offload\`; the eBPF fast-path needs
           nothing from this file. See docs/runbooks/vpp-offload.md.

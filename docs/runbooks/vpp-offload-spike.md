@@ -435,9 +435,9 @@ any new version. Check **every** package, not just the main one:
 for d in /tmp/vpp/*.deb; do echo "== $d"; dpkg -I "$d" | grep -i '^ *depends'; done
 ```
 
-### Two traps in vpp.postinst — handle BOTH before installing
+### Three traps in the vpp package — two in the postinst, one in its payload
 
-Read from the shipped postinst, not guessed:
+Read from the shipped postinst and the unpacked data.tar, not guessed:
 
 **1. It applies `sysctl --system`, and the deb ships
 `vm.nr_hugepages=1024` written for 2 MB pages.** On this fleet's
@@ -450,6 +450,19 @@ escape hatch (`VPP_INSTALL_SKIP_SYSCTL`, quoted in the postinst as a
 is **mandatory, always**. Hugepages are managed deliberately — by the
 vpp-offload module in production, by hand in this spike — never by a
 package hook.
+
+**1b. The env var does NOT defuse the file the deb ships.**
+`VPP_INSTALL_SKIP_SYSCTL` gates exactly one postinst line — the
+install-time `sysctl --system`. But `/etc/sysctl.d/80-vpp.conf` is
+package *content*, and systemd-sysctl applies it on **every
+subsequent boot**. On 2026-08-21 this bricked the primary EFG: the
+install looked clean (skip honoured, `nr_hugepages` still 0, no vpp
+running), and the next reboot reserved ~all 64 GB into 512 MB
+hugepages before userspace came up — udapi never configured an
+interface, the box answered nothing, and recovery took a factory
+reset through Recovery Mode. Delete the file as part of the install
+and verify it is gone; a flag that suppresses an installer's side
+effect says nothing about where that side effect *lives*.
 
 **2. It STARTS `vpp.service` during install** (`deb-systemd-invoke
 start`) on the stock `/etc/vpp/startup.conf`. Masking *after* install
@@ -470,9 +483,12 @@ failed mask is exactly the daemon-starts-during-install trap:
 systemctl stop vpp.service 2>/dev/null || true
 systemctl mask vpp.service \
   && cd /tmp/vpp && VPP_INSTALL_SKIP_SYSCTL=1 apt-get install -y ./*.deb \
+  && rm /etc/sysctl.d/80-vpp.conf \
   && command -v vpp && vpp --version
 cat /proc/sys/vm/nr_hugepages        # belt-and-braces: must be UNCHANGED
 pgrep -a vpp || echo "no vpp running — correct"
+ls /etc/sysctl.d/ | grep -i vpp && echo "BOOT LANDMINE STILL PRESENT" \
+  || echo "no vpp sysctl file — correct"   # trap 1b: next BOOT, not now
 ```
 
 (`apt-get install`, not `dpkg -i`, so an unmet dependency fails loudly
