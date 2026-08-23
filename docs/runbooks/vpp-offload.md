@@ -2088,6 +2088,21 @@ is documented once, in vpp-unifi's README.** It lives with the build
 so it cannot drift from what the packages actually do; this runbook
 owns what happens after `dpkg -i` succeeds.
 
+The 80-vpp.conf trap also has a check that doesn't require a reboot to
+find it: `packetframe feasibility` runs `vpp.sysctl-hugepages`, which
+scans the boot sysctl set (`/etc/sysctl.d`, `/run/sysctl.d`, the lib
+dirs and `/etc/sysctl.conf`, with systemd's shadowing and ordering
+rules) for `vm.nr_hugepages`, prices the EFFECTIVE value at the
+running kernel's default hugepage size from `/proc/meminfo`, and FAILs
+— naming the file and the `rm` — when the request exceeds half of
+MemTotal (the incident case: 1024 pages × 512 MiB default on the
+64K-page kernel = 512 GiB on a 64 GB router). Any smaller nonzero
+boot-time value is a WARN: hugepages are managed by this module at
+attach, so a competing boot-time reservation is drift. The probe runs
+in the general set, whether or not the config declares
+`module vpp-offload` — run feasibility after every VPP install,
+before the next reboot.
+
 Upgrade is `detach → install → attach`. There is no cross-version
 adoption: the state file records the VPP version, and a mismatch is
 refused rather than adopted.

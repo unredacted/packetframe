@@ -482,6 +482,7 @@ fn print_row(cap: &Capability, name_w: usize) {
     let status = match cap.status {
         CapabilityStatus::Pass => "PASS",
         CapabilityStatus::Fail => "FAIL",
+        CapabilityStatus::Warn => "WARN",
         CapabilityStatus::Unknown => "UNKN",
         CapabilityStatus::Deferred => "DEFER",
     };
