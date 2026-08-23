@@ -2117,7 +2117,11 @@ held — but the box was degraded until the daemon was stopped.
 So the overlap is a **checked precondition**: `packetframe feasibility`
 reports it (`vpp.irq-affinity`, listing each conflicting IRQ and the
 derived cores), and attach **refuses** while any member port's queue
-IRQ has its *effective* affinity on a VPP core. Effective, not
+IRQ has its *effective* affinity on a VPP core. With a config that
+declares the module, the check is `required`: a conflict makes the
+summary read "vpp-offload attach BLOCKED" (exit non-zero) rather than
+PASS — do not trust a bare PASS memory from builds before this; one
+did read PASS over a failing line (edge1-mci1-net, 2026-08-21). Effective, not
 permitted: a `0-17` wildcard mask still delivers to exactly one CPU,
 and that CPU either is or is not about to become a hot poller.
 

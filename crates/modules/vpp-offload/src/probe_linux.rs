@@ -1,10 +1,20 @@
 //! Linux feasibility probes for the vpp-offload module (plan v5).
 //!
 //! Everything here mirrors the fast-path probe philosophy: read-only,
-//! non-required (feasibility informs, attach enforces), and each
-//! verdict names its fix inline. Probes cover the layers proven live
-//! on the reference EFG (2026-08-01): active IOMMU, SR-IOV capacity,
-//! VFIO device nodes, hugepage pools, and the VPP binary.
+//! and each verdict names its fix inline. Probes cover the layers
+//! proven live on the reference EFG (2026-08-01): active IOMMU, SR-IOV
+//! capacity, VFIO device nodes, hugepage pools, and the VPP binary.
+//!
+//! Severity mirrors attach. These probes run only when the loaded
+//! config declares the module, and each one probes a condition
+//! `bring_up`/`acquire` refuses or cannot survive — so they are
+//! `required`, and a FAIL is an attach refusal the operator has not
+//! hit yet. They were advisory once, and an operator on edge1-mci1-net
+//! (2026-08-21) read the summary's "PASS" over a failing
+//! `vpp.irq-affinity` line and met the refusal at attach instead. The
+//! one exception is per-verdict: steering-budget verdicts gate only
+//! when a port is configured `steer on`, because attach queries and
+//! plans nothing otherwise (`ifaces_to_query`).
 
 use std::fs;
 use std::path::Path;
@@ -55,9 +65,12 @@ pub(crate) fn run(
 fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
     use std::path::Path;
     let name = "vpp.irq-affinity";
+    // Required on every arm: `bring_up` runs this same derivation and
+    // check behind `?`, so an Unknown here (the derive failing) is the
+    // same refusal a conflict is.
     let map = match crate::cores::derive_from_sysfs(Path::new(crate::cores::SYSFS_CPU), workers) {
         Ok(m) => m,
-        Err(e) => return Capability::unknown(name, format!("derive core map: {e}"), false),
+        Err(e) => return Capability::unknown(name, format!("derive core map: {e}"), true),
     };
     let mut vpp_cores = vec![map.main];
     vpp_cores.extend(&map.workers);
@@ -73,7 +86,7 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
                 "no NIC queue IRQ fires on the derived VPP cores (main {}, workers {:?})",
                 map.main, map.workers
             ),
-            false,
+            true,
         ),
         Ok(c) => {
             let sample: Vec<String> = c
@@ -93,10 +106,10 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
                     sample.join(", "),
                     if c.len() > 8 { ", ..." } else { "" },
                 ),
-                false,
+                true,
             )
         }
-        Err(e) => Capability::unknown(name, e, false),
+        Err(e) => Capability::unknown(name, e, true),
     }
 }
 
@@ -112,8 +125,13 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 /// by the AF, so a v6-heavy allowlist means the offload covers far less
 /// traffic than the config reads like it does.
 ///
-/// Read-only and non-required, like every probe here: it computes the
-/// plan the module would install, and installs nothing.
+/// Read-only, like every probe here: it computes the plan the module
+/// would install, and installs nothing. Required exactly when a port
+/// is configured `steer on` — those verdicts are attach refusals
+/// (`bring_up` runs the same steerable check and plan behind `?`);
+/// with every port `steer off`, attach queries and plans nothing
+/// (`ifaces_to_query`), so a staging verdict advises the future canary
+/// lever and must not block a feasibility attach would accept.
 ///
 /// **The budget comes from the NIC.** This used to plan against
 /// `McamBudget::default()` and report whether the arithmetic held — a
@@ -131,6 +149,9 @@ fn probe_steering_budget(
     use crate::steer::McamBudget;
 
     let name = "vpp.steering.budget";
+    // Whether this probe's verdicts gate attach: `bring_up` refuses an
+    // unsteerable or over-budget plan only when something steers.
+    let gating = !steer_ports.is_empty();
     // The ALLOWLIST question first, because it needs no NIC — the same
     // ordering `bring_up` documents and for the same reason: an
     // operator who wrote `steer on` against a v6-only allowlist must
@@ -152,7 +173,7 @@ fn probe_steering_budget(
                     allowlist.len()
                 )
             },
-            false,
+            gating,
         );
     }
 
@@ -177,7 +198,7 @@ fn probe_steering_budget(
                          same way; check `ip -br link`, an administratively DOWN port answers \
                          like this"
                     ),
-                    false,
+                    true,
                 )
             }
         };
@@ -279,6 +300,10 @@ fn plan_and_report(
     use crate::steer::{RuleAction, RuleSet};
 
     let free = budget.free.len();
+    // On the strict path a plan `bring_up` refuses (over budget) is an
+    // attach refusal, so the verdict is required; staging plans advise
+    // the first canary step, which attach does not take.
+    let required = !staging;
 
     // No directions handed in = plan the global default, exactly as
     // the CLI extractor falls back when nothing steers yet. Without
@@ -314,7 +339,7 @@ fn plan_and_report(
                     set.rules.len() - diverts,
                 ));
             }
-            Err(e) => return Capability::fail(name, e, false),
+            Err(e) => return Capability::fail(name, e, required),
         }
     }
     let detail = format!(
@@ -341,7 +366,7 @@ fn plan_and_report(
             String::new()
         }
     );
-    Capability::pass(name, detail, false)
+    Capability::pass(name, detail, required)
 }
 
 /// An SMMU registered in /sys/class/iommu is the difference between
@@ -354,7 +379,7 @@ fn probe_iommu() -> Capability {
                 Capability::pass(
                     "vpp.iommu",
                     format!("active: {}", e.file_name().to_string_lossy()),
-                    false,
+                    true,
                 )
             } else {
                 Capability::fail(
@@ -362,11 +387,11 @@ fn probe_iommu() -> Capability {
                     "/sys/class/iommu is empty: SMMU compiled in but not active \
                      (check firmware/boot config); VFIO would run no-iommu, which \
                      the module refuses",
-                    false,
+                    true,
                 )
             }
         }
-        Err(e) => Capability::unknown("vpp.iommu", format!("read /sys/class/iommu: {e}"), false),
+        Err(e) => Capability::unknown("vpp.iommu", format!("read /sys/class/iommu: {e}"), true),
     }
 }
 
@@ -374,16 +399,16 @@ fn probe_vfio() -> Capability {
     let dev = Path::new("/dev/vfio/vfio").exists();
     let drv = Path::new("/sys/bus/pci/drivers/vfio-pci").exists();
     match (dev, drv) {
-        (true, true) => Capability::pass("vpp.vfio", "container node + vfio-pci driver", false),
+        (true, true) => Capability::pass("vpp.vfio", "container node + vfio-pci driver", true),
         (false, _) => Capability::fail(
             "vpp.vfio",
             "/dev/vfio/vfio missing: CONFIG_VFIO not built in or module not loaded",
-            false,
+            true,
         ),
         (_, false) => Capability::fail(
             "vpp.vfio",
             "vfio-pci driver not registered (CONFIG_VFIO_PCI)",
-            false,
+            true,
         ),
     }
 }
@@ -401,7 +426,7 @@ fn probe_hugepages() -> Capability {
             return Capability::unknown(
                 "vpp.hugepages",
                 format!("read /sys/kernel/mm/hugepages: {e}"),
-                false,
+                true,
             )
         }
     };
@@ -409,14 +434,14 @@ fn probe_hugepages() -> Capability {
         return Capability::fail(
             "vpp.hugepages",
             "no hugepage pools (CONFIG_HUGETLBFS?)",
-            false,
+            true,
         );
     }
     let default_mb = default_hugepage_bytes() >> 20;
     Capability::pass(
         "vpp.hugepages",
         format!("pools: {} (default {default_mb} MiB)", pools.join(", ")),
-        false,
+        true,
     )
 }
 
@@ -432,7 +457,7 @@ fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
             } else {
                 " (default path)"
             };
-            return Capability::pass("vpp.binary", format!("{c}{note}"), false);
+            return Capability::pass("vpp.binary", format!("{c}{note}"), true);
         }
     }
     let hint = if override_path.is_some() {
@@ -442,8 +467,11 @@ fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
     };
     Capability::fail(
         "vpp.binary",
-        format!("not found at {} — {hint}", candidates.join(" or ")),
-        false,
+        format!(
+            "not found at {} — attach will refuse; {hint}",
+            candidates.join(" or ")
+        ),
+        true,
     )
 }
 
@@ -452,11 +480,11 @@ fn probe_sriov(iface: &str) -> Capability {
     let path = format!("/sys/class/net/{iface}/device/sriov_totalvfs");
     match fs::read_to_string(&path) {
         Ok(raw) => match raw.trim().parse::<u32>() {
-            Ok(0) => Capability::fail(&name, "sriov_totalvfs is 0: no VFs available", false),
-            Ok(n) => Capability::pass(&name, format!("{n} VFs available"), false),
-            Err(_) => Capability::unknown(&name, format!("unparseable {path}: {raw:?}"), false),
+            Ok(0) => Capability::fail(&name, "sriov_totalvfs is 0: no VFs available", true),
+            Ok(n) => Capability::pass(&name, format!("{n} VFs available"), true),
+            Err(_) => Capability::unknown(&name, format!("unparseable {path}: {raw:?}"), true),
         },
-        Err(e) => Capability::unknown(&name, format!("{path}: {e}"), false),
+        Err(e) => Capability::unknown(&name, format!("{path}: {e}"), true),
     }
 }
 
@@ -510,6 +538,25 @@ mod steering_probe_tests {
             empty.detail.contains("allowlist is empty"),
             "names which of the two ways it got here: {}",
             empty.detail
+        );
+        assert!(
+            !empty.required,
+            "no port steers, so attach installs nothing and this must stay advisory"
+        );
+
+        // The same nothing-to-steer verdict with a port `steer on` is
+        // `bring_up`'s refusal, so it gates the summary.
+        let gated = probe_steering_budget(
+            &["eth4".to_string()],
+            &["eth4".to_string()],
+            &[],
+            Default::default(),
+            &[],
+        );
+        assert_eq!(gated.status, CapabilityStatus::Fail, "{gated:?}");
+        assert!(
+            gated.required,
+            "attach refuses `steer on` over nothing steerable: {gated:?}"
         );
 
         let v6_only = probe_steering_budget(
@@ -620,5 +667,55 @@ mod steering_probe_tests {
             "and say why: {}",
             steered_dark.detail
         );
+
+        // Severity follows the same line leniency does: the staging
+        // verdicts above advise (attach installs nothing), the steering
+        // verdict is attach's own refusal.
+        assert!(!none.required, "{none:?}");
+        assert!(!all_dark.required, "{all_dark:?}");
+        assert!(!partial.required, "{partial:?}");
+        assert!(steered_dark.required, "{steered_dark:?}");
+
+        // 5. Steering and readable: a PASS on this path is still a
+        //    required capability — the same plan failing tomorrow is a
+        //    refusal, and REQ=yes is what tells the operator that.
+        sys::reset();
+        let steered_ok = probe_steering_budget(
+            &["eth4".to_string()],
+            &["eth4".to_string()],
+            &steerable,
+            dirs,
+            &[],
+        );
+        assert_eq!(steered_ok.status, CapabilityStatus::Pass, "{steered_ok:?}");
+        assert!(steered_ok.required, "{steered_ok:?}");
+    }
+
+    /// Every hardware probe is `required` whatever it found.
+    ///
+    /// Each one probes a condition attach refuses (`bring_up`'s named
+    /// checks) or cannot survive (acquire's vfio bind, VF creation).
+    /// They were advisory once, and on edge1-mci1-net (2026-08-21) an
+    /// operator read the summary's "PASS" over a failing
+    /// `vpp.irq-affinity` line and met the refusal at attach — so the
+    /// invariant is asserted on the flag alone, independent of what
+    /// this host's sysfs happens to answer.
+    #[test]
+    fn every_hardware_verdict_is_required_whatever_it_found() {
+        for cap in [
+            probe_iommu(),
+            probe_vfio(),
+            probe_hugepages(),
+            probe_vpp_binary(None),
+            probe_sriov("eth-nonexistent"),
+            probe_irq_affinity(&[], 1),
+        ] {
+            assert!(
+                cap.required,
+                "{} must gate the feasibility summary; attach refuses or dies on what it \
+                 probes ({:?}: {})",
+                cap.name, cap.status, cap.detail
+            );
+        }
     }
 }

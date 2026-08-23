@@ -1294,8 +1294,13 @@ impl Module for VppOffloadModule {
 }
 
 /// Feasibility probes for `packetframe feasibility`, mirroring how the
-/// fast-path's per-interface probes graft into the report. All
-/// non-required: feasibility output informs, attach enforces.
+/// fast-path's per-interface probes graft into the report. Severity
+/// mirrors attach: the caller runs these only when the config declares
+/// this module, and every verdict on a condition attach refuses is
+/// `required` — steering verdicts gate only when a port is configured
+/// `steer on`, since attach installs nothing otherwise. See
+/// `probe_linux`'s module doc for the incident that ended the
+/// all-advisory rule.
 pub fn run_feasibility_probes(
     ports: &[String],
     steer_ports: &[String],
