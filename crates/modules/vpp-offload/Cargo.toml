@@ -23,4 +23,4 @@ libc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core = { workspace = true }
 netlink-packet-route = { workspace = true }
-netlink-sys = "0.8"
+netlink-sys = "0.9"
