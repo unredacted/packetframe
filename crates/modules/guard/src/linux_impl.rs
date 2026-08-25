@@ -372,7 +372,7 @@ pub(crate) fn sample_metrics(state: &ActiveState, out: &mut String) -> ModuleRes
 /// Attach `guard_egress` to `iface`'s clsact **egress** and return the
 /// kernel-assigned `(priority, handle)`. Mirror of fast-path's
 /// `tc_attach_iface`; see the module doc for the shared rationale.
-fn tc_attach_egress(ebpf: &mut Ebpf, iface: &str) -> ModuleResult<(u16, u32)> {
+pub fn tc_attach_egress(ebpf: &mut Ebpf, iface: &str) -> ModuleResult<(u16, u32)> {
     use aya::programs::tc::{
         qdisc_add_clsact, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType,
     };
