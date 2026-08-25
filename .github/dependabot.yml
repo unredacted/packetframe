@@ -11,12 +11,24 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     groups:
+      # The rust-netlink stack moves in lockstep: rtnetlink re-exports
+      # netlink-packet-route types, so bumping either alone splits the
+      # workspace into two incompatible copies of the crate and every
+      # build job fails E0308 (PRs #194/#195). Group them at every
+      # update-type so the bump always arrives as one mergeable PR.
+      netlink:
+        update-types: ["patch", "minor", "major"]
+        patterns:
+          - "rtnetlink"
+          - "netlink-*"
       # Batch patch/minor ecosystem churn (serde, anyhow, clap etc.)
       # into one weekly PR. Major bumps land as individual PRs.
       userspace-minor:
         update-types: ["patch", "minor"]
         exclude-patterns:
           - "aya*"
+          - "rtnetlink"
+          - "netlink-*"
     ignore:
       # aya stack is pinned tight per SPEC.md §7.1. Still gets updates
       # proposed — they just go through as individual PRs (no grouping).
