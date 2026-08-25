@@ -94,9 +94,15 @@ fn last_hugepage_assignment(sources: &[SysctlSource]) -> Option<HugepageAssignme
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            // sysctl.d accepts `/` as the separator and a leading `-`
-            // for ignore-errors; normalize both before matching.
-            let key = key.trim().trim_start_matches('-').replace('/', ".");
+            // sysctl.d accepts `/` as the separator (including the
+            // canonical leading-slash spelling `/vm/nr_hugepages`) and
+            // a leading `-` for ignore-errors; normalize all three
+            // before matching.
+            let key = key
+                .trim()
+                .trim_start_matches('-')
+                .trim_start_matches('/')
+                .replace('/', ".");
             if !HUGEPAGE_KEYS.contains(&key.as_str()) {
                 continue;
             }
@@ -184,9 +190,10 @@ fn hugepage_verdict(
             format!(
                 "{file} sets {key} = {pages}; at this kernel's default hugepage size \
                  ({size}) that is a {req} boot-time reservation against {total} MemTotal — \
-                 the box will NOT survive its next reboot. Fix: rm {file} \
-                 (hugepages are managed by the vpp-offload module at attach, never by \
-                 boot config)",
+                 the box will NOT survive its next reboot. Fix: delete the {key} line \
+                 from {file}, or rm the file when the setting is its only purpose (the \
+                 VPP deb's 80-vpp.conf) — hugepages are managed by the vpp-offload \
+                 module at attach, never by boot config",
                 file = a.path.display(),
                 key = a.key,
                 pages = a.pages,
@@ -202,8 +209,8 @@ fn hugepage_verdict(
             format!(
                 "{file} sets {key} = {pages} ({req} at {size} pages, MemTotal {total}): \
                  a boot-time hugepage reservation competes with the vpp-offload module, \
-                 which manages hugepages at attach; rm {file} unless the reservation is \
-                 deliberate",
+                 which manages hugepages at attach; delete the {key} line from {file} \
+                 unless the reservation is deliberate",
                 file = a.path.display(),
                 key = a.key,
                 pages = a.pages,
@@ -219,11 +226,21 @@ fn hugepage_verdict(
 /// Every `*.conf` the boot-time sysctl apply would read, in apply
 /// order. Directory precedence is systemd-sysctl's (`/etc` over `/run`
 /// over `/usr/local/lib` over `/usr/lib`, with `/lib` for split-usr
-/// systems); `/etc/sysctl.conf` goes last, matching `sysctl --system`.
-/// Debian symlinks it into sysctl.d as `99-sysctl.conf`, so its
-/// assignments may be read twice — harmless, the winner is the same.
+/// systems). `/etc/sysctl.conf` is appended last (matching
+/// `sysctl --system`) ONLY when no sysctl.d fragment already resolves
+/// to it — Debian symlinks it in as `99-sysctl.conf`, and systemd
+/// honors the symlink's position, so re-appending it would let it
+/// wrongly override a lexicographically later fragment.
+///
+/// Errs on anything that leaves the scan incomplete: a directory that
+/// exists but can't be listed, or a selected fragment that can't be
+/// read. Silently skipping either could turn a boot-fatal file into a
+/// PASS. Absent directories/files and dangling symlinks reserve
+/// nothing at boot, so those are skipped, not errors.
 #[cfg(target_os = "linux")]
-fn collect_boot_sysctl_sources() -> Vec<SysctlSource> {
+fn collect_boot_sysctl_sources() -> Result<Vec<SysctlSource>, String> {
+    use std::io::ErrorKind;
+
     const DIRS: [&str; 5] = [
         "/etc/sysctl.d",
         "/run/sysctl.d",
@@ -233,10 +250,13 @@ fn collect_boot_sysctl_sources() -> Vec<SysctlSource> {
     ];
     let mut candidates = Vec::new();
     for (rank, dir) in DIRS.iter().enumerate() {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("could not scan {dir}: {e}")),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("could not scan {dir}: {e}"))?;
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -251,22 +271,36 @@ fn collect_boot_sysctl_sources() -> Vec<SysctlSource> {
             });
         }
     }
-    let mut sources: Vec<SysctlSource> = resolve_apply_order(candidates)
-        .into_iter()
-        .filter_map(|path| {
-            std::fs::read_to_string(&path)
-                .ok()
-                .map(|contents| SysctlSource { path, contents })
-        })
-        .collect();
+
     let conf = Path::new("/etc/sysctl.conf");
-    if let Ok(contents) = std::fs::read_to_string(conf) {
-        sources.push(SysctlSource {
-            path: conf.to_path_buf(),
-            contents,
-        });
+    let conf_canonical = std::fs::canonicalize(conf).ok();
+    let mut conf_covered = false;
+    let mut sources = Vec::new();
+    for path in resolve_apply_order(candidates) {
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            // A dangling symlink applies nothing at boot either.
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        };
+        if let (Some(canonical_conf), Ok(canonical)) =
+            (&conf_canonical, std::fs::canonicalize(&path))
+        {
+            conf_covered = conf_covered || canonical == *canonical_conf;
+        }
+        sources.push(SysctlSource { path, contents });
     }
-    sources
+    if !conf_covered {
+        match std::fs::read_to_string(conf) {
+            Ok(contents) => sources.push(SysctlSource {
+                path: conf.to_path_buf(),
+                contents,
+            }),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("could not read {}: {e}", conf.display())),
+        }
+    }
+    Ok(sources)
 }
 
 #[cfg(target_os = "linux")]
@@ -278,7 +312,18 @@ pub fn probe_sysctl_hugepages() -> Capability {
         Ok(sizes) => sizes,
         Err(e) => return Capability::unknown(PROBE_NAME, e, false),
     };
-    let sources = collect_boot_sysctl_sources();
+    let sources = match collect_boot_sysctl_sources() {
+        Ok(sources) => sources,
+        // An incomplete scan must not read as "no reservation": the
+        // unreadable file is exactly where the landmine could be.
+        Err(e) => {
+            return Capability::unknown(
+                PROBE_NAME,
+                format!("boot sysctl scan incomplete ({e}); cannot price the boot-time hugepage request"),
+                false,
+            );
+        }
+    };
     hugepage_verdict(
         last_hugepage_assignment(&sources).as_ref(),
         hugepagesize,
@@ -332,6 +377,10 @@ mod tests {
         // Slash-separated key, no spaces around `=`, ignore-errors `-`.
         let s = src("/etc/sysctl.d/x.conf", "-vm/nr_hugepages=512\n");
         assert_eq!(last_hugepage_assignment(&[s]).unwrap().pages, 512);
+
+        // The canonical leading-slash spelling systemd also accepts.
+        let s = src("/etc/sysctl.d/x.conf", "/vm/nr_hugepages = 128\n");
+        assert_eq!(last_hugepage_assignment(&[s]).unwrap().pages, 128);
 
         // The mempolicy variant sizes the same pool.
         let s = src("/etc/sysctl.d/x.conf", "vm.nr_hugepages_mempolicy = 256\n");
@@ -420,7 +469,12 @@ mod tests {
         assert!(cap.detail.contains("/etc/sysctl.d/80-vpp.conf"));
         assert!(cap.detail.contains("1024"));
         assert!(cap.detail.contains("512 GiB"), "detail: {}", cap.detail);
-        assert!(cap.detail.contains("rm /etc/sysctl.d/80-vpp.conf"));
+        assert!(
+            cap.detail
+                .contains("delete the vm.nr_hugepages line from /etc/sysctl.d/80-vpp.conf"),
+            "detail: {}",
+            cap.detail
+        );
     }
 
     #[test]

@@ -2094,7 +2094,7 @@ scans the boot sysctl set (`/etc/sysctl.d`, `/run/sysctl.d`, the lib
 dirs and `/etc/sysctl.conf`, with systemd's shadowing and ordering
 rules) for `vm.nr_hugepages`, prices the EFFECTIVE value at the
 running kernel's default hugepage size from `/proc/meminfo`, and FAILs
-— naming the file and the `rm` — when the request exceeds half of
+— naming the file and the line to delete — when the request exceeds half of
 MemTotal (the incident case: 1024 pages × 512 MiB default on the
 64K-page kernel = 512 GiB on a 64 GB router). Any smaller nonzero
 boot-time value is a WARN: hugepages are managed by this module at
