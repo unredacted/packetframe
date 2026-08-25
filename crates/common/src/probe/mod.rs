@@ -6,6 +6,7 @@
 //! since it requires a real program to attach, reported here as Deferred.
 
 pub mod bpf;
+pub mod sysctl_hugepages;
 
 use std::fs;
 use std::io::Read;
@@ -34,6 +35,10 @@ const BPF_F_NO_PREALLOC: u32 = 0x01;
 pub enum CapabilityStatus {
     Pass,
     Fail,
+    /// Works, but a condition the operator should fix is present.
+    /// On a *required* capability, Warn still fails the report (the
+    /// loader can't promise the runtime is healthy), same as Unknown.
+    Warn,
     Unknown,
     Deferred,
 }
@@ -60,6 +65,15 @@ impl Capability {
         Self {
             name: name.into(),
             status: CapabilityStatus::Fail,
+            detail: detail.into(),
+            required,
+        }
+    }
+
+    pub fn warn(name: impl Into<String>, detail: impl Into<String>, required: bool) -> Self {
+        Self {
+            name: name.into(),
+            status: CapabilityStatus::Warn,
             detail: detail.into(),
             required,
         }
@@ -179,6 +193,16 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
          hardening adds per-instruction cost to every JITed program",
     ));
     caps.push(probe_kernel_version());
+
+    // Boot-persistent hugepage sysctls, priced at the RUNNING kernel's
+    // default hugepage size (the 2026-08-21 landmine: the VPP deb's
+    // /etc/sysctl.d/80-vpp.conf survives VPP_INSTALL_SKIP_SYSCTL=1 and
+    // its 1024 pages are 512 GiB on a 512 MiB-default-hugepage kernel).
+    // In the general set, not vpp-gated: the file kills the box whether
+    // or not the config declares `module vpp-offload`. required=no;
+    // surfacing non-required FAILs above the summary line is a pending
+    // task.
+    caps.push(sysctl_hugepages::probe_sysctl_hugepages());
 
     // §2.3 per-interface native-XDP trial-attach, deferred. The probe needs
     // a real attachable program, which doesn't exist in v0.0.1.
