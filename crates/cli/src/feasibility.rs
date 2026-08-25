@@ -253,30 +253,42 @@ pub fn vpp_local_routes_from_config(
 
 /// The `vpp-binary` override from a `vpp-offload` section, if set, so
 /// feasibility probes the executable the module will actually run.
+///
+/// **Last one wins**, here and in [`vpp_loopback_from_config`], because
+/// last-wins is what `VppOffloadConfig::from_directives` hands attach —
+/// it overwrites the field as it iterates, and parsing permits repeated
+/// scalar directives. A first-wins `find_map` probed a different value
+/// than the one attach acts on whenever a directive was repeated
+/// (review finding on #200, against the loopback twin of this).
 pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
     config
         .modules
         .iter()
         .filter(|m| m.name == "vpp-offload")
         .flat_map(|m| &m.directives)
-        .find_map(|d| match d {
+        .filter_map(|d| match d {
             ModuleDirective::VppBinary(p) => Some(p.clone()),
             _ => None,
         })
+        .next_back()
 }
 
 /// The configured `loopback-address`, if any — `bring_up` refuses one
 /// the kernel currently holds, so the `vpp.loopback` probe mirrors
-/// that refusal (review finding on #200).
+/// that refusal (review finding on #200). Last-wins and scoped to
+/// `vpp-offload` sections, exactly as `from_directives` resolves it;
+/// see [`vpp_binary_from_config`].
 pub fn vpp_loopback_from_config(config: &Config) -> Option<std::net::Ipv4Addr> {
     config
         .modules
         .iter()
+        .filter(|m| m.name == "vpp-offload")
         .flat_map(|m| &m.directives)
-        .find_map(|d| match d {
+        .filter_map(|d| match d {
             ModuleDirective::VppLoopbackAddress(p) => Some(p.addr),
             _ => None,
         })
+        .next_back()
 }
 
 /// The vpp-offload facts the probes need, grouped so the parameter
@@ -606,6 +618,46 @@ fn print_row(cap: &Capability, name_w: usize) {
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+
+    /// The scalar extractors resolve repeated directives exactly as
+    /// `VppOffloadConfig::from_directives` does (last wins) — asserted
+    /// against `from_directives` itself, so the two cannot drift
+    /// silently. A first-wins `find_map` here probed the first
+    /// `loopback-address` while attach refused (or accepted) the last
+    /// (review finding on #200).
+    #[cfg(feature = "vpp-offload")]
+    #[test]
+    fn scalar_extractors_pick_the_directive_attach_acts_on() {
+        use packetframe_common::config::{GlobalConfig, Ipv4Prefix, ModuleSection};
+
+        let lo = |a: u8| Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, a),
+            prefix_len: 32,
+        };
+        let directives = vec![
+            ModuleDirective::VppBinary("/opt/vpp-first".into()),
+            ModuleDirective::VppLoopbackAddress(lo(1)),
+            ModuleDirective::VppBinary("/opt/vpp-last".into()),
+            ModuleDirective::VppLoopbackAddress(lo(2)),
+        ];
+        let config = Config {
+            global: GlobalConfig::default(),
+            modules: vec![ModuleSection {
+                name: "vpp-offload".into(),
+                directives: directives.clone(),
+            }],
+        };
+        let runtime = packetframe_vpp_offload::VppOffloadConfig::from_directives(&directives);
+        assert_eq!(vpp_binary_from_config(&config), runtime.vpp_binary);
+        assert_eq!(
+            vpp_loopback_from_config(&config),
+            runtime.loopback_address.map(|p| p.addr)
+        );
+        assert_eq!(
+            vpp_binary_from_config(&config).as_deref(),
+            Some("/opt/vpp-last")
+        );
+    }
 
     // A struct literal, not a match over CapabilityStatus: this helper
     // must keep compiling when the enum grows a variant on another
