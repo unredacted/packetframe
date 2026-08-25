@@ -52,6 +52,12 @@ pub fn program_path(bpffs_root: &Path) -> PathBuf {
     progs_dir(bpffs_root).join(PROGRAM_NAME)
 }
 
+/// Path for an arbitrary pinned program by basename; the pin lifecycle
+/// walks `PROGRAM_NAMES` through this.
+pub fn program_path_for(bpffs_root: &Path, name: &str) -> PathBuf {
+    progs_dir(bpffs_root).join(name)
+}
+
 pub fn map_path(bpffs_root: &Path, name: &str) -> PathBuf {
     maps_dir(bpffs_root).join(name)
 }

@@ -73,8 +73,9 @@ jobs:
             ~/.cargo/git/db/
             target/
             crates/modules/fast-path/bpf/target/
+            crates/modules/guard/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-
             ${{ runner.os }}-cargo-qemu-
@@ -155,6 +156,7 @@ jobs:
           # `--no-run` produces the ELFs without executing them on the
           # host kernel.
           cargo test -p packetframe-fast-path --tests --no-run
+          cargo test -p packetframe-guard --tests --no-run
           cargo test -p packetframe-probe --tests --no-run
 
       - name: Run integration tests in QEMU
@@ -186,7 +188,7 @@ jobs:
               --memory 6144 \
               --disable-kvm \
               --verbose \
-              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_QUICK=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
+              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_QUICK=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-guard --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
           }
           # Retry policy: virtme-ng propagates the guest command's exit
           # status, so a genuine test failure arrives as cargo's 101

@@ -56,8 +56,9 @@ jobs:
             ~/.cargo/git/db/
             target/
             crates/modules/fast-path/bpf/target/
+            crates/modules/guard/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-check-
 
@@ -158,6 +159,7 @@ jobs:
         # such tests doesn't fail this step with "no test matches".
         run: |
           sudo -E $(which cargo) test -p packetframe-fast-path --tests -- --ignored --nocapture
+          sudo -E $(which cargo) test -p packetframe-guard --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-probe --tests -- --ignored --nocapture
 
   cross-build:

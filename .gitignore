@@ -45,4 +45,5 @@ $RECYCLE.BIN/
 /plans/
 .claude/
 crates/modules/fast-path/bpf/target/
+crates/modules/guard/bpf/target/
 crates/modules/probe/bpf/target/

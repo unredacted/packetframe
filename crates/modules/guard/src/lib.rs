@@ -19,20 +19,26 @@
 //! frames). That remains true at every stage of the vpp-offload
 //! roadmap, so this module is permanent architecture, not a stopgap.
 //!
-//! **Slice status:** config model, state-file, and pin-path layers are
-//! in place; the BPF datapath and the Linux attach/detach lifecycle
-//! land in the next slice, and the CLI does not construct this module
-//! until the slice after that.
+//! **Slice status:** config model, BPF datapath, and the Linux
+//! lifecycle are in place; the CLI does not construct this module
+//! until the next slice, so nothing reaches it at runtime yet.
 
 pub mod cfg;
+pub mod metrics;
 pub mod pin;
+pub mod probe_linux;
 pub mod tc_links;
 
-use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+mod linux_impl;
+#[cfg(target_os = "linux")]
+pub use linux_impl::{detach_from_state_dir, stats_from_pin};
+
+pub use probe_linux::run_feasibility_probes;
 
 use packetframe_common::module::{
-    HealthCtx, HealthReport, HookType, HookUse, LoaderCtx, MetricsWriter, Module, ModuleConfig,
-    ModuleError, ModuleResult,
+    Attachment, HealthCtx, HealthReport, HookType, HookUse, LoaderCtx, MetricsWriter, Module,
+    ModuleConfig, ModuleError, ModuleResult,
 };
 
 use crate::cfg::GuardConfig;
@@ -44,13 +50,34 @@ pub const MODULE_NAME: &str = "guard";
 /// consulted (single-module-per-hook dispatch).
 pub const GUARD_PRIORITY: u16 = 100;
 
+/// The compiled guard BPF ELF, staged by `build.rs` and embedded at
+/// crate-compile time. Empty (zero bytes) when the BPF toolchain isn't
+/// available — see [`GUARD_BPF_AVAILABLE`] and fast-path's twin for
+/// the alignment note (`include_bytes!` is 1-byte aligned; copy via
+/// [`aligned_bpf_copy`] before `aya::Ebpf::load`).
+pub const GUARD_BPF: &[u8] = include_bytes!(env!("GUARD_BPF_OBJ"));
+
+/// Heap copy aligned enough (≥16 bytes from the system allocator) for
+/// the `object` crate's ELF header reads.
+pub fn aligned_bpf_copy() -> Vec<u8> {
+    GUARD_BPF.to_vec()
+}
+
+/// `true` when `build.rs` produced a real BPF ELF; `false` when it
+/// fell back to the empty stub (macOS dev loops). Load refuses on the
+/// stub; tests early-return on it.
+pub const GUARD_BPF_AVAILABLE: bool = !GUARD_BPF.is_empty();
+
+/// Guard module handle. `Default`/`new` produce an unloaded instance;
+/// call [`Module::load`] to bring it online.
 #[derive(Default)]
 pub struct GuardModule {
-    /// Parsed section, set by `load`.
+    #[cfg(target_os = "linux")]
+    state: Option<linux_impl::ActiveState>,
+    /// Non-Linux keeps just the parsed config so the load-time
+    /// validation surface behaves identically on dev laptops.
+    #[cfg(not(target_os = "linux"))]
     config: Option<GuardConfig>,
-    /// Captured at `load` (`attach` receives no ctx).
-    bpffs_root: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
 }
 
 impl GuardModule {
@@ -71,42 +98,105 @@ impl Module for GuardModule {
         }]
     }
 
+    #[cfg(target_os = "linux")]
     fn load(&mut self, cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
+        // Parse first: config refusals must not depend on BPF/pin
+        // state, so every caller gets the same verdict at the earliest
+        // point.
         let parsed = GuardConfig::from_directives(&cfg.section.directives)
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("module guard: {e}")))?;
-        self.config = Some(parsed);
-        self.bpffs_root = Some(ctx.bpffs_root.to_path_buf());
-        self.state_dir = Some(ctx.state_dir.to_path_buf());
+        let state = linux_impl::load(parsed, ctx.bpffs_root, ctx.state_dir)?;
+        self.state = Some(state);
         Ok(())
     }
 
-    fn attach(
-        &mut self,
-        _cfg: &ModuleConfig<'_>,
-    ) -> ModuleResult<Vec<packetframe_common::module::Attachment>> {
-        // Next slice: per-interface clsact + netlink cls_bpf egress
-        // attach, GUARD_CFG population, guard-tc-links.json persistence,
-        // pinning. Returns no `Attachment`s even then (the shared
-        // attachments.json registry is single-module; guard's teardown
-        // truth is its own state file, the vpp-offload precedent).
+    #[cfg(not(target_os = "linux"))]
+    fn load(&mut self, cfg: &ModuleConfig<'_>, _ctx: &LoaderCtx<'_>) -> ModuleResult<()> {
+        let parsed = GuardConfig::from_directives(&cfg.section.directives)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("module guard: {e}")))?;
+        self.config = Some(parsed);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn attach(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach before load"))?;
+        linux_impl::attach(state, cfg.global.attach_settle_time)?;
+        // No `Attachment`s by design: the shared attachments.json
+        // registry is single-module (last writer wins), so guard's
+        // teardown truth is guard-tc-links.json + its pins — the
+        // vpp-offload precedent.
+        Ok(Vec::new())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn attach(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
+    #[cfg(target_os = "linux")]
+    fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "reconfigure before load"))?;
+        let parsed = GuardConfig::from_directives(&cfg.section.directives)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("module guard: {e}")))?;
+        linux_impl::reconfigure(state, parsed)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn reconfigure(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
+    #[cfg(target_os = "linux")]
     fn detach(&mut self) -> ModuleResult<()> {
-        // Nothing can be attached while `attach` is unimplemented;
-        // no-op is the honest answer for this slice.
+        if let Some(state) = self.state.as_mut() {
+            linux_impl::detach(state)?;
+        }
+        self.state = None;
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn detach(&mut self) -> ModuleResult<()> {
+        // Nothing can be attached on a stub platform; no-op is the
+        // honest answer.
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+        match self.state.as_ref() {
+            // Unloaded: emit nothing rather than zeroed counters that
+            // read as healthy-idle (the vpp-offload rule).
+            None => Ok(()),
+            Some(state) => linux_impl::sample_metrics(state, out.out),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
+        Ok(match self.state.as_ref() {
+            None => HealthReport::healthy(),
+            Some(state) => linux_impl::health(state),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
+        // A stub platform has nothing attached; silence would be
+        // misleading only if something could be running here, and
+        // nothing can.
         Ok(HealthReport::healthy())
     }
 }
@@ -116,31 +206,17 @@ mod tests {
     use super::*;
     use packetframe_common::config::Config;
 
-    /// `load` accepts a valid section and refuses an invalid one with
-    /// the module name in the message — the same verdict the config
-    /// validator gives, per the "one verdict at the earliest point"
-    /// rule.
+    /// A config the validator refuses is refused by `load` with the
+    /// same verdict — before any BPF or pin state is consulted, so
+    /// this holds unprivileged on every platform.
     #[test]
-    fn load_parses_and_refuses() {
-        let good = Config::parse("module guard\n  interface br0\n  lldp br0 drop\n").unwrap();
+    fn load_refuses_invalid_section_first() {
         let bad = Config::parse("module guard\n  lldp br0 drop\n").unwrap();
         let global = packetframe_common::config::GlobalConfig::default();
         let ctx = LoaderCtx {
             bpffs_root: std::path::Path::new("/sys/fs/bpf/packetframe"),
             state_dir: std::path::Path::new("/var/lib/packetframe/state"),
         };
-
-        let mut m = GuardModule::new();
-        m.load(
-            &ModuleConfig {
-                section: &good.modules[0],
-                global: &global,
-            },
-            &ctx,
-        )
-        .expect("valid section loads");
-        assert!(m.config.is_some());
-
         let mut m = GuardModule::new();
         let e = m
             .load(
@@ -152,5 +228,29 @@ mod tests {
             )
             .expect_err("orphan rule refused");
         assert!(format!("{e}").contains("no `interface` line"), "{e}");
+    }
+
+    /// On stub platforms the happy path parses and stores the config
+    /// (the Linux happy path needs CAP_BPF and is covered by the
+    /// ignored integration tests).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn load_parses_on_stub_platforms() {
+        let good = Config::parse("module guard\n  interface br0\n  lldp br0 drop\n").unwrap();
+        let global = packetframe_common::config::GlobalConfig::default();
+        let ctx = LoaderCtx {
+            bpffs_root: std::path::Path::new("/sys/fs/bpf/packetframe"),
+            state_dir: std::path::Path::new("/var/lib/packetframe/state"),
+        };
+        let mut m = GuardModule::new();
+        m.load(
+            &ModuleConfig {
+                section: &good.modules[0],
+                global: &global,
+            },
+            &ctx,
+        )
+        .expect("valid section loads");
+        assert!(m.config.is_some());
     }
 }

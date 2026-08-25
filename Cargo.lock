@@ -741,6 +741,8 @@ dependencies = [
 name = "packetframe-guard"
 version = "0.2.7"
 dependencies = [
+ "aya",
+ "libc",
  "packetframe-common",
  "serde",
  "serde_json",

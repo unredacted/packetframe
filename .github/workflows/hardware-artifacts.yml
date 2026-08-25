@@ -86,8 +86,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             crates/modules/fast-path/bpf/target/
+            crates/modules/guard/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-hwtest-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/probe/bpf/**') }}
+          key: ${{ runner.os }}-hwtest-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/guard/bpf/**', 'crates/modules/probe/bpf/**') }}
 
       - name: Install bpf-linker
         run: |
@@ -126,6 +127,7 @@ jobs:
           }
           mkdir -p dist
           build_one crates/modules/fast-path/bpf fast-path fast-path.bpf.o
+          build_one crates/modules/guard/bpf     guard     guard.bpf.o
           build_one crates/modules/probe/bpf     probe     probe.bpf.o
           ls -la dist/*.bpf.o
 
@@ -134,6 +136,7 @@ jobs:
           name: bpf-elf
           path: |
             dist/fast-path.bpf.o
+            dist/guard.bpf.o
             dist/probe.bpf.o
           retention-days: 14
           if-no-files-found: error
@@ -203,13 +206,15 @@ jobs:
         run: |
           set -eux
           FAST="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
+          GUARD="$(pwd)/prebuilt-bpf/guard.bpf.o"
           PROBE="$(pwd)/prebuilt-bpf/probe.bpf.o"
           head -c 4 "${FAST}"  | od -An -c | grep -q 'E   L   F'
+          head -c 4 "${GUARD}" | od -An -c | grep -q 'E   L   F'
           head -c 4 "${PROBE}" | od -An -c | grep -q 'E   L   F'
           # Cross.toml's passthrough list doesn't cover these, so forward
           # them with explicit -e, using the container's mount point for
           # the workspace (/project). Same approach as release.yml.
-          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o" >> "${GITHUB_ENV}"
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_GUARD_BPF_OBJ_PATH=/project/prebuilt-bpf/guard.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o" >> "${GITHUB_ENV}"
 
       # `--tests` is the point of this job and is NOT covered by
       # ci.yml's cross matrix (which builds `--release --workspace`
@@ -222,8 +227,8 @@ jobs:
           set -euo pipefail
           cross build --release --target "${TARGET}" \
             --tests --bins \
-            -p packetframe-fast-path -p packetframe-probe -p packetframe-cli \
-            -p packetframe-vpp-offload \
+            -p packetframe-fast-path -p packetframe-guard -p packetframe-probe \
+            -p packetframe-cli -p packetframe-vpp-offload \
             --message-format=json | tee build.json >/dev/null
 
       - name: Stage bundle
@@ -300,7 +305,7 @@ jobs:
           # silently absent rather than failing anything. The convergence
           # bench measures the plan's ≤60 s budget and is hardware-only,
           # so an empty bundle would be discovered on the router.
-          for required in ("vpp_convergence_bench",):
+          for required in ("vpp_convergence_bench", "guard_fixtures"):
               if required not in staged_tests:
                   sys.exit(
                       f"{required} missing from the bundle — is its package "
@@ -428,7 +433,7 @@ jobs:
           set -u
           cd "$(dirname "$0")/tests" || exit 1
 
-          SAFE="verifier fixtures tc_fixtures feature_gates mss_clamp_gate fib_fixtures fib_hash_vectors bench"
+          SAFE="verifier fixtures tc_fixtures feature_gates mss_clamp_gate fib_fixtures fib_hash_vectors bench guard_verifier guard_fixtures"
 
           if [ "${1:-}" = "--list" ]; then
             ls -1

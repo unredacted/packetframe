@@ -260,7 +260,10 @@ fn probe_kconfig() -> Capability {
     }
 }
 
-fn read_kconfig() -> std::io::Result<String> {
+/// Read the running kernel's config text (/proc/config.gz, else
+/// /boot/config-$(uname -r)). Public for per-module feasibility
+/// probes (guard checks cls_bpf/clsact support).
+pub fn read_kconfig() -> std::io::Result<String> {
     // Prefer /proc/config.gz (in-kernel config) → /boot/config-$(uname -r).
     let proc_gz = Path::new("/proc/config.gz");
     if proc_gz.exists() {
@@ -283,7 +286,9 @@ fn read_kconfig() -> std::io::Result<String> {
     ))
 }
 
-fn kconfig_flag_set(contents: &str, flag: &str) -> bool {
+/// True when `flag` is set (y/m/value) in kernel-config text from
+/// [`read_kconfig`]. Public for per-module feasibility probes.
+pub fn kconfig_flag_set(contents: &str, flag: &str) -> bool {
     contents
         .lines()
         .map(str::trim)
