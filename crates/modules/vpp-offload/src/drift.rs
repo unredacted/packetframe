@@ -762,13 +762,7 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
         RouteAddress, RouteAttribute, RouteLwEnCapType, RouteMessage, RouteType,
     };
     use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
-    // The `kind()` accessor for an unparsed attribute. Same crate
-    // the message types come from, already a direct dependency.
-    use netlink_packet_core::Nla as _;
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
-
-    /// `RTA_NH_ID` — see [`KernelRoute::via_nexthop_object`].
-    const RTA_NH_ID: u16 = 30;
 
     /// The kernel's name for a lightweight-encap action, for the
     /// operator's message. `None` is the overwhelming majority and is
@@ -898,14 +892,11 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             // RTA_TABLE carries ids past the u8 header
                             // field — policy tables live up there.
                             RouteAttribute::Table(t) => table = *t,
-                            // RTA_NH_ID (30). The vendored crate does
-                            // not parse it — the constant is commented
-                            // out in its source — so it lands here,
-                            // and a route carrying it names its
-                            // devices nowhere this scan can read.
-                            RouteAttribute::Other(nla) if nla.kind() == RTA_NH_ID => {
-                                nexthop_object = true
-                            }
+                            // RTA_NH_ID: a route carrying it names its
+                            // devices in a nexthop object, nowhere this
+                            // scan can read. See
+                            // [`KernelRoute::via_nexthop_object`].
+                            RouteAttribute::NhId(_) => nexthop_object = true,
                             _ => {}
                         }
                     }

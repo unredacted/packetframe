@@ -1658,9 +1658,7 @@ fn extract_fdb_master(attrs: &[NeighbourAttribute]) -> Option<u32> {
 
 /// v0.2.9: AF_BRIDGE RTM_GETNEIGH dump — the bridge FDB. Returns
 /// `(master, MAC) → port ifindex` for masters in `parents`. Same
-/// dedicated-unicast-connection pattern as [`dump_neighbours`];
-/// `message_mut()` overrides the family because rtnetlink's typed
-/// `set_family` only speaks v4/v6.
+/// dedicated-unicast-connection pattern as [`dump_neighbours`].
 async fn dump_fdb(
     parents: &std::collections::HashSet<u32>,
 ) -> Result<HashMap<(u32, [u8; 6]), u32>, NeighError> {
@@ -1669,9 +1667,11 @@ async fn dump_fdb(
     tokio::spawn(connection);
 
     let mut out: HashMap<(u32, [u8; 6]), u32> = HashMap::new();
-    let mut req = handle.neighbours().get();
-    req.message_mut().header.family = AddressFamily::Bridge;
-    let mut entries = req.execute();
+    let mut entries = handle
+        .neighbours()
+        .get()
+        .set_address_family(AddressFamily::Bridge)
+        .execute();
     while let Some(msg) = entries
         .try_next()
         .await
