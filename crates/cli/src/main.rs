@@ -36,6 +36,12 @@ use packetframe_common::config::Config;
 pub(crate) const EXIT_OK: u8 = 0;
 pub(crate) const EXIT_STARTUP_ERROR: u8 = 1;
 pub(crate) const EXIT_RUNTIME_ERROR: u8 = 2;
+/// `feasibility` only: every core requirement passed but a declared
+/// module's attach gates are failing. Distinct from
+/// `EXIT_STARTUP_ERROR` so automation gating fast-path work does not
+/// false-negative on a box that is only missing the vpp-offload layer
+/// (review finding on #200; extends the §7.3 set — spec note owed).
+pub(crate) const EXIT_MODULE_BLOCKED: u8 = 3;
 
 /// Default config path used when the caller omits `--config`. Matches
 /// the systemd-unit install location in the deployment playbook so
@@ -359,6 +365,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         vpp_steer_ports,
         vpp_workers,
         vpp_binary,
+        vpp_loopback,
         allowlist,
         vpp_dirs,
         vpp_exempts,
@@ -378,6 +385,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 let vpp_steer_ports = feasibility::vpp_steer_ports_from_config(&c);
                 let vpp_workers = feasibility::vpp_workers_from_config(&c);
                 let vpp_binary = feasibility::vpp_binary_from_config(&c);
+                let vpp_loopback = feasibility::vpp_loopback_from_config(&c);
                 let allowlist = feasibility::allowlist_from_config(&c);
                 let vpp_dirs = feasibility::vpp_steer_directions_from_config(&c);
                 let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
@@ -388,6 +396,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     vpp_steer_ports,
                     vpp_workers,
                     vpp_binary,
+                    vpp_loopback,
                     allowlist,
                     vpp_dirs,
                     vpp_exempts,
@@ -405,6 +414,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             Vec::new(),
             0,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -419,6 +429,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             steer_ports: &vpp_steer_ports,
             workers: vpp_workers,
             binary: vpp_binary.as_deref(),
+            loopback: vpp_loopback,
             steer_directions: &vpp_dirs,
             steer_exempts: &vpp_exempts,
         },
@@ -430,6 +441,8 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
     }
     if report.passed {
         ExitCode::from(EXIT_OK)
+    } else if report.vpp_blocked_only {
+        ExitCode::from(EXIT_MODULE_BLOCKED)
     } else {
         ExitCode::from(EXIT_STARTUP_ERROR)
     }

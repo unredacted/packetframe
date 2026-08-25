@@ -1301,11 +1301,15 @@ impl Module for VppOffloadModule {
 /// `steer on`, since attach installs nothing otherwise. See
 /// `probe_linux`'s module doc for the incident that ended the
 /// all-advisory rule.
+// One argument per attach-gated directive; the CLI groups them in
+// `VppProbeInputs`, the module boundary keeps plain args.
+#[allow(clippy::too_many_arguments)]
 pub fn run_feasibility_probes(
     ports: &[String],
     steer_ports: &[String],
     workers: u32,
     vpp_binary: Option<&str>,
+    loopback: Option<std::net::Ipv4Addr>,
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
@@ -1317,6 +1321,7 @@ pub fn run_feasibility_probes(
             steer_ports,
             workers,
             vpp_binary,
+            loopback,
             allowlist,
             directions,
             steer_exempts,
@@ -1329,6 +1334,7 @@ pub fn run_feasibility_probes(
             steer_ports,
             workers,
             vpp_binary,
+            loopback,
             allowlist,
             directions,
             steer_exempts,

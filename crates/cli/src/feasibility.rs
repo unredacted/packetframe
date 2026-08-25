@@ -15,6 +15,12 @@ use packetframe_common::{
 
 pub struct Rendered {
     pub passed: bool,
+    /// Every core requirement passed and only vpp-graft capabilities
+    /// block — the "core capabilities PASS; vpp-offload attach
+    /// BLOCKED" case, which gets its own exit code so automation
+    /// gating fast-path work can tell it from a core failure (review
+    /// finding on #200).
+    pub vpp_blocked_only: bool,
     pub json_output: Option<String>,
 }
 
@@ -259,6 +265,20 @@ pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
         })
 }
 
+/// The configured `loopback-address`, if any — `bring_up` refuses one
+/// the kernel currently holds, so the `vpp.loopback` probe mirrors
+/// that refusal (review finding on #200).
+pub fn vpp_loopback_from_config(config: &Config) -> Option<std::net::Ipv4Addr> {
+    config
+        .modules
+        .iter()
+        .flat_map(|m| &m.directives)
+        .find_map(|d| match d {
+            ModuleDirective::VppLoopbackAddress(p) => Some(p.addr),
+            _ => None,
+        })
+}
+
 /// The vpp-offload facts the probes need, grouped so the parameter
 /// list stops growing by one per directive (clippy agrees at eight).
 pub struct VppProbeInputs<'a> {
@@ -266,6 +286,7 @@ pub struct VppProbeInputs<'a> {
     pub steer_ports: &'a [String],
     pub workers: u32,
     pub binary: Option<&'a str>,
+    pub loopback: Option<std::net::Ipv4Addr>,
     pub steer_directions: &'a [VppSteerDirection],
     pub steer_exempts: &'a [packetframe_common::config::Ipv4Prefix],
 }
@@ -311,6 +332,7 @@ pub fn probe_and_render(
                 vpp.steer_ports,
                 vpp.workers,
                 vpp.binary,
+                vpp.loopback,
                 allowlist,
                 vpp.steer_directions,
                 vpp.steer_exempts,
@@ -339,21 +361,54 @@ pub fn probe_and_render(
         passed,
         capabilities: report.capabilities,
     };
+    let (core_blockers, vpp_blockers) = partition_blockers(&report, &vpp_cap_names);
+    let vpp_blocked_only = core_blockers.is_empty() && !vpp_blockers.is_empty();
 
     if human {
         print_human(&report, &vpp_cap_names);
         Rendered {
             passed: report.passed,
+            vpp_blocked_only,
             json_output: None,
         }
     } else {
-        let json =
-            serde_json::to_string_pretty(&report).expect("FeasibilityReport is serializable");
+        // The JSON carries what the human summary partitions on —
+        // without it a machine consumer is left with exactly the
+        // name-prefix guess `summary_lines` disavows (review finding
+        // on #200).
+        #[derive(serde::Serialize)]
+        struct JsonReport<'a> {
+            #[serde(flatten)]
+            report: &'a FeasibilityReport,
+            /// Required vpp-graft capabilities whose verdict is not
+            /// Pass; empty when nothing blocks the module's attach.
+            vpp_attach_blockers: Vec<&'a str>,
+        }
+        let json = serde_json::to_string_pretty(&JsonReport {
+            report: &report,
+            vpp_attach_blockers: vpp_blockers.iter().map(|c| c.name.as_str()).collect(),
+        })
+        .expect("FeasibilityReport is serializable");
         Rendered {
             passed: report.passed,
+            vpp_blocked_only,
             json_output: Some(json),
         }
     }
+}
+
+/// Required-and-not-Pass capabilities, split into (core, vpp) by
+/// membership in the vpp graft.
+fn partition_blockers<'a>(
+    report: &'a FeasibilityReport,
+    vpp_cap_names: &[String],
+) -> (Vec<&'a Capability>, Vec<&'a Capability>) {
+    let (vpp, core): (Vec<&Capability>, Vec<&Capability>) = report
+        .capabilities
+        .iter()
+        .filter(|c| c.required && c.status != CapabilityStatus::Pass)
+        .partition(|c| vpp_cap_names.contains(&c.name));
+    (core, vpp)
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -478,17 +533,10 @@ fn print_human(report: &FeasibilityReport, vpp_cap_names: &[String]) {
 /// vpp-offload's probes — membership, not a name-prefix guess, decides
 /// which failures read as "attach BLOCKED".
 fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<String> {
-    let failing: Vec<&Capability> = report
-        .capabilities
-        .iter()
-        .filter(|c| c.required && c.status != CapabilityStatus::Pass)
-        .collect();
-    if failing.is_empty() {
+    let (core, vpp_blockers) = partition_blockers(report, vpp_cap_names);
+    if core.is_empty() && vpp_blockers.is_empty() {
         return vec!["Result: PASS, all required capabilities present.".into()];
     }
-    let (vpp_blockers, core): (Vec<&Capability>, Vec<&Capability>) = failing
-        .into_iter()
-        .partition(|c| vpp_cap_names.contains(&c.name));
     let item = |c: &Capability| {
         format!(
             "  - {} ({})",
@@ -498,8 +546,12 @@ fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<St
     };
     let mut lines = Vec::new();
     if core.is_empty() {
+        // "core capabilities PASS", not "PASS for fast-path": a
+        // non-required fast-path row (an xdp.attach trial) can FAIL in
+        // the table above, and the summary must not assert a readiness
+        // it did not check (review finding on #200).
         lines.push(format!(
-            "Result: PASS for fast-path; vpp-offload attach BLOCKED by {} check{}:",
+            "Result: core capabilities PASS; vpp-offload attach BLOCKED by {} check{}:",
             vpp_blockers.len(),
             if vpp_blockers.len() == 1 { "" } else { "s" },
         ));
@@ -555,12 +607,16 @@ fn print_row(cap: &Capability, name_w: usize) {
 mod summary_tests {
     use super::*;
 
+    // A struct literal, not a match over CapabilityStatus: this helper
+    // must keep compiling when the enum grows a variant on another
+    // branch (review finding on #200/#201 — the two PRs merged cleanly
+    // and the exhaustive match here broke main).
     fn cap(name: &str, status: CapabilityStatus, required: bool) -> Capability {
-        match status {
-            CapabilityStatus::Pass => Capability::pass(name, "ok", required),
-            CapabilityStatus::Fail => Capability::fail(name, "broken; fix it", required),
-            CapabilityStatus::Unknown => Capability::unknown(name, "could not tell", required),
-            CapabilityStatus::Deferred => Capability::deferred(name, "later"),
+        Capability {
+            name: name.into(),
+            status,
+            detail: "probe detail".into(),
+            required,
         }
     }
 
@@ -589,7 +645,7 @@ mod summary_tests {
         let lines = summary_lines(&report, &["vpp.irq-affinity".to_string()]);
         assert_eq!(
             lines[0],
-            "Result: PASS for fast-path; vpp-offload attach BLOCKED by 1 check:"
+            "Result: core capabilities PASS; vpp-offload attach BLOCKED by 1 check:"
         );
         assert!(
             lines.iter().any(|l| l.contains("vpp.irq-affinity")),

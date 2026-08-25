@@ -157,6 +157,22 @@ fn port_macs(sysfs_net: &Path, iface: &str) -> Result<([u8; 6], Vec<[u8; 6]>), S
 
 /// Refuse a `loopback-address` the kernel already holds.
 ///
+/// Is an IOMMU registered under the given `/sys/class/iommu`?
+/// `Ok(Some)` carries the first entry's name (the probe's PASS detail);
+/// `Ok(None)` is an empty directory; `Err` is an unreadable directory
+/// or dirent — a state neither reader may take as active. Shared by
+/// `bring_up`'s refusal and `probe_iommu` so the two verdicts cannot
+/// drift on the same directory (review finding on #200: the inline
+/// copies disagreed on an unreadable dirent).
+pub(crate) fn iommu_active(dir: &Path) -> std::io::Result<Option<std::ffi::OsString>> {
+    let mut entries = std::fs::read_dir(dir)?;
+    match entries.next() {
+        Some(Ok(e)) => Ok(Some(e.file_name())),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
 /// VPP's arp node answers requests targeting its loopback's address,
 /// sourcing the member VF's MAC. If that address is a LIVE kernel
 /// address — the gateway, in the reference incident — two responders
@@ -170,7 +186,7 @@ fn port_macs(sysfs_net: &Path, iface: &str) -> Result<([u8; 6], Vec<[u8; 6]>), S
 /// The decision is split from the `getifaddrs` read so the refusal
 /// text and the match are testable without owning the host's
 /// interfaces.
-fn loopback_collision(
+pub(crate) fn loopback_collision(
     loopback: std::net::Ipv4Addr,
     owned: &[(String, std::net::Ipv4Addr)],
 ) -> Option<String> {
@@ -196,7 +212,7 @@ fn loopback_collision(
 /// collision check rather than refusing every attach — a guard against
 /// one specific misconfiguration must not become a new way for a
 /// healthy box to fail to start.
-fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
+pub(crate) fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
@@ -468,10 +484,7 @@ pub fn bring_up(
     // on the attach path read the fact, so the refusal was
     // documentation. Still the pure phase: a box that cannot isolate
     // DMA must cost no sysfs writes.
-    let iommu_active = std::fs::read_dir(&paths.sysfs_iommu_class)
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false);
-    if !iommu_active {
+    if !matches!(iommu_active(&paths.sysfs_iommu_class), Ok(Some(_))) {
         return Err(format!(
             "no active IOMMU ({} is empty or unreadable): VFIO would bind without DMA \
              isolation (no-iommu), which this module refuses — check firmware/boot \

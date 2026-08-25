@@ -21,20 +21,27 @@ use std::path::Path;
 
 use packetframe_common::probe::Capability;
 
+// One argument per attach-gated directive; the CLI groups them in
+// `VppProbeInputs`, the module boundary keeps plain args.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     ports: &[String],
     steer_ports: &[String],
     workers: u32,
     vpp_binary: Option<&str>,
+    loopback: Option<std::net::Ipv4Addr>,
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
 ) -> Vec<Capability> {
-    let mut caps = Vec::with_capacity(5 + ports.len());
+    let mut caps = Vec::with_capacity(6 + ports.len());
     caps.push(probe_iommu());
     caps.push(probe_vfio());
     caps.push(probe_hugepages());
     caps.push(probe_irq_affinity(ports, workers));
+    if let Some(addr) = loopback {
+        caps.push(probe_loopback(addr));
+    }
     // Probe the binary the module will ACTUALLY exec. Probing the
     // defaults while the config names another path would report a pass
     // for an executable we never run (or a failure for one that
@@ -371,29 +378,48 @@ fn plan_and_report(
 
 /// An SMMU registered in /sys/class/iommu is the difference between
 /// real IOMMU-isolated VFIO and no-iommu mode; the module refuses the
-/// latter in `bring_up`'s pure phase, reading the same directory this
-/// reads — the refusal was probe-text-only until a review finding on
-/// #200 pointed out nothing on the attach path enforced it.
+/// latter in `bring_up`'s pure phase — via the same
+/// [`crate::bringup::iommu_active`] read this uses, so probe and
+/// refusal cannot drift (review finding on #200: the inline copies
+/// disagreed on an unreadable dirent). Path-injected so the non-PASS
+/// arms are testable against a fixture sysfs.
 fn probe_iommu() -> Capability {
-    match fs::read_dir("/sys/class/iommu") {
-        Ok(mut entries) => {
-            if let Some(Ok(e)) = entries.next() {
-                Capability::pass(
-                    "vpp.iommu",
-                    format!("active: {}", e.file_name().to_string_lossy()),
-                    true,
-                )
-            } else {
-                Capability::fail(
-                    "vpp.iommu",
-                    "/sys/class/iommu is empty: SMMU compiled in but not active \
-                     (check firmware/boot config); VFIO would run no-iommu, which \
-                     the module refuses",
-                    true,
-                )
-            }
-        }
-        Err(e) => Capability::unknown("vpp.iommu", format!("read /sys/class/iommu: {e}"), true),
+    probe_iommu_at(Path::new("/sys/class/iommu"))
+}
+
+fn probe_iommu_at(dir: &Path) -> Capability {
+    match crate::bringup::iommu_active(dir) {
+        Ok(Some(name)) => Capability::pass(
+            "vpp.iommu",
+            format!("active: {}", name.to_string_lossy()),
+            true,
+        ),
+        Ok(None) => Capability::fail(
+            "vpp.iommu",
+            "/sys/class/iommu is empty: SMMU compiled in but not active \
+             (check firmware/boot config); VFIO would run no-iommu, which \
+             the module refuses",
+            true,
+        ),
+        Err(e) => Capability::unknown("vpp.iommu", format!("read {}: {e}", dir.display()), true),
+    }
+}
+
+/// `bring_up` refuses a `loopback-address` the kernel currently holds
+/// (the ARP responder war measured on the primary 2026-08-14). Mirrors
+/// that refusal exactly — same collision check, same `getifaddrs`
+/// read, same degrade-open on an empty list — so the summary cannot
+/// say PASS over the one attach refusal that reads live kernel state
+/// (review finding on #200).
+fn probe_loopback(addr: std::net::Ipv4Addr) -> Capability {
+    let name = "vpp.loopback";
+    match crate::bringup::loopback_collision(addr, &crate::bringup::kernel_v4_addrs()) {
+        Some(err) => Capability::fail(name, err, true),
+        None => Capability::pass(
+            name,
+            format!("loopback-address {addr} is not a live kernel address"),
+            true,
+        ),
     }
 }
 
@@ -482,7 +508,25 @@ fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
             " (default path)",
         ),
     };
+    // A failed check as non-root is a uid artifact, not a box fact:
+    // attach runs as root, whose X_OK any x bit satisfies, and a
+    // root-only parent directory hides the file from is_file()
+    // entirely. Advisory Unknown, so the invoker's uid cannot flip the
+    // BLOCKED verdict (review finding on #200).
+    let non_root_unknown = |reason: String| -> Option<Capability> {
+        // SAFETY: geteuid has no failure modes or preconditions.
+        (unsafe { libc::geteuid() } != 0).then(|| {
+            Capability::unknown(
+                name,
+                format!("cannot verify {} as non-root ({reason}); re-run feasibility as root — attach runs as root", path.display()),
+                false,
+            )
+        })
+    };
     if !path.is_file() {
+        if let Some(cap) = non_root_unknown("not visible or not a file".to_string()) {
+            return cap;
+        }
         let hint = if override_path.is_some() {
             "configured via `vpp-binary`"
         } else {
@@ -498,6 +542,9 @@ fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
         );
     }
     if let Err(e) = crate::bringup::check_executable(&path) {
+        if let Some(cap) = non_root_unknown(format!("access(X_OK): {e}")) {
+            return cap;
+        }
         return Capability::fail(
             name,
             format!(
@@ -833,7 +880,11 @@ mod steering_probe_tests {
             probe_iommu(),
             probe_vfio(),
             probe_hugepages(),
-            probe_vpp_binary(None),
+            // A path that exists and is executable on any test host:
+            // the binary probe's one deliberate exception is a FAILING
+            // check under a non-root uid (a uid artifact, not a box
+            // fact), so the invariant is asserted on a passing path.
+            probe_vpp_binary(Some("/bin/sh")),
             probe_sriov("eth-nonexistent"),
             probe_irq_affinity(&[], 1),
         ] {
