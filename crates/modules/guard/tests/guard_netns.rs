@@ -167,40 +167,44 @@ fn open_packet_socket(ifindex: u32) -> OwnedFd {
     owned
 }
 
-fn send_frame(fd: &OwnedFd, ifindex: u32, frame: &[u8]) {
+/// Send one frame. `true` = the device path accepted it; `false` =
+/// the send failed with ENOBUFS, which at a guarded interface means
+/// **the guard dropped it**: TC_ACT_SHOT at the clsact egress hook
+/// makes `dev_queue_xmit` return `NET_XMIT_DROP`, and AF_PACKET's
+/// `packet_snd` maps that to ENOBUFS (`net_xmit_errno`) — the drop is
+/// reported to the local sender synchronously. This is the guard's
+/// operator-visible fingerprint (a clamped daemon's own sendto fails)
+/// and this test's own discovery: two earlier CI rounds misread it as
+/// queue exhaustion, and a retry-until-accepted loop turned the
+/// limiter into a pacer — every frame eventually earned a token and
+/// 40/40 were delivered, with the ~680 retries counted as drops.
+/// Any errno other than ENOBUFS still panics.
+fn send_frame(fd: &OwnedFd, ifindex: u32, frame: &[u8]) -> bool {
     let mut sll: libc::sockaddr_ll = unsafe { mem::zeroed() };
     sll.sll_family = libc::AF_PACKET as u16;
     sll.sll_ifindex = ifindex as i32;
     sll.sll_halen = 6;
     sll.sll_addr[..6].copy_from_slice(&frame[0..6]);
-    // Back-to-back sends can outrun the device queue on slow hosts
-    // (GHA runners, TCG qemu) — the kernel answers ENOBUFS, which is
-    // backpressure, not a failure. Retry with a growing pause; the
-    // storm's clamp assertions already tolerate the GCRA refill this
-    // pacing admits (its margin is sized for it).
-    for attempt in 0..50u64 {
-        let sent = unsafe {
-            libc::sendto(
-                fd.as_raw_fd(),
-                frame.as_ptr() as *const _,
-                frame.len(),
-                0,
-                &sll as *const _ as *const libc::sockaddr,
-                mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if sent == frame.len() as isize {
-            return;
-        }
-        let err = std::io::Error::last_os_error();
-        assert_eq!(
-            err.raw_os_error(),
-            Some(libc::ENOBUFS),
-            "sendto: {err} (only ENOBUFS is retryable)"
-        );
-        std::thread::sleep(Duration::from_millis(1 + attempt));
+    let sent = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            frame.as_ptr() as *const _,
+            frame.len(),
+            0,
+            &sll as *const _ as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if sent == frame.len() as isize {
+        return true;
     }
-    panic!("sendto: ENOBUFS persisted across 50 retries");
+    let err = std::io::Error::last_os_error();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOBUFS),
+        "sendto: {err} (only ENOBUFS means policed)"
+    );
+    false
 }
 
 /// Count frames matching `is_ours` arriving within `window`,
@@ -281,21 +285,21 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
     let tx = open_packet_socket(ifindex_a);
     let rx = open_packet_socket(ifindex_b);
 
-    // --- enforce: 40 same-target requests, back-to-back. Burst 5
-    // passes; the tail is dropped at the egress hook and never reaches
-    // the peer. The refill is 200 ms/token and the send loop takes
-    // ~ms, so the margin below is generous, not tight.
+    // --- enforce: 40 same-target requests, back-to-back. Burst 5 is
+    // accepted; every clamped frame is reported to the SENDER as an
+    // ENOBUFS sendto failure (see send_frame) and never reaches the
+    // peer. The loop takes ~ms against a 200 ms/token refill, so at
+    // most a token or two beyond the burst can be legitimately earned.
     let target_a = [206, 81, 82, 21];
     let storm = common::arp_request(SRC_MAC, target_a);
-    for _ in 0..40 {
-        send_frame(&tx, ifindex_a, &storm);
-    }
-    let delivered = recv_count(&rx, Duration::from_secs(2), arp_for(target_a));
+    let accepted = (0..40)
+        .filter(|_| send_frame(&tx, ifindex_a, &storm))
+        .count() as u64;
+    let delivered = recv_count(&rx, Duration::from_secs(2), arp_for(target_a)) as u64;
     // Assert the pipeline stages in order, each with the counter
     // snapshot, so a failure names WHERE it broke: program not in the
     // egress path (total_egress stuck), config lookup missing
-    // (pass_no_cfg), classifier not matching (pass_no_match), or the
-    // limiter not clamping (arp_pass = 40).
+    // (pass_no_cfg), or the limiter not clamping.
     let stats = h.snapshot();
     assert!(
         stats[idx::TOTAL_EGRESS] >= 40,
@@ -306,21 +310,32 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
         0,
         "GUARD_CFG lookup missed at real egress (skb->ifindex vs written key?): stats={stats:?}"
     );
-    // Lower bound: the burst. Upper bound: burst plus the refill a
-    // slow, ENOBUFS-paced send loop can legitimately admit at 5/s.
     assert!(
-        (5..=20).contains(&delivered),
-        "expected ~burst(5) of 40 frames delivered, got {delivered}; stats={stats:?}"
+        (5..=8).contains(&accepted),
+        "expected ~burst(5) of 40 sends accepted, got {accepted}; stats={stats:?}"
     );
-    assert!(
-        h.stat(idx::ARP_DROP) >= 20,
-        "the clamped tail must be attributed: stats={:?}",
-        h.snapshot()
+    // The three views of the clamp must agree exactly: sender-visible
+    // accepts == guard's pass counter == frames on the wire, and the
+    // ENOBUFS-rejected remainder == the drop counter. The namespace is
+    // quiet (no addresses, IPv6 off), so nothing else emits ARP.
+    assert_eq!(
+        stats[idx::ARP_PASS],
+        accepted,
+        "arp_pass must equal accepted sends: stats={stats:?}"
     );
-    assert!(h.stat(idx::ARP_PASS) >= 5);
+    assert_eq!(
+        stats[idx::ARP_DROP],
+        40 - accepted,
+        "arp_drop must equal ENOBUFS-rejected sends: stats={stats:?}"
+    );
+    assert_eq!(
+        delivered, accepted,
+        "every accepted frame and nothing else reaches the peer; stats={stats:?}"
+    );
 
-    // --- monitor: fresh target (fresh budget), same storm; everything
-    // is delivered and the would-drops are counted.
+    // --- monitor: fresh target (fresh budget), same storm; every send
+    // is accepted (no ENOBUFS — monitor never SHOTs), everything is
+    // delivered, and the would-drops are counted.
     let rules_mon = GuardIfaceRules {
         arp_ns: Some(RateRule {
             rate: 5,
@@ -333,9 +348,15 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
     h.set_guard_cfg(ifindex_a, GuardIfCfg::compile([0; 6], &rules_mon));
     let target_b = [206, 81, 81, 10];
     let storm = common::arp_request(SRC_MAC, target_b);
-    for _ in 0..40 {
-        send_frame(&tx, ifindex_a, &storm);
-    }
+    let accepted_mon = (0..40)
+        .filter(|_| send_frame(&tx, ifindex_a, &storm))
+        .count();
+    assert_eq!(
+        accepted_mon,
+        40,
+        "monitor mode must never reject a send: stats={:?}",
+        h.snapshot()
+    );
     let delivered = recv_count(&rx, Duration::from_secs(2), arp_for(target_b));
     assert!(
         delivered >= 35,
@@ -350,7 +371,10 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
     // Unicast traffic through the guarded iface is untouched either
     // way (the fast exit): a plain IPv4 frame arrives.
     let unicast = common::unicast_ipv4(SRC_MAC, [0xaa, 0, 0, 0, 0, 2]);
-    send_frame(&tx, ifindex_a, &unicast);
+    assert!(
+        send_frame(&tx, ifindex_a, &unicast),
+        "unicast send accepted"
+    );
     let delivered = recv_count(&rx, Duration::from_secs(2), move |f: &[u8]| {
         f.len() >= 14 && f[0..6] == [0xaa, 0, 0, 0, 0, 2] && f[12..14] == [0x08, 0x00]
     });
