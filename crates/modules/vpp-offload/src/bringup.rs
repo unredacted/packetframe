@@ -75,6 +75,8 @@ pub struct AttachPaths {
     pub sysfs_cpu: PathBuf,
     /// `/proc/irq`, for the NIC-IRQ/worker-core overlap check.
     pub proc_irq: PathBuf,
+    /// `/sys/class/iommu`, for the IOMMU-isolation refusal.
+    pub sysfs_iommu_class: PathBuf,
     pub api_socket: PathBuf,
     pub startup_conf: PathBuf,
 }
@@ -85,6 +87,7 @@ impl AttachPaths {
             sys: SysPaths::live(state_dir, hugepage_bytes),
             sysfs_cpu: PathBuf::from(cores::SYSFS_CPU),
             proc_irq: PathBuf::from("/proc/irq"),
+            sysfs_iommu_class: PathBuf::from("/sys/class/iommu"),
             api_socket: PathBuf::from(API_SOCKET),
             startup_conf: PathBuf::from(STARTUP_CONF),
         }
@@ -457,6 +460,26 @@ pub fn bring_up(
         ));
     }
 
+    // VFIO must be IOMMU-isolated. With no active IOMMU the vfio-pci
+    // bind either fails outright (no viable iommu_group) or — with the
+    // kernel's unsafe no-iommu escape hatch enabled — binds with no
+    // DMA isolation at all. The `vpp.iommu` probe has always said this
+    // module refuses the latter; until a review finding on #200 nothing
+    // on the attach path read the fact, so the refusal was
+    // documentation. Still the pure phase: a box that cannot isolate
+    // DMA must cost no sysfs writes.
+    let iommu_active = std::fs::read_dir(&paths.sysfs_iommu_class)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if !iommu_active {
+        return Err(format!(
+            "no active IOMMU ({} is empty or unreadable): VFIO would bind without DMA \
+             isolation (no-iommu), which this module refuses — check firmware/boot \
+             config for the SMMU; `packetframe feasibility` reports this as `vpp.iommu`",
+            paths.sysfs_iommu_class.display()
+        ));
+    }
+
     let hugepage_bytes = paths.sys.hugepage_bytes;
     if hugepage_bytes == 0 {
         return Err(
@@ -611,7 +634,7 @@ pub fn bring_up(
 /// the permission *and* the mount. Real-uid semantics (`access`, not
 /// `faccessat(AT_EACCESS)`) — packetframe is not setuid, so the two
 /// coincide, and it keeps libc out of its AT_EACCESS emulation paths.
-fn check_executable(path: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn check_executable(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::ffi::OsStrExt as _;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;

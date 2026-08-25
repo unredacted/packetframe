@@ -371,7 +371,9 @@ fn plan_and_report(
 
 /// An SMMU registered in /sys/class/iommu is the difference between
 /// real IOMMU-isolated VFIO and no-iommu mode; the module refuses the
-/// latter at attach.
+/// latter in `bring_up`'s pure phase, reading the same directory this
+/// reads — the refusal was probe-text-only until a review finding on
+/// #200 pointed out nothing on the attach path enforced it.
 fn probe_iommu() -> Capability {
     match fs::read_dir("/sys/class/iommu") {
         Ok(mut entries) => {
@@ -413,79 +415,166 @@ fn probe_vfio() -> Capability {
     }
 }
 
-/// Report which hugepage pools exist and the default page size. The
-/// module reserves at attach; the probe just proves pools exist and
-/// captures the default size the sizing math will use.
+/// The two hugepage facts attach consumes — not just "pools exist"
+/// (review finding on #200): `bring_up` refuses a zero default page
+/// size, and acquire reserves from exactly the default-size pool
+/// (`SysPaths::live` builds `hugepages-<default-kB>` from it), so an
+/// unrelated pool cannot satisfy attach and must not pass here.
 fn probe_hugepages() -> Capability {
+    let name = "vpp.hugepages";
+    let default_bytes = default_hugepage_bytes();
+    if default_bytes == 0 {
+        return Capability::fail(
+            name,
+            "no parseable `Hugepagesize` in /proc/meminfo (CONFIG_HUGETLBFS?) — attach \
+             will refuse; VPP cannot be sized without it",
+            true,
+        );
+    }
     let pools = match fs::read_dir("/sys/kernel/mm/hugepages") {
         Ok(entries) => entries
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
         Err(e) => {
-            return Capability::unknown(
-                "vpp.hugepages",
-                format!("read /sys/kernel/mm/hugepages: {e}"),
-                true,
-            )
+            return Capability::unknown(name, format!("read /sys/kernel/mm/hugepages: {e}"), true)
         }
     };
-    if pools.is_empty() {
+    let want = format!("hugepages-{}kB", default_bytes >> 10);
+    if !pools.iter().any(|p| p == &want) {
         return Capability::fail(
-            "vpp.hugepages",
-            "no hugepage pools (CONFIG_HUGETLBFS?)",
+            name,
+            format!(
+                "default-size pool {want} missing (found: {}) — acquire reserves from \
+                 exactly that pool, so attach will fail",
+                if pools.is_empty() {
+                    "none".to_string()
+                } else {
+                    pools.join(", ")
+                }
+            ),
             true,
         );
     }
-    let default_mb = default_hugepage_bytes() >> 20;
     Capability::pass(
-        "vpp.hugepages",
-        format!("pools: {} (default {default_mb} MiB)", pools.join(", ")),
-        true,
-    )
-}
-
-fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
-    let candidates = match override_path {
-        Some(p) => vec![p.to_string()],
-        None => vec!["/usr/bin/vpp".to_string(), "/usr/sbin/vpp".to_string()],
-    };
-    for c in &candidates {
-        if Path::new(c).exists() {
-            let note = if override_path.is_some() {
-                " (from `vpp-binary`)"
-            } else {
-                " (default path)"
-            };
-            return Capability::pass("vpp.binary", format!("{c}{note}"), true);
-        }
-    }
-    let hint = if override_path.is_some() {
-        "configured via `vpp-binary`"
-    } else {
-        "install the pinned VPP package (see vpp-offload runbook), or set `vpp-binary`"
-    };
-    Capability::fail(
-        "vpp.binary",
+        name,
         format!(
-            "not found at {} — attach will refuse; {hint}",
-            candidates.join(" or ")
+            "pools: {} (default {} MiB; attach reserves from {want})",
+            pools.join(", "),
+            default_bytes >> 20
         ),
         true,
     )
 }
 
-fn probe_sriov(iface: &str) -> Capability {
-    let name = format!("vpp.{iface}.sriov");
-    let path = format!("/sys/class/net/{iface}/device/sriov_totalvfs");
-    match fs::read_to_string(&path) {
-        Ok(raw) => match raw.trim().parse::<u32>() {
-            Ok(0) => Capability::fail(&name, "sriov_totalvfs is 0: no VFs available", true),
-            Ok(n) => Capability::pass(&name, format!("{n} VFs available"), true),
-            Err(_) => Capability::unknown(&name, format!("unparseable {path}: {raw:?}"), true),
-        },
-        Err(e) => Capability::unknown(&name, format!("{path}: {e}"), true),
+/// Mirrors `bring_up`'s binary gate exactly: the same single default
+/// path (`DEFAULT_VPP_BINARY`), the same `is_file()` + `access(X_OK)`
+/// checks. This used to accept either of two candidates on a bare
+/// `exists()`, so a directory, a chmod-x file, or a box with only the
+/// legacy `/usr/sbin/vpp` passed a required capability attach refuses
+/// (review finding on #200).
+fn probe_vpp_binary(override_path: Option<&str>) -> Capability {
+    let name = "vpp.binary";
+    let (path, note) = match override_path {
+        Some(p) => (Path::new(p).to_path_buf(), " (from `vpp-binary`)"),
+        None => (
+            Path::new(crate::bringup::DEFAULT_VPP_BINARY).to_path_buf(),
+            " (default path)",
+        ),
+    };
+    if !path.is_file() {
+        let hint = if override_path.is_some() {
+            "configured via `vpp-binary`"
+        } else {
+            "install the pinned VPP package (see vpp-offload runbook), or set `vpp-binary`"
+        };
+        return Capability::fail(
+            name,
+            format!(
+                "{} does not exist — attach will refuse; {hint}",
+                path.display()
+            ),
+            true,
+        );
     }
+    if let Err(e) = crate::bringup::check_executable(&path) {
+        return Capability::fail(
+            name,
+            format!(
+                "{} is not executable ({e}) — attach will refuse; `chmod +x` it, or move \
+                 it off a `noexec` mount (`/tmp` is one on UniFi OS)",
+                path.display()
+            ),
+            true,
+        );
+    }
+    Capability::pass(name, format!("{}{note}", path.display()), true)
+}
+
+fn probe_sriov(iface: &str) -> Capability {
+    probe_sriov_at(Path::new("/sys/class/net"), iface)
+}
+
+/// Capacity AND current allocation, because attach needs both: the
+/// numvfs write fails with `sriov_totalvfs` at 0, and `ensure_vf_in`
+/// refuses `sriov_numvfs >= 2` by name — it manages exactly one VF per
+/// port and cannot tell which of several is ours. Checking only the
+/// hardware maximum passed a port some other setup had already put two
+/// VFs on (review finding on #200). Path-injected so the refusal arm
+/// is testable against a fixture sysfs.
+fn probe_sriov_at(sysfs_net: &Path, iface: &str) -> Capability {
+    let name = format!("vpp.{iface}.sriov");
+    let dev = sysfs_net.join(iface).join("device");
+    let total_path = dev.join("sriov_totalvfs");
+    let total = match fs::read_to_string(&total_path) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(0) => return Capability::fail(&name, "sriov_totalvfs is 0: no VFs available", true),
+            Ok(n) => n,
+            Err(_) => {
+                return Capability::unknown(
+                    &name,
+                    format!("unparseable {}: {raw:?}", total_path.display()),
+                    true,
+                )
+            }
+        },
+        Err(e) => {
+            return Capability::unknown(&name, format!("{}: {e}", total_path.display()), true)
+        }
+    };
+    let numvfs_path = dev.join("sriov_numvfs");
+    // Unparseable reads as 0 here because that is exactly what
+    // `ensure_vf_in` does with it (`parse().unwrap_or(0)`).
+    let current = match fs::read_to_string(&numvfs_path) {
+        Ok(raw) => raw.trim().parse::<u32>().unwrap_or(0),
+        Err(e) => {
+            return Capability::unknown(
+                &name,
+                format!(
+                    "{}: {e} — attach reads this file before creating a VF",
+                    numvfs_path.display()
+                ),
+                true,
+            )
+        }
+    };
+    if current >= 2 {
+        return Capability::fail(
+            &name,
+            format!(
+                "sriov_numvfs={current} — attach will refuse; vpp-offload manages exactly \
+                 one VF per port and cannot tell which of {current} is ours, clear them \
+                 first (`echo 0 > {}`)",
+                numvfs_path.display()
+            ),
+            true,
+        );
+    }
+    Capability::pass(
+        &name,
+        format!("{total} VFs available, {current} currently allocated"),
+        true,
+    )
 }
 
 pub(crate) fn default_hugepage_bytes() -> u64 {
@@ -689,6 +778,44 @@ mod steering_probe_tests {
         );
         assert_eq!(steered_ok.status, CapabilityStatus::Pass, "{steered_ok:?}");
         assert!(steered_ok.required, "{steered_ok:?}");
+    }
+
+    /// The SR-IOV probe answers the question attach asks, not just the
+    /// hardware's: `ensure_vf_in` refuses `sriov_numvfs >= 2` because
+    /// it cannot tell which VF is ours, so a port with capacity but a
+    /// foreign allocation must fail here too (review finding on #200 —
+    /// checking only `sriov_totalvfs` passed it).
+    #[test]
+    fn a_port_with_foreign_vfs_fails_as_attach_refuses_it() {
+        let base = std::env::temp_dir().join(format!("pf-probe-sriov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dev = base.join("eth4").join("device");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("sriov_totalvfs"), "8\n").unwrap();
+
+        std::fs::write(dev.join("sriov_numvfs"), "2\n").unwrap();
+        let foreign = probe_sriov_at(&base, "eth4");
+        assert_eq!(foreign.status, CapabilityStatus::Fail, "{foreign:?}");
+        assert!(
+            foreign.detail.contains("attach will refuse"),
+            "{}",
+            foreign.detail
+        );
+        assert!(foreign.required, "{foreign:?}");
+
+        // 1 is the adoption path (`ensure_vf_in` takes it over), 0 is
+        // fresh acquisition; both are states attach accepts.
+        for ok in ["1", "0"] {
+            std::fs::write(dev.join("sriov_numvfs"), ok).unwrap();
+            let cap = probe_sriov_at(&base, "eth4");
+            assert_eq!(cap.status, CapabilityStatus::Pass, "numvfs={ok}: {cap:?}");
+        }
+
+        std::fs::write(dev.join("sriov_totalvfs"), "0\n").unwrap();
+        let none = probe_sriov_at(&base, "eth4");
+        assert_eq!(none.status, CapabilityStatus::Fail, "{none:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Every hardware probe is `required` whatever it found.
