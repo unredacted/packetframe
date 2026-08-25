@@ -15,6 +15,12 @@ use packetframe_common::{
 
 pub struct Rendered {
     pub passed: bool,
+    /// Every core requirement passed and only vpp-graft capabilities
+    /// block — the "core capabilities PASS; vpp-offload attach
+    /// BLOCKED" case, which gets its own exit code so automation
+    /// gating fast-path work can tell it from a core failure (review
+    /// finding on #200).
+    pub vpp_blocked_only: bool,
     pub json_output: Option<String>,
 }
 
@@ -247,16 +253,42 @@ pub fn vpp_local_routes_from_config(
 
 /// The `vpp-binary` override from a `vpp-offload` section, if set, so
 /// feasibility probes the executable the module will actually run.
+///
+/// **Last one wins**, here and in [`vpp_loopback_from_config`], because
+/// last-wins is what `VppOffloadConfig::from_directives` hands attach —
+/// it overwrites the field as it iterates, and parsing permits repeated
+/// scalar directives. A first-wins `find_map` probed a different value
+/// than the one attach acts on whenever a directive was repeated
+/// (review finding on #200, against the loopback twin of this).
 pub fn vpp_binary_from_config(config: &Config) -> Option<String> {
     config
         .modules
         .iter()
         .filter(|m| m.name == "vpp-offload")
         .flat_map(|m| &m.directives)
-        .find_map(|d| match d {
+        .filter_map(|d| match d {
             ModuleDirective::VppBinary(p) => Some(p.clone()),
             _ => None,
         })
+        .next_back()
+}
+
+/// The configured `loopback-address`, if any — `bring_up` refuses one
+/// the kernel currently holds, so the `vpp.loopback` probe mirrors
+/// that refusal (review finding on #200). Last-wins and scoped to
+/// `vpp-offload` sections, exactly as `from_directives` resolves it;
+/// see [`vpp_binary_from_config`].
+pub fn vpp_loopback_from_config(config: &Config) -> Option<std::net::Ipv4Addr> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::VppLoopbackAddress(p) => Some(p.addr),
+            _ => None,
+        })
+        .next_back()
 }
 
 /// The vpp-offload facts the probes need, grouped so the parameter
@@ -266,6 +298,7 @@ pub struct VppProbeInputs<'a> {
     pub steer_ports: &'a [String],
     pub workers: u32,
     pub binary: Option<&'a str>,
+    pub loopback: Option<std::net::Ipv4Addr>,
     pub steer_directions: &'a [VppSteerDirection],
     pub steer_exempts: &'a [packetframe_common::config::Ipv4Prefix],
 }
@@ -296,24 +329,37 @@ pub fn probe_and_render(
         report.capabilities.push(cap);
     }
     // vpp-offload probes (phase 4): only when the config declares the
-    // module. Non-required like the perf probes — feasibility informs,
-    // the module's attach enforces.
+    // module. They carry their own `required` flags — the module marks
+    // a verdict required exactly when its attach refuses the same
+    // condition — and their names are remembered so the summary can
+    // say "vpp-offload attach BLOCKED" instead of a bare FAIL (or,
+    // worse, the bare PASS an operator on edge1-mci1-net read over a
+    // failing `vpp.irq-affinity` line on 2026-08-21).
     #[cfg(feature = "vpp-offload")]
-    if !vpp.ports.is_empty() {
-        for cap in packetframe_vpp_offload::run_feasibility_probes(
-            vpp.ports,
-            vpp.steer_ports,
-            vpp.workers,
-            vpp.binary,
-            allowlist,
-            vpp.steer_directions,
-            vpp.steer_exempts,
-        ) {
-            report.capabilities.push(cap);
+    let vpp_cap_names: Vec<String> = {
+        let mut names = Vec::new();
+        if !vpp.ports.is_empty() {
+            for cap in packetframe_vpp_offload::run_feasibility_probes(
+                vpp.ports,
+                vpp.steer_ports,
+                vpp.workers,
+                vpp.binary,
+                vpp.loopback,
+                allowlist,
+                vpp.steer_directions,
+                vpp.steer_exempts,
+            ) {
+                names.push(cap.name.clone());
+                report.capabilities.push(cap);
+            }
         }
-    }
+        names
+    };
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = (vpp, allowlist);
+    let vpp_cap_names: Vec<String> = {
+        let _ = (vpp, allowlist);
+        Vec::new()
+    };
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.
@@ -327,21 +373,54 @@ pub fn probe_and_render(
         passed,
         capabilities: report.capabilities,
     };
+    let (core_blockers, vpp_blockers) = partition_blockers(&report, &vpp_cap_names);
+    let vpp_blocked_only = core_blockers.is_empty() && !vpp_blockers.is_empty();
 
     if human {
-        print_human(&report);
+        print_human(&report, &vpp_cap_names);
         Rendered {
             passed: report.passed,
+            vpp_blocked_only,
             json_output: None,
         }
     } else {
-        let json =
-            serde_json::to_string_pretty(&report).expect("FeasibilityReport is serializable");
+        // The JSON carries what the human summary partitions on —
+        // without it a machine consumer is left with exactly the
+        // name-prefix guess `summary_lines` disavows (review finding
+        // on #200).
+        #[derive(serde::Serialize)]
+        struct JsonReport<'a> {
+            #[serde(flatten)]
+            report: &'a FeasibilityReport,
+            /// Required vpp-graft capabilities whose verdict is not
+            /// Pass; empty when nothing blocks the module's attach.
+            vpp_attach_blockers: Vec<&'a str>,
+        }
+        let json = serde_json::to_string_pretty(&JsonReport {
+            report: &report,
+            vpp_attach_blockers: vpp_blockers.iter().map(|c| c.name.as_str()).collect(),
+        })
+        .expect("FeasibilityReport is serializable");
         Rendered {
             passed: report.passed,
+            vpp_blocked_only,
             json_output: Some(json),
         }
     }
+}
+
+/// Required-and-not-Pass capabilities, split into (core, vpp) by
+/// membership in the vpp graft.
+fn partition_blockers<'a>(
+    report: &'a FeasibilityReport,
+    vpp_cap_names: &[String],
+) -> (Vec<&'a Capability>, Vec<&'a Capability>) {
+    let (vpp, core): (Vec<&Capability>, Vec<&Capability>) = report
+        .capabilities
+        .iter()
+        .filter(|c| c.required && c.status != CapabilityStatus::Pass)
+        .partition(|c| vpp_cap_names.contains(&c.name));
+    (core, vpp)
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -419,7 +498,7 @@ fn trial_attach_caps(_ifaces: &[String]) -> Vec<Capability> {
     }]
 }
 
-fn print_human(report: &FeasibilityReport) {
+fn print_human(report: &FeasibilityReport, vpp_cap_names: &[String]) {
     println!("PacketFrame feasibility report (v{})", report.version);
     println!();
 
@@ -448,27 +527,64 @@ fn print_human(report: &FeasibilityReport) {
     }
 
     println!();
-    if report.passed {
-        println!("Result: PASS, all required capabilities present.");
+    for line in summary_lines(report, vpp_cap_names) {
+        println!("{line}");
+    }
+}
+
+/// The verdict under the table, and why it is not just `report.passed`
+/// prose: the vpp-offload capabilities are `required` only because the
+/// loaded config declares that module, and a box that is ready for
+/// fast-path but would refuse the vpp-offload attach must say exactly
+/// that. The previous summary said "PASS, all required capabilities
+/// present." over a failing (then-advisory) `vpp.irq-affinity` on
+/// edge1-mci1-net (2026-08-21), and the operator met the refusal at
+/// attach instead of before the window.
+///
+/// `vpp_cap_names` is the set of capability names grafted from
+/// vpp-offload's probes — membership, not a name-prefix guess, decides
+/// which failures read as "attach BLOCKED".
+fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<String> {
+    let (core, vpp_blockers) = partition_blockers(report, vpp_cap_names);
+    if core.is_empty() && vpp_blockers.is_empty() {
+        return vec!["Result: PASS, all required capabilities present.".into()];
+    }
+    let item = |c: &Capability| {
+        format!(
+            "  - {} ({})",
+            scrub_for_terminal(&c.name),
+            scrub_for_terminal(&c.detail)
+        )
+    };
+    let mut lines = Vec::new();
+    if core.is_empty() {
+        // "core capabilities PASS", not "PASS for fast-path": a
+        // non-required fast-path row (an xdp.attach trial) can FAIL in
+        // the table above, and the summary must not assert a readiness
+        // it did not check (review finding on #200).
+        lines.push(format!(
+            "Result: core capabilities PASS; vpp-offload attach BLOCKED by {} check{}:",
+            vpp_blockers.len(),
+            if vpp_blockers.len() == 1 { "" } else { "s" },
+        ));
+        lines.extend(vpp_blockers.iter().map(|c| item(c)));
     } else {
-        let failing: Vec<&Capability> = report
-            .capabilities
-            .iter()
-            .filter(|c| c.required && c.status != CapabilityStatus::Pass)
-            .collect();
-        println!(
+        lines.push(format!(
             "Result: FAIL, {} required capabilit{} missing or unknown:",
-            failing.len(),
-            if failing.len() == 1 { "y" } else { "ies" },
-        );
-        for f in failing {
-            println!(
-                "  - {} ({})",
-                scrub_for_terminal(&f.name),
-                scrub_for_terminal(&f.detail)
-            );
+            core.len(),
+            if core.len() == 1 { "y" } else { "ies" },
+        ));
+        lines.extend(core.iter().map(|c| item(c)));
+        if !vpp_blockers.is_empty() {
+            lines.push(format!(
+                "vpp-offload attach is also BLOCKED by {} check{}:",
+                vpp_blockers.len(),
+                if vpp_blockers.len() == 1 { "" } else { "s" },
+            ));
+            lines.extend(vpp_blockers.iter().map(|c| item(c)));
         }
     }
+    lines
 }
 
 /// Both `name` and `detail` are scrubbed, and `detail` is the reason.
@@ -493,4 +609,167 @@ fn print_row(cap: &Capability, name_w: usize) {
         scrub_for_terminal(&cap.name),
         scrub_for_terminal(&cap.detail)
     );
+}
+
+/// Deliberately outside any `cfg(target_os)` gate: the vpp probes'
+/// own tests only run on Linux (#45), but the summary's promise — no
+/// PASS over a failing attach gate — is pure over `Capability` and
+/// must hold on every host CI job.
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    /// The scalar extractors resolve repeated directives exactly as
+    /// `VppOffloadConfig::from_directives` does (last wins) — asserted
+    /// against `from_directives` itself, so the two cannot drift
+    /// silently. A first-wins `find_map` here probed the first
+    /// `loopback-address` while attach refused (or accepted) the last
+    /// (review finding on #200).
+    #[cfg(feature = "vpp-offload")]
+    #[test]
+    fn scalar_extractors_pick_the_directive_attach_acts_on() {
+        use packetframe_common::config::{GlobalConfig, Ipv4Prefix, ModuleSection};
+
+        let lo = |a: u8| Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, a),
+            prefix_len: 32,
+        };
+        let directives = vec![
+            ModuleDirective::VppBinary("/opt/vpp-first".into()),
+            ModuleDirective::VppLoopbackAddress(lo(1)),
+            ModuleDirective::VppBinary("/opt/vpp-last".into()),
+            ModuleDirective::VppLoopbackAddress(lo(2)),
+        ];
+        let config = Config {
+            global: GlobalConfig::default(),
+            modules: vec![ModuleSection {
+                name: "vpp-offload".into(),
+                directives: directives.clone(),
+            }],
+        };
+        let runtime = packetframe_vpp_offload::VppOffloadConfig::from_directives(&directives);
+        assert_eq!(vpp_binary_from_config(&config), runtime.vpp_binary);
+        assert_eq!(
+            vpp_loopback_from_config(&config),
+            runtime.loopback_address.map(|p| p.addr)
+        );
+        assert_eq!(
+            vpp_binary_from_config(&config).as_deref(),
+            Some("/opt/vpp-last")
+        );
+    }
+
+    // A struct literal, not a match over CapabilityStatus: this helper
+    // must keep compiling when the enum grows a variant on another
+    // branch (review finding on #200/#201 — the two PRs merged cleanly
+    // and the exhaustive match here broke main).
+    fn cap(name: &str, status: CapabilityStatus, required: bool) -> Capability {
+        Capability {
+            name: name.into(),
+            status,
+            detail: "probe detail".into(),
+            required,
+        }
+    }
+
+    #[test]
+    fn all_required_passing_is_still_a_plain_pass() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap("vpp.irq-affinity", CapabilityStatus::Pass, true),
+        ]);
+        let lines = summary_lines(&report, &["vpp.irq-affinity".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["Result: PASS, all required capabilities present.".to_string()]
+        );
+    }
+
+    /// The edge1-mci1-net case (2026-08-21): every core capability
+    /// passes, a required vpp gate fails. The summary must not contain
+    /// the sentence an operator reads as "the box is ready".
+    #[test]
+    fn a_failing_attach_gate_is_never_summarized_as_a_bare_pass() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap("vpp.irq-affinity", CapabilityStatus::Fail, true),
+        ]);
+        let lines = summary_lines(&report, &["vpp.irq-affinity".to_string()]);
+        assert_eq!(
+            lines[0],
+            "Result: core capabilities PASS; vpp-offload attach BLOCKED by 1 check:"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("vpp.irq-affinity")),
+            "the blocking check is named: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("all required capabilities present")),
+            "{lines:?}"
+        );
+    }
+
+    /// A required vpp verdict that came back Unknown blocks too — the
+    /// same rule the core report applies ("we can't promise the
+    /// runtime will find what it needs"), and on the gates it is
+    /// literal: `bring_up` propagates the same read failure as a
+    /// refusal.
+    #[test]
+    fn a_required_unknown_gate_also_blocks() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap("vpp.iommu", CapabilityStatus::Unknown, true),
+        ]);
+        let lines = summary_lines(&report, &["vpp.iommu".to_string()]);
+        assert!(lines[0].contains("BLOCKED by 1 check"), "{lines:?}");
+    }
+
+    /// An advisory vpp verdict (a staging steering-budget line) stays
+    /// advisory: attach installs nothing, so the summary stays PASS.
+    #[test]
+    fn an_advisory_vpp_failure_does_not_block() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap("vpp.steering.budget", CapabilityStatus::Fail, false),
+        ]);
+        let lines = summary_lines(&report, &["vpp.steering.budget".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["Result: PASS, all required capabilities present.".to_string()]
+        );
+    }
+
+    /// A core capability failure keeps the FAIL wording — and when a
+    /// vpp gate fails alongside it, both are reported, neither hidden
+    /// behind the other.
+    #[test]
+    fn core_failures_keep_fail_wording_and_vpp_blockers_are_still_named() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Fail, true),
+            cap("vpp.binary", CapabilityStatus::Fail, true),
+        ]);
+        let lines = summary_lines(&report, &["vpp.binary".to_string()]);
+        assert_eq!(
+            lines[0],
+            "Result: FAIL, 1 required capability missing or unknown:"
+        );
+        assert!(lines.iter().any(|l| l.contains("bpf.core")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("vpp-offload attach is also BLOCKED by 1 check:")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("vpp.binary")), "{lines:?}");
+
+        // Core-only failure: no vpp sentence at all.
+        let core_only = FeasibilityReport::new(vec![cap("bpf.core", CapabilityStatus::Fail, true)]);
+        let lines = summary_lines(&core_only, &[]);
+        assert!(
+            !lines.iter().any(|l| l.contains("vpp-offload")),
+            "{lines:?}"
+        );
+    }
 }

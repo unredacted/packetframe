@@ -75,6 +75,8 @@ pub struct AttachPaths {
     pub sysfs_cpu: PathBuf,
     /// `/proc/irq`, for the NIC-IRQ/worker-core overlap check.
     pub proc_irq: PathBuf,
+    /// `/sys/class/iommu`, for the IOMMU-isolation refusal.
+    pub sysfs_iommu_class: PathBuf,
     pub api_socket: PathBuf,
     pub startup_conf: PathBuf,
 }
@@ -85,6 +87,7 @@ impl AttachPaths {
             sys: SysPaths::live(state_dir, hugepage_bytes),
             sysfs_cpu: PathBuf::from(cores::SYSFS_CPU),
             proc_irq: PathBuf::from("/proc/irq"),
+            sysfs_iommu_class: PathBuf::from("/sys/class/iommu"),
             api_socket: PathBuf::from(API_SOCKET),
             startup_conf: PathBuf::from(STARTUP_CONF),
         }
@@ -154,6 +157,22 @@ fn port_macs(sysfs_net: &Path, iface: &str) -> Result<([u8; 6], Vec<[u8; 6]>), S
 
 /// Refuse a `loopback-address` the kernel already holds.
 ///
+/// Is an IOMMU registered under the given `/sys/class/iommu`?
+/// `Ok(Some)` carries the first entry's name (the probe's PASS detail);
+/// `Ok(None)` is an empty directory; `Err` is an unreadable directory
+/// or dirent — a state neither reader may take as active. Shared by
+/// `bring_up`'s refusal and `probe_iommu` so the two verdicts cannot
+/// drift on the same directory (review finding on #200: the inline
+/// copies disagreed on an unreadable dirent).
+pub(crate) fn iommu_active(dir: &Path) -> std::io::Result<Option<std::ffi::OsString>> {
+    let mut entries = std::fs::read_dir(dir)?;
+    match entries.next() {
+        Some(Ok(e)) => Ok(Some(e.file_name())),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
 /// VPP's arp node answers requests targeting its loopback's address,
 /// sourcing the member VF's MAC. If that address is a LIVE kernel
 /// address — the gateway, in the reference incident — two responders
@@ -167,7 +186,7 @@ fn port_macs(sysfs_net: &Path, iface: &str) -> Result<([u8; 6], Vec<[u8; 6]>), S
 /// The decision is split from the `getifaddrs` read so the refusal
 /// text and the match are testable without owning the host's
 /// interfaces.
-fn loopback_collision(
+pub(crate) fn loopback_collision(
     loopback: std::net::Ipv4Addr,
     owned: &[(String, std::net::Ipv4Addr)],
 ) -> Option<String> {
@@ -193,7 +212,7 @@ fn loopback_collision(
 /// collision check rather than refusing every attach — a guard against
 /// one specific misconfiguration must not become a new way for a
 /// healthy box to fail to start.
-fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
+pub(crate) fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
@@ -457,6 +476,23 @@ pub fn bring_up(
         ));
     }
 
+    // VFIO must be IOMMU-isolated. With no active IOMMU the vfio-pci
+    // bind either fails outright (no viable iommu_group) or — with the
+    // kernel's unsafe no-iommu escape hatch enabled — binds with no
+    // DMA isolation at all. The `vpp.iommu` probe has always said this
+    // module refuses the latter; until a review finding on #200 nothing
+    // on the attach path read the fact, so the refusal was
+    // documentation. Still the pure phase: a box that cannot isolate
+    // DMA must cost no sysfs writes.
+    if !matches!(iommu_active(&paths.sysfs_iommu_class), Ok(Some(_))) {
+        return Err(format!(
+            "no active IOMMU ({} is empty or unreadable): VFIO would bind without DMA \
+             isolation (no-iommu), which this module refuses — check firmware/boot \
+             config for the SMMU; `packetframe feasibility` reports this as `vpp.iommu`",
+            paths.sysfs_iommu_class.display()
+        ));
+    }
+
     let hugepage_bytes = paths.sys.hugepage_bytes;
     if hugepage_bytes == 0 {
         return Err(
@@ -611,7 +647,7 @@ pub fn bring_up(
 /// the permission *and* the mount. Real-uid semantics (`access`, not
 /// `faccessat(AT_EACCESS)`) — packetframe is not setuid, so the two
 /// coincide, and it keeps libc out of its AT_EACCESS emulation paths.
-fn check_executable(path: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn check_executable(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::ffi::OsStrExt as _;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;

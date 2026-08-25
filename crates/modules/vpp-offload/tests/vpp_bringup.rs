@@ -118,6 +118,10 @@ impl Host {
         // unifi-core.
         fs::write(cpu.join("online"), "0-17\n").unwrap();
         fs::write(cpu.join("isolated"), "12\n").unwrap();
+        // An active SMMU, as /sys/class/iommu presents one; the
+        // no-iommu refusal test empties this.
+        let iommu = base.join("iommu");
+        fs::create_dir_all(iommu.join("smmu3.0x0000000005000000")).unwrap();
 
         // Executable — `bring_up` requires it, and requires it before
         // acquiring anything — but not a program: an exec of a file with
@@ -147,6 +151,7 @@ impl Host {
                 // nothing to inspect and passes — tests that WANT a
                 // conflict populate both sides (cores.rs unit tests).
                 proc_irq: base.join("proc_irq"),
+                sysfs_iommu_class: iommu,
                 api_socket,
                 startup_conf: base.join("startup.conf"),
             },
@@ -401,6 +406,58 @@ fn a_config_that_cannot_work_touches_nothing() {
     assert!(
         !host.paths.startup_conf.exists(),
         "a refused attach rendered a startup.conf"
+    );
+}
+
+/// An inactive IOMMU refuses the attach in the pure phase.
+///
+/// The `vpp.iommu` probe has said "the module refuses" no-iommu since
+/// it shipped, but nothing on the attach path read the fact (review
+/// finding on #200): with the SMMU inactive, acquire's vfio-pci bind
+/// either failed with a rollback already in flight or — with the
+/// kernel's unsafe no-iommu escape hatch enabled — silently succeeded
+/// with no DMA isolation. Both the empty and the missing directory
+/// refuse, since a kernel without the iommu class has no SMMU either.
+#[test]
+fn an_inactive_iommu_is_refused_before_any_mutation() {
+    let fake = fake_vpp::Fake::start("bringup-noiommu");
+    let host = Host::new("noiommu", &[("eth4", "0002:07:00.0")], fake.path.clone());
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+
+    for shape in ["empty", "missing"] {
+        fs::remove_dir_all(&host.paths.sysfs_iommu_class).unwrap();
+        if shape == "empty" {
+            fs::create_dir_all(&host.paths.sysfs_iommu_class).unwrap();
+        }
+        let e = bring_up(
+            &cfg,
+            &host.paths,
+            Box::new(Mirror),
+            &ALLOW,
+            None,
+            None,
+            &McamBudget::default(),
+            &[],
+        )
+        .err()
+        .expect("must refuse without an active IOMMU");
+        assert!(e.contains("no-iommu"), "({shape}) {e}");
+    }
+
+    assert!(host.state().is_none(), "a refused attach left a state file");
+    assert_eq!(
+        fs::read_to_string(
+            host.paths
+                .sys
+                .sysfs_net
+                .join("eth4")
+                .join("device")
+                .join("sriov_numvfs")
+        )
+        .unwrap()
+        .trim(),
+        "0",
+        "a refused attach created a VF"
     );
 }
 
