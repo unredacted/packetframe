@@ -2101,7 +2101,11 @@ boot-time value is a WARN: hugepages are managed by this module at
 attach, so a competing boot-time reservation is drift. The probe runs
 in the general set, whether or not the config declares
 `module vpp-offload` — run feasibility after every VPP install,
-before the next reboot.
+before the next reboot. **The verdict is the table row, not the
+summary line or the exit code**: the probe is advisory today, so a
+boot-fatal FAIL still prints `Result: PASS` and exits 0 — read (or
+grep) the `vpp.sysctl-hugepages` row; do not gate a reboot on
+`packetframe feasibility && reboot`.
 
 Upgrade is `detach → install → attach`. There is no cross-version
 adoption: the state file records the VPP version, and a mismatch is

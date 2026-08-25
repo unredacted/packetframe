@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::Capability;
+use super::{Capability, CapabilityStatus};
 
 const PROBE_NAME: &str = "vpp.sysctl-hugepages";
 
@@ -39,6 +39,7 @@ const FAIL_FRACTION_DENOMINATOR: u64 = 2; // > MemTotal/2 ⇒ Fail
 
 /// A sysctl fragment, already in boot-apply order: where it came from
 /// (for the report) plus its text.
+#[derive(Clone)]
 struct SysctlSource {
     path: PathBuf,
     contents: String,
@@ -83,7 +84,16 @@ fn resolve_apply_order(candidates: Vec<SysctlCandidate>) -> Vec<PathBuf> {
 
 /// The effective boot value: parse each source in apply order; the
 /// last assignment to either pool key wins across all files.
-fn last_hugepage_assignment(sources: &[SysctlSource]) -> Option<HugepageAssignment> {
+///
+/// `mempolicy_supported` is whether the RUNNING kernel has
+/// `/proc/sys/vm/nr_hugepages_mempolicy` (CONFIG_NUMA=y). Without it
+/// the boot write to that key fails and applies nothing, so a later
+/// mempolicy line must not mask an earlier lethal `vm.nr_hugepages`
+/// (review finding on #201).
+fn last_hugepage_assignment(
+    sources: &[SysctlSource],
+    mempolicy_supported: bool,
+) -> Option<HugepageAssignment> {
     let mut last = None;
     for src in sources {
         for line in src.contents.lines() {
@@ -106,11 +116,24 @@ fn last_hugepage_assignment(sources: &[SysctlSource]) -> Option<HugepageAssignme
             if !HUGEPAGE_KEYS.contains(&key.as_str()) {
                 continue;
             }
-            // A value the kernel would reject at boot reserves nothing,
-            // so an unparseable one is not a landmine.
-            let Ok(pages) = value.trim().parse::<u64>() else {
+            if !mempolicy_supported && key == "vm.nr_hugepages_mempolicy" {
                 continue;
-            };
+            }
+            // The kernel's proc parser consumes leading decimal digits
+            // and stops at the first non-digit, so `1024 # comment`
+            // applies 1024 and `0x400` applies 0 — model that, not
+            // str::parse (review finding on #201). No leading digit
+            // means the boot write fails and reserves nothing; a
+            // longer-than-u64 digit run saturates so absurd is judged
+            // absurd, not skipped.
+            let value = value.trim();
+            let end = value
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(value.len());
+            if end == 0 {
+                continue;
+            }
+            let pages = value[..end].parse::<u64>().unwrap_or(u64::MAX);
             last = Some(HugepageAssignment {
                 path: src.path.clone(),
                 key,
@@ -224,13 +247,16 @@ fn hugepage_verdict(
 }
 
 /// Every `*.conf` the boot-time sysctl apply would read, in apply
-/// order. Directory precedence is systemd-sysctl's (`/etc` over `/run`
-/// over `/usr/local/lib` over `/usr/lib`, with `/lib` for split-usr
-/// systems). `/etc/sysctl.conf` is appended last (matching
-/// `sysctl --system`) ONLY when no sysctl.d fragment already resolves
-/// to it — Debian symlinks it in as `99-sysctl.conf`, and systemd
-/// honors the symlink's position, so re-appending it would let it
-/// wrongly override a lexicographically later fragment.
+/// order, plus — separately — a `/etc/sysctl.conf` no sysctl.d
+/// fragment resolves to. Directory precedence is systemd-sysctl's
+/// (`/etc` over `/run` over `/usr/local/lib` over `/usr/lib`, with
+/// `/lib` for split-usr systems). A symlinked `/etc/sysctl.conf`
+/// (Debian's `99-sysctl.d` fragment) is already in the ordered set at
+/// the symlink's position; an unsymlinked one is returned on the side
+/// because the two boot appliers disagree about it — systemd-sysctl
+/// never reads it, procps `sysctl --system` applies it last — and the
+/// verdict prices both models (review finding on #201, see
+/// [`worse_model_verdict`]).
 ///
 /// Errs on anything that leaves the scan incomplete: a directory that
 /// exists but can't be listed, or a selected fragment that can't be
@@ -238,7 +264,7 @@ fn hugepage_verdict(
 /// PASS. Absent directories/files and dangling symlinks reserve
 /// nothing at boot, so those are skipped, not errors.
 #[cfg(target_os = "linux")]
-fn collect_boot_sysctl_sources() -> Result<Vec<SysctlSource>, String> {
+fn collect_boot_sysctl_sources() -> Result<(Vec<SysctlSource>, Option<SysctlSource>), String> {
     use std::io::ErrorKind;
 
     const DIRS: [&str; 5] = [
@@ -290,17 +316,68 @@ fn collect_boot_sysctl_sources() -> Result<Vec<SysctlSource>, String> {
         }
         sources.push(SysctlSource { path, contents });
     }
+    let mut uncovered_conf = None;
     if !conf_covered {
         match std::fs::read_to_string(conf) {
-            Ok(contents) => sources.push(SysctlSource {
-                path: conf.to_path_buf(),
-                contents,
-            }),
+            Ok(contents) => {
+                uncovered_conf = Some(SysctlSource {
+                    path: conf.to_path_buf(),
+                    contents,
+                })
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(format!("could not read {}: {e}", conf.display())),
         }
     }
-    Ok(sources)
+    Ok((sources, uncovered_conf))
+}
+
+/// `Fail` outranks `Warn` outranks the rest, for picking the worse of
+/// the two boot models.
+fn severity(cap: &Capability) -> u8 {
+    match cap.status {
+        CapabilityStatus::Fail => 2,
+        CapabilityStatus::Warn => 1,
+        _ => 0,
+    }
+}
+
+/// Which boot applier runs decides whether an unsymlinked
+/// `/etc/sysctl.conf` applies at all: systemd-sysctl never reads it,
+/// while a procps `sysctl --system` boot applies it last. The probe
+/// cannot know which one this box runs at boot, so it prices both
+/// models and reports the worse verdict — a spurious WARN/FAIL for a
+/// file one applier skips beats a PASS over a file the other applies
+/// (review finding on #201: an operator zeroing the deb's lethal
+/// 80-vpp.conf from /etc/sysctl.conf must not turn the probe green
+/// when systemd-sysctl will never read the zero).
+fn worse_model_verdict(
+    systemd_sources: &[SysctlSource],
+    uncovered_conf: Option<SysctlSource>,
+    mempolicy_supported: bool,
+    hugepagesize_bytes: u64,
+    memtotal_bytes: u64,
+) -> Capability {
+    let systemd = hugepage_verdict(
+        last_hugepage_assignment(systemd_sources, mempolicy_supported).as_ref(),
+        hugepagesize_bytes,
+        memtotal_bytes,
+    );
+    let Some(conf) = uncovered_conf else {
+        return systemd;
+    };
+    let mut with_conf = systemd_sources.to_vec();
+    with_conf.push(conf);
+    let procps = hugepage_verdict(
+        last_hugepage_assignment(&with_conf, mempolicy_supported).as_ref(),
+        hugepagesize_bytes,
+        memtotal_bytes,
+    );
+    if severity(&procps) > severity(&systemd) {
+        procps
+    } else {
+        systemd
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -312,8 +389,8 @@ pub fn probe_sysctl_hugepages() -> Capability {
         Ok(sizes) => sizes,
         Err(e) => return Capability::unknown(PROBE_NAME, e, false),
     };
-    let sources = match collect_boot_sysctl_sources() {
-        Ok(sources) => sources,
+    let (sources, uncovered_conf) = match collect_boot_sysctl_sources() {
+        Ok(collected) => collected,
         // An incomplete scan must not read as "no reservation": the
         // unreadable file is exactly where the landmine could be.
         Err(e) => {
@@ -324,8 +401,11 @@ pub fn probe_sysctl_hugepages() -> Capability {
             );
         }
     };
-    hugepage_verdict(
-        last_hugepage_assignment(&sources).as_ref(),
+    let mempolicy_supported = Path::new("/proc/sys/vm/nr_hugepages_mempolicy").exists();
+    worse_model_verdict(
+        &sources,
+        uncovered_conf,
+        mempolicy_supported,
         hugepagesize,
         memtotal,
     )
@@ -370,21 +450,21 @@ mod tests {
    vm.nr_hugepages = 1024
 "#,
         );
-        let a = last_hugepage_assignment(&[s]).unwrap();
+        let a = last_hugepage_assignment(&[s], true).unwrap();
         assert_eq!(a.pages, 1024);
         assert_eq!(a.key, "vm.nr_hugepages");
 
         // Slash-separated key, no spaces around `=`, ignore-errors `-`.
         let s = src("/etc/sysctl.d/x.conf", "-vm/nr_hugepages=512\n");
-        assert_eq!(last_hugepage_assignment(&[s]).unwrap().pages, 512);
+        assert_eq!(last_hugepage_assignment(&[s], true).unwrap().pages, 512);
 
         // The canonical leading-slash spelling systemd also accepts.
         let s = src("/etc/sysctl.d/x.conf", "/vm/nr_hugepages = 128\n");
-        assert_eq!(last_hugepage_assignment(&[s]).unwrap().pages, 128);
+        assert_eq!(last_hugepage_assignment(&[s], true).unwrap().pages, 128);
 
         // The mempolicy variant sizes the same pool.
         let s = src("/etc/sysctl.d/x.conf", "vm.nr_hugepages_mempolicy = 256\n");
-        let a = last_hugepage_assignment(&[s]).unwrap();
+        let a = last_hugepage_assignment(&[s], true).unwrap();
         assert_eq!(a.pages, 256);
         assert_eq!(a.key, "vm.nr_hugepages_mempolicy");
 
@@ -393,7 +473,7 @@ mod tests {
             "/etc/sysctl.d/x.conf",
             "vm.nr_hugepagesx = 9\nvm.swappiness = 10\nvm.nr_hugepages = lots\n",
         );
-        assert!(last_hugepage_assignment(&[s]).is_none());
+        assert!(last_hugepage_assignment(&[s], true).is_none());
     }
 
     #[test]
@@ -402,20 +482,90 @@ mod tests {
             "/etc/sysctl.d/one.conf",
             "vm.nr_hugepages = 1024\nvm.nr_hugepages = 16\n",
         );
-        assert_eq!(last_hugepage_assignment(&[s]).unwrap().pages, 16);
+        assert_eq!(last_hugepage_assignment(&[s], true).unwrap().pages, 16);
     }
 
     #[test]
     fn last_file_in_apply_order_wins() {
-        // A later basename (or /etc/sysctl.conf, which the collector
-        // appends last) overrides an earlier file's assignment.
+        // A later basename overrides an earlier file's assignment.
         let sources = [
             src("/etc/sysctl.d/10-vpp.conf", "vm.nr_hugepages = 1024\n"),
             src("/etc/sysctl.d/90-fix.conf", "vm.nr_hugepages = 0\n"),
         ];
-        let a = last_hugepage_assignment(&sources).unwrap();
+        let a = last_hugepage_assignment(&sources, true).unwrap();
         assert_eq!(a.pages, 0);
         assert_eq!(a.path, PathBuf::from("/etc/sysctl.d/90-fix.conf"));
+    }
+
+    #[test]
+    fn kernel_accepted_value_forms_are_not_skipped() {
+        // The kernel's proc parser commits the leading digits and stops
+        // at the first non-digit, so an inline comment does not make
+        // the line a no-op at boot (review finding on #201).
+        let s = src(
+            "/etc/sysctl.d/80-vpp.conf",
+            "vm.nr_hugepages = 1024 # sized for 2MiB pages\n",
+        );
+        assert_eq!(last_hugepage_assignment(&[s], true).unwrap().pages, 1024);
+
+        // A hex literal applies its leading `0` at boot, not 1024.
+        let s = src("/etc/sysctl.d/x.conf", "vm.nr_hugepages = 0x400\n");
+        assert_eq!(last_hugepage_assignment(&[s], true).unwrap().pages, 0);
+
+        // A digit run past u64 saturates instead of being skipped.
+        let s = src(
+            "/etc/sysctl.d/x.conf",
+            "vm.nr_hugepages = 99999999999999999999999999\n",
+        );
+        assert_eq!(
+            last_hugepage_assignment(&[s], true).unwrap().pages,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn mempolicy_does_not_mask_on_kernels_without_it() {
+        // Without CONFIG_NUMA the boot write to
+        // vm.nr_hugepages_mempolicy fails and applies nothing, so a
+        // later mempolicy=0 must not mask an earlier lethal
+        // vm.nr_hugepages (review finding on #201).
+        let sources = [
+            src("/etc/sysctl.d/80-vpp.conf", "vm.nr_hugepages = 131072\n"),
+            src(
+                "/etc/sysctl.d/90-tune.conf",
+                "vm.nr_hugepages_mempolicy = 0\n",
+            ),
+        ];
+        let masked = last_hugepage_assignment(&sources, false).unwrap();
+        assert_eq!(masked.pages, 131072);
+        assert_eq!(masked.key, "vm.nr_hugepages");
+
+        // On a NUMA kernel the same pair really does zero the pool.
+        assert_eq!(last_hugepage_assignment(&sources, true).unwrap().pages, 0);
+    }
+
+    #[test]
+    fn unsymlinked_sysctl_conf_cannot_mask_a_lethal_fragment() {
+        // The incident file plus an old-style "fix" in an unsymlinked
+        // /etc/sysctl.conf: systemd-sysctl never reads the fix, so the
+        // worse of the two boot models (the systemd one) must win —
+        // FAIL, not PASS (review finding on #201).
+        let systemd = [src("/etc/sysctl.d/80-vpp.conf", "vm.nr_hugepages = 1024\n")];
+        let conf = src("/etc/sysctl.conf", "vm.nr_hugepages = 0\n");
+        let cap = worse_model_verdict(&systemd, Some(conf), true, 512 * MIB, MEM_64G);
+        assert_eq!(cap.status, CapabilityStatus::Fail, "{}", cap.detail);
+        assert!(cap.detail.contains("80-vpp.conf"), "{}", cap.detail);
+
+        // The reverse: a lethal value living only in the unsymlinked
+        // sysctl.conf is priced under the procps model and still fails.
+        let conf = src("/etc/sysctl.conf", "vm.nr_hugepages = 1024\n");
+        let cap = worse_model_verdict(&[], Some(conf), true, 512 * MIB, MEM_64G);
+        assert_eq!(cap.status, CapabilityStatus::Fail, "{}", cap.detail);
+        assert!(cap.detail.contains("/etc/sysctl.conf"), "{}", cap.detail);
+
+        // No uncovered conf: the systemd model alone decides.
+        let cap = worse_model_verdict(&[], None, true, 512 * MIB, MEM_64G);
+        assert_eq!(cap.status, CapabilityStatus::Pass, "{}", cap.detail);
     }
 
     #[test]
