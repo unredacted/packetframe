@@ -463,6 +463,74 @@ pub enum ModuleDirective {
     /// Default ECMP hash tuple width (3, 4, or 5). Written into
     /// `FIB_CONFIG.default_hash_mode` at load time.
     EcmpDefaultHashMode(EcmpHashMode),
+    // --- guard module (tc-egress frame policer). Directive namespace
+    // is shared across module sections; these names are guard's. ---
+    /// `interface <iface>` — the guard attach set: one tc-egress
+    /// cls_bpf classifier per listed interface. **Restart-only**, like
+    /// fast-path's `attach`: the filter and the expected-MAC snapshot
+    /// are attach-time-bound. An `interface` line with no class rules
+    /// naming it is refused at load (a policer that polices nothing
+    /// would attach and report healthy — a silent no-op).
+    GuardInterface {
+        iface: String,
+        line: usize,
+    },
+    /// `arp-ns-ratelimit <iface> rate <n>/<dur> [burst <m>] [monitor]`
+    /// — per-target token bucket over egress ARP requests and ICMPv6
+    /// Neighbor Solicitations: `n` frames per `dur` **per target
+    /// address**, with up to `burst` back-to-back (default: `n`).
+    /// Legitimate kernel resolution (up to 3 probes 1 s apart per
+    /// attempt) passes; a firmware daemon re-probing the same targets
+    /// forever clamps to the configured rate. `monitor` counts
+    /// would-drops without enforcing. Hot-reloadable: SIGHUP rewrites
+    /// the per-ifindex config map; bucket state is deliberately not
+    /// flushed (stale deadlines converge within one old-burst window).
+    GuardArpNsRatelimit {
+        iface: String,
+        rate: u32,
+        per: Duration,
+        burst: u32,
+        monitor: bool,
+        line: usize,
+    },
+    /// `bcast-mcast-ratelimit <iface> rate <n>/<dur> [burst <m>]
+    /// [monitor]` — coarse per-interface token bucket over any egress
+    /// frame with the dst-MAC I/G bit set that no earlier guard class
+    /// terminated (ARP replies/GARP, MLD, LLC/BPDUs, the next noisy
+    /// daemon). Hot-reloadable, same reload semantics as
+    /// `arp-ns-ratelimit`.
+    GuardBcastMcastRatelimit {
+        iface: String,
+        rate: u32,
+        per: Duration,
+        burst: u32,
+        monitor: bool,
+        line: usize,
+    },
+    /// `lldp <iface> drop|monitor` — egress LLDP (ethertype 0x88cc).
+    /// The action is mandatory: `drop` enforces, `monitor` counts
+    /// would-drops. Hot-reloadable. Note LLDP's dst MAC is multicast,
+    /// so with this class disabled LLDP still lands in
+    /// `bcast-mcast-ratelimit`'s budget.
+    GuardLldp {
+        iface: String,
+        monitor: bool,
+        line: usize,
+    },
+    /// `foreign-src <iface> drop|monitor` — drop any egress frame
+    /// whose source MAC is not the interface's own (the "one MAC per
+    /// member per VLAN" invariant IX port security enforces). The
+    /// expected MAC is read from the interface at attach —
+    /// self-referential, so an HA role change needs no config edit,
+    /// but a MAC change on a live interface needs a restart. In
+    /// `monitor` the frame is counted and **continues** through the
+    /// remaining classes (a foreign-MAC ARP storm must still hit the
+    /// ARP limiter). Hot-reloadable (action only).
+    GuardForeignSrc {
+        iface: String,
+        monitor: bool,
+        line: usize,
+    },
 }
 
 /// One side of the [`ModuleDirective::MssClamp`] discriminator
@@ -1520,6 +1588,7 @@ impl Config {
                     ModuleDirective::LocalPrefix { iface, line, .. } => (iface, line),
                     ModuleDirective::LocalPrefix6 { iface, line, .. } => (iface, line),
                     ModuleDirective::FallbackDefault { iface, line, .. } => (iface, line),
+                    ModuleDirective::GuardInterface { iface, line } => (iface, line),
                     _ => continue,
                 };
                 let p = sysfs_net.join(iface);
@@ -1529,6 +1598,104 @@ impl Config {
                         line: *line,
                     });
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// guard-section validation. Pure config logic — no sysfs — so it
+    /// runs everywhere `parse` does (startup, feasibility, SIGHUP; the
+    /// three call sites must stay in step or reload silently skips
+    /// enforcement — see the loader's reload-validation note).
+    ///
+    /// Rules:
+    /// - an empty `guard` section is refused (same reasoning as
+    ///   vpp-offload: one verdict at the earliest point);
+    /// - duplicate `interface` lines are refused;
+    /// - a class rule naming an interface with no `interface` line is
+    ///   refused (almost certainly a typo, and the rule would silently
+    ///   never take effect);
+    /// - duplicate `(class, interface)` pairs are refused;
+    /// - an `interface` with zero class rules is refused (a policer
+    ///   that polices nothing attaches and reports healthy — a silent
+    ///   no-op, this repo's named enemy).
+    pub fn validate_guard(&self) -> Result<(), ConfigError> {
+        let Some(guard) = self.modules.iter().find(|m| m.name == "guard") else {
+            return Ok(());
+        };
+        if guard.directives.is_empty() {
+            return Err(ConfigError::Parse {
+                line: 0,
+                message: "module guard: section is empty; declare `interface <iface>` \
+                          and at least one class rule, or remove the section"
+                    .to_string(),
+            });
+        }
+
+        // (iface, first-declaration line) for `interface` lines.
+        let mut ifaces: Vec<(&String, usize)> = Vec::new();
+        for d in &guard.directives {
+            if let ModuleDirective::GuardInterface { iface, line } = d {
+                if let Some((_, prev)) = ifaces.iter().find(|(i, _)| *i == iface) {
+                    return Err(ConfigError::Parse {
+                        line: *line,
+                        message: format!(
+                            "module guard: duplicate `interface {iface}` (first declared \
+                             on line {prev})"
+                        ),
+                    });
+                }
+                ifaces.push((iface, *line));
+            }
+        }
+
+        // Class rules: (class-name, iface, line), checked for
+        // undeclared interfaces and per-class duplicates.
+        let mut rules: Vec<(&'static str, &String, usize)> = Vec::new();
+        for d in &guard.directives {
+            let (class, iface, line) = match d {
+                ModuleDirective::GuardArpNsRatelimit { iface, line, .. } => {
+                    ("arp-ns-ratelimit", iface, *line)
+                }
+                ModuleDirective::GuardBcastMcastRatelimit { iface, line, .. } => {
+                    ("bcast-mcast-ratelimit", iface, *line)
+                }
+                ModuleDirective::GuardLldp { iface, line, .. } => ("lldp", iface, *line),
+                ModuleDirective::GuardForeignSrc { iface, line, .. } => {
+                    ("foreign-src", iface, *line)
+                }
+                _ => continue,
+            };
+            if !ifaces.iter().any(|(i, _)| *i == iface) {
+                return Err(ConfigError::Parse {
+                    line,
+                    message: format!(
+                        "module guard: `{class} {iface}` names an interface with no \
+                         `interface {iface}` line; the rule would never take effect"
+                    ),
+                });
+            }
+            if let Some((_, _, prev)) = rules.iter().find(|(c, i, _)| *c == class && *i == iface) {
+                return Err(ConfigError::Parse {
+                    line,
+                    message: format!(
+                        "module guard: duplicate `{class}` for {iface} (first declared \
+                         on line {prev})"
+                    ),
+                });
+            }
+            rules.push((class, iface, line));
+        }
+
+        for (iface, line) in &ifaces {
+            if !rules.iter().any(|(_, i, _)| i == iface) {
+                return Err(ConfigError::Parse {
+                    line: *line,
+                    message: format!(
+                        "module guard: `interface {iface}` declares no rules; add at \
+                         least one class rule for it or remove the line"
+                    ),
+                });
             }
         }
         Ok(())
@@ -2436,11 +2603,182 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let mode: EcmpHashMode = t.parse().map_err(|e: String| e)?;
             Ok(ModuleDirective::EcmpDefaultHashMode(mode))
         }),
+        "interface" => parse_single_arg(line, rest, "interface", |t| {
+            validate_iface_name(line, "interface", t).map_err(|e| e.to_string())?;
+            Ok(ModuleDirective::GuardInterface {
+                iface: t.to_string(),
+                line,
+            })
+        }),
+        "arp-ns-ratelimit" => {
+            parse_guard_ratelimit(line, rest, "arp-ns-ratelimit", ARP_NS_RATELIMIT_USAGE)
+        }
+        "bcast-mcast-ratelimit" => parse_guard_ratelimit(
+            line,
+            rest,
+            "bcast-mcast-ratelimit",
+            BCAST_MCAST_RATELIMIT_USAGE,
+        ),
+        "lldp" => parse_guard_action(line, rest, "lldp"),
+        "foreign-src" => parse_guard_action(line, rest, "foreign-src"),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
         )),
     }
+}
+
+const ARP_NS_RATELIMIT_USAGE: &str =
+    "arp-ns-ratelimit takes: <iface> rate <n>/<dur> [burst <m>] [monitor]";
+const BCAST_MCAST_RATELIMIT_USAGE: &str =
+    "bcast-mcast-ratelimit takes: <iface> rate <n>/<dur> [burst <m>] [monitor]";
+
+/// Longest token-bucket interval the guard accepts. The BPF side
+/// stores GCRA deadlines in nanoseconds; bounding the interval (and
+/// burst, below) keeps `(burst - 1) * (per / rate)` far from u64
+/// overflow without runtime checks in the datapath.
+const GUARD_RATELIMIT_MAX_PER: Duration = Duration::from_secs(3600);
+const GUARD_RATELIMIT_MAX_BURST: u32 = 65_535;
+
+/// Shared tail parser for the two guard ratelimit directives:
+/// `<iface> rate <n>/<dur> [burst <m>] [monitor]`.
+fn parse_guard_ratelimit<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+    directive: &'static str,
+    usage: &'static str,
+) -> Result<ModuleDirective, ConfigError> {
+    let iface = rest
+        .next()
+        .ok_or_else(|| ConfigError::parse(line, format!("{directive} requires an interface")))?;
+    validate_iface_name(line, directive, iface)?;
+    if rest.next() != Some("rate") {
+        return Err(ConfigError::parse(line, usage));
+    }
+    let rate_tok = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
+    let (n_tok, dur_tok) = rate_tok.split_once('/').ok_or_else(|| {
+        ConfigError::parse(
+            line,
+            format!("{directive}: rate must be <n>/<dur> (e.g. 3/60s), got `{rate_tok}`"),
+        )
+    })?;
+    let rate: u32 = n_tok.parse().map_err(|_| {
+        ConfigError::parse(line, format!("{directive}: rate count must be an integer"))
+    })?;
+    if rate == 0 {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive}: rate count must be >= 1"),
+        ));
+    }
+    let per = parse_duration(line, dur_tok, directive)?;
+    if per.is_zero() {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive}: rate interval must be non-zero"),
+        ));
+    }
+    if per > GUARD_RATELIMIT_MAX_PER {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive}: rate interval must be 3600s or less"),
+        ));
+    }
+    // The per-token interval is per/rate; refuse sub-microsecond
+    // emission intervals — they are configuration mistakes (a limiter
+    // admitting >1M frames/s per target limits nothing) and they are
+    // where integer ns math stops being meaningfully accurate.
+    if per.as_nanos() / u128::from(rate) < 1_000 {
+        return Err(ConfigError::parse(
+            line,
+            format!("{directive}: rate exceeds 1 frame per microsecond per target"),
+        ));
+    }
+    let mut burst = rate;
+    let mut monitor = false;
+    let mut tail = rest.next();
+    if tail == Some("burst") {
+        let b_tok = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
+        burst = b_tok.parse().map_err(|_| {
+            ConfigError::parse(line, format!("{directive}: burst must be an integer"))
+        })?;
+        if burst == 0 {
+            return Err(ConfigError::parse(
+                line,
+                format!("{directive}: burst must be >= 1"),
+            ));
+        }
+        if burst > GUARD_RATELIMIT_MAX_BURST {
+            return Err(ConfigError::parse(
+                line,
+                format!("{directive}: burst must be {GUARD_RATELIMIT_MAX_BURST} or less"),
+            ));
+        }
+        tail = rest.next();
+    }
+    if tail == Some("monitor") {
+        monitor = true;
+        tail = rest.next();
+    }
+    if tail.is_some() {
+        return Err(ConfigError::parse(line, usage));
+    }
+    let mk = |iface: String| match directive {
+        "arp-ns-ratelimit" => ModuleDirective::GuardArpNsRatelimit {
+            iface,
+            rate,
+            per,
+            burst,
+            monitor,
+            line,
+        },
+        _ => ModuleDirective::GuardBcastMcastRatelimit {
+            iface,
+            rate,
+            per,
+            burst,
+            monitor,
+            line,
+        },
+    };
+    Ok(mk(iface.to_string()))
+}
+
+/// Shared parser for the two action-only guard directives:
+/// `<iface> drop|monitor`. The action is mandatory — a default here
+/// would make `lldp br3998` silently enforce or silently observe, and
+/// either surprise is worse than one more token.
+fn parse_guard_action<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+    directive: &'static str,
+) -> Result<ModuleDirective, ConfigError> {
+    let usage = format!("{directive} takes: <iface> drop|monitor");
+    let iface = rest
+        .next()
+        .ok_or_else(|| ConfigError::parse(line, usage.clone()))?;
+    validate_iface_name(line, directive, iface)?;
+    let monitor = match rest.next() {
+        Some("drop") => false,
+        Some("monitor") => true,
+        _ => return Err(ConfigError::parse(line, usage.clone())),
+    };
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(line, usage));
+    }
+    let iface = iface.to_string();
+    Ok(match directive {
+        "lldp" => ModuleDirective::GuardLldp {
+            iface,
+            monitor,
+            line,
+        },
+        _ => ModuleDirective::GuardForeignSrc {
+            iface,
+            monitor,
+            line,
+        },
+    })
 }
 
 /// Helper: one argument → one `ModuleDirective`. Centralizes the
@@ -5532,5 +5870,160 @@ module fast-path
             format!("{e}").contains("eth4"),
             "the refusal must name the uncovered port: {e}"
         );
+    }
+
+    // --- guard module grammar + validation ---
+
+    /// A full guard section in the documented shape parses, and every
+    /// field lands where the parser promised.
+    #[test]
+    fn guard_section_parses_reference_shape() {
+        let s = "module guard\n\
+                 \x20 interface br3998\n\
+                 \x20 interface br3999\n\
+                 \x20 arp-ns-ratelimit br3998 rate 3/60s burst 3\n\
+                 \x20 lldp br3998 drop\n\
+                 \x20 foreign-src br3998 monitor\n\
+                 \x20 bcast-mcast-ratelimit br3998 rate 50/1s monitor\n\
+                 \x20 arp-ns-ratelimit br3999 rate 2/30s\n";
+        let c = Config::parse(s).unwrap();
+        c.validate_guard().expect("reference shape must validate");
+        let m = &c.modules[0];
+        assert_eq!(m.name, "guard");
+        match &m.directives[2] {
+            ModuleDirective::GuardArpNsRatelimit {
+                iface,
+                rate,
+                per,
+                burst,
+                monitor,
+                ..
+            } => {
+                assert_eq!(iface, "br3998");
+                assert_eq!(*rate, 3);
+                assert_eq!(*per, Duration::from_secs(60));
+                assert_eq!(*burst, 3);
+                assert!(!monitor);
+            }
+            other => panic!("expected GuardArpNsRatelimit, got {other:?}"),
+        }
+        match &m.directives[3] {
+            ModuleDirective::GuardLldp { iface, monitor, .. } => {
+                assert_eq!(iface, "br3998");
+                assert!(!monitor);
+            }
+            other => panic!("expected GuardLldp, got {other:?}"),
+        }
+        match &m.directives[4] {
+            ModuleDirective::GuardForeignSrc { monitor, .. } => assert!(monitor),
+            other => panic!("expected GuardForeignSrc, got {other:?}"),
+        }
+        // burst defaults to the rate count when omitted.
+        match &m.directives[6] {
+            ModuleDirective::GuardArpNsRatelimit { rate, burst, .. } => {
+                assert_eq!(*rate, 2);
+                assert_eq!(*burst, 2);
+            }
+            other => panic!("expected GuardArpNsRatelimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_ratelimit_grammar_refusals() {
+        // (body line, expected message fragment)
+        let cases = [
+            ("arp-ns-ratelimit br0 rate 3-60s", "rate must be <n>/<dur>"),
+            ("arp-ns-ratelimit br0 rate 0/60s", "rate count must be >= 1"),
+            (
+                "arp-ns-ratelimit br0 rate 3/0s",
+                "rate interval must be non-zero",
+            ),
+            ("arp-ns-ratelimit br0 rate 3/60m", "duration must end in"),
+            ("arp-ns-ratelimit br0 rate 3/7200s", "3600s or less"),
+            (
+                "arp-ns-ratelimit br0 rate 3/60s burst 0",
+                "burst must be >= 1",
+            ),
+            (
+                "arp-ns-ratelimit br0 rate 3/60s burst 70000",
+                "65535 or less",
+            ),
+            (
+                "bcast-mcast-ratelimit br0 rate 2000000/1s",
+                "1 frame per microsecond",
+            ),
+            ("arp-ns-ratelimit br0 rate 3/60s burst 2 extra", "takes:"),
+            ("arp-ns-ratelimit br0 burst 2", "takes:"),
+            ("lldp br0", "drop|monitor"),
+            ("lldp br0 on", "drop|monitor"),
+            ("foreign-src br0 drop extra", "drop|monitor"),
+        ];
+        for (body, want) in cases {
+            let s = format!("module guard\n  {body}\n");
+            let e = Config::parse(&s).expect_err(body);
+            match e {
+                ConfigError::Parse { line, message } => {
+                    assert_eq!(line, 2, "for `{body}`");
+                    assert!(
+                        message.contains(want),
+                        "for `{body}`: message was `{message}`"
+                    );
+                }
+                other => panic!("expected Parse for `{body}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn guard_validation_refusals() {
+        // (config, expected message fragment)
+        let cases = [
+            ("module guard\n".to_string(), "section is empty"),
+            (
+                "module guard\n  interface br0\n  interface br0\n  lldp br0 drop\n".to_string(),
+                "duplicate `interface br0`",
+            ),
+            (
+                "module guard\n  interface br0\n  lldp br0 drop\n  lldp br1 drop\n".to_string(),
+                "no `interface br1` line",
+            ),
+            (
+                "module guard\n  interface br0\n  lldp br0 drop\n  lldp br0 monitor\n".to_string(),
+                "duplicate `lldp` for br0",
+            ),
+            (
+                "module guard\n  interface br0\n  interface br1\n  lldp br0 drop\n".to_string(),
+                "`interface br1` declares no rules",
+            ),
+        ];
+        for (s, want) in cases {
+            let e = Config::parse(&s).unwrap().validate_guard().expect_err(&s);
+            assert!(
+                format!("{e}").contains(want),
+                "for config `{s}`: error was `{e}`"
+            );
+        }
+    }
+
+    /// Guard interfaces join the sysfs existence check exactly like
+    /// fast-path `attach` interfaces.
+    #[test]
+    fn guard_interfaces_are_sysfs_checked() {
+        let dir = tempfile_shim::TempDir::new("guard-sysfs");
+        std::fs::create_dir(dir.path.join("br0")).unwrap();
+        let c = Config::parse(
+            "module guard\n  interface br0\n  interface br1\n  lldp br0 drop\n  lldp br1 drop\n",
+        )
+        .unwrap();
+        let e = c
+            .validate_interfaces_in(&dir.path)
+            .expect_err("br1 does not exist");
+        match e {
+            ConfigError::InterfaceMissing { iface, .. } => assert_eq!(iface, "br1"),
+            other => panic!("expected InterfaceMissing, got {other:?}"),
+        }
+        std::fs::create_dir(dir.path.join("br1")).unwrap();
+        c.validate_interfaces_in(&dir.path)
+            .expect("both interfaces exist now");
     }
 }
