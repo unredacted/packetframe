@@ -291,11 +291,26 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
         send_frame(&tx, ifindex_a, &storm);
     }
     let delivered = recv_count(&rx, Duration::from_secs(2), arp_for(target_a));
+    // Assert the pipeline stages in order, each with the counter
+    // snapshot, so a failure names WHERE it broke: program not in the
+    // egress path (total_egress stuck), config lookup missing
+    // (pass_no_cfg), classifier not matching (pass_no_match), or the
+    // limiter not clamping (arp_pass = 40).
+    let stats = h.snapshot();
+    assert!(
+        stats[idx::TOTAL_EGRESS] >= 40,
+        "guard_egress did not run at real egress: stats={stats:?}"
+    );
+    assert_eq!(
+        stats[idx::PASS_NO_CFG],
+        0,
+        "GUARD_CFG lookup missed at real egress (skb->ifindex vs written key?): stats={stats:?}"
+    );
     // Lower bound: the burst. Upper bound: burst plus the refill a
     // slow, ENOBUFS-paced send loop can legitimately admit at 5/s.
     assert!(
         (5..=20).contains(&delivered),
-        "expected ~burst(5) of 40 frames delivered, got {delivered}"
+        "expected ~burst(5) of 40 frames delivered, got {delivered}; stats={stats:?}"
     );
     assert!(
         h.stat(idx::ARP_DROP) >= 20,
