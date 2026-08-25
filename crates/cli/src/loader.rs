@@ -119,6 +119,9 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
     config
         .validate_vpp_offload()
         .map_err(|e| RunError::Startup(e.to_string()))?;
+    config
+        .validate_guard()
+        .map_err(|e| RunError::Startup(e.to_string()))?;
 
     // Fail fast if metrics-textfile can't be written, the exporter
     // would retry silently every 15s otherwise.
@@ -341,6 +344,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                     m.set_feed_session(h.clone());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
+            }
+            #[cfg(feature = "guard")]
+            "guard" => {
+                // No cross-module setters: the guard reads only its
+                // own section plus the interface state at attach.
+                modules.push((
+                    section.name.clone(),
+                    Box::new(packetframe_guard::GuardModule::new()) as Box<dyn Module>,
+                ));
             }
             other => {
                 return Err(RunError::Startup(format!(
@@ -1019,6 +1031,15 @@ fn reconfigure_from_signal(
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
         return Published::No;
     }
+    // Same rule for the guard section: every validator that runs at
+    // startup must also run at reload, or SIGHUP silently applies a
+    // config startup would refuse (the incident this comment block
+    // exists to prevent).
+    if let Err(e) = new_config.validate_guard() {
+        tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
+        write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        return Published::No;
+    }
 
     // After the two refusals above and before the module loop: a
     // rejected reload changes nothing, including this, and a module
@@ -1500,15 +1521,17 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // alone — the first version of this teardown ran unconditionally and
     // would have terminated a VPP the operator never asked about, purely
     // because it shares the state dir.
-    let (bpffs_root, state_dir, settle_time, config_has_vpp) = match config {
+    let (bpffs_root, state_dir, settle_time, config_has_vpp, config_has_guard) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
             let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
+            let has_guard = c.modules.iter().any(|m| m.name == "guard");
             (
                 c.global.bpffs_root,
                 c.global.state_dir,
                 c.global.attach_settle_time,
                 has_vpp,
+                has_guard,
             )
         }
         // No config at all: nothing scopes the request, so only `--all`
@@ -1517,6 +1540,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
             packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
+            false,
             false,
         ),
     };
@@ -1577,7 +1601,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // nothing can push. Not a CI configuration (clippy runs
     // `--all-features`), but a warning is a warning.
     #[cfg_attr(
-        not(any(feature = "fast-path", feature = "vpp-offload")),
+        not(any(feature = "fast-path", feature = "vpp-offload", feature = "guard")),
         allow(unused_mut)
     )]
     let mut errors: Vec<String> = Vec::new();
@@ -1599,11 +1623,55 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         );
     }
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = (all, config_has_vpp);
+    let _ = config_has_vpp;
+
+    // Same scoping rule as vpp-offload: a detach scoped to a config
+    // without a guard section must leave the guard's egress filters
+    // alone; `--all` is the recovery path every guard error message
+    // advertises, so it must actually reach them.
+    #[cfg(feature = "guard")]
+    if all || config_has_guard {
+        if let Err(e) = detach_guard(&bpffs_root, &state_dir) {
+            errors.push(e);
+        }
+    } else {
+        tracing::info!(
+            "guard state left alone: this detach is scoped to the supplied config; \
+             use `--all` to tear down modules it does not declare"
+        );
+    }
+    #[cfg(not(feature = "guard"))]
+    let _ = config_has_guard;
+    #[cfg(not(any(feature = "vpp-offload", feature = "guard")))]
+    let _ = all;
 
     if !errors.is_empty() {
         return Err(errors.join("; AND "));
     }
+    Ok(())
+}
+
+/// The guard half of `detach`: state-file-driven teardown of the
+/// egress filters + pins (no live loader required — netlink cls_bpf
+/// filters have qdisc lifetime). Same split-out rationale as
+/// `detach_fast_path`: its errors aggregate rather than abort the
+/// other modules' teardown.
+#[cfg(all(feature = "guard", target_os = "linux"))]
+fn detach_guard(bpffs_root: &Path, state_dir: &Path) -> Result<(), String> {
+    match packetframe_guard::detach_from_state_dir(state_dir, bpffs_root) {
+        Ok(cleared) => {
+            if cleared > 0 {
+                tracing::info!(cleared, "guard tc egress filters detached");
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("guard: {e}")),
+    }
+}
+
+#[cfg(all(feature = "guard", not(target_os = "linux")))]
+fn detach_guard(_bpffs_root: &Path, _state_dir: &Path) -> Result<(), String> {
+    // Nothing can be attached on a stub platform.
     Ok(())
 }
 

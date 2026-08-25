@@ -38,6 +38,26 @@ pub fn attach_ifaces_from_config(config: &Config) -> Vec<String> {
     ifaces
 }
 
+/// Interfaces named by `interface` lines in a `guard` section, if
+/// any. Empty when the module isn't configured — the guard probes
+/// then stay out of the report entirely.
+pub fn guard_ifaces_from_config(config: &Config) -> Vec<String> {
+    let mut ifaces = Vec::new();
+    for m in &config.modules {
+        if m.name != "guard" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::GuardInterface { iface, .. } = d {
+                if !ifaces.contains(iface) {
+                    ifaces.push(iface.clone());
+                }
+            }
+        }
+    }
+    ifaces
+}
+
 /// Interfaces named by `port` lines in a `vpp-offload` section, if
 /// any. Empty when the module isn't configured — the vpp probes then
 /// stay out of the report entirely.
@@ -308,6 +328,7 @@ pub fn probe_and_render(
     attach_ifaces: &[String],
     vpp: &VppProbeInputs<'_>,
     allowlist: &[IpPrefix],
+    guard_ifaces: &[String],
     human: bool,
 ) -> Rendered {
     let mut report = run_probes(bpffs_root);
@@ -360,6 +381,16 @@ pub fn probe_and_render(
         let _ = (vpp, allowlist);
         Vec::new()
     };
+    // guard probes: only when the config declares the module. All
+    // non-required (feasibility informs, the module's attach enforces).
+    #[cfg(feature = "guard")]
+    if !guard_ifaces.is_empty() {
+        for cap in packetframe_guard::run_feasibility_probes(guard_ifaces) {
+            report.capabilities.push(cap);
+        }
+    }
+    #[cfg(not(feature = "guard"))]
+    let _ = guard_ifaces;
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.
