@@ -2091,8 +2091,10 @@ owns what happens after `dpkg -i` succeeds.
 The 80-vpp.conf trap also has a check that doesn't require a reboot to
 find it: `packetframe feasibility` runs `vpp.sysctl-hugepages`, which
 scans the boot sysctl set (`/etc/sysctl.d`, `/run/sysctl.d`, the lib
-dirs and `/etc/sysctl.conf`, with systemd's shadowing and ordering
-rules) for `vm.nr_hugepages`, prices the EFFECTIVE value at the
+dirs and `/etc/sysctl.conf`, pricing BOTH the systemd-sysctl and the
+procps `sysctl --system` apply models and reporting the worse — the
+two disagree about `/lib/sysctl.d` and about when `/etc/sysctl.conf`
+applies) for `vm.nr_hugepages`, prices the EFFECTIVE value at the
 running kernel's default hugepage size from `/proc/meminfo`, and FAILs
 — naming the file and the line to delete — when the request exceeds half of
 MemTotal (the incident case: 1024 pages × 512 MiB default on the
