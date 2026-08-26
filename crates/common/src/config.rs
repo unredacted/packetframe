@@ -1195,6 +1195,16 @@ mod humantime_serde_compat {
 /// memory primitive the previous behavior exposed.
 pub const MAX_CONFIG_FILE_SIZE: u64 = 1 << 20;
 
+/// Maximum `interface` lines a guard section may declare. Mirrors the
+/// BPF `GUARD_CFG` map's capacity
+/// (`crates/modules/guard/bpf/src/maps.rs`, `GUARD_CFG_MAX_ENTRIES`):
+/// the map holds one entry per guarded interface, and a config that
+/// overruns it must be refused before any filter is installed rather
+/// than failing mid-attach with the first 64 filters already live.
+/// The guard crate's `GuardConfig::from_directives` consumes this
+/// same constant, so the two verdicts cannot drift.
+pub const GUARD_MAX_INTERFACES: usize = 64;
+
 impl Config {
     /// Parse a config from a file path.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -1608,6 +1618,8 @@ impl Config {
     /// three call sites must stay in step or reload silently skips
     /// enforcement — see the loader's reload-validation note).
     ///
+    /// Also enforces [`GUARD_MAX_INTERFACES`].
+    ///
     /// Rules:
     /// - an empty `guard` section is refused (same reasoning as
     ///   vpp-offload: one verdict at the earliest point);
@@ -1654,6 +1666,20 @@ impl Config {
                           `interface <iface>` and at least one class rule, or remove \
                           the section"
                     .to_string(),
+            });
+        }
+        if ifaces.len() > GUARD_MAX_INTERFACES {
+            // Refused here, before any filter is installed — failing
+            // only at attach would leave the first 64 interfaces'
+            // filters live behind a startup error (review finding,
+            // PR #205).
+            return Err(ConfigError::Parse {
+                line: ifaces[GUARD_MAX_INTERFACES].1,
+                message: format!(
+                    "module guard: {} `interface` lines exceed the {GUARD_MAX_INTERFACES} \
+                     the datapath's per-interface config map holds",
+                    ifaces.len()
+                ),
             });
         }
 
@@ -6023,6 +6049,32 @@ module fast-path
                 "for config `{s}`: error was `{e}`"
             );
         }
+    }
+
+    /// The interface count is capped at the BPF config map's capacity
+    /// — a 65th interface must be refused before any filter attaches,
+    /// not fail mid-attach with 64 filters live.
+    #[test]
+    fn guard_interface_count_is_capped_at_the_map_size() {
+        let over = |n: usize| {
+            let mut s = String::from("module guard\n");
+            for i in 0..n {
+                s.push_str(&format!("  interface br{i}\n  lldp br{i} drop\n"));
+            }
+            s
+        };
+        let e = Config::parse(&over(GUARD_MAX_INTERFACES + 1))
+            .unwrap()
+            .validate_guard()
+            .expect_err("65 interfaces refused");
+        assert!(
+            format!("{e}").contains(&format!("exceed the {GUARD_MAX_INTERFACES}")),
+            "{e}"
+        );
+        Config::parse(&over(GUARD_MAX_INTERFACES))
+            .unwrap()
+            .validate_guard()
+            .expect("exactly the cap is allowed");
     }
 
     /// Guard interfaces join the sysfs existence check exactly like

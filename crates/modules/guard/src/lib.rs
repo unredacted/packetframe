@@ -206,6 +206,57 @@ mod tests {
     use super::*;
     use packetframe_common::config::Config;
 
+    /// A leftover `guard-tc-links.json` is prior state: attach saves
+    /// records BEFORE pinning, so a crash in that window leaves live
+    /// filters whose only teardown metadata is that file — a fresh
+    /// attach would overwrite it and orphan them (review finding,
+    /// PR #205). The refusal runs before any privileged BPF work, so
+    /// this test needs a real ELF but no capabilities.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_refuses_leftover_tc_link_records() {
+        if !crate::GUARD_BPF_AVAILABLE {
+            eprintln!("BPF stub in effect (no rustup); skipping leftover-state test.");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pf-guard-leftover-{}", std::process::id()));
+        let state_dir = dir.join("state");
+        let bpffs_root = dir.join("bpffs");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&bpffs_root).unwrap();
+        crate::tc_links::save(
+            &state_dir,
+            &crate::tc_links::TcLinksFile {
+                links: vec![crate::tc_links::TcLinkRecord {
+                    iface: "br3998".into(),
+                    ifindex: 42,
+                    priority: 49152,
+                    handle: 1,
+                }],
+            },
+        )
+        .unwrap();
+
+        let good = Config::parse("module guard\n  interface br0\n  lldp br0 drop\n").unwrap();
+        let global = packetframe_common::config::GlobalConfig::default();
+        let ctx = LoaderCtx {
+            bpffs_root: &bpffs_root,
+            state_dir: &state_dir,
+        };
+        let mut m = GuardModule::new();
+        let e = m
+            .load(
+                &ModuleConfig {
+                    section: &good.modules[0],
+                    global: &global,
+                },
+                &ctx,
+            )
+            .expect_err("leftover records refused");
+        assert!(format!("{e}").contains("detach --all"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A config the validator refuses is refused by `load` with the
     /// same verdict — before any BPF or pin state is consulted, so
     /// this holds unprivileged on every platform.

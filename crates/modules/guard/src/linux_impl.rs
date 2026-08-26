@@ -75,6 +75,30 @@ pub(crate) fn load(
             ),
         ));
     }
+    // A leftover state file is prior state even with no pins: attach
+    // persists each filter record BEFORE the post-loop pinning, so a
+    // crash in that window leaves live qdisc-lifetime filters whose
+    // ONLY teardown metadata is this file. Starting fresh would
+    // overwrite it and orphan them (review finding, PR #205).
+    match tc_links::load(state_dir) {
+        Ok(Some(file)) if !file.links.is_empty() => {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!(
+                    "existing guard tc-link records in {} from a prior \
+                     invocation; run `packetframe detach --all` first",
+                    tc_links::file_path(state_dir).display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!("read prior guard tc links: {e}"),
+            ));
+        }
+    }
     let bytes = aligned_bpf_copy();
     let mut ebpf = Ebpf::load(&bytes)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("aya::Ebpf::load failed: {e}")))?;
@@ -127,13 +151,30 @@ pub(crate) fn attach(state: &mut ActiveState, settle_time: Duration) -> ModuleRe
         let (priority, handle) = tc_attach_egress(&mut state.ebpf, iface)?;
         records.links.push(tc_links::TcLinkRecord {
             iface: iface.clone(),
+            ifindex,
             priority,
             handle,
         });
         // Save inside the loop: a failure attaching iface N must not
         // strand ifaces 0..N as invisible orphans (PR #75 lesson).
-        tc_links::save(&state.state_dir, &records)
-            .map_err(|e| ModuleError::other(MODULE_NAME, format!("persist tc links: {e}")))?;
+        // And when the save itself fails, the just-attached filter is
+        // live with NO persisted record — roll it back rather than
+        // orphan an active classifier (review finding, PR #205).
+        if let Err(e) = tc_links::save(&state.state_dir, &records) {
+            let rollback = match tc_detach_one(iface, ifindex, priority, handle) {
+                TcDetachOutcome::Cleared => {
+                    format!("the just-attached filter on {iface} was rolled back")
+                }
+                TcDetachOutcome::Failed(msg) => format!(
+                    "rollback ALSO failed ({msg}) — a live filter on {iface} has no \
+                     persisted record; remove it with `tc filter del dev {iface} egress`"
+                ),
+            };
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                format!("persist tc links: {e}; {rollback}"),
+            ));
+        }
         state.attached.push((iface.clone(), ifindex, mac));
         info!(
             iface,
@@ -206,7 +247,7 @@ pub fn detach_from_state_dir(state_dir: &Path, bpffs_root: &Path) -> ModuleResul
     let mut retained = Vec::new();
     let mut errors = Vec::new();
     for rec in links {
-        match tc_detach_one(&rec.iface, rec.priority, rec.handle) {
+        match tc_detach_one(&rec.iface, rec.ifindex, rec.priority, rec.handle) {
             TcDetachOutcome::Cleared => cleared += 1,
             TcDetachOutcome::Failed(msg) => {
                 errors.push(msg);
@@ -247,19 +288,31 @@ pub fn detach_from_state_dir(state_dir: &Path, bpffs_root: &Path) -> ModuleResul
 pub(crate) fn health(state: &ActiveState) -> HealthReport {
     let mut overall = HealthState::Healthy;
     let mut subsystems = Vec::new();
-    for (iface, _, _) in &state.attached {
-        let exists = Path::new("/sys/class/net").join(iface).exists();
-        let hs = if exists {
-            HealthState::Healthy
-        } else {
-            HealthState::Degraded
+    for (iface, ifindex, _) in &state.attached {
+        // Compare ifindex, not mere name existence: a deleted-and-
+        // recreated device keeps its name but took the qdisc-lifetime
+        // filter with it — a name-only check would report green while
+        // enforcement is silently absent (review finding, PR #205).
+        let (hs, message) = match ifindex_of(iface) {
+            Err(_) => (
+                HealthState::Degraded,
+                Some("interface vanished; its egress filter died with it".to_string()),
+            ),
+            Ok(current) if current != *ifindex => (
+                HealthState::Degraded,
+                Some(format!(
+                    "interface recreated (ifindex {ifindex} → {current}); the egress \
+                     filter died with the old device — restart (stop, `packetframe \
+                     detach`, start) to re-attach"
+                )),
+            ),
+            Ok(_) => (HealthState::Healthy, None),
         };
         overall = overall.worse_of(hs);
         subsystems.push(SubsystemHealth {
             name: format!("attach:{iface}"),
             state: hs,
-            message: (!exists)
-                .then(|| "interface vanished; its egress filter died with it".to_string()),
+            message,
             last_success_age_seconds: None,
         });
     }
@@ -355,9 +408,39 @@ enum TcDetachOutcome {
     Failed(String),
 }
 
-fn tc_detach_one(iface: &str, priority: u16, handle: u32) -> TcDetachOutcome {
+fn tc_detach_one(
+    iface: &str,
+    expected_ifindex: u32,
+    priority: u16,
+    handle: u32,
+) -> TcDetachOutcome {
     use aya::programs::tc::{SchedClassifierLink, TcAttachType, TcError};
     use aya::programs::{Link as _, ProgramError};
+
+    // A same-name device with a DIFFERENT ifindex is a recreated
+    // device: the recorded filter died with the original (qdisc
+    // lifetime), and `SchedClassifierLink::attached` resolves by name,
+    // so deleting here could remove an unrelated filter on the
+    // replacement whose (priority, handle) happens to match — the
+    // first auto-allocated tuple is common (review finding, PR #205).
+    // The check-to-delete race is accepted: it requires the device to
+    // be recreated in that instant AND the tuple to collide.
+    match ifindex_of(iface) {
+        Err(_) => {
+            info!(iface, "iface gone; guard tc filter died with it");
+            return TcDetachOutcome::Cleared;
+        }
+        Ok(current) if current != expected_ifindex => {
+            info!(
+                iface,
+                expected_ifindex,
+                current,
+                "iface recreated; the recorded filter died with the old device"
+            );
+            return TcDetachOutcome::Cleared;
+        }
+        Ok(_) => {}
+    }
 
     // `attached()` only resolves the ifindex; failure means the iface
     // is gone, and qdisc-lifetime filters go with their device.

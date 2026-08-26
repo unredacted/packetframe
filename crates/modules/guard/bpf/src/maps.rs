@@ -62,6 +62,12 @@ pub struct GuardIfCfg {
 
 const _: () = assert!(core::mem::size_of::<GuardIfCfg>() == 48);
 
+/// One entry per guarded interface. Mirrored by
+/// `packetframe_common::config::GUARD_MAX_INTERFACES`, which the
+/// config validator enforces so an attach set that would overrun this
+/// map is refused before any filter is installed.
+pub const GUARD_CFG_MAX_ENTRIES: u32 = 64;
+
 /// Per-ifindex config, keyed by the egress device's ifindex
 /// (`skb->ifindex` at the egress hook). A HashMap rather than an
 /// Array for two reasons: ifindex space is sparse (same rationale as
@@ -72,7 +78,8 @@ const _: () = assert!(core::mem::size_of::<GuardIfCfg>() == 48);
 /// No entry for an ifindex ⇒ the program passes everything (fail
 /// open).
 #[map]
-pub static GUARD_CFG: HashMap<u32, GuardIfCfg> = HashMap::with_max_entries(64, 0);
+pub static GUARD_CFG: HashMap<u32, GuardIfCfg> =
+    HashMap::with_max_entries(GUARD_CFG_MAX_ENTRIES, 0);
 
 // --- Token buckets ----------------------------------------------------------
 //
