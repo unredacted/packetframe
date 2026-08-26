@@ -49,8 +49,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             crates/modules/fast-path/bpf/target/
+            crates/modules/guard/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-release-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/probe/bpf/**') }}
+          key: ${{ runner.os }}-release-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/guard/bpf/**', 'crates/modules/probe/bpf/**') }}
 
       - name: Install bpf-linker
         run: |
@@ -90,6 +91,7 @@ jobs:
           }
           mkdir -p dist
           build_one crates/modules/fast-path/bpf fast-path fast-path.bpf.o
+          build_one crates/modules/guard/bpf     guard     guard.bpf.o
           build_one crates/modules/probe/bpf     probe     probe.bpf.o
           ls -la dist/*.bpf.o
 
@@ -98,6 +100,7 @@ jobs:
           name: bpf-elf
           path: |
             dist/fast-path.bpf.o
+            dist/guard.bpf.o
             dist/probe.bpf.o
           retention-days: 7
           if-no-files-found: error
@@ -174,21 +177,24 @@ jobs:
         run: |
           set -eux
           FAST="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
+          GUARD="$(pwd)/prebuilt-bpf/guard.bpf.o"
           PROBE="$(pwd)/prebuilt-bpf/probe.bpf.o"
-          test -e "${FAST}" && test -e "${PROBE}"
+          test -e "${FAST}" && test -e "${GUARD}" && test -e "${PROBE}"
           head -c 4 "${FAST}"  | od -An -c | grep -q 'E   L   F'
+          head -c 4 "${GUARD}" | od -An -c | grep -q 'E   L   F'
           head -c 4 "${PROBE}" | od -An -c | grep -q 'E   L   F'
           # Cross runs inside Docker, so use the container's mounted
           # project path (`/project`) for the env vars. Cross mounts
           # the workspace root there by default.
           {
             echo "PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o"
+            echo "PACKETFRAME_GUARD_BPF_OBJ_PATH=/project/prebuilt-bpf/guard.bpf.o"
             echo "PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o"
           } >> "${GITHUB_ENV}"
           # Forward env vars into the container. SOURCE_DATE_EPOCH is also
           # forwarded so rustc-embedded timestamps inside the cross build
           # match the tag commit time set in GITHUB_ENV earlier.
-          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o -e SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" >> "${GITHUB_ENV}"
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_GUARD_BPF_OBJ_PATH=/project/prebuilt-bpf/guard.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o -e SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" >> "${GITHUB_ENV}"
 
       - name: Build release
         run: cross build --release --workspace --target ${{ matrix.target }}

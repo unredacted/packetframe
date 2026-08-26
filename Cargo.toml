@@ -16,6 +16,7 @@ members = [
 # commands. Each parent crate's `build.rs` invokes a nested cargo.
 exclude = [
     "crates/modules/fast-path/bpf",
+    "crates/modules/guard/bpf",
     "crates/modules/probe/bpf",
 ]
 

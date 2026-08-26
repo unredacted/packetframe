@@ -150,6 +150,17 @@ impl GuardConfig {
         if interfaces.is_empty() {
             return Err("section declares no `interface` lines".to_string());
         }
+        // ...and at most GUARD_CFG's capacity, again matching the
+        // validator: overrunning the map would fail mid-attach with
+        // the first 64 filters already live (review finding, PR #205).
+        if interfaces.len() > packetframe_common::config::GUARD_MAX_INTERFACES {
+            return Err(format!(
+                "{} `interface` lines exceed the {} the datapath's per-interface \
+                 config map holds",
+                interfaces.len(),
+                packetframe_common::config::GUARD_MAX_INTERFACES
+            ));
+        }
         for (iface, rules) in &interfaces {
             if *rules == GuardIfaceRules::default() {
                 return Err(format!("`interface {iface}` declares no rules"));
@@ -344,6 +355,19 @@ mod tests {
             let e = GuardConfig::from_directives(&guard_directives(body)).expect_err(body);
             assert!(e.contains(want), "for `{body}`: error was `{e}`");
         }
+    }
+
+    /// Same cap as the config validator, from the same constant.
+    #[test]
+    fn interface_count_is_capped_at_the_map_size() {
+        let max = packetframe_common::config::GUARD_MAX_INTERFACES;
+        let mut body = String::new();
+        for i in 0..=max {
+            body.push_str(&format!("  interface br{i}\n  lldp br{i} drop\n"));
+        }
+        let e = GuardConfig::from_directives(&guard_directives(&body))
+            .expect_err("one over the cap refused");
+        assert!(e.contains(&format!("exceed the {max}")), "{e}");
     }
 
     #[test]

@@ -52,6 +52,15 @@ pub struct TcLinksFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcLinkRecord {
     pub iface: String,
+    /// The device's ifindex at attach time. Detach verifies it before
+    /// reconstructing the filter: a same-name RECREATED device has a
+    /// new ifindex, the recorded filter died with the original
+    /// (qdisc lifetime), and `SchedClassifierLink::attached` resolves
+    /// by name — a blind delete could remove an unrelated filter on
+    /// the replacement whose `(priority, handle)` happens to match
+    /// (the first auto-allocated tuple is common). Review finding,
+    /// PR #205.
+    pub ifindex: u32,
     pub priority: u16,
     pub handle: u32,
 }
@@ -112,6 +121,7 @@ mod tests {
         let file = TcLinksFile {
             links: vec![TcLinkRecord {
                 iface: "br3998".into(),
+                ifindex: 42,
                 priority: 49152,
                 handle: 1,
             }],
@@ -120,6 +130,7 @@ mod tests {
         let loaded = load(&dir).unwrap().expect("file present");
         assert_eq!(loaded.links.len(), 1);
         assert_eq!(loaded.links[0].iface, "br3998");
+        assert_eq!(loaded.links[0].ifindex, 42);
         remove(&dir).unwrap();
         assert!(load(&dir).unwrap().is_none());
         remove(&dir).unwrap(); // second remove is a no-op
