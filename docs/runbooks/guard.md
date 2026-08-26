@@ -55,7 +55,15 @@ module guard
   answers the IX operator's reply-only-mode blackhole objection.
 - Refused at load: an empty section, duplicate `interface` lines, a
   class rule naming an undeclared interface, duplicate
-  `(class, interface)` pairs, an `interface` with zero rules.
+  `(class, interface)` pairs, an `interface` with zero rules, more
+  interfaces than the datapath's config map holds (64), and a guard
+  section without a fast-path section — guard v1 runs alongside the
+  fast-path daemon (the startup capability gate assumes it), the same
+  explicit dependency vpp-offload declares.
+- Adding or removing a *module section* is restart-only: a SIGHUP that
+  introduces `module guard` is refused by name (the daemon cannot
+  construct modules after startup) — reload only reconciles rules on a
+  guard that attached at start.
 
 ## The monitor→enforce ladder
 

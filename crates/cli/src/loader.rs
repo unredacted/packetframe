@@ -1059,6 +1059,26 @@ fn reconfigure_from_signal(
     allowlist.publish(crate::feasibility::allowlist_from_config(&new_config));
 
     let mut failures: Vec<String> = Vec::new();
+    // Additions are restart-only, symmetric with the removal refusal
+    // below: the module set is fixed at startup, so a section with no
+    // loaded module cannot be constructed here. Without this, adding
+    // `module guard` and reloading wrote an OK marker while no guard
+    // existed — the operator believes the documented monitor/enforce
+    // protection is active when nothing is attached (review finding,
+    // PR #206).
+    for section in &new_config.modules {
+        if !modules.iter().any(|(name, _)| name == &section.name) {
+            tracing::warn!(
+                module = %section.name,
+                "module added to config; reconfigure cannot construct it \
+                 (the module set is restart-only)"
+            );
+            failures.push(format!(
+                "{}: added to config (restart required)",
+                section.name
+            ));
+        }
+    }
     for (name, module) in modules.iter_mut() {
         let section = match new_config.modules.iter().find(|m| &m.name == name) {
             Some(s) => s,
@@ -1521,25 +1541,36 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     // alone — the first version of this teardown ran unconditionally and
     // would have terminated a VPP the operator never asked about, purely
     // because it shares the state dir.
-    let (bpffs_root, state_dir, settle_time, config_has_vpp, config_has_guard) = match config {
+    let (
+        bpffs_root,
+        state_dir,
+        settle_time,
+        config_has_fast_path,
+        config_has_vpp,
+        config_has_guard,
+    ) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
+            let has_fast_path = c.modules.iter().any(|m| m.name == "fast-path");
             let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
             let has_guard = c.modules.iter().any(|m| m.name == "guard");
             (
                 c.global.bpffs_root,
                 c.global.state_dir,
                 c.global.attach_settle_time,
+                has_fast_path,
                 has_vpp,
                 has_guard,
             )
         }
-        // No config at all: nothing scopes the request, so only `--all`
-        // authorises reaching past fast-path.
+        // No config at all: nothing scopes the request. fast-path is
+        // torn down (the historical bare-`detach` recovery semantics);
+        // only `--all` authorises reaching past it.
         None => (
             PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
             packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
+            true,
             false,
             false,
         ),
@@ -1606,10 +1637,25 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     )]
     let mut errors: Vec<String> = Vec::new();
 
+    // fast-path follows the same scoping rule as the other modules now
+    // that a config without a fast-path section is legitimate (a
+    // guard-only scoping config, the fastpath-only.conf inverse): a
+    // scoped detach must not interrupt forwarding the operator never
+    // asked about. A bare `detach` (no config) still tears fast-path
+    // down — the historical recovery semantics.
     #[cfg(feature = "fast-path")]
-    if let Err(e) = detach_fast_path(&bpffs_root, &state_dir, settle_time) {
-        errors.push(e);
+    if all || config_has_fast_path {
+        if let Err(e) = detach_fast_path(&bpffs_root, &state_dir, settle_time) {
+            errors.push(e);
+        }
+    } else {
+        tracing::info!(
+            "fast-path state left alone: this detach is scoped to the supplied config; \
+             use `--all` to tear down modules it does not declare"
+        );
     }
+    #[cfg(not(feature = "fast-path"))]
+    let _ = (config_has_fast_path, settle_time);
 
     #[cfg(feature = "vpp-offload")]
     if all || config_has_vpp {
