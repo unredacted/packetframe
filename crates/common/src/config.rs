@@ -1623,14 +1623,6 @@ impl Config {
         let Some(guard) = self.modules.iter().find(|m| m.name == "guard") else {
             return Ok(());
         };
-        if guard.directives.is_empty() {
-            return Err(ConfigError::Parse {
-                line: 0,
-                message: "module guard: section is empty; declare `interface <iface>` \
-                          and at least one class rule, or remove the section"
-                    .to_string(),
-            });
-        }
 
         // (iface, first-declaration line) for `interface` lines.
         let mut ifaces: Vec<(&String, usize)> = Vec::new();
@@ -1647,6 +1639,22 @@ impl Config {
                 }
                 ifaces.push((iface, *line));
             }
+        }
+        // Specifically ≥1 `interface` line, not merely a non-empty
+        // directive list: the directive namespace is shared across
+        // module sections, so `module guard\n  attach eth0 native`
+        // parses — and a raw-emptiness check would wave through a
+        // section whose every directive belongs to another module,
+        // attaching nothing while reporting healthy (review finding,
+        // PR #204).
+        if ifaces.is_empty() {
+            return Err(ConfigError::Parse {
+                line: 0,
+                message: "module guard: section declares no `interface` lines; add \
+                          `interface <iface>` and at least one class rule, or remove \
+                          the section"
+                    .to_string(),
+            });
         }
 
         // Class rules: (class-name, iface, line), checked for
@@ -5978,7 +5986,19 @@ module fast-path
     fn guard_validation_refusals() {
         // (config, expected message fragment)
         let cases = [
-            ("module guard\n".to_string(), "section is empty"),
+            (
+                "module guard\n".to_string(),
+                "declares no `interface` lines",
+            ),
+            // The directive namespace is shared across module sections,
+            // so a guard section holding only another module's
+            // directives parses — it must still be refused (PR #204
+            // review finding: a raw non-emptiness check waved this
+            // through as a silent no-op attach).
+            (
+                "module guard\n  attach eth0 native\n".to_string(),
+                "declares no `interface` lines",
+            ),
             (
                 "module guard\n  interface br0\n  interface br0\n  lldp br0 drop\n".to_string(),
                 "duplicate `interface br0`",

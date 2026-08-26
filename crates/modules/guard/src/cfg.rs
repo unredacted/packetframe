@@ -142,6 +142,14 @@ impl GuardConfig {
             }
         }
 
+        // ≥1 `interface` line, matching `Config::validate_guard` —
+        // the shared directive namespace means a guard section holding
+        // only another module's directives parses to an empty attach
+        // set here, which would load and report healthy while policing
+        // nothing (review finding, PR #204).
+        if interfaces.is_empty() {
+            return Err("section declares no `interface` lines".to_string());
+        }
         for (iface, rules) in &interfaces {
             if *rules == GuardIfaceRules::default() {
                 return Err(format!("`interface {iface}` declares no rules"));
@@ -319,6 +327,10 @@ mod tests {
     fn from_directives_refusals_match_the_config_validator() {
         for (body, want) in [
             ("  lldp br0 drop\n", "no `interface` line"),
+            // Foreign-namespace directives parse in any section; a
+            // guard section containing only them must not become an
+            // empty (silent no-op) attach set.
+            ("  attach eth0 native\n", "declares no `interface` lines"),
             (
                 "  interface br0\n  interface br0\n  lldp br0 drop\n",
                 "duplicate `interface br0`",
