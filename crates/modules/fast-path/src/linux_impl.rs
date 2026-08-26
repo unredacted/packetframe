@@ -1549,7 +1549,7 @@ pub fn attach(
         populate_tc_mutation_progs(&mut state.ebpf)?;
 
         let mut tc_records = Vec::with_capacity(tc_dirs.len());
-        for (iface, _mode, ifindex) in tc_dirs.iter() {
+        for (iface, _mode, _planning_ifindex) in tc_dirs.iter() {
             if attach_count > 0 && !settle_time.is_zero() {
                 info!(
                     settle_secs = settle_time.as_secs_f64(),
@@ -1559,10 +1559,21 @@ pub fn attach(
                 std::thread::sleep(settle_time);
             }
             attach_count += 1;
+            // Re-resolve the ifindex HERE, not the attach_dirs planning
+            // value: tc_attach_iface attaches by NAME, and the planning
+            // resolution is separated from this attach by every earlier
+            // XDP attach plus the settle sleeps. A device recreated in
+            // that window gets the filter on its (new) self, and a
+            // record carrying the stale planning ifindex would make
+            // detach classify it as recreated and drop the record with
+            // the filter still live (review finding, PR #209). The
+            // resolve-to-attach race that remains is the same accepted
+            // TOCTOU as tc_detach_one's.
+            let ifindex = if_nametoindex(iface)?;
             let (priority, handle) = tc_attach_iface(&mut state.ebpf, iface)?;
             tc_records.push(crate::tc_links::TcLinkRecord {
                 iface: iface.clone(),
-                ifindex: *ifindex,
+                ifindex,
                 priority,
                 handle,
             });
@@ -1582,7 +1593,7 @@ pub fn attach(
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json save: {e}")))?;
             state.links.push(LinkRecord {
                 iface: iface.clone(),
-                ifindex: *ifindex,
+                ifindex,
                 effective_mode: AttachMode::Tc,
                 link: LinkHandle::Tc { priority, handle },
             });
