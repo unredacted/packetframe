@@ -1549,7 +1549,7 @@ pub fn attach(
         populate_tc_mutation_progs(&mut state.ebpf)?;
 
         let mut tc_records = Vec::with_capacity(tc_dirs.len());
-        for (iface, _mode, ifindex) in tc_dirs.iter() {
+        for (iface, _mode, _planning_ifindex) in tc_dirs.iter() {
             if attach_count > 0 && !settle_time.is_zero() {
                 info!(
                     settle_secs = settle_time.as_secs_f64(),
@@ -1559,9 +1559,21 @@ pub fn attach(
                 std::thread::sleep(settle_time);
             }
             attach_count += 1;
+            // Re-resolve the ifindex HERE, not the attach_dirs planning
+            // value: tc_attach_iface attaches by NAME, and the planning
+            // resolution is separated from this attach by every earlier
+            // XDP attach plus the settle sleeps. A device recreated in
+            // that window gets the filter on its (new) self, and a
+            // record carrying the stale planning ifindex would make
+            // detach classify it as recreated and drop the record with
+            // the filter still live (review finding, PR #209). The
+            // resolve-to-attach race that remains is the same accepted
+            // TOCTOU as tc_detach_one's.
+            let ifindex = if_nametoindex(iface)?;
             let (priority, handle) = tc_attach_iface(&mut state.ebpf, iface)?;
             tc_records.push(crate::tc_links::TcLinkRecord {
                 iface: iface.clone(),
+                ifindex,
                 priority,
                 handle,
             });
@@ -1581,7 +1593,7 @@ pub fn attach(
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("tc-links.json save: {e}")))?;
             state.links.push(LinkRecord {
                 iface: iface.clone(),
-                ifindex: *ifindex,
+                ifindex,
                 effective_mode: AttachMode::Tc,
                 link: LinkHandle::Tc { priority, handle },
             });
@@ -2386,9 +2398,10 @@ pub fn tc_attach_iface(ebpf: &mut Ebpf, iface: &str) -> ModuleResult<(u16, u32)>
 /// filter plausibly attached.
 enum TcDetachOutcome {
     /// Goal state reached: the filter was detached, or is provably
-    /// gone already (iface no longer resolvable — the qdisc and its
-    /// filters died with the device — or the netlink delete reported
-    /// ENOENT/EINVAL, i.e. no such filter/qdisc). Record droppable.
+    /// gone already (iface no longer resolvable or recreated under
+    /// the same name — the qdisc and its filters died with the
+    /// original device — or the netlink delete reported ENOENT/EINVAL,
+    /// i.e. no such filter/qdisc). Record droppable.
     Cleared,
     /// The delete failed with the filter plausibly still live
     /// (transient netlink error, EPERM, ...). Record must be retained
@@ -2399,9 +2412,45 @@ enum TcDetachOutcome {
 /// Detach one recorded tc filter. Building block for both the
 /// in-process (`detach(state)`) and out-of-process
 /// ([`tc_detach_from_state_dir`]) teardown paths.
-fn tc_detach_one(iface: &str, priority: u16, handle: u32) -> TcDetachOutcome {
+fn tc_detach_one(
+    iface: &str,
+    expected_ifindex: u32,
+    priority: u16,
+    handle: u32,
+) -> TcDetachOutcome {
     use aya::programs::tc::{SchedClassifierLink, TcAttachType, TcError};
     use aya::programs::{Link as _, ProgramError};
+
+    // A same-name device with a DIFFERENT ifindex is a recreated
+    // device: the recorded filter died with the original (qdisc
+    // lifetime), and `SchedClassifierLink::attached` resolves by name,
+    // so deleting here could remove an unrelated filter on the
+    // replacement whose (priority, handle) happens to match — the
+    // first auto-allocated tuple is common (review finding, guard
+    // PR #205; mirror of guard's tc_detach_one). The check-to-delete
+    // race is accepted: it requires the device to be recreated in
+    // that instant AND the tuple to collide. expected_ifindex == 0 is
+    // a record from a pre-ifindex build (see TcLinkRecord); no attach-
+    // time ifindex to compare, so fall through to the name-resolved
+    // delete those builds did.
+    if expected_ifindex != 0 {
+        match if_nametoindex(iface) {
+            Err(_) => {
+                info!(iface, "iface gone; tc filter died with it");
+                return TcDetachOutcome::Cleared;
+            }
+            Ok(current) if current != expected_ifindex => {
+                info!(
+                    iface,
+                    expected_ifindex,
+                    current,
+                    "iface recreated; the recorded filter died with the old device"
+                );
+                return TcDetachOutcome::Cleared;
+            }
+            Ok(_) => {}
+        }
+    }
 
     // `attached()` only resolves the ifindex; failure means the iface
     // is gone, and qdisc-lifetime filters go with their device.
@@ -2450,7 +2499,7 @@ pub fn tc_detach_from_state_dir(state_dir: &Path) -> ModuleResult<usize> {
     let mut cleared = 0usize;
     let mut retained = Vec::new();
     for rec in file.links {
-        match tc_detach_one(&rec.iface, rec.priority, rec.handle) {
+        match tc_detach_one(&rec.iface, rec.ifindex, rec.priority, rec.handle) {
             TcDetachOutcome::Cleared => {
                 info!(iface = %rec.iface, rec.priority, rec.handle, "tc filter cleared");
                 cleared += 1;
@@ -2836,12 +2885,13 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         info!(iface = %record.iface, "fast-path detaching");
         if let LinkHandle::Tc { priority, handle } = record.link {
             had_tc = true;
-            match tc_detach_one(&record.iface, priority, handle) {
+            match tc_detach_one(&record.iface, record.ifindex, priority, handle) {
                 TcDetachOutcome::Cleared => {}
                 TcDetachOutcome::Failed(e) => {
                     warn!(iface = %record.iface, error = %e, "tc filter detach failed; record retained");
                     tc_retained.push(crate::tc_links::TcLinkRecord {
                         iface: record.iface.clone(),
+                        ifindex: record.ifindex,
                         priority,
                         handle,
                     });
