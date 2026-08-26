@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/cli",
     "crates/modules/fast-path",
+    "crates/modules/guard",
     "crates/modules/probe",
     "crates/modules/vpp-offload",
     "crates/tools/vpp-api-codegen",
@@ -38,6 +39,7 @@ repository = "https://github.com/unredacted/packetframe"
 [workspace.dependencies]
 packetframe-common = { path = "crates/common" }
 packetframe-fast-path = { path = "crates/modules/fast-path" }
+packetframe-guard = { path = "crates/modules/guard" }
 packetframe-probe = { path = "crates/modules/probe" }
 packetframe-vpp-offload = { path = "crates/modules/vpp-offload" }
 

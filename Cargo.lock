@@ -738,6 +738,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "packetframe-guard"
+version = "0.2.7"
+dependencies = [
+ "packetframe-common",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "packetframe-probe"
 version = "0.2.7"
 dependencies = [
