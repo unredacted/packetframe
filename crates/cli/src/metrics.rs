@@ -102,15 +102,33 @@ fn write_once(
     modules: &ModuleGauges,
     uptime_seconds: u64,
 ) -> Result<(), String> {
-    let stats = packetframe_fast_path::stats_from_pin(bpffs_root)
-        .map_err(|e| format!("read STATS pin: {e}"))?;
-    let mut body = packetframe_fast_path::metrics::render_textfile(&stats, uptime_seconds);
-    // Custom-FIB occupancy gauges (Option F, Phase 3.8). Best-effort:
-    // `fib_status_from_pin` returns a default snapshot when the pins
-    // aren't readable (e.g., kernel-fib mode), and the renderer
-    // handles that by emitting zeros + a `mode=\"kernel-fib\"` one-hot.
-    let fib = packetframe_fast_path::fib_status_from_pin(bpffs_root);
-    body.push_str(&packetframe_fast_path::metrics::render_fib_gauges(&fib));
+    // Best-effort like every other block: an unreadable fast-path
+    // STATS pin loses fast-path's counters for this tick, never the
+    // whole file. This used to be a fatal early return, which starved
+    // OTHER modules' gauges of publication whenever fast-path's pins
+    // were absent — during a detached window, and structurally for a
+    // config that doesn't declare fast-path at all: the guard's
+    // monitor-first rollout reads exactly those module gauges (review
+    // finding, PR #206).
+    let mut body = String::new();
+    match packetframe_fast_path::stats_from_pin(bpffs_root) {
+        Ok(stats) => {
+            body.push_str(&packetframe_fast_path::metrics::render_textfile(
+                &stats,
+                uptime_seconds,
+            ));
+            // Custom-FIB occupancy gauges (Option F, Phase 3.8).
+            // Best-effort: `fib_status_from_pin` returns a default
+            // snapshot when the pins aren't readable (e.g., kernel-fib
+            // mode), and the renderer handles that by emitting zeros +
+            // a `mode="kernel-fib"` one-hot.
+            let fib = packetframe_fast_path::fib_status_from_pin(bpffs_root);
+            body.push_str(&packetframe_fast_path::metrics::render_fib_gauges(&fib));
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "fast-path STATS pin unavailable this tick");
+        }
+    }
     // Host softirq pressure. `time_squeeze` is the one early signal
     // for the silent generic-XDP TX drop mechanism (2026-08-13,
     // w12–w19), which no packetframe counter, qdisc stat, or tcpdump

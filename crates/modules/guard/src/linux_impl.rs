@@ -131,7 +131,30 @@ pub(crate) fn load(
 /// FIRST (fail-open defaults mean there is never an attached-but-
 /// unconfigured window), then clsact + egress filter, then the state-
 /// file record. Pins after the loop.
+///
+/// A mid-way failure unwinds the guard's OWN partial state: the
+/// loader's startup unwind covers modules whose attach *succeeded*,
+/// never the one failing, and netlink filters have qdisc lifetime —
+/// without this they would keep enforcing behind a failed startup
+/// (review finding, PR #206). The per-attach record saves make the
+/// state file name everything live, so the standalone teardown is the
+/// rollback.
 pub(crate) fn attach(state: &mut ActiveState, settle_time: Duration) -> ModuleResult<()> {
+    if let Err(e) = attach_all(state, settle_time) {
+        let cleanup = match detach_from_state_dir(&state.state_dir, &state.bpffs_root) {
+            Ok(0) => "nothing was attached yet".to_string(),
+            Ok(n) => format!("{n} partially-attached filter(s) rolled back"),
+            Err(de) => {
+                format!("partial-state rollback ALSO failed ({de}); run `packetframe detach --all`")
+            }
+        };
+        state.attached.clear();
+        return Err(ModuleError::other(MODULE_NAME, format!("{e}; {cleanup}")));
+    }
+    Ok(())
+}
+
+fn attach_all(state: &mut ActiveState, settle_time: Duration) -> ModuleResult<()> {
     pin::ensure_dirs(&state.bpffs_root)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("create pin dirs: {e}")))?;
 

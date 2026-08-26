@@ -690,6 +690,7 @@ dependencies = [
  "libc",
  "packetframe-common",
  "packetframe-fast-path",
+ "packetframe-guard",
  "packetframe-probe",
  "packetframe-vpp-offload",
  "serde",

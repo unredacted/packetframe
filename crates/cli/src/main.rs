@@ -369,6 +369,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         allowlist,
         vpp_dirs,
         vpp_exempts,
+        guard_ifaces,
     ) = match &config {
         Some(path) => match Config::from_file(path) {
             Ok(c) => {
@@ -380,6 +381,10 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     eprintln!("vpp-offload config check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);
                 }
+                if let Err(e) = c.validate_guard() {
+                    eprintln!("guard config check failed: {e}");
+                    return ExitCode::from(EXIT_STARTUP_ERROR);
+                }
                 let ifaces = feasibility::attach_ifaces_from_config(&c);
                 let vpp_ports = feasibility::vpp_ports_from_config(&c);
                 let vpp_steer_ports = feasibility::vpp_steer_ports_from_config(&c);
@@ -389,6 +394,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 let allowlist = feasibility::allowlist_from_config(&c);
                 let vpp_dirs = feasibility::vpp_steer_directions_from_config(&c);
                 let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
+                let guard_ifaces = feasibility::guard_ifaces_from_config(&c);
                 (
                     c.global.bpffs_root,
                     ifaces,
@@ -400,6 +406,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     allowlist,
                     vpp_dirs,
                     vpp_exempts,
+                    guard_ifaces,
                 )
             }
             Err(e) => {
@@ -415,6 +422,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             0,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -434,6 +442,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             steer_exempts: &vpp_exempts,
         },
         &allowlist,
+        &guard_ifaces,
         human,
     );
     if let Some(json) = report.json_output {

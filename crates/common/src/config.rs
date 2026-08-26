@@ -1732,6 +1732,26 @@ impl Config {
                 });
             }
         }
+
+        // v1 rides the fast-path daemon (the vpp-offload precedent):
+        // the startup feasibility gate's REQUIRED probes are the
+        // fast-path module's (XDP, LPM/devmap, redirect helpers —
+        // none of which a tc-egress policer needs), so a guard-only
+        // config would be refused for capabilities it never uses,
+        // several confusing steps downstream. Requiring the section
+        // makes the limitation explicit at the earliest point;
+        // deriving the probe set from the configured modules lifts it
+        // later. Checked LAST so a malformed guard section reports
+        // its own specific problem first.
+        if !self.modules.iter().any(|m| m.name == "fast-path") {
+            return Err(ConfigError::Parse {
+                line: 0,
+                message: "module guard: requires a `module fast-path` section (guard v1 \
+                          runs alongside the fast-path daemon; the startup capability \
+                          gate assumes it — a guard-only config cannot start)"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -5912,7 +5932,9 @@ module fast-path
     /// field lands where the parser promised.
     #[test]
     fn guard_section_parses_reference_shape() {
-        let s = "module guard\n\
+        let s = "module fast-path\n\
+                 \x20 attach eth0 generic\n\
+                 module guard\n\
                  \x20 interface br3998\n\
                  \x20 interface br3999\n\
                  \x20 arp-ns-ratelimit br3998 rate 3/60s burst 3\n\
@@ -5922,7 +5944,7 @@ module fast-path
                  \x20 arp-ns-ratelimit br3999 rate 2/30s\n";
         let c = Config::parse(s).unwrap();
         c.validate_guard().expect("reference shape must validate");
-        let m = &c.modules[0];
+        let m = &c.modules[1];
         assert_eq!(m.name, "guard");
         match &m.directives[2] {
             ModuleDirective::GuardArpNsRatelimit {
@@ -6041,6 +6063,15 @@ module fast-path
                 "module guard\n  interface br0\n  interface br1\n  lldp br0 drop\n".to_string(),
                 "`interface br1` declares no rules",
             ),
+            // A fully valid guard section without a fast-path section:
+            // v1 rides the fast-path daemon (the startup capability
+            // gate assumes it), so guard-only is refused explicitly
+            // rather than several confusing steps downstream (review
+            // finding, PR #206).
+            (
+                "module guard\n  interface br0\n  lldp br0 drop\n".to_string(),
+                "requires a `module fast-path` section",
+            ),
         ];
         for (s, want) in cases {
             let e = Config::parse(&s).unwrap().validate_guard().expect_err(&s);
@@ -6057,7 +6088,7 @@ module fast-path
     #[test]
     fn guard_interface_count_is_capped_at_the_map_size() {
         let over = |n: usize| {
-            let mut s = String::from("module guard\n");
+            let mut s = String::from("module fast-path\n  attach eth0 generic\nmodule guard\n");
             for i in 0..n {
                 s.push_str(&format!("  interface br{i}\n  lldp br{i} drop\n"));
             }
