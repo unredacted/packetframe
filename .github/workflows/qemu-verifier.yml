@@ -181,14 +181,32 @@ jobs:
           # signal 7 [Bus error]` twice in a row on the 6.6 leg, at
           # the same link. 6 GB ⇒ ~3 GB tmpfs restores the margin;
           # hosted runners have 16 GB, so TCG + 6 GB guest is fine.
+          # PACKETFRAME_BENCH_SKIP=1: skip the fast-path bench tests
+          # outright. bpf_test_run executes uninterruptibly, and under
+          # TCG a bench stalls a vCPU past the soft-lockup watchdog;
+          # the per-fire ~35-line splat to the emulated serial console
+          # then compounds until the 20-min job timeout. Two rounds of
+          # PACKETFRAME_BENCH_QUICK capping (per-syscall repeat in
+          # #82, then a ~400-execution total budget) still flaked on
+          # slow 5.15 runners (PR #206, PR #207) — runner speed varies
+          # too much for any fixed budget. Bench numbers under TCG are
+          # meaningless anyway; the benches still run full-mode in
+          # ci.yml's native sudo step and on routers via the
+          # hardware-artifacts bundle.
+          #
+          # watchdog_thresh=60 (default 10, softlockup fires at 2x+2s):
+          # belt-and-braces for the remaining fixture tests — any
+          # uninterruptible test_run syscall can stall a TCG vCPU, and
+          # a splat storm is what turns one stall into a job timeout.
           run_vm() {
             virtme-ng \
               --run "${KERNEL_IMG}" \
               --pwd \
               --memory 6144 \
               --disable-kvm \
+              --append "watchdog_thresh=60" \
               --verbose \
-              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_QUICK=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-guard --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
+              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_SKIP=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-guard --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
           }
           # Retry policy: virtme-ng propagates the guest command's exit
           # status, so a genuine test failure arrives as cargo's 101
