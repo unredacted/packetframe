@@ -11,6 +11,10 @@
 //!
 //! Sibling of `registry.rs` (`<state-dir>/tc-links.json` next to
 //! `attachments.json`); same atomic write-then-rename discipline.
+//!
+//! Mirror of guard's `tc_links.rs`; when one is updated, the other
+//! likely needs the same change (guard's header explains why the two
+//! stay separate files).
 
 use std::path::{Path, PathBuf};
 
@@ -47,6 +51,22 @@ pub struct TcLinksFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcLinkRecord {
     pub iface: String,
+    /// The device's ifindex at attach time. Detach verifies it before
+    /// reconstructing the filter: a same-name RECREATED device has a
+    /// new ifindex, the recorded filter died with the original
+    /// (qdisc lifetime), and `SchedClassifierLink::attached` resolves
+    /// by name — a blind delete could remove an unrelated filter on
+    /// the replacement whose `(priority, handle)` happens to match
+    /// (the first auto-allocated tuple is common). Review finding,
+    /// guard PR #205; same hole here.
+    ///
+    /// `#[serde(default)]` = 0 for records written by builds that
+    /// predate this field. 0 is never a real ifindex; detach treats
+    /// it as "unknown, skip the recreated-device check" (the
+    /// pre-field behavior) rather than refusing to tear down a
+    /// legacy deployment's filters.
+    #[serde(default)]
+    pub ifindex: u32,
     pub priority: u16,
     pub handle: u32,
 }
@@ -107,6 +127,7 @@ mod tests {
         let file = TcLinksFile {
             links: vec![TcLinkRecord {
                 iface: "eth5".into(),
+                ifindex: 7,
                 priority: 49152,
                 handle: 1,
             }],
@@ -115,11 +136,22 @@ mod tests {
         let loaded = load(&dir).unwrap().expect("file present");
         assert_eq!(loaded.links.len(), 1);
         assert_eq!(loaded.links[0].iface, "eth5");
+        assert_eq!(loaded.links[0].ifindex, 7);
         assert_eq!(loaded.links[0].priority, 49152);
         assert_eq!(loaded.links[0].handle, 1);
         remove(&dir).unwrap();
         assert!(load(&dir).unwrap().is_none());
         remove(&dir).unwrap(); // second remove is a no-op
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tc-links.json written by a pre-ifindex build must still load:
+    /// deployed routers can carry one across an upgrade, and refusing
+    /// to parse it would strand live filters with no teardown metadata.
+    #[test]
+    fn legacy_record_without_ifindex_loads_as_zero() {
+        let raw = r#"{"links":[{"iface":"eth5","priority":49152,"handle":1}]}"#;
+        let file: TcLinksFile = serde_json::from_str(raw).expect("legacy record parses");
+        assert_eq!(file.links[0].ifindex, 0);
     }
 }
