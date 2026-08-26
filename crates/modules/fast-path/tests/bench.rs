@@ -36,6 +36,10 @@
 //! `PACKETFRAME_BENCH_BASELINE_NS=<ns>` makes the established-flow
 //! forward bench fail if its median exceeds the baseline.
 //!
+//! Other knobs: `PACKETFRAME_BENCH_QUICK=1` caps repeat/call counts,
+//! `PACKETFRAME_BENCH_SKIP=1` skips the benches entirely (set by the
+//! qemu-verifier CI job; see `bench_skip` below).
+//!
 //! **TTL budget:** `BPF_PROG_TEST_RUN` reuses one packet buffer across
 //! all `repeat` iterations inside a syscall, and the forward path
 //! decrements TTL per pass. Forward benches therefore use `ttl: 255`
@@ -55,8 +59,28 @@ use common::{xdp_action, Harness, Ipv4TcpBuilder, StatIdx};
 /// devmap pre-check needs a real entry.
 const LO_IFINDEX: u32 = 1;
 
-/// Quick mode for CI under emulation. The statistics only matter on
-/// real hardware; under qemu TCG the full 1M-execution forward loops
+/// Hard skip knob for CI under emulation. Two rounds of quick-mode
+/// capping (per-syscall repeat in #82, then the ~400-execution total
+/// budget below) still left `bench_custom_fib_*` tripping the 22 s
+/// soft-lockup watchdog on slow TCG runners (PR #206 on 2026-08-25,
+/// PR #207 on 2026-08-26): `bpf_test_run` is uninterruptible, and
+/// TCG's per-execution cost varies enough across hosted runners that
+/// no fixed budget is both meaningful and safe. Benchmark numbers
+/// under emulation were never meaningful anyway, so qemu-verifier.yml
+/// sets this and skips the benches outright; their real homes are
+/// ci.yml's native-speed sudo step (full mode) and the
+/// hardware-artifacts bundle run on routers (`run-tests.sh bench`).
+fn bench_skip() -> bool {
+    if std::env::var_os("PACKETFRAME_BENCH_SKIP").is_some() {
+        eprintln!("PACKETFRAME_BENCH_SKIP set; skipping bench.");
+        true
+    } else {
+        false
+    }
+}
+
+/// Quick mode for constrained-but-native environments. The statistics
+/// only matter on real hardware; under qemu TCG the full 1M-execution forward loops
 /// (a) take double-digit minutes and (b) trip the kernel's 22-second
 /// soft-lockup watchdog inside `bpf_test_run`, whose per-fire ~35-line
 /// splat to the emulated serial console compounds the slowdown until
@@ -156,6 +180,9 @@ fn fwd_packet(tcp_flags: u8) -> Vec<u8> {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
 fn bench_custom_fib_forward_established() {
+    if bench_skip() {
+        return;
+    }
     let h = custom_fib_harness();
     let pkt = fwd_packet(TCP_FLAG_ACK);
 
@@ -187,6 +214,9 @@ fn bench_custom_fib_forward_established() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
 fn bench_custom_fib_forward_syn() {
+    if bench_skip() {
+        return;
+    }
     let h = custom_fib_harness();
     let pkt = fwd_packet(TCP_FLAG_SYN);
 
@@ -202,6 +232,9 @@ fn bench_custom_fib_forward_syn() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
 fn bench_allowlist_miss() {
+    if bench_skip() {
+        return;
+    }
     // No allowlist entries at all: the packet parses, does the two
     // ALLOW_V4 LPM lookups, misses, and XDP_PASSes without mutation,
     // so a single syscall can carry a large repeat.
