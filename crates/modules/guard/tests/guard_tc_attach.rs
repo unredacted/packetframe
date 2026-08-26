@@ -53,6 +53,14 @@ fn state_dir(tag: &str) -> std::path::PathBuf {
     p
 }
 
+fn ifindex_of(iface: &str) -> u32 {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .unwrap_or_else(|e| panic!("read ifindex of {iface}: {e}"))
+        .trim()
+        .parse()
+        .expect("ifindex parses")
+}
+
 #[test]
 #[ignore = "needs CAP_BPF + CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test -p packetframe-guard --tests -- --ignored`"]
 fn egress_attach_persist_detach_lifecycle() {
@@ -105,6 +113,7 @@ fn egress_attach_persist_detach_lifecycle() {
         &tc_links::TcLinksFile {
             links: vec![tc_links::TcLinkRecord {
                 iface: PEER_A.to_string(),
+                ifindex: ifindex_of(PEER_A),
                 priority,
                 handle,
             }],
@@ -165,6 +174,7 @@ fn detach_treats_vanished_iface_as_cleared() {
         &tc_links::TcLinksFile {
             links: vec![tc_links::TcLinkRecord {
                 iface: "pf-gd-gone0".to_string(),
+                ifindex: 4242,
                 priority: 49152,
                 handle: 1,
             }],
@@ -175,5 +185,93 @@ fn detach_treats_vanished_iface_as_cleared() {
         detach_from_state_dir(&state_dir, &state_dir.join("bpffs")).expect("vanished = cleared");
     assert_eq!(cleared, 1);
     assert!(tc_links::load(&state_dir).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// The recreated-device scenario from the #205 review: a record whose
+/// device was deleted and recreated under the same name must classify
+/// as Cleared WITHOUT touching the replacement — whose own filter
+/// commonly lands on the exact same auto-allocated
+/// `(priority, handle)` tuple the stale record names.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test -p packetframe-guard --tests -- --ignored`"]
+fn detach_spares_filters_on_a_recreated_device() {
+    if !packetframe_guard::GUARD_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping guard tc attach test.");
+        return;
+    }
+    const RE_A: &str = "pf-gdr0";
+    const RE_B: &str = "pf-gdr1";
+    struct ReCleanup;
+    impl Drop for ReCleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("ip").args(["link", "del", RE_A]).status();
+        }
+    }
+    let state_dir = state_dir("recreate");
+    let _cleanup = ReCleanup;
+    let _ = Command::new("ip").args(["link", "del", RE_A]).status();
+
+    // Original device: attach, record (with its ifindex), then delete
+    // the device — the filter dies with it, the record goes stale.
+    run(&[
+        "ip", "link", "add", RE_A, "type", "veth", "peer", "name", RE_B,
+    ]);
+    let bytes = aligned_bpf_copy();
+    let mut bpf = aya::Ebpf::load(&bytes).expect("Ebpf::load");
+    {
+        let prog: &mut aya::programs::tc::SchedClassifier = bpf
+            .program_mut("guard_egress")
+            .expect("guard_egress present")
+            .try_into()
+            .expect("sched_cls");
+        prog.load().expect("verifier accepts guard_egress");
+    }
+    let (priority, handle) = tc_attach_egress(&mut bpf, RE_A).expect("first attach");
+    tc_links::save(
+        &state_dir,
+        &tc_links::TcLinksFile {
+            links: vec![tc_links::TcLinkRecord {
+                iface: RE_A.to_string(),
+                ifindex: ifindex_of(RE_A),
+                priority,
+                handle,
+            }],
+        },
+    )
+    .expect("persist stale-to-be record");
+    run(&["ip", "link", "del", RE_A]);
+
+    // Recreate the same name (new ifindex) and give the REPLACEMENT
+    // its own guard filter — auto-allocation typically hands back the
+    // same (priority, handle) tuple, the collision the ifindex check
+    // exists for.
+    run(&[
+        "ip", "link", "add", RE_A, "type", "veth", "peer", "name", RE_B,
+    ]);
+    let mut bpf2 = aya::Ebpf::load(&bytes).expect("Ebpf::load 2");
+    {
+        let prog: &mut aya::programs::tc::SchedClassifier = bpf2
+            .program_mut("guard_egress")
+            .expect("guard_egress present")
+            .try_into()
+            .expect("sched_cls");
+        prog.load().expect("verifier accepts guard_egress");
+    }
+    let (p2, h2) = tc_attach_egress(&mut bpf2, RE_A).expect("attach on replacement");
+    drop(bpf2);
+
+    // Detach from the STALE record: Cleared (the old filter died with
+    // its device), and the replacement's filter survives untouched —
+    // even when the tuples collide.
+    let cleared =
+        detach_from_state_dir(&state_dir, &state_dir.join("bpffs")).expect("recreated = cleared");
+    assert_eq!(cleared, 1);
+    let shown = capture(&["tc", "filter", "show", "dev", RE_A, "egress"]);
+    assert!(
+        shown.contains("guard_egress"),
+        "the replacement device's filter (prio {p2}, handle {h2}) must survive a \
+         stale-record detach: {shown}"
+    );
     let _ = std::fs::remove_dir_all(&state_dir);
 }
