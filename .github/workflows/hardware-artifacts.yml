@@ -424,7 +424,8 @@ jobs:
           #
           # Excluded from the default run, name them explicitly to opt in:
           #   attach, tc_attach, netns, local_prefix_netns,
-          #   neigh_resolver_netns  — create interfaces or netns
+          #   neigh_resolver_netns, guard_tc_attach, guard_netns
+          #     — create interfaces or netns
           #   fib_comparison, fib_programmer_integration — pin maps into a
           #     scratch /sys/fs/bpf/pftestcmp-<pid>-<n> dir (removed on
           #     exit) and mount bpffs if it isn't already mounted

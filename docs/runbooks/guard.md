@@ -110,6 +110,21 @@ Attribution notes that will otherwise confuse a 3am reader:
 - `err_parse_*` count fail-open passes on truncated headers. Local
   daemons don't emit runts; sustained movement is worth a tcpdump.
 
+## The ENOBUFS fingerprint
+
+An enforced drop is visible to the **sender**, not just the counters:
+TC_ACT_SHOT at the clsact egress hook makes `dev_queue_xmit` return
+`NET_XMIT_DROP`, which the kernel surfaces to a local AF_PACKET/raw
+sender as a synchronous `ENOBUFS` ("No buffer space available") send
+error. So a clamped daemon logs its own failures — udapi-server's
+arping included — and any local tool that suddenly reports ENOBUFS on
+an IX interface while `packetframe_guard_frames_total{verdict=
+"dropped"}` moves is seeing the guard work, not a buffer problem.
+(Discovered by the netns integration test, whose first CI runs
+misread it as queue exhaustion; a sender that retries on ENOBUFS gets
+paced to exactly the configured rate, which is arguably the politest
+possible outcome.) Monitor mode never produces it.
+
 ## Triage by symptom
 
 - **Neighbor resolution slow/failing on an IX** (peers unreachable,
@@ -117,6 +132,11 @@ Attribution notes that will otherwise confuse a 3am reader:
   `ns/dropped`. If they move in step with the failures, the rate is
   too tight or a legitimate burst pattern exceeds it — flip to
   `monitor` via SIGHUP (instant, no restart) and re-derive the rate.
+- **A local daemon logs "No buffer space available" on a guarded
+  interface**: that's the ENOBUFS fingerprint above — the guard
+  enforcing, not a buffer shortage. Confirm with the `dropped`
+  counters; nothing to fix unless the drops are of traffic you meant
+  to allow.
 - **IX operator still sees storms while enforce is on**: confirm the
   filter exists (`tc filter show dev br3998 egress`), the module is
   healthy in `packetframe status`, and `total_egress` is moving. If

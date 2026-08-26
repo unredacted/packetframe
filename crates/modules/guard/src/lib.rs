@@ -19,9 +19,8 @@
 //! frames). That remains true at every stage of the vpp-offload
 //! roadmap, so this module is permanent architecture, not a stopgap.
 //!
-//! **Slice status:** config model, BPF datapath, and the Linux
-//! lifecycle are in place; the CLI does not construct this module
-//! until the next slice, so nothing reaches it at runtime yet.
+//! Operations: `docs/runbooks/guard.md` (monitor→enforce ladder,
+//! counter attribution, triage, recovery).
 
 pub mod cfg;
 pub mod metrics;
@@ -32,7 +31,7 @@ pub mod tc_links;
 #[cfg(target_os = "linux")]
 mod linux_impl;
 #[cfg(target_os = "linux")]
-pub use linux_impl::{detach_from_state_dir, stats_from_pin};
+pub use linux_impl::{detach_from_state_dir, stats_from_pin, tc_attach_egress};
 
 pub use probe_linux::run_feasibility_probes;
 
