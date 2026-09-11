@@ -268,6 +268,16 @@ tc filter del dev eth5 ingress
 
 (The clsact qdisc itself is harmless to leave in place.)
 
+Records in `tc-links.json` carry the attach-time ifindex; detach uses
+it to recognize a deleted-and-recreated interface (same name, new
+ifindex) and skip the stale record instead of deleting whatever filter
+the replacement device now holds at the recorded `(priority, handle)`.
+Records written by builds that predate the field load with ifindex 0
+and detach by name alone (the old behavior) — no `detach --all` is
+required before upgrading, but if you want the protection on an
+already-attached debugging interface, re-attach it once on the new
+build so the record is rewritten with its ifindex.
+
 Failure posture mirrors XDP: SIGTERM leaves filters attached
 (§8.5 parity — the filter holds its own program reference); a circuit
 breaker trip detaches everything explicitly.
