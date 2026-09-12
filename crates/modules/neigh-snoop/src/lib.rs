@@ -35,6 +35,7 @@
 
 pub mod bpf_filter;
 pub mod cfg;
+pub mod coverage;
 pub mod frame;
 pub mod health;
 pub mod metrics;
@@ -42,6 +43,13 @@ pub mod persist;
 pub mod probe_linux;
 pub mod snapshot;
 pub mod table;
+
+#[cfg(target_os = "linux")]
+pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod engine;
+#[cfg(target_os = "linux")]
+pub mod netlink;
 
 pub use probe_linux::run_feasibility_probes;
 
@@ -69,6 +77,11 @@ pub struct Loaded {
 #[derive(Default)]
 pub struct NeighSnoopModule {
     loaded: Option<Loaded>,
+    /// The running engine, Linux only. Its `Drop` stops the runtime,
+    /// closes the sockets and writes the dirty tables, because the
+    /// preserve-attach exit path drops modules without `detach`.
+    #[cfg(target_os = "linux")]
+    engine: Option<engine::EngineHandle>,
 }
 
 impl NeighSnoopModule {
@@ -125,14 +138,32 @@ impl Module for NeighSnoopModule {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn attach(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
+        let loaded = self
+            .loaded
+            .as_ref()
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach before load"))?;
+        if self.engine.is_some() {
+            return Err(ModuleError::other(
+                MODULE_NAME,
+                "attach while already running",
+            ));
+        }
+        let handle = engine::EngineHandle::start(loaded.config.clone(), loaded.persist_dir.clone())
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("engine start failed: {e}")))?;
+        self.engine = Some(handle);
+        // No `Attachment`s by design: nothing is pinned and there is no
+        // BPF program; the shared attachments.json registry is
+        // single-module (last writer wins) and must stay fast-path's.
+        Ok(Vec::new())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn attach(&mut self, _cfg: &ModuleConfig<'_>) -> ModuleResult<Vec<Attachment>> {
         self.loaded
             .as_ref()
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach before load"))?;
-        // The engine (capture sockets, netlink, runtime) lands in a
-        // later slice; until then the module loads and validates but
-        // cannot run. Returning NotImplemented keeps it unreachable
-        // from a production config while the grammar is reviewable.
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
@@ -146,24 +177,51 @@ impl Module for NeighSnoopModule {
             .config
             .restart_only_delta(&new)
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("module neigh-snoop: {e}")))?;
+        #[cfg(target_os = "linux")]
+        if let Some(engine) = &self.engine {
+            engine.reconfigure(new.clone());
+        }
         loaded.config = new;
         Ok(())
     }
 
     fn detach(&mut self) -> ModuleResult<()> {
-        // Nothing attached in this slice. Once the engine exists, detach
-        // stops it and deliberately leaves the kernel's STALE entries
-        // and the JSON cache in place.
+        #[cfg(target_os = "linux")]
+        if let Some(engine) = self.engine.take() {
+            engine.shutdown();
+            tracing::info!(
+                "neigh-snoop detached: learned NUD_STALE neighbours and the persisted tables \
+                 are left in place by design"
+            );
+        }
         self.loaded = None;
         Ok(())
     }
 
-    fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+    #[cfg(target_os = "linux")]
+    fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         // Unattached: emit nothing rather than zeroed counters that read
         // as healthy-idle (the guard/vpp-offload rule).
+        if let Some(engine) = &self.engine {
+            metrics::render_textfile(&engine.snapshot(), out.out);
+        }
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
+        Ok(match &self.engine {
+            Some(engine) => health::health(&engine.snapshot()),
+            None => HealthReport::healthy(),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
         Ok(HealthReport::healthy())
     }
@@ -238,8 +296,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn attach_is_not_implemented_yet_and_reconfigure_refuses_restart_only() {
+    fn attach_is_not_implemented_on_stub_platforms() {
         let state = scratch("attach");
         let mut m = load_with("  bridge br0\n  prefix br0 192.0.2.0/24\n", &state).unwrap();
         let global = GlobalConfig::default();
@@ -253,6 +312,14 @@ mod tests {
             m.attach(&mc),
             Err(ModuleError::NotImplemented { .. })
         ));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn reconfigure_refuses_restart_only_and_applies_hot() {
+        let state = scratch("reconf");
+        let mut m = load_with("  bridge br0\n  prefix br0 192.0.2.0/24\n", &state).unwrap();
+        let global = GlobalConfig::default();
         let c2 =
             Config::parse("module neigh-snoop\n  bridge br1\n  prefix br1 192.0.2.0/24\n").unwrap();
         let e = m

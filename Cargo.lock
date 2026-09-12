@@ -756,11 +756,17 @@ dependencies = [
 name = "packetframe-neigh-snoop"
 version = "0.2.7"
 dependencies = [
+ "futures",
  "ipnet",
  "libc",
+ "netlink-packet-core",
+ "netlink-packet-route",
  "packetframe-common",
+ "rtnetlink",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
