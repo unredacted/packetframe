@@ -275,9 +275,70 @@ pub struct IfaceSnapshot {
     pub counters: Counters,
 }
 
+/// One reconcile tick's verdict for the FRR next-hop gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// Lists already matched; nothing written.
+    Noop,
+    /// Commands applied and the readback matched.
+    Changed,
+    /// The lists had been emptied by an FRR reload and were refilled.
+    ReloadRefill,
+    /// vtysh failed, the lists were absent, or the readback mismatched.
+    Failed,
+}
+
+impl GateOutcome {
+    pub const COUNT: usize = 4;
+    pub const LABELS: [&'static str; Self::COUNT] = ["noop", "changed", "reload_refill", "failed"];
+    pub fn index(self) -> usize {
+        match self {
+            Self::Noop => 0,
+            Self::Changed => 1,
+            Self::ReloadRefill => 2,
+            Self::Failed => 3,
+        }
+    }
+}
+
+/// The gate reconciler's last published state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GateSnapshot {
+    pub lists_present: bool,
+    pub permitted_v4: u64,
+    pub permitted_v6: u64,
+    pub pending_removals: u64,
+    pub last_change_age_secs: Option<u64>,
+    pub vtysh_ms: u64,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+    pub outcomes: [u64; GateOutcome::COUNT],
+    pub age_secs: u64,
+}
+
+/// One route server's received-routes coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsCoverageSnapshot {
+    pub rs: IpAddr,
+    pub bridge: String,
+    pub received_prefixes: u64,
+    pub nexthops: Ratio,
+    pub unresolved_nexthops: Vec<IpAddr>,
+    /// Prefixes whose next-hop is neither a bilateral peer nor
+    /// resolved: the real cost of passive learning, in prefixes.
+    pub demoted_prefixes: u64,
+    pub dump_ms: u64,
+    pub age_secs: u64,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
     pub bridges: Vec<IfaceSnapshot>,
+    /// `Some` only when `frr-gate` is configured.
+    pub gate: Option<GateSnapshot>,
+    /// One per `route-server` peer, sorted by address.
+    pub rs: Vec<RsCoverageSnapshot>,
 }
 
 #[cfg(test)]
@@ -297,6 +358,7 @@ mod tests {
         check(&SeedOutcome::LABELS);
         check(&PersistOutcome::LABELS);
         check(&LinkEvent::LABELS);
+        check(&GateOutcome::LABELS);
         for (i, s) in [
             SkipReason::SameMac,
             SkipReason::Permanent,

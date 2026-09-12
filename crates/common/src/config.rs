@@ -625,8 +625,9 @@ pub enum ModuleDirective {
     },
     /// `rs-coverage-interval <N>s` — how often each `route-server`
     /// peer's received routes are dumped to measure how many of its
-    /// prefixes are still demoted. Default 300s (the dump is large).
-    /// Hot.
+    /// prefixes are still demoted. Default 300s: the dump is large (one
+    /// JSON object per received prefix), so the floor is for tests, not
+    /// for production. Hot.
     SnoopRsCoverageInterval {
         interval: Duration,
         line: usize,
@@ -3129,7 +3130,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         }),
         "frr-gate" => parse_snoop_frr_gate(line, rest),
         "rs-coverage-interval" => parse_single_arg(line, rest, "rs-coverage-interval", |t| {
-            let interval = parse_bounded_secs(line, t, "rs-coverage-interval", 60, 3600)?;
+            let interval = parse_bounded_secs(line, t, "rs-coverage-interval", 5, 3600)?;
             Ok(ModuleDirective::SnoopRsCoverageInterval { interval, line })
         }),
         other => Err(ConfigError::parse(
@@ -7025,7 +7026,7 @@ module fast-path
                 "frr-gate takes:",
             ),
             ("frr-gate v4 A v6 B bogus 1s", "frr-gate takes:"),
-            ("rs-coverage-interval 10s", "between 60s and 3600s"),
+            ("rs-coverage-interval 1s", "between 5s and 3600s"),
         ];
         for (body, want) in cases {
             let s = format!("module neigh-snoop\n  {body}\n");

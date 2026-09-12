@@ -36,14 +36,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::capture;
-use crate::cfg::{BridgeCfg, HotConfig, SnoopConfig};
+use crate::cfg::{BridgeCfg, GateCfg, HotConfig, SnoopConfig};
 use crate::coverage::{self, CoverageSample};
 use crate::frame::{self, Reject};
+use crate::frr_gate::{self, GateInput, RealVtysh, Vtysh};
 use crate::netlink::{self, LinkInfo, Messages};
 use crate::persist::{self, LoadOutcome};
+use crate::rs_coverage;
 use crate::snapshot::{
-    Counters, Coverage, CoverageState, IfaceSnapshot, InstallOutcome, LearnOutcome, LinkEvent,
-    LinkState, PersistOutcome, SeedOutcome, Snapshot,
+    Counters, Coverage, CoverageState, GateSnapshot, IfaceSnapshot, InstallOutcome, LearnOutcome,
+    LinkEvent, LinkState, PersistOutcome, RsCoverageSnapshot, SeedOutcome, Snapshot,
 };
 use crate::table::{
     admit, install_decision, Decision, FilterReject, KernelMirror, LearnedTable, Observe,
@@ -99,8 +101,29 @@ pub enum EngineMsg {
         ifindex: u32,
         result: Result<CoverageSample, String>,
     },
+    /// The FRR gate reconciler's verdict for one tick.
+    Gate(GateSnapshot),
+    /// One route server's received routes, `(prefix, next-hop)` pairs
+    /// plus the dump's wall time.
+    RsRoutes {
+        bridge_idx: usize,
+        rs: IpAddr,
+        result: Result<(Vec<(String, IpAddr)>, u64), String>,
+    },
     Reconfigure(SnoopConfig),
 }
+
+/// What the engine publishes to the route-server coverage task.
+#[derive(Debug, Clone, Default)]
+struct RsInput {
+    /// `(bridge index, route-server address)` for bridges that are up.
+    targets: Vec<(usize, IpAddr)>,
+    interval: Duration,
+}
+
+/// `vtysh` calls are bounded: a received-routes dump of a full
+/// route-server table is large, a wedged bgpd must not hang the task.
+const VTYSH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
@@ -205,6 +228,7 @@ struct Engine {
     persist_dir: PathBuf,
     deny_macs: Vec<[u8; 6]>,
     hot: HotConfig,
+    gate_cfg: Option<GateCfg>,
     bridges: Vec<IfaceState>,
     mirror: KernelMirror,
     unicast: Handle,
@@ -212,6 +236,10 @@ struct Engine {
     install_tx: mpsc::Sender<InstallJob>,
     persist_tx: mpsc::Sender<PersistJob>,
     cov_tx: watch::Sender<CoverageParams>,
+    gate_tx: watch::Sender<GateInput>,
+    rs_tx: watch::Sender<RsInput>,
+    gate: Option<(GateSnapshot, Instant)>,
+    rs: HashMap<IpAddr, (RsCoverageSnapshot, Instant)>,
     snapshot: SharedSnapshot,
     cancel: CancellationToken,
     rr: usize,
@@ -248,22 +276,36 @@ impl EngineHandle {
             bridges: Vec::new(),
             interval: config.hot.coverage_interval,
         });
+        let (gate_tx, gate_rx) = watch::channel(GateInput::default());
+        let (rs_tx, rs_rx) = watch::channel(RsInput::default());
 
         let (engine, messages) = runtime.block_on(Engine::init(
             config,
             persist_dir,
             snapshot.clone(),
-            frame_tx,
-            install_tx,
-            persist_tx,
-            cov_tx,
+            Pumps {
+                frame_tx,
+                install_tx,
+                persist_tx,
+                cov_tx,
+                gate_tx,
+                rs_tx,
+            },
             cancel.clone(),
         ))?;
         let unicast = engine.unicast.clone();
+        let vtysh: Arc<dyn Vtysh> = Arc::new(RealVtysh::from_env(VTYSH_TIMEOUT));
         let tasks = vec![
             runtime.spawn(installer(unicast, install_rx, ctl_tx.clone())),
             runtime.spawn(persister(persist_rx, ctl_tx.clone())),
             runtime.spawn(coverage_task(cov_rx, ctl_tx.clone(), cancel.clone())),
+            runtime.spawn(frr_gate::gate_task(
+                vtysh.clone(),
+                gate_rx,
+                ctl_tx.clone(),
+                cancel.clone(),
+            )),
+            runtime.spawn(rs_task(vtysh, rs_rx, ctl_tx.clone(), cancel.clone())),
             runtime.spawn(engine.run(messages, frame_rx, ctl_rx)),
         ];
         Ok(Self {
@@ -335,18 +377,33 @@ impl Drop for EngineHandle {
     }
 }
 
+/// The senders the engine loop feeds; bundled so `init` stays under
+/// the argument-count lint.
+struct Pumps {
+    frame_tx: mpsc::Sender<EngineMsg>,
+    install_tx: mpsc::Sender<InstallJob>,
+    persist_tx: mpsc::Sender<PersistJob>,
+    cov_tx: watch::Sender<CoverageParams>,
+    gate_tx: watch::Sender<GateInput>,
+    rs_tx: watch::Sender<RsInput>,
+}
+
 impl Engine {
-    #[allow(clippy::too_many_arguments)]
     async fn init(
         config: SnoopConfig,
         persist_dir: PathBuf,
         snapshot: SharedSnapshot,
-        frame_tx: mpsc::Sender<EngineMsg>,
-        install_tx: mpsc::Sender<InstallJob>,
-        persist_tx: mpsc::Sender<PersistJob>,
-        cov_tx: watch::Sender<CoverageParams>,
+        pumps: Pumps,
         cancel: CancellationToken,
     ) -> Result<(Self, Messages), String> {
+        let Pumps {
+            frame_tx,
+            install_tx,
+            persist_tx,
+            cov_tx,
+            gate_tx,
+            rs_tx,
+        } = pumps;
         let now = Instant::now();
         let wall = SystemTime::now();
         let cap = config.hot.table_max as usize;
@@ -421,6 +478,7 @@ impl Engine {
             persist_dir,
             deny_macs: config.deny_macs.clone(),
             hot: config.hot.clone(),
+            gate_cfg: config.gate.clone(),
             bridges,
             mirror: KernelMirror::default(),
             unicast,
@@ -428,6 +486,10 @@ impl Engine {
             install_tx,
             persist_tx,
             cov_tx,
+            gate_tx,
+            rs_tx,
+            gate: None,
+            rs: HashMap::new(),
             snapshot,
             cancel,
             rr: 0,
@@ -476,8 +538,46 @@ impl Engine {
             ));
         }
         engine.publish_coverage_params();
+        engine.publish_gate_input();
         engine.publish_snapshot(now);
         Ok((engine, messages))
+    }
+
+    /// The resolved participant set for the gate (addresses on up
+    /// bridges whose kernel entry resolves, link-locals excluded) and
+    /// the route-server targets. Published every housekeeping tick and
+    /// on link changes; the tasks idle while unconfigured.
+    fn publish_gate_input(&self) {
+        let mut resolved_now: HashSet<IpAddr> = HashSet::new();
+        let mut targets: Vec<(usize, IpAddr)> = Vec::new();
+        for (bi, b) in self.bridges.iter().enumerate() {
+            let Some(ifindex) = b.ifindex.filter(|_| b.up) else {
+                continue;
+            };
+            for (ip, e) in self.mirror.iter_ifindex(ifindex) {
+                let link_local = matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local());
+                if e.resolves() && !link_local {
+                    resolved_now.insert(*ip);
+                }
+            }
+            for p in b.cfg.peers.iter().filter(|p| p.route_server) {
+                for a in &p.addrs {
+                    targets.push((bi, *a));
+                }
+            }
+        }
+        self.gate_tx.send_replace(GateInput {
+            cfg: self.gate_cfg.clone(),
+            resolved_now,
+        });
+        self.rs_tx.send_replace(RsInput {
+            targets: if self.gate_cfg.is_some() {
+                targets
+            } else {
+                Vec::new()
+            },
+            interval: self.hot.rs_coverage_interval,
+        });
     }
 
     /// Re-dump addresses and neighbours; `only` restricts the refresh
@@ -507,6 +607,9 @@ impl Engine {
     }
 
     fn publish_coverage_params(&self) {
+        // Link changes also change the gate's participant set and the
+        // route-server targets.
+        self.publish_gate_input();
         let bridges = self
             .bridges
             .iter()
@@ -942,6 +1045,69 @@ impl Engine {
                 b.route_coverage = state;
                 b.coverage_at = Some(now);
             }
+            EngineMsg::Gate(snap) => {
+                self.gate = Some((snap, Instant::now()));
+            }
+            EngineMsg::RsRoutes {
+                bridge_idx,
+                rs,
+                result,
+            } => {
+                let Some(b) = self.bridges.get(bridge_idx) else {
+                    return;
+                };
+                let now = Instant::now();
+                let snap = match (result, b.ifindex) {
+                    (Ok((routes, dump_ms)), Some(ifindex)) => {
+                        let j = rs_coverage::join(
+                            &routes,
+                            &b.cfg,
+                            ifindex,
+                            &self.mirror,
+                            UNRESOLVED_SAMPLE_MAX,
+                        );
+                        debug!(
+                            %rs,
+                            received = j.received_prefixes,
+                            nexthops = j.nexthops.total,
+                            resolved = j.nexthops.resolved,
+                            demoted = j.demoted_prefixes,
+                            dump_ms,
+                            "route-server coverage sample"
+                        );
+                        RsCoverageSnapshot {
+                            rs,
+                            bridge: b.cfg.name.clone(),
+                            received_prefixes: j.received_prefixes,
+                            nexthops: j.nexthops,
+                            unresolved_nexthops: j.unresolved_nexthops,
+                            demoted_prefixes: j.demoted_prefixes,
+                            dump_ms,
+                            age_secs: 0,
+                            error: None,
+                        }
+                    }
+                    (Ok(_), None) => return,
+                    (Err(e), _) => {
+                        let prev = self.rs.get(&rs).map(|(s, _)| s.clone());
+                        let mut snap = prev.unwrap_or(RsCoverageSnapshot {
+                            rs,
+                            bridge: b.cfg.name.clone(),
+                            received_prefixes: 0,
+                            nexthops: crate::snapshot::Ratio::default(),
+                            unresolved_nexthops: Vec::new(),
+                            demoted_prefixes: 0,
+                            dump_ms: 0,
+                            age_secs: 0,
+                            error: None,
+                        });
+                        warn!(%rs, error = %e, "route-server received-routes dump failed");
+                        snap.error = Some(e);
+                        snap
+                    }
+                };
+                self.rs.insert(rs, (snap, now));
+            }
             EngineMsg::Reconfigure(new) => self.reconfigure(new),
         }
     }
@@ -1223,6 +1389,7 @@ impl Engine {
                 }
             }
         }
+        self.publish_gate_input();
         self.publish_snapshot(now);
         if self.ticks % STATS_EVERY_TICKS == 0 {
             for b in &self.bridges {
@@ -1286,6 +1453,17 @@ impl Engine {
             }
         }
         self.hot = new.hot.clone();
+        // Presence and list names are restart-only (refused upstream);
+        // interval and remove-after are hot.
+        self.gate_cfg = new.gate.clone();
+        // Route servers that disappeared from config leave the report.
+        let still: HashSet<IpAddr> = new
+            .bridges
+            .iter()
+            .flat_map(|b| b.peers.iter().filter(|p| p.route_server))
+            .flat_map(|p| p.addrs.iter().copied())
+            .collect();
+        self.rs.retain(|rs, _| still.contains(rs));
         self.publish_coverage_params();
         info!("neigh-snoop hot configuration applied");
     }
@@ -1344,8 +1522,23 @@ impl Engine {
                 }
             })
             .collect();
+        let gate = self.gate.as_ref().map(|(g, at)| {
+            let mut g = g.clone();
+            g.age_secs = now.duration_since(*at).as_secs();
+            g
+        });
+        let mut rs: Vec<RsCoverageSnapshot> = self
+            .rs
+            .values()
+            .map(|(r, at)| {
+                let mut r = r.clone();
+                r.age_secs = now.duration_since(*at).as_secs();
+                r
+            })
+            .collect();
+        rs.sort_by_key(|r| r.rs);
         if let Ok(mut s) = self.snapshot.write() {
-            *s = Snapshot { bridges };
+            *s = Snapshot { bridges, gate, rs };
         }
     }
 
@@ -1483,6 +1676,54 @@ async fn coverage_task(
                 .send(EngineMsg::Coverage {
                     bridge_idx: bi,
                     ifindex,
+                    result,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Route-server coverage: dump each configured route server's received
+/// routes every `interval` and hand the pairs to the engine for the
+/// join against the kernel mirror. Idles while no target is configured.
+async fn rs_task(
+    vtysh: Arc<dyn Vtysh>,
+    mut input: watch::Receiver<RsInput>,
+    ctl: mpsc::UnboundedSender<EngineMsg>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let inp = input.borrow_and_update().clone();
+        if inp.targets.is_empty() {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                r = input.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(inp.interval) => {}
+        }
+        let inp = input.borrow_and_update().clone();
+        for (bridge_idx, rs) in inp.targets {
+            let started = Instant::now();
+            let result = match vtysh.run(&[rs_coverage::received_routes_command(rs)]).await {
+                Ok(json) => rs_coverage::parse_received_routes(&json)
+                    .map(|r| (r, started.elapsed().as_millis() as u64)),
+                Err(e) => Err(e),
+            };
+            if ctl
+                .send(EngineMsg::RsRoutes {
+                    bridge_idx,
+                    rs,
                     result,
                 })
                 .is_err()
