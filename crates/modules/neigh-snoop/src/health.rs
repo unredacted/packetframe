@@ -401,7 +401,10 @@ mod tests {
     fn unconfirmed_promisc_degrades() {
         let mut b = up("br0");
         b.promisc_confirmed = false;
-        let r = health(&Snapshot { bridges: vec![b] });
+        let r = health(&Snapshot {
+            bridges: vec![b],
+            ..Default::default()
+        });
         let s = state_of(&r, "snoop:br0");
         assert_eq!(s.state, HealthState::Degraded);
         assert!(s

@@ -374,6 +374,7 @@ pub fn render_textfile(snapshot: &Snapshot, out: &mut String) {
 
     if !snapshot.rs.is_empty() {
         let rs_gauge = |out: &mut String, name: &str, rs: &str, iface: &str, v: u64| {
+            let iface = label(iface);
             let _ = writeln!(
                 out,
                 "{NS}_{name}{{module=\"neigh-snoop\",iface=\"{iface}\",rs=\"{rs}\"}} {v}"
