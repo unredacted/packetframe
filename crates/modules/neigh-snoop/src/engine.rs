@@ -46,7 +46,8 @@ use crate::snapshot::{
     LinkState, PersistOutcome, SeedOutcome, Snapshot,
 };
 use crate::table::{
-    admit, install_decision, Decision, KernelMirror, LearnedTable, Observe, DEFAULT_HOLDDOWN,
+    admit, install_decision, Decision, FilterReject, KernelMirror, LearnedTable, Observe,
+    DEFAULT_HOLDDOWN,
 };
 
 pub type SharedSnapshot = Arc<RwLock<Snapshot>>;
@@ -275,8 +276,24 @@ impl EngineHandle {
     }
 
     /// The last published snapshot (published every housekeeping tick).
+    /// If the engine task has exited while the handle is still live
+    /// (a panic, or an exit path that published nothing), every bridge
+    /// is reported with a terminal error rather than the frozen last
+    /// tick: nothing is being captured, installed or re-seeded.
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.read().map(|s| s.clone()).unwrap_or_default()
+        let mut s = self.snapshot.read().map(|s| s.clone()).unwrap_or_default();
+        if self.runtime.is_some() && !self.cancel.is_cancelled() && self.engine_task_finished() {
+            for b in &mut s.bridges {
+                b.socket_error
+                    .get_or_insert_with(|| "engine task exited unexpectedly".to_string());
+            }
+        }
+        s
+    }
+
+    fn engine_task_finished(&self) -> bool {
+        // The engine loop is the last task spawned in `start`.
+        self.tasks.last().is_some_and(JoinHandle::is_finished)
     }
 
     /// Apply the hot-reloadable parts of a new configuration.
@@ -447,6 +464,17 @@ impl Engine {
                 info!(bridge = %b.cfg.name, "bridge absent; waiting for RTM_NEWLINK by name");
             }
         }
+        // A bridge that is present and up but has no capture socket is
+        // an attach failure (missing CAP_NET_RAW, membership refused),
+        // not a health row: the startup contract is "attached means
+        // capturing". Failures after attach keep the retry path.
+        if let Some(b) = engine.bridges.iter().find(|b| b.up && b.capture.is_none()) {
+            return Err(format!(
+                "capture socket on {}: {}",
+                b.cfg.name,
+                b.socket_error.as_deref().unwrap_or("not open")
+            ));
+        }
         engine.publish_coverage_params();
         engine.publish_snapshot(now);
         Ok((engine, messages))
@@ -513,6 +541,7 @@ impl Engine {
                     Some((pkt, _)) => self.on_netlink(pkt).await,
                     None => {
                         warn!("netlink multicast stream closed; neigh-snoop engine stopping");
+                        self.fail_terminal("netlink multicast stream closed; engine stopped");
                         self.shutdown();
                         return;
                     }
@@ -592,6 +621,10 @@ impl Engine {
                 let b = &mut self.bridges[bi];
                 b.own_addrs.clear();
                 b.in_flight.clear();
+                // Rate-limited jobs still queued target the dead ifindex
+                // and would also block the re-seed's enqueue by dedup.
+                b.pending.clear();
+                b.queued.clear();
                 b.ifindex = Some(info.ifindex);
                 b.own_mac = info.mac;
                 b.promisc_confirmed = info.promisc;
@@ -718,6 +751,7 @@ impl Engine {
     }
 
     fn seed(&mut self, bi: usize, now: Instant) {
+        self.purge_inadmissible(bi, now);
         let entries: Vec<(IpAddr, [u8; 6])> = self.bridges[bi]
             .table
             .iter()
@@ -726,6 +760,43 @@ impl Engine {
         for (ip, mac) in entries {
             self.consider_install(bi, ip, mac, Origin::Seed, now);
         }
+    }
+
+    /// Drop learned entries the current admission policy rejects. The
+    /// table outlives the policy (persisted across restarts, kept across
+    /// hot reloads), so a narrowed prefix or a new deny-mac must apply
+    /// to what is already held before any of it is re-seeded.
+    fn purge_inadmissible(&mut self, bi: usize, now: Instant) {
+        let b = &mut self.bridges[bi];
+        let rejected: Vec<(IpAddr, FilterReject)> = b
+            .table
+            .iter()
+            .filter_map(|(ip, e)| {
+                admit(
+                    *ip,
+                    e.mac,
+                    &b.cfg.prefixes,
+                    &b.own_addrs,
+                    b.own_mac,
+                    &self.deny_macs,
+                )
+                .err()
+                .map(|why| (*ip, why))
+            })
+            .collect();
+        if rejected.is_empty() {
+            return;
+        }
+        for (ip, why) in &rejected {
+            b.table.remove(ip);
+            b.counters.filter_reject(*why);
+        }
+        b.mark_dirty(now);
+        info!(
+            bridge = %b.cfg.name,
+            dropped = rejected.len(),
+            "learned entries outside the current admission policy dropped"
+        );
     }
 
     fn on_neigh(&mut self, ifindex: u32, ip: IpAddr, entry: Option<crate::table::MirrorEntry>) {
@@ -795,8 +866,10 @@ impl Engine {
                 let Some(b) = self.bridges.get_mut(bridge_idx) else {
                     return;
                 };
-                b.in_flight.remove(&ip);
-                b.counters.install(InstallOutcome::Failed);
+                match b.in_flight.remove(&ip).map(|p| p.origin) {
+                    Some(Origin::Seed) => b.counters.seed(SeedOutcome::Failed),
+                    _ => b.counters.install(InstallOutcome::Failed),
+                }
                 b.install_failures_logged += 1;
                 if b.install_failures_logged <= LOG_BUDGET {
                     warn!(bridge = %b.cfg.name, %ip, error = %error, "neighbour install failed");
@@ -830,6 +903,13 @@ impl Engine {
                 }
                 let now = Instant::now();
                 let state = match result {
+                    // A route naming a nexthop id the object dump did not
+                    // return means the two dumps raced; reporting the
+                    // remaining set as coverage would read as complete.
+                    Ok(sample) if sample.unknown_ids > 0 => CoverageState::Unavailable(format!(
+                        "{} routes reference nexthop ids missing from the object dump; retrying next tick",
+                        sample.unknown_ids
+                    )),
                     Ok(sample) => {
                         let (ratio, unresolved) = coverage::join_coverage(
                             &sample.nexthops,
@@ -919,13 +999,16 @@ impl Engine {
             if evicted.is_some() {
                 b.counters.learn(LearnOutcome::Evicted);
             }
+            // Any admitted observation counts as hearing a peer: a peer
+            // restored from disk refreshes rather than appears, and a
+            // peer added by hot reload may already be in the table.
+            if b.cfg.peer_addrs().any(|a| a == l.ip) && b.heard_peers.insert(l.ip) {
+                info!(bridge = %b.cfg.name, ip = %l.ip, "configured peer first heard");
+            }
             match outcome {
                 Observe::New => {
                     b.counters.learn(LearnOutcome::New);
                     b.mark_dirty(now);
-                    if b.cfg.peer_addrs().any(|a| a == l.ip) && b.heard_peers.insert(l.ip) {
-                        info!(bridge = %b.cfg.name, ip = %l.ip, "configured peer first heard");
-                    }
                 }
                 Observe::Refreshed => {
                     b.counters.learn(LearnOutcome::Refreshed);
@@ -1003,22 +1086,53 @@ impl Engine {
 
     /// One paced install: round-robin across bridges so a seed on one
     /// bridge cannot starve live learns on another.
+    ///
+    /// A job can sit in `pending` for a while under the rate limit, so
+    /// the decision is taken again at dispatch against the *current*
+    /// table MAC and mirror state: a MAC learned after the enqueue
+    /// replaces the queued one, and a kernel entry that became
+    /// REACHABLE, PERMANENT or NOARP meanwhile is left alone. Jobs whose
+    /// device is gone are dropped. Skipped jobs cost no netlink write,
+    /// so the scan continues to the next dispatchable job.
     fn install_one(&mut self) {
         let n = self.bridges.len();
         if n == 0 {
             return;
         }
+        let now = Instant::now();
         for k in 0..n {
             let bi = (self.rr + k) % n;
-            let Some(job) = self.bridges[bi].pending.pop_front() else {
+            let job = loop {
+                let Some(mut job) = self.bridges[bi].pending.pop_front() else {
+                    break None;
+                };
+                let b = &mut self.bridges[bi];
+                b.queued.remove(&job.ip);
+                if !b.up || b.ifindex != Some(job.ifindex) {
+                    continue; // enqueued for a device that is gone
+                }
+                if let Some(e) = b.table.get(&job.ip) {
+                    job.mac = e.mac;
+                }
+                let last_install = match job.origin {
+                    Origin::Derived => b.derived_last_install.get(&job.ip).copied(),
+                    _ => b.table.get(&job.ip).and_then(|e| e.last_install),
+                };
+                let kernel = self.mirror.get(job.ifindex, &job.ip);
+                match install_decision(kernel, job.mac, last_install, now, DEFAULT_HOLDDOWN) {
+                    Decision::Install(_) => break Some(job),
+                    Decision::Skip(reason) => {
+                        b.counters.install(InstallOutcome::Skipped(reason));
+                    }
+                }
+            };
+            let Some(job) = job else {
                 continue;
             };
             self.rr = (bi + 1) % n;
             match self.install_tx.try_send(job.clone()) {
                 Ok(()) => {
-                    let now = Instant::now();
                     let b = &mut self.bridges[bi];
-                    b.queued.remove(&job.ip);
                     b.in_flight.insert(
                         job.ip,
                         InFlight {
@@ -1046,11 +1160,11 @@ impl Engine {
                 }
                 Err(mpsc::error::TrySendError::Full(job)) => {
                     // Hand-off buffer full: keep the job at the head.
-                    self.bridges[bi].pending.push_front(job);
+                    let b = &mut self.bridges[bi];
+                    b.queued.insert(job.ip);
+                    b.pending.push_front(job);
                 }
-                Err(mpsc::error::TrySendError::Closed(job)) => {
-                    self.bridges[bi].queued.remove(&job.ip);
-                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
             return;
         }
@@ -1070,8 +1184,14 @@ impl Engine {
                 .map(|(ip, _)| *ip)
                 .collect();
             for ip in expired {
-                b.in_flight.remove(&ip);
-                b.counters.install(InstallOutcome::Unconfirmed);
+                if let Some(p) = b.in_flight.remove(&ip) {
+                    match p.origin {
+                        Origin::Seed => b.counters.seed(SeedOutcome::Unconfirmed),
+                        Origin::Learn | Origin::Derived => {
+                            b.counters.install(InstallOutcome::Unconfirmed)
+                        }
+                    }
+                }
             }
             if b.dirty_since
                 .is_some_and(|t| now.duration_since(t) >= PERSIST_DEBOUNCE)
@@ -1151,6 +1271,9 @@ impl Engine {
             }
         }
         self.deny_macs = new.deny_macs.clone();
+        for bi in 0..self.bridges.len() {
+            self.purge_inadmissible(bi, now);
+        }
         if new.hot.table_max != self.hot.table_max {
             for b in &mut self.bridges {
                 let evicted = b.table.set_cap(new.hot.table_max as usize);
@@ -1174,10 +1297,15 @@ impl Engine {
             .map(|b| {
                 let mut counters = b.counters.clone();
                 counters.frames_backpressure_dropped = b.backpressure.load(Ordering::Relaxed);
+                // Silence is measured from the later of the last frame
+                // and the last bring-up, so time spent down does not
+                // count against a bridge that just came back.
                 let silent_secs = if b.up {
-                    b.last_frame
-                        .or(b.up_since)
-                        .map(|t| now.duration_since(t).as_secs())
+                    match (b.last_frame, b.up_since) {
+                        (Some(f), Some(u)) => Some(f.max(u)),
+                        (f, u) => f.or(u),
+                    }
+                    .map(|t| now.duration_since(t).as_secs())
                 } else {
                     None
                 };
@@ -1218,6 +1346,16 @@ impl Engine {
             .collect();
         if let Ok(mut s) = self.snapshot.write() {
             *s = Snapshot { bridges };
+        }
+    }
+
+    /// The engine is exiting for a reason other than detach: stamp
+    /// every bridge with the error so the last published snapshot reads
+    /// Unhealthy instead of freezing on "capturing".
+    fn fail_terminal(&mut self, why: &str) {
+        for b in &mut self.bridges {
+            b.socket_error = Some(why.to_string());
+            b.counters.socket_errors += 1;
         }
     }
 
