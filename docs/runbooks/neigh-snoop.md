@@ -57,7 +57,7 @@ module neigh-snoop
   peer br1 198.51.100.20
   persist-dir /var/lib/packetframe/state/neigh-cache    # RESTART-ONLY
   seed-max-age 14d                                      # hot
-  install-rate 50/1s                                    # hot
+  install-rate 50/1s                                    # hot, daemon-wide
   table-max 4096                                        # hot
   coverage-interval 60s                                 # hot
   frr-gate v4 IX-RESOLVED-NH v6 IX-RESOLVED-NH6         # presence/names RESTART-ONLY
@@ -98,6 +98,9 @@ module neigh-snoop
    second) and `install_total{outcome="confirmed"}` trickle. Check the
    `snoop:<bridge>` health row reads `capturing`.
 3. Raise `install-rate` via SIGHUP. Check `install_backlog` drains.
+   The rate is one budget for the whole daemon, dispensed round-robin
+   across bridges: with N bridges re-seeding at once each gets roughly
+   1/N of it, so size the rate for the sum of the bridges' tables.
 4. Run the acceptance tests below (T1–T3, T6).
 5. Add `ix-mode` (restart). fast-path's stats line gains
    `ix_probe_suppressed`; `custom_fib_no_neigh` should fall.
