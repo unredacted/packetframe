@@ -160,7 +160,7 @@ struct IfaceState {
     coverage_at: Option<Instant>,
     counters: Counters,
     backpressure: Arc<AtomicU64>,
-    sha_mismatch_logged: u64,
+    mac_mismatch_logged: u64,
     install_failures_logged: u64,
 }
 
@@ -188,7 +188,7 @@ impl IfaceState {
             coverage_at: None,
             counters: Counters::default(),
             backpressure: Arc::new(AtomicU64::new(0)),
-            sha_mismatch_logged: 0,
+            mac_mismatch_logged: 0,
             install_failures_logged: 0,
         }
     }
@@ -883,10 +883,18 @@ impl Engine {
             Ok(p) => p,
             Err(r) => {
                 b.counters.parse_reject(&r);
-                if r == Reject::ShaMismatch {
-                    b.sha_mismatch_logged += 1;
-                    if b.sha_mismatch_logged <= LOG_BUDGET {
-                        warn!(bridge = %b.cfg.name, "ARP sender MAC disagrees with the Ethernet source; frame dropped");
+                // Both are the spoof-shaped reject: the one field a
+                // participant can forge past the fabric's source-MAC
+                // port security. Worth a bounded WARN, not just a counter.
+                let which = match r {
+                    Reject::ShaMismatch => Some("ARP sender MAC"),
+                    Reject::LlaoMismatch => Some("ND link-layer option"),
+                    _ => None,
+                };
+                if let Some(which) = which {
+                    b.mac_mismatch_logged += 1;
+                    if b.mac_mismatch_logged <= LOG_BUDGET {
+                        warn!(bridge = %b.cfg.name, "{which} disagrees with the Ethernet source; frame dropped");
                     }
                 }
                 return;
