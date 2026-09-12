@@ -555,8 +555,20 @@ impl Engine {
                 continue;
             };
             for (ip, e) in self.mirror.iter_ifindex(ifindex) {
+                // Participants only: unicast, not link-local, and in a
+                // state the kernel reached through ARP/ND (REACHABLE,
+                // STALE, DELAY, PROBE). The kernel's own NOARP rows —
+                // multicast groups, point-to-point peers — resolve too
+                // and must never become gate entries.
                 let link_local = matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local());
-                if e.resolves() && !link_local {
+                let participant_state = matches!(
+                    e.state,
+                    crate::table::NudState::Reachable
+                        | crate::table::NudState::Stale
+                        | crate::table::NudState::Delay
+                        | crate::table::NudState::Probe
+                );
+                if participant_state && e.mac.is_some() && !link_local && !ip.is_multicast() {
                     resolved_now.insert(*ip);
                 }
             }
