@@ -36,6 +36,7 @@ pub struct LinkInfo {
 pub fn link_info(msg: &LinkMessage) -> LinkInfo {
     let mut name = None;
     let mut mac = None;
+    let mut promiscuity = 0u32;
     for attr in &msg.attributes {
         match attr {
             LinkAttribute::IfName(n) => name = Some(n.clone()),
@@ -44,15 +45,20 @@ pub fn link_info(msg: &LinkMessage) -> LinkInfo {
                 m.copy_from_slice(bytes);
                 mac = Some(m);
             }
+            LinkAttribute::Promiscuity(n) => promiscuity = *n,
             _ => {}
         }
     }
+    // `IFF_PROMISC` in the flags word reflects only the user-visible
+    // flag (`ip link set promisc on`); promiscuity raised through a
+    // socket membership is reported as the `IFLA_PROMISCUITY` refcount
+    // (what `ip -d link` prints as `promiscuity N`). Either counts.
     LinkInfo {
         ifindex: msg.header.index,
         name,
         mac,
         up: msg.header.flags.contains(LinkFlags::Up),
-        promisc: msg.header.flags.contains(LinkFlags::Promisc),
+        promisc: promiscuity > 0 || msg.header.flags.contains(LinkFlags::Promisc),
     }
 }
 
@@ -228,6 +234,12 @@ mod tests {
         assert_eq!(l.name.as_deref(), Some("br0"));
         assert_eq!(l.mac, Some([2, 0, 0, 0, 0, 9]));
         assert!(l.up && l.promisc);
+        // Socket-membership promiscuity: refcount attribute, no flag.
+        m.header.flags = LinkFlags::Up;
+        m.attributes.push(LinkAttribute::Promiscuity(1));
+        assert!(link_info(&m).promisc);
+        m.attributes.pop();
+        assert!(!link_info(&m).promisc);
     }
 
     #[test]
