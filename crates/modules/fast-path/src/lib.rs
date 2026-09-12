@@ -86,11 +86,29 @@ pub struct FastPathModule {
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     #[cfg(target_os = "linux")]
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+    /// Interfaces the neigh-snoop module declared `ix-mode`: the
+    /// resolver never issues its proactive neighbour kick for nexthops
+    /// egressing them. Names, not ifindexes. Present on every platform
+    /// so the loader's wiring stays cfg-clean.
+    ix_mode_ifaces: Vec<String>,
 }
 
 impl FastPathModule {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare the IX-mode interfaces, by name.
+    ///
+    /// Must be called before [`Module::attach`]: the resolver reads
+    /// the set when it starts. The loader is the only caller, because
+    /// it is the only place that sees both the neigh-snoop section (which
+    /// owns the `ix-mode` flag) and this module. Tying the flag to the
+    /// snooper's `bridge` line guarantees a feeder exists for every
+    /// interface the resolver stops probing on; an ix-mode without a
+    /// snooper would leave those nexthops unresolvable.
+    pub fn set_ix_mode_ifaces(&mut self, ifaces: Vec<String>) {
+        self.ix_mode_ifaces = ifaces;
     }
 
     /// Announce the resolved FIB to a second tier.
@@ -203,6 +221,7 @@ impl Module for FastPathModule {
             self.route_sink.clone(),
             self.completeness.clone(),
             self.feed_session.clone(),
+            self.ix_mode_ifaces.clone(),
         )
     }
 

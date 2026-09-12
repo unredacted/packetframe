@@ -161,6 +161,22 @@ pub struct RouteFeed {
     pub integrity_authority: IntegrityAuthoritySpec,
 }
 
+/// The operator's instructions to the neighbour resolver: which
+/// connected prefixes to fast-path, whether to synthesize a default
+/// route, and which interfaces are in IX mode (no proactive probes).
+/// One struct for the same reason as [`RouteFeed`]: they are all
+/// resolver policy, and folding them keeps `start()` under the
+/// argument-count lint the cross-clippy job enforces on this
+/// Linux-only file.
+#[derive(Default)]
+pub struct ResolverPolicy {
+    pub local_prefixes: Vec<LocalPrefixSpec>,
+    pub fallback_default: Option<FallbackDefaultSpec>,
+    /// Interface names (not ifindexes; the platform recreates bridges)
+    /// on which the resolver must never issue its `NUD_NONE` kick.
+    pub ix_interfaces: Vec<String>,
+}
+
 /// The handles a second forwarding tier registers before attach — how
 /// complete the mirror is, and whether the feed's transport session is
 /// up. One struct because they are created together (the loader),
@@ -185,8 +201,7 @@ impl RouteController {
     pub fn start(
         bpffs_root: &Path,
         feed: RouteFeed,
-        local_prefixes: Vec<LocalPrefixSpec>,
-        fallback_default: Option<FallbackDefaultSpec>,
+        policy: ResolverPolicy,
         fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
         route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
         signals: SecondTierSignals,
@@ -195,6 +210,11 @@ impl RouteController {
             source: route_source,
             integrity_authority,
         } = feed;
+        let ResolverPolicy {
+            local_prefixes,
+            fallback_default,
+            ix_interfaces,
+        } = policy;
         let SecondTierSignals {
             completeness,
             feed_session,
@@ -265,6 +285,17 @@ impl RouteController {
             resolver
         } else {
             resolver.with_fdb_pin(fdb_pin_chains, prog_handle.clone())
+        };
+        // IX mode: no proactive kick on these interfaces (declared by
+        // the neigh-snoop module's `bridge <x> ix-mode`). Empty = today.
+        let resolver = if ix_interfaces.is_empty() {
+            resolver
+        } else {
+            info!(
+                ifaces = ?ix_interfaces,
+                "ix-mode interfaces: proactive neighbour probes suppressed on them"
+            );
+            resolver.with_ix_interfaces(ix_interfaces)
         };
 
         let resolver_task = runtime.spawn(async move {
