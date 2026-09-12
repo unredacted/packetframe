@@ -521,7 +521,7 @@ fn learns_third_party_arp_and_installs_stale() {
     assert_eq!(s.bridges[0].table_entries, 1);
     assert!(
         s.bridges[0].promisc_confirmed,
-        "kernel echoed IFF_PROMISC: {s:?}"
+        "kernel reports promiscuity for the device: {s:?}"
     );
     assert_eq!(
         s.bridges[0].counters.frames[0], 1,
