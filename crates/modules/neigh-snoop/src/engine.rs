@@ -114,7 +114,7 @@ pub enum EngineMsg {
 }
 
 /// What the engine publishes to the route-server coverage task.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RsInput {
     /// `(bridge index, route-server address)` for bridges that are up.
     targets: Vec<(usize, IpAddr)>,
@@ -1734,18 +1734,29 @@ async fn rs_task(
                 }
             }
         }
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(inp.interval) => {}
-            // A hot reload changed the interval or the targets: restart
-            // the wait instead of finishing the old, possibly hour-long
-            // one first.
-            r = input.changed() => {
-                if r.is_err() {
-                    return;
+        // The engine republishes this input every housekeeping tick, so
+        // `changed()` fires constantly; only a different target set or
+        // interval (a hot reload) restarts the wait, instead of finishing
+        // the old, possibly hour-long one first.
+        let deadline = tokio::time::Instant::now() + inp.interval;
+        let mut restart = false;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep_until(deadline) => break,
+                r = input.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    if *input.borrow() != inp {
+                        restart = true;
+                        break;
+                    }
                 }
-                continue;
             }
+        }
+        if restart {
+            continue;
         }
         let inp = input.borrow_and_update().clone();
         for (bridge_idx, rs) in inp.targets {

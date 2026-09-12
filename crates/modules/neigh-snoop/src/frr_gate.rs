@@ -555,12 +555,28 @@ mod linux {
                     r = input.changed() => { if r.is_err() { return; } continue; }
                 }
             };
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(cfg.interval) => {}
-                // A hot reload shortened the interval or unconfigured
-                // the gate: restart the wait under the new input.
-                r = input.changed() => { if r.is_err() { return; } continue; }
+            // The engine republishes the resolved set every housekeeping
+            // tick, so `changed()` fires constantly; only a change to the
+            // gate configuration (a hot reload) restarts the wait.
+            let deadline = tokio::time::Instant::now() + cfg.interval;
+            let mut restart = false;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    r = input.changed() => {
+                        if r.is_err() {
+                            return;
+                        }
+                        if input.borrow().cfg.as_ref() != Some(&cfg) {
+                            restart = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if restart {
+                continue;
             }
             let inp = input.borrow_and_update().clone();
             let Some(cfg) = inp.cfg.clone() else {
