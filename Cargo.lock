@@ -753,6 +753,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "packetframe-neigh-snoop"
+version = "0.2.7"
+dependencies = [
+ "ipnet",
+ "libc",
+ "packetframe-common",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "packetframe-probe"
 version = "0.2.7"
 dependencies = [
