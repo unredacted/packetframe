@@ -136,6 +136,10 @@ impl InstallOutcome {
 pub enum SeedOutcome {
     Requested,
     Confirmed,
+    /// No RTM_NEWNEIGH echo inside the confirmation window.
+    Unconfirmed,
+    /// The netlink write itself was refused.
+    Failed,
     /// Dropped at load for exceeding `seed-max-age`.
     Expired,
     /// Persisted entries the file held but which did not parse.
@@ -143,15 +147,23 @@ pub enum SeedOutcome {
 }
 
 impl SeedOutcome {
-    pub const COUNT: usize = 4;
-    pub const LABELS: [&'static str; Self::COUNT] =
-        ["requested", "confirmed", "expired", "bad_entry"];
+    pub const COUNT: usize = 6;
+    pub const LABELS: [&'static str; Self::COUNT] = [
+        "requested",
+        "confirmed",
+        "unconfirmed",
+        "failed",
+        "expired",
+        "bad_entry",
+    ];
     pub fn index(self) -> usize {
         match self {
             Self::Requested => 0,
             Self::Confirmed => 1,
-            Self::Expired => 2,
-            Self::BadEntry => 3,
+            Self::Unconfirmed => 2,
+            Self::Failed => 3,
+            Self::Expired => 4,
+            Self::BadEntry => 5,
         }
     }
 }

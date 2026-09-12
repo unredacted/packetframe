@@ -205,6 +205,8 @@ mod linux {
     const NLMSG_DONE: u16 = 3;
     const NLM_F_REQUEST: u16 = 0x01;
     const NLM_F_DUMP: u16 = 0x300;
+    /// Set on a dump message when the table changed mid-dump.
+    const NLM_F_DUMP_INTR: u16 = 0x10;
 
     /// One blocking `RTM_GETNEXTHOP` dump: `id → object`. The table is
     /// one object per distinct next-hop, so no filter is needed.
@@ -259,8 +261,14 @@ mod linux {
                 let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
                     as usize;
                 let kind = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                let flags = u16::from_ne_bytes([buf[off + 6], buf[off + 7]]);
                 if len < NLMSG_HDR || off + len > n {
                     return Err("netlink: malformed message length".into());
+                }
+                // The table changed under the dump; what we assembled is
+                // not a consistent snapshot. Retried on the next tick.
+                if flags & NLM_F_DUMP_INTR != 0 {
+                    return Err("RTM_GETNEXTHOP dump interrupted by a concurrent change".into());
                 }
                 let payload = &buf[off + NLMSG_HDR..off + len];
                 match kind {
