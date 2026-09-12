@@ -142,6 +142,18 @@ pub struct DesiredTracker {
 }
 
 impl DesiredTracker {
+    /// Treat addresses already listed in FRR as resolved as of `now`,
+    /// without displacing anything fresher. Called once, on the first
+    /// successful read of the lists: PacketFrame may restart while FRR
+    /// still holds a full runtime list and the kernel table is still
+    /// being re-seeded, and without this the first tick would remove
+    /// every entry not yet re-seeded, ignoring `remove-after`.
+    pub fn adopt(&mut self, listed: impl IntoIterator<Item = IpAddr>, now: Instant) {
+        for ip in listed {
+            self.last_resolved.entry(ip).or_insert(now);
+        }
+    }
+
     /// Fold in this tick's resolved set and return the desired set.
     pub fn update(
         &mut self,
@@ -290,6 +302,9 @@ pub fn verify(desired: &HashSet<IpAddr>, v4: &ParsedList, v6: &ParsedList) -> Op
 #[derive(Debug, Default)]
 pub struct GateState {
     pub tracker: DesiredTracker,
+    /// Whether the lists' existing runtime entries have been folded
+    /// into the tracker (once, at the first successful read).
+    pub adopted: bool,
     pub had_runtime_entries: bool,
     pub consecutive_failures: u32,
     pub last_change: Option<Instant>,
@@ -432,12 +447,27 @@ mod linux {
         state: &mut GateState,
     ) -> GateSnapshot {
         let started = Instant::now();
-        let desired = state
-            .tracker
-            .update(resolved_now, started, cfg.remove_after);
-        let result: Result<GateOutcome, String> = async {
+        // `Ok(None)`: the lists do not exist yet. Not a failure of ours,
+        // so it neither counts toward the unhealthy threshold nor hides
+        // a real vtysh error behind "lists absent".
+        let result: Result<Option<GateOutcome>, String> = async {
             let (v4, v6) = show_lists(vtysh, cfg).await?;
             state.lists_present = v4.present && v6.present;
+            if !state.lists_present {
+                return Ok(None);
+            }
+            if !state.adopted {
+                let listed = v4
+                    .runtime_hosts()
+                    .into_iter()
+                    .chain(v6.runtime_hosts())
+                    .map(|(ip, _)| ip);
+                state.tracker.adopt(listed, started);
+                state.adopted = true;
+            }
+            let desired = state
+                .tracker
+                .update(resolved_now, started, cfg.remove_after);
             let p = plan(
                 cfg,
                 &desired,
@@ -446,15 +476,12 @@ mod linux {
                 &v6,
                 state.had_runtime_entries,
             );
-            if p.lists_missing {
-                return Err("prefix-lists absent; waiting for the static FRR configuration".into());
-            }
             state.pending_removals = p.pending_removals as u64;
             if p.commands.is_empty() {
                 state.permitted_v4 = v4.runtime_hosts().len() as u64;
                 state.permitted_v6 = v6.runtime_hosts().len() as u64;
                 state.had_runtime_entries = v4.has_runtime_entries() || v6.has_runtime_entries();
-                return Ok(GateOutcome::Noop);
+                return Ok(Some(GateOutcome::Noop));
             }
             if p.reload {
                 warn!(
@@ -480,16 +507,18 @@ mod linux {
                 "next-hop gate lists reconciled"
             );
             state.last_change = Some(Instant::now());
-            Ok(if p.reload {
+            Ok(Some(if p.reload {
                 GateOutcome::ReloadRefill
             } else {
                 GateOutcome::Changed
-            })
+            }))
         }
         .await;
         match result {
             Ok(o) => {
-                state.record(o);
+                if let Some(o) = o {
+                    state.record(o);
+                }
                 state.consecutive_failures = 0;
                 state.last_error = None;
             }
@@ -529,6 +558,9 @@ mod linux {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(cfg.interval) => {}
+                // A hot reload shortened the interval or unconfigured
+                // the gate: restart the wait under the new input.
+                r = input.changed() => { if r.is_err() { return; } continue; }
             }
             let inp = input.borrow_and_update().clone();
             let Some(cfg) = inp.cfg.clone() else {
@@ -657,6 +689,41 @@ mod tests {
         let p = plan(&cfg(), &d, &only10, &v4, &v6, true);
         assert_eq!(p.removals, 1);
         assert_eq!(p.pending_removals, 0);
+    }
+
+    #[test]
+    fn adopted_runtime_entries_get_the_removal_grace() {
+        // PacketFrame restarts while FRR still lists .10/.11/::10 and the
+        // kernel has re-seeded nothing yet: nothing may be removed until
+        // the window has elapsed.
+        let v4 = parse_prefix_list(V4_TEXT);
+        let v6 = parse_prefix_list(V6_TEXT);
+        let listed: HashSet<IpAddr> = v4
+            .runtime_hosts()
+            .into_iter()
+            .chain(v6.runtime_hosts())
+            .map(|(ip, _)| ip)
+            .collect();
+        assert!(!listed.is_empty());
+        let mut t = DesiredTracker::default();
+        let t0 = Instant::now();
+        let ra = Duration::from_secs(180);
+        t.adopt(listed.iter().copied(), t0);
+        let d = t.update(&HashSet::new(), t0, ra);
+        assert_eq!(d, listed);
+        let p = plan(&cfg(), &d, &HashSet::new(), &v4, &v6, true);
+        assert_eq!(p.removals, 0);
+        assert_eq!(p.pending_removals, listed.len());
+        // Adopting never makes a fresher observation older.
+        t.update(&listed, t0 + Duration::from_secs(100), ra);
+        t.adopt(listed.iter().copied(), t0);
+        assert_eq!(
+            t.update(&HashSet::new(), t0 + Duration::from_secs(200), ra),
+            listed
+        );
+        // Past the window with nothing re-seeded: removed, as configured.
+        let d = t.update(&HashSet::new(), t0 + Duration::from_secs(281), ra);
+        assert!(d.is_empty());
     }
 
     #[test]

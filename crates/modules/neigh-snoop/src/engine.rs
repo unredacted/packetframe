@@ -108,7 +108,7 @@ pub enum EngineMsg {
     RsRoutes {
         bridge_idx: usize,
         rs: IpAddr,
-        result: Result<(Vec<(String, IpAddr)>, u64), String>,
+        result: Result<(rs_coverage::ReceivedRoutes, u64), String>,
     },
     Reconfigure(SnoopConfig),
 }
@@ -1068,11 +1068,23 @@ impl Engine {
                 let Some(b) = self.bridges.get(bridge_idx) else {
                     return;
                 };
+                // A dump can outlive a hot reload that removed or moved
+                // this route server; `reconfigure` already dropped its
+                // row, and a late result must not resurrect it.
+                if !b
+                    .cfg
+                    .peers
+                    .iter()
+                    .any(|p| p.route_server && p.addrs.contains(&rs))
+                {
+                    debug!(%rs, "route-server result for a peer no longer configured; dropped");
+                    return;
+                }
                 let now = Instant::now();
                 let snap = match (result, b.ifindex) {
-                    (Ok((routes, dump_ms)), Some(ifindex)) => {
+                    (Ok((received, dump_ms)), Some(ifindex)) => {
                         let j = rs_coverage::join(
-                            &routes,
+                            &received.routes,
                             &b.cfg,
                             ifindex,
                             &self.mirror,
@@ -1090,7 +1102,8 @@ impl Engine {
                         RsCoverageSnapshot {
                             rs,
                             bridge: b.cfg.name.clone(),
-                            received_prefixes: j.received_prefixes,
+                            received_prefixes: j.received_prefixes + received.unparsed,
+                            unparsed_prefixes: received.unparsed,
                             nexthops: j.nexthops,
                             unresolved_nexthops: j.unresolved_nexthops,
                             demoted_prefixes: j.demoted_prefixes,
@@ -1106,6 +1119,7 @@ impl Engine {
                             rs,
                             bridge: b.cfg.name.clone(),
                             received_prefixes: 0,
+                            unparsed_prefixes: 0,
                             nexthops: crate::snapshot::Ratio::default(),
                             unresolved_nexthops: Vec::new(),
                             demoted_prefixes: 0,
@@ -1723,6 +1737,15 @@ async fn rs_task(
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(inp.interval) => {}
+            // A hot reload changed the interval or the targets: restart
+            // the wait instead of finishing the old, possibly hour-long
+            // one first.
+            r = input.changed() => {
+                if r.is_err() {
+                    return;
+                }
+                continue;
+            }
         }
         let inp = input.borrow_and_update().clone();
         for (bridge_idx, rs) in inp.targets {

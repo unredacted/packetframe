@@ -21,16 +21,27 @@ use crate::cfg::BridgeCfg;
 use crate::snapshot::Ratio;
 use crate::table::KernelMirror;
 
-/// `(prefix, next-hop)` for every received route with a parsable
-/// next-hop.
-pub fn parse_received_routes(json: &str) -> Result<Vec<(String, IpAddr)>, String> {
+/// The parsed dump: `(prefix, next-hop)` for every received route with
+/// a parsable next-hop, plus how many entries had none. The latter is
+/// kept so `received_prefixes` stays the true count and a silently
+/// understated coverage figure is impossible.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReceivedRoutes {
+    pub routes: Vec<(String, IpAddr)>,
+    pub unparsed: u64,
+}
+
+pub fn parse_received_routes(json: &str) -> Result<ReceivedRoutes, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("received-routes json: {e}"))?;
     let routes = v
         .get("receivedRoutes")
         .or_else(|| v.get("advertisedRoutes"))
         .and_then(Value::as_object)
         .ok_or_else(|| "received-routes json: no `receivedRoutes` object".to_string())?;
-    let mut out = Vec::with_capacity(routes.len());
+    let mut out = ReceivedRoutes {
+        routes: Vec::with_capacity(routes.len()),
+        unparsed: 0,
+    };
     for (prefix, entry) in routes {
         let nh = entry
             .get("nextHop")
@@ -44,8 +55,9 @@ pub fn parse_received_routes(json: &str) -> Result<Vec<(String, IpAddr)>, String
                     .and_then(Value::as_str)
             })
             .and_then(|s| s.parse::<IpAddr>().ok());
-        if let Some(nh) = nh {
-            out.push((prefix.clone(), nh));
+        match nh {
+            Some(nh) => out.routes.push((prefix.clone(), nh)),
+            None => out.unparsed += 1,
         }
     }
     Ok(out)
@@ -131,8 +143,10 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_both_nexthop_shapes_and_skips_broken_entries() {
-        let mut r = parse_received_routes(SAMPLE).unwrap();
+    fn parses_both_nexthop_shapes_and_counts_broken_entries() {
+        let parsed = parse_received_routes(SAMPLE).unwrap();
+        assert_eq!(parsed.unparsed, 1);
+        let mut r = parsed.routes;
         r.sort();
         assert_eq!(r.len(), 4);
         assert!(r.contains(&("203.0.113.0/24".into(), "192.0.2.10".parse().unwrap())));
@@ -151,7 +165,7 @@ mod tests {
 
     #[test]
     fn join_counts_demoted_prefixes_not_nexthops() {
-        let routes = parse_received_routes(SAMPLE).unwrap();
+        let routes = parse_received_routes(SAMPLE).unwrap().routes;
         let bridge = BridgeCfg {
             name: "br0".into(),
             ix_mode: true,

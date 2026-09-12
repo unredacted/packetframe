@@ -202,14 +202,20 @@ fn vtysh_sync(path: &Path, commands: &[&str]) -> Result<String, String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
+    // Drain stdout on its own thread: a prefix-list with thousands of
+    // runtime entries fills the pipe, and a child blocked on write never
+    // exits for the try_wait loop below.
+    let mut stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        out
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_string(&mut out);
-                }
+                let out = reader.join().unwrap_or_default();
                 if !status.success() {
                     return Err(format!("exited {status}"));
                 }

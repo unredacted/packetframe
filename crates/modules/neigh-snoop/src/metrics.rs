@@ -410,6 +410,12 @@ pub fn render_textfile(snapshot: &Snapshot, out: &mut String) {
             "gauge",
             "wall time of the last received-routes dump",
         );
+        family(
+            out,
+            "rs_unparsed_prefixes",
+            "gauge",
+            "received entries whose next-hop the parser did not understand",
+        );
         family(out, "rs_dump_ok", "gauge", "1 when the last dump parsed");
         for r in &snapshot.rs {
             let rs = r.rs.to_string();
@@ -442,6 +448,13 @@ pub fn render_textfile(snapshot: &Snapshot, out: &mut String) {
                 r.demoted_prefixes,
             );
             rs_gauge(out, "rs_dump_ms", &rs, &r.bridge, r.dump_ms);
+            rs_gauge(
+                out,
+                "rs_unparsed_prefixes",
+                &rs,
+                &r.bridge,
+                r.unparsed_prefixes,
+            );
             rs_gauge(
                 out,
                 "rs_dump_ok",
@@ -590,6 +603,7 @@ mod tests {
                 rs: "192.0.2.2".parse().unwrap(),
                 bridge: "br0".into(),
                 received_prefixes: 100,
+                unparsed_prefixes: 1,
                 nexthops: Ratio {
                     resolved: 8,
                     total: 10,
@@ -613,6 +627,9 @@ mod tests {
             "rs_unresolved_nexthops{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 2"
         ));
         assert!(out.contains("rs_dump_ok{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 1"));
+        assert!(out.contains(
+            "rs_unparsed_prefixes{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 1"
+        ));
     }
 
     #[test]

@@ -177,14 +177,10 @@ pub fn health(s: &Snapshot) -> HealthReport {
     }
 
     if let Some(g) = &s.gate {
-        let r = if !g.lists_present {
-            row(
-                "frr-gate".into(),
-                HealthState::Degraded,
-                "prefix-lists absent; waiting for the static FRR configuration".into(),
-                None,
-            )
-        } else if let Some(e) = &g.last_error {
+        // A vtysh that is missing or failing is checked before the
+        // lists' presence: the lists read as absent precisely because
+        // nothing could read them, and that failure must escalate.
+        let r = if let Some(e) = &g.last_error {
             let state = if g.consecutive_failures >= GATE_UNHEALTHY_AFTER {
                 HealthState::Unhealthy
             } else {
@@ -195,6 +191,13 @@ pub fn health(s: &Snapshot) -> HealthReport {
                 state,
                 format!("{} consecutive failures: {e}", g.consecutive_failures),
                 g.last_change_age_secs,
+            )
+        } else if !g.lists_present {
+            row(
+                "frr-gate".into(),
+                HealthState::Degraded,
+                "prefix-lists absent; waiting for the static FRR configuration".into(),
+                None,
             )
         } else {
             let pending = if g.pending_removals > 0 {
@@ -225,7 +228,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                     parts.push(format!("{}: unknown ({e})", r.rs));
                 }
                 None => {
-                    if r.demoted_prefixes > 0 {
+                    if r.demoted_prefixes > 0 || r.unparsed_prefixes > 0 {
                         state = state.worse_of(HealthState::Degraded);
                     }
                     let shown: Vec<String> = r
@@ -234,8 +237,13 @@ pub fn health(s: &Snapshot) -> HealthReport {
                         .take(NEVER_HEARD_LIST_MAX)
                         .map(|a| a.to_string())
                         .collect();
+                    let unparsed = if r.unparsed_prefixes > 0 {
+                        format!(", {} without a parsable next-hop", r.unparsed_prefixes)
+                    } else {
+                        String::new()
+                    };
                     parts.push(format!(
-                        "{}: {} demoted of {} received, unresolved next-hops [{}]",
+                        "{}: {} demoted of {} received{unparsed}, unresolved next-hops [{}]",
                         r.rs,
                         r.demoted_prefixes,
                         r.received_prefixes,
@@ -329,6 +337,7 @@ mod tests {
             rs: "192.0.2.2".parse().unwrap(),
             bridge: "br0".into(),
             received_prefixes: 50,
+            unparsed_prefixes: 0,
             nexthops: Ratio {
                 resolved: 4,
                 total: 5,

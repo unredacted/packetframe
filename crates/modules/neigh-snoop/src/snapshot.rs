@@ -321,7 +321,11 @@ pub struct GateSnapshot {
 pub struct RsCoverageSnapshot {
     pub rs: IpAddr,
     pub bridge: String,
+    /// Every entry the dump returned, parsable next-hop or not.
     pub received_prefixes: u64,
+    /// Entries with no next-hop this parser understands; they are in
+    /// `received_prefixes` but in no coverage figure.
+    pub unparsed_prefixes: u64,
     pub nexthops: Ratio,
     pub unresolved_nexthops: Vec<IpAddr>,
     /// Prefixes whose next-hop is neither a bilateral peer nor
