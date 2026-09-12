@@ -1,0 +1,24 @@
+[package]
+name = "packetframe-neigh-snoop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PacketFrame neigh-snoop module: passive ARP/ND neighbour snooper for IX-facing bridges (learn from the fabric, seed NUD_STALE, persist, never transmit)"
+
+[lib]
+path = "src/lib.rs"
+
+# Userspace only: no BPF crate, no build.rs. Everything that parses
+# frames, decides installs or renders metrics is portable and tested on
+# macOS; the capture socket, netlink and the runtime arrive cfg-gated.
+[dependencies]
+packetframe-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ipnet.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

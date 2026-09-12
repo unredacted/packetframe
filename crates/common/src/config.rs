@@ -11,7 +11,7 @@
 //! cross-host audit).
 
 use std::fs;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -529,6 +529,105 @@ pub enum ModuleDirective {
     GuardForeignSrc {
         iface: String,
         monitor: bool,
+        line: usize,
+    },
+    // --- neigh-snoop module (passive ARP/ND neighbour snooper). Shared
+    // directive namespace; these names are neigh-snoop's. `interface`
+    // already belongs to guard, hence `bridge`. ---
+    /// `bridge <iface> [ix-mode]` — a bridge to snoop. **Restart-only**
+    /// (the capture socket and the persisted-table file are bound to
+    /// the name at attach). Tracked by *name*: the platform daemon
+    /// destroys and recreates bridges on provision, so an absent
+    /// bridge is not a startup error — the module waits for it.
+    /// `ix-mode` additionally tells fast-path's neighbour resolver to
+    /// stop issuing its own broadcast probes for nexthops routed via
+    /// this bridge (custom-fib only; inert under kernel-fib).
+    SnoopBridge {
+        iface: String,
+        ix_mode: bool,
+        line: usize,
+    },
+    /// `prefix <iface> <cidr>` — an address range the snooper may
+    /// learn on that bridge. Repeated; v4 and v6 both accepted; a
+    /// bridge with zero prefixes is refused (an empty allowlist learns
+    /// nothing and reports healthy). `/0` is refused. Hot-reloadable.
+    SnoopPrefix {
+        iface: String,
+        cidr: ipnet::IpNet,
+        line: usize,
+    },
+    /// `deny-mac <mac>` — never learn or install this hardware address
+    /// (an HA standby, the aggregation switch). Each bridge's own MAC
+    /// is denied implicitly. Repeated; hot-reloadable.
+    SnoopDenyMac {
+        mac: [u8; 6],
+        line: usize,
+    },
+    /// `peer <iface> <ip> [<ip>...] [route-server]` — one router on the
+    /// fabric and every address it uses there. Configured peers
+    /// produce a `never_heard` health set and one INFO line the first
+    /// time each is learned. Because the exchange enforces one MAC per
+    /// member port, a MAC learned for any address on the line is
+    /// installed for the others too (how a route server's v6 global
+    /// gets a MAC when it only ever sources NS from link-local).
+    /// `route-server` marks a router whose received routes feed the
+    /// route-server coverage measurement. Hot-reloadable.
+    SnoopPeer {
+        iface: String,
+        addrs: Vec<IpAddr>,
+        route_server: bool,
+        line: usize,
+    },
+    /// `persist-dir <path>` — where `<bridge>.json` learned-table files
+    /// live. Default `<state-dir>/neigh-cache`. **Restart-only**.
+    SnoopPersistDir {
+        path: PathBuf,
+        line: usize,
+    },
+    /// `seed-max-age <N>d` — persisted entries not heard for longer are
+    /// dropped from the file and never re-seeded. Default 14d. Hot.
+    SnoopSeedMaxAge {
+        max_age: Duration,
+        line: usize,
+    },
+    /// `install-rate <n>/<dur>` — kernel neighbour writes per bridge,
+    /// so a boot-time seed does not stall the netlink socket other
+    /// daemons share. Default 50/1s. Hot.
+    SnoopInstallRate {
+        rate: u32,
+        per: Duration,
+        line: usize,
+    },
+    /// `table-max <n>` — learned entries per bridge; least recently
+    /// seen is evicted when full. Default 4096. Hot (a shrink evicts).
+    SnoopTableMax {
+        max: u32,
+        line: usize,
+    },
+    /// `coverage-interval <N>s` — how often the kernel-route next-hop
+    /// coverage is recomputed per bridge. Default 60s. Hot.
+    SnoopCoverageInterval {
+        interval: Duration,
+        line: usize,
+    },
+    /// `frr-gate v4 <list> v6 <list> [interval <N>s] [remove-after <N>s]`
+    /// — enable reconciling FRR's two runtime next-hop prefix-lists
+    /// (the dynamic half of the IX next-hop gate) from the kernel
+    /// mirror through `vtysh`. Presence and list names are
+    /// **restart-only**; interval and remove-after are hot.
+    SnoopFrrGate {
+        v4_list: String,
+        v6_list: String,
+        interval: Duration,
+        remove_after: Duration,
+        line: usize,
+    },
+    /// `rs-coverage-interval <N>s` — how often each `route-server`
+    /// peer's received routes are dumped to measure how many of its
+    /// prefixes are still demoted. Default 300s (the dump is large).
+    /// Hot.
+    SnoopRsCoverageInterval {
+        interval: Duration,
         line: usize,
     },
 }
@@ -1205,6 +1304,24 @@ pub const MAX_CONFIG_FILE_SIZE: u64 = 1 << 20;
 /// same constant, so the two verdicts cannot drift.
 pub const GUARD_MAX_INTERFACES: usize = 64;
 
+/// Maximum `bridge` lines a neigh-snoop section may declare. Each
+/// bridge costs one AF_PACKET socket, one persisted JSON file and one
+/// health row; the bound keeps `status` output and the seed backlog
+/// legible. The module crate's `SnoopConfig::from_directives`
+/// consumes this same constant, so the two verdicts cannot drift.
+pub const NEIGH_SNOOP_MAX_BRIDGES: usize = 16;
+/// Subdirectory of `state-dir` used when `persist-dir` is absent.
+pub const NEIGH_SNOOP_PERSIST_SUBDIR: &str = "neigh-cache";
+/// Defaults shared by the parser, the module crate, `example.conf`
+/// prose and the runbook — kept in one place so they cannot drift.
+pub const NEIGH_SNOOP_DEFAULT_SEED_MAX_AGE: Duration = Duration::from_secs(14 * 86_400);
+pub const NEIGH_SNOOP_DEFAULT_INSTALL_RATE: (u32, Duration) = (50, Duration::from_secs(1));
+pub const NEIGH_SNOOP_DEFAULT_TABLE_MAX: u32 = 4096;
+pub const NEIGH_SNOOP_DEFAULT_COVERAGE_INTERVAL: Duration = Duration::from_secs(60);
+pub const NEIGH_SNOOP_DEFAULT_GATE_INTERVAL: Duration = Duration::from_secs(30);
+pub const NEIGH_SNOOP_DEFAULT_GATE_REMOVE_AFTER: Duration = Duration::from_secs(180);
+pub const NEIGH_SNOOP_DEFAULT_RS_COVERAGE_INTERVAL: Duration = Duration::from_secs(300);
+
 impl Config {
     /// Parse a config from a file path.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -1754,6 +1871,301 @@ impl Config {
         }
         Ok(())
     }
+
+    /// neigh-snoop-section validation. Pure config logic — no sysfs —
+    /// so it runs everywhere `parse` does (startup, feasibility,
+    /// SIGHUP; the call sites must stay in step or reload silently
+    /// applies a config startup would refuse).
+    ///
+    /// Deliberately **not** a sysfs existence check on `bridge` names:
+    /// the platform daemon recreates bridges on provision and the
+    /// module tracks them by name, so an absent bridge is a health
+    /// row, not a startup refusal.
+    ///
+    /// Rules:
+    /// - ≥1 `bridge` line (a section holding only another module's
+    ///   directives parses; it must not load as an empty snooper);
+    /// - no duplicate `bridge`; at most [`NEIGH_SNOOP_MAX_BRIDGES`];
+    /// - `prefix` / `peer` naming an undeclared bridge is refused;
+    /// - every `bridge` needs ≥1 `prefix` (an empty allowlist learns
+    ///   nothing and reports healthy — a silent no-op);
+    /// - duplicate `(bridge, cidr)` prefixes, duplicate `deny-mac`, and
+    ///   a peer address appearing twice anywhere in the section are
+    ///   refused;
+    /// - a `peer` address outside every prefix of its bridge is
+    ///   refused (it would be `never_heard` forever);
+    /// - more peer addresses on a bridge than `table-max` is refused;
+    /// - every singleton directive at most once;
+    /// - `persist-dir` may not equal the global `state-dir` (the
+    ///   per-bridge JSON files would share a directory with the
+    ///   daemon's registry, health and pid files);
+    /// - `route-server` peers require `frr-gate` (route-server
+    ///   coverage is meaningless without the gate);
+    /// - last, a `module fast-path` section is required (the ix-mode
+    ///   probe suppression lives in fast-path's resolver and the
+    ///   startup capability gate assumes fast-path — the guard
+    ///   precedent).
+    pub fn validate_neigh_snoop(&self) -> Result<(), ConfigError> {
+        let Some(sec) = self.modules.iter().find(|m| m.name == "neigh-snoop") else {
+            return Ok(());
+        };
+        let refuse = |line: usize, msg: String| ConfigError::Parse {
+            line,
+            message: format!("module neigh-snoop: {msg}"),
+        };
+
+        let mut bridges: Vec<(&String, usize)> = Vec::new();
+        for d in &sec.directives {
+            if let ModuleDirective::SnoopBridge { iface, line, .. } = d {
+                if let Some((_, prev)) = bridges.iter().find(|(i, _)| *i == iface) {
+                    return Err(refuse(
+                        *line,
+                        format!("duplicate `bridge {iface}` (first declared on line {prev})"),
+                    ));
+                }
+                bridges.push((iface, *line));
+            }
+        }
+        if bridges.is_empty() {
+            return Err(refuse(
+                0,
+                "section declares no `bridge` lines; add `bridge <iface>` and at least \
+                 one `prefix` for it, or remove the section"
+                    .to_string(),
+            ));
+        }
+        if bridges.len() > NEIGH_SNOOP_MAX_BRIDGES {
+            return Err(refuse(
+                bridges[NEIGH_SNOOP_MAX_BRIDGES].1,
+                format!(
+                    "{} `bridge` lines exceed the {NEIGH_SNOOP_MAX_BRIDGES} the module \
+                     supports",
+                    bridges.len()
+                ),
+            ));
+        }
+        let declared = |iface: &String| bridges.iter().any(|(i, _)| *i == iface);
+
+        let mut prefixes: Vec<(&String, ipnet::IpNet, usize)> = Vec::new();
+        let mut deny_macs: Vec<([u8; 6], usize)> = Vec::new();
+        let mut peer_addrs: Vec<(IpAddr, usize)> = Vec::new();
+        let mut peer_count_by_bridge: Vec<(&String, usize)> = Vec::new();
+        let mut any_route_server = false;
+        let mut singletons: Vec<(&'static str, usize)> = Vec::new();
+        let mut table_max = NEIGH_SNOOP_DEFAULT_TABLE_MAX;
+        let mut persist_dir: Option<(&PathBuf, usize)> = None;
+        let mut has_gate = false;
+
+        let mut singleton = |name: &'static str, line: usize| -> Result<(), ConfigError> {
+            if let Some((_, prev)) = singletons.iter().find(|(n, _)| *n == name) {
+                return Err(refuse(
+                    line,
+                    format!("`{name}` may appear once (first on line {prev})"),
+                ));
+            }
+            singletons.push((name, line));
+            Ok(())
+        };
+
+        for d in &sec.directives {
+            match d {
+                ModuleDirective::SnoopPrefix { iface, cidr, line } => {
+                    if !declared(iface) {
+                        return Err(refuse(
+                            *line,
+                            format!(
+                                "`prefix {iface} {cidr}` names a bridge with no `bridge {iface}` \
+                                 line; it would never take effect"
+                            ),
+                        ));
+                    }
+                    if let Some((_, _, prev)) =
+                        prefixes.iter().find(|(i, c, _)| *i == iface && c == cidr)
+                    {
+                        return Err(refuse(
+                            *line,
+                            format!("duplicate `prefix {iface} {cidr}` (first on line {prev})"),
+                        ));
+                    }
+                    prefixes.push((iface, *cidr, *line));
+                }
+                ModuleDirective::SnoopDenyMac { mac, line } => {
+                    if let Some((_, prev)) = deny_macs.iter().find(|(m, _)| m == mac) {
+                        return Err(refuse(
+                            *line,
+                            format!(
+                                "duplicate `deny-mac {}` (first on line {prev})",
+                                format_mac(*mac)
+                            ),
+                        ));
+                    }
+                    deny_macs.push((*mac, *line));
+                }
+                ModuleDirective::SnoopPeer {
+                    iface,
+                    addrs,
+                    route_server,
+                    line,
+                } => {
+                    if !declared(iface) {
+                        return Err(refuse(
+                            *line,
+                            format!(
+                                "`peer {iface} ...` names a bridge with no `bridge {iface}` \
+                                 line; it would never take effect"
+                            ),
+                        ));
+                    }
+                    for a in addrs {
+                        if let Some((_, prev)) = peer_addrs.iter().find(|(p, _)| p == a) {
+                            return Err(refuse(
+                                *line,
+                                format!(
+                                    "peer address {a} appears twice (first on line {prev}); one \
+                                     router, one `peer` line"
+                                ),
+                            ));
+                        }
+                        peer_addrs.push((*a, *line));
+                    }
+                    match peer_count_by_bridge.iter_mut().find(|(i, _)| *i == iface) {
+                        Some((_, n)) => *n += addrs.len(),
+                        None => peer_count_by_bridge.push((iface, addrs.len())),
+                    }
+                    any_route_server |= *route_server;
+                }
+                ModuleDirective::SnoopPersistDir { path, line } => {
+                    singleton("persist-dir", *line)?;
+                    persist_dir = Some((path, *line));
+                }
+                ModuleDirective::SnoopSeedMaxAge { line, .. } => singleton("seed-max-age", *line)?,
+                ModuleDirective::SnoopInstallRate { line, .. } => singleton("install-rate", *line)?,
+                ModuleDirective::SnoopTableMax { max, line } => {
+                    singleton("table-max", *line)?;
+                    table_max = *max;
+                }
+                ModuleDirective::SnoopCoverageInterval { line, .. } => {
+                    singleton("coverage-interval", *line)?
+                }
+                ModuleDirective::SnoopFrrGate { line, .. } => {
+                    singleton("frr-gate", *line)?;
+                    has_gate = true;
+                }
+                ModuleDirective::SnoopRsCoverageInterval { line, .. } => {
+                    singleton("rs-coverage-interval", *line)?
+                }
+                _ => {}
+            }
+        }
+
+        for (iface, line) in &bridges {
+            if !prefixes.iter().any(|(i, _, _)| i == iface) {
+                return Err(refuse(
+                    *line,
+                    format!(
+                        "`bridge {iface}` has no `prefix` lines; an empty allowlist learns \
+                         nothing — add `prefix {iface} <cidr>` or remove the bridge"
+                    ),
+                ));
+            }
+        }
+        for d in &sec.directives {
+            if let ModuleDirective::SnoopPeer {
+                iface, addrs, line, ..
+            } = d
+            {
+                for a in addrs {
+                    let covered = prefixes
+                        .iter()
+                        .any(|(i, c, _)| *i == iface && c.contains(a));
+                    if !covered {
+                        return Err(refuse(
+                            *line,
+                            format!(
+                                "peer {a} is outside every `prefix` of {iface}; it could never \
+                                 be learned"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        for (iface, n) in &peer_count_by_bridge {
+            if *n > table_max as usize {
+                return Err(refuse(
+                    0,
+                    format!(
+                        "{n} peer addresses on {iface} exceed `table-max {table_max}`; the \
+                         table could not hold them all"
+                    ),
+                ));
+            }
+        }
+        if let Some((path, line)) = persist_dir {
+            if *path == self.global.state_dir {
+                return Err(refuse(
+                    line,
+                    format!(
+                        "`persist-dir {}` is the global state-dir; use a subdirectory (the \
+                         default is <state-dir>/{NEIGH_SNOOP_PERSIST_SUBDIR})",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        if any_route_server && !has_gate {
+            return Err(refuse(
+                0,
+                "`peer ... route-server` requires `frr-gate`; route-server coverage is \
+                 meaningless without the next-hop gate"
+                    .to_string(),
+            ));
+        }
+        // Checked LAST so a malformed section reports its own problem
+        // first (the guard precedent, same rationale).
+        if !self.modules.iter().any(|m| m.name == "fast-path") {
+            return Err(refuse(
+                0,
+                "requires a `module fast-path` section (the ix-mode probe suppression \
+                 lives in fast-path's neighbour resolver and the startup capability gate \
+                 assumes fast-path — a neigh-snoop-only config cannot start)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `aa:bb:cc:dd:ee:ff` rendering shared by error messages and the
+/// module crate's persistence layer.
+pub fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+/// Parse a `xx:xx:xx:xx:xx:xx` hardware address. Refuses anything but
+/// six colon-separated hex octets. Does **not** judge the value (zero,
+/// group bit); callers that need that check it.
+pub fn parse_mac_literal(tok: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = tok.split(':').collect();
+    if parts.len() != 6 {
+        return Err(format!(
+            "`{tok}` is not a MAC address (expected six colon-separated hex octets)"
+        ));
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        if p.len() != 2 {
+            return Err(format!(
+                "`{tok}`: octet `{p}` must be exactly two hex digits"
+            ));
+        }
+        mac[i] =
+            u8::from_str_radix(p, 16).map_err(|_| format!("`{tok}`: octet `{p}` is not hex"))?;
+    }
+    Ok(mac)
 }
 
 /// One warning per `local-prefix` / `local-prefix6` directive that no
@@ -2675,6 +3087,50 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         ),
         "lldp" => parse_guard_action(line, rest, "lldp"),
         "foreign-src" => parse_guard_action(line, rest, "foreign-src"),
+        "bridge" => parse_snoop_bridge(line, rest),
+        "prefix" => parse_snoop_prefix(line, rest),
+        "deny-mac" => parse_single_arg(line, rest, "deny-mac", |t| {
+            let mac = parse_mac_literal(t)?;
+            if mac == [0u8; 6] {
+                return Err("the all-zero address is not a hardware address".to_string());
+            }
+            if mac[0] & 1 != 0 {
+                return Err(format!(
+                    "`{t}` has the group bit set (multicast/broadcast); ARP/ND senders are \
+                     unicast, so this could never match"
+                ));
+            }
+            Ok(ModuleDirective::SnoopDenyMac { mac, line })
+        }),
+        "peer" => parse_snoop_peer(line, rest),
+        "persist-dir" => parse_single_arg(line, rest, "persist-dir", |t| {
+            let path = validate_safe_path(line, "persist-dir", t).map_err(|e| e.to_string())?;
+            Ok(ModuleDirective::SnoopPersistDir { path, line })
+        }),
+        "seed-max-age" => parse_single_arg(line, rest, "seed-max-age", |t| {
+            let max_age = parse_days(t, 1, 365)?;
+            Ok(ModuleDirective::SnoopSeedMaxAge { max_age, line })
+        }),
+        "install-rate" => parse_snoop_rate(line, rest),
+        "table-max" => parse_single_arg(line, rest, "table-max", |t| {
+            let max: u32 = t.parse().map_err(|e| format!("bad integer `{t}`: {e}"))?;
+            if !(SNOOP_TABLE_MAX_RANGE.0..=SNOOP_TABLE_MAX_RANGE.1).contains(&max) {
+                return Err(format!(
+                    "table-max must be between {} and {}",
+                    SNOOP_TABLE_MAX_RANGE.0, SNOOP_TABLE_MAX_RANGE.1
+                ));
+            }
+            Ok(ModuleDirective::SnoopTableMax { max, line })
+        }),
+        "coverage-interval" => parse_single_arg(line, rest, "coverage-interval", |t| {
+            let interval = parse_bounded_secs(line, t, "coverage-interval", 5, 3600)?;
+            Ok(ModuleDirective::SnoopCoverageInterval { interval, line })
+        }),
+        "frr-gate" => parse_snoop_frr_gate(line, rest),
+        "rs-coverage-interval" => parse_single_arg(line, rest, "rs-coverage-interval", |t| {
+            let interval = parse_bounded_secs(line, t, "rs-coverage-interval", 60, 3600)?;
+            Ok(ModuleDirective::SnoopRsCoverageInterval { interval, line })
+        }),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
@@ -2833,6 +3289,266 @@ fn parse_guard_action<'a>(
             line,
         },
     })
+}
+
+// --- neigh-snoop grammar --------------------------------------------------
+
+/// Inclusive bounds for `table-max`.
+const SNOOP_TABLE_MAX_RANGE: (u32, u32) = (16, 1_048_576);
+/// `install-rate` may not exceed this many writes per second: above it
+/// the "limit" is a netlink storm, not pacing.
+const SNOOP_INSTALL_RATE_MAX_PER_SEC: u128 = 1000;
+const SNOOP_GATE_LIST_NAME_MAX: usize = 63;
+
+/// `bridge <iface> [ix-mode]`.
+fn parse_snoop_bridge<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const USAGE: &str = "bridge takes: <iface> [ix-mode]";
+    let iface = rest
+        .next()
+        .ok_or_else(|| ConfigError::parse(line, "bridge requires an interface"))?;
+    validate_iface_name(line, "bridge", iface)?;
+    let ix_mode = match rest.next() {
+        None => false,
+        Some("ix-mode") => true,
+        Some(_) => return Err(ConfigError::parse(line, USAGE)),
+    };
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(line, USAGE));
+    }
+    Ok(ModuleDirective::SnoopBridge {
+        iface: iface.to_string(),
+        ix_mode,
+        line,
+    })
+}
+
+/// `prefix <iface> <cidr>`. Host bits are tolerated and cleared (the
+/// `allow-prefix` convention); `/0` is refused because the allowlist
+/// is the safety boundary and a `/0` learns everything.
+fn parse_snoop_prefix<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const USAGE: &str = "prefix takes: <iface> <cidr>";
+    let iface = rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?;
+    validate_iface_name(line, "prefix", iface)?;
+    let cidr_tok = rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?;
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(line, USAGE));
+    }
+    let cidr: ipnet::IpNet = cidr_tok
+        .parse()
+        .map_err(|e| ConfigError::parse(line, format!("prefix: bad CIDR `{cidr_tok}`: {e}")))?;
+    if cidr.prefix_len() == 0 {
+        return Err(ConfigError::parse(
+            line,
+            format!(
+                "prefix: `{cidr_tok}` is a /0; the allowlist is the safety boundary and a /0 \
+                 learns everything"
+            ),
+        ));
+    }
+    Ok(ModuleDirective::SnoopPrefix {
+        iface: iface.to_string(),
+        cidr: cidr.trunc(),
+        line,
+    })
+}
+
+/// `peer <iface> <ip> [<ip>...] [route-server]`.
+fn parse_snoop_peer<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const USAGE: &str = "peer takes: <iface> <ip> [<ip>...] [route-server]";
+    let iface = rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?;
+    validate_iface_name(line, "peer", iface)?;
+    let mut addrs: Vec<IpAddr> = Vec::new();
+    let mut route_server = false;
+    for tok in rest {
+        if tok == "route-server" {
+            if route_server {
+                return Err(ConfigError::parse(line, USAGE));
+            }
+            route_server = true;
+            continue;
+        }
+        if route_server {
+            // Addresses after the flag: almost certainly a typo.
+            return Err(ConfigError::parse(line, USAGE));
+        }
+        let ip: IpAddr = tok
+            .parse()
+            .map_err(|_| ConfigError::parse(line, format!("peer: `{tok}` is not an IP address")))?;
+        if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
+            return Err(ConfigError::parse(
+                line,
+                format!("peer: `{tok}` cannot be a neighbour (unspecified, multicast or loopback)"),
+            ));
+        }
+        if addrs.contains(&ip) {
+            return Err(ConfigError::parse(
+                line,
+                format!("peer: `{tok}` listed twice on one line"),
+            ));
+        }
+        addrs.push(ip);
+    }
+    if addrs.is_empty() {
+        return Err(ConfigError::parse(line, USAGE));
+    }
+    Ok(ModuleDirective::SnoopPeer {
+        iface: iface.to_string(),
+        addrs,
+        route_server,
+        line,
+    })
+}
+
+/// `install-rate <n>/<dur>`: the guard's rate token shape without the
+/// `rate` keyword, burst or monitor.
+fn parse_snoop_rate<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const USAGE: &str = "install-rate takes: <n>/<dur> (e.g. 50/1s)";
+    let tok = rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?;
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(line, USAGE));
+    }
+    let (n_tok, dur_tok) = tok
+        .split_once('/')
+        .ok_or_else(|| ConfigError::parse(line, USAGE))?;
+    let rate: u32 = n_tok
+        .parse()
+        .map_err(|_| ConfigError::parse(line, "install-rate: count must be an integer"))?;
+    if rate == 0 {
+        return Err(ConfigError::parse(line, "install-rate: count must be >= 1"));
+    }
+    let per = parse_duration(line, dur_tok, "install-rate")?;
+    if per.is_zero() {
+        return Err(ConfigError::parse(
+            line,
+            "install-rate: interval must be non-zero",
+        ));
+    }
+    if per > Duration::from_secs(3600) {
+        return Err(ConfigError::parse(
+            line,
+            "install-rate: interval must be 3600s or less",
+        ));
+    }
+    // n / per ≤ 1000/s  ⇔  n * 1s ≤ 1000 * per
+    if u128::from(rate) * 1_000_000_000 > SNOOP_INSTALL_RATE_MAX_PER_SEC * per.as_nanos() {
+        return Err(ConfigError::parse(
+            line,
+            format!(
+                "install-rate: more than {SNOOP_INSTALL_RATE_MAX_PER_SEC} neighbour writes per \
+                 second is a netlink storm, not a rate limit"
+            ),
+        ));
+    }
+    Ok(ModuleDirective::SnoopInstallRate { rate, per, line })
+}
+
+/// `frr-gate v4 <list> v6 <list> [interval <N>s] [remove-after <N>s]`.
+fn parse_snoop_frr_gate<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const USAGE: &str = "frr-gate takes: v4 <list> v6 <list> [interval <N>s] [remove-after <N>s]";
+    let list_name = |tok: &str| -> Result<String, ConfigError> {
+        let ok = !tok.is_empty()
+            && tok.len() <= SNOOP_GATE_LIST_NAME_MAX
+            && tok
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !ok {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "frr-gate: `{tok}` is not a prefix-list name (letters, digits, `_`, `-`; \
+                     at most {SNOOP_GATE_LIST_NAME_MAX} characters)"
+                ),
+            ));
+        }
+        Ok(tok.to_string())
+    };
+    expect_token(&mut rest, line, "v4")?;
+    let v4_list = list_name(rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?)?;
+    expect_token(&mut rest, line, "v6")?;
+    let v6_list = list_name(rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?)?;
+    if v4_list == v6_list {
+        return Err(ConfigError::parse(
+            line,
+            "frr-gate: the v4 and v6 lists must have different names",
+        ));
+    }
+    let mut interval = NEIGH_SNOOP_DEFAULT_GATE_INTERVAL;
+    let mut remove_after = NEIGH_SNOOP_DEFAULT_GATE_REMOVE_AFTER;
+    let mut seen_interval = false;
+    let mut seen_remove = false;
+    while let Some(tok) = rest.next() {
+        let val = rest.next().ok_or_else(|| ConfigError::parse(line, USAGE))?;
+        match tok {
+            "interval" if !seen_interval => {
+                interval = parse_bounded_secs(line, val, "frr-gate interval", 5, 600)
+                    .map_err(|e| ConfigError::parse(line, e))?;
+                seen_interval = true;
+            }
+            "remove-after" if !seen_remove => {
+                remove_after = parse_bounded_secs(line, val, "frr-gate remove-after", 0, 3600)
+                    .map_err(|e| ConfigError::parse(line, e))?;
+                seen_remove = true;
+            }
+            _ => return Err(ConfigError::parse(line, USAGE)),
+        }
+    }
+    Ok(ModuleDirective::SnoopFrrGate {
+        v4_list,
+        v6_list,
+        interval,
+        remove_after,
+        line,
+    })
+}
+
+/// `Nd` day literal, inclusive bounds. Deliberately separate from
+/// [`parse_duration`]: teaching that one about days would make every
+/// existing caller (attach-settle-time, guard rates) silently accept
+/// day-scale values none of them should.
+fn parse_days(tok: &str, min_days: u64, max_days: u64) -> Result<Duration, String> {
+    let Some(n) = tok.strip_suffix('d') else {
+        return Err(format!("`{tok}` must be a whole number of days, e.g. 14d"));
+    };
+    let days: u64 = n
+        .parse()
+        .map_err(|e| format!("bad day count `{tok}`: {e}"))?;
+    if !(min_days..=max_days).contains(&days) {
+        return Err(format!("must be between {min_days}d and {max_days}d"));
+    }
+    Ok(Duration::from_secs(days * 86_400))
+}
+
+/// A `Ns`/`Nms` duration with inclusive second bounds; error as a
+/// `String` so it composes inside [`parse_single_arg`] closures.
+fn parse_bounded_secs(
+    line: usize,
+    tok: &str,
+    context: &str,
+    min_secs: u64,
+    max_secs: u64,
+) -> Result<Duration, String> {
+    let d = parse_duration(line, tok, context).map_err(|e| e.to_string())?;
+    if d < Duration::from_secs(min_secs) || d > Duration::from_secs(max_secs) {
+        return Err(format!(
+            "{context} must be between {min_secs}s and {max_secs}s"
+        ));
+    }
+    Ok(d)
 }
 
 /// Helper: one argument → one `ModuleDirective`. Centralizes the
@@ -6128,5 +6844,330 @@ module fast-path
         std::fs::create_dir(dir.path.join("br1")).unwrap();
         c.validate_interfaces_in(&dir.path)
             .expect("both interfaces exist now");
+    }
+
+    // --- neigh-snoop module grammar + validation ---
+
+    /// The full documented section shape (placeholder addresses).
+    const SNOOP_REFERENCE: &str = "module fast-path\n\
+         \x20 attach eth0 generic\n\
+         module neigh-snoop\n\
+         \x20 bridge br0 ix-mode\n\
+         \x20 bridge br1\n\
+         \x20 prefix br0 192.0.2.0/24\n\
+         \x20 prefix br0 2001:db8:1::/64\n\
+         \x20 prefix br0 fe80::/10\n\
+         \x20 prefix br1 198.51.100.7/24\n\
+         \x20 deny-mac 02:00:00:00:00:01\n\
+         \x20 deny-mac 02:00:00:00:00:02\n\
+         \x20 peer br0 192.0.2.10 2001:db8:1::10 route-server\n\
+         \x20 peer br0 192.0.2.11\n\
+         \x20 peer br1 198.51.100.20\n\
+         \x20 persist-dir /var/lib/packetframe/state/neigh-cache\n\
+         \x20 seed-max-age 14d\n\
+         \x20 install-rate 50/1s\n\
+         \x20 table-max 4096\n\
+         \x20 coverage-interval 60s\n\
+         \x20 frr-gate v4 IX-RESOLVED-NH v6 IX-RESOLVED-NH6 interval 30s remove-after 180s\n\
+         \x20 rs-coverage-interval 300s\n";
+
+    #[test]
+    fn neigh_snoop_section_parses_reference_shape() {
+        let c = Config::parse(SNOOP_REFERENCE).unwrap();
+        c.validate_neigh_snoop()
+            .expect("reference shape must validate");
+        let m = &c.modules[1];
+        assert_eq!(m.name, "neigh-snoop");
+        match &m.directives[0] {
+            ModuleDirective::SnoopBridge { iface, ix_mode, .. } => {
+                assert_eq!(iface, "br0");
+                assert!(ix_mode);
+            }
+            other => panic!("expected SnoopBridge, got {other:?}"),
+        }
+        match &m.directives[1] {
+            ModuleDirective::SnoopBridge { ix_mode, .. } => assert!(!ix_mode),
+            other => panic!("expected SnoopBridge, got {other:?}"),
+        }
+        // Host bits are cleared, as for allow-prefix.
+        match &m.directives[5] {
+            ModuleDirective::SnoopPrefix { iface, cidr, .. } => {
+                assert_eq!(iface, "br1");
+                assert_eq!(cidr.to_string(), "198.51.100.0/24");
+            }
+            other => panic!("expected SnoopPrefix, got {other:?}"),
+        }
+        match &m.directives[6] {
+            ModuleDirective::SnoopDenyMac { mac, .. } => {
+                assert_eq!(*mac, [0x02, 0, 0, 0, 0, 0x01]);
+            }
+            other => panic!("expected SnoopDenyMac, got {other:?}"),
+        }
+        match &m.directives[8] {
+            ModuleDirective::SnoopPeer {
+                iface,
+                addrs,
+                route_server,
+                ..
+            } => {
+                assert_eq!(iface, "br0");
+                assert_eq!(addrs.len(), 2);
+                assert!(route_server);
+            }
+            other => panic!("expected SnoopPeer, got {other:?}"),
+        }
+        match &m.directives[9] {
+            ModuleDirective::SnoopPeer { route_server, .. } => assert!(!route_server),
+            other => panic!("expected SnoopPeer, got {other:?}"),
+        }
+        match &m.directives[12] {
+            ModuleDirective::SnoopSeedMaxAge { max_age, .. } => {
+                assert_eq!(*max_age, Duration::from_secs(14 * 86_400));
+            }
+            other => panic!("expected SnoopSeedMaxAge, got {other:?}"),
+        }
+        match &m.directives[13] {
+            ModuleDirective::SnoopInstallRate { rate, per, .. } => {
+                assert_eq!(*rate, 50);
+                assert_eq!(*per, Duration::from_secs(1));
+            }
+            other => panic!("expected SnoopInstallRate, got {other:?}"),
+        }
+        match &m.directives[16] {
+            ModuleDirective::SnoopFrrGate {
+                v4_list,
+                v6_list,
+                interval,
+                remove_after,
+                ..
+            } => {
+                assert_eq!(v4_list, "IX-RESOLVED-NH");
+                assert_eq!(v6_list, "IX-RESOLVED-NH6");
+                assert_eq!(*interval, Duration::from_secs(30));
+                assert_eq!(*remove_after, Duration::from_secs(180));
+            }
+            other => panic!("expected SnoopFrrGate, got {other:?}"),
+        }
+    }
+
+    /// `frr-gate` without the optional tail takes the shared defaults.
+    #[test]
+    fn neigh_snoop_frr_gate_defaults() {
+        let c = Config::parse("module neigh-snoop\n  frr-gate v4 A v6 B\n").unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::SnoopFrrGate {
+                interval,
+                remove_after,
+                ..
+            } => {
+                assert_eq!(*interval, NEIGH_SNOOP_DEFAULT_GATE_INTERVAL);
+                assert_eq!(*remove_after, NEIGH_SNOOP_DEFAULT_GATE_REMOVE_AFTER);
+            }
+            other => panic!("expected SnoopFrrGate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn neigh_snoop_grammar_refusals() {
+        // (body line, expected message fragment)
+        let cases = [
+            ("bridge", "requires an interface"),
+            ("bridge br0 nonsense", "bridge takes:"),
+            ("bridge br0 ix-mode extra", "bridge takes:"),
+            ("prefix br0", "prefix takes:"),
+            ("prefix br0 0.0.0.0/0", "is a /0"),
+            ("prefix br0 ::/0", "is a /0"),
+            ("prefix br0 192.0.2.0", "bad CIDR"),
+            ("prefix br0 192.0.2.0/24 extra", "prefix takes:"),
+            ("deny-mac 02:00:00:00:00", "six colon-separated"),
+            ("deny-mac 02:00:00:00:00:zz", "is not hex"),
+            ("deny-mac 00:00:00:00:00:00", "all-zero"),
+            ("deny-mac 01:00:5e:00:00:01", "group bit"),
+            ("deny-mac ff:ff:ff:ff:ff:ff", "group bit"),
+            ("peer br0", "peer takes:"),
+            ("peer br0 route-server", "peer takes:"),
+            ("peer br0 192.0.2.1 route-server 192.0.2.2", "peer takes:"),
+            ("peer br0 192.0.2.1 192.0.2.1", "listed twice"),
+            ("peer br0 0.0.0.0", "cannot be a neighbour"),
+            ("peer br0 224.0.0.1", "cannot be a neighbour"),
+            ("peer br0 ::1", "cannot be a neighbour"),
+            ("peer br0 not-an-ip", "is not an IP address"),
+            ("persist-dir relative/path", "must be absolute"),
+            ("persist-dir /a/../b", ".."),
+            ("seed-max-age 14", "whole number of days"),
+            ("seed-max-age 0d", "between 1d and 365d"),
+            ("seed-max-age 400d", "between 1d and 365d"),
+            ("install-rate 50", "install-rate takes:"),
+            ("install-rate 0/1s", "count must be >= 1"),
+            ("install-rate 50/0s", "interval must be non-zero"),
+            ("install-rate 1/7200s", "3600s or less"),
+            ("install-rate 5000/1s", "netlink storm"),
+            ("install-rate 50/1s extra", "install-rate takes:"),
+            ("table-max 1", "between 16 and 1048576"),
+            ("table-max 2000000", "between 16 and 1048576"),
+            ("table-max lots", "bad integer"),
+            ("coverage-interval 1s", "between 5s and 3600s"),
+            ("coverage-interval 5000s", "between 5s and 3600s"),
+            ("coverage-interval 5m", "duration must end in"),
+            ("frr-gate A v6 B", "expected `v4`"),
+            ("frr-gate v4 A B", "expected `v6`"),
+            ("frr-gate v4 A v6 A", "different names"),
+            ("frr-gate v4 A/B v6 C", "is not a prefix-list name"),
+            ("frr-gate v4 A v6 B interval 1s", "between 5s and 600s"),
+            (
+                "frr-gate v4 A v6 B remove-after 9999s",
+                "between 0s and 3600s",
+            ),
+            ("frr-gate v4 A v6 B interval", "frr-gate takes:"),
+            (
+                "frr-gate v4 A v6 B interval 30s interval 30s",
+                "frr-gate takes:",
+            ),
+            ("frr-gate v4 A v6 B bogus 1s", "frr-gate takes:"),
+            ("rs-coverage-interval 10s", "between 60s and 3600s"),
+        ];
+        for (body, want) in cases {
+            let s = format!("module neigh-snoop\n  {body}\n");
+            let e = Config::parse(&s).expect_err(body);
+            match e {
+                ConfigError::Parse { line, message } => {
+                    assert_eq!(line, 2, "for `{body}`");
+                    assert!(
+                        message.contains(want),
+                        "for `{body}`: message was `{message}`"
+                    );
+                }
+                other => panic!("expected Parse for `{body}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every rule in `validate_neigh_snoop`, one case each. Each body
+    /// is a complete, otherwise-valid section so exactly one rule can
+    /// be the refusal.
+    #[test]
+    fn neigh_snoop_validation_refusals() {
+        let fp = "module fast-path\n  attach eth0 generic\n";
+        let ok_bridge = "  bridge br0\n  prefix br0 192.0.2.0/24\n";
+        let cases: Vec<(String, &str)> = vec![
+            (
+                format!("{fp}module neigh-snoop\n  attach eth1 generic\n"),
+                "declares no `bridge` lines",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  bridge br0\n"),
+                "duplicate `bridge br0`",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  prefix br9 192.0.2.0/24\n"),
+                "no `bridge br9` line",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  peer br9 192.0.2.5\n"),
+                "no `bridge br9` line",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  bridge br1\n"),
+                "`bridge br1` has no `prefix` lines",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  prefix br0 192.0.2.0/24\n"),
+                "duplicate `prefix br0 192.0.2.0/24`",
+            ),
+            (
+                format!(
+                    "{fp}module neigh-snoop\n{ok_bridge}  deny-mac 02:00:00:00:00:01\n  \
+                     deny-mac 02:00:00:00:00:01\n"
+                ),
+                "duplicate `deny-mac 02:00:00:00:00:01`",
+            ),
+            (
+                format!(
+                    "{fp}module neigh-snoop\n{ok_bridge}  peer br0 192.0.2.5\n  \
+                     peer br0 192.0.2.5\n"
+                ),
+                "appears twice",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  peer br0 198.51.100.5\n"),
+                "outside every `prefix`",
+            ),
+            (
+                format!(
+                    "{fp}module neigh-snoop\n{ok_bridge}  table-max 16\n{}",
+                    (1..=17)
+                        .map(|i| format!("  peer br0 192.0.2.{i}\n"))
+                        .collect::<String>()
+                ),
+                "exceed `table-max 16`",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  table-max 16\n  table-max 32\n"),
+                "`table-max` may appear once",
+            ),
+            (
+                format!(
+                    "{fp}module neigh-snoop\n{ok_bridge}  persist-dir /var/lib/packetframe/state\n"
+                ),
+                "is the global state-dir",
+            ),
+            (
+                format!("{fp}module neigh-snoop\n{ok_bridge}  peer br0 192.0.2.5 route-server\n"),
+                "requires `frr-gate`",
+            ),
+            (
+                format!("module neigh-snoop\n{ok_bridge}"),
+                "requires a `module fast-path` section",
+            ),
+        ];
+        for (s, want) in cases {
+            let c = Config::parse(&s).unwrap_or_else(|e| panic!("parse of\n{s}\nfailed: {e}"));
+            let e = c
+                .validate_neigh_snoop()
+                .expect_err(&format!("expected refusal `{want}` for\n{s}"));
+            assert!(e.to_string().contains(want), "for\n{s}\nmessage was `{e}`");
+        }
+        // And the bridge cap, generated.
+        let mut s = format!("{fp}module neigh-snoop\n");
+        for i in 0..=NEIGH_SNOOP_MAX_BRIDGES {
+            s.push_str(&format!("  bridge b{i}\n  prefix b{i} 192.0.2.0/24\n"));
+        }
+        let e = Config::parse(&s)
+            .unwrap()
+            .validate_neigh_snoop()
+            .expect_err("one over the cap");
+        assert!(e.to_string().contains("exceed the 16"), "{e}");
+    }
+
+    /// A guard `interface br0` and a snooper `bridge br0` coexist in
+    /// one config: the directive heads differ, and each validator sees
+    /// only its own section.
+    #[test]
+    fn neigh_snoop_and_guard_do_not_collide() {
+        let s = "module fast-path\n  attach eth0 generic\n\
+                 module guard\n  interface br0\n  lldp br0 drop\n\
+                 module neigh-snoop\n  bridge br0\n  prefix br0 192.0.2.0/24\n";
+        let c = Config::parse(s).unwrap();
+        c.validate_guard().unwrap();
+        c.validate_neigh_snoop().unwrap();
+        // A guard section with a snooper directive in it is refused by
+        // the guard validator (no `interface` line), never accepted as
+        // a bridge.
+        let s = "module fast-path\n  attach eth0 generic\nmodule guard\n  bridge br0\n";
+        let e = Config::parse(s)
+            .unwrap()
+            .validate_guard()
+            .expect_err("foreign head");
+        assert!(e.to_string().contains("no `interface` lines"), "{e}");
+    }
+
+    #[test]
+    fn mac_literal_round_trip() {
+        let mac = parse_mac_literal("02:AB:cd:00:ff:10").unwrap();
+        assert_eq!(mac, [0x02, 0xab, 0xcd, 0x00, 0xff, 0x10]);
+        assert_eq!(format_mac(mac), "02:ab:cd:00:ff:10");
+        assert!(parse_mac_literal("02:ab:cd:00:ff").is_err());
+        assert!(parse_mac_literal("2:ab:cd:00:ff:10").is_err());
+        assert!(parse_mac_literal("02-ab-cd-00-ff-10").is_err());
     }
 }
