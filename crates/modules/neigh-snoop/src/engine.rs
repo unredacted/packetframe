@@ -1075,6 +1075,26 @@ impl Engine {
                 self.open_capture(bi);
             }
         }
+        // Raising promiscuity through a socket membership changes the
+        // device flags without an RTM_NEWLINK, so the echo never comes;
+        // confirm it from a link dump instead, once per bridge until seen.
+        if self
+            .bridges
+            .iter()
+            .any(|b| b.up && b.capture.is_some() && !b.promisc_confirmed)
+        {
+            if let Ok(links) = netlink::dump_links(&self.unicast).await {
+                for l in links {
+                    if let Some(b) = self
+                        .bridges
+                        .iter_mut()
+                        .find(|b| b.ifindex == Some(l.ifindex))
+                    {
+                        b.promisc_confirmed = l.promisc;
+                    }
+                }
+            }
+        }
         self.publish_snapshot(now);
         if self.ticks % STATS_EVERY_TICKS == 0 {
             for b in &self.bridges {

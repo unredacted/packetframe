@@ -467,10 +467,6 @@ impl Rig {
         self.engine.as_ref().unwrap().snapshot()
     }
 
-    fn counter_install(&self, o: InstallOutcome) -> u64 {
-        self.snapshot().bridges[0].counters.installs[o.index()]
-    }
-
     fn wait_neigh(&self, ip: &str, pred: impl Fn(&str) -> bool) -> String {
         wait_for(Duration::from_secs(5), &format!("neighbour {ip}"), || {
             self.neigh(ip).filter(|l| pred(l))
@@ -551,7 +547,9 @@ fn learns_ns_and_na_pairs() {
         let line = rig.wait_neigh(ip, |l| l.contains("STALE"));
         assert!(line.contains(&mac_str(mac)), "{ip}: {line}");
     }
-    assert_eq!(rig.snapshot().bridges[0].table_entries, 3);
+    // The snapshot is published once per housekeeping tick; wait for it
+    // rather than reading the previous tick's.
+    rig.wait_counter("three entries", |s| s.bridges[0].table_entries == 3);
     rig.stop();
 }
 
@@ -559,15 +557,25 @@ fn learns_ns_and_na_pairs() {
 /// real kernel state: a REACHABLE entry with the same MAC is left
 /// alone; a REACHABLE entry with another MAC is left alone and counted
 /// as a conflict; a STALE entry with another MAC is replaced.
+///
+/// The conflict and override cases use IPv6 solicitations on purpose.
+/// For IPv4, Linux itself updates an *existing* neighbour entry from
+/// any ARP packet whose sender it already knows (`arp_process`, with a
+/// one-second lock time), so an ARP-based version of this test observes
+/// the kernel's own update and proves nothing about the engine. The
+/// kernel ignores a third-party NS's source unless the target is ours.
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
 fn never_downgrades_or_overrides_confirmed_entries() {
     let rig = Rig::start();
     rig.set_neigh("198.51.100.77", Some(MAC_X), "reachable");
-    rig.set_neigh("198.51.100.78", Some(MAC_X), "stale");
-    // Let the mirror pick both up via the multicast echo.
+    rig.set_neigh("2001:db8::77", Some(MAC_X), "reachable");
+    rig.set_neigh("2001:db8::78", Some(MAC_X), "stale");
+    // Let the mirror pick them up via the multicast echo.
     std::thread::sleep(Duration::from_millis(300));
 
+    // Same MAC as a confirmed entry: nothing to do (the kernel also
+    // keeps REACHABLE for a same-lladdr non-admin update).
     rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
     rig.wait_counter("same_mac skip", |s| {
         s.bridges[0].counters.installs[InstallOutcome::Skipped(SkipReason::SameMac).index()] >= 1
@@ -578,22 +586,27 @@ fn never_downgrades_or_overrides_confirmed_entries() {
         "{line}"
     );
 
-    rig.inject(&arp_request(MAC_Y, MAC_Y, v4(77), v4(200)));
+    // Another MAC for a confirmed entry: counted, not installed.
+    rig.inject(&ns_with_sllao(MAC_Y, v6(0x77), v6(0x200)));
     rig.wait_counter("mac_conflict", |s| {
         s.bridges[0].counters.installs[InstallOutcome::Skipped(SkipReason::MacConflict).index()]
             >= 1
     });
     std::thread::sleep(Duration::from_millis(200));
-    let line = rig.neigh("198.51.100.77").unwrap();
+    let line = rig.neigh("2001:db8::77").unwrap();
     assert!(
         line.contains("REACHABLE") && line.contains(&mac_str(MAC_X)),
         "a confirmed entry must not be overridden: {line}"
     );
 
-    rig.inject(&arp_request(MAC_Z, MAC_Z, v4(78), v4(200)));
-    let line = rig.wait_neigh("198.51.100.78", |l| l.contains(&mac_str(MAC_Z)));
+    // Another MAC for a STALE entry: replaced.
+    rig.inject(&ns_with_sllao(MAC_Z, v6(0x78), v6(0x200)));
+    let line = rig.wait_neigh("2001:db8::78", |l| l.contains(&mac_str(MAC_Z)));
     assert!(line.contains("STALE"), "{line}");
-    assert_eq!(rig.counter_install(InstallOutcome::Failed), 0);
+    rig.wait_counter("no install failures", |s| {
+        s.bridges[0].counters.installs[InstallOutcome::Confirmed.index()] >= 1
+            && s.bridges[0].counters.installs[InstallOutcome::Failed.index()] == 0
+    });
     rig.stop();
 }
 
