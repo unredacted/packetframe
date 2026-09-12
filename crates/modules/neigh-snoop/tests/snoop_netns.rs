@@ -973,3 +973,157 @@ fn derives_sibling_addresses_of_a_declared_peer() {
     );
     rig.stop();
 }
+
+// --- by-name link tracking and nexthop-object coverage ---------------------
+
+/// (f) The device is deleted and recreated under the same name: the
+/// engine drops the dead socket, binds a fresh one to the new ifindex,
+/// re-seeds the learned table onto the new device, and keeps learning.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn survives_device_recreation_by_name() {
+    let mut rig = Rig::start();
+    rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
+    rig.wait_neigh("198.51.100.77", |l| l.contains("STALE"));
+    let old_ifindex = rig.snapshot().bridges[0].ifindex.expect("bound");
+
+    // Deleting one end of a veth pair deletes both. Recreate with the
+    // same names and addresses, as a provision does.
+    let (netns, a, b) = (
+        rig.names.netns.clone(),
+        rig.names.veth_a.clone(),
+        rig.names.veth_b.clone(),
+    );
+    ns_run(&netns, &["ip", "link", "del", &a]);
+    rig.wait_counter("link gone", |s| {
+        s.bridges[0].link == packetframe_neigh_snoop::snapshot::LinkState::Absent
+    });
+    ns_run(
+        &netns,
+        &["ip", "link", "add", &a, "type", "veth", "peer", "name", &b],
+    );
+    ns_run(&netns, &["ip", "link", "set", &a, "up"]);
+    ns_run(&netns, &["ip", "link", "set", &b, "up"]);
+    ns_run(&netns, &["ip", "addr", "add", "198.51.100.1/24", "dev", &a]);
+    ns_run(
+        &netns,
+        &[
+            "ip",
+            "-6",
+            "addr",
+            "add",
+            "2001:db8::1/64",
+            "dev",
+            &a,
+            "nodad",
+        ],
+    );
+    ns_run(&netns, &["ip", "addr", "add", "198.51.100.2/24", "dev", &b]);
+
+    // Re-seeded from the learned table onto the new device.
+    let line = rig.wait_neigh("198.51.100.77", |l| l.contains("STALE"));
+    assert!(line.contains(&mac_str(MAC_X)), "{line}");
+    // The snapshot is published once per tick; wait for the one that
+    // shows the new device rather than reading the previous tick's.
+    rig.wait_counter("new device tracked", |s| {
+        s.bridges[0].link == packetframe_neigh_snoop::snapshot::LinkState::Up
+            && s.bridges[0].ifindex.is_some_and(|i| i != old_ifindex)
+    });
+    let s = rig.snapshot();
+    assert!(
+        s.bridges[0].counters.link_events
+            [packetframe_neigh_snoop::snapshot::LinkEvent::Down.index()]
+            >= 1
+            && s.bridges[0].counters.link_events
+                [packetframe_neigh_snoop::snapshot::LinkEvent::Up.index()]
+                >= 2,
+        "{:?}",
+        s.bridges[0].counters.link_events
+    );
+
+    // And the fresh socket learns: a new participant on the new device.
+    rig.b_ifindex = if_nametoindex(&b);
+    rig.injector = open_packet_socket(rig.b_ifindex);
+    rig.inject(&arp_request(MAC_Z, MAC_Z, v4(79), v4(200)));
+    let line = rig.wait_neigh("198.51.100.79", |l| l.contains("STALE"));
+    assert!(line.contains(&mac_str(MAC_Z)), "{line}");
+    rig.stop();
+}
+
+/// (j) Coverage reads kernel nexthop objects: routes installed with
+/// `nhid` (FRR's shape) carry no gateway attribute, so the sampler
+/// must expand the objects — including a group — and skip the
+/// gateway-less connected object.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn coverage_reads_nexthop_objects_and_groups() {
+    let rig = Rig::start();
+    let (netns, a) = (rig.names.netns.clone(), rig.names.veth_a.clone());
+    ns_run(
+        &netns,
+        &[
+            "ip",
+            "nexthop",
+            "add",
+            "id",
+            "10",
+            "via",
+            "198.51.100.77",
+            "dev",
+            &a,
+        ],
+    );
+    ns_run(
+        &netns,
+        &[
+            "ip",
+            "nexthop",
+            "add",
+            "id",
+            "11",
+            "via",
+            "198.51.100.78",
+            "dev",
+            &a,
+        ],
+    );
+    ns_run(&netns, &["ip", "nexthop", "add", "id", "12", "dev", &a]);
+    ns_run(
+        &netns,
+        &["ip", "nexthop", "add", "id", "20", "group", "10/11"],
+    );
+    ns_run(
+        &netns,
+        &["ip", "route", "add", "203.0.113.0/24", "nhid", "20"],
+    );
+    ns_run(
+        &netns,
+        &["ip", "route", "add", "203.0.113.0/25", "nhid", "12"],
+    );
+    // .77 becomes resolvable; .78 stays unheard.
+    rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
+    rig.wait_neigh("198.51.100.77", |l| l.contains("STALE"));
+
+    use packetframe_neigh_snoop::snapshot::CoverageState;
+    wait_for(Duration::from_secs(20), "coverage sample", || {
+        let s = rig.snapshot();
+        match &s.bridges[0].route_coverage {
+            CoverageState::Measured(c) if c.nexthops.total == 2 && c.nexthops.resolved == 1 => {
+                Some(format!("{c:?}"))
+            }
+            CoverageState::Unavailable(e) => panic!("coverage unavailable: {e}"),
+            _ => None,
+        }
+    });
+    let s = rig.snapshot();
+    let CoverageState::Measured(c) = &s.bridges[0].route_coverage else {
+        panic!("measured");
+    };
+    assert_eq!(
+        c.unresolved_sample,
+        vec!["198.51.100.78".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert!(c.nexthop_objects >= 4, "{c:?}");
+    assert!(c.routes_seen >= 2, "{c:?}");
+    rig.stop();
+}

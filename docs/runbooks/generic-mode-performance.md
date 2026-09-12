@@ -416,8 +416,10 @@ nothing is attached to a NIC, no route/neighbour/sysctl state is touched, and
 nothing is written outside the test process — so it is safe on a forwarding
 router. Two groups are excluded and must be named explicitly:
 
-- `attach`, `tc_attach`, `netns`, `local_prefix_netns`, `neigh_resolver_netns` —
-  create interfaces or network namespaces.
+- `attach`, `tc_attach`, `netns`, `local_prefix_netns`, `neigh_resolver_netns`,
+  `guard_tc_attach`, `guard_netns`, `snoop_netns` — create interfaces or network
+  namespaces (`snoop_netns` also writes neighbour entries, inside its own
+  namespace only).
 - `fib_comparison`, `fib_programmer_integration` — pin maps into a scratch
   `/sys/fs/bpf/pftestcmp-<pid>-<n>` directory (removed on exit) and will mount
   bpffs if it isn't already mounted.

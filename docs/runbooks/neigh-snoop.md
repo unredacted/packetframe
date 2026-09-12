@@ -311,3 +311,9 @@ age without a daemon.
   refreshes produces one write per window.
 - Installs are paced round-robin across bridges, so a boot-time seed on
   one bridge cannot starve live learns on another.
+- For IPv4 the kernel itself updates an *existing* neighbour entry from
+  any ARP packet whose sender it already knows (one-second lock time),
+  even a third-party request. The snooper's never-override rule
+  therefore protects IPv6 entries and addresses the kernel has never
+  seen; a `mac_changed` on a known IPv4 address may be the kernel's own
+  update as much as the snooper's observation.
