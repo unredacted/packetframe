@@ -1334,6 +1334,7 @@ pub fn attach(
     route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+    ix_mode_ifaces: Vec<String>,
 ) -> ModuleResult<Vec<Attachment>> {
     // `anyip` preflight FIRST, before anything attaches or pins: the
     // refusals inside it (interface-owned address, directed
@@ -1860,8 +1861,11 @@ pub fn attach(
                 source: route_source,
                 integrity_authority,
             },
-            local_prefixes,
-            fallback_default,
+            crate::fib::controller::ResolverPolicy {
+                local_prefixes,
+                fallback_default,
+                ix_interfaces: ix_mode_ifaces,
+            },
             fdb_pin_chains,
             route_sink,
             crate::fib::controller::SecondTierSignals {
@@ -1902,6 +1906,17 @@ pub fn attach(
             warn!(
                 "fdb-pin on has no effect in kernel-fib mode (pins are published by the \
                  custom-FIB neighbour resolver, which is not running)"
+            );
+        }
+        // Same class again: the probe the ix-mode flag suppresses is the
+        // custom-FIB resolver's, so under kernel-fib the flag changes
+        // nothing here. The snooper itself still runs; only fast-path's
+        // half of the arrangement is idle.
+        if !ix_mode_ifaces.is_empty() {
+            info!(
+                ifaces = ?ix_mode_ifaces,
+                "ix-mode configured but forwarding-mode is kernel-fib; fast-path's \
+                 proactive-probe suppression is inert until custom-fib"
             );
         }
         info!(

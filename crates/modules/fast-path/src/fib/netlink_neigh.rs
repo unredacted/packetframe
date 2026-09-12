@@ -28,7 +28,9 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
@@ -301,6 +303,47 @@ pub struct NetlinkNeighborResolver {
     /// strand a nexthop pinned to an expired port. Keyed by IP with
     /// last-write-wins, so churn collapses instead of accumulating.
     pending_pins: HashMap<IpAddr, Option<(u32, u16)>>,
+    /// Interfaces in "IX mode" (the neigh-snoop module's `bridge <x>
+    /// ix-mode`): on these the proactive `NUD_NONE` kick is never
+    /// issued, because the kernel's resulting broadcast ARP / multicast
+    /// NS is dropped by an upstream ACL and every attempt is a wasted
+    /// frame; the snooper seeds these neighbours instead. Held by
+    /// *name* and resolved to ifindex at check time through
+    /// `iface_to_ifindex`, since the platform recreates bridges with
+    /// new ifindexes and a stale ifindex would silently re-enable the
+    /// kick.
+    ix_interfaces: HashSet<String>,
+    /// How many cache misses the IX-mode rule turned into no-ops.
+    /// Shared so a test (or a future metrics reader) can observe it
+    /// while the resolver owns itself inside `run()`.
+    ix_probe_suppressed: Arc<AtomicU64>,
+}
+
+/// `if_nametoindex(3)`: one ioctl, no netlink round trip. `None` when
+/// the kernel has no interface by that name (or the name is not a
+/// valid C string).
+fn ifindex_by_name(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated string for the call's
+    // duration; if_nametoindex reads it and returns 0 on failure.
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    (idx != 0).then_some(idx)
+}
+
+/// What `issue_proactive_resolve` did with one cache miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// `RTM_NEWNEIGH NUD_NONE` was written; the kernel resolves.
+    Kicked,
+    /// The neighbour write failed (logged at debug; first-packet ARP
+    /// remains the fallback).
+    Failed,
+    /// The route lookup found no unicast egress.
+    NoRoute,
+    /// Unspecified nexthop: nothing to resolve.
+    Unspecified,
+    /// The egress is an IX-mode interface: deliberately not kicked.
+    Suppressed,
 }
 
 impl NetlinkNeighborResolver {
@@ -336,10 +379,51 @@ impl NetlinkNeighborResolver {
                 fdb_pins_sent: 0,
                 fdb_pins_cleared: 0,
                 pending_pins: HashMap::new(),
+                ix_interfaces: HashSet::new(),
+                ix_probe_suppressed: Arc::new(AtomicU64::new(0)),
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
         )
+    }
+
+    /// Declare the IX-mode interfaces (by name). On a cache miss for a
+    /// nexthop whose route egresses one of them, the proactive
+    /// `NUD_NONE` kick is skipped and counted instead of sent: the
+    /// kernel's broadcast/multicast resolution is dropped upstream on
+    /// those links, so the kick could only ever cost frames. Empty =
+    /// today's behaviour everywhere. Builder-style like the others.
+    pub fn with_ix_interfaces(mut self, names: Vec<String>) -> Self {
+        self.ix_interfaces = names.into_iter().collect();
+        self
+    }
+
+    /// The suppressed-kick counter, readable after `run()` has taken
+    /// ownership of the resolver.
+    pub fn ix_probe_suppressed_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.ix_probe_suppressed)
+    }
+
+    /// The current ifindexes of the IX-mode interfaces. Recomputed per
+    /// miss (a handful of names) so a recreated bridge is honoured as
+    /// soon as its RTM_NEWLINK has been seen.
+    ///
+    /// A name missing from the cache is asked of the kernel directly:
+    /// the startup link dump can fail (`run()` continues without it)
+    /// and a stable interface never emits a later RTM_NEWLINK, so a
+    /// cache miss must not become a broadcast the operator promised
+    /// the fabric would never see. A name the kernel does not know has
+    /// no routes, so nothing is lost by leaving it out.
+    fn ix_oifs(&self) -> HashSet<u32> {
+        self.ix_interfaces
+            .iter()
+            .filter_map(|n| {
+                self.iface_to_ifindex
+                    .get(n)
+                    .copied()
+                    .or_else(|| ifindex_by_name(n))
+            })
+            .collect()
     }
 
     /// Enable the v0.2.1 connected fast-path. `local_prefixes` are the
@@ -612,7 +696,21 @@ impl NetlinkNeighborResolver {
                                 // Best-effort proactive resolve. If the route
                                 // lookup or neighbor add fails, log at debug
                                 // and fall back to first-packet kernel ARP.
-                                issue_proactive_resolve(&handle, ip).await;
+                                let ix_oifs = self.ix_oifs();
+                                if issue_proactive_resolve(&handle, ip, &ix_oifs).await
+                                    == ProbeOutcome::Suppressed
+                                {
+                                    let n = self.ix_probe_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n <= 20 {
+                                        info!(
+                                            ?ip,
+                                            "neighbour cache miss on an ix-mode interface; \
+                                             proactive probe suppressed (the snooper seeds it)"
+                                        );
+                                    } else {
+                                        debug!(?ip, "proactive probe suppressed (ix-mode)");
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -640,6 +738,7 @@ impl NetlinkNeighborResolver {
                         fdb_pins_sent = self.fdb_pins_sent,
                         fdb_pins_cleared = self.fdb_pins_cleared,
                         fdb_pins_pending = self.pending_pins.len(),
+                        ix_probe_suppressed = self.ix_probe_suppressed.load(Ordering::Relaxed),
                         "neighbour resolver stats"
                     );
                     // Unpins are one-shot; a dropped one would strand a
@@ -1054,6 +1153,21 @@ impl NetlinkNeighborResolver {
             .local_prefixes
             .iter()
             .filter(|s| s.arp_scavenge)
+            .filter(|s| {
+                // A sweep is hundreds of broadcast ARP requests; on an
+                // IX-mode interface every one is dropped upstream, so
+                // the sweep can only cost frames and switch counters.
+                let ix = self.ix_interfaces.contains(&s.iface);
+                if ix {
+                    warn!(
+                        iface = %s.iface,
+                        cidr = %format_args!("{}/{}", s.addr, s.prefix_len),
+                        "arp-scavenge on an ix-mode interface refused; its broadcasts are \
+                         dropped upstream and the snooper learns these neighbours instead"
+                    );
+                }
+                !ix
+            })
             .filter_map(|s| match self.iface_to_ifindex.get(&s.iface).copied() {
                 Some(ifindex) => Some((s.clone(), ifindex)),
                 None => {
@@ -1368,7 +1482,19 @@ impl NetlinkNeighborResolver {
 /// arrives", exactly what we'd get without proactive resolve, so
 /// the only cost of a proactive-resolve failure is one-packet latency
 /// on first forward.
-async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
+///
+/// `ix_oifs` are the current ifindexes of the IX-mode interfaces: a
+/// nexthop whose unicast route egresses one of them is reported as
+/// [`ProbeOutcome::Suppressed`] and nothing is written — the kernel's
+/// resolution on that link is dropped upstream, and the neigh-snoop
+/// module seeds the entry from the fabric's own traffic instead. The
+/// check sits *after* the route lookup on purpose: it is the egress
+/// device that is IX-mode, not the address.
+async fn issue_proactive_resolve(
+    handle: &Handle,
+    ip: IpAddr,
+    ix_oifs: &HashSet<u32>,
+) -> ProbeOutcome {
     // An unspecified nexthop (0.0.0.0 / ::) means "the route is
     // self-originated" in every BGP dialect that emits it (FRR does,
     // for locally-originated networks over iBGP). There is no
@@ -1376,7 +1502,7 @@ async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
     // it to the loopback local route — see the RTN_UNICAST guard.
     if ip.is_unspecified() {
         debug!(?ip, "proactive resolve: unspecified nexthop; skipping");
-        return;
+        return ProbeOutcome::Unspecified;
     }
     let (oif, plen) = match ip {
         IpAddr::V4(v4) => {
@@ -1402,9 +1528,13 @@ async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
                 ?ip,
                 "proactive resolve: route lookup returned no OIF; skipping"
             );
-            return;
+            return ProbeOutcome::NoRoute;
         }
     };
+    if ix_oifs.contains(&oif) {
+        debug!(?ip, oif, "proactive resolve: egress is ix-mode; not kicked");
+        return ProbeOutcome::Suppressed;
+    }
     // Issue the RTM_NEWNEIGH with NUD_NONE. The kernel interprets
     // "state NONE + no lladdr" as "initialize this neighbor and start
     // resolving." Replace lets the call be idempotent, if the
@@ -1417,8 +1547,14 @@ async fn issue_proactive_resolve(handle: &Handle, ip: IpAddr) {
         .execute()
         .await
     {
-        Ok(()) => debug!(?ip, oif, "proactive resolve kicked"),
-        Err(e) => debug!(?ip, oif, error = %e, "proactive resolve failed"),
+        Ok(()) => {
+            debug!(?ip, oif, "proactive resolve kicked");
+            ProbeOutcome::Kicked
+        }
+        Err(e) => {
+            debug!(?ip, oif, error = %e, "proactive resolve failed");
+            ProbeOutcome::Failed
+        }
     }
 }
 

@@ -517,3 +517,91 @@ fn proactive_resolve_never_writes_loopback_neighbours() {
         let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
     });
 }
+
+/// IX mode: a nexthop whose route egresses an interface declared
+/// `ix-mode` must not receive the proactive `NUD_NONE` kick — on such a
+/// link the kernel's resulting broadcast is dropped upstream and the
+/// neigh-snoop module seeds the entry instead. A second veth pair
+/// outside IX mode is the control: its nexthop is still kicked, so the
+/// suppression is per egress device, not global.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn proactive_resolve_suppressed_on_ix_interfaces() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    // A second pair, C/D, on a different prefix: the non-IX control.
+    let veth_c = format!("{}c", names.veth_a);
+    let veth_d = format!("{}d", names.veth_a);
+    ns_run(
+        &names.netns,
+        &[
+            "ip", "link", "add", &veth_c, "type", "veth", "peer", "name", &veth_d,
+        ],
+    );
+    ns_run(&names.netns, &["ip", "link", "set", &veth_c, "up"]);
+    ns_run(&names.netns, &["ip", "link", "set", &veth_d, "up"]);
+    ns_run(
+        &names.netns,
+        &["ip", "addr", "add", "203.0.113.254/24", "dev", &veth_c],
+    );
+
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let (resolver, events_rx, resolve_handle) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver = resolver.with_ix_interfaces(vec![veth_a.clone()]);
+        let suppressed = resolver.ix_probe_suppressed_counter();
+        let resolver_task = tokio::spawn(resolver.run());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Neither address is in the startup dump, so both take the
+        // cache-miss path. .77 on the IX-mode pair must be suppressed;
+        // 203.0.113.77 on the control pair must be kicked.
+        resolve_handle.request_resolve(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)));
+        resolve_handle.request_resolve(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77)));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let neigh = ns_capture(&netns, &["ip", "neigh", "show", "nud", "all"]);
+            if neigh
+                .lines()
+                .any(|l| l.starts_with("203.0.113.77 ") && l.contains(&veth_c))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control probe for 203.0.113.77 never created a neighbour entry \
+                 (suppression too broad?); last dump:\n{neigh}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // The control went through, so ordering is settled: the IX
+        // nexthop was handled before it and must have left nothing.
+        let neigh = ns_capture(&netns, &["ip", "neigh", "show", "nud", "all"]);
+        for line in neigh.lines() {
+            assert!(
+                !line.starts_with("198.51.100.77 "),
+                "proactive resolve kicked a nexthop on an ix-mode interface: {line}"
+            );
+        }
+        assert_eq!(
+            suppressed.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly the IX-mode miss is counted as suppressed"
+        );
+
+        shutdown.cancel();
+        drop(events_rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
