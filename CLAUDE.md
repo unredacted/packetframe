@@ -12,6 +12,7 @@ PacketFrame is a modular eBPF data plane written in pure Rust (aya + aya-ebpf). 
 - `crates/cli/`: the `packetframe` binary (clap subcommands: `feasibility`, `run`, `detach`, `status`, `fib`, `probe`)
 - `crates/modules/fast-path/`: fast-path module including the custom-FIB control plane under `src/fib/`
 - `crates/modules/guard/`: tc-egress frame policer (ARP/NS per-target rate limit, LLDP drop, foreign-src-MAC drop, bcast/mcast catch-all) for the IX-facing bridges; runbook at `docs/runbooks/guard.md`
+- `crates/modules/neigh-snoop/`: passive ARP/ND neighbour snooper for the IX-facing bridges (receive-only AF_PACKET + cBPF, learns third-party pairs, installs NUD_STALE, persists per bridge, tracks bridges by name, `ix-mode` into fast-path's resolver, FRR next-hop gate feed); runbook at `docs/runbooks/neigh-snoop.md`. No site-specific addresses in code, tests or docs: RFC 5737/3849 prefixes and `02:…` MACs only
 - `conf/example.conf`: reference config per SPEC.md §4.8
 - `docs/runbooks/custom-fib.md`: Option F operations runbook (healthy state, triage by symptom, cutover + rollback, Phase 4 config snippets)
 - `.github/workflows/`: `ci.yml` (fmt/clippy/test + 4× cross-build), `qemu-verifier.yml` (integration tests on 5.15 + 6.6 kernels), `release.yml` (tag-triggered tarballs), `hardware-artifacts.yml` (per-main-push aarch64 test-binary + CLI bundle for on-router runs)

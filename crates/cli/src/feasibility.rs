@@ -38,6 +38,67 @@ pub fn attach_ifaces_from_config(config: &Config) -> Vec<String> {
     ifaces
 }
 
+/// The neigh-snoop inputs `probe_and_render` needs: the configured
+/// bridges and the resolved persist directory. `bridges` is empty when
+/// the module isn't configured, and the probes then stay out of the
+/// report entirely.
+#[derive(Debug, Default, Clone)]
+pub struct NeighSnoopProbeInputs {
+    pub bridges: Vec<String>,
+    pub persist_dir: std::path::PathBuf,
+}
+
+pub fn neigh_snoop_probe_inputs_from_config(config: &Config) -> NeighSnoopProbeInputs {
+    let mut out = NeighSnoopProbeInputs {
+        bridges: Vec::new(),
+        persist_dir: config
+            .global
+            .state_dir
+            .join(packetframe_common::config::NEIGH_SNOOP_PERSIST_SUBDIR),
+    };
+    for m in &config.modules {
+        if m.name != "neigh-snoop" {
+            continue;
+        }
+        for d in &m.directives {
+            match d {
+                ModuleDirective::SnoopBridge { iface, .. } if !out.bridges.contains(iface) => {
+                    out.bridges.push(iface.clone());
+                }
+                ModuleDirective::SnoopPersistDir { path, .. } => out.persist_dir = path.clone(),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Bridges a `neigh-snoop` section flags `ix-mode`, for fast-path's
+/// resolver. Empty when none are. Consumed by the Linux run path only,
+/// hence unused on the stub platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn neigh_snoop_ix_ifaces_from_config(config: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in &config.modules {
+        if m.name != "neigh-snoop" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::SnoopBridge {
+                iface,
+                ix_mode: true,
+                ..
+            } = d
+            {
+                if !out.contains(iface) {
+                    out.push(iface.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Interfaces named by `interface` lines in a `guard` section, if
 /// any. Empty when the module isn't configured — the guard probes
 /// then stay out of the report entirely.
@@ -329,6 +390,7 @@ pub fn probe_and_render(
     vpp: &VppProbeInputs<'_>,
     allowlist: &[IpPrefix],
     guard_ifaces: &[String],
+    snoop: &NeighSnoopProbeInputs,
     human: bool,
 ) -> Rendered {
     let mut report = run_probes(bpffs_root);
@@ -391,6 +453,19 @@ pub fn probe_and_render(
     }
     #[cfg(not(feature = "guard"))]
     let _ = guard_ifaces;
+    // neigh-snoop probes: only when the config declares the module.
+    // All non-required; an absent bridge is a warning because the
+    // module waits for it by name.
+    #[cfg(feature = "neigh-snoop")]
+    if !snoop.bridges.is_empty() {
+        for cap in
+            packetframe_neigh_snoop::run_feasibility_probes(&snoop.bridges, &snoop.persist_dir)
+        {
+            report.capabilities.push(cap);
+        }
+    }
+    #[cfg(not(feature = "neigh-snoop"))]
+    let _ = snoop;
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.

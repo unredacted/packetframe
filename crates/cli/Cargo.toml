@@ -16,6 +16,7 @@ packetframe-common.workspace = true
 packetframe-fast-path = { workspace = true, optional = true }
 packetframe-vpp-offload = { workspace = true, optional = true }
 packetframe-guard = { workspace = true, optional = true }
+packetframe-neigh-snoop = { workspace = true, optional = true }
 packetframe-probe = { workspace = true, optional = true }
 
 anyhow.workspace = true
@@ -31,10 +32,11 @@ libc.workspace = true
 signal-hook.workspace = true
 
 [features]
-default = ["fast-path", "guard", "probe", "vpp-offload"]
+default = ["fast-path", "guard", "neigh-snoop", "probe", "vpp-offload"]
 fast-path = ["dep:packetframe-fast-path"]
 vpp-offload = ["dep:packetframe-vpp-offload"]
 guard = ["dep:packetframe-guard"]
+neigh-snoop = ["dep:packetframe-neigh-snoop"]
 probe = ["dep:packetframe-probe"]
 
 # cargo-deb metadata. CI builds the .deb in the release workflow via
