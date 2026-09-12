@@ -122,6 +122,9 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
     config
         .validate_guard()
         .map_err(|e| RunError::Startup(e.to_string()))?;
+    config
+        .validate_neigh_snoop()
+        .map_err(|e| RunError::Startup(e.to_string()))?;
 
     // Fail fast if metrics-textfile can't be written, the exporter
     // would retry silently every 15s otherwise.
@@ -296,12 +299,23 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         .as_ref()
         .map(|_| std::sync::Arc::new(packetframe_common::fib::FeedSession::new()));
 
+    // The bridges the neigh-snoop section declares `ix-mode`: fast-path's
+    // resolver must stop probing on them, and only the loader sees both
+    // sections. Computed before the loop because the sections may come
+    // in either order.
+    #[cfg(feature = "neigh-snoop")]
+    let ix_ifaces = crate::feasibility::neigh_snoop_ix_ifaces_from_config(&config);
+
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
     for section in &config.modules {
         match section.name.as_str() {
             "fast-path" => {
                 #[allow(unused_mut)]
                 let mut m = FastPathModule::new();
+                #[cfg(feature = "neigh-snoop")]
+                if !ix_ifaces.is_empty() {
+                    m.set_ix_mode_ifaces(ix_ifaces.clone());
+                }
                 #[cfg(feature = "vpp-offload")]
                 if let Some(f) = &feed {
                     m.set_route_sink(f.clone());
@@ -352,6 +366,16 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 modules.push((
                     section.name.clone(),
                     Box::new(packetframe_guard::GuardModule::new()) as Box<dyn Module>,
+                ));
+            }
+            #[cfg(feature = "neigh-snoop")]
+            "neigh-snoop" => {
+                // The one cross-module edge points the other way: the
+                // snooper's `ix-mode` bridges were handed to fast-path
+                // above. The snooper itself reads only its own section.
+                modules.push((
+                    section.name.clone(),
+                    Box::new(packetframe_neigh_snoop::NeighSnoopModule::new()) as Box<dyn Module>,
                 ));
             }
             other => {
@@ -428,12 +452,25 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
 
         // Persist the pin registry so `packetframe detach` has
         // something to look at post-exit. Pinning itself is PR #6.
+        //
+        // The registry is single-module, last writer wins. A module
+        // with no attachments (guard, neigh-snoop — their teardown
+        // truth lives elsewhere) must not overwrite the one that has
+        // them, or `packetframe status` reports an empty attach set for
+        // a forwarding daemon.
         let file = RegistryFile {
             module: module.name().to_string(),
             attachments: attachments.into_iter().map(Into::into).collect(),
         };
-        save(&config.global.state_dir, &file)
-            .map_err(|e| RunError::Runtime(format!("pin registry save: {e}")))?;
+        if file.attachments.is_empty() {
+            tracing::debug!(
+                module = %name,
+                "no attachments; pin registry left to the attaching module"
+            );
+        } else {
+            save(&config.global.state_dir, &file)
+                .map_err(|e| RunError::Runtime(format!("pin registry save: {e}")))?;
+        }
 
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
     }
@@ -1040,6 +1077,12 @@ fn reconfigure_from_signal(
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
         return Published::No;
     }
+    // And the neigh-snoop section, for the same reason.
+    if let Err(e) = new_config.validate_neigh_snoop() {
+        tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
+        write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        return Published::No;
+    }
 
     // After the two refusals above and before the module loop: a
     // rejected reload changes nothing, including this, and a module
@@ -1548,12 +1591,14 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         config_has_fast_path,
         config_has_vpp,
         config_has_guard,
+        config_has_neigh_snoop,
     ) = match config {
         Some(p) => {
             let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
             let has_fast_path = c.modules.iter().any(|m| m.name == "fast-path");
             let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
             let has_guard = c.modules.iter().any(|m| m.name == "guard");
+            let has_neigh_snoop = c.modules.iter().any(|m| m.name == "neigh-snoop");
             (
                 c.global.bpffs_root,
                 c.global.state_dir,
@@ -1561,6 +1606,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
                 has_fast_path,
                 has_vpp,
                 has_guard,
+                has_neigh_snoop,
             )
         }
         // No config at all: nothing scopes the request. fast-path is
@@ -1571,6 +1617,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
             packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
             true,
+            false,
             false,
             false,
         ),
@@ -1637,6 +1684,23 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     )]
     let mut errors: Vec<String> = Vec::new();
 
+    // neigh-snoop has no kernel state to tear down: no BPF, no pins, no
+    // tc. Its learned NUD_STALE neighbours are correct kernel state the
+    // kernel owns from here, and its JSON cache is the next start's
+    // seed; both are deliberately left in place. Said out loud so an
+    // operator running the recovery path knows nothing was missed.
+    #[cfg(feature = "neigh-snoop")]
+    if all || config_has_neigh_snoop {
+        tracing::info!(
+            "neigh-snoop: nothing to tear down (userspace only; learned NUD_STALE \
+             neighbours and the persisted tables under the persist directory are left in \
+             place by design — `ip neigh flush dev <bridge> nud stale` removes the entries \
+             if you mean it)"
+        );
+    }
+    #[cfg(not(feature = "neigh-snoop"))]
+    let _ = config_has_neigh_snoop;
+
     // fast-path follows the same scoping rule as the other modules now
     // that a config without a fast-path section is legitimate (a
     // guard-only scoping config, the fastpath-only.conf inverse): a
@@ -1688,7 +1752,7 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     }
     #[cfg(not(feature = "guard"))]
     let _ = config_has_guard;
-    #[cfg(not(any(feature = "vpp-offload", feature = "guard")))]
+    #[cfg(not(any(feature = "vpp-offload", feature = "guard", feature = "neigh-snoop")))]
     let _ = all;
 
     if !errors.is_empty() {
@@ -2018,7 +2082,45 @@ pub fn status(config_path: &Path) -> Result<(), String> {
         print_module_health(&config.global.state_dir);
     }
 
+    #[cfg(feature = "neigh-snoop")]
+    print_neigh_snoop_cache(&config);
+
     Ok(())
+}
+
+/// The neigh-snoop persisted tables, one line per configured bridge.
+/// Read from disk, so it works without a daemon: the file is the seed
+/// the next start will install from, and its age says how fresh that
+/// seed is.
+#[cfg(feature = "neigh-snoop")]
+fn print_neigh_snoop_cache(config: &Config) {
+    use packetframe_neigh_snoop::cfg::SnoopConfig;
+    use packetframe_neigh_snoop::persist;
+    let Some(section) = config.modules.iter().find(|m| m.name == "neigh-snoop") else {
+        return;
+    };
+    let Ok(snoop) = SnoopConfig::from_directives(&section.directives) else {
+        return; // the validators already reported it
+    };
+    let dir = snoop.resolve_persist_dir(&config.global.state_dir);
+    println!("neigh-snoop persisted tables ({}):", dir.display());
+    let now = std::time::SystemTime::now();
+    for b in &snoop.bridges {
+        let path = persist::file_path(&dir, &b.name);
+        match persist::summarize(&path, now) {
+            Some((entries, age)) => println!(
+                "  {:<14} {entries} entries, written {}s ago{}",
+                scrub_for_terminal(&b.name),
+                age.as_secs(),
+                if b.ix_mode { " [ix-mode]" } else { "" }
+            ),
+            None => println!(
+                "  {:<14} no persisted table yet{}",
+                scrub_for_terminal(&b.name),
+                if b.ix_mode { " [ix-mode]" } else { "" }
+            ),
+        }
+    }
 }
 
 /// Whether the snapshot's own publisher is the process running now.

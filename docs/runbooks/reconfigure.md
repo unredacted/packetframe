@@ -41,6 +41,7 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | (auto) VLAN-subif resolution | `VLAN_RESOLVE` | Re-scanned from `/proc/net/vlan/config` |
 | (auto) Redirect devmap | `REDIRECT_DEVMAP` | Re-scanned from `/sys/class/net` |
 | `log-level` | (none — userspace tracing filter) | v0.2.7+; applied before the module loop, so the reconcile it is on logs at the new level. **No effect while `RUST_LOG` is set** — see below |
+| neigh-snoop `prefix`, `deny-mac`, `peer`, `seed-max-age`, `install-rate`, `table-max`, `coverage-interval`, `frr-gate` interval/remove-after, `rs-coverage-interval` | (none — userspace engine state) | applied on the next engine tick; a `table-max` shrink evicts least-recently-seen entries |
 
 `log-level` is the one entry here that touches no BPF map: it swaps the
 daemon's tracing filter in place. Raising to `debug` to watch a canary

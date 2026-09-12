@@ -370,6 +370,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         vpp_dirs,
         vpp_exempts,
         guard_ifaces,
+        snoop_inputs,
     ) = match &config {
         Some(path) => match Config::from_file(path) {
             Ok(c) => {
@@ -385,6 +386,10 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     eprintln!("guard config check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);
                 }
+                if let Err(e) = c.validate_neigh_snoop() {
+                    eprintln!("neigh-snoop config check failed: {e}");
+                    return ExitCode::from(EXIT_STARTUP_ERROR);
+                }
                 let ifaces = feasibility::attach_ifaces_from_config(&c);
                 let vpp_ports = feasibility::vpp_ports_from_config(&c);
                 let vpp_steer_ports = feasibility::vpp_steer_ports_from_config(&c);
@@ -395,6 +400,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 let vpp_dirs = feasibility::vpp_steer_directions_from_config(&c);
                 let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
                 let guard_ifaces = feasibility::guard_ifaces_from_config(&c);
+                let snoop_inputs = feasibility::neigh_snoop_probe_inputs_from_config(&c);
                 (
                     c.global.bpffs_root,
                     ifaces,
@@ -407,6 +413,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     vpp_dirs,
                     vpp_exempts,
                     guard_ifaces,
+                    snoop_inputs,
                 )
             }
             Err(e) => {
@@ -426,6 +433,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            feasibility::NeighSnoopProbeInputs::default(),
         ),
     };
 
@@ -443,6 +451,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         },
         &allowlist,
         &guard_ifaces,
+        &snoop_inputs,
         human,
     );
     if let Some(json) = report.json_output {

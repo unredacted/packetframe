@@ -85,6 +85,7 @@ PacketFrame does not replace a routing daemon. The intended pairing is `bird` (B
 | `probe` module (diagnostic XDP) | Production |
 | tc-ingress datapath (`attach <iface> tc`, custom-fib only) | Built and measured slower: +70% CPU per packet on the reference hardware. Kept for reference, not recommended; see [docs/runbooks/tc-datapath.md](docs/runbooks/tc-datapath.md) |
 | Per-module health + metrics, read by `packetframe status` and the Prometheus textfile | Production (v0.2.7+) |
+| `neigh-snoop` module (passive ARP/ND neighbour snooper for IX bridges, NUD_STALE seeding, persisted table, FRR next-hop gate feed) | Code-complete, hardware ladder pending; see [docs/runbooks/neigh-snoop.md](docs/runbooks/neigh-snoop.md) |
 | `vpp-offload` module (VPP-on-VF forwarding vector) | **Code-complete, hardware-unproven** — never run against a real VPP; see [docs/runbooks/vpp-offload.md](docs/runbooks/vpp-offload.md) |
 | `ddos` module (XDP-time SYN-flood + amplification filter) | Future; sketched in SPEC §5.2 (priority 0–999, security/admission) |
 | `sampler` module (per-flow ringbuf observability) | Future; sketched in SPEC §5.3 (priority 2000–2999, observation) |

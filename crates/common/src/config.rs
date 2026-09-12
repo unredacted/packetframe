@@ -590,9 +590,10 @@ pub enum ModuleDirective {
         max_age: Duration,
         line: usize,
     },
-    /// `install-rate <n>/<dur>` — kernel neighbour writes per bridge,
-    /// so a boot-time seed does not stall the netlink socket other
-    /// daemons share. Default 50/1s. Hot.
+    /// `install-rate <n>/<dur>` — kernel neighbour writes, daemon-wide
+    /// and shared round-robin across bridges, so a boot-time seed does
+    /// not stall the netlink socket other daemons share. Default 50/1s.
+    /// Hot.
     SnoopInstallRate {
         rate: u32,
         per: Duration,
