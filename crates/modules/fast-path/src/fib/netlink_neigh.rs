@@ -319,6 +319,17 @@ pub struct NetlinkNeighborResolver {
     ix_probe_suppressed: Arc<AtomicU64>,
 }
 
+/// `if_nametoindex(3)`: one ioctl, no netlink round trip. `None` when
+/// the kernel has no interface by that name (or the name is not a
+/// valid C string).
+fn ifindex_by_name(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated string for the call's
+    // duration; if_nametoindex reads it and returns 0 on failure.
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    (idx != 0).then_some(idx)
+}
+
 /// What `issue_proactive_resolve` did with one cache miss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -396,10 +407,22 @@ impl NetlinkNeighborResolver {
     /// The current ifindexes of the IX-mode interfaces. Recomputed per
     /// miss (a handful of names) so a recreated bridge is honoured as
     /// soon as its RTM_NEWLINK has been seen.
+    ///
+    /// A name missing from the cache is asked of the kernel directly:
+    /// the startup link dump can fail (`run()` continues without it)
+    /// and a stable interface never emits a later RTM_NEWLINK, so a
+    /// cache miss must not become a broadcast the operator promised
+    /// the fabric would never see. A name the kernel does not know has
+    /// no routes, so nothing is lost by leaving it out.
     fn ix_oifs(&self) -> HashSet<u32> {
         self.ix_interfaces
             .iter()
-            .filter_map(|n| self.iface_to_ifindex.get(n).copied())
+            .filter_map(|n| {
+                self.iface_to_ifindex
+                    .get(n)
+                    .copied()
+                    .or_else(|| ifindex_by_name(n))
+            })
             .collect()
     }
 
