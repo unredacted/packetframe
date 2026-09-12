@@ -63,18 +63,23 @@ pub fn health(s: &Snapshot) -> HealthReport {
                         ),
                         Some(secs),
                     ),
+                    // Broadcast ARP and multicast NS reach a non-promiscuous
+                    // tap anyway, so frames keep arriving while unicast
+                    // replies and advertisements are silently missed.
+                    // Not Healthy until the kernel reports promiscuity.
+                    secs if !b.promisc_confirmed => row(
+                        name,
+                        HealthState::Degraded,
+                        format!(
+                            "capturing without confirmed promiscuous mode, {} entries; unicast ND/ARP replies may be missed",
+                            b.table_entries
+                        ),
+                        secs,
+                    ),
                     secs => row(
                         name,
                         HealthState::Healthy,
-                        format!(
-                            "capturing, {} entries{}",
-                            b.table_entries,
-                            if b.promisc_confirmed {
-                                ""
-                            } else {
-                                ", promisc not yet confirmed"
-                            }
-                        ),
+                        format!("capturing, {} entries", b.table_entries),
                         secs,
                     ),
                 },
@@ -242,6 +247,20 @@ mod tests {
             state_of(&r, "coverage").message.as_deref(),
             Some("no bridge up")
         );
+    }
+
+    #[test]
+    fn unconfirmed_promisc_degrades() {
+        let mut b = up("br0");
+        b.promisc_confirmed = false;
+        let r = health(&Snapshot { bridges: vec![b] });
+        let s = state_of(&r, "snoop:br0");
+        assert_eq!(s.state, HealthState::Degraded);
+        assert!(s
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("without confirmed promiscuous mode"));
     }
 
     #[test]

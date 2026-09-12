@@ -134,16 +134,21 @@ pub fn load(
             file.ifname
         ));
     }
+    let Some(written_at) = unix_time(file.written_at) else {
+        return LoadOutcome::Unusable("written_at is out of range; ignored".into());
+    };
     let now_secs = unix_secs(now);
     let cutoff = now_secs.saturating_sub(max_age.as_secs());
     let mut entries = Vec::with_capacity(file.entries.len());
     let mut expired = 0usize;
     let mut bad_entries = 0usize;
     for e in file.entries {
-        let (Ok(ip), Ok(mac), Some(source)) = (
+        let (Ok(ip), Ok(mac), Some(source), Some(first_seen), Some(last_seen)) = (
             e.ip.parse::<IpAddr>(),
             parse_mac_literal(&e.mac),
             Source::from_label(&e.source),
+            unix_time(e.first_seen),
+            unix_time(e.last_seen),
         ) else {
             bad_entries += 1;
             continue;
@@ -157,8 +162,8 @@ pub fn load(
             ip,
             LearnedEntry {
                 mac,
-                first_seen: UNIX_EPOCH + Duration::from_secs(e.first_seen),
-                last_seen: UNIX_EPOCH + Duration::from_secs(e.last_seen),
+                first_seen,
+                last_seen,
                 last_seen_mono: now_mono.checked_sub(age).unwrap_or(now_mono),
                 source,
                 last_install: None,
@@ -169,8 +174,15 @@ pub fn load(
         entries,
         expired,
         bad_entries,
-        written_at: UNIX_EPOCH + Duration::from_secs(file.written_at),
+        written_at,
     }
+}
+
+/// A persisted second count as a `SystemTime`, or `None` when it does
+/// not fit: the file is input, and `UNIX_EPOCH + Duration` panics on
+/// overflow.
+fn unix_time(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
 /// `(entry count, file age)` for `packetframe status`, which runs
@@ -353,6 +365,13 @@ mod tests {
                     last_seen: secs,
                     source: "carrier_pigeon".into(),
                 },
+                PersistEntry {
+                    ip: "192.0.2.4".into(),
+                    mac: "02:00:00:00:00:0a".into(),
+                    first_seen: u64::MAX,
+                    last_seen: secs,
+                    source: "arp_request".into(),
+                },
             ],
         };
         save(&path, &serde_json::to_string(&f).unwrap()).unwrap();
@@ -363,8 +382,32 @@ mod tests {
                 ..
             } => {
                 assert_eq!(entries.len(), 1);
-                assert_eq!(bad_entries, 3);
+                assert_eq!(bad_entries, 4);
             }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_written_at_is_unusable_not_a_panic() {
+        let dir = scratch();
+        let path = file_path(&dir, "br0");
+        let f = PersistFileV1 {
+            version: PERSIST_VERSION,
+            ifname: "br0".into(),
+            written_at: u64::MAX,
+            entries: Vec::new(),
+        };
+        save(&path, &serde_json::to_string(&f).unwrap()).unwrap();
+        match load(
+            &path,
+            "br0",
+            SystemTime::now(),
+            Instant::now(),
+            Duration::from_secs(60),
+        ) {
+            LoadOutcome::Unusable(why) => assert!(why.contains("written_at"), "{why}"),
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);

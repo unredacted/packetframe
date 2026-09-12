@@ -131,9 +131,14 @@ fn run(bridges: &[String], persist_dir: &Path) -> Vec<Capability> {
     caps
 }
 
-/// Writable now, creatable at load, or neither.
+/// Writable now, creatable at load, or neither. An existing
+/// non-directory is "neither": `create_dir_all` at load cannot replace
+/// it, so feasibility must not promise it will.
 #[cfg(target_os = "linux")]
 fn persist_dir_state(dir: &Path) -> Result<String, String> {
+    if dir.exists() && !dir.is_dir() {
+        return Err(format!("{} exists but is not a directory", dir.display()));
+    }
     if dir.is_dir() {
         let probe = dir.join(format!(".feasibility-{}", std::process::id()));
         return match std::fs::write(&probe, b"") {

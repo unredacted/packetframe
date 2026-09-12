@@ -13,6 +13,14 @@
 //!   `(ip6.src, TLLAO)` when the source is a link-local address other
 //!   than the target — one router, two addresses, one frame.
 //!
+//! The link-layer option of an NS/NA must equal `eth.src` too. The
+//! fabric's port security binds a member to its Ethernet source MAC
+//! only; an option naming another MAC is the one field a participant
+//! could forge past that check, and on an exchange there are no ND
+//! proxies to make the mismatch legitimate. ND options are read only
+//! within the length the IPv6 header declares, so trailing bytes past
+//! the payload cannot masquerade as an option.
+//!
 //! The ICMPv6 checksum is not validated: a forged pair costs one
 //! failed unicast probe and is corrected on the next genuine sighting,
 //! and the exchange enforces one MAC per member port.
@@ -127,10 +135,13 @@ pub enum Reject {
     OptionBadLen,
     /// Zero, broadcast or multicast sender MAC.
     SenderMac(MacClass),
+    /// ND source/target link-layer option disagrees with the Ethernet
+    /// source. The ND counterpart of [`Reject::ShaMismatch`].
+    LlaoMismatch,
 }
 
 impl Reject {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 18;
     pub const LABELS: [&'static str; Self::COUNT] = [
         "truncated",
         "vlan_tagged",
@@ -149,6 +160,7 @@ impl Reject {
         "no_ll_option",
         "option_bad_len",
         "sender_mac",
+        "llao_mismatch",
     ];
 
     pub fn index(&self) -> usize {
@@ -170,6 +182,7 @@ impl Reject {
             Self::NoLinkLayerOption => 14,
             Self::OptionBadLen => 15,
             Self::SenderMac(_) => 16,
+            Self::LlaoMismatch => 17,
         }
     }
 
@@ -217,7 +230,7 @@ pub fn parse_frame(f: &[u8]) -> Result<Vec<Learned>, Reject> {
     match be16(f, 12) {
         ETHERTYPE_VLAN | ETHERTYPE_QINQ => Err(Reject::VlanTagged),
         ETHERTYPE_ARP => parse_arp(f, eth_src),
-        ETHERTYPE_IPV6 => parse_nd(f),
+        ETHERTYPE_IPV6 => parse_nd(f, eth_src),
         other => Err(Reject::EtherType(other)),
     }
 }
@@ -258,7 +271,7 @@ fn parse_arp(f: &[u8], eth_src: [u8; 6]) -> Result<Vec<Learned>, Reject> {
     }])
 }
 
-fn parse_nd(f: &[u8]) -> Result<Vec<Learned>, Reject> {
+fn parse_nd(f: &[u8], eth_src: [u8; 6]) -> Result<Vec<Learned>, Reject> {
     if f.len() < IP6_HDR_END {
         return Err(Reject::Truncated("ip6"));
     }
@@ -291,7 +304,10 @@ fn parse_nd(f: &[u8]) -> Result<Vec<Learned>, Reject> {
             if src.is_unspecified() {
                 return Err(Reject::DadSource);
             }
-            let mac = find_ll_option(&f[ND_OPTIONS_START..], ND_OPT_SOURCE_LL)?;
+            let mac = find_ll_option(nd_options(f)?, ND_OPT_SOURCE_LL)?;
+            if mac != eth_src {
+                return Err(Reject::LlaoMismatch);
+            }
             if let Some(class) = classify_mac(mac) {
                 return Err(Reject::SenderMac(class));
             }
@@ -306,7 +322,10 @@ fn parse_nd(f: &[u8]) -> Result<Vec<Learned>, Reject> {
                 return Err(Reject::Truncated("na"));
             }
             let target = ip6_at(f, 62);
-            let mac = find_ll_option(&f[ND_OPTIONS_START..], ND_OPT_TARGET_LL)?;
+            let mac = find_ll_option(nd_options(f)?, ND_OPT_TARGET_LL)?;
+            if mac != eth_src {
+                return Err(Reject::LlaoMismatch);
+            }
             if let Some(class) = classify_mac(mac) {
                 return Err(Reject::SenderMac(class));
             }
@@ -326,6 +345,18 @@ fn parse_nd(f: &[u8]) -> Result<Vec<Learned>, Reject> {
         }
         other => Err(Reject::Icmp6Type(other)),
     }
+}
+
+/// The ND options region, bounded by the IPv6 payload length rather
+/// than the captured length: bytes past the declared payload (padding
+/// or garbage) are not part of the message and must not be read as
+/// options. Caller has already checked `f.len() >= ND_OPTIONS_START`.
+fn nd_options(f: &[u8]) -> Result<&[u8], Reject> {
+    let end = IP6_HDR_END + be16(f, 18) as usize;
+    if end < ND_OPTIONS_START || f.len() < end {
+        return Err(Reject::Truncated("ip6_payload"));
+    }
+    Ok(&f[ND_OPTIONS_START..end])
 }
 
 /// Walk ND options `[type, len/8, data...]` for the wanted link-layer
@@ -720,10 +751,44 @@ mod tests {
 
     #[test]
     fn nd_sender_mac_classes_are_refused() {
-        let f = ns(MAC_A, v6(0x10), v6(0x20), &ll_option(1, [0xff; 6]));
+        let f = ns([0xff; 6], v6(0x10), v6(0x20), &ll_option(1, [0xff; 6]));
         assert_eq!(parse_frame(&f), Err(Reject::SenderMac(MacClass::Broadcast)));
-        let f = na(MAC_A, v6(0x10), v6(0x10), &ll_option(2, [0; 6]));
+        let f = na([0; 6], v6(0x10), v6(0x10), &ll_option(2, [0; 6]));
         assert_eq!(parse_frame(&f), Err(Reject::SenderMac(MacClass::Zero)));
+    }
+
+    #[test]
+    fn nd_link_layer_option_must_match_ethernet_source() {
+        let f = ns(MAC_A, v6(0x10), v6(0x20), &ll_option(1, MAC_B));
+        assert_eq!(parse_frame(&f), Err(Reject::LlaoMismatch));
+        let f = na(MAC_A, v6(0x10), v6(0x10), &ll_option(2, MAC_B));
+        assert_eq!(parse_frame(&f), Err(Reject::LlaoMismatch));
+        // A nonce option first, then a matching TLLAO, still learns.
+        let mut opts = vec![14, 1, 0, 0, 0, 0, 0, 0];
+        opts.extend_from_slice(&ll_option(2, MAC_A));
+        assert_eq!(one(&na(MAC_A, v6(0x10), v6(0x10), &opts)).mac, MAC_A);
+    }
+
+    #[test]
+    fn nd_options_are_bounded_by_the_ipv6_payload_length() {
+        // Declared payload ends before the option: the option bytes
+        // are trailing garbage, not an SLLAO.
+        let mut f = ns_with_sllao(MAC_A, v6(0x10), v6(0x20));
+        let declared = u16::from_be_bytes([f[18], f[19]]) - 8;
+        f[18..20].copy_from_slice(&declared.to_be_bytes());
+        assert_eq!(parse_frame(&f), Err(Reject::NoLinkLayerOption));
+        // Declared payload shorter than the fixed NS body.
+        let mut f = ns_with_sllao(MAC_A, v6(0x10), v6(0x20));
+        f[18..20].copy_from_slice(&4u16.to_be_bytes());
+        assert_eq!(parse_frame(&f), Err(Reject::Truncated("ip6_payload")));
+        // Declared payload longer than the frame.
+        let mut f = na_with_tllao(MAC_A, v6(0x10), v6(0x10));
+        f[18..20].copy_from_slice(&200u16.to_be_bytes());
+        assert_eq!(parse_frame(&f), Err(Reject::Truncated("ip6_payload")));
+        // Trailing bytes past the declared payload are ignored.
+        let mut f = ns_with_sllao(MAC_A, v6(0x10), v6(0x20));
+        f.extend_from_slice(&[1, 1, 0xde, 0xad, 0xbe, 0xef, 0, 0]);
+        assert_eq!(one(&f).mac, MAC_A);
     }
 
     #[test]

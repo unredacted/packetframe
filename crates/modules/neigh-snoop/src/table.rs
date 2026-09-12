@@ -92,9 +92,11 @@ impl LearnedTable {
             } else {
                 let old = e.mac;
                 e.mac = mac;
-                // A new MAC is a new fact; the holddown protected the
-                // old one, not this one.
-                e.last_install = None;
+                // `last_install` is deliberately kept: the holddown
+                // spaces overrides of this IP, whatever MAC each one
+                // carries. Two routers alternately claiming one address
+                // is exactly the case it exists for, and resetting here
+                // would let every alternation bypass it.
                 Observe::MacChanged { old }
             };
             e.last_seen = now;
@@ -599,9 +601,10 @@ mod tests {
         let (o, _) = t.observe(ip(1), B, Source::ArpRequest, later, mono);
         assert_eq!(o, Observe::MacChanged { old: A });
         assert_eq!(t.get(&ip(1)).unwrap().mac, B);
-        assert!(
-            t.get(&ip(1)).unwrap().last_install.is_none(),
-            "a new MAC resets the holddown"
+        assert_eq!(
+            t.get(&ip(1)).unwrap().last_install,
+            Some(mono),
+            "a MAC change keeps the holddown, so alternating claimants cannot flap the entry"
         );
     }
 

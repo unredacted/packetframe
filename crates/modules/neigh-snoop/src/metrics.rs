@@ -22,16 +22,36 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# TYPE {NS}_{name} {kind}");
 }
 
-fn labelled(out: &mut String, name: &str, iface: &str, label: &str, values: &[(&str, u64)]) {
+/// Escape an operator-supplied label value for the text exposition
+/// format. Interface names may contain `"` (the kernel allows it and
+/// `validate_iface_name` follows the kernel); one unbalanced quote
+/// makes the textfile collector reject the whole file, every module's
+/// metrics included.
+fn label(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn labelled(out: &mut String, name: &str, iface: &str, label_name: &str, values: &[(&str, u64)]) {
+    let iface = label(iface);
     for (v, n) in values {
         let _ = writeln!(
             out,
-            "{NS}_{name}{{module=\"neigh-snoop\",iface=\"{iface}\",{label}=\"{v}\"}} {n}"
+            "{NS}_{name}{{module=\"neigh-snoop\",iface=\"{iface}\",{label_name}=\"{v}\"}} {n}"
         );
     }
 }
 
 fn scalar(out: &mut String, name: &str, iface: &str, value: impl std::fmt::Display) {
+    let iface = label(iface);
     let _ = writeln!(
         out,
         "{NS}_{name}{{module=\"neigh-snoop\",iface=\"{iface}\"}} {value}"
@@ -379,6 +399,29 @@ mod tests {
         );
         // Pending coverage renders no route_nexthops series.
         assert!(!out.contains("route_nexthops{"));
+    }
+
+    #[test]
+    fn interface_names_are_escaped_and_quotes_stay_balanced() {
+        assert_eq!(label("br0"), "br0");
+        assert_eq!(label("br\"0"), "br\\\"0");
+        assert_eq!(label("a\\b"), "a\\\\b");
+        let snap = Snapshot {
+            bridges: vec![IfaceSnapshot {
+                name: "br\"0".into(),
+                ..Default::default()
+            }],
+        };
+        let mut out = String::new();
+        render_textfile(&snap, &mut out);
+        assert!(out.contains(r#"iface="br\"0""#), "{out}");
+        for line in out.lines().filter(|l| !l.starts_with('#')) {
+            let unescaped = line
+                .char_indices()
+                .filter(|(i, c)| *c == '"' && (*i == 0 || line.as_bytes()[i - 1] != b'\\'))
+                .count();
+            assert_eq!(unescaped % 2, 0, "unbalanced quotes in: {line}");
+        }
     }
 
     #[test]
