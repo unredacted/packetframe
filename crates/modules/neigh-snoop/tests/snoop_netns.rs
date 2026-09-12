@@ -865,6 +865,7 @@ fn gate_reconciles_lists_and_measures_route_server_coverage() {
     rig.wait_counter("gate changed", |s| {
         s.gate.as_ref().is_some_and(|g| {
             g.permitted_v4 == 1
+                && g.permitted_v6 == 0
                 && g.outcomes[packetframe_neigh_snoop::snapshot::GateOutcome::Changed.index()] >= 1
                 && g.last_error.is_none()
         })
@@ -887,8 +888,10 @@ fn gate_reconciles_lists_and_measures_route_server_coverage() {
         vec!["198.51.100.90".parse::<std::net::IpAddr>().unwrap()]
     );
 
-    // FRR reload: the runtime entries vanish; the next tick refills.
+    // FRR reload: a bgpd restart empties BOTH lists back to their
+    // placeholders; the next tick refills.
     std::fs::write(&v4_file, "seq 5 deny 0.0.0.0/32\n").unwrap();
+    std::fs::write(rig.names.persist.join("v6"), "seq 5 deny ::/128\n").unwrap();
     wait_for(Duration::from_secs(15), "reload refill", || {
         std::fs::read_to_string(&v4_file)
             .ok()
