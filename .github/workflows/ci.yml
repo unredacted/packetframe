@@ -160,6 +160,7 @@ jobs:
         run: |
           sudo -E $(which cargo) test -p packetframe-fast-path --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-guard --tests -- --ignored --nocapture
+          sudo -E $(which cargo) test -p packetframe-neigh-snoop --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-probe --tests -- --ignored --nocapture
 
   cross-build:

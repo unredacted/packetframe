@@ -157,6 +157,7 @@ jobs:
           # host kernel.
           cargo test -p packetframe-fast-path --tests --no-run
           cargo test -p packetframe-guard --tests --no-run
+          cargo test -p packetframe-neigh-snoop --tests --no-run
           cargo test -p packetframe-probe --tests --no-run
 
       - name: Run integration tests in QEMU
@@ -206,7 +207,7 @@ jobs:
               --disable-kvm \
               --append "watchdog_thresh=60" \
               --verbose \
-              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_SKIP=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-guard --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
+              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_SKIP=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-guard --tests -- --ignored --nocapture; cargo test -p packetframe-neigh-snoop --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture'
           }
           # Retry policy: virtme-ng propagates the guest command's exit
           # status, so a genuine test failure arrives as cargo's 101
