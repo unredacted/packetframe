@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 
 use crate::frame::{Reject, Source};
 use crate::snapshot::{
-    Counters, CoverageState, InstallOutcome, LearnOutcome, LinkEvent, LinkState, PersistOutcome,
-    SeedOutcome, Snapshot,
+    Counters, CoverageState, GateOutcome, InstallOutcome, LearnOutcome, LinkEvent, LinkState,
+    PersistOutcome, SeedOutcome, Snapshot,
 };
 use crate::table::FilterReject;
 
@@ -309,6 +309,161 @@ pub fn render_textfile(snapshot: &Snapshot, out: &mut String) {
             scalar(out, "coverage_age_seconds", &b.name, c.age_secs);
         }
     }
+
+    if let Some(g) = &snapshot.gate {
+        let gauge = |out: &mut String, name: &str, v: u64| {
+            let _ = writeln!(out, "{NS}_{name}{{module=\"neigh-snoop\"}} {v}");
+        };
+        family(
+            out,
+            "gate_reconcile_total",
+            "counter",
+            "FRR next-hop gate reconcile ticks by outcome",
+        );
+        for (label, v) in GateOutcome::LABELS.iter().zip(g.outcomes.iter()) {
+            let _ = writeln!(
+                out,
+                "{NS}_gate_reconcile_total{{module=\"neigh-snoop\",outcome=\"{label}\"}} {v}"
+            );
+        }
+        family(
+            out,
+            "gate_permitted_nexthops",
+            "gauge",
+            "runtime entries currently in the gate lists",
+        );
+        for (fam, v) in [("v4", g.permitted_v4), ("v6", g.permitted_v6)] {
+            let _ = writeln!(
+                out,
+                "{NS}_gate_permitted_nexthops{{module=\"neigh-snoop\",family=\"{fam}\"}} {v}"
+            );
+        }
+        family(
+            out,
+            "gate_pending_removals",
+            "gauge",
+            "listed addresses unresolved but inside the removal hysteresis",
+        );
+        gauge(out, "gate_pending_removals", g.pending_removals);
+        family(
+            out,
+            "gate_lists_present",
+            "gauge",
+            "1 when both gate prefix-lists exist in FRR",
+        );
+        gauge(out, "gate_lists_present", u64::from(g.lists_present));
+        family(
+            out,
+            "gate_vtysh_ms",
+            "gauge",
+            "wall time of the last reconcile tick",
+        );
+        gauge(out, "gate_vtysh_ms", g.vtysh_ms);
+        family(
+            out,
+            "gate_consecutive_failures",
+            "gauge",
+            "reconcile ticks failed in a row",
+        );
+        gauge(
+            out,
+            "gate_consecutive_failures",
+            u64::from(g.consecutive_failures),
+        );
+    }
+
+    if !snapshot.rs.is_empty() {
+        let rs_gauge = |out: &mut String, name: &str, rs: &str, iface: &str, v: u64| {
+            let iface = label(iface);
+            let _ = writeln!(
+                out,
+                "{NS}_{name}{{module=\"neigh-snoop\",iface=\"{iface}\",rs=\"{rs}\"}} {v}"
+            );
+        };
+        family(
+            out,
+            "rs_received_prefixes",
+            "gauge",
+            "prefixes received from the route server",
+        );
+        family(
+            out,
+            "rs_received_nexthops",
+            "gauge",
+            "distinct next-hops among them",
+        );
+        family(
+            out,
+            "rs_unresolved_nexthops",
+            "gauge",
+            "next-hops neither bilateral nor resolved",
+        );
+        family(
+            out,
+            "rs_demoted_prefixes",
+            "gauge",
+            "received prefixes the gate keeps below transit",
+        );
+        family(
+            out,
+            "rs_dump_ms",
+            "gauge",
+            "wall time of the last received-routes dump",
+        );
+        family(
+            out,
+            "rs_unparsed_prefixes",
+            "gauge",
+            "received entries whose next-hop the parser did not understand",
+        );
+        family(out, "rs_dump_ok", "gauge", "1 when the last dump parsed");
+        for r in &snapshot.rs {
+            let rs = r.rs.to_string();
+            rs_gauge(
+                out,
+                "rs_received_prefixes",
+                &rs,
+                &r.bridge,
+                r.received_prefixes,
+            );
+            rs_gauge(
+                out,
+                "rs_received_nexthops",
+                &rs,
+                &r.bridge,
+                r.nexthops.total,
+            );
+            rs_gauge(
+                out,
+                "rs_unresolved_nexthops",
+                &rs,
+                &r.bridge,
+                r.nexthops.total.saturating_sub(r.nexthops.resolved),
+            );
+            rs_gauge(
+                out,
+                "rs_demoted_prefixes",
+                &rs,
+                &r.bridge,
+                r.demoted_prefixes,
+            );
+            rs_gauge(out, "rs_dump_ms", &rs, &r.bridge, r.dump_ms);
+            rs_gauge(
+                out,
+                "rs_unparsed_prefixes",
+                &rs,
+                &r.bridge,
+                r.unparsed_prefixes,
+            );
+            rs_gauge(
+                out,
+                "rs_dump_ok",
+                &rs,
+                &r.bridge,
+                u64::from(r.error.is_none()),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +513,7 @@ mod tests {
                 counters: counters.clone(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let mut out = String::new();
         render_textfile(&snap, &mut out);
@@ -411,6 +567,7 @@ mod tests {
                 name: "br\"0".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let mut out = String::new();
         render_textfile(&snap, &mut out);
@@ -422,6 +579,57 @@ mod tests {
                 .count();
             assert_eq!(unescaped % 2, 0, "unbalanced quotes in: {line}");
         }
+    }
+
+    #[test]
+    fn gate_and_rs_render_when_present() {
+        use crate::snapshot::{GateSnapshot, RsCoverageSnapshot};
+        let mut outcomes = [0u64; GateOutcome::COUNT];
+        outcomes[GateOutcome::Changed.index()] = 3;
+        let snap = Snapshot {
+            bridges: vec![IfaceSnapshot {
+                name: "br0".into(),
+                ..Default::default()
+            }],
+            gate: Some(GateSnapshot {
+                lists_present: true,
+                permitted_v4: 12,
+                permitted_v6: 4,
+                pending_removals: 1,
+                outcomes,
+                ..Default::default()
+            }),
+            rs: vec![RsCoverageSnapshot {
+                rs: "192.0.2.2".parse().unwrap(),
+                bridge: "br0".into(),
+                received_prefixes: 100,
+                unparsed_prefixes: 1,
+                nexthops: Ratio {
+                    resolved: 8,
+                    total: 10,
+                },
+                unresolved_nexthops: vec![],
+                demoted_prefixes: 7,
+                dump_ms: 900,
+                age_secs: 0,
+                error: None,
+            }],
+        };
+        let mut out = String::new();
+        render_textfile(&snap, &mut out);
+        assert!(out.contains("gate_reconcile_total{module=\"neigh-snoop\",outcome=\"changed\"} 3"));
+        assert!(out.contains("gate_permitted_nexthops{module=\"neigh-snoop\",family=\"v4\"} 12"));
+        assert!(out.contains("gate_pending_removals{module=\"neigh-snoop\"} 1"));
+        assert!(out.contains(
+            "rs_demoted_prefixes{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 7"
+        ));
+        assert!(out.contains(
+            "rs_unresolved_nexthops{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 2"
+        ));
+        assert!(out.contains("rs_dump_ok{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 1"));
+        assert!(out.contains(
+            "rs_unparsed_prefixes{module=\"neigh-snoop\",iface=\"br0\",rs=\"192.0.2.2\"} 1"
+        ));
     }
 
     #[test]
@@ -454,6 +662,7 @@ mod tests {
                 }),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let mut out = String::new();
         render_textfile(&snap, &mut out);

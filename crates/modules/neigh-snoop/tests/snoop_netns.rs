@@ -29,8 +29,6 @@ use packetframe_neigh_snoop::engine::EngineHandle;
 use packetframe_neigh_snoop::snapshot::{InstallOutcome, Snapshot};
 use packetframe_neigh_snoop::table::SkipReason;
 
-const IGNORE_REASON: &str = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored";
-
 // --- netns plumbing ------------------------------------------------------
 
 struct Names {
@@ -508,7 +506,6 @@ fn ll(last: u16) -> Ipv6Addr {
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
 fn learns_third_party_arp_and_installs_stale() {
-    let _ = IGNORE_REASON;
     let rig = Rig::start();
     assert!(rig.neigh("198.51.100.77").is_none(), "clean start");
     rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
@@ -733,6 +730,246 @@ fn emits_nothing() {
     assert_eq!(
         ours, 0,
         "the snooped interface emitted ARP/ND during a learn cycle"
+    );
+    rig.stop();
+}
+
+// --- FRR gate + route-server coverage, against a stateful fake vtysh ---
+
+/// A `vtysh` stand-in that keeps the two prefix-lists in files, logs
+/// every invocation (one line per process, so batching is visible),
+/// and serves a canned received-routes JSON. Written by the test into
+/// the scratch directory; the engine finds it via `PACKETFRAME_VTYSH`.
+fn write_fake_vtysh(state: &std::path::Path) -> PathBuf {
+    let script = format!(
+        r#"#!/bin/sh
+STATE="{state}"
+echo "$*" >> "$STATE/log"
+show_list() {{
+  fam="$1"; name="$2"; f="$STATE/$3"
+  if [ -f "$f" ]; then
+    echo "$fam prefix-list $name: $(wc -l < "$f" | tr -d ' ') entries"
+    sed 's/^/   /' "$f"
+  else
+    echo "% Can't find specified prefix-list"
+  fi
+}}
+del_line() {{
+  f="$STATE/$1"; line="$2"
+  grep -v -x -F -- "$line" "$f" > "$f.tmp" || true
+  mv "$f.tmp" "$f"
+}}
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-c" ]; then
+    shift; cmd="$1"
+    case "$cmd" in
+      "show version") echo "FRRouting 10.1.2 (fake)";;
+      "show ip prefix-list "*) show_list ip "${{cmd##* }}" v4;;
+      "show ipv6 prefix-list "*) show_list ipv6 "${{cmd##* }}" v6;;
+      "show bgp ipv4 unicast neighbors "*" received-routes json") cat "$STATE/rs4.json";;
+      "show bgp ipv6 unicast neighbors "*" received-routes json") echo '{{"receivedRoutes":{{}}}}';;
+      "configure terminal") ;;
+      "no ip prefix-list "*) del_line v4 "${{cmd#no ip prefix-list * }}";;
+      "no ipv6 prefix-list "*) del_line v6 "${{cmd#no ipv6 prefix-list * }}";;
+      "ip prefix-list "*) echo "${{cmd#ip prefix-list * }}" >> "$STATE/v4";;
+      "ipv6 prefix-list "*) echo "${{cmd#ipv6 prefix-list * }}" >> "$STATE/v6";;
+      *) echo "% Unknown command: $cmd" >&2; exit 1;;
+    esac
+  fi
+  shift
+done
+"#,
+        state = state.display()
+    );
+    let path = state.join("vtysh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+const RS_JSON: &str = r#"{"receivedRoutes":{
+  "203.0.113.0/25":{"network":"203.0.113.0/25","nextHop":"198.51.100.77"},
+  "203.0.113.128/25":{"network":"203.0.113.128/25","nextHop":"198.51.100.77"},
+  "192.0.2.0/24":{"network":"192.0.2.0/24","nextHop":"198.51.100.90"}
+}}"#;
+
+/// (k) The gate reconciler against real kernel state and a fake vtysh:
+/// a learned, confirmed neighbour lands in the v4 list in one batched
+/// invocation with an explicit sequence number; the route-server join
+/// counts the prefix behind an unheard next-hop as demoted; an
+/// emptied list (FRR reload) is refilled; a deleted neighbour leaves
+/// the list only after the removal hysteresis.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn gate_reconciles_lists_and_measures_route_server_coverage() {
+    let names = Names::new();
+    let guard = NetnsGuard::setup(&names);
+    let ns_fd = enter_netns(&names.netns);
+    std::fs::create_dir_all(&names.persist).unwrap();
+    std::fs::write(names.persist.join("v4"), "seq 5 deny 0.0.0.0/32\n").unwrap();
+    std::fs::write(names.persist.join("v6"), "seq 5 deny ::/128\n").unwrap();
+    std::fs::write(names.persist.join("rs4.json"), RS_JSON).unwrap();
+    let fake = write_fake_vtysh(&names.persist);
+    // Read once, at engine start; the gate tests are serialized through
+    // this env var by being one test.
+    std::env::set_var("PACKETFRAME_VTYSH", &fake);
+
+    let s = format!(
+        "module neigh-snoop\n  bridge {a}\n  prefix {a} 198.51.100.0/24\n  \
+         prefix {a} 2001:db8::/64\n  prefix {a} fe80::/10\n  install-rate 500/1s\n  \
+         peer {a} 198.51.100.2 route-server\n  \
+         frr-gate v4 GATE4 v6 GATE6 interval 5s remove-after 3s\n  \
+         rs-coverage-interval 5s\n",
+        a = names.veth_a
+    );
+    let c = Config::parse(&s).unwrap();
+    let cfg = SnoopConfig::from_directives(&c.modules[0].directives).unwrap();
+    let engine = EngineHandle::start(cfg, names.persist.clone()).expect("engine start");
+    let b_ifindex = if_nametoindex(&names.veth_b);
+    let injector = open_packet_socket(b_ifindex);
+    let rig = Rig {
+        names,
+        _guard: guard,
+        _ns_fd: ns_fd,
+        engine: Some(engine),
+        injector,
+        b_ifindex,
+    };
+    let v4_file = rig.names.persist.join("v4");
+    let log_file = rig.names.persist.join("log");
+    let entry = "seq 100 permit 198.51.100.77/32";
+
+    rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
+    rig.wait_neigh("198.51.100.77", |l| l.contains("STALE"));
+    wait_for(Duration::from_secs(15), "gate add", || {
+        std::fs::read_to_string(&v4_file)
+            .ok()
+            .filter(|s| s.contains(entry))
+    });
+    let log = std::fs::read_to_string(&log_file).unwrap();
+    let batch = log
+        .lines()
+        .find(|l| l.contains("configure terminal"))
+        .expect("one configure invocation");
+    assert!(
+        batch.contains(entry),
+        "the add rides in the configure batch: {batch}"
+    );
+    assert!(
+        !std::fs::read_to_string(&v4_file)
+            .unwrap()
+            .contains("seq 5 permit"),
+        "placeholders untouched"
+    );
+    rig.wait_counter("gate changed", |s| {
+        s.gate.as_ref().is_some_and(|g| {
+            g.permitted_v4 == 1
+                && g.permitted_v6 == 0
+                && g.outcomes[packetframe_neigh_snoop::snapshot::GateOutcome::Changed.index()] >= 1
+                && g.last_error.is_none()
+        })
+    });
+
+    // Route-server join: .77 resolves (two prefixes), .90 was never
+    // heard (one prefix demoted).
+    wait_for(Duration::from_secs(15), "rs coverage", || {
+        let s = rig.snapshot();
+        s.rs.first()
+            .filter(|r| r.error.is_none() && r.received_prefixes == 3)
+            .map(|r| format!("{r:?}"))
+    });
+    let r = rig.snapshot().rs.remove(0);
+    assert_eq!(r.demoted_prefixes, 1, "{r:?}");
+    assert_eq!(r.nexthops.total, 2);
+    assert_eq!(r.nexthops.resolved, 1);
+    assert_eq!(
+        r.unresolved_nexthops,
+        vec!["198.51.100.90".parse::<std::net::IpAddr>().unwrap()]
+    );
+
+    // FRR reload: a bgpd restart empties BOTH lists back to their
+    // placeholders; the next tick refills.
+    std::fs::write(&v4_file, "seq 5 deny 0.0.0.0/32\n").unwrap();
+    std::fs::write(rig.names.persist.join("v6"), "seq 5 deny ::/128\n").unwrap();
+    wait_for(Duration::from_secs(15), "reload refill", || {
+        std::fs::read_to_string(&v4_file)
+            .ok()
+            .filter(|s| s.contains(entry))
+    });
+    rig.wait_counter("reload counted", |s| {
+        s.gate.as_ref().is_some_and(|g| {
+            g.outcomes[packetframe_neigh_snoop::snapshot::GateOutcome::ReloadRefill.index()] >= 1
+        })
+    });
+
+    // Removal hysteresis: delete the kernel entry; the list keeps it
+    // for remove-after, then drops it in a `no … seq 100 …` command.
+    ns_run(
+        &rig.names.netns,
+        &[
+            "ip",
+            "neigh",
+            "del",
+            "198.51.100.77",
+            "dev",
+            &rig.names.veth_a,
+        ],
+    );
+    wait_for(Duration::from_secs(25), "gate removal", || {
+        std::fs::read_to_string(&v4_file)
+            .ok()
+            .filter(|s| !s.contains(entry))
+    });
+    let log = std::fs::read_to_string(&log_file).unwrap();
+    assert!(
+        log.contains(&format!("no ip prefix-list GATE4 {entry}")),
+        "removal carries the parsed sequence number: {log}"
+    );
+    rig.stop();
+}
+
+/// (l) One MAC per member port: a MAC learned for one address on a
+/// declared `peer` line is installed for its other addresses too.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn derives_sibling_addresses_of_a_declared_peer() {
+    let names = Names::new();
+    let guard = NetnsGuard::setup(&names);
+    let ns_fd = enter_netns(&names.netns);
+    let s = format!(
+        "module neigh-snoop\n  bridge {a}\n  prefix {a} 198.51.100.0/24\n  \
+         prefix {a} 2001:db8::/64\n  install-rate 500/1s\n  \
+         peer {a} 198.51.100.77 2001:db8::77\n",
+        a = names.veth_a
+    );
+    let c = Config::parse(&s).unwrap();
+    let cfg = SnoopConfig::from_directives(&c.modules[0].directives).unwrap();
+    std::fs::create_dir_all(&names.persist).unwrap();
+    let engine = EngineHandle::start(cfg, names.persist.clone()).expect("engine start");
+    let b_ifindex = if_nametoindex(&names.veth_b);
+    let injector = open_packet_socket(b_ifindex);
+    let rig = Rig {
+        names,
+        _guard: guard,
+        _ns_fd: ns_fd,
+        engine: Some(engine),
+        injector,
+        b_ifindex,
+    };
+    rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
+    let line = rig.wait_neigh("2001:db8::77", |l| l.contains("STALE"));
+    assert!(line.contains(&mac_str(MAC_X)), "{line}");
+    rig.wait_counter("derived counted", |s| {
+        s.bridges[0].counters.learn
+            [packetframe_neigh_snoop::snapshot::LearnOutcome::Derived.index()]
+            >= 1
+    });
+    assert!(
+        rig.snapshot().bridges[0]
+            .never_heard
+            .contains(&"2001:db8::77".parse().unwrap()),
+        "derived is installed but not counted as heard"
     );
     rig.stop();
 }

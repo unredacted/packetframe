@@ -46,6 +46,8 @@ pub fn attach_ifaces_from_config(config: &Config) -> Vec<String> {
 pub struct NeighSnoopProbeInputs {
     pub bridges: Vec<String>,
     pub persist_dir: std::path::PathBuf,
+    /// `frr-gate` `(v4 list, v6 list)` when configured.
+    pub gate_lists: Option<(String, String)>,
 }
 
 pub fn neigh_snoop_probe_inputs_from_config(config: &Config) -> NeighSnoopProbeInputs {
@@ -55,6 +57,7 @@ pub fn neigh_snoop_probe_inputs_from_config(config: &Config) -> NeighSnoopProbeI
             .global
             .state_dir
             .join(packetframe_common::config::NEIGH_SNOOP_PERSIST_SUBDIR),
+        gate_lists: None,
     };
     for m in &config.modules {
         if m.name != "neigh-snoop" {
@@ -66,6 +69,9 @@ pub fn neigh_snoop_probe_inputs_from_config(config: &Config) -> NeighSnoopProbeI
                     out.bridges.push(iface.clone());
                 }
                 ModuleDirective::SnoopPersistDir { path, .. } => out.persist_dir = path.clone(),
+                ModuleDirective::SnoopFrrGate {
+                    v4_list, v6_list, ..
+                } => out.gate_lists = Some((v4_list.clone(), v6_list.clone())),
                 _ => {}
             }
         }
@@ -458,9 +464,14 @@ pub fn probe_and_render(
     // module waits for it by name.
     #[cfg(feature = "neigh-snoop")]
     if !snoop.bridges.is_empty() {
-        for cap in
-            packetframe_neigh_snoop::run_feasibility_probes(&snoop.bridges, &snoop.persist_dir)
-        {
+        for cap in packetframe_neigh_snoop::run_feasibility_probes(
+            &snoop.bridges,
+            &snoop.persist_dir,
+            snoop
+                .gate_lists
+                .as_ref()
+                .map(|(a, b)| (a.as_str(), b.as_str())),
+        ) {
             report.capabilities.push(cap);
         }
     }

@@ -167,9 +167,7 @@ next-hop the address the lists hold. The failure direction is
 "demote", never "prefer": a bgpd restart empties the runtime entries
 and every route-server route drops below transit until PF refills them.
 
-PF owns the dynamic half when `frr-gate` is configured (its behaviour
-is described here for operators; the reconciler lands with the
-`frr-gate` slice):
+PF owns the dynamic half when `frr-gate` is configured:
 
 - Desired set: addresses on snooped bridges whose kernel entry holds a
   MAC in REACHABLE/STALE/DELAY/PROBE. Added at once; removed only after
@@ -179,7 +177,9 @@ is described here for operators; the reconciler lands with the
 - Actual set: `show ip prefix-list <name>` / `show ipv6 prefix-list
   <name>` through `vtysh`, compared by content. Entries at sequence
   numbers below 100 are the operator's placeholders and are never
-  touched.
+  touched; runtime entries are written with explicit sequence numbers
+  from 100 upward (FRR's auto-numbering would continue from the
+  placeholder into the operator's range).
 - One batched `vtysh` invocation per changed tick; a readback that
   matches the desired set is what counts as `changed`.
 - A reload (the lists fell back to placeholders only) triggers an

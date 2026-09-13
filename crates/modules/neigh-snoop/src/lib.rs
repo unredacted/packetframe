@@ -37,10 +37,12 @@ pub mod bpf_filter;
 pub mod cfg;
 pub mod coverage;
 pub mod frame;
+pub mod frr_gate;
 pub mod health;
 pub mod metrics;
 pub mod persist;
 pub mod probe_linux;
+pub mod rs_coverage;
 pub mod snapshot;
 pub mod table;
 
