@@ -244,9 +244,13 @@ Alongside the existing counter family, the textfile exporter emits:
 Example alerts:
 
 ```promql
-# 80% NEXTHOPS occupancy.
-(packetframe_nexthops{state="resolved"} + packetframe_nexthops{state="failed"})
+# 80% NEXTHOPS occupancy: every live bucket counts, and the failure
+# mode this section describes is precisely thousands of `incomplete`.
+sum(packetframe_nexthops{state=~"resolved|incomplete|failed|stale"})
   / packetframe_nexthops_max > 0.8
+
+# Nexthops whose traffic is on the kernel path.
+sum(packetframe_nexthops{state=~"incomplete|failed"}) > 0
 
 # Unexpected forwarding-mode transition.
 changes(packetframe_fib_forwarding_mode{mode="custom-fib"}[5m]) > 0

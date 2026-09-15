@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
-use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_REQUEST};
 use netlink_packet_route::{
     link::{LinkAttribute, LinkMessage},
     neighbour::{
@@ -345,8 +345,10 @@ fn ifindex_by_name(name: &str) -> Option<u32> {
 /// What `issue_proactive_resolve` did with one cache miss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
-    /// `RTM_NEWNEIGH NUD_NONE` was written; the kernel resolves.
-    Kicked,
+    /// `RTM_NEWNEIGH NTF_USE` was accepted for the neighbour on `oif`;
+    /// the kernel is soliciting (or already had it, see
+    /// `read_back_after_kick`).
+    Kicked { oif: u32 },
     /// The neighbour write failed (logged at debug; first-packet ARP
     /// remains the fallback).
     Failed,
@@ -709,19 +711,25 @@ impl NetlinkNeighborResolver {
                                 // lookup or neighbor add fails, log at debug
                                 // and fall back to first-packet kernel ARP.
                                 let ix_oifs = self.ix_oifs();
-                                if issue_proactive_resolve(&handle, ip, &ix_oifs).await
-                                    == ProbeOutcome::Suppressed
-                                {
-                                    let n = self.ix_probe_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n <= 20 {
-                                        info!(
-                                            ?ip,
-                                            "neighbour cache miss on an ix-mode interface; \
-                                             proactive probe suppressed (the snooper seeds it)"
-                                        );
-                                    } else {
-                                        debug!(?ip, "proactive probe suppressed (ix-mode)");
+                                match issue_proactive_resolve(&handle, ip, &ix_oifs).await {
+                                    ProbeOutcome::Suppressed => {
+                                        let n = self.ix_probe_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if n <= 20 {
+                                            info!(
+                                                ?ip,
+                                                "neighbour cache miss on an ix-mode interface; \
+                                                 proactive probe suppressed (the snooper seeds it)"
+                                            );
+                                        } else {
+                                            debug!(?ip, "proactive probe suppressed (ix-mode)");
+                                        }
                                     }
+                                    ProbeOutcome::Kicked { oif } => {
+                                        self.read_back_after_kick(&handle, ip, oif).await;
+                                    }
+                                    ProbeOutcome::Failed
+                                    | ProbeOutcome::NoRoute
+                                    | ProbeOutcome::Unspecified => {}
                                 }
                             }
                         }
@@ -909,6 +917,85 @@ impl NetlinkNeighborResolver {
                 warn!(?err, "netlink error message");
             }
             _ => {}
+        }
+    }
+
+    /// After a kick the kernel accepted, read the entry back.
+    ///
+    /// `NTF_USE` is a no-op on a REACHABLE or PERMANENT neighbour. So
+    /// when the kernel already knew the answer and only our cache did
+    /// not — the startup dump failed, or the same address on another
+    /// device displaced this one in the IP-keyed cache — no
+    /// `RTM_NEWNEIGH` follows the kick, and the nexthop would sit
+    /// `Incomplete`, re-probed on backoff, until some unrelated state
+    /// change (never, for a permanent entry). One non-dump
+    /// `RTM_GETNEIGH` for `(oif, ip)` closes that: a usable MAC in the
+    /// reply is synthesized into `Learned` exactly as a cache hit would
+    /// have been (review finding on #220).
+    ///
+    /// Best-effort. `ENOENT` means nothing is there yet and the
+    /// solicitation is in flight; a kernel without `neigh_get` (pre-5.1)
+    /// answers `EOPNOTSUPP`. Both fall through to the multicast path,
+    /// which is where the answer arrives in the common case anyway.
+    async fn read_back_after_kick(&mut self, handle: &Handle, ip: IpAddr, oif: u32) {
+        let mut h = handle.clone();
+        let mut replies = match h.request(neigh_get_request(ip, oif)) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(?ip, oif, error = %e, "neighbour read-back request failed");
+                return;
+            }
+        };
+        while let Some(msg) = replies.next().await {
+            match msg.payload {
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(n)) => {
+                    let src_mac = self
+                        .iface_mac
+                        .get(&n.header.ifindex)
+                        .copied()
+                        .unwrap_or([0; 6]);
+                    if let Some(NeighEvent::Learned {
+                        ip: got,
+                        mac,
+                        ifindex,
+                        src_mac,
+                    }) = parse_neighbour_add(&n, src_mac)
+                    {
+                        self.neigh_cache.insert(got, (ifindex, mac));
+                        self.maybe_send_pin(got, ifindex, mac);
+                        let evt = NeighEvent::Learned {
+                            ip: got,
+                            mac,
+                            ifindex,
+                            src_mac,
+                        };
+                        match self.events_tx.send(evt).await {
+                            Ok(()) => {
+                                self.synth_learned_emitted += 1;
+                                debug!(
+                                    ?got,
+                                    ifindex,
+                                    "kernel already held a usable neighbour; Learned synthesized \
+                                     from read-back"
+                                );
+                            }
+                            Err(e) => warn!(?got, error = %e, "read-back Learned send failed"),
+                        }
+                    }
+                    return;
+                }
+                NetlinkPayload::Error(e) => {
+                    debug!(
+                        ?ip,
+                        oif,
+                        code = ?e.code,
+                        "neighbour read-back: no entry yet (solicitation in flight) or \
+                         neigh_get unsupported"
+                    );
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1607,13 +1694,34 @@ async fn issue_proactive_resolve(
     {
         Ok(()) => {
             debug!(?ip, oif, "proactive resolve kicked");
-            ProbeOutcome::Kicked
+            ProbeOutcome::Kicked { oif }
         }
         Err(e) => {
             debug!(?ip, oif, error = %e, "proactive resolve failed");
             ProbeOutcome::Failed
         }
     }
+}
+
+/// A non-dump `RTM_GETNEIGH` for one `(device, address)` pair — the
+/// kernel's `neigh_get` (5.1+). `NLM_F_REQUEST` only: with `NLM_F_DUMP`
+/// this would be the whole table, which is what the startup seed does
+/// and what a per-kick read-back must not.
+pub fn neigh_get_request(ip: IpAddr, oif: u32) -> NetlinkMessage<RouteNetlinkMessage> {
+    let mut nm = NeighbourMessage::default();
+    nm.header.ifindex = oif;
+    nm.header.family = match ip {
+        IpAddr::V4(_) => AddressFamily::Inet,
+        IpAddr::V6(_) => AddressFamily::Inet6,
+    };
+    nm.attributes
+        .push(NeighbourAttribute::Destination(match ip {
+            IpAddr::V4(a) => NeighbourAddress::Inet(a),
+            IpAddr::V6(a) => NeighbourAddress::Inet6(a),
+        }));
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::GetNeighbour(nm));
+    req.header.flags = NLM_F_REQUEST;
+    req
 }
 
 /// Query the main routing table for `msg`, return the OIF of the
@@ -2253,5 +2361,37 @@ mod tests {
         assert_eq!(v4, Some(PeerId::local_arp(33)));
         assert_eq!(v6, Some(PeerId::local_arp(33)));
         assert_eq!(v4, v6, "both families must resolve to the same peer");
+    }
+}
+
+#[cfg(test)]
+mod read_back_tests {
+    use super::*;
+
+    #[test]
+    fn neigh_get_request_is_a_single_entry_lookup_not_a_dump() {
+        use netlink_packet_core::NLM_F_DUMP;
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+        let req = neigh_get_request(ip, 17);
+        assert_eq!(
+            req.header.flags & NLM_F_DUMP,
+            0,
+            "a dump would walk the whole table per kick"
+        );
+        assert_ne!(req.header.flags & NLM_F_REQUEST, 0);
+        match req.payload {
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::GetNeighbour(nm)) => {
+                assert_eq!(
+                    nm.header.ifindex, 17,
+                    "keyed by device like the kernel table"
+                );
+                assert_eq!(nm.header.family, AddressFamily::Inet);
+                assert!(matches!(
+                    nm.attributes.as_slice(),
+                    [NeighbourAttribute::Destination(NeighbourAddress::Inet(a))] if *a == Ipv4Addr::new(192, 0, 2, 9)
+                ));
+            }
+            other => panic!("expected GetNeighbour, got {other:?}"),
+        }
     }
 }
