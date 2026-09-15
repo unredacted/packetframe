@@ -68,7 +68,7 @@ pub fn run(op: FibOp) -> ExitCode {
     match op {
         FibOp::DumpV4 { config, unresolved } => dispatch(config, |bpffs| {
             match inspect::dump_v4(bpffs) {
-                Ok(entries) => print_dump("v4", &only_unresolved(entries, unresolved)),
+                Ok(entries) => print_dump("v4", entries, unresolved),
                 Err(e) => {
                     eprintln!("fib dump-v4 failed: {e}");
                     return ExitCode::from(EXIT_RUNTIME_ERROR);
@@ -78,7 +78,7 @@ pub fn run(op: FibOp) -> ExitCode {
         }),
         FibOp::DumpV6 { config, unresolved } => dispatch(config, |bpffs| {
             match inspect::dump_v6(bpffs) {
-                Ok(entries) => print_dump("v6", &only_unresolved(entries, unresolved)),
+                Ok(entries) => print_dump("v6", entries, unresolved),
                 Err(e) => {
                     eprintln!("fib dump-v6 failed: {e}");
                     return ExitCode::from(EXIT_RUNTIME_ERROR);
@@ -132,35 +132,44 @@ where
     body(&cfg.global.bpffs_root)
 }
 
-/// `--unresolved`: keep the prefixes with at least one nexthop that is
-/// not forwarding. An ECMP group with one dead leg still forwards (the
-/// datapath walks to a live leg), but it is listed too: the dead leg is
-/// what the operator is hunting.
-fn only_unresolved(entries: Vec<FibEntry>, filter: bool) -> Vec<FibEntry> {
-    if !filter {
-        return entries;
+/// Print a dump. With `unresolved` set, only the prefixes whose nexthop
+/// chain has a member that is not forwarding are printed, and the
+/// header says so against the full table size — a filtered dump that
+/// read "(FIB_V4 empty)" on a healthy table, or "2 entries in FIB_V4"
+/// on a full one, would mislead exactly when it is being used. An ECMP
+/// group with one dead leg still forwards (the datapath walks to a live
+/// leg) but is listed too: the dead leg is what the operator is hunting.
+fn print_dump(family_tag: &str, entries: Vec<FibEntry>, unresolved: bool) {
+    let map = format!("FIB_{}", family_tag.to_uppercase());
+    let total = entries.len();
+    if !unresolved {
+        if entries.is_empty() {
+            println!("({map} empty)");
+            return;
+        }
+        println!("{total} entries in {map}");
+        for entry in &entries {
+            print_entry(entry);
+        }
+        return;
     }
-    entries
+    let hits: Vec<FibEntry> = entries
         .into_iter()
         .filter(|e| {
             e.nexthops
                 .iter()
                 .any(|nh| nh.state != NexthopState::Resolved)
         })
-        .collect()
-}
-
-fn print_dump(family_tag: &str, entries: &[FibEntry]) {
-    if entries.is_empty() {
-        println!("(FIB_{} empty)", family_tag.to_uppercase());
+        .collect();
+    if hits.is_empty() {
+        println!("(no entries with an unresolved nexthop among {total} in {map})");
         return;
     }
     println!(
-        "{} entries in FIB_{}",
-        entries.len(),
-        family_tag.to_uppercase()
+        "{} of {total} entries in {map} have an unresolved nexthop",
+        hits.len()
     );
-    for entry in entries {
+    for entry in &hits {
         print_entry(entry);
     }
 }

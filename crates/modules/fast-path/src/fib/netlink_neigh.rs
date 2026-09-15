@@ -36,7 +36,9 @@ use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{
     link::{LinkAttribute, LinkMessage},
-    neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState},
+    neighbour::{
+        NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
+    },
     route::{RouteAttribute, RouteType},
     AddressFamily, RouteNetlinkMessage,
 };
@@ -1314,10 +1316,14 @@ impl NetlinkNeighborResolver {
             }
         };
         tokio::spawn(connection);
+        // NTF_USE for the same reason as `issue_proactive_resolve`:
+        // without it the kernel creates a silent NUD_NONE entry and no
+        // ARP leaves the box.
         match handle
             .neighbours()
             .add(oif, ip)
             .state(NeighbourState::None)
+            .flags(NeighbourFlags::Use)
             .replace()
             .execute()
             .await
@@ -1575,14 +1581,26 @@ async fn issue_proactive_resolve(
         debug!(?ip, oif, "proactive resolve: egress is ix-mode; not kicked");
         return ProbeOutcome::Suppressed;
     }
-    // Issue the RTM_NEWNEIGH with NUD_NONE. The kernel interprets
-    // "state NONE + no lladdr" as "initialize this neighbor and start
-    // resolving." Replace lets the call be idempotent, if the
-    // neighbor already exists, we quietly succeed.
+    // Issue the RTM_NEWNEIGH with NTF_USE. The flag is what makes the
+    // kernel *do* something: `neigh_add` routes an NTF_USE request to
+    // `neigh_event_send`, which takes a NONE/FAILED entry to INCOMPLETE
+    // and transmits the first ARP/NS immediately, walks a STALE one
+    // through DELAY/PROBE, and is a no-op on REACHABLE. Without it the
+    // request is a plain `__neigh_update` to `NUD_NONE`: the entry is
+    // created or reset with no timer and no solicitation, and nothing
+    // resolves it until the kernel itself sends to that address —
+    // which, for a nexthop whose traffic is XDP-redirected, it never
+    // does. That gap is why the re-probe schedule in the programmer
+    // could otherwise back off forever (review finding on #220).
+    // `state` is ignored on the NTF_USE path; it is set so a kernel
+    // that ever fell back to the update path would still not write a
+    // bogus VALID state. Replace keeps the call idempotent when the
+    // entry already exists.
     match handle
         .neighbours()
         .add(oif, ip)
         .state(NeighbourState::None)
+        .flags(NeighbourFlags::Use)
         .replace()
         .execute()
         .await

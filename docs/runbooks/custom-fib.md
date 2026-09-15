@@ -69,10 +69,13 @@ Indicators that the custom-FIB path is working:
   both increment it on redirect **acceptance** — under generic XDP the
   kernel can still drop the frame silently after the count; see
   `generic-mode-performance.md`, "Silent TX drops under generic XDP").
-- `pass_no_neigh` stays below ~0.01% of matched traffic after the
-  first few seconds (first-packet ARP is expected; sustained-high
-  means a nexthop is genuinely unreachable or the neighbor resolver
-  is broken — see the triage entry below, and check it as a rate).
+- `pass_no_neigh` stays below ~1% of matched traffic (`matched_v4 +
+  matched_v6`) once the table has converged, and does not trend up.
+  Judge it as a rate over 60 s, never from the lifetime total. A
+  small floor from neighbours that never answer (dead hosts inside a
+  local-prefix, peers that filter ARP/ND) is normal; a sustained climb
+  above your converged baseline means nexthops are losing resolution
+  and not regaining it — see the triage entry below.
 - `packetframe status` shows `nexthops (incomplete)` and `nexthops
   (failed)` at or near zero once the table has converged.
 - `bmp_peer_down` stays at zero unless a BGP session you expect to
@@ -975,8 +978,9 @@ What it means: FIB matches land on nexthop entries with state ≠
 `Resolved`, and every one of those packets takes the kernel path:
 netfilter, conntrack, the FIB walk — the load the fast path exists
 to remove. Judge it as a **rate**, never from the lifetime total
-(`status` twice, 60 s apart). Healthy is well under 0.1 % of
-`rx_total`.
+(`status` twice, 60 s apart), against the same threshold the healthy
+list uses: below ~1% of matched traffic (`matched_v4 + matched_v6`)
+after convergence, and not trending up.
 
 Why it happens: the kernel only re-resolves a neighbour it sends to
 itself, and XDP-redirected traffic never touches the kernel entry.
