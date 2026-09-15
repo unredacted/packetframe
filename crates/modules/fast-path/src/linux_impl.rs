@@ -593,6 +593,11 @@ pub struct ActiveState {
     /// `kernel-fib` mode (which is the default and today's behavior).
     /// `detach` shuts it down cooperatively before tearing down pins.
     pub route_controller: Option<crate::fib::controller::RouteController>,
+    /// Keeps `REDIRECT_DEVMAP` / `TC_REDIRECT_TARGETS` current with the
+    /// kernel link table between SIGHUPs (see `redirect_watch`).
+    /// Started right after the maps are pinned, in every forwarding
+    /// mode; stopped first in `detach`. `None` only before attach.
+    pub redirect_watch: Option<crate::redirect_watch::RedirectTargetWatcher>,
     /// `attach_settle_time` from the config, retained for use in
     /// `detach` so we can pace link-pin removals symmetrically with
     /// the attach path. Removing all link pins inside one STP
@@ -736,6 +741,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         state_dir: ctx.state_dir.to_path_buf(),
         bpffs_root: ctx.bpffs_root.to_path_buf(),
         route_controller: None,
+        redirect_watch: None,
         attach_settle_time: cfg.global.attach_settle_time,
         integrity_authority: integrity_authority_from_cfg(cfg),
         route_source_spec: route_source_spec_from_cfg(cfg),
@@ -1681,6 +1687,22 @@ pub fn attach(
     // partial-load failure (above) doesn't leave half-initialized maps
     // in bpffs.
     pin_program_and_maps(state)?;
+
+    // From here on the redirect-target maps follow the kernel's link
+    // table instead of waiting for a SIGHUP: a bridge or VLAN sub-
+    // interface the platform re-creates mid-run is a valid redirect
+    // target as soon as it is up, not a `pass_not_in_devmap` leak
+    // until the next reload. Opens the maps from their pins, so it
+    // must run after `pin_program_and_maps`. Mode-independent: the
+    // datapath pre-check it feeds exists under kernel-fib too.
+    match crate::redirect_watch::RedirectTargetWatcher::start(&state.bpffs_root) {
+        Ok(w) => state.redirect_watch = Some(w),
+        Err(e) => warn!(
+            error = %e,
+            "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
+             only on SIGHUP"
+        ),
+    }
 
     // Start Option F's RouteController if the operator asked for the
     // custom FIB path. Uses `MapData::from_pin` internally, so it
@@ -2883,6 +2905,11 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         info!("shutting down RouteController");
         ctrl.shutdown();
     }
+    // Same ordering for the redirect-target watcher: its map handles
+    // come from the pins removed below.
+    if let Some(w) = state.redirect_watch.take() {
+        w.shutdown();
+    }
 
     // Drop every PinnedLink next: this closes our userspace FDs but
     // the kernel keeps the attach alive via the bpffs inodes. tc
@@ -3747,6 +3774,7 @@ mod tests {
             state_dir: tmp.clone(),
             bpffs_root: tmp,
             route_controller: None,
+            redirect_watch: None,
             attach_settle_time: std::time::Duration::ZERO,
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::Birdc {
                 path: None,

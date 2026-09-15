@@ -1017,6 +1017,30 @@ Check:
   interface (probes are deliberately suppressed there; the snooper
   seeds them), and whether the peer answers ARP/ND at all.
 
+### Symptom: `pass_not_in_devmap` climbs
+
+What it means: the FIB resolved an egress interface that is not in
+`REDIRECT_DEVMAP` (or, for the tc datapath, `TC_REDIRECT_TARGETS`),
+so the packet took XDP_PASS into the kernel path. The maps are filled
+at attach from `/sys/class/net` (Ethernet-type, oper-up or unknown)
+and were once refreshed only on SIGHUP; since the 2026-09-15 fix a
+watcher thread follows `RTM_NEWLINK`/`RTM_DELLINK` and keeps them
+current, so a bridge or VLAN sub-interface the platform re-creates
+mid-run is a valid target as soon as it is up.
+
+Check:
+
+- `journalctl -u packetframe | grep 'redirect-target'`: the watcher
+  logs `live (RTNLGRP_LINK)` at start and every add/remove; a line
+  saying it stopped means SIGHUP is again the only refresh —
+  `systemctl reload packetframe` reconciles immediately.
+- `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/REDIRECT_DEVMAP`
+  against `ip -br link`: every up Ethernet-type ifindex should be a key.
+- `packetframe fib lookup <dst>` for an affected destination: the
+  nexthop's `ifindex` names the egress; if it is a non-Ethernet device
+  (tunnel, loopback) or oper-down, the miss is correct and the route
+  itself is the problem.
+
 ### Symptom: `bmp_peer_down` incremented
 
 What it means: bird reported a BGP peer went down; the programmer

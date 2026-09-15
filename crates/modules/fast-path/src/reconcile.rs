@@ -588,7 +588,7 @@ fn reconcile_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
 /// Does the kernel still know this ifindex? Wraps `if_indextoname`;
 /// returns false on any error (ENXIO for an unknown index, EINVAL for
 /// impossible values, etc.).
-fn ifindex_exists(ifindex: u32) -> bool {
+pub(crate) fn ifindex_exists(ifindex: u32) -> bool {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     let ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr().cast()) };
     if ptr.is_null() {
