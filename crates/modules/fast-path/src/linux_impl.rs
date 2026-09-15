@@ -2888,7 +2888,21 @@ fn populate_vlan_resolve(
 /// Skip the two header lines, split each subsequent line on `|`, trim
 /// whitespace, and return `(subif_name, vid, parent_name)` tuples.
 pub(crate) fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> {
-    let content = std::fs::read_to_string("/proc/net/vlan/config")?;
+    // `/proc/thread-self/net` is the calling THREAD's network namespace;
+    // `/proc/net` is `/proc/self/net`, the thread-group leader's. They
+    // are the same for the daemon, but the redirect-target watcher runs
+    // on its own thread and a harness that `setns` a test thread into a
+    // netns (the leader stays in the host's) would otherwise read the
+    // wrong table — the way the first CI run of that test did. The
+    // fallback keeps the "missing file = no VLANs" contract on a kernel
+    // without `thread-self` (pre-3.17).
+    let content = match std::fs::read_to_string("/proc/thread-self/net/vlan/config") {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read_to_string("/proc/net/vlan/config")?
+        }
+        Err(e) => return Err(e),
+    };
     let mut out = Vec::new();
     for line in content.lines().skip(2) {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();

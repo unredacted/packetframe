@@ -11,7 +11,10 @@
 //! reconcile reads `/sys/class/net`, which is not remounted per-netns
 //! and so shows the host's links from inside the namespace; that path
 //! is the same code the SIGHUP reconcile has always run and is covered
-//! there.
+//! there. The VLAN table, by contrast, is read through
+//! `/proc/thread-self/net`, which follows the watcher thread into the
+//! namespace (`/proc/net` would follow the harness's leader thread and
+//! stay in the host's — the first CI run of this test proved it).
 
 #![cfg(target_os = "linux")]
 
