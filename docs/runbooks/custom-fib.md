@@ -72,7 +72,9 @@ Indicators that the custom-FIB path is working:
 - `pass_no_neigh` stays below ~0.01% of matched traffic after the
   first few seconds (first-packet ARP is expected; sustained-high
   means a nexthop is genuinely unreachable or the neighbor resolver
-  is broken).
+  is broken — see the triage entry below, and check it as a rate).
+- `packetframe status` shows `nexthops (incomplete)` and `nexthops
+  (failed)` at or near zero once the table has converged.
 - `bmp_peer_down` stays at zero unless a BGP session you expect to
   flap has flapped.
 - `nexthop_seq_retry` stays below ~0.01% of `custom_fib_hit` (the
@@ -226,8 +228,12 @@ Alongside the existing counter family, the textfile exporter emits:
 
 - `packetframe_fib_forwarding_mode{mode="kernel-fib|custom-fib|compare"}`:
   one-hot gauge; alert on unexpected transitions.
-- `packetframe_nexthops{state="resolved|failed|stale|unwritten_or_incomplete"}`:
-  NEXTHOPS state bucket counts.
+- `packetframe_nexthops{state="resolved|incomplete|failed|stale|freed|unwritten"}`:
+  NEXTHOPS slot counts. `incomplete` + `failed` are live nexthops whose
+  traffic is on the kernel path — alert on them. `freed` is tombstones
+  left by churn (harmless), `unwritten` is untouched capacity. (Replaces
+  the former `unwritten_or_incomplete` bucket, which could not separate
+  the two and hid the alerting half.)
 - `packetframe_nexthops_max`: configured NEXTHOPS capacity.
 - `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`.
 - `packetframe_fib_default_hash_mode`: 3/4/5-tuple.
@@ -966,17 +972,46 @@ Check:
 ### Symptom: `pass_no_neigh` climbs sustainedly
 
 What it means: FIB matches land on nexthop entries with state ≠
-`Resolved`. Either the kernel hasn't ARP'd the nexthop yet (first-
-packet; expected briefly), or the nexthop is genuinely unreachable.
+`Resolved`, and every one of those packets takes the kernel path:
+netfilter, conntrack, the FIB walk — the load the fast path exists
+to remove. Judge it as a **rate**, never from the lifetime total
+(`status` twice, 60 s apart). Healthy is well under 0.1 % of
+`rx_total`.
+
+Why it happens: the kernel only re-resolves a neighbour it sends to
+itself, and XDP-redirected traffic never touches the kernel entry.
+A nexthop the kernel has no reason to talk to (route-server-learned
+IX peers) ages REACHABLE → STALE → garbage-collected; the daemon
+sees `Gone`, marks the slot `Incomplete`, and — before this fix —
+waited for the kernel to ARP it again, which it only did if its own
+FIB happened to forward the fallen-through packets to the same
+neighbour. On 2026-09-15 that left a third of the traffic on the
+kernel path until a restart. The programmer now re-probes every
+unresolved slot itself with 1 s → 60 s backoff, so a live neighbour
+recovers within seconds and a dead one costs one probe cycle per
+minute.
 
 Check:
 
-- `ip neigh show <nexthop-ip>`: what state does the kernel report?
-- `packetframe status`: is `nexthops (failed)` > 0?
-- Proactive resolve is currently relying on first-packet kernel ARP
-  (Phase 3.5+ adds proactive `RTM_NEWNEIGH NUD_NONE`). If
-  `pass_no_neigh` only spikes for a few packets per new destination
-  and then drops, that's expected.
+- `packetframe status`: `nexthops (incomplete)` and `nexthops
+  (failed)` are the live slots whose traffic is on the kernel path.
+  `nexthop slots freed` is tombstones from churn and costs nothing.
+- `packetframe fib dump-v4 --unresolved` (and `dump-v6`): the
+  routes behind those slots and the nexthop each one is stuck on.
+  Walks the whole trie: several seconds and ~200 MB on a full table.
+- `ip neigh show <nexthop-ip>`: what the kernel thinks, **per
+  interface** — the same address can be FAILED on one device and
+  REACHABLE on the one the nexthop forwards out of. Events on any
+  other device are ignored by design.
+- `journalctl -u packetframe | grep -E 'lost resolution|re-resolved|awaiting resolution'`:
+  the first 20 losses and slow recoveries are logged, and a once-a-
+  minute summary runs while anything is pending.
+- If a slot stays `incomplete` with `chronic_over_1min` > 0 in that
+  summary, the kernel is not answering the probe: check the route to
+  the nexthop (`ip route get <nexthop-ip>` must be a unicast route
+  with an egress device), whether that egress is an `ix-mode`
+  interface (probes are deliberately suppressed there; the snooper
+  seeds them), and whether the peer answers ARP/ND at all.
 
 ### Symptom: `bmp_peer_down` incremented
 

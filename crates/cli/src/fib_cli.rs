@@ -18,7 +18,9 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 use packetframe_common::config::Config;
-use packetframe_fast_path::fib::inspect::{self, FibEntry, FibValueKind, NexthopSummary};
+use packetframe_fast_path::fib::inspect::{
+    self, FibEntry, FibValueKind, NexthopState, NexthopSummary,
+};
 
 use crate::{config_path_or_default, EXIT_OK, EXIT_RUNTIME_ERROR};
 
@@ -30,12 +32,21 @@ pub enum FibOp {
     DumpV4 {
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Print only prefixes whose nexthop chain has a member that
+        /// is not `resolved` — the routes whose traffic is taking the
+        /// kernel path right now. (The prefix line itself never
+        /// carries a state, so `grep -v resolved` cannot do this.)
+        #[arg(long)]
+        unresolved: bool,
     },
     /// Walk FIB_V6 and print every prefix with its resolved nexthop
     /// chain.
     DumpV6 {
         #[arg(long)]
         config: Option<PathBuf>,
+        /// As for `dump-v4 --unresolved`.
+        #[arg(long)]
+        unresolved: bool,
     },
     /// LPM-lookup a single IP and print the FibValue chain
     /// (nexthop or ECMP group + constituent nexthops).
@@ -55,9 +66,9 @@ pub enum FibOp {
 
 pub fn run(op: FibOp) -> ExitCode {
     match op {
-        FibOp::DumpV4 { config } => dispatch(config, |bpffs| {
+        FibOp::DumpV4 { config, unresolved } => dispatch(config, |bpffs| {
             match inspect::dump_v4(bpffs) {
-                Ok(entries) => print_dump("v4", &entries),
+                Ok(entries) => print_dump("v4", &only_unresolved(entries, unresolved)),
                 Err(e) => {
                     eprintln!("fib dump-v4 failed: {e}");
                     return ExitCode::from(EXIT_RUNTIME_ERROR);
@@ -65,9 +76,9 @@ pub fn run(op: FibOp) -> ExitCode {
             }
             ExitCode::from(EXIT_OK)
         }),
-        FibOp::DumpV6 { config } => dispatch(config, |bpffs| {
+        FibOp::DumpV6 { config, unresolved } => dispatch(config, |bpffs| {
             match inspect::dump_v6(bpffs) {
-                Ok(entries) => print_dump("v6", &entries),
+                Ok(entries) => print_dump("v6", &only_unresolved(entries, unresolved)),
                 Err(e) => {
                     eprintln!("fib dump-v6 failed: {e}");
                     return ExitCode::from(EXIT_RUNTIME_ERROR);
@@ -119,6 +130,24 @@ where
         }
     };
     body(&cfg.global.bpffs_root)
+}
+
+/// `--unresolved`: keep the prefixes with at least one nexthop that is
+/// not forwarding. An ECMP group with one dead leg still forwards (the
+/// datapath walks to a live leg), but it is listed too: the dead leg is
+/// what the operator is hunting.
+fn only_unresolved(entries: Vec<FibEntry>, filter: bool) -> Vec<FibEntry> {
+    if !filter {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|e| {
+            e.nexthops
+                .iter()
+                .any(|nh| nh.state != NexthopState::Resolved)
+        })
+        .collect()
 }
 
 fn print_dump(family_tag: &str, entries: &[FibEntry]) {
@@ -194,14 +223,13 @@ fn print_stats(snap: &packetframe_fast_path::FibStatusSnapshot) {
         println!("default-hash-mode: {h}-tuple");
     }
     println!("nexthops:");
-    println!("  resolved: {}", snap.nh_resolved);
-    println!("  failed:   {}", snap.nh_failed);
-    println!("  stale:    {}", snap.nh_stale);
-    println!(
-        "  unwritten-or-incomplete: {}",
-        snap.nh_unwritten_or_incomplete
-    );
-    println!("  max:      {}", snap.nh_max_entries);
+    println!("  resolved:   {}", snap.nh_resolved);
+    println!("  incomplete: {}", snap.nh_incomplete);
+    println!("  failed:     {}", snap.nh_failed);
+    println!("  stale:      {}", snap.nh_stale);
+    println!("  freed:      {}", snap.nh_freed);
+    println!("  unwritten:  {}", snap.nh_unwritten);
+    println!("  max:        {}", snap.nh_max_entries);
     println!(
         "ecmp-groups: active={} max={}",
         snap.ecmp_active, snap.ecmp_max_entries

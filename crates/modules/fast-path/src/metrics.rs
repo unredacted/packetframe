@@ -225,6 +225,11 @@ pub fn render_fib_gauges(snap: &FibStatusSnapshot) -> String {
     );
     let _ = writeln!(
         out,
+        "packetframe_nexthops{{module=\"fast-path\",state=\"incomplete\"}} {}",
+        snap.nh_incomplete
+    );
+    let _ = writeln!(
+        out,
         "packetframe_nexthops{{module=\"fast-path\",state=\"failed\"}} {}",
         snap.nh_failed
     );
@@ -235,8 +240,17 @@ pub fn render_fib_gauges(snap: &FibStatusSnapshot) -> String {
     );
     let _ = writeln!(
         out,
-        "packetframe_nexthops{{module=\"fast-path\",state=\"unwritten_or_incomplete\"}} {}",
-        snap.nh_unwritten_or_incomplete
+        "packetframe_nexthops{{module=\"fast-path\",state=\"freed\"}} {}",
+        snap.nh_freed
+    );
+    // Replaces the former `unwritten_or_incomplete` bucket, which
+    // could not tell never-touched capacity from live nexthops whose
+    // traffic was falling to the kernel; `incomplete` above is the
+    // half of it that matters.
+    let _ = writeln!(
+        out,
+        "packetframe_nexthops{{module=\"fast-path\",state=\"unwritten\"}} {}",
+        snap.nh_unwritten
     );
     let _ = writeln!(
         out,
@@ -359,9 +373,11 @@ mod tests {
             forwarding_mode: Some("custom-fib"),
             default_hash_mode: Some(5),
             nh_resolved: 12,
+            nh_incomplete: 2,
             nh_failed: 1,
             nh_stale: 0,
-            nh_unwritten_or_incomplete: 8179,
+            nh_freed: 5,
+            nh_unwritten: 8172,
             nh_max_entries: 8192,
             ecmp_active: 3,
             ecmp_max_entries: 1024,
@@ -378,6 +394,12 @@ mod tests {
         assert!(body.contains("packetframe_fib_default_hash_mode{module=\"fast-path\"} 5"));
         assert!(body.contains("packetframe_nexthops{module=\"fast-path\",state=\"resolved\"} 12"));
         assert!(body.contains("packetframe_nexthops{module=\"fast-path\",state=\"failed\"} 1"));
+        assert!(body.contains("packetframe_nexthops{module=\"fast-path\",state=\"incomplete\"} 2"));
+        assert!(body.contains("packetframe_nexthops{module=\"fast-path\",state=\"freed\"} 5"));
+        assert!(
+            body.contains("packetframe_nexthops{module=\"fast-path\",state=\"unwritten\"} 8172")
+        );
+        assert!(!body.contains("unwritten_or_incomplete"));
         assert!(body.contains("packetframe_nexthops_max{module=\"fast-path\"} 8192"));
         assert!(body.contains("packetframe_ecmp_groups_active{module=\"fast-path\"} 3"));
         assert!(body.contains("packetframe_ecmp_groups_max{module=\"fast-path\"} 1024"));
@@ -392,9 +414,11 @@ mod tests {
             forwarding_mode: None,
             default_hash_mode: None,
             nh_resolved: 0,
+            nh_incomplete: 0,
             nh_failed: 0,
             nh_stale: 0,
-            nh_unwritten_or_incomplete: 0,
+            nh_freed: 0,
+            nh_unwritten: 0,
             nh_max_entries: 0,
             ecmp_active: 0,
             ecmp_max_entries: 0,

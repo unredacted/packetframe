@@ -3200,16 +3200,19 @@ pub struct FibStatusSnapshot {
     /// binary left pins behind).
     pub forwarding_mode: Option<&'static str>,
     pub default_hash_mode: Option<u8>,
-    /// NEXTHOPS[idx].state distribution. Slots that were never
-    /// written read as state=0 which collides with
-    /// `NH_STATE_INCOMPLETE`; we can't distinguish those from
-    /// actual in-progress entries without programmer-internal
-    /// refcount state, so `nh_unwritten_or_incomplete` is reported
-    /// as a single bucket.
+    /// NEXTHOPS slot distribution by [`NexthopSlotClass`]. The four
+    /// live buckets are slots some route may be forwarding through;
+    /// `nh_incomplete` + `nh_failed` is the count of nexthops whose
+    /// traffic is currently falling to the kernel path. `nh_freed` is
+    /// tombstones (never traffic), `nh_unwritten` is capacity never
+    /// touched. See the enum for why `family` makes the split possible
+    /// without programmer state.
     pub nh_resolved: u32,
+    pub nh_incomplete: u32,
     pub nh_failed: u32,
     pub nh_stale: u32,
-    pub nh_unwritten_or_incomplete: u32,
+    pub nh_freed: u32,
+    pub nh_unwritten: u32,
     pub nh_max_entries: u32,
     /// ECMP groups where `nh_count > 0`, a conservative estimate
     /// of "how many groups are actively in use." Slots with nh_count=0
@@ -3229,9 +3232,11 @@ pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
         forwarding_mode: None,
         default_hash_mode: None,
         nh_resolved: 0,
+        nh_incomplete: 0,
         nh_failed: 0,
         nh_stale: 0,
-        nh_unwritten_or_incomplete: 0,
+        nh_freed: 0,
+        nh_unwritten: 0,
         nh_max_entries: 0,
         ecmp_active: 0,
         ecmp_max_entries: 0,
@@ -3257,9 +3262,11 @@ pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
     // --- NEXTHOPS: walk for state distribution ---
     if let Ok((dist, cap)) = read_nexthops_state_distribution(bpffs_root) {
         snapshot.nh_resolved = dist.resolved;
+        snapshot.nh_incomplete = dist.incomplete;
         snapshot.nh_failed = dist.failed;
         snapshot.nh_stale = dist.stale;
-        snapshot.nh_unwritten_or_incomplete = dist.unwritten_or_incomplete;
+        snapshot.nh_freed = dist.freed;
+        snapshot.nh_unwritten = dist.unwritten;
         snapshot.nh_max_entries = cap;
     }
 
@@ -3299,14 +3306,16 @@ fn read_fib_config_hash_mode(bpffs_root: &Path) -> ModuleResult<u8> {
 #[derive(Debug, Default)]
 struct NhStateDistribution {
     resolved: u32,
+    incomplete: u32,
     failed: u32,
     stale: u32,
-    unwritten_or_incomplete: u32,
+    freed: u32,
+    unwritten: u32,
 }
 
 fn read_nexthops_state_distribution(bpffs_root: &Path) -> ModuleResult<(NhStateDistribution, u32)> {
     use crate::fib::programmer::NEXTHOPS_CAP;
-    use crate::fib::types::{NexthopEntry, NH_STATE_FAILED, NH_STATE_RESOLVED, NH_STATE_STALE};
+    use crate::fib::types::{NexthopEntry, NexthopSlotClass};
 
     let pin_path = pin::map_path(bpffs_root, "NEXTHOPS");
     let map_data = aya::maps::MapData::from_pin(&pin_path)
@@ -3323,11 +3332,16 @@ fn read_nexthops_state_distribution(bpffs_root: &Path) -> ModuleResult<(NhStateD
             Ok(e) => e,
             Err(_) => continue,
         };
-        match entry.state {
-            NH_STATE_RESOLVED => dist.resolved += 1,
-            NH_STATE_FAILED => dist.failed += 1,
-            NH_STATE_STALE => dist.stale += 1,
-            _ => dist.unwritten_or_incomplete += 1,
+        match NexthopSlotClass::from_entry(entry.state, entry.family) {
+            NexthopSlotClass::Resolved => dist.resolved += 1,
+            NexthopSlotClass::Incomplete => dist.incomplete += 1,
+            NexthopSlotClass::Failed => dist.failed += 1,
+            NexthopSlotClass::Stale => dist.stale += 1,
+            NexthopSlotClass::Freed => dist.freed += 1,
+            // An unknown state byte can only come from a build skew
+            // between the pinned map and this binary; count it with
+            // the never-written capacity rather than invent a row.
+            NexthopSlotClass::Unwritten | NexthopSlotClass::Unknown(_) => dist.unwritten += 1,
         }
     }
     Ok((dist, NEXTHOPS_CAP))

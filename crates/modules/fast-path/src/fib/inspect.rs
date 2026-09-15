@@ -23,8 +23,8 @@ use aya::maps::lpm_trie::Key as LpmKey;
 
 use super::programmer::FibProgrammer;
 use super::types::{
-    EcmpGroup, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, FIB_KIND_SINGLE,
-    NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED, NH_STATE_STALE,
+    EcmpGroup, FibValue, NexthopEntry, NexthopSlotClass, ECMP_NH_UNUSED, FIB_KIND_ECMP,
+    FIB_KIND_SINGLE,
 };
 
 /// One resolved FIB entry: the prefix, what kind of lookup value
@@ -68,38 +68,11 @@ pub struct NexthopSummary {
     pub src_mac: [u8; 6],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NexthopState {
-    Incomplete,
-    Resolved,
-    Stale,
-    Failed,
-    Unknown(u8),
-}
-
-impl NexthopState {
-    pub fn from_raw(raw: u8) -> Self {
-        match raw {
-            NH_STATE_INCOMPLETE => Self::Incomplete,
-            NH_STATE_RESOLVED => Self::Resolved,
-            NH_STATE_STALE => Self::Stale,
-            NH_STATE_FAILED => Self::Failed,
-            other => Self::Unknown(other),
-        }
-    }
-}
-
-impl std::fmt::Display for NexthopState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Incomplete => f.write_str("incomplete"),
-            Self::Resolved => f.write_str("resolved"),
-            Self::Stale => f.write_str("stale"),
-            Self::Failed => f.write_str("failed"),
-            Self::Unknown(n) => write!(f, "unknown({n})"),
-        }
-    }
-}
+/// The slot classification shared with `status` and the metrics
+/// exporter, so a `fib dump` row and a `status` bucket never disagree
+/// about what a slot is. `freed` marks the programmer's tombstone: a
+/// route still pointing at one is a bug, not an unreachable nexthop.
+pub type NexthopState = NexthopSlotClass;
 
 /// Walk FIB_V4. Returns one `FibEntry` per prefix with the
 /// complete resolved nexthop chain.
@@ -234,7 +207,7 @@ where
         .map_err(|e| format!("NEXTHOPS[{id}]: {e}"))?;
     Ok(NexthopSummary {
         id,
-        state: NexthopState::from_raw(entry.state),
+        state: NexthopState::from_entry(entry.state, entry.family),
         family: entry.family,
         ifindex: entry.ifindex,
         dst_mac: entry.dst_mac,
@@ -247,20 +220,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nexthop_state_round_trips() {
-        for raw in [
-            NH_STATE_INCOMPLETE,
-            NH_STATE_RESOLVED,
-            NH_STATE_STALE,
-            NH_STATE_FAILED,
-        ] {
-            assert!(!matches!(
-                NexthopState::from_raw(raw),
-                NexthopState::Unknown(_)
-            ));
-        }
+    fn nexthop_state_distinguishes_tombstone_from_failed() {
+        use super::super::types::{NH_FAMILY_V4, NH_STATE_FAILED};
+        // What `fib dump` prints for a freed slot vs a live nexthop the
+        // kernel gave up on — the two used to render identically.
+        assert_eq!(
+            NexthopState::from_entry(NH_STATE_FAILED, 0).to_string(),
+            "freed"
+        );
+        assert_eq!(
+            NexthopState::from_entry(NH_STATE_FAILED, NH_FAMILY_V4).to_string(),
+            "failed"
+        );
         assert!(matches!(
-            NexthopState::from_raw(99),
+            NexthopState::from_entry(99, NH_FAMILY_V4),
             NexthopState::Unknown(99)
         ));
     }

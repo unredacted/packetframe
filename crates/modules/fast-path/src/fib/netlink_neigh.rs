@@ -200,6 +200,16 @@ pub struct NeighborResolveHandle {
 }
 
 impl NeighborResolveHandle {
+    /// A handle with no resolver behind it, plus the receiving end of
+    /// its queue. For harnesses that drive a `FibProgrammer` and want
+    /// to observe *what* it asks to have resolved (and when) without
+    /// running netlink; production always gets its handle from
+    /// [`NetlinkNeighborResolver::new`].
+    pub fn detached() -> (Self, mpsc::Receiver<IpAddr>) {
+        let (resolve_tx, resolve_rx) = mpsc::channel(RESOLVE_QUEUE_CAPACITY);
+        (Self { resolve_tx }, resolve_rx)
+    }
+
     /// Request proactive resolution of `ip`. Non-blocking.
     pub fn request_resolve(&self, ip: IpAddr) {
         if let Err(e) = self.resolve_tx.try_send(ip) {
@@ -799,8 +809,25 @@ impl NetlinkNeighborResolver {
                         // the iface-disappears case.
                         self.maybe_emit_local_arp_add(*ip, *ifindex).await;
                     }
+                    if let NeighEvent::Failed { ip, ifindex, .. } = &evt {
+                        // The cache must not outlive the kernel's
+                        // verdict: the programmer re-probes a failed
+                        // nexthop through `request_resolve`, and a
+                        // cache hit there synthesizes a Learned from
+                        // the stored MAC — the one the kernel just
+                        // declared unreachable. Device-keyed like the
+                        // kernel table: a failure on another interface
+                        // says nothing about the entry we cached.
+                        if self
+                            .neigh_cache
+                            .get(ip)
+                            .is_some_and(|&(cached_if, _)| cached_if == *ifindex)
+                        {
+                            self.neigh_cache.remove(ip);
+                        }
+                    }
                     if let Err(e) = self.events_tx.send(evt).await {
-                        debug!(error = %e, "NeighEvent::Learned send failed");
+                        debug!(error = %e, "NeighEvent send failed");
                     }
                 }
             }
@@ -815,8 +842,21 @@ impl NetlinkNeighborResolver {
                 // Capture ifindex before we move msg into parse_neighbour_del.
                 let ifindex = msg.header.ifindex;
                 if let Some(evt) = parse_neighbour_del(&msg) {
-                    if let NeighEvent::Gone { ip } = &evt {
-                        self.neigh_cache.remove(ip);
+                    if let NeighEvent::Gone {
+                        ip,
+                        ifindex: gone_if,
+                    } = &evt
+                    {
+                        // Device-keyed removal: the same address can be
+                        // deleted on an interface we never resolved it
+                        // through while the cached entry stays valid.
+                        if self
+                            .neigh_cache
+                            .get(ip)
+                            .is_some_and(|&(cached_if, _)| cached_if == *gone_if)
+                        {
+                            self.neigh_cache.remove(ip);
+                        }
                         // v0.2.1 symmetric: withdraw the /32 if the
                         // departing neighbour was registered under a
                         // local-prefix.
@@ -1720,6 +1760,7 @@ fn parse_neighbour_add(msg: &NeighbourMessage, src_mac: [u8; 6]) -> Option<Neigh
     match msg.header.state {
         NeighbourState::Failed => Some(NeighEvent::Failed {
             ip,
+            ifindex: msg.header.ifindex,
             reason: "kernel marked NUD_FAILED".into(),
         }),
         NeighbourState::Reachable
@@ -1747,9 +1788,15 @@ fn parse_neighbour_add(msg: &NeighbourMessage, src_mac: [u8; 6]) -> Option<Neigh
     }
 }
 
-/// RTM_DELNEIGH → [`NeighEvent::Gone`].
+/// RTM_DELNEIGH → [`NeighEvent::Gone`]. Carries the device the entry
+/// was deleted from: the kernel keys neighbours `(device, address)`,
+/// and the consumer must not treat a deletion on one interface as
+/// the loss of the same address on another.
 fn parse_neighbour_del(msg: &NeighbourMessage) -> Option<NeighEvent> {
-    extract_ip(&msg.attributes).map(|ip| NeighEvent::Gone { ip })
+    extract_ip(&msg.attributes).map(|ip| NeighEvent::Gone {
+        ip,
+        ifindex: msg.header.ifindex,
+    })
 }
 
 fn extract_ip(attrs: &[NeighbourAttribute]) -> Option<IpAddr> {
@@ -1875,10 +1922,19 @@ mod tests {
             NeighbourState::Failed,
             vec![NeighbourAttribute::Destination(NeighbourAddress::Inet(ip))],
         );
-        assert!(matches!(
-            parse_neighbour_add(&msg, TEST_SRC_MAC),
-            Some(NeighEvent::Failed { .. })
-        ));
+        match parse_neighbour_add(&msg, TEST_SRC_MAC) {
+            Some(NeighEvent::Failed {
+                ip: got_ip,
+                ifindex,
+                ..
+            }) => {
+                assert_eq!(got_ip, IpAddr::V4(ip));
+                // The device is part of the kernel's key; a consumer
+                // filtering by it needs the message's own ifindex.
+                assert_eq!(ifindex, 42);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1909,10 +1965,16 @@ mod tests {
             NeighbourState::Permanent,
             vec![NeighbourAttribute::Destination(NeighbourAddress::Inet(ip))],
         );
-        assert!(matches!(
-            parse_neighbour_del(&msg),
-            Some(NeighEvent::Gone { .. })
-        ));
+        match parse_neighbour_del(&msg) {
+            Some(NeighEvent::Gone {
+                ip: got_ip,
+                ifindex,
+            }) => {
+                assert_eq!(got_ip, IpAddr::V4(ip));
+                assert_eq!(ifindex, 42);
+            }
+            other => panic!("expected Gone, got {other:?}"),
+        }
     }
 
     // --- v0.2.1 LocalPrefixSpec --------------------------------------------

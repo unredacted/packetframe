@@ -2432,14 +2432,29 @@ fn print_fib_status(bpffs_root: &Path) {
         println!("  default-hash-mode:          {h}-tuple");
     }
     if snap.nh_max_entries > 0 {
-        let used = snap.nh_resolved + snap.nh_failed + snap.nh_stale;
+        // "Used" is the live set: slots a route may forward through.
+        // Tombstones are excluded — they hold no route and cost no
+        // traffic — and printed on their own row so a large number
+        // there reads as churn history, not as a problem.
+        let used = snap.nh_resolved + snap.nh_incomplete + snap.nh_failed + snap.nh_stale;
         let pct = 100.0 * used as f64 / snap.nh_max_entries as f64;
         println!("  nexthops (resolved):        {}", snap.nh_resolved);
-        println!("  nexthops (failed):          {}", snap.nh_failed);
+        println!(
+            "  nexthops (incomplete):      {}   <- traffic via these takes the kernel path",
+            snap.nh_incomplete
+        );
+        println!(
+            "  nexthops (failed):          {}   <- traffic via these takes the kernel path",
+            snap.nh_failed
+        );
         println!("  nexthops (stale):           {}", snap.nh_stale);
         println!(
             "  nexthops (total used / max): {} / {} ({pct:.2}%)",
             used, snap.nh_max_entries
+        );
+        println!(
+            "  nexthop slots freed (tombstones, not in use): {}",
+            snap.nh_freed
         );
     } else {
         println!("  nexthops pin:               unavailable");
