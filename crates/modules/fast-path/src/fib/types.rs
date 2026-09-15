@@ -66,6 +66,75 @@ pub const NH_STATE_FAILED: u8 = 3;
 pub const NH_FAMILY_V4: u8 = 4;
 pub const NH_FAMILY_V6: u8 = 6;
 
+/// What a `NEXTHOPS` slot means, derived from `(state, family)` alone
+/// so every reader of the pinned map (`status`, the metrics exporter,
+/// `fib dump`) classifies slots identically without programmer state.
+///
+/// The programmer stamps `family` on every live write (the `Incomplete`
+/// seed at allocation, `Resolved`, `Failed`, `Gone` → `Incomplete`) and
+/// zeroes it only on the tombstone it leaves when a slot is freed; a
+/// kernel-zeroed slot that was never written is `(0, 0)`. So `family`
+/// separates live from dead, and `state` says which kind of live.
+///
+/// Before this split `status` counted tombstones as "failed" and never
+/// printed live `Incomplete` slots at all — the row that would have
+/// shown a third of the traffic falling to the kernel path looked like
+/// leftover tombstones instead (2026-09-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NexthopSlotClass {
+    /// Live and forwarding.
+    Resolved,
+    /// Live; MAC known, kernel has not revalidated it recently.
+    Stale,
+    /// Live; the kernel marked the neighbour `NUD_FAILED`. A re-probe
+    /// is armed while any route still references the slot.
+    Failed,
+    /// Live; allocated but not (or no longer) resolved. Re-probe armed.
+    Incomplete,
+    /// Freed: the programmer's tombstone. No route references it.
+    Freed,
+    /// Never written since the map was created.
+    Unwritten,
+    /// A state byte this build does not know.
+    Unknown(u8),
+}
+
+impl NexthopSlotClass {
+    pub const fn from_entry(state: u8, family: u8) -> Self {
+        match (state, family) {
+            (NH_STATE_RESOLVED, _) => Self::Resolved,
+            (NH_STATE_STALE, _) => Self::Stale,
+            (NH_STATE_FAILED, 0) => Self::Freed,
+            (NH_STATE_FAILED, _) => Self::Failed,
+            (NH_STATE_INCOMPLETE, 0) => Self::Unwritten,
+            (NH_STATE_INCOMPLETE, _) => Self::Incomplete,
+            (other, _) => Self::Unknown(other),
+        }
+    }
+
+    /// A slot some route may be forwarding through right now.
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Resolved | Self::Stale | Self::Failed | Self::Incomplete
+        )
+    }
+}
+
+impl core::fmt::Display for NexthopSlotClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Resolved => f.write_str("resolved"),
+            Self::Stale => f.write_str("stale"),
+            Self::Failed => f.write_str("failed"),
+            Self::Incomplete => f.write_str("incomplete"),
+            Self::Freed => f.write_str("freed"),
+            Self::Unwritten => f.write_str("unwritten"),
+            Self::Unknown(n) => write!(f, "unknown({n})"),
+        }
+    }
+}
+
 /// Userspace mirror of `maps::NexthopEntry`. 28 bytes.
 ///
 /// **Seqlock discipline** (see `bpf/src/maps.rs` `NexthopEntry` doc):
@@ -279,5 +348,57 @@ mod tests {
         let c = FpFibCfg::default_v1();
         assert_eq!(c.default_hash_mode, 5);
         assert_eq!(c.version, FpFibCfg::VERSION_V1);
+    }
+}
+
+#[cfg(test)]
+mod slot_class_tests {
+    use super::*;
+
+    #[test]
+    fn family_separates_live_from_dead() {
+        // Tombstone left by `unregister`: state Failed, family cleared.
+        assert_eq!(
+            NexthopSlotClass::from_entry(NH_STATE_FAILED, 0),
+            NexthopSlotClass::Freed
+        );
+        // A live nexthop the kernel marked NUD_FAILED keeps its family.
+        assert_eq!(
+            NexthopSlotClass::from_entry(NH_STATE_FAILED, NH_FAMILY_V4),
+            NexthopSlotClass::Failed
+        );
+        // Kernel-zeroed slot vs the `Incomplete` seed written at
+        // allocation: same state byte, different family.
+        assert_eq!(
+            NexthopSlotClass::from_entry(0, 0),
+            NexthopSlotClass::Unwritten
+        );
+        assert_eq!(
+            NexthopSlotClass::from_entry(NH_STATE_INCOMPLETE, NH_FAMILY_V6),
+            NexthopSlotClass::Incomplete
+        );
+    }
+
+    #[test]
+    fn live_is_exactly_the_route_referenced_classes() {
+        for (state, family, live) in [
+            (NH_STATE_RESOLVED, NH_FAMILY_V4, true),
+            (NH_STATE_STALE, NH_FAMILY_V4, true),
+            (NH_STATE_FAILED, NH_FAMILY_V4, true),
+            (NH_STATE_INCOMPLETE, NH_FAMILY_V4, true),
+            (NH_STATE_FAILED, 0, false),
+            (0, 0, false),
+            (99, NH_FAMILY_V4, false),
+        ] {
+            assert_eq!(
+                NexthopSlotClass::from_entry(state, family).is_live(),
+                live,
+                "state={state} family={family}"
+            );
+        }
+        assert_eq!(
+            NexthopSlotClass::from_entry(99, NH_FAMILY_V4),
+            NexthopSlotClass::Unknown(99)
+        );
     }
 }

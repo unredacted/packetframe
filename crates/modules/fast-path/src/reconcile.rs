@@ -147,6 +147,12 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let vlan = reconcile_vlan_resolve(state, cfg)?;
     let devmap = reconcile_devmap(state)?;
     reconcile_fib_cache(state, cfg);
+    // The watcher derives VLAN_RESOLVE from the same directives
+    // (`bridge-resolve`), so a reload that changes them must reach it
+    // or its next refresh would undo this one.
+    if let Some(w) = &state.redirect_watch {
+        w.set_directives(cfg.section.directives.to_vec());
+    }
 
     info!(
         v4_added = v4.added,
@@ -333,13 +339,30 @@ where
     Ok(delta)
 }
 
-pub(crate) fn reconcile_vlan_resolve(
-    state: &mut ActiveState,
-    cfg: &ModuleConfig<'_>,
-) -> ModuleResult<DeltaCount> {
-    // Rebuild the desired set from /proc/net/vlan/config. Missing file
-    // means no VLAN subifs, desired is empty, which will remove any
-    // stale entries.
+/// The `VLAN_RESOLVE` content the host's topology calls for right now:
+/// 802.1Q sub-interfaces (`/proc/net/vlan/config`) and, when
+/// `bridge-resolve` is on, the bridge egress short-circuits. Shared by
+/// the SIGHUP reconcile and the redirect-target watcher so both derive
+/// the map from one rule.
+pub(crate) struct VlanDesired {
+    pub subifs: HashSet<(u32, u32, u16)>,
+    pub bridges: HashSet<(u32, u32, u16)>,
+    /// The bridge chains by name, for the mss-clamp scoping warning
+    /// only the SIGHUP path emits.
+    pub chains: Vec<(String, String, u16)>,
+}
+
+impl VlanDesired {
+    pub(crate) fn union(&self) -> HashSet<(u32, u32, u16)> {
+        self.subifs.union(&self.bridges).copied().collect()
+    }
+}
+
+/// Read the topology and resolve it to ifindexes. A missing
+/// `/proc/net/vlan/config` means no sub-interfaces; any other read
+/// error is returned so the caller never clears the gate bit on a
+/// transient failure while the map still holds entries.
+pub(crate) fn desired_vlan_resolve(directives: &[ModuleDirective]) -> ModuleResult<VlanDesired> {
     let vlan_entries = match read_vlan_config() {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -350,45 +373,9 @@ pub(crate) fn reconcile_vlan_resolve(
             ));
         }
     };
-
-    // Bridge egress short-circuits share this map and bit 6: the
-    // desired set is the UNION of both sources, and only the single
-    // set_cfg_flag below writes the gate. `bridge-resolve off` yields
-    // an empty chain set, which purges any previously installed bridge
-    // keys via the normal diff — the SIGHUP rollback path. Read errors
-    // abort before the flag RMW, same policy as the vlan read above
-    // (never clear the gate on a transient failure while the map still
-    // holds entries).
-    let chains = discover_bridge_chains(&cfg.section.directives)
+    let chains = discover_bridge_chains(directives)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("bridge topology read: {e}")))?;
-
-    // Same clamp-scoping warning the attach-time population emits: an
-    // `mss-clamp via <bridge>` cannot match while that bridge is
-    // collapsed (matching keys on the post-resolve egress ifindex).
-    // A SIGHUP can introduce either half of the collision — the clamp
-    // rule or the alias — so the check has to live here too.
-    for (bridge_name, phys_name, _) in &chains {
-        for d in &cfg.section.directives {
-            if let ModuleDirective::MssClamp {
-                iface: Some(clamp_iface),
-                ..
-            } = d
-            {
-                if clamp_iface == bridge_name {
-                    warn!(
-                        bridge = %bridge_name,
-                        underlying = %phys_name,
-                        "mss-clamp `via {bridge_name}` will NOT match while the bridge \
-                         egress short-circuit is installed (clamp matching keys on the \
-                         resolved egress ifindex). Scope the clamp `via {phys_name}` or \
-                         set `bridge-resolve off`."
-                    );
-                }
-            }
-        }
-    }
-
-    let desired_subifs: HashSet<(u32, u32, u16)> = vlan_entries
+    let subifs: HashSet<(u32, u32, u16)> = vlan_entries
         .iter()
         .filter_map(|(subif, vid, parent)| {
             // Skip entries whose ifindexes don't resolve, the proc
@@ -399,7 +386,7 @@ pub(crate) fn reconcile_vlan_resolve(
             Some((subif_idx, phys_idx, *vid))
         })
         .collect();
-    let desired_bridges: HashSet<(u32, u32, u16)> = chains
+    let bridges: HashSet<(u32, u32, u16)> = chains
         .iter()
         .filter_map(|(bridge, phys, vid)| {
             let bridge_idx = if_nametoindex(bridge).ok()?;
@@ -407,20 +394,26 @@ pub(crate) fn reconcile_vlan_resolve(
             Some((bridge_idx, phys_idx, *vid))
         })
         .collect();
-    // Union for the diff/removal/gate logic; the ADD pass below runs
-    // subif entries before bridge aliases so that under map-capacity
+    Ok(VlanDesired {
+        subifs,
+        bridges,
+        chains,
+    })
+}
+
+/// Diff `want` against the live map and apply it. Generic over the
+/// handle so the SIGHUP path (an `Ebpf`-owned map) and the watcher (a
+/// pinned map) run the identical add/remove logic.
+pub(crate) fn apply_vlan_resolve<T: std::borrow::BorrowMut<aya::maps::MapData>>(
+    hm: &mut AyaHashMap<T, u32, VlanResolve>,
+    want: &VlanDesired,
+) -> DeltaCount {
+    // Union for the diff/removal logic; the ADD pass runs subif
+    // entries before bridge aliases so that under map-capacity
     // pressure the slot that runs out is always the optional
     // optimization's, never a required subif entry (mirrors the
     // attach-time population order).
-    let desired: HashSet<(u32, u32, u16)> =
-        desired_subifs.union(&desired_bridges).copied().collect();
-
-    let map = state
-        .ebpf
-        .map_mut("VLAN_RESOLVE")
-        .ok_or_else(|| ModuleError::other(MODULE_NAME, "VLAN_RESOLVE missing from ELF"))?;
-    let mut hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("VLAN_RESOLVE try_from: {e}")))?;
+    let desired = want.union();
 
     // Gather current state, value is VlanResolve { phys_ifindex, vid }.
     let current: HashSet<(u32, u32, u16)> = hm
@@ -431,12 +424,7 @@ pub(crate) fn reconcile_vlan_resolve(
 
     let mut delta = DeltaCount::default();
     let mut to_add: Vec<&(u32, u32, u16)> = desired.difference(&current).collect();
-    to_add.sort_by_key(|t| {
-        (
-            desired_bridges.contains(t) && !desired_subifs.contains(t),
-            t.0,
-        )
-    });
+    to_add.sort_by_key(|t| (want.bridges.contains(t) && !want.subifs.contains(t), t.0));
     for (subif_idx, phys_idx, vid) in to_add.into_iter() {
         let value = VlanResolve {
             phys_ifindex: *phys_idx,
@@ -471,6 +459,55 @@ pub(crate) fn reconcile_vlan_resolve(
             Err(e) => warn!(subif_idx, error = %e, "VLAN_RESOLVE remove failed"),
         }
     }
+    delta
+}
+
+pub(crate) fn reconcile_vlan_resolve(
+    state: &mut ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<DeltaCount> {
+    // Bridge egress short-circuits share this map and bit 6: the
+    // desired set is the UNION of both sources, and only the single
+    // set_cfg_flag below writes the gate. `bridge-resolve off` yields
+    // an empty chain set, which purges any previously installed bridge
+    // keys via the normal diff — the SIGHUP rollback path. Read errors
+    // abort before the flag RMW (never clear the gate on a transient
+    // failure while the map still holds entries).
+    let want = desired_vlan_resolve(&cfg.section.directives)?;
+
+    // Same clamp-scoping warning the attach-time population emits: an
+    // `mss-clamp via <bridge>` cannot match while that bridge is
+    // collapsed (matching keys on the post-resolve egress ifindex).
+    // A SIGHUP can introduce either half of the collision — the clamp
+    // rule or the alias — so the check has to live here too.
+    for (bridge_name, phys_name, _) in &want.chains {
+        for d in &cfg.section.directives {
+            if let ModuleDirective::MssClamp {
+                iface: Some(clamp_iface),
+                ..
+            } = d
+            {
+                if clamp_iface == bridge_name {
+                    warn!(
+                        bridge = %bridge_name,
+                        underlying = %phys_name,
+                        "mss-clamp `via {bridge_name}` will NOT match while the bridge \
+                         egress short-circuit is installed (clamp matching keys on the \
+                         resolved egress ifindex). Scope the clamp `via {phys_name}` or \
+                         set `bridge-resolve off`."
+                    );
+                }
+            }
+        }
+    }
+
+    let map = state
+        .ebpf
+        .map_mut("VLAN_RESOLVE")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "VLAN_RESOLVE missing from ELF"))?;
+    let mut hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("VLAN_RESOLVE try_from: {e}")))?;
+    let delta = apply_vlan_resolve(&mut hm, &want);
 
     // Authoritative post-convergence fix of the VLAN_PRESENT gate bit:
     // set iff the map has (desired) entries. Covers subifs appearing
@@ -478,7 +515,7 @@ pub(crate) fn reconcile_vlan_resolve(
     set_cfg_flag(
         &mut state.ebpf,
         FP_CFG_FLAG_VLAN_PRESENT,
-        !desired.is_empty(),
+        !(want.subifs.is_empty() && want.bridges.is_empty()),
     )?;
     Ok(delta)
 }
@@ -588,7 +625,7 @@ fn reconcile_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
 /// Does the kernel still know this ifindex? Wraps `if_indextoname`;
 /// returns false on any error (ENXIO for an unknown index, EINVAL for
 /// impossible values, etc.).
-fn ifindex_exists(ifindex: u32) -> bool {
+pub(crate) fn ifindex_exists(ifindex: u32) -> bool {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     let ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr().cast()) };
     if ptr.is_null() {

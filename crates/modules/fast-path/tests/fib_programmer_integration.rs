@@ -32,10 +32,12 @@ use aya::maps::{Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
+use packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle;
 use packetframe_fast_path::fib::programmer::{FibProgrammer, ECMP_GROUPS_CAP};
 use packetframe_fast_path::fib::types::{
-    EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, FIB_KIND_ECMP, FIB_KIND_SINGLE, NH_FAMILY_V4,
-    NH_FAMILY_V6, NH_STATE_INCOMPLETE,
+    EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, NexthopSlotClass, FIB_KIND_ECMP,
+    FIB_KIND_SINGLE, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE,
+    NH_STATE_RESOLVED,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -360,6 +362,75 @@ impl ProgrammerHarness {
             },
             sink,
         )
+    }
+
+    /// `with_sink` plus a detached resolver handle, so a test can watch
+    /// the programmer's `request_resolve` traffic: what it asks to have
+    /// resolved and when. Nothing answers those requests — the test
+    /// plays the resolver by feeding `NeighEvent`s itself.
+    fn with_sink_and_resolver() -> (
+        Self,
+        Arc<RecordingSink>,
+        tokio::sync::mpsc::Receiver<IpAddr>,
+    ) {
+        let pins = PinDirs::setup();
+        let ebpf = load_and_pin(&pins);
+        let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
+        let fib_v4 = open_lpm_v4(&pins.path("FIB_V4"));
+        let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
+        let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
+        let shutdown = CancellationToken::new();
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (resolver, resolve_rx) = NeighborResolveHandle::detached();
+        let (mut programmer, handle) = FibProgrammer::new_with_resolver(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            None,
+            events_rx,
+            shutdown.clone(),
+            Some(resolver),
+        );
+        let sink = Arc::new(RecordingSink::default());
+        programmer.set_route_sink(sink.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let task = rt.spawn(programmer.run());
+        (
+            Self {
+                pins,
+                _ebpf: ebpf,
+                rt,
+                shutdown,
+                handle,
+                task: Some(task),
+                events_tx: Some(events_tx),
+            },
+            sink,
+            resolve_rx,
+        )
+    }
+
+    /// Let the programmer run for `wait`, then return every resolve
+    /// request it issued that is sitting in the detached queue. The
+    /// wait happens on the harness runtime so the programmer's timers
+    /// (`REPROBE_TICK`) actually fire.
+    fn drain_resolves(
+        &self,
+        rx: &mut tokio::sync::mpsc::Receiver<IpAddr>,
+        wait: Duration,
+    ) -> Vec<IpAddr> {
+        self.run(async move {
+            tokio::time::sleep(wait).await;
+            let mut out = Vec::new();
+            while let Ok(ip) = rx.try_recv() {
+                out.push(ip);
+            }
+            out
+        })
     }
 
     /// Push a `NeighEvent` into the programmer and let it drain.
@@ -2195,7 +2266,10 @@ fn neighbour_resolution_and_loss_reach_the_sink() {
         ifindex,
         src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
     });
-    h.feed_neigh(NeighEvent::Gone { ip: nh });
+    h.feed_neigh(NeighEvent::Gone {
+        ip: nh,
+        ifindex: 4242,
+    });
 
     let calls = sink.calls();
     assert_eq!(
@@ -2210,7 +2284,10 @@ fn neighbour_resolution_and_loss_reach_the_sink() {
     // An unregistered neighbour is not announced — the programmer's own
     // filter, inherited rather than duplicated.
     let stranger = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
-    h.feed_neigh(NeighEvent::Gone { ip: stranger });
+    h.feed_neigh(NeighEvent::Gone {
+        ip: stranger,
+        ifindex: 4242,
+    });
     assert_eq!(
         sink.calls().len(),
         2,
@@ -2263,10 +2340,186 @@ fn unregistering_a_nexthop_tells_the_sink_it_is_gone() {
     // after the unregister is dropped, which is what makes the
     // notification above the only one there will ever be.
     let before = sink.calls().len();
-    h.feed_neigh(NeighEvent::Gone { ip: nh });
+    h.feed_neigh(NeighEvent::Gone {
+        ip: nh,
+        ifindex: 4242,
+    });
     assert_eq!(
         sink.calls().len(),
         before,
         "a post-unregister event is filtered, so it cannot substitute"
+    );
+}
+
+// ========== Neighbour loss: interface filter, re-probe, tombstones ==========
+//
+// Background (2026-09-15): a third of the primary's traffic was taking
+// the kernel path because nexthops that lost resolution were never
+// re-probed, and `status` could not show it because tombstones and
+// live failures shared a bucket. These pin the three behaviours that
+// fix that.
+
+/// The kernel keys neighbours `(device, address)`. A `Gone` for the
+/// nexthop's address on some *other* device is a fact about a different
+/// entry and must not take the nexthop off the fast path; the same
+/// event on the device it is forwarding out of must.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn neighbour_loss_on_another_interface_is_ignored() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 21));
+    let mac = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x21];
+    let live_if = 4242;
+
+    let id = h
+        .run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    h.feed_neigh(NeighEvent::Learned {
+        ip: nh,
+        mac,
+        ifindex: live_if,
+        src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+    });
+    assert_eq!(h.read_nexthop(id).state, NH_STATE_RESOLVED);
+
+    // Same address deleted on a device we never resolved it through.
+    h.feed_neigh(NeighEvent::Gone {
+        ip: nh,
+        ifindex: live_if + 1,
+    });
+    let entry = h.read_nexthop(id);
+    assert_eq!(
+        entry.state, NH_STATE_RESOLVED,
+        "foreign-device Gone must not demote"
+    );
+    assert_eq!(entry.dst_mac, mac);
+    assert_eq!(entry.ifindex, live_if);
+    assert_eq!(
+        sink.calls(),
+        vec![SinkCall::NeighResolved(nh, mac, live_if)],
+        "and the second tier must not be told the neighbour is lost"
+    );
+
+    // A NUD_FAILED on the foreign device is filtered the same way.
+    h.feed_neigh(NeighEvent::Failed {
+        ip: nh,
+        ifindex: live_if + 1,
+        reason: "test".into(),
+    });
+    assert_eq!(h.read_nexthop(id).state, NH_STATE_RESOLVED);
+
+    // On the live device it is the real thing.
+    h.feed_neigh(NeighEvent::Gone {
+        ip: nh,
+        ifindex: live_if,
+    });
+    assert_eq!(h.read_nexthop(id).state, NH_STATE_INCOMPLETE);
+    assert_eq!(sink.calls().last(), Some(&SinkCall::NeighLost(nh)));
+}
+
+/// A nexthop that loses resolution is asked about again, with backoff,
+/// until the kernel answers — and stops being asked about once it does.
+/// Before this the only request ever made was the one at allocation.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn lost_nexthop_is_reprobed_until_it_resolves() {
+    let (h, _sink, mut resolves) = ProgrammerHarness::with_sink_and_resolver();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 22));
+    let mac = [0x02, 0x00, 0x5e, 0x10, 0x00, 0x22];
+    let learned = NeighEvent::Learned {
+        ip: nh,
+        mac,
+        ifindex: 4242,
+        src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+    };
+
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    // Allocation kicks once immediately (pre-existing behaviour).
+    let first = h.drain_resolves(&mut resolves, Duration::from_millis(200));
+    assert_eq!(
+        first,
+        vec![nh],
+        "allocation issues exactly one immediate request"
+    );
+
+    // Resolved promptly: the schedule armed at allocation is cancelled,
+    // so nothing further is asked over several ticks.
+    h.feed_neigh(learned.clone());
+    let quiet = h.drain_resolves(&mut resolves, Duration::from_millis(3500));
+    assert!(
+        quiet.is_empty(),
+        "a resolved nexthop is not re-probed: {quiet:?}"
+    );
+
+    // Lost on the live device: the re-probe fires within the first
+    // backoff step plus one tick (1 s + 1 s), generous for a TCG guest.
+    h.feed_neigh(NeighEvent::Gone {
+        ip: nh,
+        ifindex: 4242,
+    });
+    let after_loss = h.drain_resolves(&mut resolves, Duration::from_millis(3500));
+    assert!(
+        !after_loss.is_empty() && after_loss.iter().all(|ip| *ip == nh),
+        "a lost nexthop must be re-probed (got {after_loss:?})"
+    );
+
+    // Answered: the schedule is disarmed again. A request already due
+    // when the Learned landed may still fire on the same tick; discard
+    // that edge before asserting silence over several further ticks.
+    h.feed_neigh(learned);
+    let _ = h.drain_resolves(&mut resolves, Duration::from_millis(300));
+    let settled = h.drain_resolves(&mut resolves, Duration::from_millis(3500));
+    assert!(
+        settled.is_empty(),
+        "re-resolution stops the re-probes: {settled:?}"
+    );
+}
+
+/// A freed slot and a live nexthop the kernel gave up on both carry
+/// `state = FAILED`; `family` is what tells them apart, and the shared
+/// classifier is what `status`, the exporter and `fib dump` all read.
+/// Pins the write-side half of that contract: the tombstone clears
+/// `family`, a live failure keeps it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn freed_slot_reads_as_tombstone_not_as_failed_nexthop() {
+    let (h, _sink) = ProgrammerHarness::with_sink();
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 23));
+
+    let id = h
+        .run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    let seeded = h.read_nexthop(id);
+    assert_eq!(
+        NexthopSlotClass::from_entry(seeded.state, seeded.family),
+        NexthopSlotClass::Incomplete,
+        "the allocation seed is a live, unresolved slot — not untouched capacity"
+    );
+
+    h.feed_neigh(NeighEvent::Failed {
+        ip: nh,
+        ifindex: 4242,
+        reason: "test".into(),
+    });
+    let failed = h.read_nexthop(id);
+    assert_eq!(failed.state, NH_STATE_FAILED);
+    assert_eq!(
+        NexthopSlotClass::from_entry(failed.state, failed.family),
+        NexthopSlotClass::Failed,
+        "a kernel NUD_FAILED on a referenced nexthop is a live failure"
+    );
+
+    h.run(async { h.handle.unregister_nexthop(nh).await })
+        .expect("unregister_nexthop");
+    let freed = h.read_nexthop(id);
+    assert_eq!(
+        freed.state, NH_STATE_FAILED,
+        "tombstone keeps the fail-closed state"
+    );
+    assert_eq!(
+        NexthopSlotClass::from_entry(freed.state, freed.family),
+        NexthopSlotClass::Freed,
+        "but reads as a tombstone, so status never counts it as a failed nexthop"
     );
 }
