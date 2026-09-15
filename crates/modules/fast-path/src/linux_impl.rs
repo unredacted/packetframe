@@ -86,7 +86,7 @@ pub(crate) const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 /// `reconcile_cfg` flag rebuild included; a bit missing there would be
 /// silently wiped on SIGHUP, the head-shift-bug pattern).
 pub(crate) const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
-pub(crate) const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
+pub const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
 pub(crate) const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
 
 /// Compute the feature-presence bits (5-7) of `FpCfg.flags` from the
@@ -510,6 +510,16 @@ pub(crate) fn set_cfg_flag(ebpf: &mut Ebpf, bit: u8, on: bool) -> ModuleResult<(
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "CFG map missing from ELF"))?;
     let mut arr: Array<_, FpCfg> = Array::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG Array::try_from: {e}")))?;
+    set_cfg_flag_in(&mut arr, bit, on)
+}
+
+/// The RMW itself, over any CFG handle: the `Ebpf`-owned map above or
+/// one opened from the bpffs pin (the redirect-target watcher).
+pub(crate) fn set_cfg_flag_in<T: std::borrow::BorrowMut<aya::maps::MapData>>(
+    arr: &mut Array<T, FpCfg>,
+    bit: u8,
+    on: bool,
+) -> ModuleResult<()> {
     let mut cur: FpCfg = arr
         .get(&0, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
@@ -1695,7 +1705,10 @@ pub fn attach(
     // until the next reload. Opens the maps from their pins, so it
     // must run after `pin_program_and_maps`. Mode-independent: the
     // datapath pre-check it feeds exists under kernel-fib too.
-    match crate::redirect_watch::RedirectTargetWatcher::start(&state.bpffs_root) {
+    match crate::redirect_watch::RedirectTargetWatcher::start(
+        &state.bpffs_root,
+        cfg.section.directives.to_vec(),
+    ) {
         Ok(w) => state.redirect_watch = Some(w),
         Err(e) => warn!(
             error = %e,

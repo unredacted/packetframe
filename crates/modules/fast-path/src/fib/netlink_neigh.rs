@@ -212,15 +212,22 @@ impl NeighborResolveHandle {
         (Self { resolve_tx }, resolve_rx)
     }
 
-    /// Request proactive resolution of `ip`. Non-blocking.
-    pub fn request_resolve(&self, ip: IpAddr) {
-        if let Err(e) = self.resolve_tx.try_send(ip) {
-            warn!(
-                ?ip,
-                error = %e,
-                "proactive resolve queue saturated; dropping request \
-                 (kernel resolves on first real packet anyway)"
-            );
+    /// Request proactive resolution of `ip`. Non-blocking. Returns
+    /// whether the request was enqueued: `false` means the bounded
+    /// queue is full and nothing was asked, so the caller must not
+    /// treat it as a probe that happened (the programmer's re-probe
+    /// scheduler leaves the entry due and retries next tick).
+    pub fn request_resolve(&self, ip: IpAddr) -> bool {
+        match self.resolve_tx.try_send(ip) {
+            Ok(()) => true,
+            Err(e) => {
+                debug!(
+                    ?ip,
+                    error = %e,
+                    "proactive resolve queue saturated; request not enqueued"
+                );
+                false
+            }
         }
     }
 }

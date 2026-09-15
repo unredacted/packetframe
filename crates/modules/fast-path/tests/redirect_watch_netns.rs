@@ -1,6 +1,8 @@
 //! `RedirectTargetWatcher` against a real kernel: links created and
 //! deleted inside a netns must appear in and vanish from the pinned
-//! `REDIRECT_DEVMAP` / `TC_REDIRECT_TARGETS` without a SIGHUP.
+//! `REDIRECT_DEVMAP` / `TC_REDIRECT_TARGETS` without a SIGHUP, and a
+//! VLAN sub-interface must get its `VLAN_RESOLVE` translation (and the
+//! `VLAN_PRESENT` gate) along with its admission.
 //!
 //! Needs CAP_NET_ADMIN + CAP_SYS_ADMIN (netns) and CAP_BPF + bpffs
 //! (pins); runs in the qemu-verifier job via `--ignored`.
@@ -13,7 +15,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -21,9 +23,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use aya::maps::{xdp::DevMapHash, HashMap as AyaHashMap, Map, MapData};
+use aya::maps::{xdp::DevMapHash, Array, HashMap as AyaHashMap, Map, MapData};
 use aya::Ebpf;
 use packetframe_fast_path::aligned_bpf_copy;
+use packetframe_fast_path::linux_impl::{FpCfg, VlanResolve, FP_CFG_FLAG_VLAN_PRESENT};
 use packetframe_fast_path::pin;
 use packetframe_fast_path::redirect_watch::RedirectTargetWatcher;
 
@@ -87,7 +90,12 @@ impl Pins {
         std::fs::create_dir_all(pin::maps_dir(&root)).expect("mkdir pin dirs");
         let bytes = aligned_bpf_copy();
         let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
-        for name in ["REDIRECT_DEVMAP", "TC_REDIRECT_TARGETS"] {
+        for name in [
+            "REDIRECT_DEVMAP",
+            "TC_REDIRECT_TARGETS",
+            "VLAN_RESOLVE",
+            "CFG",
+        ] {
             let path = pin::map_path(&root, name);
             ebpf.map(name)
                 .unwrap_or_else(|| panic!("{name} map missing from ELF"))
@@ -109,6 +117,23 @@ impl Pins {
         let tc: AyaHashMap<MapData, u32, u32> = AyaHashMap::try_from(Map::HashMap(tm)).expect("tc");
         tc.keys().filter_map(Result::ok).collect()
     }
+
+    /// `VLAN_RESOLVE` as `subif_idx → (phys_idx, vid)`.
+    fn vlan_entries(&self) -> HashMap<u32, (u32, u16)> {
+        let vm = MapData::from_pin(pin::map_path(&self.root, "VLAN_RESOLVE")).expect("pin");
+        let vlan: AyaHashMap<MapData, u32, VlanResolve> =
+            AyaHashMap::try_from(Map::HashMap(vm)).expect("vlan");
+        vlan.iter()
+            .filter_map(Result::ok)
+            .map(|(k, v)| (k, (v.phys_ifindex, v.vid)))
+            .collect()
+    }
+
+    fn vlan_present_gate(&self) -> bool {
+        let cm = MapData::from_pin(pin::map_path(&self.root, "CFG")).expect("pin");
+        let cfg: Array<MapData, FpCfg> = Array::try_from(Map::Array(cm)).expect("cfg");
+        cfg.get(&0, 0).expect("CFG[0]").flags & FP_CFG_FLAG_VLAN_PRESENT != 0
+    }
 }
 
 impl Drop for Pins {
@@ -117,21 +142,31 @@ impl Drop for Pins {
     }
 }
 
-/// Poll `pred` on both maps until it holds or `deadline` passes.
-fn wait_for(pins: &Pins, what: &str, deadline: Duration, pred: impl Fn(&HashSet<u32>) -> bool) {
+/// Poll `pred` until it holds or `deadline` passes; on failure print
+/// every map so the assertion message says what the watcher did.
+fn poll(pins: &Pins, what: &str, deadline: Duration, pred: impl Fn() -> bool) {
     let start = Instant::now();
     loop {
-        let dev = pins.devmap_keys();
-        let tc = pins.tc_keys();
-        if pred(&dev) && pred(&tc) {
+        if pred() {
             return;
         }
         assert!(
             start.elapsed() < deadline,
-            "{what}: not satisfied within {deadline:?}; devmap={dev:?} tc={tc:?}"
+            "{what}: not satisfied within {deadline:?}; devmap={:?} tc={:?} vlan={:?} gate={}",
+            pins.devmap_keys(),
+            pins.tc_keys(),
+            pins.vlan_entries(),
+            pins.vlan_present_gate()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Both redirect maps satisfy `pred`.
+fn wait_for(pins: &Pins, what: &str, deadline: Duration, pred: impl Fn(&HashSet<u32>) -> bool) {
+    poll(pins, what, deadline, || {
+        pred(&pins.devmap_keys()) && pred(&pins.tc_keys())
+    });
 }
 
 fn bpffs_present(root: &Path) -> bool {
@@ -155,7 +190,7 @@ fn links_created_and_deleted_at_runtime_track_into_the_redirect_maps() {
     // to it.
     let _ns_fd = enter_netns(&netns);
     let pins = Pins::setup();
-    let watcher = RedirectTargetWatcher::start(&pins.root).expect("watcher start");
+    let watcher = RedirectTargetWatcher::start(&pins.root, Vec::new()).expect("watcher start");
 
     // Give the subscription a moment to come up; an event before it
     // is live would be a test race, not a product bug.
@@ -181,12 +216,44 @@ fn links_created_and_deleted_at_runtime_track_into_the_redirect_maps() {
         k.contains(&ia) && k.contains(&ib)
     });
 
-    // Deleting one end deletes the pair; both ifindexes must leave
-    // both maps.
+    // A VLAN sub-interface on top of one end: its translation to
+    // (parent, vid) must be in VLAN_RESOLVE with the gate bit set, and
+    // the sub-interface itself admitted — this is the recreated
+    // `switch0.N` case that motivated the watcher.
+    let sub = format!("{a}.100");
+    ns_run(
+        &netns,
+        &[
+            "ip", "link", "add", "link", &a, "name", &sub, "type", "vlan", "id", "100",
+        ],
+    );
+    ns_run(&netns, &["ip", "link", "set", &sub, "up"]);
+    let isub = if_nametoindex(&sub);
+    poll(
+        &pins,
+        "vlan subif translated and admitted",
+        Duration::from_secs(5),
+        || {
+            pins.vlan_entries().get(&isub) == Some(&(ia, 100))
+                && pins.vlan_present_gate()
+                && pins.devmap_keys().contains(&isub)
+                && pins.tc_keys().contains(&isub)
+        },
+    );
+
+    // Deleting one end deletes the pair and the sub-interface riding
+    // on it; every ifindex must leave both redirect maps and the
+    // translation must go with them.
     ns_run(&netns, &["ip", "link", "del", &a]);
     wait_for(&pins, "deleted veths purged", Duration::from_secs(5), |k| {
-        !k.contains(&ia) && !k.contains(&ib)
+        !k.contains(&ia) && !k.contains(&ib) && !k.contains(&isub)
     });
+    poll(
+        &pins,
+        "vlan translation purged",
+        Duration::from_secs(5),
+        || !pins.vlan_entries().contains_key(&isub),
+    );
 
     watcher.shutdown();
 }

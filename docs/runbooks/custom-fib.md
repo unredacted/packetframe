@@ -1030,7 +1030,11 @@ at attach from `/sys/class/net` (Ethernet-type, oper-up or unknown)
 and were once refreshed only on SIGHUP; since the 2026-09-15 fix a
 watcher thread follows `RTM_NEWLINK`/`RTM_DELLINK` and keeps them
 current, so a bridge or VLAN sub-interface the platform re-creates
-mid-run is a valid target as soon as it is up.
+mid-run is a valid target as soon as it is up. The same refresh
+rewrites `VLAN_RESOLVE` (sub-interface → physical port + VID, and the
+bridge egress short-circuits) *before* admitting the new link, so a
+recreated `switch0.N` is redirected through its parent with the tag,
+never to the virtual device itself.
 
 Check:
 

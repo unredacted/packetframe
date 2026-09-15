@@ -1201,8 +1201,23 @@ impl FibProgrammer {
             .take(REPROBE_BATCH)
             .collect();
         for ip in due {
-            if let Some(h) = &self.neigh_handle {
-                h.request_resolve(ip);
+            // Only a request that actually reached the resolver counts
+            // as an attempt. When its bounded queue is full — a mass
+            // loss, or the resolver blocked on netlink — the entry
+            // stays due at its current backoff and the rest of the
+            // batch waits for the next tick; advancing the backoff on
+            // a probe that was never issued would push exactly the
+            // mass-loss case out to the 60 s cap (review finding).
+            let enqueued = match &self.neigh_handle {
+                Some(h) => h.request_resolve(ip),
+                None => true,
+            };
+            if !enqueued {
+                debug!(
+                    ?ip,
+                    "resolver queue full; remaining re-probes stay due for the next tick"
+                );
+                break;
             }
             if let Some(r) = self.reprobe.get_mut(&ip) {
                 r.attempts = r.attempts.saturating_add(1);
