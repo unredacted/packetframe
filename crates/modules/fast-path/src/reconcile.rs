@@ -25,8 +25,8 @@ use tracing::{info, warn};
 use crate::linux_impl::{
     discover_bridge_chains, feature_flags_from_config, fib_cache_enabled,
     fib_flags_from_forwarding_mode, if_nametoindex, mss_clamp_global_value, read_vlan_config,
-    set_cfg_flag, ActiveState, FpCfg, MssClampValue, VlanResolve, FP_CFG_FLAG_HEAD_SHIFT_128,
-    FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
+    set_cfg_flag, ActiveState, FpCfg, MssClampValue, VlanResolve, CFG_WRITE_LOCK,
+    FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -222,6 +222,12 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     // keep its entries while the datapath stopped consulting them,
     // mistagging subif egress until the next successful reconcile.
     // (Found by review on the original recompute-on-SIGHUP version.)
+    //
+    // The read below and the write at the end are one RMW of the whole
+    // struct; the redirect-target watcher performs its own on another
+    // thread for bit 6. `CFG_WRITE_LOCK` keeps them from interleaving —
+    // see its doc for what an interleaving would have lost.
+    let _serialized = CFG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let current: FpCfg = cfg_arr
         .get(&0, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
@@ -404,10 +410,16 @@ pub(crate) fn desired_vlan_resolve(directives: &[ModuleDirective]) -> ModuleResu
 /// Diff `want` against the live map and apply it. Generic over the
 /// handle so the SIGHUP path (an `Ebpf`-owned map) and the watcher (a
 /// pinned map) run the identical add/remove logic.
+///
+/// Returns the delta and the set of desired keys whose entry is NOT in
+/// the map after this pass (insert failed — typically the 256-entry
+/// map is full). The watcher refuses to admit such a link as a redirect
+/// target; redirecting to it untranslated is the failure the ordering
+/// exists to prevent (review finding).
 pub(crate) fn apply_vlan_resolve<T: std::borrow::BorrowMut<aya::maps::MapData>>(
     hm: &mut AyaHashMap<T, u32, VlanResolve>,
     want: &VlanDesired,
-) -> DeltaCount {
+) -> (DeltaCount, HashSet<u32>) {
     // Union for the diff/removal logic; the ADD pass runs subif
     // entries before bridge aliases so that under map-capacity
     // pressure the slot that runs out is always the optional
@@ -423,6 +435,7 @@ pub(crate) fn apply_vlan_resolve<T: std::borrow::BorrowMut<aya::maps::MapData>>(
         .collect();
 
     let mut delta = DeltaCount::default();
+    let mut untranslated: HashSet<u32> = HashSet::new();
     let mut to_add: Vec<&(u32, u32, u16)> = desired.difference(&current).collect();
     to_add.sort_by_key(|t| (want.bridges.contains(t) && !want.subifs.contains(t), t.0));
     for (subif_idx, phys_idx, vid) in to_add.into_iter() {
@@ -436,7 +449,10 @@ pub(crate) fn apply_vlan_resolve<T: std::borrow::BorrowMut<aya::maps::MapData>>(
                 delta.added += 1;
                 info!(subif_idx, phys_idx, vid, "VLAN_RESOLVE added");
             }
-            Err(e) => warn!(subif_idx, error = %e, "VLAN_RESOLVE insert failed"),
+            Err(e) => {
+                warn!(subif_idx, error = %e, "VLAN_RESOLVE insert failed");
+                untranslated.insert(*subif_idx);
+            }
         }
     }
     // The diff is over full (key, value) tuples but the map is keyed
@@ -459,7 +475,7 @@ pub(crate) fn apply_vlan_resolve<T: std::borrow::BorrowMut<aya::maps::MapData>>(
             Err(e) => warn!(subif_idx, error = %e, "VLAN_RESOLVE remove failed"),
         }
     }
-    delta
+    (delta, untranslated)
 }
 
 pub(crate) fn reconcile_vlan_resolve(
@@ -507,7 +523,10 @@ pub(crate) fn reconcile_vlan_resolve(
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "VLAN_RESOLVE missing from ELF"))?;
     let mut hm: AyaHashMap<_, u32, VlanResolve> = AyaHashMap::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("VLAN_RESOLVE try_from: {e}")))?;
-    let delta = apply_vlan_resolve(&mut hm, &want);
+    // Failed inserts are already warned about; on the SIGHUP path the
+    // redirect maps are reconciled independently and there is no
+    // admission to hold back.
+    let (delta, _untranslated) = apply_vlan_resolve(&mut hm, &want);
 
     // Authoritative post-convergence fix of the VLAN_PRESENT gate bit:
     // set iff the map has (desired) entries. Covers subifs appearing

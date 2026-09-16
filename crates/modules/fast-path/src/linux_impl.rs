@@ -513,13 +513,31 @@ pub(crate) fn set_cfg_flag(ebpf: &mut Ebpf, bit: u8, on: bool) -> ModuleResult<(
     set_cfg_flag_in(&mut arr, bit, on)
 }
 
+/// Serializes every read-modify-write of `CFG[0]` in this process.
+///
+/// `CFG[0]` is one struct, and every writer — the SIGHUP reconcile
+/// rewriting dry-run / forwarding-mode / feature flags on the main
+/// thread, the redirect-target watcher flipping the VLAN_PRESENT bit on
+/// its own thread — reads the whole value, changes its part and writes
+/// the whole value back. Two such RMWs interleaved lose one of them:
+/// a watcher that read before a reload wrote and wrote after would
+/// restore every field the reload had just changed, and the later VLAN
+/// reconcile would faithfully preserve that stale value (review
+/// finding on #220). Every RMW takes this lock for its read+write.
+pub(crate) static CFG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The RMW itself, over any CFG handle: the `Ebpf`-owned map above or
-/// one opened from the bpffs pin (the redirect-target watcher).
+/// one opened from the bpffs pin (the redirect-target watcher). Holds
+/// [`CFG_WRITE_LOCK`] across the read and the write.
 pub(crate) fn set_cfg_flag_in<T: std::borrow::BorrowMut<aya::maps::MapData>>(
     arr: &mut Array<T, FpCfg>,
     bit: u8,
     on: bool,
 ) -> ModuleResult<()> {
+    // A poisoned lock means another writer panicked mid-RMW; the map
+    // holds whatever it last wrote, which is a complete value, so
+    // proceeding is safe.
+    let _serialized = CFG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut cur: FpCfg = arr
         .get(&0, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;

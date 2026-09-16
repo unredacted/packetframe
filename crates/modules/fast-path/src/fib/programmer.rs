@@ -1452,29 +1452,48 @@ impl FibProgrammer {
             }
         };
 
-        if let Err(e) = self.write_seqlock(id, entry) {
-            warn!(?ip, id, error = %e, "NEXTHOPS update failed");
-        }
+        let written = match self.write_seqlock(id, entry) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(?ip, id, error = %e, "NEXTHOPS update failed");
+                false
+            }
+        };
 
-        // Recovery bookkeeping. `Learned` settles the slot and disarms
-        // the schedule; `Failed`/`Gone` arm it (an existing entry keeps
-        // its backoff). The two info lines are rate-limited to the
-        // first 20 losses and recoveries that took real waiting, so a
-        // GC-cycling neighbour shows up in the journal without owning
-        // it; the once-a-minute summary in `fire_due_reprobes` carries
-        // the totals.
+        // Recovery bookkeeping. A `Learned` that reached the map settles
+        // the slot and disarms the schedule; `Failed`/`Gone` arm it (an
+        // existing entry keeps its backoff). The two info lines are
+        // rate-limited to the first 20 losses and recoveries that took
+        // real waiting, so a GC-cycling neighbour shows up in the
+        // journal without owning it; the once-a-minute summary in
+        // `fire_due_reprobes` carries the totals.
         if learned.is_some() {
-            if let Some(r) = self.reprobe.remove(&ip) {
-                if r.attempts > 0 {
-                    self.reprobe_recoveries += 1;
-                    if r.attempts >= 2 || self.reprobe_recoveries <= 20 {
-                        info!(
-                            ?ip,
-                            attempts = r.attempts,
-                            "nexthop re-resolved after re-probing; back on the fast path"
-                        );
+            if written {
+                if let Some(r) = self.reprobe.remove(&ip) {
+                    if r.attempts > 0 {
+                        self.reprobe_recoveries += 1;
+                        if r.attempts >= 2 || self.reprobe_recoveries <= 20 {
+                            info!(
+                                ?ip,
+                                attempts = r.attempts,
+                                "nexthop re-resolved after re-probing; back on the fast path"
+                            );
+                        }
                     }
                 }
+            } else {
+                // The kernel's answer never reached the slot: it still
+                // reads Incomplete/Failed and the traffic is still on the
+                // kernel path. Disarming here would end recovery on a
+                // transient map-write failure — an already-reachable
+                // neighbour emits no further event on its own (review
+                // finding). Keep `live` honest and keep asking; the next
+                // probe's read-back or cache hit re-delivers the Learned
+                // and retries the write.
+                if let Some(rec) = self.by_ip.get_mut(&ip) {
+                    rec.live = None;
+                }
+                self.arm_reprobe(ip);
             }
         } else {
             if live_before.is_some() {

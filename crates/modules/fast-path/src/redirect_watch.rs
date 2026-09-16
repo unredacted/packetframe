@@ -75,6 +75,9 @@ pub struct RedirectTargetWatcher {
     shutdown: CancellationToken,
     thread: Option<JoinHandle<()>>,
     directives: Arc<Mutex<Vec<ModuleDirective>>>,
+    /// Wakes the watcher for a refresh that no link event caused: a
+    /// SIGHUP handed over new directives.
+    refresh_now: Arc<tokio::sync::Notify>,
 }
 
 impl RedirectTargetWatcher {
@@ -93,6 +96,8 @@ impl RedirectTargetWatcher {
         let root = bpffs_root.to_path_buf();
         let directives = Arc::new(Mutex::new(directives));
         let shared = Arc::clone(&directives);
+        let refresh_now = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::clone(&refresh_now);
         let thread = std::thread::Builder::new()
             .name("pf-redirect-watch".into())
             .spawn(move || {
@@ -110,22 +115,31 @@ impl RedirectTargetWatcher {
                         return;
                     }
                 };
-                rt.block_on(run(root, token, shared));
+                rt.block_on(run(root, token, shared, wake));
             })?;
         Ok(Self {
             shutdown,
             thread: Some(thread),
             directives,
+            refresh_now,
         })
     }
 
-    /// Replace the directives the next topology refresh derives
-    /// `VLAN_RESOLVE` from. Called by the SIGHUP reconcile after it has
-    /// applied the same directives itself.
+    /// Replace the directives the topology refresh derives
+    /// `VLAN_RESOLVE` from, and schedule a refresh with them. Called by
+    /// the SIGHUP reconcile after it has applied the same directives
+    /// itself. The scheduled refresh is what makes the hand-over
+    /// converge: a refresh already running on the watcher thread may
+    /// have cloned the OLD directives and will finish after the
+    /// reload, writing the old bridge mapping back; the refresh queued
+    /// here runs after it, with the new ones, and undoes that (review
+    /// finding). `Notify` stores the wake-up if the watcher is not
+    /// waiting yet, so it cannot be lost.
     pub fn set_directives(&self, directives: Vec<ModuleDirective>) {
         if let Ok(mut d) = self.directives.lock() {
             *d = directives;
         }
+        self.refresh_now.notify_one();
     }
 
     /// Stop the thread and wait for it. The map handles it holds are
@@ -241,15 +255,18 @@ impl Targets {
 
     /// Bring `VLAN_RESOLVE` and its gate bit to what the topology says
     /// right now. `Err` means the topology could not be read; nothing
-    /// was written and the caller should hold off admitting targets.
-    fn refresh_vlan(&mut self, directives: &[ModuleDirective]) -> Result<(), String> {
+    /// was written and the caller must hold off admitting targets.
+    /// `Ok` carries the ifindexes whose translation is REQUIRED but not
+    /// in the map after this pass (insert failed, map full): admitting
+    /// one of those would redirect to the untranslated virtual device,
+    /// which is what this ordering exists to prevent, so the caller
+    /// holds them too.
+    fn refresh_vlan(&mut self, directives: &[ModuleDirective]) -> Result<HashSet<u32>, String> {
         let want = desired_vlan_resolve(directives).map_err(|e| e.to_string())?;
-        let delta = apply_vlan_resolve(&mut self.vlan, &want);
+        let (delta, untranslated) = apply_vlan_resolve(&mut self.vlan, &want);
         let present = !(want.subifs.is_empty() && want.bridges.is_empty());
-        // The SIGHUP path performs the same RMW on the same bit from
-        // the main thread. Both write the value the topology dictates,
-        // so an interleaving can at worst lose one update until the
-        // next refresh or reload sets it again.
+        // Serialized against the SIGHUP path's CFG writes by
+        // `CFG_WRITE_LOCK` inside `set_cfg_flag_in`.
         if let Err(e) = set_cfg_flag_in(&mut self.cfg, FP_CFG_FLAG_VLAN_PRESENT, present) {
             warn!(error = %e, "VLAN_PRESENT gate write failed");
         }
@@ -261,7 +278,7 @@ impl Targets {
                 "VLAN_RESOLVE refreshed from link events"
             );
         }
-        Ok(())
+        Ok(untranslated)
     }
 
     /// Start-up pass: what `/sys/class/net` says versus what the maps
@@ -274,13 +291,20 @@ impl Targets {
             .map(|(_, ifindex)| ifindex)
             .collect();
         let known: HashSet<u32> = self.in_devmap.union(&self.in_tc).copied().collect();
-        let missing: Vec<u32> = desired.difference(&known).copied().collect();
         let stale: Vec<u32> = known
             .difference(&desired)
             .copied()
             .filter(|i| !ifindex_exists(*i))
             .collect();
-        for ifindex in missing {
+        // Every desired ifindex goes through `admit`, whose per-map
+        // checks fill whichever side is missing: an interface attach
+        // put in one map but failed to insert into the other is still
+        // repaired here, where a `missing = desired − known` diff would
+        // have skipped it (review finding). Already-complete entries
+        // cost two set lookups and no syscall.
+        let mut desired_sorted: Vec<u32> = desired.into_iter().collect();
+        desired_sorted.sort_unstable();
+        for ifindex in desired_sorted {
             self.admit(ifindex, "present at watcher start");
         }
         for ifindex in stale {
@@ -327,6 +351,7 @@ async fn run(
     root: PathBuf,
     shutdown: CancellationToken,
     directives: Arc<Mutex<Vec<ModuleDirective>>>,
+    refresh_now: Arc<tokio::sync::Notify>,
 ) {
     // Subscribe BEFORE the reconcile so a link that changes during the
     // reconcile is replayed from the socket buffer afterwards instead
@@ -387,14 +412,20 @@ async fn run(
             _ = async { tokio::time::sleep_until(due.unwrap_or_else(Instant::now)).await }, if due.is_some() => {
                 refresh(&mut targets, &mut pending, &directives);
             }
+            _ = refresh_now.notified() => {
+                // A SIGHUP changed the directives; converge on them
+                // after whatever refresh may just have run.
+                pending.touch();
+            }
         }
     }
 }
 
 /// The debounced pass: `VLAN_RESOLVE` first, then the admits it was
-/// holding back. A topology read failure keeps the admits pending and
-/// re-arms the debounce, so a transient `/proc` error costs a retry,
-/// not a redirect to an untranslated sub-interface.
+/// holding back. A topology read failure keeps every admit pending and
+/// re-arms the debounce; a translation that could not be written keeps
+/// THAT admit pending the same way. Either way a transient failure
+/// costs a retry, never a redirect to an untranslated sub-interface.
 fn refresh(
     targets: &mut Targets,
     pending: &mut Pending,
@@ -404,17 +435,36 @@ fn refresh(
         Ok(d) => d.clone(),
         Err(_) => Vec::new(),
     };
-    if let Err(e) = targets.refresh_vlan(&snapshot) {
-        warn!(error = %e, "topology read failed; redirect admits held for retry");
-        pending.touch();
-        return;
-    }
+    let untranslated = match targets.refresh_vlan(&snapshot) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!(error = %e, "topology read failed; redirect admits held for retry");
+            pending.touch();
+            return;
+        }
+    };
     pending.due = None;
+    let mut held = Vec::new();
     for ifindex in std::mem::take(&mut pending.admit) {
         // The link may have gone away again inside the debounce window.
-        if ifindex_exists(ifindex) {
-            targets.admit(ifindex, "RTM_NEWLINK");
+        if !ifindex_exists(ifindex) {
+            continue;
         }
+        if untranslated.contains(&ifindex) {
+            warn!(
+                ifindex,
+                "VLAN translation for this link is not in VLAN_RESOLVE (insert failed or map \
+                 full); not admitted as a redirect target — its traffic stays on the kernel \
+                 path until the entry lands"
+            );
+            held.push(ifindex);
+            continue;
+        }
+        targets.admit(ifindex, "RTM_NEWLINK");
+    }
+    if !held.is_empty() {
+        pending.admit = held;
+        pending.touch();
     }
 }
 
