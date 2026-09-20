@@ -414,7 +414,7 @@ fn resolver_emits_gone_on_neigh_delete() {
                 Ok(None) => break,
                 Err(_) => break,
             };
-            if let NeighEvent::Gone { ip } = evt {
+            if let NeighEvent::Gone { ip, .. } = evt {
                 if ip == expected_ip {
                     seen_gone = true;
                     break;

@@ -736,13 +736,27 @@ pub enum NeighEvent {
         ifindex: u32,
         src_mac: [u8; 6],
     },
-    /// Resolution failed after retries. Programmer marks the
-    /// nexthop `Failed`; XDP packets for routes pointing at this
-    /// NH return `NoNeigh` to the kernel.
-    Failed { ip: IpAddr, reason: String },
-    /// The kernel removed the neighbor (link down, RTM_DELNEIGH).
-    /// Programmer marks `Incomplete` and queues a fresh resolve.
-    Gone { ip: IpAddr },
+    /// The kernel marked the neighbour `NUD_FAILED` on `ifindex`.
+    /// Programmer marks the nexthop `Failed` and arms a re-probe;
+    /// XDP packets for routes pointing at this NH return `NoNeigh`
+    /// to the kernel meanwhile.
+    ///
+    /// `ifindex` is the device the kernel's neighbour entry lives
+    /// on. Neighbour tables are keyed `(device, address)`, so the
+    /// same address can fail on one interface while it is perfectly
+    /// reachable on the one the nexthop was resolved through; the
+    /// programmer ignores a Failed whose `ifindex` is not the one it
+    /// is forwarding out of.
+    Failed {
+        ip: IpAddr,
+        ifindex: u32,
+        reason: String,
+    },
+    /// The kernel removed the neighbour on `ifindex` (RTM_DELNEIGH:
+    /// garbage collection, link down, `ip neigh del`). Programmer
+    /// marks `Incomplete` and arms a re-probe. Same `ifindex`
+    /// filter as `Failed`.
+    Gone { ip: IpAddr, ifindex: u32 },
 }
 
 // --- ResolvedRouteSink ------------------------------------------------

@@ -100,6 +100,41 @@ pub const DEFAULT_ROUTE_GRACE: Duration = Duration::from_millis(100);
 /// this is just a backstop.
 const RECLAIM_TICK: Duration = Duration::from_millis(50);
 
+/// Re-probe cadence for nexthops that are allocated but not
+/// `Resolved`.
+///
+/// Resolution used to be requested exactly once, at allocation. After
+/// that the only way back to `Resolved` was the kernel volunteering an
+/// `RTM_NEWNEIGH` with a MAC, which it does only when *it* sends to the
+/// neighbour. XDP-redirected traffic never touches the kernel neighbour
+/// entry, so for a nexthop the kernel itself has no reason to talk to
+/// (a route-server-learned IX peer is the common case) the entry ages
+/// REACHABLE → STALE → garbage-collected; the `Gone` put the slot at
+/// `Incomplete`, and recovery then depended on the kernel forwarding
+/// the fallen-through packets to the *same* neighbour and ARPing it.
+/// When its own FIB disagreed with the mirror, or the packets were
+/// dropped before reaching it, the slot stayed unresolved until the
+/// daemon restarted. On 2026-09-15 that was a third of the traffic
+/// taking the kernel path.
+///
+/// The programmer now owns recovery: every unresolved slot with a live
+/// refcount has a re-probe due, fired through `request_resolve` with
+/// exponential backoff from `REPROBE_INITIAL` to `REPROBE_MAX`, and
+/// disarmed by the next `Learned`. A dead neighbour therefore costs one
+/// kernel probe cycle per minute; a live one recovers on the first
+/// probe.
+const REPROBE_TICK: Duration = Duration::from_secs(1);
+const REPROBE_INITIAL: Duration = Duration::from_secs(1);
+const REPROBE_MAX: Duration = Duration::from_secs(60);
+/// Requests issued per tick, so a mass loss (link flap over hundreds
+/// of nexthops) cannot saturate the resolver queue in one burst; what
+/// does not fit stays due and goes next tick.
+const REPROBE_BATCH: usize = 256;
+/// How often the pending re-probe set is summarised at info while it
+/// is non-empty. One line a minute at most, so a chronic loss is
+/// visible in the journal without a flapping neighbour flooding it.
+const REPROBE_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
 /// `NexthopId` is an index into the `NEXTHOPS` BPF array. Stable
 /// once assigned (via refcount/free-list recycling) so FIB_V4 / FIB_V6
 /// LPM trie values can reference it without cascading updates on
@@ -622,6 +657,22 @@ pub struct FibProgrammer {
     /// nexthops stuck in `incomplete` in pre-rc4 builds.
     /// `Option` so test harnesses can pass `None`.
     neigh_handle: Option<NeighborResolveHandle>,
+    /// Nexthops owed a re-probe: every allocated slot that is not
+    /// `Resolved`, keyed by IP. Armed at allocation and on
+    /// `Failed`/`Gone`, disarmed by `Learned` and by the slot being
+    /// freed. See `REPROBE_TICK` for why this exists.
+    reprobe: HashMap<IpAddr, Reprobe>,
+    /// Lifetime counters behind the periodic re-probe summary.
+    reprobe_losses: u64,
+    reprobe_recoveries: u64,
+    reprobe_last_stats: Instant,
+}
+
+/// One pending re-probe. `attempts` drives the backoff.
+#[derive(Debug, Clone, Copy)]
+struct Reprobe {
+    due: Instant,
+    attempts: u32,
 }
 
 impl FibProgrammer {
@@ -759,6 +810,10 @@ impl FibProgrammer {
                 cache_generation: 1,
                 cache_publish_wedged: false,
                 neigh_handle,
+                reprobe: HashMap::new(),
+                reprobe_losses: 0,
+                reprobe_recoveries: 0,
+                reprobe_last_stats: Instant::now(),
             },
             FibProgrammerHandle { tx: cmd_tx },
         )
@@ -789,12 +844,17 @@ impl FibProgrammer {
         // `interval`'s first tick fires immediately; skip it so the
         // first reclaim check lands one full period after startup.
         reclaim_tick.tick().await;
+        let mut reprobe_tick = interval(REPROBE_TICK);
+        reprobe_tick.tick().await;
 
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     info!("FibProgrammer shutdown requested");
                     return;
+                }
+                _ = reprobe_tick.tick() => {
+                    self.fire_due_reprobes();
                 }
                 evt = self.events_rx.recv() => {
                     match evt {
@@ -1106,8 +1166,89 @@ impl FibProgrammer {
         if let Some(h) = &self.neigh_handle {
             h.request_resolve(ip);
         }
+        // And keep asking until the kernel answers. The kick above can
+        // land on nothing (no route yet, IX-mode egress, resolver queue
+        // full) and the kernel never volunteers a resolution for an
+        // address it has no reason to send to.
+        self.arm_reprobe(ip);
 
         Ok(id)
+    }
+
+    /// Put `ip` on the re-probe schedule if it is not already there. An
+    /// existing entry keeps its backoff: a neighbour that flaps
+    /// `Failed`→`Incomplete`→`Failed` must not have its timer reset by
+    /// each transition, or a dead one would be probed as fast as the
+    /// kernel can report failures.
+    fn arm_reprobe(&mut self, ip: IpAddr) {
+        self.reprobe.entry(ip).or_insert(Reprobe {
+            due: Instant::now() + REPROBE_INITIAL,
+            attempts: 0,
+        });
+    }
+
+    /// Issue `request_resolve` for every due re-probe (up to
+    /// `REPROBE_BATCH`), push each one's next due time out by its
+    /// backoff, and summarise the pending set once a minute while it
+    /// is non-empty. Called from the `REPROBE_TICK` arm of `run`.
+    fn fire_due_reprobes(&mut self) {
+        let now = Instant::now();
+        let due: Vec<IpAddr> = self
+            .reprobe
+            .iter()
+            .filter(|(_, r)| r.due <= now)
+            .map(|(ip, _)| *ip)
+            .take(REPROBE_BATCH)
+            .collect();
+        for ip in due {
+            // Only a request that actually reached the resolver counts
+            // as an attempt. When its bounded queue is full — a mass
+            // loss, or the resolver blocked on netlink — the entry
+            // stays due at its current backoff and the rest of the
+            // batch waits for the next tick; advancing the backoff on
+            // a probe that was never issued would push exactly the
+            // mass-loss case out to the 60 s cap (review finding).
+            let enqueued = match &self.neigh_handle {
+                Some(h) => h.request_resolve(ip),
+                None => true,
+            };
+            if !enqueued {
+                debug!(
+                    ?ip,
+                    "resolver queue full; remaining re-probes stay due for the next tick"
+                );
+                break;
+            }
+            if let Some(r) = self.reprobe.get_mut(&ip) {
+                r.attempts = r.attempts.saturating_add(1);
+                // 1, 2, 4, … s, capped: `min(6)` keeps the shift in
+                // range and 64 s already exceeds the cap.
+                let backoff = REPROBE_INITIAL
+                    .saturating_mul(1u32 << r.attempts.min(6))
+                    .min(REPROBE_MAX);
+                r.due = now + backoff;
+                debug!(
+                    ?ip,
+                    attempts = r.attempts,
+                    next_in_secs = backoff.as_secs(),
+                    "nexthop re-probe issued"
+                );
+            }
+        }
+        if !self.reprobe.is_empty()
+            && now.duration_since(self.reprobe_last_stats) >= REPROBE_STATS_INTERVAL
+        {
+            self.reprobe_last_stats = now;
+            let chronic = self.reprobe.values().filter(|r| r.attempts >= 6).count();
+            info!(
+                pending = self.reprobe.len(),
+                chronic_over_1min = chronic,
+                losses_total = self.reprobe_losses,
+                recoveries_total = self.reprobe_recoveries,
+                "nexthops awaiting resolution; their traffic is taking the kernel path \
+                 (custom_fib_no_neigh). `packetframe fib dump-v4 --unresolved` lists the routes"
+            );
+        }
     }
 
     fn unregister(&mut self, ip: IpAddr) -> Result<(), ProgrammerError> {
@@ -1124,6 +1265,8 @@ impl FibProgrammer {
         self.by_id.remove(&id);
         self.seq_by_id.remove(&id);
         self.free_ids.push(id);
+        // Nothing routes through it any more, so nothing to recover.
+        self.reprobe.remove(&ip);
 
         // The second tier's LAST chance to hear about this address.
         //
@@ -1154,7 +1297,10 @@ impl FibProgrammer {
 
         // Leave the NEXTHOPS slot marked Failed so any stale FIB
         // pointer still producing lookups gets CustomFibNoNeigh
-        // rather than forwarding to a recycled MAC.
+        // rather than forwarding to a recycled MAC. `family: 0` is
+        // what tells every reader (`NexthopSlotClass`) this is a
+        // tombstone and not a live nexthop the kernel gave up on; keep
+        // it zero.
         let marker = NexthopEntry {
             seq: 0,
             ifindex: 0,
@@ -1179,21 +1325,44 @@ impl FibProgrammer {
         let ip = match &evt {
             NeighEvent::Learned { ip, .. } => *ip,
             NeighEvent::Failed { ip, .. } => *ip,
-            NeighEvent::Gone { ip } => *ip,
+            NeighEvent::Gone { ip, .. } => *ip,
         };
         // We only care about neigh events for IPs we've actually
         // registered as nexthops. Every other kernel neighbor update
         // is noise at this layer.
-        let (id, family) = match self.by_ip.get(&ip) {
+        let (id, family, live_before) = match self.by_ip.get(&ip) {
             Some(rec) => (
                 rec.id,
                 match ip {
                     IpAddr::V4(_) => NH_FAMILY_V4,
                     IpAddr::V6(_) => NH_FAMILY_V6,
                 },
+                rec.live,
             ),
             None => return,
         };
+
+        // The kernel keys neighbours `(device, address)`; we key
+        // nexthops by address. A `Failed`/`Gone` for this address on a
+        // device other than the one we are forwarding out of is a
+        // statement about a different entry — the same IX peer probed
+        // through a second bridge, a stray entry on a management
+        // interface — and must not take a working nexthop off the fast
+        // path. Only checked while the entry is live: an unresolved
+        // slot has no device to disagree with.
+        if let NeighEvent::Failed { ifindex, .. } | NeighEvent::Gone { ifindex, .. } = &evt {
+            if let Some((live_if, _, _)) = live_before {
+                if live_if != *ifindex {
+                    debug!(
+                        ?ip,
+                        event_ifindex = ifindex,
+                        live_ifindex = live_if,
+                        "neighbour lost on another interface; nexthop stays resolved where it is"
+                    );
+                    return;
+                }
+            }
+        }
 
         // Captured before the match consumes `evt`, and captured
         // **pre-pin**: the FDB-pin rewrite below swaps `ifindex` for a
@@ -1283,8 +1452,62 @@ impl FibProgrammer {
             }
         };
 
-        if let Err(e) = self.write_seqlock(id, entry) {
-            warn!(?ip, id, error = %e, "NEXTHOPS update failed");
+        let written = match self.write_seqlock(id, entry) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(?ip, id, error = %e, "NEXTHOPS update failed");
+                false
+            }
+        };
+
+        // Recovery bookkeeping. A `Learned` that reached the map settles
+        // the slot and disarms the schedule; `Failed`/`Gone` arm it (an
+        // existing entry keeps its backoff). The two info lines are
+        // rate-limited to the first 20 losses and recoveries that took
+        // real waiting, so a GC-cycling neighbour shows up in the
+        // journal without owning it; the once-a-minute summary in
+        // `fire_due_reprobes` carries the totals.
+        if learned.is_some() {
+            if written {
+                if let Some(r) = self.reprobe.remove(&ip) {
+                    if r.attempts > 0 {
+                        self.reprobe_recoveries += 1;
+                        if r.attempts >= 2 || self.reprobe_recoveries <= 20 {
+                            info!(
+                                ?ip,
+                                attempts = r.attempts,
+                                "nexthop re-resolved after re-probing; back on the fast path"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // The kernel's answer never reached the slot: it still
+                // reads Incomplete/Failed and the traffic is still on the
+                // kernel path. Disarming here would end recovery on a
+                // transient map-write failure — an already-reachable
+                // neighbour emits no further event on its own (review
+                // finding). Keep `live` honest and keep asking; the next
+                // probe's read-back or cache hit re-delivers the Learned
+                // and retries the write.
+                if let Some(rec) = self.by_ip.get_mut(&ip) {
+                    rec.live = None;
+                }
+                self.arm_reprobe(ip);
+            }
+        } else {
+            if live_before.is_some() {
+                self.reprobe_losses += 1;
+                if self.reprobe_losses <= 20 {
+                    info!(
+                        ?ip,
+                        id,
+                        "nexthop lost resolution; its traffic takes the kernel path until \
+                         a re-probe succeeds (backoff 1 s → 60 s)"
+                    );
+                }
+            }
+            self.arm_reprobe(ip);
         }
 
         // Announced regardless of whether that write landed, which is the

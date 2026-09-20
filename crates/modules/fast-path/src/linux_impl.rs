@@ -86,7 +86,7 @@ pub(crate) const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 /// `reconcile_cfg` flag rebuild included; a bit missing there would be
 /// silently wiped on SIGHUP, the head-shift-bug pattern).
 pub(crate) const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
-pub(crate) const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
+pub const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
 pub(crate) const FP_CFG_FLAG_MSS_CLAMP_PRESENT: u8 = 0b1000_0000;
 
 /// Compute the feature-presence bits (5-7) of `FpCfg.flags` from the
@@ -510,6 +510,34 @@ pub(crate) fn set_cfg_flag(ebpf: &mut Ebpf, bit: u8, on: bool) -> ModuleResult<(
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "CFG map missing from ELF"))?;
     let mut arr: Array<_, FpCfg> = Array::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG Array::try_from: {e}")))?;
+    set_cfg_flag_in(&mut arr, bit, on)
+}
+
+/// Serializes every read-modify-write of `CFG[0]` in this process.
+///
+/// `CFG[0]` is one struct, and every writer — the SIGHUP reconcile
+/// rewriting dry-run / forwarding-mode / feature flags on the main
+/// thread, the redirect-target watcher flipping the VLAN_PRESENT bit on
+/// its own thread — reads the whole value, changes its part and writes
+/// the whole value back. Two such RMWs interleaved lose one of them:
+/// a watcher that read before a reload wrote and wrote after would
+/// restore every field the reload had just changed, and the later VLAN
+/// reconcile would faithfully preserve that stale value (review
+/// finding on #220). Every RMW takes this lock for its read+write.
+pub(crate) static CFG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The RMW itself, over any CFG handle: the `Ebpf`-owned map above or
+/// one opened from the bpffs pin (the redirect-target watcher). Holds
+/// [`CFG_WRITE_LOCK`] across the read and the write.
+pub(crate) fn set_cfg_flag_in<T: std::borrow::BorrowMut<aya::maps::MapData>>(
+    arr: &mut Array<T, FpCfg>,
+    bit: u8,
+    on: bool,
+) -> ModuleResult<()> {
+    // A poisoned lock means another writer panicked mid-RMW; the map
+    // holds whatever it last wrote, which is a complete value, so
+    // proceeding is safe.
+    let _serialized = CFG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut cur: FpCfg = arr
         .get(&0, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
@@ -593,6 +621,11 @@ pub struct ActiveState {
     /// `kernel-fib` mode (which is the default and today's behavior).
     /// `detach` shuts it down cooperatively before tearing down pins.
     pub route_controller: Option<crate::fib::controller::RouteController>,
+    /// Keeps `REDIRECT_DEVMAP` / `TC_REDIRECT_TARGETS` current with the
+    /// kernel link table between SIGHUPs (see `redirect_watch`).
+    /// Started right after the maps are pinned, in every forwarding
+    /// mode; stopped first in `detach`. `None` only before attach.
+    pub redirect_watch: Option<crate::redirect_watch::RedirectTargetWatcher>,
     /// `attach_settle_time` from the config, retained for use in
     /// `detach` so we can pace link-pin removals symmetrically with
     /// the attach path. Removing all link pins inside one STP
@@ -736,6 +769,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         state_dir: ctx.state_dir.to_path_buf(),
         bpffs_root: ctx.bpffs_root.to_path_buf(),
         route_controller: None,
+        redirect_watch: None,
         attach_settle_time: cfg.global.attach_settle_time,
         integrity_authority: integrity_authority_from_cfg(cfg),
         route_source_spec: route_source_spec_from_cfg(cfg),
@@ -1681,6 +1715,25 @@ pub fn attach(
     // partial-load failure (above) doesn't leave half-initialized maps
     // in bpffs.
     pin_program_and_maps(state)?;
+
+    // From here on the redirect-target maps follow the kernel's link
+    // table instead of waiting for a SIGHUP: a bridge or VLAN sub-
+    // interface the platform re-creates mid-run is a valid redirect
+    // target as soon as it is up, not a `pass_not_in_devmap` leak
+    // until the next reload. Opens the maps from their pins, so it
+    // must run after `pin_program_and_maps`. Mode-independent: the
+    // datapath pre-check it feeds exists under kernel-fib too.
+    match crate::redirect_watch::RedirectTargetWatcher::start(
+        &state.bpffs_root,
+        cfg.section.directives.to_vec(),
+    ) {
+        Ok(w) => state.redirect_watch = Some(w),
+        Err(e) => warn!(
+            error = %e,
+            "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
+             only on SIGHUP"
+        ),
+    }
 
     // Start Option F's RouteController if the operator asked for the
     // custom FIB path. Uses `MapData::from_pin` internally, so it
@@ -2853,7 +2906,21 @@ fn populate_vlan_resolve(
 /// Skip the two header lines, split each subsequent line on `|`, trim
 /// whitespace, and return `(subif_name, vid, parent_name)` tuples.
 pub(crate) fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> {
-    let content = std::fs::read_to_string("/proc/net/vlan/config")?;
+    // `/proc/thread-self/net` is the calling THREAD's network namespace;
+    // `/proc/net` is `/proc/self/net`, the thread-group leader's. They
+    // are the same for the daemon, but the redirect-target watcher runs
+    // on its own thread and a harness that `setns` a test thread into a
+    // netns (the leader stays in the host's) would otherwise read the
+    // wrong table — the way the first CI run of that test did. The
+    // fallback keeps the "missing file = no VLANs" contract on a kernel
+    // without `thread-self` (pre-3.17).
+    let content = match std::fs::read_to_string("/proc/thread-self/net/vlan/config") {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read_to_string("/proc/net/vlan/config")?
+        }
+        Err(e) => return Err(e),
+    };
     let mut out = Vec::new();
     for line in content.lines().skip(2) {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
@@ -2882,6 +2949,11 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
     if let Some(ctrl) = state.route_controller.take() {
         info!("shutting down RouteController");
         ctrl.shutdown();
+    }
+    // Same ordering for the redirect-target watcher: its map handles
+    // come from the pins removed below.
+    if let Some(w) = state.redirect_watch.take() {
+        w.shutdown();
     }
 
     // Drop every PinnedLink next: this closes our userspace FDs but
@@ -3200,16 +3272,19 @@ pub struct FibStatusSnapshot {
     /// binary left pins behind).
     pub forwarding_mode: Option<&'static str>,
     pub default_hash_mode: Option<u8>,
-    /// NEXTHOPS[idx].state distribution. Slots that were never
-    /// written read as state=0 which collides with
-    /// `NH_STATE_INCOMPLETE`; we can't distinguish those from
-    /// actual in-progress entries without programmer-internal
-    /// refcount state, so `nh_unwritten_or_incomplete` is reported
-    /// as a single bucket.
+    /// NEXTHOPS slot distribution by [`NexthopSlotClass`]. The four
+    /// live buckets are slots some route may be forwarding through;
+    /// `nh_incomplete` + `nh_failed` is the count of nexthops whose
+    /// traffic is currently falling to the kernel path. `nh_freed` is
+    /// tombstones (never traffic), `nh_unwritten` is capacity never
+    /// touched. See the enum for why `family` makes the split possible
+    /// without programmer state.
     pub nh_resolved: u32,
+    pub nh_incomplete: u32,
     pub nh_failed: u32,
     pub nh_stale: u32,
-    pub nh_unwritten_or_incomplete: u32,
+    pub nh_freed: u32,
+    pub nh_unwritten: u32,
     pub nh_max_entries: u32,
     /// ECMP groups where `nh_count > 0`, a conservative estimate
     /// of "how many groups are actively in use." Slots with nh_count=0
@@ -3229,9 +3304,11 @@ pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
         forwarding_mode: None,
         default_hash_mode: None,
         nh_resolved: 0,
+        nh_incomplete: 0,
         nh_failed: 0,
         nh_stale: 0,
-        nh_unwritten_or_incomplete: 0,
+        nh_freed: 0,
+        nh_unwritten: 0,
         nh_max_entries: 0,
         ecmp_active: 0,
         ecmp_max_entries: 0,
@@ -3257,9 +3334,11 @@ pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
     // --- NEXTHOPS: walk for state distribution ---
     if let Ok((dist, cap)) = read_nexthops_state_distribution(bpffs_root) {
         snapshot.nh_resolved = dist.resolved;
+        snapshot.nh_incomplete = dist.incomplete;
         snapshot.nh_failed = dist.failed;
         snapshot.nh_stale = dist.stale;
-        snapshot.nh_unwritten_or_incomplete = dist.unwritten_or_incomplete;
+        snapshot.nh_freed = dist.freed;
+        snapshot.nh_unwritten = dist.unwritten;
         snapshot.nh_max_entries = cap;
     }
 
@@ -3299,14 +3378,16 @@ fn read_fib_config_hash_mode(bpffs_root: &Path) -> ModuleResult<u8> {
 #[derive(Debug, Default)]
 struct NhStateDistribution {
     resolved: u32,
+    incomplete: u32,
     failed: u32,
     stale: u32,
-    unwritten_or_incomplete: u32,
+    freed: u32,
+    unwritten: u32,
 }
 
 fn read_nexthops_state_distribution(bpffs_root: &Path) -> ModuleResult<(NhStateDistribution, u32)> {
     use crate::fib::programmer::NEXTHOPS_CAP;
-    use crate::fib::types::{NexthopEntry, NH_STATE_FAILED, NH_STATE_RESOLVED, NH_STATE_STALE};
+    use crate::fib::types::{NexthopEntry, NexthopSlotClass};
 
     let pin_path = pin::map_path(bpffs_root, "NEXTHOPS");
     let map_data = aya::maps::MapData::from_pin(&pin_path)
@@ -3323,11 +3404,16 @@ fn read_nexthops_state_distribution(bpffs_root: &Path) -> ModuleResult<(NhStateD
             Ok(e) => e,
             Err(_) => continue,
         };
-        match entry.state {
-            NH_STATE_RESOLVED => dist.resolved += 1,
-            NH_STATE_FAILED => dist.failed += 1,
-            NH_STATE_STALE => dist.stale += 1,
-            _ => dist.unwritten_or_incomplete += 1,
+        match NexthopSlotClass::from_entry(entry.state, entry.family) {
+            NexthopSlotClass::Resolved => dist.resolved += 1,
+            NexthopSlotClass::Incomplete => dist.incomplete += 1,
+            NexthopSlotClass::Failed => dist.failed += 1,
+            NexthopSlotClass::Stale => dist.stale += 1,
+            NexthopSlotClass::Freed => dist.freed += 1,
+            // An unknown state byte can only come from a build skew
+            // between the pinned map and this binary; count it with
+            // the never-written capacity rather than invent a row.
+            NexthopSlotClass::Unwritten | NexthopSlotClass::Unknown(_) => dist.unwritten += 1,
         }
     }
     Ok((dist, NEXTHOPS_CAP))
@@ -3733,6 +3819,7 @@ mod tests {
             state_dir: tmp.clone(),
             bpffs_root: tmp,
             route_controller: None,
+            redirect_watch: None,
             attach_settle_time: std::time::Duration::ZERO,
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::Birdc {
                 path: None,

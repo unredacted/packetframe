@@ -69,10 +69,15 @@ Indicators that the custom-FIB path is working:
   both increment it on redirect **acceptance** — under generic XDP the
   kernel can still drop the frame silently after the count; see
   `generic-mode-performance.md`, "Silent TX drops under generic XDP").
-- `pass_no_neigh` stays below ~0.01% of matched traffic after the
-  first few seconds (first-packet ARP is expected; sustained-high
-  means a nexthop is genuinely unreachable or the neighbor resolver
-  is broken).
+- `pass_no_neigh` stays below ~1% of matched traffic (`matched_v4 +
+  matched_v6`) once the table has converged, and does not trend up.
+  Judge it as a rate over 60 s, never from the lifetime total. A
+  small floor from neighbours that never answer (dead hosts inside a
+  local-prefix, peers that filter ARP/ND) is normal; a sustained climb
+  above your converged baseline means nexthops are losing resolution
+  and not regaining it — see the triage entry below.
+- `packetframe status` shows `nexthops (incomplete)` and `nexthops
+  (failed)` at or near zero once the table has converged.
 - `bmp_peer_down` stays at zero unless a BGP session you expect to
   flap has flapped.
 - `nexthop_seq_retry` stays below ~0.01% of `custom_fib_hit` (the
@@ -226,8 +231,12 @@ Alongside the existing counter family, the textfile exporter emits:
 
 - `packetframe_fib_forwarding_mode{mode="kernel-fib|custom-fib|compare"}`:
   one-hot gauge; alert on unexpected transitions.
-- `packetframe_nexthops{state="resolved|failed|stale|unwritten_or_incomplete"}`:
-  NEXTHOPS state bucket counts.
+- `packetframe_nexthops{state="resolved|incomplete|failed|stale|freed|unwritten"}`:
+  NEXTHOPS slot counts. `incomplete` + `failed` are live nexthops whose
+  traffic is on the kernel path — alert on them. `freed` is tombstones
+  left by churn (harmless), `unwritten` is untouched capacity. (Replaces
+  the former `unwritten_or_incomplete` bucket, which could not separate
+  the two and hid the alerting half.)
 - `packetframe_nexthops_max`: configured NEXTHOPS capacity.
 - `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`.
 - `packetframe_fib_default_hash_mode`: 3/4/5-tuple.
@@ -235,9 +244,13 @@ Alongside the existing counter family, the textfile exporter emits:
 Example alerts:
 
 ```promql
-# 80% NEXTHOPS occupancy.
-(packetframe_nexthops{state="resolved"} + packetframe_nexthops{state="failed"})
+# 80% NEXTHOPS occupancy: every live bucket counts, and the failure
+# mode this section describes is precisely thousands of `incomplete`.
+sum(packetframe_nexthops{state=~"resolved|incomplete|failed|stale"})
   / packetframe_nexthops_max > 0.8
+
+# Nexthops whose traffic is on the kernel path.
+sum(packetframe_nexthops{state=~"incomplete|failed"}) > 0
 
 # Unexpected forwarding-mode transition.
 changes(packetframe_fib_forwarding_mode{mode="custom-fib"}[5m]) > 0
@@ -966,17 +979,75 @@ Check:
 ### Symptom: `pass_no_neigh` climbs sustainedly
 
 What it means: FIB matches land on nexthop entries with state ≠
-`Resolved`. Either the kernel hasn't ARP'd the nexthop yet (first-
-packet; expected briefly), or the nexthop is genuinely unreachable.
+`Resolved`, and every one of those packets takes the kernel path:
+netfilter, conntrack, the FIB walk — the load the fast path exists
+to remove. Judge it as a **rate**, never from the lifetime total
+(`status` twice, 60 s apart), against the same threshold the healthy
+list uses: below ~1% of matched traffic (`matched_v4 + matched_v6`)
+after convergence, and not trending up.
+
+Why it happens: the kernel only re-resolves a neighbour it sends to
+itself, and XDP-redirected traffic never touches the kernel entry.
+A nexthop the kernel has no reason to talk to (route-server-learned
+IX peers) ages REACHABLE → STALE → garbage-collected; the daemon
+sees `Gone`, marks the slot `Incomplete`, and — before this fix —
+waited for the kernel to ARP it again, which it only did if its own
+FIB happened to forward the fallen-through packets to the same
+neighbour. On 2026-09-15 that left a third of the traffic on the
+kernel path until a restart. The programmer now re-probes every
+unresolved slot itself with 1 s → 60 s backoff, so a live neighbour
+recovers within seconds and a dead one costs one probe cycle per
+minute.
 
 Check:
 
-- `ip neigh show <nexthop-ip>`: what state does the kernel report?
-- `packetframe status`: is `nexthops (failed)` > 0?
-- Proactive resolve is currently relying on first-packet kernel ARP
-  (Phase 3.5+ adds proactive `RTM_NEWNEIGH NUD_NONE`). If
-  `pass_no_neigh` only spikes for a few packets per new destination
-  and then drops, that's expected.
+- `packetframe status`: `nexthops (incomplete)` and `nexthops
+  (failed)` are the live slots whose traffic is on the kernel path.
+  `nexthop slots freed` is tombstones from churn and costs nothing.
+- `packetframe fib dump-v4 --unresolved` (and `dump-v6`): the
+  routes behind those slots and the nexthop each one is stuck on.
+  Walks the whole trie: several seconds and ~200 MB on a full table.
+- `ip neigh show <nexthop-ip>`: what the kernel thinks, **per
+  interface** — the same address can be FAILED on one device and
+  REACHABLE on the one the nexthop forwards out of. Events on any
+  other device are ignored by design.
+- `journalctl -u packetframe | grep -E 'lost resolution|re-resolved|awaiting resolution'`:
+  the first 20 losses and slow recoveries are logged, and a once-a-
+  minute summary runs while anything is pending.
+- If a slot stays `incomplete` with `chronic_over_1min` > 0 in that
+  summary, the kernel is not answering the probe: check the route to
+  the nexthop (`ip route get <nexthop-ip>` must be a unicast route
+  with an egress device), whether that egress is an `ix-mode`
+  interface (probes are deliberately suppressed there; the snooper
+  seeds them), and whether the peer answers ARP/ND at all.
+
+### Symptom: `pass_not_in_devmap` climbs
+
+What it means: the FIB resolved an egress interface that is not in
+`REDIRECT_DEVMAP` (or, for the tc datapath, `TC_REDIRECT_TARGETS`),
+so the packet took XDP_PASS into the kernel path. The maps are filled
+at attach from `/sys/class/net` (Ethernet-type, oper-up or unknown)
+and were once refreshed only on SIGHUP; since the 2026-09-15 fix a
+watcher thread follows `RTM_NEWLINK`/`RTM_DELLINK` and keeps them
+current, so a bridge or VLAN sub-interface the platform re-creates
+mid-run is a valid target as soon as it is up. The same refresh
+rewrites `VLAN_RESOLVE` (sub-interface → physical port + VID, and the
+bridge egress short-circuits) *before* admitting the new link, so a
+recreated `switch0.N` is redirected through its parent with the tag,
+never to the virtual device itself.
+
+Check:
+
+- `journalctl -u packetframe | grep 'redirect-target'`: the watcher
+  logs `live (RTNLGRP_LINK)` at start and every add/remove; a line
+  saying it stopped means SIGHUP is again the only refresh —
+  `systemctl reload packetframe` reconciles immediately.
+- `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/REDIRECT_DEVMAP`
+  against `ip -br link`: every up Ethernet-type ifindex should be a key.
+- `packetframe fib lookup <dst>` for an affected destination: the
+  nexthop's `ifindex` names the egress; if it is a non-Ethernet device
+  (tunnel, loopback) or oper-down, the miss is correct and the route
+  itself is the problem.
 
 ### Symptom: `bmp_peer_down` incremented
 
