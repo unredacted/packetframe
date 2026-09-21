@@ -759,8 +759,33 @@ fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<St
         }
     };
     if core.is_empty() && vpp_blockers.is_empty() {
-        let mut lines = vec!["Result: PASS, all required capabilities present.".into()];
-        boot_lines(&mut lines);
+        if boot_blockers.is_empty() {
+            return vec!["Result: PASS, all required capabilities present.".into()];
+        }
+        // A PROMOTED boot hazard makes `report.passed` false and the
+        // exit code 3, so the headline must not also say every required
+        // capability passed. One invocation printing "PASS" beside
+        // `"passed": false` is a contradiction a parser resolves
+        // arbitrarily and a tired operator resolves optimistically.
+        //
+        // The attach verdict stays separate either way: this blocks the
+        // rollout, not the attach, and saying so is the whole reason
+        // the hazard has its own bucket.
+        let n = boot_blockers.len();
+        let mut lines = vec![if boot_blockers.iter().any(|c| c.required) {
+            format!(
+                "Result: ROLLOUT BLOCKED by {n} boot-persistence check{}; \
+                 the attach itself is unaffected:",
+                if n == 1 { "" } else { "s" },
+            )
+        } else {
+            format!(
+                "Result: required capabilities PASS, but {n} boot-persistence check{} \
+                 not passing; the attach itself is unaffected:",
+                if n == 1 { " is" } else { "s are" },
+            )
+        }];
+        lines.extend(boot_blockers.iter().map(|c| item(c)));
         return lines;
     }
     let mut lines = Vec::new();
@@ -1008,13 +1033,15 @@ mod summary_tests {
         assert_eq!(blockers.boot.len(), 1);
 
         let lines = summary_lines(&report, &[]);
-        assert_eq!(
-            lines[0], "Result: PASS, all required capabilities present.",
-            "the attach verdict is unchanged: {lines:?}"
+        assert!(
+            !lines.iter().any(|l| l.contains("BLOCKED")),
+            "advisory, and no attach blocker: nothing here is blocked: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with("REBOOT HAZARD:")),
-            "the hazard must still be stated: {lines:?}"
+            lines
+                .iter()
+                .any(|l| l.contains(sysctl_hugepages::PROBE_NAME)),
+            "the hazard must still be named: {lines:?}"
         );
     }
 
@@ -1032,6 +1059,61 @@ mod summary_tests {
         assert!(blockers.core.is_empty());
         assert!(blockers.vpp.is_empty());
         assert_eq!(blockers.boot.len(), 1);
+    }
+
+    /// ...and the summary must not then claim every required capability
+    /// passed. Promotion makes `report.passed` false and the exit code
+    /// 3; a headline of "PASS" beside that is a contradiction one
+    /// invocation should never emit (review finding on #225 — the
+    /// bucket test above passed while the prose said the opposite).
+    #[test]
+    fn a_promoted_boot_hazard_is_never_summarized_as_a_pass() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, true),
+        ]);
+        assert!(!report.passed, "promotion must fail the report");
+
+        let lines = summary_lines(&report, &[]);
+        assert!(
+            !lines.iter().any(|l| l.contains("PASS, all required")),
+            "the report is not passing; the summary must not say it is: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("Result: ROLLOUT BLOCKED by 1 boot-persistence check;"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("the attach itself is unaffected"),
+            "the attach verdict stays separate: {lines:?}"
+        );
+    }
+
+    /// The advisory case still says the required capabilities passed —
+    /// because they did, and `report.passed` is true — but does not
+    /// leave it at that.
+    #[test]
+    fn an_advisory_boot_hazard_qualifies_the_pass_rather_than_blocking() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, false),
+        ]);
+        assert!(
+            report.passed,
+            "an advisory failure does not fail the report"
+        );
+
+        let lines = summary_lines(&report, &[]);
+        assert!(
+            lines[0].starts_with("Result: required capabilities PASS, but 1 boot-persistence"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(sysctl_hugepages::PROBE_NAME)),
+            "the hazard is still named: {lines:?}"
+        );
     }
 
     /// A boot hazard alongside a real attach blocker: both are stated,

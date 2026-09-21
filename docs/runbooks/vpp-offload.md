@@ -1973,16 +1973,26 @@ module's own deltas.
 > proves nothing about the boot that follows it.
 >
 > ```bash
-> packetframe feasibility | jq '.boot_sysctl_blockers'
+> packetframe feasibility | jq -e '.boot_sysctl_blockers | length == 0' >/dev/null
 > ```
 >
-> Empty array is the only passing answer. `boot_sysctl_blockers` is
-> reported **regardless of whether the capability is required**, which
-> is the point: between installing VPP and adding the `vpp-offload`
-> block there is no module for the check to be gated on, and that gap
-> is exactly when the hazard exists. Once the config does declare the
-> module the same check is also promoted to `required`, so
-> `packetframe feasibility` stops exiting 0 over it.
+> **The `-e` is load-bearing — do not drop it.** Without it `jq` exits 0
+> whether the array is empty or full, and in the pre-config window
+> `packetframe feasibility` also exits 0 (the capability is still
+> advisory there), so a gate written as a bare `jq '.boot_sysctl_blockers'`
+> passes while printing the blocker that is about to brick the box. With
+> `-e` the pipeline exits nonzero when the array is non-empty, and also
+> when `feasibility` produced no JSON at all — both are the safe
+> direction. To read the blockers rather than gate on them, drop the
+> `-e` and the redirect.
+>
+> `boot_sysctl_blockers` is reported **regardless of whether the
+> capability is required**, which is the point: between installing VPP
+> and adding the `vpp-offload` block there is no module for the check to
+> be gated on, and that gap is exactly when the hazard exists. Once the
+> config does declare the module the same check is also promoted to
+> `required`, so `packetframe feasibility` stops exiting 0 over it and
+> its own summary reads `ROLLOUT BLOCKED` rather than `PASS`.
 >
 > **Do not substitute `ls /etc/sysctl.d/ | grep -i vpp`.** That answers
 > a narrower question than the one that matters. The probe resolves the
