@@ -906,6 +906,34 @@ sudo systemctl restart bird
 sudo systemctl stop packetframe && sudo packetframe detach --all && sudo systemctl start packetframe
 ```
 
+### Recovering from `failed` after the start limit trips
+
+The unit caps restarts at 3 per 5 minutes (`StartLimitBurst` /
+`StartLimitIntervalSec`). That cap exists because a non-clean exit
+*after* a successful attach leaves the bpffs pins behind, and every
+subsequent start then refuses them — without the cap that is an
+infinite loop with the dataplane still forwarding on a frozen FIB.
+
+So `Active: failed (Result: start-limit-hit)` is the guard working, and
+the surviving pins are the thing to clear. Restarting harder will not
+do it: until the limit is reset systemd will not even try, and once it
+does the start fails on the same pins.
+
+```sh
+sudo systemctl stop packetframe &&
+  sudo packetframe detach --all
+sudo systemctl reset-failed packetframe
+sudo systemctl start packetframe
+```
+
+Read the `detach` output rather than assuming it: it refuses outright
+if it cannot confirm the daemon is gone, which is the case where
+unlinking pins would leave the program attached through a live
+process's open FDs while reporting success. Then confirm forwarding
+actually came back (`packetframe status`, and the `custom_fib_hit`
+counter moving) — the start limit resetting proves only that systemd
+will try again.
+
 ### When to use `route-source bmp` instead
 
 The BMP route source is useful when:

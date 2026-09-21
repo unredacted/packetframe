@@ -71,9 +71,19 @@ assets = [
 
 # Built-in systemd-units integration: cargo-deb generates the
 # postinst/prerm/postrm maintainer scripts to register the unit with
-# systemctl. enable+start are off because the daemon needs an
-# operator-supplied interface list before it can do anything useful;
-# auto-starting would just produce a noisy first-launch failure.
+# systemctl.
+#
+# enable+start stay off, for two reasons that are worth keeping
+# straight. The first is the original one: the daemon needs an
+# operator-supplied interface list before it can do anything useful, so
+# auto-starting on a fresh install just produces a noisy first-launch
+# failure. The second is why it is still off even on a configured box —
+# enabling at boot is a per-deployment decision, because a reboot with
+# no packetframe leaves a custom-FIB box with a near-empty route table
+# until someone runs the teardown-and-start sequence by hand, while
+# enabling it commits to the unit's crash-loop behaviour. The unit now
+# caps that loop (see StartLimit* there), which is what makes enabling
+# defensible at all; the call still belongs to whoever runs the box.
 # `restart-after-upgrade = true` keeps a running daemon alive across
 # `apt upgrade` (the SIGTERM handler preserves pins per SPEC.md §8.5).
 [package.metadata.deb.systemd-units]
