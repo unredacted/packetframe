@@ -26,7 +26,15 @@ use std::path::{Path, PathBuf};
 
 use super::{Capability, CapabilityStatus};
 
-const PROBE_NAME: &str = "vpp.sysctl-hugepages";
+/// This probe's capability name.
+///
+/// Public because the CLI both promotes this capability to `required`
+/// when the config declares `module vpp-offload` and reports it in its
+/// own bucket — it is a REBOOT hazard, not an attach blocker, and the
+/// two must not be conflated in the operator's verdict. Matching on the
+/// name is how the CLI finds a capability the general probe set built
+/// without any knowledge of the config.
+pub const PROBE_NAME: &str = "vpp.sysctl-hugepages";
 
 /// Both keys size the same default hugepage pool: a write to either
 /// sysctl sets the pool, so the last boot-time assignment to either

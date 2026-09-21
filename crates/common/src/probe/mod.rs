@@ -199,9 +199,16 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     // /etc/sysctl.d/80-vpp.conf survives VPP_INSTALL_SKIP_SYSCTL=1 and
     // its 1024 pages are 512 GiB on a 512 MiB-default-hugepage kernel).
     // In the general set, not vpp-gated: the file kills the box whether
-    // or not the config declares `module vpp-offload`. required=no;
-    // surfacing non-required FAILs above the summary line is a pending
-    // task.
+    // or not the config declares `module vpp-offload`, and it is
+    // planted by INSTALLING VPP — which happens before there is a
+    // module block to gate on.
+    //
+    // Advisory here, because a large hugepage reservation is the
+    // operator's business on a box that runs no VPP. The CLI promotes
+    // it to `required` when the config does declare the module, and
+    // reports it in its own bucket either way: a boot hazard is not an
+    // attach blocker, and the verdict says which it is rather than
+    // letting a non-required FAIL sit silently under a PASS summary.
     caps.push(sysctl_hugepages::probe_sysctl_hugepages());
 
     // §2.3 per-interface native-XDP trial-attach, deferred. The probe needs
