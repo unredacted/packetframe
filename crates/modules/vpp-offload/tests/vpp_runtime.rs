@@ -1795,6 +1795,51 @@ mod steered {
 /// touches VPP until the source is loaded and quiet; then the
 /// supervisor unsteers FIRST; the dump runs against an idle VPP; and
 /// steering returns only after the verified resync.
+/// An operator can take traffic OFF while an adopted resync is still
+/// deferred — the rollback lever the deferral used to swallow.
+///
+/// A deferral can hold indefinitely: the release gate needs the feed
+/// loaded and quiet, and a feed whose churn never yields that quiet
+/// never releases it. For its whole length `reconfigure` answered "not
+/// converged" while traffic was still going through VPP, so the only
+/// way off was stopping the daemon. That is a teardown, not a rollback.
+///
+/// The assertion is that the removal reaches the NIC double. An
+/// acknowledgement with no removal behind it is the failure this arm
+/// could most easily have shipped — relaxing admission alone would have
+/// produced exactly that, since `UnsteerRequested` had no transition
+/// outside `Ready | Steered` and would have fallen to the catch-all.
+#[test]
+fn an_operator_can_unsteer_a_held_deferral() {
+    let (fake, _shared, log, rt, _session) =
+        steered::fixture("unsteer-held-deferral", &[fake_vpp::v4(0, 0)], 160);
+    let mut d = Driver::new();
+    // Holds through 40 ticks with the gate unreleased, and asserts on
+    // the way that no steering transition and no route op happened.
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 40);
+    assert_eq!(d.state(), State::AdoptedResyncing, "still deferred");
+
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, Event::UnsteerRequested, &mut fx);
+        for e in rt.take_pending() {
+            d.inject(now, e, &mut fx);
+        }
+    }
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["unsteer"],
+        "the rules must actually leave the NIC"
+    );
+    assert_eq!(
+        d.state(),
+        State::AdoptedResyncing,
+        "and the convergence in flight is untouched: this is a rollback, not an abort \
+         — collapsing to Ready would drop a deferral that still owes a FIB dump"
+    );
+}
+
 #[test]
 fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
     let (fake, shared, log, rt, session) =
