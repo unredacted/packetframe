@@ -4,6 +4,26 @@ Documentation=https://github.com/unredacted/packetframe
 After=network-online.target
 Wants=network-online.target
 
+# Give up rather than crash-loop. bpffs pins survive SIGTERM by design
+# (SPEC.md §8.5) and fast-path refuses to start over existing pins
+# ("run `packetframe detach --all` before restarting"), so ANY non-clean
+# exit after a successful attach makes every subsequent start fail the
+# same way. Without a cap that is an infinite loop with the dataplane
+# still forwarding on a frozen FIB — the 2026-07-31/08-01 production
+# incident, automated.
+#
+# systemd's defaults (5 starts per 10s) cannot fire here: RestartSec=5
+# means at most ~2 starts land in a 10s window, so the counter resets
+# forever. The interval has to be longer than burst*RestartSec to mean
+# anything. 3 starts per 5 minutes gives up ~15s into a hard loop while
+# still auto-recovering a box that trips once every few hours.
+#
+# Recovery from the resulting `failed` state is the documented teardown:
+# `systemctl stop packetframe && packetframe detach --all`, then
+# `systemctl reset-failed packetframe && systemctl start packetframe`.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/packetframe run
