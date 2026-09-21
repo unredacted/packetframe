@@ -23,7 +23,13 @@
 //! because a *bound* listener emits no error when the route is
 //! flushed (SYNs silently stop being delivered; review finding,
 //! PR #196), so only time-based replacement can heal that case.
-//! Replace semantics make every call idempotent. The controller
+//! Every call is idempotent, and an already-correct route is left
+//! untouched rather than rewritten: a `.replace()` emits an
+//! `RTM_NEWROUTE` exactly as a create does, and waking every route
+//! subscriber on the box twice a minute forever is a cost with no
+//! benefit.
+//!
+//! The controller
 //! calls [`remove_local_route`] during explicit shutdown AND from
 //! its `Drop` impl — the latter because the §8.5 preserve-attach
 //! exit (the normal `systemctl stop`) drops the controller without
@@ -56,6 +62,7 @@ use netlink_packet_route::address::AddressAttribute;
 use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteProtocol, RouteScope, RouteType,
 };
+use rtnetlink::sys::{AsyncSocket, TokioSocket};
 use rtnetlink::{Handle, RouteMessageBuilder};
 use tracing::info;
 
@@ -156,6 +163,10 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipEr
         }
         None => {}
     }
+    let (strict_conn, strict) = strict_connection()?;
+    tokio::spawn(strict_conn);
+    let existing = existing_local_table_entry(&strict, addr).await?;
+
     // A pre-existing table-local entry for this /32 is adopted only
     // when it is a `local` route wearing our protocol tag (a previous
     // daemon life). A foreign-protocol local route means another
@@ -166,17 +177,49 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipEr
     // behind the directed-broadcast check above, driven by what the
     // routing table actually holds rather than address arithmetic.
     let mut outcome = EnsureOutcome::Created;
-    if let Some((kind, proto)) = existing_local_table_entry(&handle, addr).await? {
-        if kind != RouteType::Local {
-            return Err(AnyipError::RouteKindConflict { addr, kind });
+    if let Some(entry) = existing {
+        if entry.kind != RouteType::Local {
+            return Err(AnyipError::RouteKindConflict {
+                addr,
+                kind: entry.kind,
+            });
         }
-        if proto != ANYIP_ROUTE_PROTOCOL {
-            return Err(AnyipError::RouteContested { addr, proto });
+        if entry.proto != ANYIP_ROUTE_PROTOCOL {
+            return Err(AnyipError::RouteContested {
+                addr,
+                proto: entry.proto,
+            });
         }
         outcome = EnsureOutcome::Adopted;
     }
 
     let lo = lo_ifindex(&handle).await?;
+
+    // Write only when the write would change something. `.replace()`
+    // is idempotent in effect but NOT in observation: the kernel emits
+    // an RTM_NEWROUTE to RTNLGRP_IPV4_ROUTE for a replace exactly as it
+    // does for a create, and every subscriber wakes for it. On the
+    // primary that subscriber is tailscaled, which rescans host state
+    // on every route change — so an unconditional rewrite every 30 s
+    // made packetframe a metronome driving ~64 log lines/s and rotating
+    // the volatile journal every few minutes (2026-09-11). An already
+    // correct route is left exactly as it is.
+    //
+    // "Correct" means every field the write below sets. An owned route
+    // whose oif or scope has drifted is still repaired — the reconcile
+    // exists to heal a route someone altered, and skipping that would
+    // trade one silent failure for another.
+    if let Some(entry) = existing {
+        if entry.scope == RouteScope::Host && entry.oif == Some(lo) {
+            info!(%addr, "anyip: local /32 already correct, left alone");
+            return Ok(outcome);
+        }
+        info!(
+            %addr, scope = ?entry.scope, oif = ?entry.oif,
+            "anyip: adopting local /32 with wrong attributes, repairing"
+        );
+    }
+
     let route = RouteMessageBuilder::<Ipv4Addr>::new()
         .destination_prefix(addr, 32)
         .output_interface(lo)
@@ -270,41 +313,100 @@ async fn address_conflict(
     Ok(None)
 }
 
-/// The (kind, protocol) of an existing `<addr>/32` entry in the
-/// local table, or `None` when no such entry exists. This is the
-/// ownership probe: the caller adopts only `(Local,
-/// ANYIP_ROUTE_PROTOCOL)` and refuses everything else — a foreign
-/// `local` route, the kernel's own `broadcast` entry, or any other
-/// kind a replace would silently clobber.
+/// What the local table already holds for `<addr>/32`.
+///
+/// Every field the write path sets, so the caller can both judge
+/// ownership and decide whether a write would change anything. The
+/// ownership half is the load-bearing one: the caller adopts only
+/// `(Local, ANYIP_ROUTE_PROTOCOL)` and refuses everything else — a
+/// foreign `local` route, the kernel's own `broadcast` entry, or any
+/// other kind a replace would silently clobber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalEntry {
+    kind: RouteType,
+    proto: RouteProtocol,
+    scope: RouteScope,
+    oif: Option<u32>,
+}
+
+/// A netlink connection with `NETLINK_GET_STRICT_CHK` set, so the
+/// kernel actually honours the dump filter below.
+///
+/// neigh-snoop carries the twin of this (`netlink::new_strict_connection`,
+/// whose doc comment anticipated this adoption). It is duplicated rather
+/// than hoisted into `crates/common` on purpose: common has no netlink
+/// dependency at all today and must keep building on a macOS dev host,
+/// so moving six lines there would drag rtnetlink across the platform
+/// split this workspace is careful about.
+fn strict_connection() -> Result<
+    (
+        rtnetlink::proto::Connection<netlink_packet_route::RouteNetlinkMessage, TokioSocket>,
+        Handle,
+    ),
+    AnyipError,
+> {
+    let (mut conn, handle, _) = rtnetlink::new_connection_with_socket::<TokioSocket>()?;
+    conn.socket_mut()
+        .socket_mut()
+        .set_netlink_get_strict_chk(true)?;
+    Ok((conn, handle))
+}
+
+/// The local table's entry for `<addr>/32`, or `None` when there is
+/// none.
+///
+/// Requires a handle from [`strict_connection`]: without
+/// `NETLINK_GET_STRICT_CHK` the kernel ignores the table filter and a
+/// destination-less GetRoute dumps the ENTIRE v4 FIB — on a full-table
+/// edge that is 1M+ routes serialized and scanned on every 30 s
+/// reconcile tick just to check one /32. Measured on the primary
+/// 2026-09-11: `ip -4 route show` took 48 s wall against 1.06M routes,
+/// and this dump pays the same cost.
+///
+/// **The filter names the table and nothing else.** `RouteMessageBuilder`
+/// seeds `protocol = Static` and `kind = Unicast`, and under strict-chk
+/// the kernel filters on both whenever they are nonzero — so the seeds
+/// must be zeroed explicitly. Naming our own `protocol`/`kind` here
+/// instead would be worse than leaving the seeds: it would hide exactly
+/// the entries this probe exists to find, and `RouteContested` /
+/// `RouteKindConflict` would stop firing while the write below happily
+/// replaced a foreign route. Ownership is judged in userspace, from the
+/// fields the dump returns.
 async fn existing_local_table_entry(
-    handle: &Handle,
+    strict: &Handle,
     addr: Ipv4Addr,
-) -> Result<Option<(RouteType, RouteProtocol)>, AnyipError> {
-    // Destination-less GetRoute is an NLM_F_DUMP; without a table
-    // filter the kernel exports the ENTIRE v4 FIB — on a full-table
-    // edge that is 1M+ routes serialized and scanned every 30 s
-    // reconcile tick just to check one /32 (review finding, PR
-    // #196). Setting the header's table field makes 4.20+ kernels
-    // filter the dump to table local (hundreds of entries); the
-    // userspace re-check below keeps correctness on anything that
-    // ignores the filter.
-    let filter = RouteMessageBuilder::<Ipv4Addr>::new()
+) -> Result<Option<LocalEntry>, AnyipError> {
+    let mut filter = RouteMessageBuilder::<Ipv4Addr>::new()
         .table_id(LOCAL_TABLE)
         .build();
-    let mut routes = handle.route().get(filter).execute();
+    filter.header.protocol = RouteProtocol::Unspec;
+    filter.header.kind = RouteType::Unspec;
+    // Scope is left as the builder's `Universe`, which is RT_SCOPE_UNIVERSE
+    // (0) and therefore already "no filter".
+    let mut routes = strict.route().get(filter).execute();
     while let Some(msg) = routes.try_next().await? {
         if msg.header.destination_prefix_length != 32 || u32::from(msg.header.table) != LOCAL_TABLE
         {
             continue;
         }
-        let dst_matches = msg.attributes.iter().any(|attr| {
-            matches!(
-                attr,
-                RouteAttribute::Destination(RouteAddress::Inet(a)) if *a == addr
-            )
-        });
+        let mut dst_matches = false;
+        let mut oif = None;
+        for attr in &msg.attributes {
+            match attr {
+                RouteAttribute::Destination(RouteAddress::Inet(a)) if *a == addr => {
+                    dst_matches = true;
+                }
+                RouteAttribute::Oif(i) => oif = Some(*i),
+                _ => {}
+            }
+        }
         if dst_matches {
-            return Ok(Some((msg.header.kind, msg.header.protocol)));
+            return Ok(Some(LocalEntry {
+                kind: msg.header.kind,
+                proto: msg.header.protocol,
+                scope: msg.header.scope,
+                oif,
+            }));
         }
     }
     Ok(None)

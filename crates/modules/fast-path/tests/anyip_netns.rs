@@ -1,7 +1,7 @@
 //! Integration coverage for `fib::anyip` against a real kernel.
 //!
-//! Three properties, each of which failed silently in some ancestor
-//! of this design and can only be proven against a live netlink:
+//! Each of these failed silently in some ancestor of this design, and
+//! each can only be proven against a live netlink:
 //!
 //! 1. `ensure_local_route` makes an unassigned address bindable
 //!    (the whole point of AnyIP), and is idempotent (the controller
@@ -21,6 +21,13 @@
 //!    kernel-driven gates cover it: the IFA_BROADCAST address
 //!    attribute (when the address was added with a broadcast set)
 //!    and the kernel's broadcast route in table local (always).
+//! 6. The ownership gates survive the dump filter: a kernel-owned
+//!    route KIND at our address is refused even when it wears our
+//!    own protocol tag. A dump filtered on `kind Local` would not
+//!    return it, and the replace would clobber it silently.
+//! 7. An owned route whose attributes have drifted is repaired, and
+//!    an already-correct one is left alone — proven by subscribing
+//!    to `RTNLGRP_IPV4_ROUTE` and asserting the reconcile is silent.
 //!
 //! Runs inside its own netns so the routes and the veth address it
 //! creates never touch the host (qemu VM) tables. Same harness
@@ -285,5 +292,188 @@ fn anyip_refuses_and_never_deletes_foreign_route() {
     assert!(
         bindable(CONTESTED),
         "foreign local route must survive our remove untouched"
+    );
+}
+
+// --- Strict-dump and write-skip coverage --------------------------------
+
+/// A `broadcast` entry in the local table at our address. The
+/// directed-broadcast test above is driven by the IFA_BROADCAST
+/// attribute; this one is driven purely by what the routing table
+/// holds, which is the gate that has to survive the dump filter.
+const KERNEL_KIND: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
+/// An owned (proto 199) local route whose output interface is wrong.
+const DRIFTED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 11);
+/// Address for the no-notification test.
+const QUIET: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 12);
+
+fn local_table() -> String {
+    let out = Command::new("ip")
+        .args(["route", "show", "table", "local"])
+        .output()
+        .expect("ip route show table local");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A kernel-owned route KIND at our address is refused even when it
+/// wears our own protocol tag.
+///
+/// The tag is deliberate: it proves the kind check is independent of
+/// ownership, and that the dump still returns non-`Unicast` entries.
+/// A filter naming `kind Local` would hide this route entirely, the
+/// probe would report "nothing there", and the replace below would
+/// silently convert the kernel's broadcast entry into our local one.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn anyip_refuses_kernel_owned_route_kind() {
+    let names = Names::new("k");
+    let _guard = NetnsGuard::setup(&names);
+    let _ns_fd = enter_netns(&names.netns);
+
+    run(&[
+        "ip",
+        "route",
+        "add",
+        "broadcast",
+        "198.51.100.10/32",
+        "dev",
+        "lo",
+        "table",
+        "local",
+        "proto",
+        "199",
+    ]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current-thread runtime");
+
+    match rt.block_on(ensure_local_route(KERNEL_KIND)) {
+        Err(AnyipError::RouteKindConflict { addr, kind }) => {
+            assert_eq!(addr, KERNEL_KIND);
+            assert_eq!(kind, RouteType::Broadcast);
+        }
+        other => panic!("expected RouteKindConflict for {KERNEL_KIND}, got {other:?}"),
+    }
+
+    assert!(
+        local_table().contains("broadcast 198.51.100.10"),
+        "the kernel's broadcast entry must survive a refused ensure:\n{}",
+        local_table()
+    );
+}
+
+/// An owned route whose attributes have drifted is repaired, not
+/// skipped. The write-skip must not turn the reconcile into a no-op
+/// for the case it exists to heal.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn anyip_repairs_owned_route_with_wrong_attributes() {
+    let names = Names::new("r");
+    let _guard = NetnsGuard::setup(&names);
+    let _ns_fd = enter_netns(&names.netns);
+
+    // Ours by protocol, but pointed at the veth instead of lo.
+    run(&[
+        "ip",
+        "route",
+        "add",
+        "local",
+        "198.51.100.11/32",
+        "dev",
+        &names.veth_a,
+        "table",
+        "local",
+        "proto",
+        "199",
+    ]);
+    assert!(
+        local_table().contains(&format!("dev {}", names.veth_a)),
+        "setup should have left the route on the veth:\n{}",
+        local_table()
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current-thread runtime");
+
+    // Adopted, because it is ours — and repaired, because it is wrong.
+    assert_eq!(
+        rt.block_on(ensure_local_route(DRIFTED)).expect("ensure"),
+        EnsureOutcome::Adopted
+    );
+
+    let table = local_table();
+    let line = table
+        .lines()
+        .find(|l| l.contains("198.51.100.11"))
+        .unwrap_or_else(|| panic!("route vanished:\n{table}"));
+    assert!(
+        line.contains("dev lo"),
+        "drifted oif must be repaired to lo, got: {line}"
+    );
+    assert!(
+        line.starts_with("local "),
+        "kind must still be local, got: {line}"
+    );
+}
+
+/// A reconcile over an already-correct route writes nothing, and so
+/// wakes no `RTNLGRP_IPV4_ROUTE` subscriber.
+///
+/// This is the whole point of the write-skip: `.replace()` is
+/// idempotent in effect but not in observation, and on the primary the
+/// subscriber it woke every 30 s was tailscaled, which rescans host
+/// state on every route change.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn anyip_unchanged_reconcile_emits_no_route_notification() {
+    let names = Names::new("q");
+    let _guard = NetnsGuard::setup(&names);
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current-thread runtime");
+
+    assert_eq!(
+        rt.block_on(ensure_local_route(QUIET))
+            .expect("first ensure"),
+        EnsureOutcome::Created
+    );
+
+    rt.block_on(async {
+        // Subscribe only after the creating write, so the one
+        // notification we expect to exist is already behind us.
+        let (conn, _handle, mut msgs) =
+            rtnetlink::new_multicast_connection(&[rtnetlink::MulticastGroup::Ipv4Route])
+                .expect("subscribe RTNLGRP_IPV4_ROUTE");
+        tokio::spawn(conn);
+
+        // Second ensure: same address, nothing drifted, so no write.
+        assert_eq!(
+            ensure_local_route(QUIET).await.expect("second ensure"),
+            EnsureOutcome::Adopted
+        );
+
+        // Anything the kernel broadcast would already be queued; the
+        // window is for delivery, not for the kernel to make up its
+        // mind.
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures::StreamExt::next(&mut msgs),
+        )
+        .await;
+        if let Ok(Some((msg, _))) = quiet {
+            panic!("unchanged reconcile emitted a route notification: {msg:?}");
+        }
+    });
+
+    assert!(
+        bindable(QUIET),
+        "the route must still be there after a skipped write"
     );
 }
