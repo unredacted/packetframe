@@ -47,3 +47,8 @@ $RECYCLE.BIN/
 crates/modules/fast-path/bpf/target/
 crates/modules/guard/bpf/target/
 crates/modules/probe/bpf/target/
+
+# Locally downloaded hwtest/release bundles. CI writes this path too,
+# but only ever uploads it as an artifact — nothing here belongs in git
+# (a stray `git add -A` once staged a 28 MB bundle of test binaries).
+dist/
