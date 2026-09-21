@@ -315,8 +315,14 @@ jobs:
           print("bins: ", " ".join(sorted(staged_bins)))
           PY
           cp conf/example.conf "dist/packetframe-hwtest-${TARGET}/"
+          # vpp-offload.md rides along because vpp-pin.txt sends the
+          # operator to it for the boot-sysctl audit, and the whole
+          # point of this bundle is that it works on a router with no
+          # checkout. A safety procedure referenced but not shipped is
+          # not a procedure.
           cp docs/runbooks/tc-datapath.md \
              docs/runbooks/generic-mode-performance.md \
+             docs/runbooks/vpp-offload.md \
              "dist/packetframe-hwtest-${TARGET}/"
 
           # VPP pointer, not payload. The vpp-offload module needs a VPP
@@ -340,6 +346,20 @@ jobs:
             VPP_PLATFORM=$(jq -r '.platform' "$SRC")
             VPP_DISTRO=$(jq -r '.distro' "$SRC" | sed 's/^debian-//')
             VPP_ARCH=$(jq -r '.arch' "$SRC")
+            # The packaging note is the release's own statement about
+            # what the deb contains — NOT a sentence pinned here. A
+            # hardcoded warning goes stale the moment a release changes
+            # its packaging, and this one did: it kept telling operators
+            # the deb ships /etc/sysctl.d/80-vpp.conf for weeks after
+            # that file was removed from it.
+            # `-e` so a manifest without `packaging` fails the build
+            # instead of printing the literal "null". The field is not
+            # validated by the re-vendoring procedure (the README copies
+            # the release manifest verbatim) and manifests predating the
+            # field exist in history — and since this note REPLACED a
+            # hardcoded safety warning, a null here would silently erase
+            # it rather than degrade it.
+            VPP_PACKAGING=$(jq -er '.packaging' "$SRC")
             cat > "dist/packetframe-hwtest-${TARGET}/vpp-pin.txt" <<EOF
           VPP for the vpp-offload module: ${VPP_REF} (${VPP_PLATFORM}, ${VPP_DISTRO}/${VPP_ARCH})
 
@@ -354,11 +374,32 @@ jobs:
 
           then install per the "Installing on a gateway" section of
           ${VPP_REPO}'s README — NOT a bare dpkg -i. The deb starts its
-          own service at install AND ships /etc/sysctl.d/80-vpp.conf,
-          a hugepage sysctl that re-applies on every boot (512 GiB on a
-          64K-page kernel; it bricked a 64 GB router on 2026-08-21).
-          The README sequence masks the service, skips the install-time
-          sysctl, and deletes the shipped file.
+          own service at install, so the README sequence masks the unit
+          first and skips the install-time sysctl.
+
+          Packaging notes for THIS release, from its own SOURCE.json:
+            ${VPP_PACKAGING}
+
+          Whatever that says, audit the boot-time hugepage sysctls after
+          installing and before rebooting — a reservation priced at the
+          64K-page kernel's 512 MiB default hugepage size bricked a
+          64 GB router on 2026-08-21, and only a boot revealed it.
+          Order matters: install, THEN audit, THEN reboot.
+
+            packetframe feasibility | jq -e '
+              [.capabilities[]
+               | select(.name == "vpp.sysctl-hugepages") | .status]
+              == ["pass"]' >/dev/null
+
+          Exits nonzero if anything would be reserved at boot, and also
+          if the check is missing from the report entirely — both are
+          the safe direction. The -e is what makes it a gate: without it
+          jq exits 0 whatever it prints. Drop -e and the redirect to
+          read the verdict instead of gating on it.
+
+          Full procedure, including why 'ls /etc/sysctl.d | grep vpp' is
+          not a substitute: vpp-offload.md in this bundle, "Install and
+          upgrade on the router".
 
           Only needed for \`module vpp-offload\`; the eBPF fast-path needs
           nothing from this file. See docs/runbooks/vpp-offload.md.
