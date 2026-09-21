@@ -10,7 +10,10 @@ use std::path::Path;
 use packetframe_common::{
     config::{Config, ModuleDirective, VppSteerDirection},
     fib::IpPrefix,
-    probe::{run_iface_probes, run_probes, Capability, CapabilityStatus, FeasibilityReport},
+    probe::{
+        run_iface_probes, run_probes, sysctl_hugepages, Capability, CapabilityStatus,
+        FeasibilityReport,
+    },
 };
 
 pub struct Rendered {
@@ -424,6 +427,9 @@ pub fn probe_and_render(
     // say "vpp-offload attach BLOCKED" instead of a bare FAIL (or,
     // worse, the bare PASS an operator on edge1-mci1-net read over a
     // failing `vpp.irq-affinity` line on 2026-08-21).
+    // Read before the graft consumes `vpp`: the boot-sysctl promotion
+    // below needs it whether or not this binary carries the module.
+    let vpp_configured = !vpp.ports.is_empty();
     #[cfg(feature = "vpp-offload")]
     let vpp_cap_names: Vec<String> = {
         let mut names = Vec::new();
@@ -477,6 +483,26 @@ pub fn probe_and_render(
     }
     #[cfg(not(feature = "neigh-snoop"))]
     let _ = snoop;
+    // The boot-sysctl audit is advisory in the general set — a large
+    // `vm.nr_hugepages` is the operator's business on a box that runs
+    // no VPP. On a box whose config declares `module vpp-offload` it
+    // stops being advisory: installing VPP is what plants the
+    // assignment, the damage lands at the NEXT BOOT rather than at
+    // attach, and a report that says PASS over it is how a 64 GB router
+    // got a 512 GiB hugepage request and never came back (2026-08-21).
+    //
+    // Promotion is deliberately not the same as joining the vpp graft:
+    // this is a reboot hazard, not an attach blocker, and it is
+    // partitioned separately below so the verdict says which one it is.
+    if vpp_configured {
+        if let Some(cap) = report
+            .capabilities
+            .iter_mut()
+            .find(|c| c.name == sysctl_hugepages::PROBE_NAME)
+        {
+            cap.required = true;
+        }
+    }
     // `passed` needs recomputing after the iface probes; the trial
     // attach caps are non-required (a native-XDP failure shouldn't
     // abort startup), but we preserve the existing `passed` logic.
@@ -490,8 +516,16 @@ pub fn probe_and_render(
         passed,
         capabilities: report.capabilities,
     };
-    let (core_blockers, vpp_blockers) = partition_blockers(&report, &vpp_cap_names);
-    let vpp_blocked_only = core_blockers.is_empty() && !vpp_blockers.is_empty();
+    let Blockers {
+        core: core_blockers,
+        vpp: vpp_blockers,
+        boot: boot_blockers,
+    } = partition_blockers(&report, &vpp_cap_names);
+    // A boot hazard blocks the rollout without blocking the attach, so
+    // it shares the module-blocked exit rather than the core-failure
+    // one: "this box is not ready" without claiming fast-path is broken.
+    let vpp_blocked_only =
+        core_blockers.is_empty() && !(vpp_blockers.is_empty() && boot_blockers.is_empty());
 
     if human {
         print_human(&report, &vpp_cap_names);
@@ -512,10 +546,19 @@ pub fn probe_and_render(
             /// Required vpp-graft capabilities whose verdict is not
             /// Pass; empty when nothing blocks the module's attach.
             vpp_attach_blockers: Vec<&'a str>,
+            /// Boot-persistence hazards whose verdict is not Pass.
+            ///
+            /// Reported **regardless of `required`**, so this doubles as
+            /// a standalone pre-reboot gate on a box that has no
+            /// `vpp-offload` block yet — which is exactly the state a
+            /// router is in between installing VPP and configuring the
+            /// module, and exactly when the hazard is planted.
+            boot_sysctl_blockers: Vec<&'a str>,
         }
         let json = serde_json::to_string_pretty(&JsonReport {
             report: &report,
             vpp_attach_blockers: vpp_blockers.iter().map(|c| c.name.as_str()).collect(),
+            boot_sysctl_blockers: boot_blockers.iter().map(|c| c.name.as_str()).collect(),
         })
         .expect("FeasibilityReport is serializable");
         Rendered {
@@ -526,18 +569,39 @@ pub fn probe_and_render(
     }
 }
 
-/// Required-and-not-Pass capabilities, split into (core, vpp) by
-/// membership in the vpp graft.
-fn partition_blockers<'a>(
-    report: &'a FeasibilityReport,
-    vpp_cap_names: &[String],
-) -> (Vec<&'a Capability>, Vec<&'a Capability>) {
+/// Not-Pass capabilities, split by what they actually block.
+struct Blockers<'a> {
+    /// Required core capabilities: fast-path itself is not ready.
+    core: Vec<&'a Capability>,
+    /// Required vpp-graft capabilities: the module's attach is refused.
+    vpp: Vec<&'a Capability>,
+    /// Boot-persistence hazards: attach is fine, the next REBOOT is not.
+    boot: Vec<&'a Capability>,
+}
+
+/// Split the not-Pass capabilities into what each one blocks.
+///
+/// Three buckets rather than two because "attach will be refused" and
+/// "the next boot will not come back" are different verdicts with
+/// different remedies, and filing one under the other is how an
+/// operator reads past it. The boot bucket ignores `required` on
+/// purpose: the hazard is planted by installing VPP, which happens
+/// before there is a `vpp-offload` block to promote the check, so this
+/// has to answer on a box where the capability is still advisory.
+fn partition_blockers<'a>(report: &'a FeasibilityReport, vpp_cap_names: &[String]) -> Blockers<'a> {
+    let is_boot_hazard =
+        |c: &Capability| c.name == packetframe_common::probe::sysctl_hugepages::PROBE_NAME;
+    let boot: Vec<&Capability> = report
+        .capabilities
+        .iter()
+        .filter(|c| is_boot_hazard(c) && c.status != CapabilityStatus::Pass)
+        .collect();
     let (vpp, core): (Vec<&Capability>, Vec<&Capability>) = report
         .capabilities
         .iter()
-        .filter(|c| c.required && c.status != CapabilityStatus::Pass)
+        .filter(|c| c.required && c.status != CapabilityStatus::Pass && !is_boot_hazard(c))
         .partition(|c| vpp_cap_names.contains(&c.name));
-    (core, vpp)
+    Blockers { core, vpp, boot }
 }
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -662,10 +726,11 @@ fn print_human(report: &FeasibilityReport, vpp_cap_names: &[String]) {
 /// vpp-offload's probes — membership, not a name-prefix guess, decides
 /// which failures read as "attach BLOCKED".
 fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<String> {
-    let (core, vpp_blockers) = partition_blockers(report, vpp_cap_names);
-    if core.is_empty() && vpp_blockers.is_empty() {
-        return vec!["Result: PASS, all required capabilities present.".into()];
-    }
+    let Blockers {
+        core,
+        vpp: vpp_blockers,
+        boot: boot_blockers,
+    } = partition_blockers(report, vpp_cap_names);
     let item = |c: &Capability| {
         format!(
             "  - {} ({})",
@@ -673,6 +738,56 @@ fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<St
             scrub_for_terminal(&c.detail)
         )
     };
+    // The boot hazard gets its own sentence wherever it appears. It
+    // does not block the attach, so folding it into the attach verdict
+    // would be wrong in both directions: it would overstate the attach
+    // problem and understate a fault whose blast radius is the whole
+    // box on next boot.
+    let boot_lines = |lines: &mut Vec<String>| {
+        if !boot_blockers.is_empty() {
+            lines.push(format!(
+                "REBOOT HAZARD: {} boot-persistent sysctl check{} not passing. \
+                 The attach is unaffected; the next boot may be:",
+                boot_blockers.len(),
+                if boot_blockers.len() == 1 {
+                    " is"
+                } else {
+                    "s are"
+                },
+            ));
+            lines.extend(boot_blockers.iter().map(|c| item(c)));
+        }
+    };
+    if core.is_empty() && vpp_blockers.is_empty() {
+        if boot_blockers.is_empty() {
+            return vec!["Result: PASS, all required capabilities present.".into()];
+        }
+        // A PROMOTED boot hazard makes `report.passed` false and the
+        // exit code 3, so the headline must not also say every required
+        // capability passed. One invocation printing "PASS" beside
+        // `"passed": false` is a contradiction a parser resolves
+        // arbitrarily and a tired operator resolves optimistically.
+        //
+        // The attach verdict stays separate either way: this blocks the
+        // rollout, not the attach, and saying so is the whole reason
+        // the hazard has its own bucket.
+        let n = boot_blockers.len();
+        let mut lines = vec![if boot_blockers.iter().any(|c| c.required) {
+            format!(
+                "Result: ROLLOUT BLOCKED by {n} boot-persistence check{}; \
+                 the attach itself is unaffected:",
+                if n == 1 { "" } else { "s" },
+            )
+        } else {
+            format!(
+                "Result: required capabilities PASS, but {n} boot-persistence check{} \
+                 not passing; the attach itself is unaffected:",
+                if n == 1 { " is" } else { "s are" },
+            )
+        }];
+        lines.extend(boot_blockers.iter().map(|c| item(c)));
+        return lines;
+    }
     let mut lines = Vec::new();
     if core.is_empty() {
         // "core capabilities PASS", not "PASS for fast-path": a
@@ -701,6 +816,7 @@ fn summary_lines(report: &FeasibilityReport, vpp_cap_names: &[String]) -> Vec<St
             lines.extend(vpp_blockers.iter().map(|c| item(c)));
         }
     }
+    boot_lines(&mut lines);
     lines
 }
 
@@ -888,6 +1004,153 @@ mod summary_tests {
         assert!(
             !lines.iter().any(|l| l.contains("vpp-offload")),
             "{lines:?}"
+        );
+    }
+
+    /// A boot hazard is reported even when it is still advisory, and
+    /// never as an attach blocker.
+    ///
+    /// This is the state a router is in between installing VPP and
+    /// adding the `vpp-offload` block — exactly when the hazard is
+    /// planted, and exactly when the capability is not yet `required`.
+    /// A gate that only answered for a configured box would have
+    /// nothing to say at the reboot that matters.
+    #[test]
+    fn an_advisory_boot_hazard_is_still_reported_and_is_not_an_attach_blocker() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, false),
+        ]);
+        let blockers = partition_blockers(&report, &[]);
+        assert!(
+            blockers.core.is_empty(),
+            "a boot hazard is not a core fault"
+        );
+        assert!(
+            blockers.vpp.is_empty(),
+            "a boot hazard is not an attach blocker"
+        );
+        assert_eq!(blockers.boot.len(), 1);
+
+        let lines = summary_lines(&report, &[]);
+        assert!(
+            !lines.iter().any(|l| l.contains("BLOCKED")),
+            "advisory, and no attach blocker: nothing here is blocked: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(sysctl_hugepages::PROBE_NAME)),
+            "the hazard must still be named: {lines:?}"
+        );
+    }
+
+    /// Promoted to `required`, it still does not become an attach
+    /// blocker — and it still does not make the run a core FAIL, which
+    /// would claim fast-path itself is not ready.
+    #[test]
+    fn a_promoted_boot_hazard_stays_in_its_own_bucket() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap("vpp.iommu", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, true),
+        ]);
+        let blockers = partition_blockers(&report, &["vpp.iommu".to_string()]);
+        assert!(blockers.core.is_empty());
+        assert!(blockers.vpp.is_empty());
+        assert_eq!(blockers.boot.len(), 1);
+    }
+
+    /// ...and the summary must not then claim every required capability
+    /// passed. Promotion makes `report.passed` false and the exit code
+    /// 3; a headline of "PASS" beside that is a contradiction one
+    /// invocation should never emit (review finding on #225 — the
+    /// bucket test above passed while the prose said the opposite).
+    #[test]
+    fn a_promoted_boot_hazard_is_never_summarized_as_a_pass() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, true),
+        ]);
+        assert!(!report.passed, "promotion must fail the report");
+
+        let lines = summary_lines(&report, &[]);
+        assert!(
+            !lines.iter().any(|l| l.contains("PASS, all required")),
+            "the report is not passing; the summary must not say it is: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("Result: ROLLOUT BLOCKED by 1 boot-persistence check;"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("the attach itself is unaffected"),
+            "the attach verdict stays separate: {lines:?}"
+        );
+    }
+
+    /// The advisory case still says the required capabilities passed —
+    /// because they did, and `report.passed` is true — but does not
+    /// leave it at that.
+    #[test]
+    fn an_advisory_boot_hazard_qualifies_the_pass_rather_than_blocking() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, false),
+        ]);
+        assert!(
+            report.passed,
+            "an advisory failure does not fail the report"
+        );
+
+        let lines = summary_lines(&report, &[]);
+        assert!(
+            lines[0].starts_with("Result: required capabilities PASS, but 1 boot-persistence"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(sysctl_hugepages::PROBE_NAME)),
+            "the hazard is still named: {lines:?}"
+        );
+    }
+
+    /// A boot hazard alongside a real attach blocker: both are stated,
+    /// in their own words.
+    #[test]
+    fn a_boot_hazard_and_an_attach_blocker_are_reported_separately() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap("vpp.irq-affinity", CapabilityStatus::Fail, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Fail, true),
+        ]);
+        let lines = summary_lines(&report, &["vpp.irq-affinity".to_string()]);
+        assert_eq!(
+            lines[0],
+            "Result: core capabilities PASS; vpp-offload attach BLOCKED by 1 check:"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("vpp.irq-affinity")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("REBOOT HAZARD:")),
+            "{lines:?}"
+        );
+    }
+
+    /// A passing boot check says nothing at all.
+    #[test]
+    fn a_passing_boot_check_adds_no_line() {
+        let report = FeasibilityReport::new(vec![
+            cap("bpf.core", CapabilityStatus::Pass, true),
+            cap(sysctl_hugepages::PROBE_NAME, CapabilityStatus::Pass, true),
+        ]);
+        assert!(partition_blockers(&report, &[]).boot.is_empty());
+        assert_eq!(
+            summary_lines(&report, &[]),
+            vec!["Result: PASS, all required capabilities present.".to_string()]
         );
     }
 }

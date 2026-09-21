@@ -1966,6 +1966,53 @@ module's own deltas.
 
 ## Install and upgrade on the router
 
+> ## The boot-sysctl audit: run it after every install, before every reboot
+>
+> **Order matters: install → audit → reboot.** Installing the package is
+> what can plant the assignment, so an audit taken before the install
+> proves nothing about the boot that follows it.
+>
+> ```bash
+> packetframe feasibility | jq -e '.boot_sysctl_blockers | length == 0' >/dev/null
+> ```
+>
+> **The `-e` is load-bearing — do not drop it.** Without it `jq` exits 0
+> whether the array is empty or full, and in the pre-config window
+> `packetframe feasibility` also exits 0 (the capability is still
+> advisory there), so a gate written as a bare `jq '.boot_sysctl_blockers'`
+> passes while printing the blocker that is about to brick the box. With
+> `-e` the pipeline exits nonzero when the array is non-empty, and also
+> when `feasibility` produced no JSON at all — both are the safe
+> direction. To read the blockers rather than gate on them, drop the
+> `-e` and the redirect.
+>
+> `boot_sysctl_blockers` is reported **regardless of whether the
+> capability is required**, which is the point: between installing VPP
+> and adding the `vpp-offload` block there is no module for the check to
+> be gated on, and that gap is exactly when the hazard exists. Once the
+> config does declare the module the same check is also promoted to
+> `required`, so `packetframe feasibility` stops exiting 0 over it and
+> its own summary reads `ROLLOUT BLOCKED` rather than `PASS`.
+>
+> **Do not substitute `ls /etc/sysctl.d/ | grep -i vpp`.** That answers
+> a narrower question than the one that matters. The probe resolves the
+> effective assignment across every `sysctl.d` location under both
+> appliers — systemd-sysctl and procps order and shadow files
+> differently — and reports the worse of the two verdicts, because a
+> file one applier skips and the other applies is still lethal. It then
+> prices the result at the running kernel's **default hugepage size**
+> (`Hugepagesize:` in `/proc/meminfo`), which is where 1024 pages
+> becomes a 512 GiB request on this fleet rather than 2 GiB.
+>
+> **An unknown verdict blocks the reboot.** `Unknown` means the scan
+> could not read what boot will do, not that boot is fine.
+>
+> **After a firmware change, establish that the new kernel's hugepage
+> size matches what you audited.** The page count is unchanged across
+> the upgrade; the multiplier is not necessarily, and an audit priced on
+> the old kernel does not transfer. Re-run the audit on the new kernel
+> before the next reboot, including after a recovery-mode restore.
+
 > **`detach` and `status` can be run from a newly deployed bundle.**
 > Until 2026-08-12 they could not: every liveness check asked whether
 > some process ran *the CLI's own executable path*, which is false
