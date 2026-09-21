@@ -30,7 +30,10 @@ running badly.
 > `steer-exempt` machinery all exist because a rung exposed the need.
 > Read that as the ladder working, and as the reason not to skip rungs.
 >
-> **Still unproven anywhere:** more than two steered ports, `detach`
+> **Still unproven anywhere: more than ONE port steered at a time.**
+> Every steer on record diverted a single port — eth1 on the lab
+> gateway, eth4 on all five primary windows — so rung 2 is the first
+> untested rung, not rung 3. Also unproven: `detach`
 > across more than one VF, and whether MCAM rules survive a UniFi
 > provisioning push. A 5 h steered-idle soak proves nothing wiped them;
 > it does not prove a provisioning cycle cannot.
