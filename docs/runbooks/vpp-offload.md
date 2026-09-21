@@ -11,14 +11,34 @@ running badly.
 
 > ## Read this before the first bring-up
 >
-> **This module has run against real VPP on the shadow, repeatedly.**
-> First bring-up 2026-08-05; first forwarded packet 2026-08-07; the five
-> acceptance drills and a restart-over-steered-VPP cycle through
-> 2026-08-09; `detach --all`, a cold bring-up and the steering-reconcile
-> checks on 2026-08-11. What has NOT happened is any of it on the
-> primary, or on more than one VF, or with real customer traffic — the
-> shadow's only wired port carries the interconnect, so every packet
-> that has ever traversed VPP here was one we generated.
+> **This module has forwarded production traffic.** On the lab
+> gateway: first bring-up 2026-08-05, first forwarded packet
+> 2026-08-07, the five acceptance drills and a restart-over-steered-VPP
+> cycle through 2026-08-09, then `detach --all`, a cold bring-up and the
+> steering-reconcile checks on 2026-08-11. On the **primary**, across
+> 2026-08-13..17: a full-table six-port attach behind bird's live dump,
+> then five steers of a live trunk port, ending in a 2 h soak with
+> kernel exemptions in place. At rung 1 the steered path beat the XDP
+> path by more than 10x under coexistence — ~0.1% remote loss steered
+> against 4-7%/min unsteered in the same window.
+>
+> **Each of those five steers found a defect.** Undeclared trunk VLANs
+> punting 8.7M frames; the VF answering to its own MAC instead of the
+> bridge's; the bridge MAC as a member's PRIMARY silently capturing
+> ~300 kpps from attach with the lever still off; locally-terminating
+> traffic dying at `null-node`. The `vlans`, secondary-MAC and
+> `steer-exempt` machinery all exist because a rung exposed the need.
+> Read that as the ladder working, and as the reason not to skip rungs.
+>
+> **Still unproven anywhere:** more than two steered ports, `detach`
+> across more than one VF, and whether MCAM rules survive a UniFi
+> provisioning push. A 5 h steered-idle soak proves nothing wiped them;
+> it does not prove a provisioning cycle cannot.
+>
+> **None of the above is currently deployed.** The 2026-08-21 hugepage
+> brick, the firmware upgrade that reset dpkg state, and the 2026-08-26
+> factory reset left the fleet with no VPP installed and no
+> `vpp-offload` block in the config. The ladder restarts from rung 0.
 >
 > **The MCAM ioctl path has now met a NIC, and it took several rounds.**
 > First contact on 2026-08-05 found one real defect — the `loc` space
@@ -27,12 +47,12 @@ running badly.
 > rules than existed, and a mask "correction" that inverted a field
 > which had been right all along. Every one of them failed loudly, as
 > designed: nothing was installed, and the all-or-nothing unwind left the
-> port with zero rules each time. Everything past installation is now
-> proven too, on the shadow: steered frames counted on `octeon0/0`
-> (2026-08-07), forwarded end to end through VPP's graph the same day,
-> and PMTUD answered correctly through a steered path. What remains
-> unproven is scale and reality — one VF, one wired port, and traffic we
-> generated ourselves. Every rule
+> port with zero rules each time. Everything past installation is proven
+> too: steered frames counted on `octeon0/0` (2026-08-07), forwarded end
+> to end through VPP's graph the same day, PMTUD answered correctly
+> through a steered path, and — on the primary — ~500M packets forwarded
+> in 27 minutes, split by best path across two upstreams with zero loop
+> and no drops on the forwarding path. Every rule
 > insert is followed by an `ETHTOOL_GRXCLSRULE` readback and compared
 > field by field, precisely so a wrong `ethtool_rx_flow_spec` offset
 > fails loudly on first contact instead of installing a rule that
