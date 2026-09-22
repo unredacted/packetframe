@@ -70,6 +70,17 @@ pub struct UpstreamState {
 impl UpstreamState {
     /// Whether this upstream has finished loading every declared
     /// family for its current session.
+    ///
+    /// **Deliberately does not consider `established_epoch`, and the
+    /// caller must.** This answers "is the table loaded"; the epoch
+    /// answers "which session loaded it", and that is a comparison
+    /// against a previous reading, which a method on one reading cannot
+    /// make. But an epoch that is `None` is not merely uncomparable — it
+    /// means nothing here can be tied to a session at all, so readiness
+    /// without one is a completeness decision with no session identity
+    /// behind it (review finding, PR #229). `classify_eligibility`
+    /// treats that as `Unknown` rather than letting it pass; see the
+    /// `a_ready_upstream_with_no_epoch_is_unknown` test.
     pub fn ready(&self) -> bool {
         self.established && self.missing_eor.is_empty()
     }
@@ -213,14 +224,34 @@ pub enum ExportPolicy {
 
 /// Read the PF peer's outbound policy out of `show running-config`.
 ///
-/// Deliberately a whitelist: anything this does not recognise as
-/// harmless counts as filtering. An unrecognised directive that turns
-/// out to be benign costs one refusal and a line in the runbook; one
-/// that turns out to narrow the table costs a steer into a FIB with
-/// holes the gate swore were not there.
+/// **A blacklist of the directives known to narrow a table, and its
+/// doc used to claim the opposite.** The first version said it was a
+/// whitelist — "anything this does not recognise as harmless counts as
+/// filtering" — which is the stronger design and is not what the code
+/// did or does. It matches six keywords and calls everything else
+/// unfiltered. The claim is withdrawn rather than the code inverted,
+/// because a genuine whitelist has to enumerate FRR's whole per-neighbor
+/// grammar, and every directive missing from it refuses a valid config;
+/// guessing at that list is exactly what [D2b] existed to stop. Widening
+/// it is a measurement task, not an edit.
+///
+/// What the blacklist DOES cover is stated so an operator can reason
+/// about the gap: `route-map`, `prefix-list`, `filter-list`,
+/// `distribute-list`, `unsuppress-map` and `maximum-prefix`, in either
+/// direction, on the peer **or on a peer-group it belongs to**.
+///
+/// Peer-group inheritance is not an extra: FRR keys an inherited policy
+/// by the GROUP name, and the peer's own line reads `neighbor <peer>
+/// peer-group <G>`, which matches nothing in the list. Without
+/// resolving it, the single most ordinary way to attach a route-map to
+/// a session was invisible and this returned `Unfiltered` over a
+/// narrowed feed — the one failure mode the counts cannot catch
+/// afterwards (review finding, PR #229).
 ///
 /// `next-hop-self` is the one known-harmless per-peer AF directive on
 /// this path — it rewrites an attribute, it does not remove prefixes.
+///
+/// [D2b]: the discovery gate in the VPP readiness plan
 pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
     const NARROWING: [&str; 6] = [
         "route-map",
@@ -230,21 +261,45 @@ pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
         "unsuppress-map",
         "maximum-prefix",
     ];
-    let needle = format!("neighbor {peer} ");
+    // The peer's own name, plus every peer-group it is a member of.
+    // Resolved first, in its own pass, because a `peer-group` line can
+    // appear after the group's policy in the rendered config and a
+    // single pass would miss it.
+    let mut names = vec![peer.to_string()];
+    let member_of = format!("neighbor {peer} peer-group ");
     for raw in running_config.lines() {
-        let line = raw.trim();
-        let Some(tail) = line.strip_prefix(&needle) else {
-            continue;
-        };
-        // Direction matters only for reporting: an INBOUND filter on
-        // this peer is equally disqualifying, because the peer is a
-        // consumer and an inbound filter there means the operator is
-        // running a shape this authority was not designed for.
-        for kw in NARROWING {
-            if tail.starts_with(kw) {
-                return ExportPolicy::Filtered {
-                    why: format!("`neighbor {peer} {tail}` narrows what this peer receives"),
-                };
+        if let Some(group) = raw.trim().strip_prefix(&member_of) {
+            let group = group.trim();
+            if !group.is_empty() && !names.iter().any(|n| n == group) {
+                names.push(group.to_string());
+            }
+        }
+    }
+
+    for name in &names {
+        let needle = format!("neighbor {name} ");
+        for raw in running_config.lines() {
+            let line = raw.trim();
+            let Some(tail) = line.strip_prefix(&needle) else {
+                continue;
+            };
+            // Direction matters only for reporting: an INBOUND filter on
+            // this peer is equally disqualifying, because the peer is a
+            // consumer and an inbound filter there means the operator is
+            // running a shape this authority was not designed for.
+            for kw in NARROWING {
+                if tail.starts_with(kw) {
+                    let via = if name == peer {
+                        String::new()
+                    } else {
+                        format!(" (inherited by {peer} from peer-group {name})")
+                    };
+                    return ExportPolicy::Filtered {
+                        why: format!(
+                            "`neighbor {name} {tail}` narrows what this peer receives{via}"
+                        ),
+                    };
+                }
             }
         }
     }
@@ -306,7 +361,12 @@ pub enum Eligibility {
 ///    upload looks like — so the export policy read alongside the old
 ///    reading may not be the current one. Revocation is sticky, so the
 ///    cost is one tick.
-/// 4. **A read that failed is `Unknown`, and only if nothing above
+/// 4. **A ready upstream with no session epoch is `Unknown`.** Not
+///    `Revoked` — nothing disqualifying was observed, something simply
+///    could not be read — but not `Ok` either, because readiness with
+///    no session identity behind it is the decision the epoch exists to
+///    prevent.
+/// 5. **A read that failed is `Unknown`, and only if nothing above
 ///    fired.** Positive evidence outranks a partial read: one upstream
 ///    timing out must not hide another one answering "not Established".
 pub fn classify_eligibility(
@@ -338,17 +398,34 @@ pub fn classify_eligibility(
         // Ready — but is it the same session the standing permission was
         // earned under? Recorded even when it is the first sighting, so
         // the NEXT tick has something to compare against.
-        if let Some(epoch) = state.established_epoch {
-            if let Some(prev) = seen_epochs.insert(*peer, epoch) {
-                if prev != epoch && moved.is_none() {
-                    moved = Some(format!(
-                        "upstream {peer} re-established since the last check (epoch \
-                         {prev} → {epoch}); on this platform an FRR configuration \
-                         upload restarts bgpd and flaps every session, so the previous \
-                         reading described a session that no longer exists — and the \
-                         export policy it was taken under may not be the current one"
-                    ));
-                }
+        //
+        // No epoch means that question CANNOT be asked. `ready()`
+        // answers "the table is loaded" from the neighbor document
+        // alone, and without an epoch there is nothing tying that answer
+        // to a session — a future FRR that renames the field, or a
+        // summary whose schema drifts, would hand back a completeness
+        // decision with no session identity behind it, which is exactly
+        // what the epoch was introduced to prevent. `Unknown` rather
+        // than `Revoked`: we failed to read something, we did not
+        // observe a disqualifying fact (review finding, PR #229).
+        let Some(epoch) = state.established_epoch else {
+            unknown.get_or_insert(format!(
+                "upstream {peer} reports Established with End-of-RIB, but FRR gave no \
+                 `peerUptimeEstablishedEpoch` for it — without a session generation \
+                 there is nothing to tie that readiness to the current session, so it \
+                 cannot be acted on"
+            ));
+            continue;
+        };
+        if let Some(prev) = seen_epochs.insert(*peer, epoch) {
+            if prev != epoch && moved.is_none() {
+                moved = Some(format!(
+                    "upstream {peer} re-established since the last check (epoch \
+                     {prev} → {epoch}); on this platform an FRR configuration \
+                     upload restarts bgpd and flaps every session, so the previous \
+                     reading described a session that no longer exists — and the \
+                     export policy it was taken under may not be the current one"
+                ));
             }
         }
     }
@@ -818,6 +895,53 @@ router bgp 65000
             ));
         }
 
+        /// Readiness with no session epoch cannot be acted on.
+        ///
+        /// `ready()` answers "the table is loaded" from the neighbor
+        /// document alone. The epoch is what ties that answer to a
+        /// session, and without one there is nothing to compare against
+        /// next tick and nothing to prove the End-of-RIB belongs to the
+        /// session running now — a completeness decision with no session
+        /// identity behind it, which is the thing the epoch was
+        /// introduced to prevent.
+        ///
+        /// `Unknown`, not `Revoked`: a field we could not read is not a
+        /// disqualifying fact, and reporting it as one would send an
+        /// operator to inspect a BGP config that is fine.
+        #[test]
+        fn a_ready_upstream_with_no_epoch_is_unknown() {
+            let mut seen = HashMap::new();
+            let e = classify_eligibility(
+                Ok(ExportPolicy::Unfiltered),
+                &[ready(peer(1), None)],
+                &mut seen,
+            );
+            let Eligibility::Unknown(why) = e else {
+                panic!("expected Unknown, got {e:?}");
+            };
+            assert!(why.contains("peerUptimeEstablishedEpoch"), "{why}");
+            assert!(
+                seen.is_empty(),
+                "and nothing is banked, or the next tick would compare against a \
+                 generation this one never established"
+            );
+        }
+
+        /// One upstream missing its epoch does not mask another
+        /// upstream's positive disqualification.
+        #[test]
+        fn a_disqualification_still_beats_a_missing_epoch() {
+            let mut seen = HashMap::new();
+            assert!(matches!(
+                classify_eligibility(
+                    Ok(ExportPolicy::Unfiltered),
+                    &[ready(peer(1), None), down(peer(2))],
+                    &mut seen
+                ),
+                Eligibility::Revoked(_)
+            ));
+        }
+
         /// A session that re-established since the last reading revokes
         /// **even though it is ready now**.
         ///
@@ -977,5 +1101,86 @@ router bgp 65000
                 "a truncated document must not be reported as a clean cut"
             );
         }
+    }
+
+    /// A route-map the peer inherits from a peer-group is found.
+    ///
+    /// The single most ordinary way to attach outbound policy in FRR,
+    /// and the first version missed all of it: the policy line is keyed
+    /// by the GROUP name, and the peer's own line says `peer-group <G>`,
+    /// which matches none of the narrowing keywords. So the check
+    /// returned `Unfiltered` over a narrowed feed — and a filter below
+    /// the drift tolerance is precisely what the counts can never catch
+    /// afterwards.
+    #[test]
+    fn a_peer_group_route_map_is_found() {
+        let cfg = "\
+router bgp 65000
+ neighbor TRANSIT peer-group
+ neighbor TRANSIT remote-as 65001
+ neighbor 10.255.0.2 peer-group TRANSIT
+ neighbor 10.255.0.2 port 1179
+ address-family ipv4 unicast
+  neighbor TRANSIT route-map ONLY-CUSTOMERS out
+ exit-address-family
+";
+        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "10.255.0.2") else {
+            panic!("an inherited route-map must disqualify");
+        };
+        assert!(why.contains("ONLY-CUSTOMERS"), "{why}");
+        assert!(
+            why.contains("inherited") && why.contains("TRANSIT"),
+            "and say where it came from, or an operator greps the peer's own lines and \
+             finds nothing: {why}"
+        );
+    }
+
+    /// Order-independent: FRR renders the group's policy inside an
+    /// `address-family` block, which comes AFTER the `peer-group`
+    /// membership line — but a config written the other way round must
+    /// resolve identically, so membership is collected in its own pass.
+    #[test]
+    fn peer_group_membership_is_resolved_before_the_scan() {
+        let cfg = "\
+ neighbor TRANSIT route-map OUT out
+ neighbor 10.255.0.2 peer-group TRANSIT
+";
+        assert!(matches!(
+            parse_export_policy(cfg, "10.255.0.2"),
+            ExportPolicy::Filtered { .. }
+        ));
+    }
+
+    /// Membership alone is not a filter. A peer-group with no narrowing
+    /// policy is the ordinary way to share timers and remote-as, and
+    /// refusing it would make the authority unusable on most real
+    /// configs.
+    #[test]
+    fn a_plain_peer_group_is_not_a_filter() {
+        let cfg = "\
+ neighbor TRANSIT peer-group
+ neighbor TRANSIT remote-as 65001
+ neighbor TRANSIT timers 3 9
+ neighbor 10.255.0.2 peer-group TRANSIT
+ neighbor 10.255.0.2 next-hop-self
+";
+        assert_eq!(
+            parse_export_policy(cfg, "10.255.0.2"),
+            ExportPolicy::Unfiltered
+        );
+    }
+
+    /// Another peer's group must not be attributed to ours.
+    #[test]
+    fn a_group_this_peer_is_not_in_is_ignored() {
+        let cfg = "\
+ neighbor CUSTOMERS route-map NARROW out
+ neighbor 192.0.2.7 peer-group CUSTOMERS
+ neighbor 10.255.0.2 remote-as 65000
+";
+        assert_eq!(
+            parse_export_policy(cfg, "10.255.0.2"),
+            ExportPolicy::Unfiltered
+        );
     }
 }

@@ -75,7 +75,7 @@ pub fn frr_authority_from_config(
                 },
             ) = d
             {
-                return Some((vtysh.clone(), upstreams.clone()));
+                return Some((vtysh.clone(), upstreams.iter().map(|u| u.addr).collect()));
             }
         }
     }

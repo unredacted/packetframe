@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use packetframe_common::config::AuthorityFamily;
+use packetframe_common::config::{AuthorityFamily, AuthorityUpstream};
 use packetframe_common::fib::TableCompleteness;
 use packetframe_common::frr::{RealVtysh, Vtysh};
 
@@ -72,9 +72,11 @@ pub struct FrrAuthorityConfig {
     /// front of it).
     pub vtysh_path: Option<PathBuf>,
     /// Upstreams whose End-of-RIB must have arrived for their current
-    /// session. Declared by the operator, never inferred.
-    pub upstreams: Vec<IpAddr>,
-    pub families: Vec<AuthorityFamily>,
+    /// session, each with the families ITS session carries. Declared by
+    /// the operator, never inferred — see
+    /// [`AuthorityUpstream`] for why there is no default and why the
+    /// families are per-upstream rather than global.
+    pub upstreams: Vec<AuthorityUpstream>,
     /// The FRR neighbour that IS packetframe — the session being
     /// attested, and the one whose export policy must not narrow the
     /// table.
@@ -91,18 +93,33 @@ impl FrrAuthorityConfig {
     pub fn new(
         interval: Duration,
         vtysh_path: Option<PathBuf>,
-        upstreams: Vec<IpAddr>,
-        families: Vec<AuthorityFamily>,
+        upstreams: Vec<AuthorityUpstream>,
         pf_peer: IpAddr,
     ) -> Self {
         Self {
             interval,
             vtysh_path,
             upstreams,
-            families,
             pf_peer,
             drift_warn_fraction: DEFAULT_DRIFT_WARN_FRACTION,
         }
+    }
+
+    /// The families the COMPARISON counts: the union of what the
+    /// upstreams carry.
+    ///
+    /// Derived rather than declared, because the mirror holds exactly
+    /// what the upstreams deliver — a separate global list would be a
+    /// second place to state the same fact, and the two would disagree
+    /// the first time an upstream was added.
+    ///
+    /// Order is v4 then v6 so the summed count and the log line are
+    /// stable across config edits.
+    pub fn counted_families(&self) -> Vec<AuthorityFamily> {
+        [AuthorityFamily::V4, AuthorityFamily::V6]
+            .into_iter()
+            .filter(|f| self.upstreams.iter().any(|u| u.families.contains(f)))
+            .collect()
     }
 }
 
@@ -176,7 +193,7 @@ impl FrrAuthorityChecker {
         info!(
             interval_secs = self.config.interval.as_secs(),
             upstreams = ?self.config.upstreams,
-            families = ?self.config.families,
+            families = ?self.config.counted_families(),
             pf_peer = %self.config.pf_peer,
             "FrrAuthorityChecker started"
         );
@@ -310,13 +327,13 @@ impl FrrAuthorityChecker {
     /// mirror", a conclusion a missing subprocess has not earned.
     async fn authority_count(&self) -> Result<usize, String> {
         let mut total = 0usize;
-        for family in &self.config.families {
+        for family in self.config.counted_families() {
             let out = self
                 .vtysh
                 .run(&[format!("show bgp {} unicast statistics json", family.afi())])
                 .await
                 .map_err(|e| format!("vtysh statistics {}: {e}", family.afi()))?;
-            total += parse_total_prefixes(&out, *family)? as usize;
+            total += parse_total_prefixes(&out, family)? as usize;
         }
         Ok(total)
     }
@@ -331,8 +348,9 @@ impl FrrAuthorityChecker {
     async fn eligibility(&mut self) -> Eligibility {
         let export = self.export_policy().await;
         let mut upstreams = Vec::with_capacity(self.config.upstreams.len());
-        for peer in self.config.upstreams.clone() {
-            upstreams.push((peer, self.upstream(peer).await));
+        for u in self.config.upstreams.clone() {
+            let state = self.upstream(&u).await;
+            upstreams.push((u.addr, state));
         }
         classify_eligibility(export, &upstreams, &mut self.seen_epochs)
     }
@@ -345,19 +363,31 @@ impl FrrAuthorityChecker {
     /// would let a flap land between them and produce a reading that is
     /// self-consistently wrong. The outputs are split on the boundary
     /// between the two JSON documents.
-    async fn upstream(&self, peer: IpAddr) -> Result<UpstreamState, String> {
+    async fn upstream(&self, up: &AuthorityUpstream) -> Result<UpstreamState, String> {
+        let peer = up.addr;
+        // The summary is asked under a family THIS session carries. The
+        // epoch it reports is a session property rather than a per-AF
+        // one, but a family the peer does not carry has no row to read
+        // it from — which is how a v6-only upstream lost its epoch when
+        // the afi was picked from a global list.
+        let afi = up
+            .families
+            .first()
+            .copied()
+            .unwrap_or(AuthorityFamily::V4)
+            .afi();
         let out = self
             .vtysh
             .run(&[
                 format!("show bgp neighbor {peer} json"),
-                format!("show bgp {} unicast summary json", self.primary_afi()),
+                format!("show bgp {afi} unicast summary json"),
             ])
             .await
             .map_err(|e| format!("vtysh neighbor {peer}: {e}"))?;
         let (neighbor, summary) = split_two_json(&out)
             .ok_or_else(|| format!("vtysh returned no second document for neighbor {peer}"))?;
 
-        let mut state = parse_upstream_state(neighbor, &peer.to_string(), &self.config.families)?;
+        let mut state = parse_upstream_state(neighbor, &peer.to_string(), &up.families)?;
         state.established_epoch = parse_established_epoch(summary, &peer.to_string());
         Ok(state)
     }
@@ -369,17 +399,5 @@ impl FrrAuthorityChecker {
             .await
             .map_err(|e| format!("vtysh running-config: {e}"))?;
         Ok(parse_export_policy(&out, &self.config.pf_peer.to_string()))
-    }
-
-    /// The family the `summary` command is asked under. The epoch it
-    /// reports is a SESSION property, not a per-AF one, so any declared
-    /// family answers it; v4 is preferred only because a v6-only
-    /// deployment is the rarer shape.
-    fn primary_afi(&self) -> &'static str {
-        if self.config.families.contains(&AuthorityFamily::V4) {
-            AuthorityFamily::V4.afi()
-        } else {
-            AuthorityFamily::V6.afi()
-        }
     }
 }

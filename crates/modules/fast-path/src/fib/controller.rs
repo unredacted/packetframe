@@ -88,11 +88,7 @@ fn spawn_authority(
             }
             tasks.push(runtime.spawn(async move { checker.run().await }));
         }
-        IntegrityAuthoritySpec::Frr {
-            vtysh,
-            upstreams,
-            families,
-        } => {
+        IntegrityAuthoritySpec::Frr { vtysh, upstreams } => {
             let Some(peer) = pf_peer else {
                 // Unreachable through config validation, and an
                 // `expect` here would be a panic in a loader path. A
@@ -107,13 +103,8 @@ fn spawn_authority(
                 );
                 return;
             };
-            let cfg = FrrAuthorityConfig::new(
-                DEFAULT_INTERVAL,
-                vtysh.clone(),
-                upstreams.clone(),
-                families.clone(),
-                peer,
-            );
+            let cfg =
+                FrrAuthorityConfig::new(DEFAULT_INTERVAL, vtysh.clone(), upstreams.clone(), peer);
             let mut checker =
                 FrrAuthorityChecker::new(cfg, snapshot.clone(), prog.clone(), shutdown.clone());
             if let Some(h) = completeness.clone() {
