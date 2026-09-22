@@ -1567,6 +1567,128 @@ fn a_steering_change_before_convergence_is_refused() {
     svc.stop();
 }
 
+/// An all-off reconfigure that performs no steering action still
+/// commits the staged drift scope.
+///
+/// `apply_steering` stages the reloaded exemptions unconditionally, and
+/// on this path only a successful `unsteer` commits them — but with no
+/// rules in the NIC there is no `Action::Unsteer` to run, and the
+/// request clears `steer_wanted` so no later `VerifyPassed` emits a
+/// `Steer` either. The scope would sit pending forever: `reconfigure`
+/// returns success while the drift scan keeps judging the PREVIOUS
+/// config, which is precisely the divergence the staleness machinery
+/// exists to prevent.
+///
+/// Older than the converging-state admission that exposed it — this
+/// reaches it from `Ready`.
+#[test]
+fn an_all_off_reconfigure_with_no_rules_still_commits_the_drift_scope() {
+    struct SpyDrift(std::sync::Arc<std::sync::Mutex<usize>>);
+    impl packetframe_vpp_offload::drift::DriftWatch for SpyDrift {
+        fn uncovered(&mut self) -> Result<packetframe_vpp_offload::drift::DriftFindings, String> {
+            Ok(packetframe_vpp_offload::drift::DriftFindings::default())
+        }
+        fn set_scope(
+            &mut self,
+            _exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+            _dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+        ) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
+    let fake = Fake::start("svc-unsteer-scope");
+    let sock = fake.path.clone();
+    let scopes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let spy = scopes.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    accept_macs: vec![],
+                    vlans: vec![],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SpySteering(std::sync::Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                )))),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            // Staging is a no-op without a scanner installed, so the
+            // fixture must have one or the test cannot fail.
+            runtime.drift_watch(Box::new(SpyDrift(spy)));
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = svc.status().expect("published");
+        if s.state == State::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "did not reach Ready: {:?}",
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let before = *scopes.lock().unwrap();
+
+    // Nothing steered, so this emits no steering action at all.
+    svc.apply_steering(
+        Vec::new(),
+        vec![packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(192, 0, 2, 0),
+            prefix_len: 24,
+        }],
+        None,
+        false,
+        true,
+    )
+    .expect("an all-off reconfigure is accepted");
+
+    assert!(
+        *scopes.lock().unwrap() > before,
+        "the reloaded exemptions must reach the scanner, or reconfigure reported \
+         success while the scan kept judging the old config"
+    );
+
+    svc.stop();
+}
+
 /// A SIGHUP that did not move the lever must not divert traffic.
 ///
 /// `steer on` in the config is not the same as the operator asking to

@@ -1035,6 +1035,23 @@ fn apply_steering(
         }
         Event::SteerRequested
     } else {
+        // With no rules in the NIC no `Action::Unsteer` will run, and
+        // `unsteer` is the only thing on this path that commits a
+        // staged scope. Nothing downstream would do it either: the
+        // request clears `steer_wanted`, so `VerifyPassed` emits no
+        // `Steer`. The scope would sit pending indefinitely and the
+        // drift scan would keep predicting from the PREVIOUS config
+        // while `reconfigure` reported success — the failure mode the
+        // staleness machinery exists to make impossible.
+        //
+        // Same remedy as the no-action first-canary path above, and
+        // deliberately not conditioned on the state: this hole is
+        // older than the converging-state admission that exposed it,
+        // and an all-off reconfigure from `Ready` with nothing steered
+        // reaches it the same way.
+        if !runtime.steering_rules_installed() {
+            runtime.commit_drift_scope();
+        }
         Event::UnsteerRequested
     };
 
