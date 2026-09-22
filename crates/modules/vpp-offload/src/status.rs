@@ -580,7 +580,25 @@ impl StatusSnapshot {
         // the protection. Counting that as "steered but broken" would
         // report the safeguard as the module's worst fault for as long
         // as bird takes to reload.
-        let fib_unverified = !self.fib.verified() && self.resync_deferred.is_none();
+        //
+        // `Unfit` asks the LIVE counts instead of the verdict, because
+        // that verdict is the one that outlives its condition. Verify
+        // does not re-run in steady state and the steering gate reads
+        // current counts, so a box whose first verify sampled an empty
+        // mirror goes on to steer correctly with that verdict still
+        // standing — and treating it as a blackhole paged for a
+        // dataplane forwarding 69k routes (rig, 2026-09-21). What would
+        // make it a real blackhole now is a hole in the table or no
+        // table at all, and both of those are readable right here.
+        // `withheld` deliberately does not count: withholding is the
+        // designed response to a table that outgrew the heap, it has
+        // never been "steered but broken", and `fib_health` already
+        // reports it as Degraded.
+        let fib_broken = match &self.fib {
+            FibSync::Unfit { .. } => self.counts.unresolvable > 0 || self.counts.installed == 0,
+            other => !other.verified(),
+        };
+        let fib_unverified = fib_broken && self.resync_deferred.is_none();
         // BLACKHOLE ports, not dead ones — "under paths that resolve
         // through it" was this comment's claim all along, and the code
         // read every dark member as one. On the shadow (2026-08-14) a
@@ -2754,6 +2772,108 @@ mod tests {
             .expect("the fib row");
         assert_eq!(fib.state, HealthState::Unhealthy);
         assert!(fib.message.expect("a message").contains("4s ago"));
+    }
+
+    /// The row is not the alert. **`overall` must come down too.**
+    ///
+    /// My own test for the stale verdict asserted `fib.state` and
+    /// stopped there, which is the defect this repo keeps producing:
+    /// the mechanism was right and the operator-visible behaviour was
+    /// untouched. `overall()` does not take the max of the subsystems —
+    /// `steered_but_broken()` reads `fib.verified()` directly — so
+    /// `packetframe_vpp_health{state="unhealthy"}` stayed 1 and the page
+    /// still fired while the `fib-synced` row said Degraded (review
+    /// finding, PR #231).
+    #[test]
+    fn a_recovered_unfit_verdict_does_not_page_at_the_top_level() {
+        let stale = FibSync::Unfit {
+            age: Duration::from_secs(1847),
+            summary: VerifyOutcome::default().summary(),
+        };
+        let s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(5_000, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            stale,
+            ports_up(),
+        );
+        assert!(s.steered, "the case only exists while steering");
+        assert_eq!(
+            s.report().overall,
+            HealthState::Degraded,
+            "the whole point: a verdict its own recovery outran must not page"
+        );
+    }
+
+    /// But the live counts still can, and they are what decides.
+    ///
+    /// The verdict is stale; a hole in the table is not. Steered with
+    /// `unresolvable > 0` is a real blackhole and pages — otherwise this
+    /// change would have swapped a false alarm for a missing one, which
+    /// is the worse trade.
+    #[test]
+    fn an_unfit_verdict_over_a_table_that_is_still_holed_pages() {
+        for led in [ledger_with(5_000, 0, 3), ledger_with(0, 0, 0)] {
+            let s = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::ZERO,
+                },
+                FibSync::Unfit {
+                    age: Duration::from_secs(30),
+                    summary: VerifyOutcome::default().summary(),
+                },
+                ports_up(),
+            );
+            assert_eq!(
+                s.report().overall,
+                HealthState::Unhealthy,
+                "unresolvable routes, or no routes at all, under steering IS a blackhole"
+            );
+        }
+    }
+
+    /// `withheld` is not a blackhole, here as everywhere else.
+    ///
+    /// Withholding is the designed response to a table that outgrew the
+    /// heap. A `Verified` verdict with withheld routes has never paged;
+    /// an `Unfit` one must not start.
+    #[test]
+    fn withheld_routes_under_an_unfit_verdict_do_not_page() {
+        let s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(5_000, 12, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            FibSync::Unfit {
+                age: Duration::from_secs(30),
+                summary: VerifyOutcome::default().summary(),
+            },
+            ports_up(),
+        );
+        assert_eq!(s.report().overall, HealthState::Degraded);
+    }
+
+    /// A mismatch still pages at the top level, not just in its row.
+    #[test]
+    fn a_mismatch_verdict_pages_at_the_top_level() {
+        let s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(5_000, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            FibSync::Failed {
+                age: Duration::from_secs(4),
+                summary: "verify FAIL: 63/64 probes matched".into(),
+            },
+            ports_up(),
+        );
+        assert_eq!(s.report().overall, HealthState::Unhealthy);
     }
 
     /// The inverse, and the worst state in the system: MCAM is diverting
