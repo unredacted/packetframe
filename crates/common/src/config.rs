@@ -739,21 +739,47 @@ pub enum IntegrityAuthoritySpec {
         /// `vtysh` path. `None` ⇒ `/usr/bin/vtysh`.
         vtysh: Option<PathBuf>,
         /// The upstream peers whose End-of-RIB must have arrived for
-        /// this session before the mirror can be called complete.
+        /// their current session before the mirror can be called
+        /// complete, each with the families that session carries.
         ///
         /// Declared, never inferred: only the operator knows which
         /// sessions carry the table as opposed to being a consumer of
         /// it. PF's own downstream session must NOT appear here — it is
         /// the thing being attested, and listing it would have the
         /// authority wait on its own answer.
-        upstreams: Vec<IpAddr>,
-        /// Address families that count toward the comparison. The
-        /// mirror holds whatever the feed carries, so these must match
-        /// it: a family FRR does not carry at all contributes nothing
-        /// and must not be declared, or every check reads as a failure
-        /// to observe it.
-        families: Vec<AuthorityFamily>,
+        upstreams: Vec<AuthorityUpstream>,
     },
+}
+
+/// One declared upstream and the families its session carries.
+///
+/// Families are **per upstream and mandatory**, which an earlier
+/// revision got wrong in two ways at once by making them a single
+/// global list that defaulted to `v4,v6`:
+///
+/// - On an IPv4-only box the default silently declared IPv6 as well.
+///   `parse_total_prefixes` refuses a missing `ipv6Unicast` array and a
+///   missing IPv6 End-of-RIB reads as not-ready, so a perfectly valid
+///   deployment could never attest anything and
+///   `require-table-complete` would defer forever — the exact failure
+///   this whole variant exists to prevent, introduced by its own
+///   default.
+/// - Where IPv4 and IPv6 arrive over SEPARATE sessions, one global list
+///   is a Cartesian product: the v4-only peer permanently lacks IPv6
+///   End-of-RIB and the v6-only peer permanently lacks IPv4. A common
+///   dual-stack arrangement was simply not expressible.
+///
+/// There is no safe default here, because the right answer is a fact
+/// about the operator's topology that nothing in the config can see. So
+/// it is required rather than guessed, the way `upstream` itself
+/// already is. The families the *comparison* counts are the union of
+/// these — derived, because the mirror holds exactly what the upstreams
+/// carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthorityUpstream {
+    pub addr: IpAddr,
+    /// Non-empty, enforced at parse.
+    pub families: Vec<AuthorityFamily>,
 }
 
 /// An address family the FRR authority counts.
@@ -3726,11 +3752,11 @@ fn parse_integrity_authority<'a>(
 /// The tail of `integrity-authority frr ...`.
 fn parse_integrity_authority_frr<'a>(
     line: usize,
-    mut rest: impl Iterator<Item = &'a str>,
+    rest: impl Iterator<Item = &'a str>,
 ) -> Result<IntegrityAuthoritySpec, ConfigError> {
     let mut vtysh = None;
-    let mut upstreams: Vec<IpAddr> = Vec::new();
-    let mut families: Option<Vec<AuthorityFamily>> = None;
+    let mut upstreams: Vec<AuthorityUpstream> = Vec::new();
+    let mut rest = rest.peekable();
 
     while let Some(tok) = rest.next() {
         match tok {
@@ -3744,19 +3770,38 @@ fn parse_integrity_authority_frr<'a>(
                         format!("integrity-authority frr: `{raw}` is not an IP address"),
                     )
                 })?;
-                if upstreams.contains(&addr) {
+                if upstreams.iter().any(|u| u.addr == addr) {
                     return Err(ConfigError::parse(
                         line,
                         format!("integrity-authority frr: upstream {addr} listed twice"),
                     ));
                 }
-                upstreams.push(addr);
+                upstreams.push(AuthorityUpstream {
+                    addr,
+                    families: Vec::new(),
+                });
             }
+            // Binds to the upstream it follows. Positional rather than
+            // free-floating because a global list cannot describe a
+            // deployment whose families arrive over separate sessions,
+            // and a list that sometimes means "this peer" and sometimes
+            // "all peers" is worse than either.
             "families" => {
-                if families.is_some() {
+                let Some(current) = upstreams.last_mut() else {
                     return Err(ConfigError::parse(
                         line,
-                        "integrity-authority frr: `families` given twice",
+                        "integrity-authority frr: `families` must follow the `upstream` it \
+                         describes — families are per-session, because IPv4 and IPv6 can \
+                         arrive over different ones",
+                    ));
+                };
+                if !current.families.is_empty() {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!(
+                            "integrity-authority frr: `families` given twice for upstream {}",
+                            current.addr
+                        ),
                     ));
                 }
                 let raw = rest.next().ok_or_else(|| {
@@ -3765,7 +3810,6 @@ fn parse_integrity_authority_frr<'a>(
                         "integrity-authority frr: `families` needs v4, v6, or v4,v6",
                     )
                 })?;
-                let mut fams = Vec::new();
                 for part in raw.split(',') {
                     let f = match part {
                         "v4" => AuthorityFamily::V4,
@@ -3780,21 +3824,20 @@ fn parse_integrity_authority_frr<'a>(
                             ))
                         }
                     };
-                    if fams.contains(&f) {
+                    if current.families.contains(&f) {
                         return Err(ConfigError::parse(
                             line,
                             format!("integrity-authority frr: family `{part}` listed twice"),
                         ));
                     }
-                    fams.push(f);
+                    current.families.push(f);
                 }
-                if fams.is_empty() {
+                if current.families.is_empty() {
                     return Err(ConfigError::parse(
                         line,
                         "integrity-authority frr: `families` must name at least one family",
                     ));
                 }
-                families = Some(fams);
             }
             "vtysh" => {
                 if vtysh.is_some() {
@@ -3832,19 +3875,31 @@ fn parse_integrity_authority_frr<'a>(
     if upstreams.is_empty() {
         return Err(ConfigError::parse(
             line,
-            "integrity-authority frr needs at least one `upstream <ip>`: the peers whose \
-             End-of-RIB proves FRR's own table is loaded. Without one, a prefix count \
-             cannot tell a converged table from one still filling from upstream — both \
+            "integrity-authority frr needs at least one `upstream <ip> families <list>`: the \
+             peers whose End-of-RIB proves FRR's own table is loaded. Without one, a prefix \
+             count cannot tell a converged table from one still filling from upstream — both \
              sides grow together and the counts agree the whole way. Do NOT list \
              packetframe's own session here; that is the thing being attested",
         ));
     }
+    // No default, deliberately. See `AuthorityUpstream`: a wrong guess
+    // here is a box that can never attest, discovered during a rollout
+    // window rather than at load.
+    if let Some(u) = upstreams.iter().find(|u| u.families.is_empty()) {
+        return Err(ConfigError::parse(
+            line,
+            format!(
+                "integrity-authority frr: upstream {} needs `families v4`, `families v6` or \
+                 `families v4,v6`. There is no default: declaring a family this session does \
+                 not carry makes the authority refuse forever (FRR reports no statistics for \
+                 it and its End-of-RIB never arrives), and omitting one it does carry would \
+                 attest a mirror nobody checked",
+                u.addr
+            ),
+        ));
+    }
 
-    Ok(IntegrityAuthoritySpec::Frr {
-        vtysh,
-        upstreams,
-        families: families.unwrap_or_else(|| vec![AuthorityFamily::V4, AuthorityFamily::V6]),
-    })
+    Ok(IntegrityAuthoritySpec::Frr { vtysh, upstreams })
 }
 
 /// Parse `route-source <kind> <args...>`. Two kinds supported:
@@ -4712,33 +4767,88 @@ module fast-path
     #[test]
     fn integrity_authority_frr_parses() {
         let dir = |cfg: &str| Config::parse(cfg).unwrap().modules[0].directives[0].clone();
-        let one = dir("module fast-path\n  integrity-authority frr upstream 192.0.2.1\n");
+        let one =
+            dir("module fast-path\n  integrity-authority frr upstream 192.0.2.1 families v4,v6\n");
         assert_eq!(
             one,
             ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr {
                 vtysh: None,
-                upstreams: vec!["192.0.2.1".parse().unwrap()],
-                families: vec![AuthorityFamily::V4, AuthorityFamily::V6],
-            }),
-            "both families by default — the mirror holds whatever the feed carries"
+                upstreams: vec![AuthorityUpstream {
+                    addr: "192.0.2.1".parse().unwrap(),
+                    families: vec![AuthorityFamily::V4, AuthorityFamily::V6],
+                }],
+            })
         );
 
         let full = dir(
-            "module fast-path\n  integrity-authority frr upstream 192.0.2.1 upstream \
-             2001:db8::1 families v4 vtysh /opt/frr/vtysh\n",
+            "module fast-path\n  integrity-authority frr upstream 192.0.2.1 families v4 \
+             upstream 2001:db8::1 families v6 vtysh /opt/frr/vtysh\n",
         );
         match full {
             ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr {
                 vtysh,
                 upstreams,
-                families,
             }) => {
                 assert!(vtysh.is_some());
-                assert_eq!(upstreams.len(), 2);
-                assert_eq!(families, vec![AuthorityFamily::V4]);
+                assert_eq!(
+                    upstreams,
+                    vec![
+                        AuthorityUpstream {
+                            addr: "192.0.2.1".parse().unwrap(),
+                            families: vec![AuthorityFamily::V4],
+                        },
+                        AuthorityUpstream {
+                            addr: "2001:db8::1".parse().unwrap(),
+                            families: vec![AuthorityFamily::V6],
+                        },
+                    ],
+                    "each `families` binds to the upstream it follows — the separate-session \
+                     dual-stack shape a single global list could not express"
+                );
             }
             other => panic!("expected Frr, got {other:?}"),
         }
+    }
+
+    /// There is no default family set, and the refusal explains why in
+    /// both directions.
+    ///
+    /// The earlier default of `v4,v6` was wrong on an IPv4-only box in
+    /// the worst way available: `parse_total_prefixes` refuses a missing
+    /// `ipv6Unicast` array and a missing IPv6 End-of-RIB reads as
+    /// not-ready, so the authority could never attest anything and
+    /// `require-table-complete` deferred forever — the failure the whole
+    /// variant exists to prevent, delivered by its own default.
+    #[test]
+    fn integrity_authority_frr_requires_families_per_upstream() {
+        let e = Config::parse("module fast-path\n  integrity-authority frr upstream 192.0.2.1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("192.0.2.1"), "name the upstream: {e}");
+        assert!(e.contains("There is no default"), "{e}");
+        assert!(
+            e.contains("refuse forever") && e.contains("nobody checked"),
+            "both directions of the mistake: {e}"
+        );
+
+        // Only the SECOND upstream is missing them — the check is
+        // per-upstream, not "at least one has some".
+        let e = Config::parse(
+            "module fast-path\n  integrity-authority frr upstream 192.0.2.1 families v4 \
+             upstream 192.0.2.2\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("192.0.2.2"), "{e}");
+
+        // And `families` before any `upstream` is a positional error
+        // rather than a silent global.
+        let e = Config::parse(
+            "module fast-path\n  integrity-authority frr families v4 upstream 192.0.2.1\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("must follow the `upstream`"), "{e}");
     }
 
     /// An upstream is mandatory, and the refusal has to say why rather
@@ -4780,7 +4890,7 @@ module fast-path
   attach eth2 generic
   allow-prefix 203.0.113.0/24
   forwarding-mode custom-fib
-  integrity-authority frr upstream 192.0.2.1
+  integrity-authority frr upstream 192.0.2.1 families v4,v6
 
 module vpp-offload
   loopback-address 198.51.100.1/32
