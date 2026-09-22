@@ -576,7 +576,11 @@ impl IdentityStore for FileStore {
         self.state.save(&self.state_dir)
     }
 
-    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+    fn steering_changed(
+        &mut self,
+        rules: &[(String, u32)],
+        plans: &[(String, u32, crate::steer::RuleSet)],
+    ) -> Result<(), String> {
         // Grouped by interface for the file's shape, and REPLACED rather
         // than merged: the argument is the complete ledger, so an
         // interface that no longer appears has no rules left. Merging
@@ -589,6 +593,13 @@ impl IdentityStore for FileStore {
         // because the port record looks wrong would leave the one thing
         // a later `detach --all` needs unrecorded.
         self.state.steer_rules = crate::resources::group_steer_rules(rules);
+        // Replaced for the same reason and written in the same call: the
+        // plan is how the rules above come back out, and a file holding
+        // one without the other is a teardown that cannot finish. An
+        // empty `plans` overwrites a previous one deliberately — it means
+        // no install in this process has succeeded, so nothing on record
+        // describes what is in the NIC now.
+        self.state.steer_plans = plans.to_vec();
         self.state.save(&self.state_dir)
     }
 }
@@ -656,7 +667,11 @@ impl IdentityStore for ResourceOwner {
         self.store.interfaces_attached(indices)
     }
 
-    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+    fn steering_changed(
+        &mut self,
+        rules: &[(String, u32)],
+        plans: &[(String, u32, crate::steer::RuleSet)],
+    ) -> Result<(), String> {
         if self.released {
             // Release only happens after a teardown reported clean,
             // which requires an `Unsteer` that confirmed the rules gone
@@ -670,7 +685,7 @@ impl IdentityStore for ResourceOwner {
                 "resources were already released; refusing to re-create the state file".into(),
             );
         }
-        self.store.steering_changed(rules)
+        self.store.steering_changed(rules, plans)
     }
 }
 
@@ -725,8 +740,12 @@ impl IdentityStore for SharedOwner {
     fn interfaces_attached(&mut self, indices: &[(String, u32)]) -> Result<(), String> {
         self.0.borrow_mut().interfaces_attached(indices)
     }
-    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
-        self.0.borrow_mut().steering_changed(rules)
+    fn steering_changed(
+        &mut self,
+        rules: &[(String, u32)],
+        plans: &[(String, u32, crate::steer::RuleSet)],
+    ) -> Result<(), String> {
+        self.0.borrow_mut().steering_changed(rules, plans)
     }
 }
 
@@ -1412,7 +1431,21 @@ mod tests {
             ("eth2".to_string(), 1025),
             ("eth3".to_string(), 1024),
         ];
-        owner.steering_changed(&rules).unwrap();
+        let plans = vec![(
+            "eth2".to_string(),
+            0u32,
+            crate::steer::RuleSet {
+                rules: vec![crate::steer::SteerRule {
+                    prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
+                    prefix_len: 24,
+                    side: crate::steer::Side::Dst,
+                    location: 1024,
+                    action: crate::steer::RuleAction::Keep,
+                }],
+                skipped_v6: 0,
+            },
+        )];
+        owner.steering_changed(&rules, &plans).unwrap();
 
         // The flattening `bring_up` performs, against what it was given.
         let on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
@@ -1421,6 +1454,14 @@ mod tests {
         assert!(
             !on_disk.steer_rules.is_empty(),
             "and it is non-empty, which is what makes `Adopted {{ steered: true }}` reachable"
+        );
+        // The plan rides the SAME write. A file holding locations
+        // without the spec they were installed under is a teardown that
+        // cannot remove the exemptions — cookie 0 identifies nothing, so
+        // the spec is the only thing that claims them.
+        assert_eq!(
+            on_disk.steer_plans, plans,
+            "and the plan comes back with it"
         );
     }
 
@@ -1440,14 +1481,22 @@ mod tests {
         let mut owner = ResourceOwner::new(state, f.paths.clone());
 
         owner
-            .steering_changed(&[("eth2".to_string(), 1024)])
+            .steering_changed(
+                &[("eth2".to_string(), 1024)],
+                &[("eth2".to_string(), 0, crate::steer::RuleSet::default())],
+            )
             .unwrap();
-        owner.steering_changed(&[]).unwrap();
+        owner.steering_changed(&[], &[]).unwrap();
 
         let on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
         assert!(
             on_disk.steer_rules.is_empty(),
             "an unsteer that confirmed removal must leave nothing for the next start to adopt"
+        );
+        assert!(
+            on_disk.steer_plans.is_empty(),
+            "and the plan goes with them — a plan outliving its ledger would describe \
+             rules the NIC no longer has"
         );
     }
 }

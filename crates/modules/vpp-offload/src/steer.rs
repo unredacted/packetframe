@@ -60,7 +60,7 @@ use packetframe_common::config::VppSteerDirection;
 use packetframe_common::fib::IpPrefix;
 
 /// One steering rule, before it becomes bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SteerRule {
     /// The allowlisted prefix.
     pub prefix: Ipv4Addr,
@@ -73,14 +73,14 @@ pub struct SteerRule {
     pub action: RuleAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Src,
     Dst,
 }
 
 /// What a matching packet's fate is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleAction {
     /// Redirect to VPP's VF — the steering rules proper.
     Divert,
@@ -124,7 +124,14 @@ pub const BUILTIN_EXEMPTS: [(Ipv4Addr, u8); 2] = [
 /// directions, how many slots, what gets skipped — is decided and
 /// tested without a NIC. Every mistake that silently misroutes traffic
 /// lives in here rather than in the syscall.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Serializable because the plan has to outlive the process that
+/// installed it. A `Keep` rule carries `ring_cookie` 0, so nothing in
+/// the cookie distinguishes it from a stranger's kernel-delivery rule —
+/// the only thing that can is the spec it was installed under, compared
+/// field by field. A teardown running in a *different* process (the
+/// CLI's `detach --all`) has no such spec in memory, so it must read it
+/// off the state file; see [`crate::resources::ResourceState::steer_plans`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RuleSet {
     pub rules: Vec<SteerRule>,
     /// v6 prefixes skipped because the NIC cannot match them. Reported
