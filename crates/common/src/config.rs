@@ -748,8 +748,37 @@ pub enum IntegrityAuthoritySpec {
         /// the thing being attested, and listing it would have the
         /// authority wait on its own answer.
         upstreams: Vec<AuthorityUpstream>,
+        /// Seconds between checks. `None` ⇒ the checker's default (300).
+        ///
+        /// Configurable because the interval is not only a test-loop
+        /// annoyance: it IS the recovery time after every session flap.
+        /// A revocation is sticky and clears only on the next clean
+        /// check, so at 300 s a single flap costs 5–10 minutes of
+        /// ineligibility — measured on the lab rig, 2026-09-22 — and on
+        /// this platform every FRR config upload flaps every session.
+        ///
+        /// Bounded by [`FRR_INTERVAL_SECS`]. Restart-only like the rest of
+        /// the spec: `restart_only_delta` compares the whole value.
+        interval_secs: Option<u64>,
     },
 }
+
+/// Allowed range for `integrity-authority frr interval`.
+///
+/// The floor is what one check costs. Every tick runs a `vtysh` per
+/// counted family plus the running-config and one per upstream, each
+/// with a 10 s timeout, and `show bgp <afi> unicast statistics` walks
+/// the whole table — cheap at the lab rig's 69k routes, unmeasured at a
+/// full one. Below ten seconds a slow tick simply runs back to back.
+///
+/// The ceiling comes from the report-age limit the steering gate
+/// applies: a report older than `STEER_MAX_REPORT_AGE` (900 s) is
+/// `Stale` and refuses. An interval near that would let every report
+/// age out before its successor lands, so the gate would refuse between
+/// ticks on a healthy box; two thirds of it leaves room for one slow
+/// or failed check.
+pub const FRR_INTERVAL_SECS: std::ops::RangeInclusive<u64> =
+    10..=(crate::fib::STEER_MAX_REPORT_AGE.as_secs() * 2 / 3);
 
 /// One declared upstream and the families its session carries.
 ///
@@ -3854,6 +3883,7 @@ fn parse_integrity_authority_frr<'a>(
     rest: impl Iterator<Item = &'a str>,
 ) -> Result<IntegrityAuthoritySpec, ConfigError> {
     let mut vtysh = None;
+    let mut interval_secs: Option<u64> = None;
     let mut upstreams: Vec<AuthorityUpstream> = Vec::new();
     let mut rest = rest.peekable();
 
@@ -3938,6 +3968,45 @@ fn parse_integrity_authority_frr<'a>(
                     ));
                 }
             }
+            "interval" => {
+                if interval_secs.is_some() {
+                    return Err(ConfigError::parse(
+                        line,
+                        "integrity-authority frr: `interval` given twice",
+                    ));
+                }
+                let raw = rest.next().ok_or_else(|| {
+                    ConfigError::parse(
+                        line,
+                        "integrity-authority frr: `interval` needs a number of seconds",
+                    )
+                })?;
+                let secs: u64 = raw.parse().map_err(|_| {
+                    ConfigError::parse(
+                        line,
+                        format!(
+                            "integrity-authority frr: interval `{raw}` is not a whole number \
+                             of seconds"
+                        ),
+                    )
+                })?;
+                if !FRR_INTERVAL_SECS.contains(&secs) {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!(
+                            "integrity-authority frr: interval {secs}s is outside {}..={}s. \
+                             Below the floor a check cannot finish before the next is due; \
+                             above the ceiling a report ages past the steering gate's {}s \
+                             staleness limit before its successor lands, and the gate would \
+                             refuse between checks on a healthy box",
+                            FRR_INTERVAL_SECS.start(),
+                            FRR_INTERVAL_SECS.end(),
+                            crate::fib::STEER_MAX_REPORT_AGE.as_secs()
+                        ),
+                    ));
+                }
+                interval_secs = Some(secs);
+            }
             "vtysh" => {
                 if vtysh.is_some() {
                     return Err(ConfigError::parse(
@@ -3959,7 +4028,7 @@ fn parse_integrity_authority_frr<'a>(
                     line,
                     format!(
                         "integrity-authority frr: unexpected `{other}` (expected `upstream`, \
-                         `families`, or `vtysh`)"
+                         `families`, `interval`, or `vtysh`)"
                     ),
                 ))
             }
@@ -3998,7 +4067,11 @@ fn parse_integrity_authority_frr<'a>(
         ));
     }
 
-    Ok(IntegrityAuthoritySpec::Frr { vtysh, upstreams })
+    Ok(IntegrityAuthoritySpec::Frr {
+        vtysh,
+        upstreams,
+        interval_secs,
+    })
 }
 
 /// Parse `route-source <kind> <args...>`. Two kinds supported:
@@ -4876,19 +4949,22 @@ module fast-path
                     addr: "192.0.2.1".parse().unwrap(),
                     families: vec![AuthorityFamily::V4, AuthorityFamily::V6],
                 }],
+                interval_secs: None,
             })
         );
 
         let full = dir(
             "module fast-path\n  integrity-authority frr upstream 192.0.2.1 families v4 \
-             upstream 2001:db8::1 families v6 vtysh /opt/frr/vtysh\n",
+             upstream 2001:db8::1 families v6 vtysh /opt/frr/vtysh interval 15\n",
         );
         match full {
             ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr {
                 vtysh,
                 upstreams,
+                interval_secs,
             }) => {
                 assert!(vtysh.is_some());
+                assert_eq!(interval_secs, Some(15));
                 assert_eq!(
                     upstreams,
                     vec![
@@ -4907,6 +4983,59 @@ module fast-path
             }
             other => panic!("expected Frr, got {other:?}"),
         }
+    }
+
+    /// `interval` is bounded, and both bounds say why.
+    ///
+    /// The ceiling is the one that matters: a report older than the
+    /// steering gate's staleness limit refuses, so an interval near it
+    /// would make a healthy box refuse between every pair of checks.
+    #[test]
+    fn integrity_authority_frr_interval_is_bounded() {
+        let with = |i: &str| {
+            Config::parse(&format!(
+                "module fast-path\n  integrity-authority frr upstream 192.0.2.1 families v4 \
+                 interval {i}\n"
+            ))
+        };
+        let lo = *FRR_INTERVAL_SECS.start();
+        let hi = *FRR_INTERVAL_SECS.end();
+        assert!(with(&lo.to_string()).is_ok());
+        assert!(with(&hi.to_string()).is_ok());
+        let e = with(&(hi + 1).to_string()).unwrap_err().to_string();
+        assert!(
+            e.contains("staleness limit"),
+            "say why the ceiling exists: {e}"
+        );
+        assert!(with(&(lo - 1).to_string()).is_err());
+        assert!(with("0").is_err());
+        assert!(
+            with("15s").is_err(),
+            "whole seconds only — a unit suffix is a typo"
+        );
+        assert!(with("15 interval 20").is_err(), "given twice");
+        assert!(
+            hi < crate::fib::STEER_MAX_REPORT_AGE.as_secs(),
+            "the ceiling must stay below the report-age limit it is derived from"
+        );
+    }
+
+    /// Changing it is a restart, like every other part of the spec — a
+    /// reload that accepted the edit and kept the running checker's old
+    /// cadence would be the silent no-op this repo keeps refusing.
+    #[test]
+    fn integrity_authority_frr_interval_is_restart_only() {
+        let spec = |i: Option<u64>| IntegrityAuthoritySpec::Frr {
+            vtysh: None,
+            upstreams: vec![AuthorityUpstream {
+                addr: "192.0.2.1".parse().unwrap(),
+                families: vec![AuthorityFamily::V4],
+            }],
+            interval_secs: i,
+        };
+        spec(Some(15)).restart_only_delta(&spec(Some(15))).unwrap();
+        let e = spec(None).restart_only_delta(&spec(Some(15))).unwrap_err();
+        assert!(e.contains("Restart the daemon"), "{e}");
     }
 
     /// There is no default family set, and the refusal explains why in
