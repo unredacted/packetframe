@@ -49,9 +49,9 @@ use packetframe_common::fib::TableCompleteness;
 use packetframe_common::frr::{RealVtysh, Vtysh};
 
 use crate::fib::frr::{
-    classify_eligibility, observation, parse_established_epoch, parse_export_policy,
-    parse_total_prefixes, parse_upstream_state, split_two_json, Eligibility, ExportPolicy,
-    UpstreamState,
+    classify_eligibility, mirror_family_mismatch, observation, parse_established_epoch,
+    parse_export_policy, parse_total_prefixes, parse_upstream_state, split_two_json, Eligibility,
+    ExportPolicy, UpstreamState,
 };
 use crate::fib::integrity::{Comparison, Drift, SharedSnapshot, DEFAULT_DRIFT_WARN_FRACTION};
 use crate::fib::programmer::FibProgrammerHandle;
@@ -146,6 +146,16 @@ pub struct FrrAuthorityChecker {
     /// re-establishes every session — which is the one event that can
     /// introduce an export filter under a running daemon.
     seen_epochs: HashMap<IpAddr, u64>,
+    /// The revocation reason currently announced in the log, so the
+    /// transitions are logged and the steady state is not.
+    ///
+    /// A disqualification is an operator-visible state change and until
+    /// now it reached `packetframe status` and nothing else — which is
+    /// fine on a rig somebody is watching and useless on the primary at
+    /// 03:00, where the journal is the record. Logging it every tick
+    /// instead would be 288 identical warnings a day, which is the same
+    /// as not logging it.
+    announced_revocation: Option<String>,
 }
 
 impl FrrAuthorityChecker {
@@ -178,6 +188,7 @@ impl FrrAuthorityChecker {
             completeness: None,
             shutdown,
             seen_epochs: HashMap::new(),
+            announced_revocation: None,
         }
     }
 
@@ -228,10 +239,44 @@ impl FrrAuthorityChecker {
         // outside the pair — same placement as the birdc checker's peer
         // count, and for the same reason: a subprocess call that neither
         // number depends on must not sit between them.
-        let eligibility = self.eligibility().await;
+        let mut eligibility = self.eligibility().await;
+        // The mirror's own composition is evidence too, and it needs no
+        // subprocess — so it is checked here rather than inside
+        // `eligibility`, which is the vtysh half. It outranks
+        // `Unknown` for the usual reason (a fact beats a failed read)
+        // and defers to an existing `Revoked`, because the first reason
+        // found is as true as the second and churning the message
+        // between ticks helps nobody.
+        //
+        // ROUTE-SOURCE families, not `mirror`: the mirror carries the
+        // resolver's synthetic `local-prefix` routes too, and one /128
+        // would read as a v6 feed on a v4-only box. A failed query is
+        // simply no evidence — it cannot produce a revocation.
+        if let Ok((v4, v6)) = self.prog.session_families().await {
+            if let Some(r) = mirror_family_mismatch(v4, v6, &self.config.counted_families()) {
+                if !matches!(eligibility, Eligibility::Revoked(_)) {
+                    eligibility = Eligibility::Revoked(r);
+                }
+            }
+        }
 
         let fresh_authority = authority.as_ref().ok().copied();
         let fresh_mirror = mirror.as_ref().ok().map(|(v4, v6)| v4 + v6);
+
+        // Exactly one observation per tick, and the precedence is the
+        // point of the ordering.
+        //
+        // A disqualification is POSITIVE evidence and outranks a partial
+        // read: if one upstream could not be read and another answered
+        // "not Established", the second is a fact and must withdraw
+        // permission. A count that could not be sampled, by contrast,
+        // can never produce `Clean` — so a tick that read eligibility
+        // fine and lost the counts is `Unreadable`, which retains the
+        // previous report under the age policy and retains any standing
+        // revocation. Neither of those is the same as renewing.
+        if let Some(handle) = self.completeness.as_ref() {
+            handle.record(observation(&eligibility, fresh_authority, fresh_mirror, at));
+        }
 
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
@@ -240,17 +285,74 @@ impl FrrAuthorityChecker {
         // The disqualification, on the snapshot as its own fact.
         //
         // It is NOT an error — nothing failed to be read, and the remedy
-        // is in the operator's BGP configuration. But without it a tick
+        // is in the operator's BGP configuration. Without it a tick
         // whose counts agreed recorded a clean comparison and no error,
         // so `fib-integrity` reported a converged authority while
         // `TableCompleteness` held `Ineligible` and the second tier
         // refused every steer, with the concrete reason nowhere on the
-        // box (review finding, PR #232). Cleared on every run that is
-        // not revoked, so it always describes THIS tick.
-        snap.revoked = match &eligibility {
-            Eligibility::Revoked(r) => Some(r.describe().to_string()),
-            Eligibility::Ok | Eligibility::Unknown(_) => None,
+        // box (review finding, PR #232).
+        //
+        // **The STANDING revocation, not this tick's observation**, and
+        // that is the whole reason the handle is consulted rather than
+        // `eligibility` read directly. Revocation is sticky: a tick that
+        // could not read `vtysh` publishes `Unreadable`, which leaves it
+        // in force. Reporting this tick instead would drop the
+        // DISQUALIFIED clause the moment vtysh failed — while steering
+        // stayed refused — and the row would go back to advertising the
+        // rollout, which is the contradiction fixed one commit ago
+        // arriving through a second door.
+        //
+        // With no handle there is no second tier and so no standing
+        // state to consult; this tick's own observation is then the only
+        // thing there is to report, and nothing is enforcing stickiness
+        // for it to contradict.
+        snap.revoked = match self.completeness.as_ref() {
+            Some(handle) => match handle.latest_verdict().1 {
+                packetframe_common::fib::Completeness::Ineligible(r) => Some(r),
+                _ => None,
+            },
+            // A failed read changes nothing — the rule
+            // `TableCompleteness::record(Unreadable)` applies, stated
+            // for the one path that has no handle to apply it. Mapping
+            // `Unknown` to `None` here logged a false "eligible again"
+            // on every unreadable tick and a fresh DISQUALIFIED warning
+            // on the next readable one (review finding, PR #234).
+            None => match &eligibility {
+                Eligibility::Revoked(r) => Some(r.clone()),
+                Eligibility::Ok => None,
+                Eligibility::Unknown(_) => snap.revoked.clone(),
+            },
         };
+        // Transitions only. Entering a revocation, or the reason
+        // changing under it, is what an operator needs in the journal;
+        // the steady state is what `packetframe status` is for.
+        let now_reason = snap.revoked.as_ref().map(|r| r.describe().to_string());
+        match (&now_reason, &self.announced_revocation) {
+            (Some(now), prev) if prev.as_deref() != Some(now.as_str()) => {
+                // SUBJUNCTIVE, for the reason the status row is: this
+                // checker cannot see whether anything consults it. With
+                // no vpp-offload there is no gate at all, and with
+                // `require-table-complete off` the runtime deliberately
+                // discards this one — so "steering refused" would send
+                // an operator hunting a refusal that never happened
+                // (review finding, PR #234).
+                warn!(
+                    reason = %now,
+                    "completeness authority: mirror DISQUALIFIED — a steering gate that \
+                     consults this authority would refuse until a check comes back clean AND \
+                     the counts agree"
+                );
+                self.announced_revocation = Some(now.clone());
+            }
+            (None, Some(prev)) => {
+                info!(
+                    cleared = %prev,
+                    "completeness authority: mirror eligible again"
+                );
+                self.announced_revocation = None;
+            }
+            _ => {}
+        }
         if let Err(e) = &authority {
             snap.last_error = Some(e.clone());
             warn!(error = %e, "FRR authority: prefix count failed");
@@ -307,24 +409,7 @@ impl FrrAuthorityChecker {
                 drift,
             });
         }
-
-        let Some(handle) = self.completeness.as_ref() else {
-            return;
-        };
-        // Exactly one observation per tick, and the precedence is the
-        // point of the ordering.
-        //
-        // A disqualification is POSITIVE evidence and outranks a partial
-        // read: if one upstream could not be read and another answered
-        // "not Established", the second is a fact and must withdraw
-        // permission. A count that could not be sampled, by contrast,
-        // can never produce `Clean` — so a tick that read eligibility
-        // fine and lost the counts is `Unreadable`, which retains the
-        // previous report under the age policy and retains any standing
-        // revocation. Neither of those is the same as renewing.
-        handle.record(observation(&eligibility, fresh_authority, fresh_mirror, at));
     }
-
     /// Sum the declared families' prefix counts.
     ///
     /// One `vtysh` per family, run concurrently. Batching them into a
@@ -421,5 +506,118 @@ impl FrrAuthorityChecker {
             .await
             .map_err(|e| format!("vtysh running-config: {e}"))?;
         Ok(parse_export_policy(&out, &self.config.pf_peer.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::fib::integrity::shared_snapshot;
+    use crate::fib::programmer::recording_handle;
+
+    /// A `vtysh` that answers one tick "the upstream is down" and every
+    /// tick after with a failure — the drill-2 shape from the rig: a
+    /// revocation, then a tick where nothing can be read.
+    struct DownThenGone {
+        gone: AtomicBool,
+    }
+
+    impl Vtysh for DownThenGone {
+        fn run<'a>(
+            &'a self,
+            commands: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.gone.load(Ordering::SeqCst) {
+                    return Err("spawn /usr/bin/vtysh: No such file or directory".into());
+                }
+                let first = commands.first().map(String::as_str).unwrap_or("");
+                Ok(if first.starts_with("show bgp neighbor") {
+                    // neighbor document, then the summary document, as one
+                    // invocation's concatenated output.
+                    r#"{"192.0.2.1":{"bgpState":"Active"}}{"peers":{}}"#.to_string()
+                } else if first == "show running-config" {
+                    String::new()
+                } else {
+                    r#"{"ipv4Unicast":[{"totalPrefixes":10}]}"#.to_string()
+                })
+            })
+        }
+    }
+
+    fn config() -> FrrAuthorityConfig {
+        FrrAuthorityConfig::new(
+            Duration::from_secs(300),
+            None,
+            vec![AuthorityUpstream {
+                addr: "192.0.2.1".parse().expect("ip"),
+                families: vec![AuthorityFamily::V4],
+            }],
+            "198.51.100.2".parse().expect("ip"),
+        )
+    }
+
+    /// An unreadable tick must not announce a recovery that did not
+    /// happen — on the path with NO completeness handle, which is the
+    /// one that has no `TableCompleteness` to apply stickiness for it.
+    ///
+    /// Before the fix, `Unknown` mapped `snap.revoked` to `None`, so the
+    /// tick after a revocation logged "mirror eligible again" merely
+    /// because `vtysh` could not be run, and the next readable tick
+    /// logged a fresh DISQUALIFIED warning for the same condition
+    /// (review finding, PR #234). Asserted on the snapshot and the
+    /// announcement state together, because those are what `status`
+    /// and the journal are built from.
+    #[tokio::test]
+    async fn an_unreadable_tick_keeps_the_revocation_without_a_handle() {
+        let (prog, _log) = recording_handle();
+        let vtysh = Arc::new(DownThenGone {
+            gone: AtomicBool::new(false),
+        });
+        let snapshot = shared_snapshot();
+        let mut checker = FrrAuthorityChecker::with_vtysh(
+            config(),
+            vtysh.clone(),
+            snapshot.clone(),
+            prog,
+            CancellationToken::new(),
+        );
+        assert!(
+            checker.completeness.is_none(),
+            "the fixture must be the no-handle path, or this proves nothing about it"
+        );
+
+        checker.run_check().await;
+        let first = snapshot.read().await.revoked.clone();
+        assert!(
+            matches!(
+                first,
+                Some(packetframe_common::fib::Revocation::UpstreamNotReady(_))
+            ),
+            "tick 1 revokes on the down upstream: {first:?}"
+        );
+        let announced = checker.announced_revocation.clone();
+        assert!(announced.is_some(), "and announces it once");
+
+        vtysh.gone.store(true, Ordering::SeqCst);
+        checker.run_check().await;
+        assert_eq!(
+            snapshot.read().await.revoked,
+            first,
+            "a tick that could read nothing must not lift the revocation"
+        );
+        assert_eq!(
+            checker.announced_revocation, announced,
+            "nor announce a recovery — the journal would say 'eligible again' while \
+             nothing had changed"
+        );
+        assert!(
+            snapshot.read().await.last_error.is_some(),
+            "the failed read is still reported, as an error rather than a verdict"
+        );
     }
 }
