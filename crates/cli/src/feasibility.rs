@@ -5,7 +5,7 @@
 //! to a real pass/fail check.
 
 use crate::scrub::scrub_for_terminal;
-use std::path::Path;
+use std::path::PathBuf;
 
 use packetframe_common::{
     config::{Config, ModuleDirective, VppSteerDirection},
@@ -412,45 +412,88 @@ pub fn vpp_loopback_from_config(config: &Config) -> Option<std::net::Ipv4Addr> {
 
 /// The vpp-offload facts the probes need, grouped so the parameter
 /// list stops growing by one per directive (clippy agrees at eight).
-pub struct VppProbeInputs<'a> {
-    pub ports: &'a [String],
-    pub steer_ports: &'a [String],
+#[derive(Debug, Default, Clone)]
+pub struct VppProbeInputs {
+    pub ports: Vec<String>,
+    pub steer_ports: Vec<String>,
     pub workers: u32,
-    pub binary: Option<&'a str>,
+    pub binary: Option<String>,
     pub loopback: Option<std::net::Ipv4Addr>,
-    pub steer_directions: &'a [VppSteerDirection],
-    pub steer_exempts: &'a [packetframe_common::config::Ipv4Prefix],
+    pub steer_directions: Vec<VppSteerDirection>,
+    pub steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
 }
 
-/// The fast-path inputs, grouped the way `VppProbeInputs` already
-/// groups vpp-offload's. Three loose parameters that all describe one
-/// module, and the third pushed the parameter list past what clippy
-/// tolerates — which was a fair warning rather than a lint to silence:
-/// `attach_ifaces` and `guard_ifaces` are both `&[String]`, so a
-/// positional swap between them compiles and probes the wrong
-/// interfaces.
-pub struct FastPathProbeInputs<'a> {
-    pub attach_ifaces: &'a [String],
-    pub allowlist: &'a [IpPrefix],
+/// Everything `probe_and_render` needs from the config, in one named
+/// place. This was a 12-element tuple built in `main`, destructured
+/// positionally: four of the fields are `Vec<String>` and two more are
+/// prefix vectors, so swapping a pair compiled cleanly and silently
+/// probed the wrong thing. Field names make that swap a type error or
+/// an obvious misread.
+pub struct FeasibilityInputs {
+    pub bpffs_root: PathBuf,
+    pub attach_ifaces: Vec<String>,
+    pub allowlist: Vec<IpPrefix>,
+    pub guard_ifaces: Vec<String>,
+    pub vpp: VppProbeInputs,
+    pub snoop: NeighSnoopProbeInputs,
     /// `(vtysh path, declared upstreams)` when the config names the FRR
     /// completeness authority. `None` for `birdc` or `none`, which have
     /// no preconditions worth a subprocess.
-    pub frr_authority: Option<&'a (Option<std::path::PathBuf>, Vec<std::net::IpAddr>)>,
+    pub frr_authority: Option<(Option<PathBuf>, Vec<std::net::IpAddr>)>,
 }
 
-pub fn probe_and_render(
-    bpffs_root: &Path,
-    fast_path: &FastPathProbeInputs<'_>,
-    vpp: &VppProbeInputs<'_>,
-    guard_ifaces: &[String],
-    snoop: &NeighSnoopProbeInputs,
-    human: bool,
-) -> Rendered {
-    let FastPathProbeInputs {
+impl Default for FeasibilityInputs {
+    /// The no-`--config` pass: the default bpffs root, and no module
+    /// configured, so every module's probes stay out of the report.
+    /// `bpffs_root` is why this is hand-written — an empty `PathBuf`
+    /// would probe the wrong mount.
+    fn default() -> Self {
+        Self {
+            bpffs_root: PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
+            attach_ifaces: Vec::new(),
+            allowlist: Vec::new(),
+            guard_ifaces: Vec::new(),
+            vpp: VppProbeInputs::default(),
+            snoop: NeighSnoopProbeInputs::default(),
+            frr_authority: None,
+        }
+    }
+}
+
+impl FeasibilityInputs {
+    /// Collect the per-module extractors against one parsed config.
+    /// Callers validate the config first; this only reads it.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            bpffs_root: config.global.bpffs_root.clone(),
+            attach_ifaces: attach_ifaces_from_config(config),
+            allowlist: allowlist_from_config(config),
+            guard_ifaces: guard_ifaces_from_config(config),
+            vpp: VppProbeInputs {
+                ports: vpp_ports_from_config(config),
+                steer_ports: vpp_steer_ports_from_config(config),
+                workers: vpp_workers_from_config(config),
+                binary: vpp_binary_from_config(config),
+                loopback: vpp_loopback_from_config(config),
+                steer_directions: vpp_steer_directions_from_config(config),
+                steer_exempts: vpp_steer_exempts_from_config(config),
+            },
+            snoop: neigh_snoop_probe_inputs_from_config(config),
+            frr_authority: frr_authority_from_config(config),
+        }
+    }
+}
+
+pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
+    let FeasibilityInputs {
+        bpffs_root,
         attach_ifaces,
         allowlist,
+        guard_ifaces,
+        vpp,
+        snoop,
         frr_authority,
-    } = *fast_path;
+    } = inputs;
     let mut report = run_probes(bpffs_root);
 
     // Graduate §2.3 per-interface trial-attach probe from Deferred
@@ -484,14 +527,14 @@ pub fn probe_and_render(
         let mut names = Vec::new();
         if !vpp.ports.is_empty() {
             for cap in packetframe_vpp_offload::run_feasibility_probes(
-                vpp.ports,
-                vpp.steer_ports,
+                &vpp.ports,
+                &vpp.steer_ports,
                 vpp.workers,
-                vpp.binary,
+                vpp.binary.as_deref(),
                 vpp.loopback,
                 allowlist,
-                vpp.steer_directions,
-                vpp.steer_exempts,
+                &vpp.steer_directions,
+                &vpp.steer_exempts,
             ) {
                 names.push(cap.name.clone());
                 report.capabilities.push(cap);
@@ -949,6 +992,118 @@ mod summary_tests {
             vpp_binary_from_config(&config).as_deref(),
             Some("/opt/vpp-last")
         );
+    }
+
+    /// A config whose same-typed fields all hold different values, so
+    /// a cross-wired assignment in `from_config` cannot pass by
+    /// coincidence. Four `Vec<String>` fields and two prefix vectors
+    /// is exactly the shape that made the old positional tuple
+    /// dangerous: a swap there compiled and probed the wrong thing.
+    const CROSS_WIRING_CONFIG: &str = "\
+global
+  bpffs-root /sys/fs/bpf/pf-test
+  state-dir /var/lib/pf-test
+module fast-path
+  attach fp0 native
+  attach fp1 native
+  allow-prefix 198.51.100.0/24
+  allow-prefix6 2001:db8:1::/48
+module guard
+  interface gd0
+module vpp-offload
+  port vp0 cores 2 steer on
+  port vp1 cores 2 steer off
+  vpp-binary /opt/vpp-test
+  loopback-address 203.0.113.9/32
+  steer-direction dst
+  steer-exempt 192.0.2.0/24
+module neigh-snoop
+  bridge ns0
+  persist-dir /var/lib/pf-test/snoop
+  frr-gate v4 pf-v4 v6 pf-v6
+";
+
+    /// Every field of `FeasibilityInputs` carries what its own
+    /// extractor returns. Asserted against the extractors rather than
+    /// against literals so this cannot drift when a directive's
+    /// resolution rules change — the only thing pinned here is the
+    /// wiring.
+    #[test]
+    fn from_config_wires_each_field_to_its_own_extractor() {
+        let config = Config::parse(CROSS_WIRING_CONFIG).expect("parse");
+        let inputs = FeasibilityInputs::from_config(&config);
+
+        assert_eq!(inputs.bpffs_root, config.global.bpffs_root);
+        assert_eq!(inputs.attach_ifaces, attach_ifaces_from_config(&config));
+        assert_eq!(inputs.allowlist, allowlist_from_config(&config));
+        assert_eq!(inputs.guard_ifaces, guard_ifaces_from_config(&config));
+        assert_eq!(inputs.vpp.ports, vpp_ports_from_config(&config));
+        assert_eq!(inputs.vpp.steer_ports, vpp_steer_ports_from_config(&config));
+        assert_eq!(inputs.vpp.workers, vpp_workers_from_config(&config));
+        assert_eq!(inputs.vpp.binary, vpp_binary_from_config(&config));
+        assert_eq!(inputs.vpp.loopback, vpp_loopback_from_config(&config));
+        assert_eq!(
+            inputs.vpp.steer_directions,
+            vpp_steer_directions_from_config(&config)
+        );
+        assert_eq!(
+            inputs.vpp.steer_exempts,
+            vpp_steer_exempts_from_config(&config)
+        );
+        let snoop = neigh_snoop_probe_inputs_from_config(&config);
+        assert_eq!(inputs.snoop.bridges, snoop.bridges);
+        assert_eq!(inputs.snoop.persist_dir, snoop.persist_dir);
+        assert_eq!(inputs.snoop.gate_lists, snoop.gate_lists);
+    }
+
+    /// The assertions above only discriminate a swap if the fields
+    /// they compare actually differ. Guard that premise: if a future
+    /// edit makes two of these identical, the wiring test silently
+    /// stops testing anything and this one says so.
+    #[test]
+    fn cross_wiring_config_gives_every_same_typed_field_a_distinct_value() {
+        let config = Config::parse(CROSS_WIRING_CONFIG).expect("parse");
+        let inputs = FeasibilityInputs::from_config(&config);
+
+        let string_vecs = [
+            ("attach_ifaces", &inputs.attach_ifaces),
+            ("guard_ifaces", &inputs.guard_ifaces),
+            ("vpp.ports", &inputs.vpp.ports),
+            ("vpp.steer_ports", &inputs.vpp.steer_ports),
+            ("snoop.bridges", &inputs.snoop.bridges),
+        ];
+        for (i, (na, a)) in string_vecs.iter().enumerate() {
+            assert!(!a.is_empty(), "{na} is empty, so it discriminates nothing");
+            for (nb, b) in &string_vecs[i + 1..] {
+                assert_ne!(a, b, "{na} and {nb} are indistinguishable");
+            }
+        }
+        assert!(!inputs.allowlist.is_empty());
+        assert!(!inputs.vpp.steer_exempts.is_empty());
+    }
+
+    /// The `None` arm: no config means the default bpffs root — not
+    /// an empty path — and no module configured, so every module's
+    /// probes stay out of the report.
+    #[test]
+    fn default_inputs_probe_the_default_bpffs_root_and_no_module() {
+        let inputs = FeasibilityInputs::default();
+        assert_eq!(
+            inputs.bpffs_root,
+            PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT)
+        );
+        assert!(inputs.attach_ifaces.is_empty());
+        assert!(inputs.allowlist.is_empty());
+        assert!(inputs.guard_ifaces.is_empty());
+        assert!(inputs.vpp.ports.is_empty());
+        assert!(inputs.vpp.steer_ports.is_empty());
+        assert_eq!(inputs.vpp.workers, 0);
+        assert!(inputs.vpp.binary.is_none());
+        assert!(inputs.vpp.loopback.is_none());
+        assert!(inputs.vpp.steer_directions.is_empty());
+        assert!(inputs.vpp.steer_exempts.is_empty());
+        assert!(inputs.snoop.bridges.is_empty());
+        assert!(inputs.snoop.gate_lists.is_none());
     }
 
     // A struct literal, not a match over CapabilityStatus: this helper
