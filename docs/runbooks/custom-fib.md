@@ -243,7 +243,7 @@ How long a disqualification lasts is set by the checker's **interval**:
 it clears only on the next clean check, so a session flap costs one to
 two intervals. At the default 300 s that is 5–10 minutes (measured on
 the lab rig, 2026-09-22), and on UniFi every FRR config upload flaps
-every session. `interval <seconds>` (10–600) shortens it:
+every session. `interval <seconds>` (10–300) shortens it:
 
 ```
 integrity-authority frr upstream 192.0.2.1 families v4 interval 60
@@ -257,9 +257,12 @@ there:
 time vtysh -c 'show bgp ipv4 unicast statistics json' >/dev/null
 ```
 
-The ceiling exists because the steering gate treats a report older than
-900 s as stale: an interval near that would let every report age out
-before its successor lands.
+The ceiling is 300 s, a third of the steering gate's 900 s staleness
+limit, and it has to be: the checker sleeps a full interval after every
+attempt, so one failed check means the retained report is next
+refreshed at about twice the interval — and that has to land before it
+goes stale. Slower than the default would only lengthen the flap cost
+and the staleness exposure together.
 
 Disqualification is **sticky**: it survives a `vtysh` timeout,
 unparseable output, and a clean check whose counts still disagree.

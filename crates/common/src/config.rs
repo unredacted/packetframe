@@ -773,12 +773,23 @@ pub enum IntegrityAuthoritySpec {
 ///
 /// The ceiling comes from the report-age limit the steering gate
 /// applies: a report older than `STEER_MAX_REPORT_AGE` (900 s) is
-/// `Stale` and refuses. An interval near that would let every report
-/// age out before its successor lands, so the gate would refuse between
-/// ticks on a healthy box; two thirds of it leaves room for one slow
-/// or failed check.
+/// `Stale` and refuses. **One failed check must not be able to age the
+/// retained report out**, and the arithmetic for that is not "interval
+/// below the limit". The checker sleeps a full interval after every
+/// attempt, failed or not, so from a report at t=0 the next attempt
+/// lands at about `interval + check time` and — if that one fails, which
+/// retains the old report — the one after it at twice that. That second
+/// attempt has to land before t=900.
+///
+/// An earlier revision allowed two thirds of the limit (600 s) and said
+/// it left room for one failed check. It did not: attempt at ~600,
+/// failure, retry at ~1200, and a healthy box refused every steer from
+/// 900 to 1200 (review finding, PR #236). A third of the limit — 300 s,
+/// which is also the default — leaves 150 s for the two checks
+/// themselves. Slower than the default buys nothing anyway: it only
+/// lengthens the flap cost and the staleness exposure together.
 pub const FRR_INTERVAL_SECS: std::ops::RangeInclusive<u64> =
-    10..=(crate::fib::STEER_MAX_REPORT_AGE.as_secs() * 2 / 3);
+    10..=(crate::fib::STEER_MAX_REPORT_AGE.as_secs() / 3);
 
 /// One declared upstream and the families its session carries.
 ///
@@ -5014,9 +5025,19 @@ module fast-path
             "whole seconds only — a unit suffix is a typo"
         );
         assert!(with("15 interval 20").is_err(), "given twice");
+        // The property the ceiling exists for, stated as arithmetic:
+        // from a report at t=0, a failed attempt at ~hi and its retry at
+        // ~2*hi must still beat the staleness limit, with room left for
+        // the checks' own duration.
+        let limit = crate::fib::STEER_MAX_REPORT_AGE.as_secs();
         assert!(
-            hi < crate::fib::STEER_MAX_REPORT_AGE.as_secs(),
-            "the ceiling must stay below the report-age limit it is derived from"
+            2 * hi < limit,
+            "a failed check at the ceiling must not age the retained report out: \
+             2 x {hi}s must be under {limit}s"
+        );
+        assert!(
+            limit - 2 * hi >= 120,
+            "and leave real time for the two checks themselves, not a sliver"
         );
     }
 
