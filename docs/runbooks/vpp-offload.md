@@ -1588,6 +1588,29 @@ teardown fixes is wrong. `FAIL` is reserved for probe mismatches —
 the one verdict a restart genuinely repairs — and only `FAIL`
 tears down.
 
+`fib-synced` reports it **Degraded, never Unhealthy**, for the same
+reason, and prints the verdict's age and the live table beside it:
+
+```
+fib-synced   DEGRADED — verify INCOMPLETE — steering refused, no
+  restart: 0/0 probes matched, unresolvable=0, withheld=0 (verify ran
+  1847s ago and does not re-run in steady state; the table now holds
+  69155 installed, 0 withheld, 0 unresolvable)
+```
+
+Read the parenthesis first. Verification is a convergence-time gate, and
+**the live steering gates never consult this verdict** — they re-read
+the route counts, the source backlog and the authority on every retry.
+So a box whose first verify ran before its feed landed recovers and
+steers on its own, with this line still quoting the empty-mirror window.
+A large installed count next to `0/0 probes matched` is that recovery,
+not a contradiction. On the lab rig (2026-09-21) the row paged as
+UNHEALTHY while 69,155 routes forwarded; it does not any more.
+
+If the counts in the parenthesis are *also* bad — nonzero
+`unresolvable`, or an installed count that never grows — the condition
+is live, and it is the counts, not the verdict, that say so.
+
 ### Load rises by roughly one core per VPP worker, permanently. That is poll mode, not a fault.
 
 The native octeon driver supports neither interrupt nor adaptive rx
@@ -2011,6 +2034,11 @@ What this means when you are reading a dashboard: a green `fib-synced`
 says the FIB was verified *at some point*, not that it is being watched.
 Nothing here would notice VPP's FIB drifting for a reason other than this
 module's own deltas.
+
+The same applies to a NON-green one, and it bites harder, because the
+condition usually clears while the verdict does not. Every `fib-synced`
+line that is not `healthy` therefore carries its own age; compare that
+against the counts printed beside it before acting on the verdict.
 
 **Failed, and shaping the design:**
 

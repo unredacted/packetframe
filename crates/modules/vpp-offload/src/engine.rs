@@ -361,7 +361,7 @@ impl Verdict {
     /// primary's eth5 is the motivating case).
     pub fn event(&self) -> crate::supervisor::Event {
         let blocking_dark = self.outcome.dead_interfaces.iter().any(|d| d.in_use);
-        if !self.outcome.mismatches.is_empty() {
+        if self.outcome.restart_worthy() {
             crate::supervisor::Event::VerifyFailed
         } else if self.outcome.fib_correct() && self.may_steer && !blocking_dark {
             crate::supervisor::Event::VerifyPassed
