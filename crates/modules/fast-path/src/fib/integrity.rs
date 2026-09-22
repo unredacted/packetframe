@@ -213,7 +213,7 @@ impl IntegrityChecker {
             warn!(error = %e, "integrity check: birdc route count failed");
         }
         match bird_peers {
-            Ok(n) => snap.bird_established_peers = Some(n),
+            Ok(n) => snap.authority_established_peers = Some(n),
             Err(e) => {
                 // Non-fatal for the route-count side, but the stall
                 // gate relies on this so surface it.
@@ -252,13 +252,13 @@ impl IntegrityChecker {
             });
             match drift {
                 Some(d) if d.above => warn!(
-                    bird_prefixes = bird,
+                    authority_prefixes = bird,
                     packetframe_prefixes = pf,
                     drift_fraction = d.fraction,
                     "integrity drift above threshold"
                 ),
                 Some(d) => debug!(
-                    bird_prefixes = bird,
+                    authority_prefixes = bird,
                     packetframe_prefixes = pf,
                     drift_fraction = d.fraction,
                     "integrity check OK"
@@ -270,14 +270,14 @@ impl IntegrityChecker {
                 // measured (a box whose own bird carried 13 routes
                 // against a 1.3M mirror), so it warns like drift does.
                 None => warn!(
-                    bird_prefixes = bird,
+                    authority_prefixes = bird,
                     packetframe_prefixes = pf,
                     "integrity check: bird reports no prefixes in master4/master6"
                 ),
             }
             snap.last_comparison = Some(Comparison {
                 at,
-                bird_prefixes: bird,
+                authority_prefixes: bird,
                 packetframe_prefixes: pf,
                 drift,
             });

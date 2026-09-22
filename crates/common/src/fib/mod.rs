@@ -195,7 +195,8 @@ pub const STEER_MAX_REPORT_AGE: std::time::Duration = std::time::Duration::from_
 /// One comparison of the mirror against its authority.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompletenessReport {
-    /// What the authority (bird) says it has.
+    /// What the authority says it has — whichever daemon
+    /// `integrity-authority` names.
     pub authority_routes: u64,
     /// What our mirror holds.
     pub mirror_routes: u64,
@@ -323,7 +324,9 @@ impl Completeness {
             Completeness::AuthorityMismatch { authority, mirror } => format!(
                 "the route mirror holds {mirror} routes but the authority reports only \
                  {authority} — that is not the authority feeding this mirror. Check which \
-                 bird `birdc` is talking to; on a box whose routes come from elsewhere, \
+                 daemon `integrity-authority` reads — `birdc` asks the local bird, `frr` \
+                 asks the local FRR through vtysh — and whether that is the one this \
+                 box's routes come from. Where they legitimately come from elsewhere, \
                  `require-table-complete off` is the right answer — but it is read once at \
                  bring-up, so the daemon has to be RESTARTED for it. A reload is refused by \
                  name rather than accepted and ignored, so there is nothing to try first"

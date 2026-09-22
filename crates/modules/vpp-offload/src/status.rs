@@ -948,8 +948,9 @@ impl StatusSnapshot {
                          table size, so waiting for the source to go quiet will not clear \
                          it — quiescence is never what releases a veto. TWO CONSECUTIVE \
                          CHECKS reported it, so this is not one report catching a bulk \
-                         withdrawal mid-flight. Check which bird `birdc` is talking to on \
-                         THIS box; where the routes legitimately come from elsewhere, \
+                         withdrawal mid-flight. Check that `integrity-authority` names \
+                         the daemon THIS box's routes actually come from; where they \
+                         legitimately come from elsewhere, \
                          `require-table-complete off` is the right answer — but it is read \
                          once at bring-up, so it needs a daemon RESTART. A reload is \
                          refused by name and says so, so there is nothing to try first and \
@@ -1014,7 +1015,8 @@ impl StatusSnapshot {
                          but if {have} IS the whole table, the gate will never release: \
                          with no authority it refuses to guess completeness below the \
                          floor, by design. Size `expected-routes` within 16x of the real \
-                         table, or give this box a bird and enable \
+                         table, or name a completeness authority \
+                         (`integrity-authority birdc|frr`) and enable \
                          `require-table-complete`"
                     )
                 } else {

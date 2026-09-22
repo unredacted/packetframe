@@ -90,7 +90,7 @@ pub struct Comparison {
     /// [`IntegritySnapshot::last_run`] for that same run, which is what
     /// lets a reader tell a current comparison from a retained one.
     pub at: Instant,
-    pub bird_prefixes: usize,
+    pub authority_prefixes: usize,
     pub packetframe_prefixes: usize,
     /// `None` when bird reported zero prefixes, where a fraction of the
     /// authority's count is undefined. Not "no drift" — see
@@ -102,7 +102,7 @@ pub struct Comparison {
 /// Snapshot of the most recent integrity-check result.
 ///
 /// Two readers, asking different questions. The BmpStalled gate wants
-/// `bird_established_peers` — "does bird still think there are peers to
+/// `authority_established_peers` — "does bird still think there are peers to
 /// hear from?" — before it calls a quiet feed a stall. The health
 /// surface wants the comparison, via [`IntegrityPosture`]. Neither
 /// reads a field the other writes, which is why the counts live inside
@@ -114,7 +114,7 @@ pub struct IntegritySnapshot {
     /// The most recent run that did. Retained across a failed run, so it
     /// can be older than `last_run`.
     pub last_comparison: Option<Comparison>,
-    pub bird_established_peers: Option<usize>,
+    pub authority_established_peers: Option<usize>,
     /// Why the most recent run could not complete. Cleared at the start
     /// of every run, so it always describes `last_run` and never an
     /// older one.
@@ -132,7 +132,7 @@ pub struct Sample {
     /// two cannot disagree.
     pub at: Instant,
     pub observed_at: Instant,
-    pub bird_prefixes: usize,
+    pub authority_prefixes: usize,
     pub packetframe_prefixes: usize,
     pub drift: Option<Drift>,
     /// This comparison is the most recent run's own result, rather than
@@ -156,7 +156,7 @@ impl Sample {
     /// work there too.
     fn report(&self) -> packetframe_common::fib::CompletenessReport {
         packetframe_common::fib::CompletenessReport {
-            authority_routes: self.bird_prefixes as u64,
+            authority_routes: self.authority_prefixes as u64,
             mirror_routes: self.packetframe_prefixes as u64,
             at: self.at,
         }
@@ -242,7 +242,7 @@ impl IntegrityPosture {
             sample: snap.last_comparison.map(|c| Sample {
                 at: c.at,
                 observed_at: now,
-                bird_prefixes: c.bird_prefixes,
+                authority_prefixes: c.authority_prefixes,
                 packetframe_prefixes: c.packetframe_prefixes,
                 drift: c.drift,
                 // Instant equality, not an age comparison: the checker
@@ -415,7 +415,7 @@ impl IntegrityPosture {
         let mut state = HealthState::Healthy;
         let counts = format!(
             "bird {} prefixes, mirror {}",
-            s.bird_prefixes, s.packetframe_prefixes
+            s.authority_prefixes, s.packetframe_prefixes
         );
 
         let gate = s.gate_verdict();
@@ -503,11 +503,11 @@ mod tests {
             last_run: Some(at),
             last_comparison: Some(Comparison {
                 at,
-                bird_prefixes: bird,
+                authority_prefixes: bird,
                 packetframe_prefixes: mirror,
                 drift: d,
             }),
-            bird_established_peers: Some(2),
+            authority_established_peers: Some(2),
             last_error: None,
         }
     }
@@ -774,7 +774,7 @@ mod tests {
         let snap = IntegritySnapshot {
             last_run: Some(at),
             last_comparison: None,
-            bird_established_peers: None,
+            authority_established_peers: None,
             last_error: Some("birdc show route count: spawn /usr/sbin/birdc: No such file".into()),
         };
         let h = IntegrityPosture::observe(&snap, at + Duration::from_secs(4)).subsystem_health();
@@ -795,11 +795,11 @@ mod tests {
             last_run: Some(compared_at + Duration::from_secs(300)),
             last_comparison: Some(Comparison {
                 at: compared_at,
-                bird_prefixes: 1_272_306,
+                authority_prefixes: 1_272_306,
                 packetframe_prefixes: 1_272_281,
                 drift: drift(0.0000196, 0.01),
             }),
-            bird_established_peers: Some(2),
+            authority_established_peers: Some(2),
             last_error: Some("programmer mirror_counts: channel closed".into()),
         };
         let p = IntegrityPosture::observe(&snap, compared_at + Duration::from_secs(305));
@@ -825,7 +825,7 @@ mod tests {
     fn error_alongside_a_current_comparison_keeps_the_comparison() {
         let at = t0();
         let mut snap = clean_run(at, 1000, 1000, drift(0.0, 0.01));
-        snap.bird_established_peers = None;
+        snap.authority_established_peers = None;
         snap.last_error = Some("birdc show protocols: exit 1".into());
         let p = IntegrityPosture::observe(&snap, at + Duration::from_secs(2));
         match &p {
