@@ -358,20 +358,7 @@ fn main() -> ExitCode {
 }
 
 fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
-    let (
-        bpffs_root,
-        attach_ifaces,
-        vpp_ports,
-        vpp_steer_ports,
-        vpp_workers,
-        vpp_binary,
-        vpp_loopback,
-        allowlist,
-        vpp_dirs,
-        vpp_exempts,
-        guard_ifaces,
-        snoop_inputs,
-    ) = match &config {
+    let inputs = match &config {
         Some(path) => match Config::from_file(path) {
             Ok(c) => {
                 if let Err(e) = c.validate_interfaces() {
@@ -390,70 +377,17 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     eprintln!("neigh-snoop config check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);
                 }
-                let ifaces = feasibility::attach_ifaces_from_config(&c);
-                let vpp_ports = feasibility::vpp_ports_from_config(&c);
-                let vpp_steer_ports = feasibility::vpp_steer_ports_from_config(&c);
-                let vpp_workers = feasibility::vpp_workers_from_config(&c);
-                let vpp_binary = feasibility::vpp_binary_from_config(&c);
-                let vpp_loopback = feasibility::vpp_loopback_from_config(&c);
-                let allowlist = feasibility::allowlist_from_config(&c);
-                let vpp_dirs = feasibility::vpp_steer_directions_from_config(&c);
-                let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
-                let guard_ifaces = feasibility::guard_ifaces_from_config(&c);
-                let snoop_inputs = feasibility::neigh_snoop_probe_inputs_from_config(&c);
-                (
-                    c.global.bpffs_root,
-                    ifaces,
-                    vpp_ports,
-                    vpp_steer_ports,
-                    vpp_workers,
-                    vpp_binary,
-                    vpp_loopback,
-                    allowlist,
-                    vpp_dirs,
-                    vpp_exempts,
-                    guard_ifaces,
-                    snoop_inputs,
-                )
+                feasibility::FeasibilityInputs::from_config(&c)
             }
             Err(e) => {
                 eprintln!("config parse error: {e}");
                 return ExitCode::from(EXIT_STARTUP_ERROR);
             }
         },
-        None => (
-            std::path::PathBuf::from(packetframe_common::config::DEFAULT_BPFFS_ROOT),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            feasibility::NeighSnoopProbeInputs::default(),
-        ),
+        None => feasibility::FeasibilityInputs::default(),
     };
 
-    let report = feasibility::probe_and_render(
-        &bpffs_root,
-        &attach_ifaces,
-        &feasibility::VppProbeInputs {
-            ports: &vpp_ports,
-            steer_ports: &vpp_steer_ports,
-            workers: vpp_workers,
-            binary: vpp_binary.as_deref(),
-            loopback: vpp_loopback,
-            steer_directions: &vpp_dirs,
-            steer_exempts: &vpp_exempts,
-        },
-        &allowlist,
-        &guard_ifaces,
-        &snoop_inputs,
-        human,
-    );
+    let report = feasibility::probe_and_render(&inputs, human);
     if let Some(json) = report.json_output {
         println!("{json}");
     }
