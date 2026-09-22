@@ -14,7 +14,9 @@ path = "src/lib.rs"
 # frames, decides installs or renders metrics is portable and tested on
 # macOS; the capture socket, netlink and the runtime arrive cfg-gated.
 [dependencies]
-packetframe-common.workspace = true
+# `frr` brings the shared `vtysh` invoker this module's next-hop gate
+# runs on; see `crate::frr_gate`.
+packetframe-common = { workspace = true, features = ["frr"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

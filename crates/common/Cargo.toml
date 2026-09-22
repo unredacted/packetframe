@@ -16,5 +16,19 @@ tracing.workspace = true
 libc.workspace = true
 flate2.workspace = true
 ipnet.workspace = true
+# Only for the shared `vtysh` client (`frr` feature). Optional on
+# purpose: everything else in this crate is deliberately
+# runtime-agnostic — `TableCompleteness` uses a `std` lock precisely so
+# a synchronous supervision loop and an async checker can share it
+# without either adopting the other's runtime — and a hard tokio
+# dependency here would quietly undo that.
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# `crate::frr`: one `vtysh` invoker for every module that shells out to
+# FRR. A feature rather than always-on so a consumer that wants only the
+# config parser or the probes does not link a process runtime.
+frr = ["dep:tokio"]
 
 [dev-dependencies]

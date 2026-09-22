@@ -7,6 +7,8 @@
 
 pub mod config;
 pub mod fib;
+#[cfg(feature = "frr")]
+pub mod frr;
 pub mod module;
 pub mod probe;
 
