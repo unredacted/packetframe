@@ -352,6 +352,9 @@ pub enum Eligibility {
 ///    upstreams say. It is the condition the counts are completely blind
 ///    to — at a 1% tolerance a filter dropping 5,000 of a million reads
 ///    `Converged` — so it can only ever be refused on the configuration.
+///    An export policy that could not be READ is a different matter: it
+///    is recorded and the upstreams are still evaluated, because a
+///    concrete not-ready upstream in the same tick outranks it.
 /// 2. **An upstream that answered and is not ready disqualifies**, and
 ///    returns immediately: no later upstream can make this one ready.
 /// 3. **A session that re-established since the last reading
@@ -374,15 +377,24 @@ pub fn classify_eligibility(
     upstreams: &[(IpAddr, Result<UpstreamState, String>)],
     seen_epochs: &mut HashMap<IpAddr, u64>,
 ) -> Eligibility {
+    // The export read is CLASSIFIED first and ACTED ON last, and those
+    // are different things. A filtered export is positive evidence and
+    // outranks everything; a read that failed is not, and returning
+    // early on it threw away a concrete "this upstream is down" that the
+    // same tick had already established — publishing `Unreadable`, which
+    // retains a permitting report for its full 900 s, over a table the
+    // tick had just proved incomplete (review finding, PR #232). The
+    // documented precedence says positive evidence outranks a partial
+    // read; this is that rule applied to the export read too.
+    let mut unknown: Option<String> = None;
     match export {
         Ok(ExportPolicy::Filtered { why }) => {
             return Eligibility::Revoked(Revocation::UnsupportedExport(why))
         }
         Ok(ExportPolicy::Unfiltered) => {}
-        Err(e) => return Eligibility::Unknown(e),
+        Err(e) => unknown = Some(e),
     }
 
-    let mut unknown: Option<String> = None;
     let mut moved: Option<String> = None;
     for (peer, result) in upstreams {
         let state = match result {
@@ -860,6 +872,48 @@ router bgp 65000
                     "order must not decide this"
                 );
             }
+        }
+
+        /// An unreadable export policy must not bury a concrete
+        /// upstream disqualification found in the same tick.
+        ///
+        /// The first version returned `Unknown` the moment `show
+        /// running-config` failed, discarding a "this peer is down" the
+        /// tick had already established. `Unreadable` then retains a
+        /// PERMITTING report for its full 900 s over a table the tick
+        /// had just proved incomplete — the documented precedence
+        /// (positive evidence outranks a partial read) applied
+        /// everywhere except here (review finding, PR #232).
+        #[test]
+        fn an_unreadable_export_does_not_hide_a_down_upstream() {
+            let mut seen = HashMap::new();
+            let e = classify_eligibility(
+                Err("vtysh timed out after 10s".into()),
+                &[down(peer(1))],
+                &mut seen,
+            );
+            assert!(
+                matches!(e, Eligibility::Revoked(Revocation::UpstreamNotReady(_))),
+                "the disqualification is a fact; the failed read is not: {e:?}"
+            );
+        }
+
+        /// But a filtered export still outranks everything, since it is
+        /// positive evidence too and the one the counts cannot see.
+        #[test]
+        fn a_filtered_export_outranks_a_down_upstream() {
+            let mut seen = HashMap::new();
+            let e = classify_eligibility(
+                Ok(ExportPolicy::Filtered {
+                    why: "neighbor 198.51.100.2 route-map OUT out".into(),
+                }),
+                &[down(peer(1))],
+                &mut seen,
+            );
+            assert!(matches!(
+                e,
+                Eligibility::Revoked(Revocation::UnsupportedExport(_))
+            ));
         }
 
         /// A read that failed and nothing else is `Unknown`, which is

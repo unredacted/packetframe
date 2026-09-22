@@ -115,6 +115,25 @@ pub struct IntegritySnapshot {
     /// can be older than `last_run`.
     pub last_comparison: Option<Comparison>,
     pub authority_established_peers: Option<usize>,
+    /// Which daemon the checker is reading, for the rendering. `None`
+    /// before any run.
+    ///
+    /// The row used to say "bird N prefixes" unconditionally, so a clean
+    /// FRR attestation looked as though the daemon had queried a bird
+    /// installation that may not exist — and pointed an operator at the
+    /// wrong RIB when diagnosing a mismatch (review finding, PR #232).
+    pub authority: Option<&'static str>,
+    /// Why the authority has DISQUALIFIED the mirror, independent of the
+    /// counts.
+    ///
+    /// Only the FRR authority sets it. Without it, a tick whose counts
+    /// agreed recorded a clean comparison and no error, so `fib-integrity`
+    /// reported a converged authority while `TableCompleteness` held
+    /// `Ineligible` and the second tier refused every steer — with the
+    /// concrete reason nowhere on the box (review finding, PR #232).
+    /// Not an `error`: nothing failed to be read, and the remedy is in
+    /// the operator's BGP configuration rather than in this checker.
+    pub revoked: Option<String>,
     /// Why the most recent run could not complete. Cleared at the start
     /// of every run, so it always describes `last_run` and never an
     /// older one.
@@ -215,6 +234,10 @@ pub enum IntegrityPosture {
         sample: Option<Sample>,
         /// Why the most recent run could not complete.
         error: Option<String>,
+        /// Which daemon answered, for the wording.
+        authority: Option<&'static str>,
+        /// Why the mirror is disqualified regardless of the counts.
+        revoked: Option<String>,
     },
     /// The snapshot was being written at the instant status sampled it.
     ///
@@ -251,6 +274,8 @@ impl IntegrityPosture {
                 current: c.at == last_run,
             }),
             error: snap.last_error.clone(),
+            authority: snap.authority,
+            revoked: snap.revoked.clone(),
         }
     }
 
@@ -265,8 +290,8 @@ impl IntegrityPosture {
                 // is not the feed.
                 HealthState::Healthy,
                 "no integrity authority on this box (`integrity-authority none`): its routes \
-                 are fed from a source elsewhere, so a local birdc would compare the mirror \
-                 against the wrong RIB. No comparison is run and completeness is not \
+                 are fed from a source elsewhere, so a local authority would compare the \
+                 mirror against the wrong RIB. No comparison is run and completeness is not \
                  attested here — a second-tier steering gate treats the mirror as \
                  unattested, which is why `require-table-complete on` is refused with this \
                  setting"
@@ -281,7 +306,8 @@ impl IntegrityPosture {
                 format!(
                     "no comparison has completed yet — the first lands one interval ({}s by \
                      default) after the control plane starts. This is NOT agreement: nothing \
-                     has yet compared bird's RIB against the mirror, and a second-tier \
+                     has yet compared the authority's RIB against the mirror, and a \
+                     second-tier \
                      steering gate that consults it holds until something does",
                     DEFAULT_INTERVAL.as_secs()
                 ),
@@ -297,7 +323,15 @@ impl IntegrityPosture {
                 run_age,
                 sample,
                 error,
-            } => Self::checked_health(*run_age, sample.as_ref(), error.as_deref()),
+                authority,
+                revoked,
+            } => Self::checked_health(
+                *run_age,
+                sample.as_ref(),
+                error.as_deref(),
+                *authority,
+                revoked.as_deref(),
+            ),
         };
         SubsystemHealth {
             name: SUBSYS_FIB_INTEGRITY.into(),
@@ -325,13 +359,30 @@ impl IntegrityPosture {
         run_age: Duration,
         sample: Option<&Sample>,
         error: Option<&str>,
+        authority: Option<&'static str>,
+        revoked: Option<&str>,
     ) -> (HealthState, String) {
         let mut state = HealthState::Healthy;
         let mut clauses: Vec<String> = Vec::new();
 
+        // FIRST, and its own clause, because it overrides the verdict
+        // below rather than qualifying it: the counts can agree
+        // perfectly while the mirror is ineligible, and a row that led
+        // with "converged" would describe an authority that is refusing
+        // every steer. Degraded rather than Healthy for the same reason.
+        if let Some(why) = revoked {
+            state = state.worse_of(HealthState::Degraded);
+            clauses.push(format!(
+                "the authority has DISQUALIFIED this mirror regardless of the counts: \
+                 {why}. Steering is refused while this holds, and it clears only on a \
+                 check that comes back clean AND whose counts agree — waiting alone will \
+                 not do it"
+            ));
+        }
+
         match sample {
             Some(s) => {
-                let (verdict_state, verdict) = Self::verdict(s);
+                let (verdict_state, verdict) = Self::verdict(s, authority);
                 state = state.worse_of(verdict_state);
                 clauses.push(verdict);
             }
@@ -411,11 +462,13 @@ impl IntegrityPosture {
     /// at the boundary where the two comparisons differ (`>=` here,
     /// `<=` there), and across the entire range between them for any
     /// operator who had tuned the warn fraction (review finding).
-    fn verdict(s: &Sample) -> (HealthState, String) {
+    fn verdict(s: &Sample, authority: Option<&'static str>) -> (HealthState, String) {
         let mut state = HealthState::Healthy;
         let counts = format!(
-            "bird {} prefixes, mirror {}",
-            s.authority_prefixes, s.packetframe_prefixes
+            "{} {} prefixes, mirror {}",
+            authority.unwrap_or("the authority"),
+            s.authority_prefixes,
+            s.packetframe_prefixes
         );
 
         let gate = s.gate_verdict();
@@ -509,6 +562,8 @@ mod tests {
             }),
             authority_established_peers: Some(2),
             last_error: None,
+            authority: Some("bird"),
+            revoked: None,
         }
     }
 
@@ -776,6 +831,8 @@ mod tests {
             last_comparison: None,
             authority_established_peers: None,
             last_error: Some("birdc show route count: spawn /usr/sbin/birdc: No such file".into()),
+            authority: None,
+            revoked: None,
         };
         let h = IntegrityPosture::observe(&snap, at + Duration::from_secs(4)).subsystem_health();
         assert_eq!(h.state, HealthState::Degraded);
@@ -801,6 +858,8 @@ mod tests {
             }),
             authority_established_peers: Some(2),
             last_error: Some("programmer mirror_counts: channel closed".into()),
+            authority: Some("bird"),
+            revoked: None,
         };
         let p = IntegrityPosture::observe(&snap, compared_at + Duration::from_secs(305));
         match &p {

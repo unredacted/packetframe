@@ -1451,6 +1451,105 @@ impl Config {
         self.validate_interfaces_in(Path::new("/sys/class/net"))
     }
 
+    /// Cross-directive checks for `module fast-path` alone.
+    ///
+    /// Separate from [`Self::validate_vpp_offload`] because that one
+    /// returns immediately when there is no `vpp-offload` section, and
+    /// both rules here are about fast-path's own directives. A
+    /// fast-path-only config was slipping past them entirely — reaching
+    /// the loader, failing to spawn an authority, logging an internal
+    /// error and running unattested instead of being refused as
+    /// documented (review finding, PR #232).
+    pub fn validate_fast_path(&self) -> Result<(), ConfigError> {
+        let Some(fp) = self.modules.iter().find(|m| m.name == "fast-path") else {
+            return Ok(());
+        };
+
+        let frr = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr {
+                upstreams, ..
+            }) => Some(upstreams),
+            _ => None,
+        });
+        let Some(upstreams) = frr else {
+            return Ok(());
+        };
+
+        let source = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::RouteSource(s) => Some(s),
+            _ => None,
+        });
+
+        // `integrity-authority frr` against a BMP route source is
+        // refused, and this is a gap rather than a rule.
+        //
+        // Two of the authority's three conjuncts are fine over BMP: the
+        // per-AF counts and the upstreams' End-of-RIB are read from FRR
+        // itself and say nothing about how the mirror is fed. The third
+        // is not. Export-policy validation asks whether the session
+        // feeding packetframe is narrowed, and over BMP there is no
+        // session — what narrows the feed is FRR's own `bmp targets`
+        // configuration, a different grammar that nothing on the
+        // reference fleet has been measured against. Accepting the
+        // combination would mean silently dropping the one conjunct the
+        // counts cannot substitute for: at a 1% drift tolerance a filter
+        // removing 5,000 prefixes from a million still reads
+        // `Converged`.
+        //
+        // Refused rather than downgraded, because a downgrade is
+        // invisible — the operator who wrote `integrity-authority frr`
+        // would get the weaker guarantee and a green row.
+        if matches!(source, Some(RouteSourceSpec::Bmp { .. })) {
+            return Err(ConfigError::parse(
+                0,
+                "module fast-path has `integrity-authority frr` with a BMP route source. \
+                 The FRR authority validates the export policy of the BGP session that \
+                 feeds this mirror, and a BMP feed has no such session — what narrows it \
+                 is FRR's `bmp targets` configuration, which this release cannot read. \
+                 Accepting it would quietly drop the one check the prefix counts cannot \
+                 substitute for. Use `route-source bgp` (the production path), or \
+                 `integrity-authority birdc` if a local bird is the real authority",
+            ));
+        }
+
+        // packetframe's own session must not be in the upstream set.
+        //
+        // The spec's docs say so and the parser cannot enforce it: only
+        // here are both the declared upstreams and the listen address in
+        // scope. Listing it is circular — the authority would wait for
+        // End-of-RIB from the session it is supposed to be attesting,
+        // which packetframe never sends, so the peer reads not-ready on
+        // every check, eligibility is revoked forever and the
+        // completeness gate defers every steer. It parses, it passes
+        // feasibility (FRR does know that neighbor), and it is
+        // discovered as a rollout that will not start (review finding,
+        // PR #232).
+        if let Some(RouteSourceSpec::Bgp { addr, .. }) = source {
+            // `addr` is the listen address as written; a parse failure
+            // here means it is not an IP literal, which the route-source
+            // parser has already refused, so there is nothing to check.
+            let Ok(ours) = addr.parse::<IpAddr>() else {
+                return Ok(());
+            };
+            if upstreams.iter().any(|u| u.addr == ours) {
+                return Err(ConfigError::parse(
+                    0,
+                    format!(
+                        "module fast-path lists {ours} as an `integrity-authority frr \
+                         upstream`, but that is packetframe's own `route-source bgp` \
+                         listen address — the session being attested. The authority would \
+                         wait for End-of-RIB from a session packetframe never sends one \
+                         on, so it would read not-ready on every check and no steer would \
+                         ever be permitted. List the peers that feed FRR, not the one FRR \
+                         feeds"
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// vpp-offload cross-section validation (phase 4). Pure config
     /// logic — no sysfs — so it runs everywhere `parse` does.
     ///
@@ -1654,45 +1753,6 @@ impl Config {
                 )
             })
         });
-        // `integrity-authority frr` against a BMP route source is
-        // refused, and this is a gap rather than a rule.
-        //
-        // Two of the authority's three conjuncts are fine over BMP: the
-        // per-AF counts and the upstreams' End-of-RIB are read from FRR
-        // itself and say nothing about how the mirror is fed. The third
-        // is not. Export-policy validation asks whether the session
-        // feeding packetframe is narrowed, and over BMP there is no
-        // session — what narrows the feed is FRR's own `bmp targets`
-        // configuration, a different grammar that nothing on the
-        // reference fleet has been measured against. Accepting the
-        // combination would mean silently dropping the one conjunct the
-        // counts cannot substitute for: at a 1% drift tolerance a filter
-        // removing 5,000 prefixes from a million still reads
-        // `Converged`.
-        //
-        // Refused rather than downgraded, because a downgrade is
-        // invisible — the operator who wrote `integrity-authority frr`
-        // would get the weaker guarantee and a green row.
-        let authority_is_frr = fast_path.is_some_and(|fp| {
-            fp.directives.iter().any(|d| {
-                matches!(
-                    d,
-                    ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr { .. })
-                )
-            })
-        });
-        let source_is_bmp = fast_path.is_some_and(|fp| {
-            fp.directives
-                .iter()
-                .any(|d| matches!(d, ModuleDirective::RouteSource(RouteSourceSpec::Bmp { .. })))
-        });
-        if authority_is_frr && source_is_bmp {
-            return Err(ConfigError::parse(
-                0,
-                "module fast-path has `integrity-authority frr` with a BMP route source.                  The FRR authority validates the export policy of the BGP session that                  feeds this mirror, and a BMP feed has no such session — what narrows it                  is FRR's `bmp targets` configuration, which this release cannot read.                  Accepting it would quietly drop the one check the prefix counts cannot                  substitute for. Use `route-source bgp` (the production path), or                  `integrity-authority birdc` if a local bird is the real authority",
-            ));
-        }
-
         if require_complete && authority_is_none {
             return Err(ConfigError::parse(
                 0,
@@ -5042,7 +5102,7 @@ module vpp-offload
                    port eth1 cores 1 steer off\n";
         let err = Config::parse(bmp)
             .unwrap()
-            .validate_vpp_offload()
+            .validate_fast_path()
             .expect_err("must refuse");
         let err = format!("{err}");
         assert!(
@@ -5063,8 +5123,61 @@ module vpp-offload
         );
         Config::parse(&bgp)
             .unwrap()
-            .validate_vpp_offload()
+            .validate_fast_path()
             .expect("frr over bgp is the supported shape");
+
+        // And it runs for a config with NO vpp-offload section at all,
+        // which is the hole this moved out of `validate_vpp_offload` to
+        // close: that one returns immediately when the section is
+        // absent, so a fast-path-only config reached the loader, failed
+        // to spawn an authority, logged an internal error and ran
+        // unattested.
+        let fast_path_only = bmp
+            .split("module vpp-offload")
+            .next()
+            .expect("split")
+            .to_string();
+        assert!(
+            Config::parse(&fast_path_only)
+                .unwrap()
+                .validate_fast_path()
+                .is_err(),
+            "the refusal must not depend on a vpp-offload section being present"
+        );
+    }
+
+    /// packetframe's own listen address must not appear as an upstream.
+    ///
+    /// Circular: the authority would wait for End-of-RIB from the
+    /// session it is supposed to be attesting, which packetframe never
+    /// sends — so the peer reads not-ready on every check, eligibility
+    /// is revoked forever, and the completeness gate defers every steer.
+    /// It parses, and it passes feasibility (FRR really does know that
+    /// neighbor), so this is the only place it can be caught before a
+    /// rollout window.
+    #[test]
+    fn the_frr_authority_rejects_packetframes_own_session_as_an_upstream() {
+        let cfg = "module fast-path\n  forwarding-mode custom-fib\n  \
+                   route-source bgp 127.0.0.1:1179 local-as 64512 peer-as 64512\n  \
+                   integrity-authority frr upstream 127.0.0.1 families v4\n";
+        let err = Config::parse(cfg)
+            .unwrap()
+            .validate_fast_path()
+            .expect_err("must refuse the circular declaration")
+            .to_string();
+        assert!(err.contains("127.0.0.1"), "{err}");
+        assert!(
+            err.contains("the session being attested"),
+            "say why it is circular: {err}"
+        );
+        assert!(
+            err.contains("List the peers that feed FRR"),
+            "and what to write instead: {err}"
+        );
+
+        // A different upstream on the same box is fine.
+        let ok = cfg.replace("upstream 127.0.0.1", "upstream 192.0.2.1");
+        Config::parse(&ok).unwrap().validate_fast_path().unwrap();
     }
 
     /// `require-table-complete on` + `integrity-authority none` is a

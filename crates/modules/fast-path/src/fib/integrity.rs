@@ -207,6 +207,11 @@ impl IntegrityChecker {
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
         snap.last_error = None;
+        snap.authority = Some("bird");
+        // Never set by this authority: `birdc` reports two counts and
+        // has no notion of eligibility, so there is nothing it could
+        // disqualify the mirror on.
+        snap.revoked = None;
 
         if let Err(e) = &bird_route {
             snap.last_error = Some(format!("birdc show route count: {e}"));

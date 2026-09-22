@@ -379,6 +379,10 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     eprintln!("config interface check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);
                 }
+                if let Err(e) = c.validate_fast_path() {
+                    eprintln!("fast-path config check failed: {e}");
+                    return ExitCode::from(EXIT_STARTUP_ERROR);
+                }
                 if let Err(e) = c.validate_vpp_offload() {
                     eprintln!("vpp-offload config check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);

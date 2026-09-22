@@ -236,6 +236,21 @@ impl FrrAuthorityChecker {
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
         snap.last_error = None;
+        snap.authority = Some("FRR");
+        // The disqualification, on the snapshot as its own fact.
+        //
+        // It is NOT an error — nothing failed to be read, and the remedy
+        // is in the operator's BGP configuration. But without it a tick
+        // whose counts agreed recorded a clean comparison and no error,
+        // so `fib-integrity` reported a converged authority while
+        // `TableCompleteness` held `Ineligible` and the second tier
+        // refused every steer, with the concrete reason nowhere on the
+        // box (review finding, PR #232). Cleared on every run that is
+        // not revoked, so it always describes THIS tick.
+        snap.revoked = match &eligibility {
+            Eligibility::Revoked(r) => Some(r.describe().to_string()),
+            Eligibility::Ok | Eligibility::Unknown(_) => None,
+        };
         if let Err(e) = &authority {
             snap.last_error = Some(e.clone());
             warn!(error = %e, "FRR authority: prefix count failed");
@@ -326,16 +341,23 @@ impl FrrAuthorityChecker {
     /// `AuthorityMismatch`: "that is not the authority feeding this
     /// mirror", a conclusion a missing subprocess has not earned.
     async fn authority_count(&self) -> Result<usize, String> {
+        let families = self.config.counted_families();
+        let counts =
+            futures::future::join_all(families.iter().map(|f| self.family_count(*f))).await;
         let mut total = 0usize;
-        for family in self.config.counted_families() {
-            let out = self
-                .vtysh
-                .run(&[format!("show bgp {} unicast statistics json", family.afi())])
-                .await
-                .map_err(|e| format!("vtysh statistics {}: {e}", family.afi()))?;
-            total += parse_total_prefixes(&out, family)? as usize;
+        for c in counts {
+            total += c?;
         }
         Ok(total)
+    }
+
+    async fn family_count(&self, family: AuthorityFamily) -> Result<usize, String> {
+        let out = self
+            .vtysh
+            .run(&[format!("show bgp {} unicast statistics json", family.afi())])
+            .await
+            .map_err(|e| format!("vtysh statistics {}: {e}", family.afi()))?;
+        Ok(parse_total_prefixes(&out, family)? as usize)
     }
 
     /// Read everything eligibility depends on, then judge it.

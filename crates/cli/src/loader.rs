@@ -117,6 +117,9 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
     config
+        .validate_fast_path()
+        .map_err(|e| RunError::Startup(e.to_string()))?;
+    config
         .validate_vpp_offload()
         .map_err(|e| RunError::Startup(e.to_string()))?;
     config
@@ -1063,6 +1066,11 @@ fn reconfigure_from_signal(
     // configuration it already had, and the operator gets the reason
     // from `packetframe reconfigure` — which is the right outcome for a
     // config that would have diverted traffic into a hole.
+    if let Err(e) = new_config.validate_fast_path() {
+        tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
+        write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        return Published::No;
+    }
     if let Err(e) = new_config.validate_vpp_offload() {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
