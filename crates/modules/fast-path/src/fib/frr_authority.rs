@@ -49,9 +49,9 @@ use packetframe_common::fib::TableCompleteness;
 use packetframe_common::frr::{RealVtysh, Vtysh};
 
 use crate::fib::frr::{
-    classify_eligibility, observation, parse_established_epoch, parse_export_policy,
-    parse_total_prefixes, parse_upstream_state, split_two_json, Eligibility, ExportPolicy,
-    UpstreamState,
+    classify_eligibility, mirror_family_mismatch, observation, parse_established_epoch,
+    parse_export_policy, parse_total_prefixes, parse_upstream_state, split_two_json, Eligibility,
+    ExportPolicy, UpstreamState,
 };
 use crate::fib::integrity::{Comparison, Drift, SharedSnapshot, DEFAULT_DRIFT_WARN_FRACTION};
 use crate::fib::programmer::FibProgrammerHandle;
@@ -146,6 +146,16 @@ pub struct FrrAuthorityChecker {
     /// re-establishes every session — which is the one event that can
     /// introduce an export filter under a running daemon.
     seen_epochs: HashMap<IpAddr, u64>,
+    /// The revocation reason currently announced in the log, so the
+    /// transitions are logged and the steady state is not.
+    ///
+    /// A disqualification is an operator-visible state change and until
+    /// now it reached `packetframe status` and nothing else — which is
+    /// fine on a rig somebody is watching and useless on the primary at
+    /// 03:00, where the journal is the record. Logging it every tick
+    /// instead would be 288 identical warnings a day, which is the same
+    /// as not logging it.
+    announced_revocation: Option<String>,
 }
 
 impl FrrAuthorityChecker {
@@ -178,6 +188,7 @@ impl FrrAuthorityChecker {
             completeness: None,
             shutdown,
             seen_epochs: HashMap::new(),
+            announced_revocation: None,
         }
     }
 
@@ -228,7 +239,21 @@ impl FrrAuthorityChecker {
         // outside the pair — same placement as the birdc checker's peer
         // count, and for the same reason: a subprocess call that neither
         // number depends on must not sit between them.
-        let eligibility = self.eligibility().await;
+        let mut eligibility = self.eligibility().await;
+        // The mirror's own composition is evidence too, and it needs no
+        // subprocess — so it is checked here rather than inside
+        // `eligibility`, which is the vtysh half. It outranks
+        // `Unknown` for the usual reason (a fact beats a failed read)
+        // and defers to an existing `Revoked`, because the first reason
+        // found is as true as the second and churning the message
+        // between ticks helps nobody.
+        if let Some((v4, v6)) = mirror.as_ref().ok().copied() {
+            if let Some(r) = mirror_family_mismatch(v4, v6, &self.config.counted_families()) {
+                if !matches!(eligibility, Eligibility::Revoked(_)) {
+                    eligibility = Eligibility::Revoked(r);
+                }
+            }
+        }
 
         let fresh_authority = authority.as_ref().ok().copied();
         let fresh_mirror = mirror.as_ref().ok().map(|(v4, v6)| v4 + v6);
@@ -251,6 +276,27 @@ impl FrrAuthorityChecker {
             Eligibility::Revoked(r) => Some(r.describe().to_string()),
             Eligibility::Ok | Eligibility::Unknown(_) => None,
         };
+        // Transitions only. Entering a revocation, or the reason
+        // changing under it, is what an operator needs in the journal;
+        // the steady state is what `packetframe status` is for.
+        match (&snap.revoked, &self.announced_revocation) {
+            (Some(now), prev) if prev.as_deref() != Some(now.as_str()) => {
+                warn!(
+                    reason = %now,
+                    "completeness authority: mirror DISQUALIFIED — steering refused until a \
+                     check comes back clean AND the counts agree"
+                );
+                self.announced_revocation = Some(now.clone());
+            }
+            (None, Some(prev)) => {
+                info!(
+                    cleared = %prev,
+                    "completeness authority: mirror eligible again"
+                );
+                self.announced_revocation = None;
+            }
+            _ => {}
+        }
         if let Err(e) = &authority {
             snap.last_error = Some(e.clone());
             warn!(error = %e, "FRR authority: prefix count failed");

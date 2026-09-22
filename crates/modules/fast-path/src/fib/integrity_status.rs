@@ -499,8 +499,9 @@ impl IntegrityPosture {
                         d.threshold * 100.0
                     )
                 }
-                None => "no drift fraction is defined: bird reports NO prefixes in \
-                         master4/master6, and a fraction of zero says nothing"
+                None => "no drift fraction is defined: the authority reports NO prefixes \
+                         in the families it was asked about, and a fraction of zero says \
+                         nothing"
                     .to_string(),
             }
         };
@@ -516,7 +517,7 @@ impl IntegrityPosture {
         let rollout = if gate.permits_steering() {
             "a second-tier steering gate reads this same comparison and would permit a steer \
              — this is the positive evidence a rollout needs, and the counts behind it are \
-             bird's master4 plus master6 against the mirror's v4+v6"
+             the authority's own table against the route mirror"
                 .to_string()
         } else {
             state = state.worse_of(HealthState::Degraded);
