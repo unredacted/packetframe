@@ -258,6 +258,21 @@ impl FrrAuthorityChecker {
         let fresh_authority = authority.as_ref().ok().copied();
         let fresh_mirror = mirror.as_ref().ok().map(|(v4, v6)| v4 + v6);
 
+        // Exactly one observation per tick, and the precedence is the
+        // point of the ordering.
+        //
+        // A disqualification is POSITIVE evidence and outranks a partial
+        // read: if one upstream could not be read and another answered
+        // "not Established", the second is a fact and must withdraw
+        // permission. A count that could not be sampled, by contrast,
+        // can never produce `Clean` — so a tick that read eligibility
+        // fine and lost the counts is `Unreadable`, which retains the
+        // previous report under the age policy and retains any standing
+        // revocation. Neither of those is the same as renewing.
+        if let Some(handle) = self.completeness.as_ref() {
+            handle.record(observation(&eligibility, fresh_authority, fresh_mirror, at));
+        }
+
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
         snap.last_error = None;
@@ -265,16 +280,36 @@ impl FrrAuthorityChecker {
         // The disqualification, on the snapshot as its own fact.
         //
         // It is NOT an error — nothing failed to be read, and the remedy
-        // is in the operator's BGP configuration. But without it a tick
+        // is in the operator's BGP configuration. Without it a tick
         // whose counts agreed recorded a clean comparison and no error,
         // so `fib-integrity` reported a converged authority while
         // `TableCompleteness` held `Ineligible` and the second tier
         // refused every steer, with the concrete reason nowhere on the
-        // box (review finding, PR #232). Cleared on every run that is
-        // not revoked, so it always describes THIS tick.
-        snap.revoked = match &eligibility {
-            Eligibility::Revoked(r) => Some(r.clone()),
-            Eligibility::Ok | Eligibility::Unknown(_) => None,
+        // box (review finding, PR #232).
+        //
+        // **The STANDING revocation, not this tick's observation**, and
+        // that is the whole reason the handle is consulted rather than
+        // `eligibility` read directly. Revocation is sticky: a tick that
+        // could not read `vtysh` publishes `Unreadable`, which leaves it
+        // in force. Reporting this tick instead would drop the
+        // DISQUALIFIED clause the moment vtysh failed — while steering
+        // stayed refused — and the row would go back to advertising the
+        // rollout, which is the contradiction fixed one commit ago
+        // arriving through a second door.
+        //
+        // With no handle there is no second tier and so no standing
+        // state to consult; this tick's own observation is then the only
+        // thing there is to report, and nothing is enforcing stickiness
+        // for it to contradict.
+        snap.revoked = match self.completeness.as_ref() {
+            Some(handle) => match handle.latest_verdict().1 {
+                packetframe_common::fib::Completeness::Ineligible(r) => Some(r),
+                _ => None,
+            },
+            None => match &eligibility {
+                Eligibility::Revoked(r) => Some(r.clone()),
+                Eligibility::Ok | Eligibility::Unknown(_) => None,
+            },
         };
         // Transitions only. Entering a revocation, or the reason
         // changing under it, is what an operator needs in the journal;
@@ -354,24 +389,7 @@ impl FrrAuthorityChecker {
                 drift,
             });
         }
-
-        let Some(handle) = self.completeness.as_ref() else {
-            return;
-        };
-        // Exactly one observation per tick, and the precedence is the
-        // point of the ordering.
-        //
-        // A disqualification is POSITIVE evidence and outranks a partial
-        // read: if one upstream could not be read and another answered
-        // "not Established", the second is a fact and must withdraw
-        // permission. A count that could not be sampled, by contrast,
-        // can never produce `Clean` — so a tick that read eligibility
-        // fine and lost the counts is `Unreadable`, which retains the
-        // previous report under the age policy and retains any standing
-        // revocation. Neither of those is the same as renewing.
-        handle.record(observation(&eligibility, fresh_authority, fresh_mirror, at));
     }
-
     /// Sum the declared families' prefix counts.
     ///
     /// One `vtysh` per family, run concurrently. Batching them into a

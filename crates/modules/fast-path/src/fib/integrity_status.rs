@@ -1042,4 +1042,75 @@ mod tests {
             "a revocation outranks agreeing counts, exactly as latest_verdict orders it"
         );
     }
+
+    /// A revocation that survives an unreadable tick must survive it on
+    /// the STATUS ROW too, not just in the gate.
+    ///
+    /// The second door into the contradiction fixed above, found by
+    /// tracing what D3's drill 2 would print before running it: move
+    /// `vtysh` aside while revoked, and the tick's own eligibility
+    /// becomes `Unknown`. `TableCompleteness` correctly stays revoked —
+    /// that is what sticky means, and steering stays refused — but a row
+    /// derived from the tick rather than from the standing state drops
+    /// the DISQUALIFIED clause and goes back to advertising the rollout.
+    ///
+    /// So the assertion is on the handle's verdict driving the row, and
+    /// it is written against `TableCompleteness` directly because that
+    /// is the thing whose stickiness the row has to inherit.
+    #[test]
+    fn an_unreadable_tick_does_not_lift_the_row_s_disqualification() {
+        use packetframe_common::fib::{
+            AuthorityObservation, Completeness, Revocation, TableCompleteness,
+        };
+
+        let h = TableCompleteness::new();
+        h.record(AuthorityObservation::Disqualified(
+            Revocation::UpstreamNotReady("upstream 192.0.2.1 is not Established".into()),
+        ));
+        // The tick after: nothing could be read at all.
+        h.record(AuthorityObservation::Unreadable);
+
+        let Completeness::Ineligible(r) = h.latest_verdict().1 else {
+            panic!("an unreadable tick must not lift a revocation");
+        };
+
+        // And that is what the row renders — counts agreeing or not.
+        let at = t0();
+        let mut snap = clean_run(at, 100, 100, drift(0.0, 0.01));
+        snap.revoked = Some(r);
+        let msg = IntegrityPosture::observe(&snap, at + Duration::from_secs(5))
+            .subsystem_health()
+            .message
+            .expect("a message");
+        assert!(msg.contains("DISQUALIFIED"), "{msg}");
+        assert!(
+            !msg.contains("would permit a steer"),
+            "the row must not advertise a steer the gate refuses, whichever door it \
+             arrives through: {msg}"
+        );
+    }
+
+    /// The counterpart: a genuinely clean, agreeing tick DOES lift it,
+    /// or the row would latch on the first flap and never recover.
+    #[test]
+    fn a_clean_agreeing_tick_lifts_it_again() {
+        use packetframe_common::fib::{
+            AuthorityObservation, CompletenessReport, Revocation, TableCompleteness,
+        };
+        use std::time::Instant;
+
+        let h = TableCompleteness::new();
+        h.record(AuthorityObservation::Disqualified(
+            Revocation::UpstreamNotReady("upstream 192.0.2.1 is not Established".into()),
+        ));
+        h.record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: 69_155,
+            mirror_routes: 69_155,
+            at: Instant::now(),
+        }));
+        assert!(
+            h.latest_verdict().1.permits_steering(),
+            "one clean agreeing check is exactly what re-eligibility costs"
+        );
+    }
 }
