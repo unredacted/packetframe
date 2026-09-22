@@ -451,18 +451,28 @@ pub fn classify_eligibility(
     }
 }
 
-/// Does the mirror hold a family no declared upstream carries?
+/// Does the feed deliver a family no declared upstream carries?
 ///
 /// The two halves of the comparison must count the same thing. The
 /// authority side sums only the declared families; the mirror side is
 /// the whole mirror, because that is what a steer would divert traffic
-/// into. When the mirror carries a family nobody declared, those two
-/// are measuring different sets — and the arithmetic reads the mirror as
+/// into. When the feed carries a family nobody declared, those two are
+/// measuring different sets — and the arithmetic reads the mirror as
 /// LARGER than the authority, which `assess` classifies as
 /// `AuthorityMismatch`: "that is not the authority feeding this mirror".
 /// It is, and the message would send an operator to check which FRR
 /// `vtysh` is talking to when the answer is one missing word in their
 /// own config.
+///
+/// **Route-source routes only.** The first version took its evidence
+/// from `mirror_counts()`, which includes the synthetic `local-prefix`
+/// /32s and /128s the neighbour resolver injects under `local_arp` —
+/// resident for the daemon's life, belonging to no session. One
+/// `local-prefix6` on a v4-only box then read as "the feed carries v6",
+/// and this check revoked, stickily, a perfectly valid deployment: the
+/// refuse-forever failure the whole family redesign existed to remove,
+/// reintroduced by the check meant to guard it (review finding, PR
+/// #234). The caller passes `FibProgrammerHandle::session_families`.
 ///
 /// Reported as a revocation rather than left to the counts, for the
 /// reason every other conjunct here exists: it is a fact about the
@@ -471,17 +481,17 @@ pub fn classify_eligibility(
 /// would attest a table whose other half nobody compared, which is
 /// exactly what declaring too few families is supposed to prevent.
 pub fn mirror_family_mismatch(
-    mirror_v4: usize,
-    mirror_v6: usize,
+    session_v4: bool,
+    session_v6: bool,
     declared: &[AuthorityFamily],
 ) -> Option<Revocation> {
-    for (count, family) in [
-        (mirror_v4, AuthorityFamily::V4),
-        (mirror_v6, AuthorityFamily::V6),
+    for (present, family) in [
+        (session_v4, AuthorityFamily::V4),
+        (session_v6, AuthorityFamily::V6),
     ] {
-        if count > 0 && !declared.contains(&family) {
+        if present && !declared.contains(&family) {
             return Some(Revocation::UnsupportedExport(format!(
-                "the route mirror holds {count} {} routes, but no declared upstream carries \
+                "the route feed is delivering {} routes, but no declared upstream carries \
                  {} — the comparison would count the authority's declared families against \
                  the whole mirror, which reads as a mismatch rather than the missing \
                  declaration it is. Add `families` covering {} to the upstream that carries \
@@ -1297,39 +1307,38 @@ router bgp 65000
         use super::super::*;
 
         #[test]
-        fn an_undeclared_family_in_the_mirror_revokes_and_says_which() {
-            let r = mirror_family_mismatch(1_000, 42, &[AuthorityFamily::V4])
-                .expect("v6 in the mirror with only v4 declared");
+        fn an_undeclared_family_in_the_feed_revokes_and_says_which() {
+            let r = mirror_family_mismatch(true, true, &[AuthorityFamily::V4])
+                .expect("v6 in the feed with only v4 declared");
             let why = r.describe();
-            assert!(why.contains("42 ipv6 routes"), "{why}");
+            assert!(why.contains("delivering ipv6 routes"), "{why}");
             assert!(why.contains("`families`"), "name the remedy: {why}");
             assert!(why.contains("restart-only"), "and that it needs one: {why}");
         }
 
-        /// Symmetric — a v4-only mirror under a v6-only declaration is
-        /// the same mistake in the other direction.
+        /// Symmetric — a v4-only feed under a v6-only declaration is the
+        /// same mistake in the other direction.
         #[test]
         fn it_works_in_both_directions() {
-            assert!(mirror_family_mismatch(7, 0, &[AuthorityFamily::V6]).is_some());
-            assert!(mirror_family_mismatch(0, 7, &[AuthorityFamily::V4]).is_some());
+            assert!(mirror_family_mismatch(true, false, &[AuthorityFamily::V6]).is_some());
+            assert!(mirror_family_mismatch(false, true, &[AuthorityFamily::V4]).is_some());
         }
 
-        /// An EMPTY family is not a mismatch. A dual-stack box whose v6
-        /// half has simply not loaded yet must not be disqualified for
-        /// it — that is the ordinary startup shape, and the readiness
-        /// conjunct already covers a feed that never arrives.
+        /// An ABSENT family is not a mismatch. A dual-stack box whose v6
+        /// half has not loaded yet must not be disqualified for it —
+        /// that is the ordinary startup shape, and readiness already
+        /// covers a feed that never arrives.
         #[test]
-        fn a_family_with_no_routes_is_not_a_mismatch() {
-            assert!(mirror_family_mismatch(1_000, 0, &[AuthorityFamily::V4]).is_none());
-            assert!(mirror_family_mismatch(0, 0, &[AuthorityFamily::V4]).is_none());
+        fn a_family_the_feed_is_not_delivering_is_not_a_mismatch() {
+            assert!(mirror_family_mismatch(true, false, &[AuthorityFamily::V4]).is_none());
+            assert!(mirror_family_mismatch(false, false, &[AuthorityFamily::V4]).is_none());
         }
 
-        /// And the declared-everything case, which is the rig's.
         #[test]
-        fn declaring_what_the_mirror_holds_is_clean() {
+        fn declaring_what_the_feed_delivers_is_clean() {
             assert!(mirror_family_mismatch(
-                69_155,
-                12,
+                true,
+                true,
                 &[AuthorityFamily::V4, AuthorityFamily::V6]
             )
             .is_none());

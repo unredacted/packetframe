@@ -2199,6 +2199,83 @@ fn only_route_source_peers_count_as_session_routes() {
     });
 }
 
+/// `session_families` reports what the FEED delivers, not what the
+/// mirror holds.
+///
+/// The FRR authority revokes when the feed carries a family no
+/// declared upstream does. It first took that evidence from
+/// `mirror_counts()`, which includes the resolver's synthetic
+/// `local-prefix` routes — so a single `local-prefix6` /128 on a v4-only
+/// box read as "the feed carries v6" and revoked, stickily, a valid
+/// deployment (review finding, PR #234). The synthetic route here is
+/// v6 and the session route is v4 on purpose: that is exactly the shape
+/// that tripped it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn session_families_ignore_local_prefix_routes() {
+    let h = ProgrammerHarness::new();
+    let session_peer = PeerId(0x7070);
+    let local_peer = PeerId::local_arp(34);
+    let nh4 = IpAddr::V4(Ipv4Addr::new(10, 3, 0, 1));
+    let nh6 = IpAddr::V6("2001:db8::1".parse().expect("v6"));
+
+    h.run(async {
+        assert_eq!(
+            h.handle.session_families().await.expect("query"),
+            (false, false),
+            "a fresh programmer carries no family"
+        );
+
+        // A synthetic local-prefix6 /128 — no session owns it.
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: local_peer,
+                prefix: IpPrefix::V6 {
+                    addr: "2001:db8::9"
+                        .parse::<std::net::Ipv6Addr>()
+                        .expect("v6")
+                        .octets(),
+                    prefix_len: 128,
+                },
+                nexthops: vec![nh6],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("local-prefix6 route");
+        assert_eq!(
+            h.handle.session_families().await.expect("query"),
+            (false, false),
+            "a local-prefix /128 is not a v6 feed"
+        );
+        let (_, mirror_v6) = h.handle.mirror_counts().await.expect("counts");
+        assert_eq!(
+            mirror_v6, 1,
+            "while the whole mirror DOES count it — which is the difference that matters"
+        );
+
+        // The session delivers v4 only.
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: session_peer,
+                prefix: IpPrefix::V4 {
+                    addr: [198, 18, 31, 0],
+                    prefix_len: 24,
+                },
+                nexthops: vec![nh4],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("session v4 route");
+        assert_eq!(
+            h.handle.session_families().await.expect("query"),
+            (true, false),
+            "v4 from the session, and still no v6 feed despite the synthetic /128"
+        );
+    });
+}
+
 /// Re-advertising an identical nexthop set announces nothing.
 ///
 /// Not an optimisation: under a peering flap the same prefix is

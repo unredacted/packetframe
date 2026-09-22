@@ -298,6 +298,32 @@ impl FibProgrammerHandle {
             .map_err(|_| ProgrammerError::Shutdown)?;
         rx.await.map_err(|_| ProgrammerError::Shutdown)
     }
+
+    /// `(any v4, any v6)` among ROUTE-SOURCE routes — which address
+    /// families the feed is actually delivering.
+    ///
+    /// Narrower than [`Self::mirror_counts`] for the reason
+    /// [`Self::has_session_routes`] is: the synthetic `local-prefix`
+    /// routes live in the same mirror under [`PeerId::local_arp`] and
+    /// belong to no session. Asked of the whole mirror, one
+    /// `local-prefix6` /128 answers "the feed carries v6" on a box
+    /// whose upstreams carry nothing but v4 — and the FRR authority
+    /// then revokes, stickily, for a family nobody forgot to declare
+    /// (review finding, PR #234).
+    ///
+    /// Booleans rather than counts because counts would have to be
+    /// deduplicated: a prefix several sessions advertise sits in every
+    /// one of their sets, so a per-peer sum is an upper bound that
+    /// reads like a measurement. The question being asked is only
+    /// "is this family present at all".
+    pub async fn session_families(&self) -> Result<(bool, bool), ProgrammerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SessionFamilies { reply: tx })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown)?;
+        rx.await.map_err(|_| ProgrammerError::Shutdown)
+    }
 }
 
 /// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
@@ -364,6 +390,9 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
                 Command::HasSessionRoutes { reply } => {
                     let _ = reply.send(false);
                 }
+                Command::SessionFamilies { reply } => {
+                    let _ = reply.send((false, false));
+                }
                 // Fire-and-forget; nothing to record or reply to.
                 Command::SetCacheEnabled { .. } | Command::SetNexthopPin { .. } => {}
             }
@@ -396,6 +425,11 @@ enum Command {
     /// Report whether any route-source peer still holds an
     /// advertisement. See [`FibProgrammerHandle::has_session_routes`].
     HasSessionRoutes { reply: oneshot::Sender<bool> },
+    /// Report which families route-source routes occupy. See
+    /// [`FibProgrammerHandle::session_families`].
+    SessionFamilies {
+        reply: oneshot::Sender<(bool, bool)>,
+    },
     /// Flip the destination cache on or off. Fire-and-forget: config
     /// apply and SIGHUP reconcile send this instead of touching
     /// FIB_CACHE_CFG themselves — the programmer is the map's sole
@@ -911,6 +945,30 @@ impl FibProgrammer {
                         .keys()
                         .any(|p| p.as_local_arp_ifindex().is_none());
                 let _ = reply.send(any);
+            }
+            Command::SessionFamilies { reply } => {
+                // Early-exit per family: O(session peers), not O(routes),
+                // and it stops as soon as both answers are known.
+                let (mut v4, mut v6) = (false, false);
+                for (peer, keys) in &self.routes_by_peer {
+                    if peer.as_local_arp_ifindex().is_some() {
+                        continue;
+                    }
+                    for (is_v4, _, _) in keys {
+                        if *is_v4 {
+                            v4 = true;
+                        } else {
+                            v6 = true;
+                        }
+                        if v4 && v6 {
+                            break;
+                        }
+                    }
+                    if v4 && v6 {
+                        break;
+                    }
+                }
+                let _ = reply.send((v4, v6));
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
             Command::SetNexthopPin { ip, pin } => self.set_nexthop_pin(ip, pin),

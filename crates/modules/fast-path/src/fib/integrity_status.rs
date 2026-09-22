@@ -396,8 +396,9 @@ impl IntegrityPosture {
             state = state.worse_of(HealthState::Degraded);
             clauses.push(format!(
                 "the authority has DISQUALIFIED this mirror regardless of the counts: {}. \
-                 Steering is refused while this holds, and it clears only on a check that \
-                 comes back clean AND whose counts agree — waiting alone will not do it",
+                 A steering gate that consults this authority would refuse while this holds, \
+                 and it clears only on a check that comes back clean AND whose counts agree \
+                 — waiting alone will not do it",
                 r.describe()
             ));
         }
