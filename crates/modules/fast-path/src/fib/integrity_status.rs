@@ -133,7 +133,7 @@ pub struct IntegritySnapshot {
     /// concrete reason nowhere on the box (review finding, PR #232).
     /// Not an `error`: nothing failed to be read, and the remedy is in
     /// the operator's BGP configuration rather than in this checker.
-    pub revoked: Option<String>,
+    pub revoked: Option<packetframe_common::fib::Revocation>,
     /// Why the most recent run could not complete. Cleared at the start
     /// of every run, so it always describes `last_run` and never an
     /// older one.
@@ -196,7 +196,25 @@ impl Sample {
     /// operator who tuned `drift-warn-fraction` away from the default
     /// got a row that advertised a rollout across a whole range the
     /// gate refuses.
-    pub fn gate_verdict(&self) -> packetframe_common::fib::Completeness {
+    /// `revoked` is the authority's standing disqualification, and it
+    /// is an ARGUMENT rather than something this reconstructs, for the
+    /// same reason the thresholds are not restated above: the gate
+    /// reads it, so a predictor that did not would predict the wrong
+    /// thing. It did, briefly, and the rig printed the result in one
+    /// line — "Steering is refused while this holds" immediately
+    /// followed by "would permit a steer — this is the positive
+    /// evidence a rollout needs" (2026-09-22). An operator reading the
+    /// second half would have proceeded.
+    ///
+    /// Ordered exactly as `TableCompleteness::latest_verdict` orders
+    /// it: a revocation outranks the counts, whatever they say.
+    pub fn gate_verdict(
+        &self,
+        revoked: Option<&packetframe_common::fib::Revocation>,
+    ) -> packetframe_common::fib::Completeness {
+        if let Some(r) = revoked {
+            return packetframe_common::fib::Completeness::Ineligible(r.clone());
+        }
         packetframe_common::fib::assess(
             Some(self.report()),
             self.observed_at,
@@ -237,7 +255,11 @@ pub enum IntegrityPosture {
         /// Which daemon answered, for the wording.
         authority: Option<&'static str>,
         /// Why the mirror is disqualified regardless of the counts.
-        revoked: Option<String>,
+        ///
+        /// The typed value, not a rendered string: `gate_verdict` needs
+        /// it to predict the gate correctly, and a message cannot be
+        /// turned back into the verdict it describes.
+        revoked: Option<packetframe_common::fib::Revocation>,
     },
     /// The snapshot was being written at the instant status sampled it.
     ///
@@ -330,7 +352,7 @@ impl IntegrityPosture {
                 sample.as_ref(),
                 error.as_deref(),
                 *authority,
-                revoked.as_deref(),
+                revoked.as_ref(),
             ),
         };
         SubsystemHealth {
@@ -360,7 +382,7 @@ impl IntegrityPosture {
         sample: Option<&Sample>,
         error: Option<&str>,
         authority: Option<&'static str>,
-        revoked: Option<&str>,
+        revoked: Option<&packetframe_common::fib::Revocation>,
     ) -> (HealthState, String) {
         let mut state = HealthState::Healthy;
         let mut clauses: Vec<String> = Vec::new();
@@ -370,19 +392,19 @@ impl IntegrityPosture {
         // perfectly while the mirror is ineligible, and a row that led
         // with "converged" would describe an authority that is refusing
         // every steer. Degraded rather than Healthy for the same reason.
-        if let Some(why) = revoked {
+        if let Some(r) = revoked {
             state = state.worse_of(HealthState::Degraded);
             clauses.push(format!(
-                "the authority has DISQUALIFIED this mirror regardless of the counts: \
-                 {why}. Steering is refused while this holds, and it clears only on a \
-                 check that comes back clean AND whose counts agree — waiting alone will \
-                 not do it"
+                "the authority has DISQUALIFIED this mirror regardless of the counts: {}. \
+                 Steering is refused while this holds, and it clears only on a check that \
+                 comes back clean AND whose counts agree — waiting alone will not do it",
+                r.describe()
             ));
         }
 
         match sample {
             Some(s) => {
-                let (verdict_state, verdict) = Self::verdict(s, authority);
+                let (verdict_state, verdict) = Self::verdict(s, authority, revoked);
                 state = state.worse_of(verdict_state);
                 clauses.push(verdict);
             }
@@ -462,7 +484,11 @@ impl IntegrityPosture {
     /// at the boundary where the two comparisons differ (`>=` here,
     /// `<=` there), and across the entire range between them for any
     /// operator who had tuned the warn fraction (review finding).
-    fn verdict(s: &Sample, authority: Option<&'static str>) -> (HealthState, String) {
+    fn verdict(
+        s: &Sample,
+        authority: Option<&'static str>,
+        revoked: Option<&packetframe_common::fib::Revocation>,
+    ) -> (HealthState, String) {
         let mut state = HealthState::Healthy;
         let counts = format!(
             "{} {} prefixes, mirror {}",
@@ -471,7 +497,7 @@ impl IntegrityPosture {
             s.packetframe_prefixes
         );
 
-        let gate = s.gate_verdict();
+        let gate = s.gate_verdict(revoked);
 
         // The drift PERCENTAGE is only worth printing when it is a
         // drift. When the authority is at fault — the mirror holds far
@@ -641,7 +667,7 @@ mod tests {
             other => panic!("expected Checked, got {other:?}"),
         };
         // The gate permits at the boundary; the warn fires at it.
-        assert!(s.gate_verdict().permits_steering());
+        assert!(s.gate_verdict(None).permits_steering());
         assert!(s.drift.unwrap().above);
 
         let m = IntegrityPosture::observe(&snap, at)
@@ -943,5 +969,77 @@ mod tests {
             // vpp-offload's status arms shipped once.
             assert!(!m.contains("   "), "indentation leaked into {p:?}: {m}");
         }
+    }
+
+    /// A revoked row must not also advertise a rollout.
+    ///
+    /// Printed verbatim by the lab rig, 2026-09-22, in ONE line:
+    ///
+    /// > Steering is refused while this holds … a second-tier steering
+    /// > gate reads this same comparison and would permit a steer —
+    /// > this is the positive evidence a rollout needs
+    ///
+    /// `gate_verdict` exists to PREDICT the gate, and its own doc says
+    /// any rule restated there can drift out from under it. Adding
+    /// revocation to the gate without teaching the predictor is exactly
+    /// that drift — and the failure is not cosmetic: an operator reading
+    /// the second half proceeds with a steer the gate refuses.
+    #[test]
+    fn a_revoked_row_does_not_advertise_a_rollout() {
+        use packetframe_common::fib::Revocation;
+        let at = t0();
+        let mut snap = clean_run(at, 69_155, 69_155, drift(0.0, 0.01));
+        snap.revoked = Some(Revocation::UpstreamNotReady(
+            "upstream 192.0.2.1 re-established since the last check (epoch 1 → 2)".into(),
+        ));
+
+        let row = IntegrityPosture::observe(&snap, at + Duration::from_secs(15)).subsystem_health();
+        let msg = row.message.expect("a message");
+
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            msg.contains("DISQUALIFIED") && msg.contains("epoch 1 → 2"),
+            "the reason is still reported: {msg}"
+        );
+        assert!(
+            !msg.contains("would permit a steer"),
+            "and must NOT predict a steer the gate refuses: {msg}"
+        );
+        assert!(
+            !msg.contains("positive evidence a rollout needs"),
+            "nor invite one: {msg}"
+        );
+        assert!(
+            msg.contains("would refuse") || msg.contains("disqualifies"),
+            "the prediction has to say what the gate would actually do: {msg}"
+        );
+        // The counts are still shown — an operator watching the mirror
+        // refill needs them, and hiding them was never the fix.
+        assert!(msg.contains("69155"), "{msg}");
+    }
+
+    /// The predictor is the decision function, not a copy of it.
+    #[test]
+    fn the_gate_prediction_tracks_revocation() {
+        use packetframe_common::fib::{Completeness, Revocation};
+        let at = t0();
+        let snap = clean_run(at, 100, 100, drift(0.0, 0.01));
+        let IntegrityPosture::Checked { sample, .. } =
+            IntegrityPosture::observe(&snap, at + Duration::from_secs(1))
+        else {
+            panic!("expected Checked");
+        };
+        let s = sample.expect("a sample");
+
+        assert!(s.gate_verdict(None).permits_steering());
+        let r = Revocation::UnsupportedExport("neighbor 198.51.100.2 route-map OUT out".into());
+        assert!(matches!(
+            s.gate_verdict(Some(&r)),
+            Completeness::Ineligible(_)
+        ));
+        assert!(
+            !s.gate_verdict(Some(&r)).permits_steering(),
+            "a revocation outranks agreeing counts, exactly as latest_verdict orders it"
+        );
     }
 }

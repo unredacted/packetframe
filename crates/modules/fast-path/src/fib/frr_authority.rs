@@ -273,13 +273,14 @@ impl FrrAuthorityChecker {
         // box (review finding, PR #232). Cleared on every run that is
         // not revoked, so it always describes THIS tick.
         snap.revoked = match &eligibility {
-            Eligibility::Revoked(r) => Some(r.describe().to_string()),
+            Eligibility::Revoked(r) => Some(r.clone()),
             Eligibility::Ok | Eligibility::Unknown(_) => None,
         };
         // Transitions only. Entering a revocation, or the reason
         // changing under it, is what an operator needs in the journal;
         // the steady state is what `packetframe status` is for.
-        match (&snap.revoked, &self.announced_revocation) {
+        let now_reason = snap.revoked.as_ref().map(|r| r.describe().to_string());
+        match (&now_reason, &self.announced_revocation) {
             (Some(now), prev) if prev.as_deref() != Some(now.as_str()) => {
                 warn!(
                     reason = %now,
