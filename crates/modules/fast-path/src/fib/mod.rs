@@ -17,6 +17,13 @@ pub mod types;
 /// docs.
 pub mod integrity_status;
 
+/// Ungated for the same reason: the FRR authority's parsing is pure
+/// (it reads `vtysh`'s JSON, it does not invoke it), and the field
+/// choices it encodes are subtle enough that their tests should not
+/// need a VM to run. The `vtysh` invocation itself is Linux-gated
+/// inside the module.
+pub mod frr;
+
 #[cfg(target_os = "linux")]
 pub mod anyip;
 #[cfg(target_os = "linux")]
