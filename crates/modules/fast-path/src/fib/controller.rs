@@ -30,6 +30,7 @@ use tracing::{error, info, warn};
 
 use crate::fib::integrity::{
     shared_snapshot, IntegrityChecker, IntegrityConfig, IntegrityPosture, SharedSnapshot,
+    DEFAULT_INTERVAL,
 };
 use crate::fib::netlink_neigh::{
     FallbackDefaultSpec, LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver,
@@ -38,6 +39,90 @@ use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError
 use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
 use crate::fib::route_source_bmp::BmpStation;
 use packetframe_common::config::IntegrityAuthoritySpec;
+
+use crate::fib::frr_authority::{FrrAuthorityChecker, FrrAuthorityConfig};
+
+/// Spawn the completeness authority the config names, if any.
+///
+/// One function for both route sources. It was the same twenty lines
+/// twice — which was survivable with one authority and is not with two:
+/// the third copy is where a `with_completeness` gets forgotten on one
+/// path only, and the symptom would be a second tier that never receives
+/// an attestation and defers its first steer forever, on one feed type,
+/// silently.
+///
+/// `integrity-authority none` spawns nothing but still allocates the
+/// snapshot (the BMP stall gate reads it). That is not an omission: a
+/// mirror fed from a route source elsewhere has no local RIB that is its
+/// authority, and comparing against the wrong one produced the
+/// 6.8-million-percent "drift" the shadow reported for months.
+///
+/// `pf_peer` is packetframe's own listen address, which the FRR
+/// authority needs and the `birdc` one does not. `None` where the feed
+/// has no such session; config validation refuses the FRR authority
+/// there, so the arm cannot be reached with a `None`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_authority(
+    spec: &IntegrityAuthoritySpec,
+    pf_peer: Option<IpAddr>,
+    snapshot: &SharedSnapshot,
+    prog: &FibProgrammerHandle,
+    completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    shutdown: &CancellationToken,
+    runtime: &Runtime,
+    tasks: &mut Vec<JoinHandle<()>>,
+) {
+    match spec {
+        IntegrityAuthoritySpec::None => {}
+        IntegrityAuthoritySpec::Birdc { path } => {
+            let mut icfg = IntegrityConfig::default();
+            if let Some(p) = path {
+                icfg.birdc_path = p.clone();
+            }
+            let mut checker =
+                IntegrityChecker::new(icfg, snapshot.clone(), prog.clone(), shutdown.clone());
+            // The second tier's steering gate reads what this
+            // publishes; see `TableCompleteness`.
+            if let Some(h) = completeness.clone() {
+                checker = checker.with_completeness(h);
+            }
+            tasks.push(runtime.spawn(async move { checker.run().await }));
+        }
+        IntegrityAuthoritySpec::Frr {
+            vtysh,
+            upstreams,
+            families,
+        } => {
+            let Some(peer) = pf_peer else {
+                // Unreachable through config validation, and an
+                // `expect` here would be a panic in a loader path. A
+                // refused attach with the reason named is the right
+                // failure for a combination that should have been
+                // caught earlier.
+                error!(
+                    "internal: `integrity-authority frr` reached a route source with no \
+                     BGP session of its own; no authority will run and a first steer \
+                     will defer. This combination is supposed to be refused at config \
+                     validation"
+                );
+                return;
+            };
+            let cfg = FrrAuthorityConfig::new(
+                DEFAULT_INTERVAL,
+                vtysh.clone(),
+                upstreams.clone(),
+                families.clone(),
+                peer,
+            );
+            let mut checker =
+                FrrAuthorityChecker::new(cfg, snapshot.clone(), prog.clone(), shutdown.clone());
+            if let Some(h) = completeness.clone() {
+                checker = checker.with_completeness(h);
+            }
+            tasks.push(runtime.spawn(async move { checker.run().await }));
+        }
+    }
+}
 
 /// Forwarding-feed source. The controller spawns at most one route
 /// source: operators pick `bmp` or `bgp` via `route-source ...`.
@@ -329,24 +414,21 @@ impl RouteController {
                 // so a birdc comparison would be against the wrong
                 // reference — the 6.8-million-percent "drift" the shadow
                 // reported for months.
-                if let IntegrityAuthoritySpec::Birdc { path } = &integrity_authority {
-                    let mut icfg = IntegrityConfig::default();
-                    if let Some(p) = path {
-                        icfg.birdc_path = p.clone();
-                    }
-                    let mut checker = IntegrityChecker::new(
-                        icfg,
-                        snapshot.clone(),
-                        prog_handle.clone(),
-                        shutdown_token.clone(),
-                    );
-                    // The second tier's steering gate reads what this
-                    // publishes; see `TableCompleteness`.
-                    if let Some(h) = completeness.clone() {
-                        checker = checker.with_completeness(h);
-                    }
-                    tasks.push(runtime.spawn(async move { checker.run().await }));
-                }
+                spawn_authority(
+                    &integrity_authority,
+                    // No BGP session feeds a BMP mirror, so there is no
+                    // peer whose export policy could be validated —
+                    // which is exactly why config validation refuses
+                    // `integrity-authority frr` here. `None` cannot
+                    // reach the FRR arm.
+                    None,
+                    &snapshot,
+                    &prog_handle,
+                    &completeness,
+                    &shutdown_token,
+                    &runtime,
+                    &mut tasks,
+                );
 
                 // v0.2.2: spawn under a retry-with-backoff loop. Pre-fix,
                 // a `bind` failure (TIME_WAIT after a quick restart) would
@@ -416,24 +498,20 @@ impl RouteController {
                 // so a birdc comparison would be against the wrong
                 // reference — the 6.8-million-percent "drift" the shadow
                 // reported for months.
-                if let IntegrityAuthoritySpec::Birdc { path } = &integrity_authority {
-                    let mut icfg = IntegrityConfig::default();
-                    if let Some(p) = path {
-                        icfg.birdc_path = p.clone();
-                    }
-                    let mut checker = IntegrityChecker::new(
-                        icfg,
-                        snapshot.clone(),
-                        prog_handle.clone(),
-                        shutdown_token.clone(),
-                    );
-                    // The second tier's steering gate reads what this
-                    // publishes; see `TableCompleteness`.
-                    if let Some(h) = completeness.clone() {
-                        checker = checker.with_completeness(h);
-                    }
-                    tasks.push(runtime.spawn(async move { checker.run().await }));
-                }
+                spawn_authority(
+                    &integrity_authority,
+                    // PF's own listen address IS the FRR neighbour being
+                    // attested, so the export-policy check reads it from
+                    // here rather than from a directive an operator
+                    // could get wrong or let drift.
+                    Some(listen.ip()),
+                    &snapshot,
+                    &prog_handle,
+                    &completeness,
+                    &shutdown_token,
+                    &runtime,
+                    &mut tasks,
+                );
 
                 // `anyip`: claim the phantom listen address before the
                 // first bind so a fresh start binds on attempt one

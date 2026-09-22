@@ -1628,6 +1628,45 @@ impl Config {
                 )
             })
         });
+        // `integrity-authority frr` against a BMP route source is
+        // refused, and this is a gap rather than a rule.
+        //
+        // Two of the authority's three conjuncts are fine over BMP: the
+        // per-AF counts and the upstreams' End-of-RIB are read from FRR
+        // itself and say nothing about how the mirror is fed. The third
+        // is not. Export-policy validation asks whether the session
+        // feeding packetframe is narrowed, and over BMP there is no
+        // session — what narrows the feed is FRR's own `bmp targets`
+        // configuration, a different grammar that nothing on the
+        // reference fleet has been measured against. Accepting the
+        // combination would mean silently dropping the one conjunct the
+        // counts cannot substitute for: at a 1% drift tolerance a filter
+        // removing 5,000 prefixes from a million still reads
+        // `Converged`.
+        //
+        // Refused rather than downgraded, because a downgrade is
+        // invisible — the operator who wrote `integrity-authority frr`
+        // would get the weaker guarantee and a green row.
+        let authority_is_frr = fast_path.is_some_and(|fp| {
+            fp.directives.iter().any(|d| {
+                matches!(
+                    d,
+                    ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr { .. })
+                )
+            })
+        });
+        let source_is_bmp = fast_path.is_some_and(|fp| {
+            fp.directives
+                .iter()
+                .any(|d| matches!(d, ModuleDirective::RouteSource(RouteSourceSpec::Bmp { .. })))
+        });
+        if authority_is_frr && source_is_bmp {
+            return Err(ConfigError::parse(
+                0,
+                "module fast-path has `integrity-authority frr` with a BMP route source.                  The FRR authority validates the export policy of the BGP session that                  feeds this mirror, and a BMP feed has no such session — what narrows it                  is FRR's `bmp targets` configuration, which this release cannot read.                  Accepting it would quietly drop the one check the prefix counts cannot                  substitute for. Use `route-source bgp` (the production path), or                  `integrity-authority birdc` if a local bird is the real authority",
+            ));
+        }
+
         if require_complete && authority_is_none {
             return Err(ConfigError::parse(
                 0,
@@ -4870,6 +4909,52 @@ module vpp-offload
                 "a refused change must say why and what to do: {err}"
             );
         }
+    }
+
+    /// `integrity-authority frr` over a BMP feed is refused, and the
+    /// message says it is a gap rather than a rule.
+    ///
+    /// Two of the FRR authority's three conjuncts work fine over BMP —
+    /// the per-AF counts and the upstreams' End-of-RIB are read from FRR
+    /// and say nothing about how the mirror is fed. Export-policy
+    /// validation does not: over BMP there is no session to this
+    /// packetframe, and what narrows the feed is FRR's `bmp targets`
+    /// grammar, which nothing on the reference fleet has been measured
+    /// against. Accepting the combination would silently drop the one
+    /// conjunct the counts cannot substitute for, and hand back a green
+    /// row for a weaker guarantee than the operator asked for.
+    #[test]
+    fn the_frr_authority_is_refused_over_a_bmp_feed() {
+        let bmp = "module fast-path\n  forwarding-mode custom-fib\n  \
+                   route-source bmp 127.0.0.1:1790 require-loc-rib\n  \
+                   integrity-authority frr upstream 192.0.2.1\n\
+                   module vpp-offload\n  loopback-address 192.0.2.9/32\n  \
+                   port eth1 cores 1 steer off\n";
+        let err = Config::parse(bmp)
+            .unwrap()
+            .validate_vpp_offload()
+            .expect_err("must refuse");
+        let err = format!("{err}");
+        assert!(
+            err.contains("bmp targets"),
+            "name what it cannot read: {err}"
+        );
+        assert!(
+            err.contains("route-source bgp"),
+            "and the way forward: {err}"
+        );
+
+        // The same authority over the BGP feed it was designed for is
+        // accepted — and satisfies `require-table-complete on`, which
+        // is the whole point of implementing it.
+        let bgp = bmp.replace(
+            "route-source bmp 127.0.0.1:1790 require-loc-rib",
+            "route-source bgp 127.0.0.1:1179 local-as 64512 peer-as 64512",
+        );
+        Config::parse(&bgp)
+            .unwrap()
+            .validate_vpp_offload()
+            .expect("frr over bgp is the supported shape");
     }
 
     /// `require-table-complete on` + `integrity-authority none` is a

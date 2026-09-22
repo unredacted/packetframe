@@ -251,6 +251,193 @@ pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
     ExportPolicy::Unfiltered
 }
 
+// ---------------------------------------------------------------------
+// What a tick concludes. Pure, so it is tested on a dev host rather than
+// only in the qemu job — and because the *precedence* between these
+// outcomes is the whole safety argument, which is not a thing to leave
+// to an integration test that needs a NIC and a live FRR.
+// ---------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+
+use packetframe_common::fib::{AuthorityObservation, CompletenessReport, Revocation};
+
+/// What one tick established about eligibility, before the counts are
+/// considered.
+///
+/// Three outcomes rather than a `Result`, because "could not read" and
+/// "read, and it is disqualified" must not collapse: the first retains
+/// whatever standing eligibility there is, the second withdraws it. A
+/// `Result<bool, _>` would have said the same thing and invited every
+/// caller to `unwrap_or(false)` its way into treating a timeout as a
+/// disqualification — which is the *safe* direction for steering and the
+/// wrong one for an operator, who would be sent to check a BGP config
+/// that is fine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Eligibility {
+    /// Every declared upstream is loaded for its current session, the
+    /// session generation is unchanged, and nothing narrows our feed.
+    Ok,
+    /// Positive evidence of disqualification.
+    Revoked(Revocation),
+    /// Could not be established. Says nothing either way.
+    Unknown(String),
+}
+
+/// Decide eligibility from one tick's readings.
+///
+/// `seen_epochs` is read AND updated here, because the session-
+/// generation check is a comparison against the last successful reading
+/// and the two must not drift apart.
+///
+/// Precedence, and each step of it is load-bearing:
+///
+/// 1. **A narrowed export policy disqualifies outright**, whatever the
+///    upstreams say. It is the condition the counts are completely blind
+///    to — at a 1% tolerance a filter dropping 5,000 of a million reads
+///    `Converged` — so it can only ever be refused on the configuration.
+/// 2. **An upstream that answered and is not ready disqualifies**, and
+///    returns immediately: no later upstream can make this one ready.
+/// 3. **A session that re-established since the last reading
+///    disqualifies**, even when it is ready NOW. The permission standing
+///    at that moment was earned by a session that no longer exists, and
+///    on this platform a session flap is what an FRR configuration
+///    upload looks like — so the export policy read alongside the old
+///    reading may not be the current one. Revocation is sticky, so the
+///    cost is one tick.
+/// 4. **A read that failed is `Unknown`, and only if nothing above
+///    fired.** Positive evidence outranks a partial read: one upstream
+///    timing out must not hide another one answering "not Established".
+pub fn classify_eligibility(
+    export: Result<ExportPolicy, String>,
+    upstreams: &[(IpAddr, Result<UpstreamState, String>)],
+    seen_epochs: &mut HashMap<IpAddr, u64>,
+) -> Eligibility {
+    match export {
+        Ok(ExportPolicy::Filtered { why }) => {
+            return Eligibility::Revoked(Revocation::UnsupportedExport(why))
+        }
+        Ok(ExportPolicy::Unfiltered) => {}
+        Err(e) => return Eligibility::Unknown(e),
+    }
+
+    let mut unknown: Option<String> = None;
+    let mut moved: Option<String> = None;
+    for (peer, result) in upstreams {
+        let state = match result {
+            Ok(s) => s,
+            Err(e) => {
+                unknown.get_or_insert(e.clone());
+                continue;
+            }
+        };
+        if let Some(why) = state.why_not_ready() {
+            return Eligibility::Revoked(Revocation::UpstreamNotReady(why));
+        }
+        // Ready — but is it the same session the standing permission was
+        // earned under? Recorded even when it is the first sighting, so
+        // the NEXT tick has something to compare against.
+        if let Some(epoch) = state.established_epoch {
+            if let Some(prev) = seen_epochs.insert(*peer, epoch) {
+                if prev != epoch && moved.is_none() {
+                    moved = Some(format!(
+                        "upstream {peer} re-established since the last check (epoch \
+                         {prev} → {epoch}); on this platform an FRR configuration \
+                         upload restarts bgpd and flaps every session, so the previous \
+                         reading described a session that no longer exists — and the \
+                         export policy it was taken under may not be the current one"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(why) = moved {
+        return Eligibility::Revoked(Revocation::UpstreamNotReady(why));
+    }
+    match unknown {
+        Some(e) => Eligibility::Unknown(e),
+        None => Eligibility::Ok,
+    }
+}
+
+/// The single observation a tick publishes to the steering gate.
+///
+/// Three inputs, one answer, and the combination rules are why this is
+/// not written inline at the call site:
+///
+/// - A disqualification publishes regardless of the counts. It is a fact
+///   about the deployment, and the counts cannot argue with it.
+/// - `Clean` needs eligibility AND both fresh counts. A tick that read
+///   eligibility fine and lost a count has established nothing new.
+/// - Everything else is `Unreadable`, which is not neutral — it retains
+///   the previous report under the age policy and retains any standing
+///   revocation. That is the whole reason it is a distinct outcome and
+///   not "publish nothing".
+pub fn observation(
+    eligibility: &Eligibility,
+    authority: Option<usize>,
+    mirror: Option<usize>,
+    at: std::time::Instant,
+) -> AuthorityObservation {
+    match (eligibility, authority, mirror) {
+        (Eligibility::Revoked(r), _, _) => AuthorityObservation::Disqualified(r.clone()),
+        (Eligibility::Ok, Some(auth), Some(pf)) => {
+            AuthorityObservation::Clean(CompletenessReport {
+                authority_routes: auth as u64,
+                mirror_routes: pf as u64,
+                at,
+            })
+        }
+        _ => AuthorityObservation::Unreadable,
+    }
+}
+
+/// Split `vtysh`'s concatenated output into its first two JSON
+/// documents.
+///
+/// `vtysh -c A -c B` writes both answers to one stream with nothing
+/// between them. Two commands in one invocation is what lets a caller
+/// sample a session's state and the epoch that qualifies it from ONE
+/// view of FRR — read from two processes, a flap can land between them
+/// and produce a reading that is self-consistently wrong.
+///
+/// String-aware, because a route-map name, a peer description or an
+/// interface name can contain a brace and a naive depth count would cut
+/// in the wrong place.
+pub fn split_two_json(out: &str) -> Option<(&str, &str)> {
+    let bytes = out.as_bytes();
+    let start = out.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&out[start..=i], &out[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +651,331 @@ router bgp 65000
             parse_export_policy(cfg, "10.255.0.2"),
             ExportPolicy::Unfiltered
         );
+    }
+
+    /// The precedence between "disqualified", "could not read" and
+    /// "fine" — the whole safety argument of this authority.
+    mod eligibility {
+        use super::super::*;
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        fn peer(last: u8) -> IpAddr {
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
+        }
+
+        fn ready(p: IpAddr, epoch: Option<u64>) -> (IpAddr, Result<UpstreamState, String>) {
+            (
+                p,
+                Ok(UpstreamState {
+                    peer: p.to_string(),
+                    established: true,
+                    missing_eor: Vec::new(),
+                    established_epoch: epoch,
+                }),
+            )
+        }
+
+        fn down(p: IpAddr) -> (IpAddr, Result<UpstreamState, String>) {
+            (
+                p,
+                Ok(UpstreamState {
+                    peer: p.to_string(),
+                    established: false,
+                    missing_eor: Vec::new(),
+                    established_epoch: None,
+                }),
+            )
+        }
+
+        fn filling(p: IpAddr) -> (IpAddr, Result<UpstreamState, String>) {
+            (
+                p,
+                Ok(UpstreamState {
+                    peer: p.to_string(),
+                    established: true,
+                    missing_eor: vec![AuthorityFamily::V4],
+                    established_epoch: Some(1000),
+                }),
+            )
+        }
+
+        fn unreadable(p: IpAddr) -> (IpAddr, Result<UpstreamState, String>) {
+            (p, Err("vtysh timed out after 10s".into()))
+        }
+
+        #[test]
+        fn everything_ready_and_unfiltered_is_eligible() {
+            let mut seen = HashMap::new();
+            let e = classify_eligibility(
+                Ok(ExportPolicy::Unfiltered),
+                &[ready(peer(1), Some(1000)), ready(peer(2), Some(1001))],
+                &mut seen,
+            );
+            assert_eq!(e, Eligibility::Ok);
+            assert_eq!(seen.len(), 2, "and the epochs are banked for next tick");
+        }
+
+        /// An Established peer that has not sent End-of-RIB is the case
+        /// this authority exists for: measured on the lab gateway two
+        /// seconds after `clear bgp`, and session state alone would have
+        /// called that table complete.
+        #[test]
+        fn established_without_end_of_rib_is_revoked() {
+            let mut seen = HashMap::new();
+            let Eligibility::Revoked(Revocation::UpstreamNotReady(why)) =
+                classify_eligibility(Ok(ExportPolicy::Unfiltered), &[filling(peer(1))], &mut seen)
+            else {
+                panic!("a filling upstream must revoke");
+            };
+            assert!(why.contains("End-of-RIB"), "{why}");
+        }
+
+        #[test]
+        fn a_down_upstream_is_revoked() {
+            let mut seen = HashMap::new();
+            assert!(matches!(
+                classify_eligibility(Ok(ExportPolicy::Unfiltered), &[down(peer(1))], &mut seen),
+                Eligibility::Revoked(Revocation::UpstreamNotReady(_))
+            ));
+        }
+
+        /// Export policy outranks everything, because it is the one
+        /// condition the counts cannot see at all.
+        #[test]
+        fn a_narrowed_export_revokes_even_with_every_upstream_ready() {
+            let mut seen = HashMap::new();
+            let e = classify_eligibility(
+                Ok(ExportPolicy::Filtered {
+                    why: "neighbor 198.51.100.2 route-map OUT out".into(),
+                }),
+                &[ready(peer(1), Some(1000))],
+                &mut seen,
+            );
+            assert!(matches!(
+                e,
+                Eligibility::Revoked(Revocation::UnsupportedExport(_))
+            ));
+            assert!(
+                seen.is_empty(),
+                "and it short-circuits — no point reading sessions for a feed that is \
+                 filtered whatever they say"
+            );
+        }
+
+        /// **Positive evidence outranks a partial read.** One upstream
+        /// timing out must not hide another one answering "not
+        /// Established": the safe outcome and the honest one are the
+        /// same here, and collapsing them would make a disqualification
+        /// depend on which peer the loop reached first.
+        #[test]
+        fn a_disqualification_beats_an_unreadable_peer_in_either_order() {
+            for order in [
+                vec![unreadable(peer(1)), down(peer(2))],
+                vec![down(peer(2)), unreadable(peer(1))],
+            ] {
+                let mut seen = HashMap::new();
+                assert!(
+                    matches!(
+                        classify_eligibility(Ok(ExportPolicy::Unfiltered), &order, &mut seen),
+                        Eligibility::Revoked(_)
+                    ),
+                    "order must not decide this"
+                );
+            }
+        }
+
+        /// A read that failed and nothing else is `Unknown`, which is
+        /// NOT a disqualification: it retains whatever eligibility
+        /// stands rather than withdrawing one on no evidence.
+        #[test]
+        fn an_unreadable_peer_alone_is_unknown() {
+            let mut seen = HashMap::new();
+            let e = classify_eligibility(
+                Ok(ExportPolicy::Unfiltered),
+                &[ready(peer(1), Some(1000)), unreadable(peer(2))],
+                &mut seen,
+            );
+            let Eligibility::Unknown(why) = e else {
+                panic!("expected Unknown, got {e:?}");
+            };
+            assert!(why.contains("timed out"), "{why}");
+        }
+
+        /// So is an unreadable running-config — and it short-circuits,
+        /// because an export policy we could not read is not one we can
+        /// call unfiltered.
+        #[test]
+        fn an_unreadable_export_policy_is_unknown() {
+            let mut seen = HashMap::new();
+            assert!(matches!(
+                classify_eligibility(
+                    Err("vtysh exited 1".into()),
+                    &[ready(peer(1), Some(1000))],
+                    &mut seen
+                ),
+                Eligibility::Unknown(_)
+            ));
+        }
+
+        /// A session that re-established since the last reading revokes
+        /// **even though it is ready now**.
+        ///
+        /// The permission standing at that moment was earned by a
+        /// session that no longer exists, and on UniFi a session flap is
+        /// what an FRR configuration upload looks like — so the export
+        /// policy read alongside the old reading may not be the current
+        /// one. Revocation is sticky, so this costs exactly one tick.
+        #[test]
+        fn a_re_established_session_revokes_for_one_tick() {
+            let mut seen = HashMap::new();
+            assert_eq!(
+                classify_eligibility(
+                    Ok(ExportPolicy::Unfiltered),
+                    &[ready(peer(1), Some(1000))],
+                    &mut seen
+                ),
+                Eligibility::Ok
+            );
+
+            let Eligibility::Revoked(Revocation::UpstreamNotReady(why)) = classify_eligibility(
+                Ok(ExportPolicy::Unfiltered),
+                &[ready(peer(1), Some(2000))],
+                &mut seen,
+            ) else {
+                panic!("a moved epoch must revoke");
+            };
+            assert!(why.contains("1000 → 2000"), "{why}");
+
+            // And the new epoch is banked, so the very next tick is
+            // clean again — one tick of caution, not a latch.
+            assert_eq!(
+                classify_eligibility(
+                    Ok(ExportPolicy::Unfiltered),
+                    &[ready(peer(1), Some(2000))],
+                    &mut seen
+                ),
+                Eligibility::Ok
+            );
+        }
+
+        /// The FIRST sighting of a peer is not a move.
+        #[test]
+        fn a_first_sighting_is_not_a_re_establishment() {
+            let mut seen = HashMap::new();
+            assert_eq!(
+                classify_eligibility(
+                    Ok(ExportPolicy::Unfiltered),
+                    &[ready(peer(1), Some(7))],
+                    &mut seen
+                ),
+                Eligibility::Ok,
+                "a fresh daemon has nothing to compare against and must not refuse for it"
+            );
+        }
+    }
+
+    /// What a tick publishes, from the three things it knows.
+    mod observations {
+        use super::super::*;
+        use packetframe_common::fib::AuthorityObservation;
+        use std::time::Instant;
+
+        fn revoked() -> Eligibility {
+            Eligibility::Revoked(Revocation::UpstreamNotReady(
+                "upstream 192.0.2.1 down".into(),
+            ))
+        }
+
+        #[test]
+        fn a_disqualification_publishes_whatever_the_counts_say() {
+            for counts in [(Some(10), Some(10)), (None, None), (Some(10), None)] {
+                assert!(
+                    matches!(
+                        observation(&revoked(), counts.0, counts.1, Instant::now()),
+                        AuthorityObservation::Disqualified(_)
+                    ),
+                    "the counts cannot argue with a fact about the deployment"
+                );
+            }
+        }
+
+        #[test]
+        fn clean_needs_eligibility_and_both_counts() {
+            let at = Instant::now();
+            assert!(matches!(
+                observation(&Eligibility::Ok, Some(100), Some(99), at),
+                AuthorityObservation::Clean(_)
+            ));
+            for counts in [(None, Some(99)), (Some(100), None), (None, None)] {
+                assert_eq!(
+                    observation(&Eligibility::Ok, counts.0, counts.1, at),
+                    AuthorityObservation::Unreadable,
+                    "a tick that lost a count has established nothing new"
+                );
+            }
+        }
+
+        /// `Unknown` never publishes a report, however good the counts
+        /// look. Eligibility we could not establish is not eligibility.
+        #[test]
+        fn unknown_eligibility_never_produces_a_report() {
+            assert_eq!(
+                observation(
+                    &Eligibility::Unknown("vtysh timed out".into()),
+                    Some(1_000_000),
+                    Some(1_000_000),
+                    Instant::now()
+                ),
+                AuthorityObservation::Unreadable
+            );
+        }
+    }
+
+    /// Splitting the two-command `vtysh` response.
+    mod splitting {
+        use super::super::*;
+
+        #[test]
+        fn it_cuts_between_two_documents() {
+            let (a, b) = split_two_json(r#"{"x":1}{"y":2}"#).expect("two documents");
+            assert_eq!(a, r#"{"x":1}"#);
+            assert_eq!(b.trim(), r#"{"y":2}"#);
+        }
+
+        #[test]
+        fn whitespace_and_a_leading_banner_do_not_break_it() {
+            let (a, b) = split_two_json("\n{\n  \"x\": 1\n}\n\n{\"y\":2}\n").expect("two");
+            assert!(a.contains("\"x\""));
+            assert_eq!(b.trim(), r#"{"y":2}"#);
+        }
+
+        /// The reason this is not a depth counter: FRR emits peer
+        /// descriptions, route-map names and interface names verbatim,
+        /// and a brace inside one would cut the first document short —
+        /// handing the parser a truncated body and the caller a
+        /// "not JSON" error on output that was fine.
+        #[test]
+        fn a_brace_inside_a_string_is_not_a_delimiter() {
+            let (a, b) = split_two_json(r#"{"desc":"peer {A}","n":{"k":1}}{"y":2}"#).expect("two");
+            assert_eq!(a, r#"{"desc":"peer {A}","n":{"k":1}}"#);
+            assert_eq!(b, r#"{"y":2}"#);
+        }
+
+        #[test]
+        fn an_escaped_quote_does_not_end_the_string() {
+            let (a, _) = split_two_json(r#"{"desc":"a \" {b}"}{"y":2}"#).expect("two");
+            assert_eq!(a, r#"{"desc":"a \" {b}"}"#);
+        }
+
+        #[test]
+        fn one_document_or_none_is_no_split() {
+            assert!(split_two_json(r#"{"only":1}"#).expect("cuts").1.is_empty());
+            assert!(split_two_json("not json at all").is_none());
+            assert!(
+                split_two_json(r#"{"unterminated": "#).is_none(),
+                "a truncated document must not be reported as a clean cut"
+            );
+        }
     }
 }
