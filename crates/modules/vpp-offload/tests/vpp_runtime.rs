@@ -308,7 +308,11 @@ fn a_persist_that_recovers_clears_the_recorded_failure() {
                 Ok(())
             }
         }
-        fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+        fn steering_changed(
+            &mut self,
+            _: &[(String, u32)],
+            _: &[(String, u32, packetframe_vpp_offload::steer::RuleSet)],
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -403,7 +407,11 @@ fn a_successful_spawn_persist_clears_an_earlier_store_failure() {
         fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
             Ok(())
         }
-        fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+        fn steering_changed(
+            &mut self,
+            _: &[(String, u32)],
+            _: &[(String, u32, packetframe_vpp_offload::steer::RuleSet)],
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -1604,6 +1612,9 @@ mod steered {
         pub log: Arc<Mutex<Vec<&'static str>>>,
     }
     impl packetframe_vpp_offload::runtime::Steering for RecordingSteering {
+        fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+            Vec::new()
+        }
         fn missing_from_nic(
             &self,
         ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
@@ -2744,6 +2755,9 @@ fn the_retry_does_not_steer_into_a_table_with_known_holes() {
         debris: Vec<(String, u32)>,
     }
     impl packetframe_vpp_offload::runtime::Steering for CountingRefusal {
+        fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+            Vec::new()
+        }
         fn missing_from_nic(
             &self,
         ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
@@ -2880,6 +2894,9 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
     /// `unsteer` left in the NIC.
     struct EmptyTarget(Vec<(String, u32)>);
     impl packetframe_vpp_offload::runtime::Steering for EmptyTarget {
+        fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+            Vec::new()
+        }
         fn missing_from_nic(
             &self,
         ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {

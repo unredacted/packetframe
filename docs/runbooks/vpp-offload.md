@@ -210,6 +210,12 @@ cat /var/lib/packetframe/state/vpp-offload.json | jq '{vpp_pid, vpp_start_ticks,
 ```
 
 ```bash
+# Can a teardown identify the exemptions? (empty here = it cannot; see
+# "A state file with no steer_plans leaves the exemptions behind")
+jq '.steer_plans' /var/lib/packetframe/state/vpp-offload.json
+```
+
+```bash
 # What MCAM rules does the NIC actually hold? (ground truth, not our ledger)
 ethtool -n eth5
 ```
@@ -444,6 +450,38 @@ the same remedy. That is deliberate: a slot the record names can hold
 somebody else's rule by now, and on a NIC that will not answer, "do not
 delete a stranger's rule" and "do not unbind a VF that may still be
 steered into" point the same way.
+
+### A state file with no `steer_plans` leaves the exemptions behind
+
+A diversion identifies itself from the NIC: its `ring_cookie` names our
+VF. An exemption does not — `Keep` rules carry cookie 0, meaning
+"deliver to the PF", which is what any other classifier rule aimed at
+the kernel also says. So a teardown claims a cookie-zero rule only by
+matching it against the exemption its own recorded plan put at that
+slot, and the state file carries that plan in `steer_plans`.
+
+A file written by a build older than that field has the locations and
+nothing else. The teardown still removes the diversions and still
+reports honestly, but it **logs a warning naming the locations and
+leaves the exemptions in the MCAM** — it cannot tell them from a
+stranger's rule, and deleting on a guess is how a teardown breaks
+traffic this module never claimed. That warning is the only record: the
+locations are dropped from the ledger at the same time, so the state
+file written afterwards will not name them either.
+
+If you see it, check the NIC directly and clear what remains:
+
+```bash
+ethtool -n eth5
+```
+
+```bash
+ethtool -N eth5 delete <loc>
+```
+
+Only reachable on the first teardown after upgrading a **steered** box.
+Once a steer has run under a build that writes `steer_plans`, the record
+is complete.
 
 ## The adopted-reconciliation release gate: what it needs, and when it refuses
 

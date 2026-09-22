@@ -152,6 +152,35 @@ pub struct ResourceState {
     /// everything else uses is flat, and three open-coded conversions is
     /// how the two stop agreeing.
     pub steer_rules: Vec<(String, Vec<u32>)>,
+    /// `(PF iface, VF index, plan)` the ledger above was last installed
+    /// under — the durable mirror of
+    /// [`crate::ntuple::NtupleSteering::installed_as`].
+    ///
+    /// Locations alone are not enough to take steering down, and the
+    /// gap is not cosmetic. A `Divert` rule is identifiable from the
+    /// NIC: its `ring_cookie` names our VF. A `Keep` rule is not —
+    /// cookie 0 means "deliver to the PF", which is what every
+    /// stranger's kernel-delivery rule also says. `occupant` therefore
+    /// claims a cookie-zero rule only when it matches the `Keep` its
+    /// own plan put at that slot, and with no plan there is no match:
+    /// every exemption reads `Elsewhere` and survives the teardown.
+    ///
+    /// In-process that never showed, because a successful `steer` sets
+    /// `installed_as` and the same object does the removal. Out of
+    /// process it is total: `packetframe detach --all` builds a fresh
+    /// `NtupleSteering` from this file, so on the primary's `both`
+    /// layout one detach would leave every exemption behind — MCAM
+    /// slots consumed by rules nothing will ever remove, and the next
+    /// steer refused for budget with a message blaming the allowlist.
+    ///
+    /// `serde(default)` so a file written before this field still
+    /// parses. Its empty plan restores exactly today's behaviour for
+    /// the `Divert` rules (cookie identifies them) and today's leak for
+    /// the `Keep` rules — the honest outcome for a record that does not
+    /// say what it installed, and not one worth refusing a teardown
+    /// over.
+    #[serde(default)]
+    pub steer_plans: Vec<(String, u32, crate::steer::RuleSet)>,
     /// VPP pid at last state write. `None` = no process was running.
     ///
     /// ALWAYS paired with `vpp_start_ticks`: after an uncontrolled
@@ -193,6 +222,7 @@ impl ResourceState {
             hugepage_prior_pages: 0,
             ports: Vec::new(),
             steer_rules: Vec::new(),
+            steer_plans: Vec::new(),
             vpp_pid: None,
             vpp_start_ticks: None,
             vpp_boot_id: None,
@@ -642,6 +672,77 @@ mod tests {
         ResourceState::remove(&dir).unwrap();
         assert!(ResourceState::load(&dir).unwrap().is_none());
         ResourceState::remove(&dir).unwrap(); // idempotent
+    }
+
+    /// The plan survives the file, and a file written before it existed
+    /// still opens.
+    ///
+    /// Both halves matter on the same day. The first is the fix: the
+    /// CLI's `detach --all` reads `steer_plans` to identify cookie-zero
+    /// exemptions, and a plan that did not round-trip would leave it
+    /// exactly as blind as no field at all. The second is the upgrade
+    /// path — a box steered by the previous build has a state file with
+    /// no `steer_plans` in it, and the daemon that replaces it must be
+    /// able to read that file rather than refuse to start over a field
+    /// it invented.
+    #[test]
+    fn the_steering_plan_round_trips_and_its_absence_is_readable() {
+        use crate::steer::{RuleAction, RuleSet, Side, SteerRule};
+        let dir = tmpdir();
+
+        let plan = RuleSet {
+            rules: vec![
+                SteerRule {
+                    prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
+                    prefix_len: 24,
+                    side: Side::Dst,
+                    location: 15,
+                    action: RuleAction::Divert,
+                },
+                SteerRule {
+                    prefix: std::net::Ipv4Addr::new(203, 0, 113, 7),
+                    prefix_len: 32,
+                    side: Side::Dst,
+                    location: 1,
+                    action: RuleAction::Keep,
+                },
+            ],
+            skipped_v6: 2,
+        };
+
+        let mut st = ResourceState::empty();
+        st.steer_rules.push(("eth4".into(), vec![1, 15]));
+        st.steer_plans.push(("eth4".into(), 0, plan.clone()));
+        st.save(&dir).unwrap();
+
+        let back = ResourceState::load(&dir).unwrap().unwrap();
+        assert_eq!(back, st, "the whole record, plan included");
+        // Spelt out rather than left to the equality above: it is the
+        // `Keep`'s action and match fields that `occupant` compares a
+        // cookie-zero rule against, so those are the bytes the teardown
+        // actually depends on.
+        let (_, _, got) = &back.steer_plans[0];
+        assert_eq!(got, &plan);
+
+        // A file from before the field: it parses, and the plan is
+        // simply empty.
+        fs::write(
+            ResourceState::path_in(&dir),
+            serde_json::to_string(&serde_json::json!({
+                "version": STATE_VERSION,
+                "hugepage_pool_bytes": 0, "hugepage_pages": 0,
+                "ports": [], "steer_rules": [["eth4", [1, 15]]], "vpp_pid": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let old = ResourceState::load(&dir).unwrap().unwrap();
+        assert_eq!(old.steer_rules, vec![("eth4".to_string(), vec![1, 15])]);
+        assert!(
+            old.steer_plans.is_empty(),
+            "no plan on record — the teardown then removes what cookies identify and \
+             says so, which is what such a file honestly supports"
+        );
     }
 
     #[test]

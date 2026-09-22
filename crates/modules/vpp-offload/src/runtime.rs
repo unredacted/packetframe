@@ -117,7 +117,18 @@ pub trait IdentityStore {
     /// [`Steering::unsteer`] removes what its own ledger names, so a
     /// fresh ledger would have answered `Ok` — reporting rules removed
     /// that were still in the NIC.
-    fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String>;
+    ///
+    /// `plans` is what those locations were installed to HOLD, and it
+    /// travels with them because a location alone cannot be taken back
+    /// out: see
+    /// [`crate::resources::ResourceState::steer_plans`]. The two are one
+    /// argument list rather than two calls so the file can never record
+    /// rules without the plan that removes them.
+    fn steering_changed(
+        &mut self,
+        rules: &[(String, u32)],
+        plans: &[(String, u32, crate::steer::RuleSet)],
+    ) -> Result<(), String>;
 }
 
 /// Hands back the VF/vfio/hugepage resources attach acquired.
@@ -154,7 +165,11 @@ impl IdentityStore for NullStore {
     fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
         Ok(())
     }
-    fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+    fn steering_changed(
+        &mut self,
+        _: &[(String, u32)],
+        _: &[(String, u32, crate::steer::RuleSet)],
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -390,6 +405,20 @@ pub trait Steering {
     fn missing_from_nic(&self) -> Result<SteeringAudit, String>;
 
     fn installed(&self) -> Vec<(String, u32)>;
+    /// `(iface, VF, plan)` the ledger above was last successfully
+    /// installed under — empty where nothing has been.
+    ///
+    /// Persisted next to the ledger on every change, for the half of
+    /// removal that locations cannot express: a `Keep` rule's
+    /// `ring_cookie` is 0, so only its spec distinguishes it from a
+    /// stranger's kernel-delivery rule, and a teardown in another
+    /// process has no spec unless this one wrote it down.
+    ///
+    /// Not a trait default. An implementor that quietly returned
+    /// nothing here would leak exemptions exactly as the missing field
+    /// did, and silently — the failure this module has already paid for
+    /// once with `adopt_installed` shipping with no caller (#127).
+    fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)>;
     /// Change what steering *should* be, without touching the NIC.
     ///
     /// Deliberately infallible and side-effect-free: it records intent,
@@ -432,6 +461,12 @@ pub struct SteeringUnavailable;
 impl Steering for SteeringUnavailable {
     fn configured_ports(&self) -> usize {
         0
+    }
+
+    /// Nothing, and truthfully so: this seam refuses every `steer`, so
+    /// no plan of its ever reached a NIC.
+    fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+        Vec::new()
     }
 
     fn steer(&mut self) -> Result<SteerOutcome, String> {
@@ -2032,7 +2067,8 @@ impl Core {
         // stepping a canary ladder is watching (review finding).
         self.last_steer_audit = None;
         let rules = self.steering.installed();
-        let r = self.store.steering_changed(&rules);
+        let plans = self.steering.installed_plan();
+        let r = self.store.steering_changed(&rules, &plans);
         let _ = self.note_persist(r);
     }
 
@@ -3784,11 +3820,19 @@ mod tests {
         /// `configured_ports` is being answerable when nothing is
         /// installed.
         configured: usize,
+        /// The plan the ledger was installed under. Reported alongside
+        /// it so the persistence wiring can be observed carrying BOTH —
+        /// a record holding locations without their spec is a teardown
+        /// that cannot remove the exemptions.
+        plan: Vec<(String, u32, crate::steer::RuleSet)>,
     }
 
     impl Steering for LedgerSteering {
         fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
             Ok(SteeringAudit::clean())
+        }
+        fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+            self.plan.clone()
         }
         fn configured_ports(&self) -> usize {
             self.configured
@@ -3832,7 +3876,11 @@ mod tests {
         fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
             Ok(())
         }
-        fn steering_changed(&mut self, rules: &[(String, u32)]) -> Result<(), String> {
+        fn steering_changed(
+            &mut self,
+            rules: &[(String, u32)],
+            _: &[(String, u32, crate::steer::RuleSet)],
+        ) -> Result<(), String> {
             self.0.borrow_mut().push(rules.to_vec());
             Ok(())
         }
@@ -3872,6 +3920,7 @@ mod tests {
             rules: vec![("eth4".into(), 1024), ("eth4".into(), 1025)],
             next: Some((vec![("eth4".into(), 1025)], false)),
             configured: 1,
+            plan: Vec::new(),
         });
         fx.unsteer().expect_err("one rule would not come out");
 
@@ -3887,6 +3936,83 @@ mod tests {
             vec![("eth4".to_string(), 1025)],
             "the FAILED unsteer recorded the rule still in the NIC — a record of nothing \
              here is a VF released under live steering"
+        );
+    }
+
+    /// The ledger and the plan reach the store in the SAME call.
+    ///
+    /// Two separate writes would be two chances to record one without
+    /// the other, and the half-record is not benign: locations with no
+    /// plan is precisely the state in which `packetframe detach --all`
+    /// removes the diversions, silently disowns every cookie-zero
+    /// exemption, and reports success. The store's argument list is
+    /// where that is made impossible, so this asserts on the pairing
+    /// rather than on either field.
+    #[test]
+    fn the_installed_plan_is_persisted_alongside_the_ledger() {
+        type PlanLog = std::rc::Rc<
+            std::cell::RefCell<
+                Vec<(
+                    Vec<(String, u32)>,
+                    Vec<(String, u32, crate::steer::RuleSet)>,
+                )>,
+            >,
+        >;
+        struct PairStore(PlanLog);
+        impl IdentityStore for PairStore {
+            fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+                Ok(())
+            }
+            fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+                Ok(())
+            }
+            fn steering_changed(
+                &mut self,
+                rules: &[(String, u32)],
+                plans: &[(String, u32, crate::steer::RuleSet)],
+            ) -> Result<(), String> {
+                self.0.borrow_mut().push((rules.to_vec(), plans.to_vec()));
+                Ok(())
+            }
+        }
+
+        let exemption = crate::steer::RuleSet {
+            rules: vec![crate::steer::SteerRule {
+                prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
+                prefix_len: 24,
+                side: crate::steer::Side::Dst,
+                location: 1024,
+                action: crate::steer::RuleAction::Keep,
+            }],
+            skipped_v6: 0,
+        };
+
+        let seen: PlanLog = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let steering = LedgerSteering {
+            next: Some((vec![("eth4".into(), 1024)], true)),
+            plan: vec![("eth4".into(), 0, exemption.clone())],
+            ..Default::default()
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(PairStore(std::rc::Rc::clone(&seen))),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let (_, mut fx) = rt.views();
+        fx.steer().expect("installs");
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1, "one write, carrying both");
+        let (rules, plans) = &seen[0];
+        assert_eq!(rules, &vec![("eth4".to_string(), 1024)]);
+        assert_eq!(
+            plans,
+            &vec![("eth4".to_string(), 0, exemption)],
+            "the spec the location was installed under, not just the location"
         );
     }
 
@@ -3906,7 +4032,11 @@ mod tests {
             fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
                 Ok(())
             }
-            fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            fn steering_changed(
+                &mut self,
+                _: &[(String, u32)],
+                _: &[(String, u32, crate::steer::RuleSet)],
+            ) -> Result<(), String> {
                 Err("state dir is read-only".into())
             }
         }
@@ -3946,6 +4076,9 @@ mod tests {
     fn an_incomplete_audit_publishes_its_count_and_its_gap() {
         struct PartialAudit;
         impl Steering for PartialAudit {
+            fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+                Vec::new()
+            }
             fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
                 Ok(SteeringAudit {
                     missing: vec![("eth4".into(), 1024)],
@@ -4009,6 +4142,9 @@ mod tests {
         /// re-audit is visible in the published count.
         struct DriftsAfterFirstPass(std::cell::Cell<usize>);
         impl Steering for DriftsAfterFirstPass {
+            fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+                Vec::new()
+            }
             fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
                 let n = self.0.get();
                 self.0.set(n + 1);
@@ -4164,7 +4300,11 @@ mod tests {
             fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
                 Ok(())
             }
-            fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            fn steering_changed(
+                &mut self,
+                _: &[(String, u32)],
+                _: &[(String, u32, crate::steer::RuleSet)],
+            ) -> Result<(), String> {
                 Ok(())
             }
         }
@@ -4201,7 +4341,11 @@ mod tests {
             fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
                 Ok(())
             }
-            fn steering_changed(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            fn steering_changed(
+                &mut self,
+                _: &[(String, u32)],
+                _: &[(String, u32, crate::steer::RuleSet)],
+            ) -> Result<(), String> {
                 Ok(())
             }
         }

@@ -1249,7 +1249,7 @@ impl NtupleSteering {
     /// rule accounting for one location is the property that catches a
     /// duplicated rule on the NIC itself; relaxing it to tolerate a
     /// malformed ledger would trade a real check for a cosmetic one.
-    pub fn adopt_installed(&mut self, installed: Vec<(String, u32)>) {
+    pub(crate) fn adopt_installed(&mut self, installed: Vec<(String, u32)>) {
         let found = installed.len();
         let mut seen = std::collections::HashSet::new();
         self.installed = installed
@@ -1264,6 +1264,76 @@ impl NtupleSteering {
                  location exists once on the NIC, so the ledger keeps it once"
             );
         }
+    }
+
+    /// Take over a previous process's steering from the state file —
+    /// **both halves, in one call**.
+    ///
+    /// The only entry point outside this crate, and paired on purpose.
+    /// Its two halves are separately meaningful and jointly required:
+    /// [`Self::adopt_installed`] says which locations hold rules, and
+    /// [`Self::adopt_installed_plan`] says what those rules ARE. A
+    /// caller that took the first and forgot the second would get a
+    /// teardown that removes the diversions, silently disowns every
+    /// cookie-zero exemption as somebody else's, and reports success —
+    /// which is not a hypothetical, it is what `packetframe detach
+    /// --all` did until the plan was persisted.
+    ///
+    /// A ledger arriving with no plan is therefore called out rather
+    /// than accepted quietly. It is legitimate — a state file written
+    /// by a build older than
+    /// [`ResourceState::steer_plans`](crate::resources::ResourceState::steer_plans)
+    /// has locations and nothing else — and it is not a reason to
+    /// refuse a teardown that can still remove the diversions. But the
+    /// operator has to know the exemptions will be left, because
+    /// `ethtool -N <iface> delete <loc>` is then the only thing that
+    /// clears them and this warning is the only place their locations
+    /// are named.
+    pub fn adopt_record(
+        &mut self,
+        installed: Vec<(String, u32)>,
+        plans: Vec<(String, u32, RuleSet)>,
+    ) {
+        let orphaned = !installed.is_empty() && plans.is_empty();
+        self.adopt_installed(installed);
+        self.adopt_installed_plan(plans);
+        if orphaned {
+            tracing::warn!(
+                locations = ?self.installed,
+                "the steering record names rules but not the plan they were installed \
+                 under — it predates that field. Diversions can still be removed (their \
+                 ring_cookie names our VF); any EXEMPTION among these locations cannot \
+                 be told from a stranger's rule and will be left in the MCAM. Check \
+                 `ethtool -n <iface>` after the teardown and delete by hand what remains"
+            );
+        }
+    }
+
+    /// Restore `installed_as` from the durable record.
+    ///
+    /// The other half of [`Self::adopt_installed`], and it is what makes
+    /// a teardown in a fresh process able to remove `Keep` rules at all:
+    /// their `ring_cookie` is 0, so
+    /// [`Self::occupant`] can only claim one by matching it against the
+    /// exemption this plan put at that slot, and without a plan there is
+    /// nothing to match. A ledger adopted without its plan removes every
+    /// `Divert` and leaves every `Keep`.
+    ///
+    /// A candidate generator, not an authority: whatever this restores
+    /// is still compared field-for-field against what the NIC actually
+    /// returns before a rule is claimed, so a stale plan costs a
+    /// `Elsewhere` verdict, never a wrong delete.
+    ///
+    /// Empty input leaves `installed_as` `None` rather than `Some(vec![])`
+    /// — the two are not the same to `planned_keep_at`'s callers, and
+    /// "the record says nothing" must not read as "the record says this
+    /// port planned nothing", which would let
+    /// [`Self::install_disowns`] disown rules that really are ours.
+    pub(crate) fn adopt_installed_plan(&mut self, plans: Vec<(String, u32, RuleSet)>) {
+        if plans.is_empty() {
+            return;
+        }
+        self.installed_as = Some(plans);
     }
 
     /// Can the outgoing target prove this slot is **not** ours?
@@ -1458,6 +1528,16 @@ impl crate::runtime::Steering for NtupleSteering {
         // about what happens to a rule that would not come out.
         let victims = std::mem::take(&mut self.installed);
         let failed = self.remove_all(victims);
+        // The plan describes the LEDGER, so it goes when the ledger
+        // does. `remove_all` pushes every rule it could not clear back
+        // into `installed`, so an empty ledger here means nothing is
+        // left for a plan to describe — and persisting one anyway would
+        // write a state file claiming a spec for rules that are gone.
+        // A partial failure keeps it, because the survivors are exactly
+        // what the operator's next attempt has to identify.
+        if self.installed.is_empty() {
+            self.installed_as = None;
+        }
         if failed.is_empty() {
             Ok(())
         } else {
@@ -1755,6 +1835,18 @@ impl crate::runtime::Steering for NtupleSteering {
 
     fn installed(&self) -> Vec<(String, u32)> {
         self.installed.clone()
+    }
+
+    /// `installed_as` verbatim, including its absence.
+    ///
+    /// Empty when no steer in this process has succeeded — which is the
+    /// honest answer, not a gap to paper over with `targets`. `targets`
+    /// is intent; a reconcile refused at the completeness gate leaves it
+    /// naming rules that never reached the NIC, and persisting that
+    /// would put a spec in the state file for a slot the NIC holds
+    /// something else in.
+    fn installed_plan(&self) -> Vec<(String, u32, RuleSet)> {
+        self.installed_as.clone().unwrap_or_default()
     }
 
     fn retarget(&mut self, targets: Vec<(String, u32, RuleSet)>) {
@@ -3302,7 +3394,7 @@ mod tests {
     fn exemptions_install_with_cookie_zero_and_clear_on_unsteer() {
         use crate::runtime::Steering as _;
         sys::reset();
-        let plan = plan_with_keeps(&[[23, 191, 200, 0]]);
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
         let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
         s.steer().expect("steer");
 
@@ -3334,6 +3426,168 @@ mod tests {
             sys::rules().is_empty(),
             "exemptions are torn down with the diversions — a Keep rule left behind \
              pins gateway traffic to PF queue 0 forever"
+        );
+    }
+
+    /// The same teardown, run by a DIFFERENT PROCESS — and this is the
+    /// one that was broken in production.
+    ///
+    /// `packetframe detach --all` is the remedy every error in this
+    /// subsystem points an operator at, and it runs in the CLI, not the
+    /// daemon. It builds a fresh `NtupleSteering` from the state file,
+    /// so `installed_as` — which only a successful `steer` in *this*
+    /// process sets — is `None`. `occupant` then had no `Keep` spec to
+    /// compare a cookie-zero rule against, disowned every exemption as
+    /// `Elsewhere`, and reported a clean removal over rules still in the
+    /// MCAM. On the primary's `both` layout that is most of the port's
+    /// 16 slots, and the next steer is refused for budget with a message
+    /// blaming the allowlist.
+    ///
+    /// `exemptions_install_with_cookie_zero_and_clear_on_unsteer` could
+    /// never have caught it: it tears down with the same object that
+    /// installed. The out-of-process path needs its own test because it
+    /// is a different object with a different amount of knowledge.
+    #[test]
+    fn a_teardown_in_another_process_removes_the_exemptions_too() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
+        assert!(
+            plan.rules
+                .iter()
+                .any(|r| r.action == crate::steer::RuleAction::Keep),
+            "the fixture must contain exemptions or this proves nothing"
+        );
+
+        let mut daemon = steering(vec![("eth0".into(), 0)], plan);
+        daemon.steer().expect("steer");
+        // What the state file carries between the two processes.
+        let recorded_rules = daemon.installed();
+        let recorded_plan = daemon.installed_plan();
+        assert!(
+            !recorded_plan.is_empty(),
+            "a successful steer must publish its plan, or there is nothing to persist"
+        );
+        drop(daemon);
+
+        // The CLI's reconstruction: members from `ports`, no steering
+        // target at all, everything else off the record.
+        let mut cli = NtupleSteering::new(vec![("eth0".into(), 0)], Vec::new());
+        cli.adopt_record(recorded_rules, recorded_plan);
+        cli.unsteer().expect("unsteer");
+
+        assert!(
+            sys::rules().is_empty(),
+            "every rule gone, exemptions included — what remains: {:?}",
+            sys::rules_with_cookies()
+        );
+    }
+
+    /// Why the plan has to travel, pinned: a ledger without one loses
+    /// its exemptions **silently and permanently**.
+    ///
+    /// This is the pre-fix behaviour, and it is worse than "the rules
+    /// are left behind". `occupant` reads a cookie-zero rule it cannot
+    /// claim as `Elsewhere`, and `remove_all` treats `Elsewhere` as
+    /// *ours is already gone* — the right call when the cookie names a
+    /// stranger's VF, and the wrong one for cookie 0, which is what
+    /// every unmatched exemption becomes. So the location is dropped
+    /// from the ledger too, the teardown returns **`Ok`**, and the state
+    /// file written after it no longer mentions the rules. Nothing on
+    /// the box records that they exist; the operator's only trace is a
+    /// `warn` line, and no later `detach --all` can find them.
+    ///
+    /// Kept as a test rather than left to the comments because it is the
+    /// entire justification for
+    /// [`ResourceState::steer_plans`](crate::resources::ResourceState::steer_plans),
+    /// and it shows the asymmetry that makes the plan necessary: the
+    /// diversions come out on their cookie alone. Only cookie 0 is
+    /// ambiguous.
+    #[test]
+    fn a_ledger_without_its_plan_loses_its_exemptions_silently() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
+        let keeps: Vec<u32> = plan
+            .rules
+            .iter()
+            .filter(|r| r.action == crate::steer::RuleAction::Keep)
+            .map(|r| r.location)
+            .collect();
+        assert!(!keeps.is_empty(), "the fixture must contain exemptions");
+
+        let mut daemon = steering(vec![("eth0".into(), 0)], plan);
+        daemon.steer().expect("steer");
+        let recorded_rules = daemon.installed();
+        drop(daemon);
+
+        let mut cli = NtupleSteering::new(vec![("eth0".into(), 0)], Vec::new());
+        // The pre-fix state file: locations, no plan.
+        cli.adopt_record(recorded_rules, Vec::new());
+        cli.unsteer()
+            .expect("and it reports success, which is the sharp end of this");
+
+        let left: Vec<u32> = sys::rules_with_cookies()
+            .into_iter()
+            .map(|(_, loc, _)| loc)
+            .collect();
+        assert_eq!(
+            left, keeps,
+            "exactly the exemptions survive a teardown that said it was clean"
+        );
+        assert!(
+            cli.installed().is_empty(),
+            "and they are gone from the ledger, so the state file written after this \
+             cannot name them either — that is what makes the leak permanent"
+        );
+    }
+
+    /// A clean unsteer publishes an EMPTY plan; a failed one keeps the
+    /// plan for the rules that are left.
+    ///
+    /// The plan is persisted from `installed_plan()` on every steering
+    /// change, so whatever this reports after a removal is what the
+    /// state file holds. A plan outliving its ledger would describe
+    /// rules the NIC no longer has. A plan DROPPED while rules remain is
+    /// the worse half: it is this field's own leak reached from the
+    /// other side, and it would strand exactly the exemptions the failed
+    /// teardown could not clear.
+    #[test]
+    fn the_plan_outlives_a_failed_removal_and_not_a_clean_one() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
+        let stuck = plan
+            .rules
+            .iter()
+            .find(|r| r.action == crate::steer::RuleAction::Keep)
+            .expect("an exemption to wedge")
+            .location;
+        let mut s = steering(vec![("eth0".into(), 0)], plan);
+        s.steer().expect("steer");
+        assert!(!s.installed_plan().is_empty(), "a steer publishes its plan");
+
+        sys::wedge_delete(&[stuck]);
+        s.unsteer().expect_err("the stuck rule must be reported");
+        assert_eq!(
+            s.installed(),
+            vec![("eth0".to_string(), stuck)],
+            "and stay on the ledger"
+        );
+        assert!(
+            !s.installed_plan().is_empty(),
+            "with its plan, or the operator's retry cannot identify it — and it is an \
+             exemption, so nothing else can"
+        );
+
+        // Unwedged, the ledger empties and the plan goes with it.
+        sys::wedge_delete(&[]);
+        s.unsteer().expect("now it comes out");
+        assert!(s.installed().is_empty());
+        assert!(
+            s.installed_plan().is_empty(),
+            "no ledger, no plan — the state file must not claim a spec for rules \
+             that are gone"
         );
     }
 
