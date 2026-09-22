@@ -907,7 +907,17 @@ fn finish(
     // them here because the config changed is how a `steer on` port
     // removed from the config keeps diverting traffic forever.
     let mut steering = steering;
-    steering.adopt_installed(crate::resources::flatten_steer_rules(&state.steer_rules));
+    // Both halves: the locations, AND what they were installed to HOLD.
+    // Without the plan a restart inherits the ledger but not the spec,
+    // and the `Keep` rules — `ring_cookie` 0, indistinguishable from any
+    // other kernel-delivery rule on cookie alone — become unremovable by
+    // the very daemon that is now responsible for them: a `steer off`
+    // after a restart would clear the diversions and leave every
+    // exemption in the MCAM.
+    steering.adopt_record(
+        crate::resources::flatten_steer_rules(&state.steer_rules),
+        state.steer_plans.clone(),
+    );
 
     let capacity = startup_conf::route_capacity(sizing);
     let api_socket_path = paths.api_socket.clone();

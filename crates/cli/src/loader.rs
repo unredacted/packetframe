@@ -1935,7 +1935,21 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
             .map(|p| (p.iface.clone(), 0u32))
             .collect();
         let mut steering = NtupleSteering::new(members, Vec::new());
-        steering.adopt_installed(recorded);
+        // The ledger AND the plan the daemon installed it under, which
+        // this process cannot otherwise know and cannot do without.
+        //
+        // A `Divert` rule identifies itself: its `ring_cookie` names our
+        // VF. An EXEMPTION does not — `Keep` carries cookie 0, meaning
+        // "deliver to the PF", which is what a stranger's classifier
+        // rule says too. `occupant` claims a cookie-zero rule only when
+        // it matches the `Keep` the plan put at that slot, so a teardown
+        // with no plan disowns every exemption as `Elsewhere`, reports a
+        // clean removal, and leaves them in the MCAM. On the primary's
+        // `both` layout that is most of the table: one `detach --all`
+        // would consume the port's slots with rules nothing will ever
+        // remove, and the next steer would be refused for budget with a
+        // message blaming the allowlist.
+        steering.adopt_record(recorded, state.steer_plans.clone());
         if let Err(e) = steering.unsteer() {
             // Write back what is STILL in the NIC before refusing. The rules
             // that came out must not be retried by the operator's next
@@ -1943,6 +1957,12 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
             // this file is the only record of them.
             let mut state = state;
             state.steer_rules = group_steer_rules(&steering.installed());
+            // `steer_plans` is left ALONE. It describes the rules that
+            // are still in the NIC — the operator's retry needs it for
+            // exactly the reason this attempt did — and narrowing it to
+            // the survivors would mean re-deriving the plan here, a
+            // second implementation of the thing that is supposed to be
+            // recorded rather than computed.
             let _ = state.save(state_dir);
             return Err(format!(
                 "vpp-offload: {e}. The VF(s) were NOT unbound, because MCAM is still \
@@ -2744,6 +2764,21 @@ mod vpp_detach_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut state = ResourceState::empty();
         state.steer_rules = vec![("eth5".to_string(), vec![0, 1])];
+        state.steer_plans = vec![(
+            "eth5".to_string(),
+            0,
+            packetframe_vpp_offload::steer::RuleSet {
+                rules: vec![packetframe_vpp_offload::steer::SteerRule {
+                    prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
+                    prefix_len: 24,
+                    side: packetframe_vpp_offload::steer::Side::Dst,
+                    location: 0,
+                    action: packetframe_vpp_offload::steer::RuleAction::Keep,
+                }],
+                skipped_v6: 0,
+            },
+        )];
+        let planned = state.steer_plans.clone();
         state.save(&dir).unwrap();
 
         let e = detach_vpp_offload(&dir).expect_err("must refuse while rules remain");
@@ -2761,6 +2796,12 @@ mod vpp_detach_tests {
             flatten_steer_rules(&after.steer_rules),
             vec![("eth5".to_string(), 0), ("eth5".to_string(), 1)],
             "every rule still in the NIC must still be on the record"
+        );
+        assert_eq!(
+            after.steer_plans, planned,
+            "and so must the plan — it is what identifies the cookie-zero exemptions \
+             among them, so a retry without it would disown the rules this attempt \
+             just refused to abandon"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

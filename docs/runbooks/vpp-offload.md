@@ -210,6 +210,12 @@ cat /var/lib/packetframe/state/vpp-offload.json | jq '{vpp_pid, vpp_start_ticks,
 ```
 
 ```bash
+# Can a teardown identify the exemptions? (empty here = it cannot; see
+# "A state file with no steer_plans leaves the exemptions behind")
+jq '.steer_plans' /var/lib/packetframe/state/vpp-offload.json
+```
+
+```bash
 # What MCAM rules does the NIC actually hold? (ground truth, not our ledger)
 ethtool -n eth5
 ```
@@ -444,6 +450,38 @@ the same remedy. That is deliberate: a slot the record names can hold
 somebody else's rule by now, and on a NIC that will not answer, "do not
 delete a stranger's rule" and "do not unbind a VF that may still be
 steered into" point the same way.
+
+### A state file with no `steer_plans` leaves the exemptions behind
+
+A diversion identifies itself from the NIC: its `ring_cookie` names our
+VF. An exemption does not — `Keep` rules carry cookie 0, meaning
+"deliver to the PF", which is what any other classifier rule aimed at
+the kernel also says. So a teardown claims a cookie-zero rule only by
+matching it against the exemption its own recorded plan put at that
+slot, and the state file carries that plan in `steer_plans`.
+
+A file written by a build older than that field has the locations and
+nothing else. The teardown still removes the diversions and still
+reports honestly, but it **logs a warning naming the locations and
+leaves the exemptions in the MCAM** — it cannot tell them from a
+stranger's rule, and deleting on a guess is how a teardown breaks
+traffic this module never claimed. That warning is the only record: the
+locations are dropped from the ledger at the same time, so the state
+file written afterwards will not name them either.
+
+If you see it, check the NIC directly and clear what remains:
+
+```bash
+ethtool -n eth5
+```
+
+```bash
+ethtool -N eth5 delete <loc>
+```
+
+Only reachable on the first teardown after upgrading a **steered** box.
+Once a steer has run under a build that writes `steer_plans`, the record
+is complete.
 
 ## The adopted-reconciliation release gate: what it needs, and when it refuses
 
@@ -1588,6 +1626,29 @@ teardown fixes is wrong. `FAIL` is reserved for probe mismatches —
 the one verdict a restart genuinely repairs — and only `FAIL`
 tears down.
 
+`fib-synced` reports it **Degraded, never Unhealthy**, for the same
+reason, and prints the verdict's age and the live table beside it:
+
+```
+fib-synced   DEGRADED — verify INCOMPLETE — steering refused, no
+  restart: 0/0 probes matched, unresolvable=0, withheld=0 (verify ran
+  1847s ago and does not re-run in steady state; the table now holds
+  69155 installed, 0 withheld, 0 unresolvable)
+```
+
+Read the parenthesis first. Verification is a convergence-time gate, and
+**the live steering gates never consult this verdict** — they re-read
+the route counts, the source backlog and the authority on every retry.
+So a box whose first verify ran before its feed landed recovers and
+steers on its own, with this line still quoting the empty-mirror window.
+A large installed count next to `0/0 probes matched` is that recovery,
+not a contradiction. On the lab rig (2026-09-21) the row paged as
+UNHEALTHY while 69,155 routes forwarded; it does not any more.
+
+If the counts in the parenthesis are *also* bad — nonzero
+`unresolvable`, or an installed count that never grows — the condition
+is live, and it is the counts, not the verdict, that say so.
+
 ### Load rises by roughly one core per VPP worker, permanently. That is poll mode, not a fault.
 
 The native octeon driver supports neither interrupt nor adaptive rx
@@ -2011,6 +2072,11 @@ What this means when you are reading a dashboard: a green `fib-synced`
 says the FIB was verified *at some point*, not that it is being watched.
 Nothing here would notice VPP's FIB drifting for a reason other than this
 module's own deltas.
+
+The same applies to a NON-green one, and it bites harder, because the
+condition usually clears while the verdict does not. Every `fib-synced`
+line that is not `healthy` therefore carries its own age; compare that
+against the counts printed beside it before acting on the verdict.
 
 **Failed, and shaping the design:**
 
