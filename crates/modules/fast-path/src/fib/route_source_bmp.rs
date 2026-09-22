@@ -108,7 +108,7 @@ pub struct BmpStation {
     /// a reference to the BmpStation itself.
     last_rm_unix: Arc<AtomicI64>,
     /// Optional integrity snapshot. When `Some`, the stall monitor
-    /// reads `bird_established_peers`: an alert only fires when bird
+    /// reads `authority_established_peers`: an alert only fires when bird
     /// thinks there's at least one peer we should be hearing from.
     stall_gate: Option<SharedIntegritySnapshot>,
     /// Loc-RIB-only safety mode. When true, RouteMonitoring frames
@@ -891,7 +891,7 @@ async fn stall_monitor(
                     continue;
                 }
                 // Gate on bird's cached peer state.
-                let established = integrity.read().await.bird_established_peers;
+                let established = integrity.read().await.authority_established_peers;
                 match established {
                     None => {
                         // Integrity cache cold. Can't gate the alert
@@ -911,7 +911,7 @@ async fn stall_monitor(
                     Some(n) => {
                         warn!(
                             quiet_seconds,
-                            bird_established_peers = n,
+                            authority_established_peers = n,
                             "BMP session appears stalled (no ROUTE MONITORING + bird reports Established peers)"
                         );
                     }

@@ -53,6 +53,35 @@ pub struct NeighSnoopProbeInputs {
     pub gate_lists: Option<(String, String)>,
 }
 
+/// The completeness authority the config names, if any — the FRR one
+/// is the only variant with preconditions worth probing.
+///
+/// Both of its probes catch the same symptom from different causes: a
+/// mirror nothing attests, so a first steer under
+/// `require-table-complete on` defers forever. Neither cause is visible
+/// in the config file, which is what makes them worth a subprocess at
+/// feasibility time rather than a discovery during a rollout window.
+pub fn frr_authority_from_config(
+    config: &Config,
+) -> Option<(Option<std::path::PathBuf>, Vec<std::net::IpAddr>)> {
+    for m in &config.modules {
+        if m.name != "fast-path" {
+            continue;
+        }
+        for d in &m.directives {
+            if let ModuleDirective::IntegrityAuthority(
+                packetframe_common::config::IntegrityAuthoritySpec::Frr {
+                    vtysh, upstreams, ..
+                },
+            ) = d
+            {
+                return Some((vtysh.clone(), upstreams.iter().map(|u| u.addr).collect()));
+            }
+        }
+    }
+    None
+}
+
 pub fn neigh_snoop_probe_inputs_from_config(config: &Config) -> NeighSnoopProbeInputs {
     let mut out = NeighSnoopProbeInputs {
         bridges: Vec::new(),
@@ -407,6 +436,10 @@ pub struct FeasibilityInputs {
     pub guard_ifaces: Vec<String>,
     pub vpp: VppProbeInputs,
     pub snoop: NeighSnoopProbeInputs,
+    /// `(vtysh path, declared upstreams)` when the config names the FRR
+    /// completeness authority. `None` for `birdc` or `none`, which have
+    /// no preconditions worth a subprocess.
+    pub frr_authority: Option<(Option<PathBuf>, Vec<std::net::IpAddr>)>,
 }
 
 impl Default for FeasibilityInputs {
@@ -422,6 +455,7 @@ impl Default for FeasibilityInputs {
             guard_ifaces: Vec::new(),
             vpp: VppProbeInputs::default(),
             snoop: NeighSnoopProbeInputs::default(),
+            frr_authority: None,
         }
     }
 }
@@ -445,6 +479,7 @@ impl FeasibilityInputs {
                 steer_exempts: vpp_steer_exempts_from_config(config),
             },
             snoop: neigh_snoop_probe_inputs_from_config(config),
+            frr_authority: frr_authority_from_config(config),
         }
     }
 }
@@ -457,6 +492,7 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
         guard_ifaces,
         vpp,
         snoop,
+        frr_authority,
     } = inputs;
     let mut report = run_probes(bpffs_root);
 
@@ -539,6 +575,15 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
     }
     #[cfg(not(feature = "neigh-snoop"))]
     let _ = snoop;
+    // The completeness authority's preconditions, only when the config
+    // names the FRR one. Non-required, like the other module probes,
+    // but both failures produce a rollout that cannot proceed rather
+    // than a module that degrades — see `probe_authority`.
+    if let Some((vtysh, upstreams)) = frr_authority {
+        for cap in packetframe_fast_path::run_frr_authority_probes(vtysh.as_deref(), upstreams) {
+            report.capabilities.push(cap);
+        }
+    }
     // The boot-sysctl audit is advisory in the general set — a large
     // `vm.nr_hugepages` is the operator's business on a box that runs
     // no VPP. On a box whose config declares `module vpp-offload` it

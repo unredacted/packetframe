@@ -315,8 +315,9 @@ pub fn bring_up(
     if cfg.require_table_complete && completeness.is_none() {
         return Err(
             "`require-table-complete on` (the default), but nothing is publishing route \
-             completeness — the fast-path integrity checker needs `birdc` and a bird to \
-             ask. Steering would be refused forever. Either give this box a bird, or set \
+             completeness — module fast-path has no `integrity-authority` naming a \
+             daemon to ask (`birdc`, or `frr upstream <ip>` on an FRR-fed box). \
+             Steering would be refused forever. Either name an authority, or set \
              `require-table-complete off` and own the judgement yourself (see the canary \
              ladder in docs/runbooks/vpp-offload.md)"
                 .into(),

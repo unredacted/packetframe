@@ -166,12 +166,108 @@ neighbor 10.255.0.2 timers connect 10
 
 Startup refuses an `anyip` address some interface already owns —
 that shape can never establish (FRR would reject the neighbor), so
-failing attach loudly beats converging into a dead feed. Session
-liveness checks are the FRR flavors of the bird ones above:
-`vtysh -c 'show bgp neighbor 10.255.0.2'` should report Established,
-and `ss -Htnp state established "( sport = :1179 )"` one line.
-Remember `integrity-authority none` — there is no birdc to
-cross-check against and the default would fail blind every 300 s.
+failing attach loudly beats converging into a dead feed. The session
+should report Established, and `ss` one line.
+### The completeness authority on an FRR-fed box
+
+`integrity-authority` names the daemon packetframe cross-checks its
+mirror against, and on an FRR box that is **`frr`**, not the `birdc`
+default and not `none`:
+
+```
+integrity-authority frr upstream 192.0.2.1 families v4,v6
+```
+
+Where IPv4 and IPv6 arrive over different sessions, say so — `families`
+binds to the `upstream` it follows:
+
+```
+integrity-authority frr upstream 192.0.2.1 families v4 upstream 2001:db8::1 families v6
+```
+
+`none` was the only honest answer before this variant existed — a
+`birdc` that is not installed fails blind every 300 s — and it is still
+what the fleet's configs say. It is also refused alongside
+`require-table-complete on`, because a gate waiting on an attestation
+nothing produces defers a first steer forever.
+
+`upstream` **and its `families` are both mandatory, and declared,
+never inferred.** Only the operator knows which sessions carry the
+table as opposed to consuming it, and which families each one carries.
+**Do not list packetframe's own session** — that is the thing being
+attested, and listing it makes the authority wait on its own answer.
+
+There is deliberately **no default family set**. A default of both is
+wrong in both directions and neither is recoverable at runtime: on an
+IPv4-only box it makes the authority refuse forever, because FRR
+reports no `ipv6Unicast` statistics and an IPv6 End-of-RIB that will
+never arrive reads as not-ready; and omitting a family the session does
+carry would attest a mirror nobody checked. The families the count
+compares are the **union** of what the upstreams carry — derived, not
+declared again.
+
+Why upstreams at all, when `birdc` gets by on a count: before an
+upstream has finished loading, FRR's table and packetframe's mirror
+fill *together*, so the counts agree the whole way up and the
+comparison is vacuous. Measured on the lab gateway (FRR 10.1.2,
+2026-09-22): two seconds after `clear bgp` the peer read `Established`
+with `endOfRibRecv=false`. Session state alone would have called that
+table complete. So the authority also requires End-of-RIB from every
+declared upstream, scoped to the **current** session.
+
+Three things disqualify the mirror outright, whatever the counts say,
+and they report as `Ineligible` rather than as drift:
+
+| Condition | Why counts cannot see it |
+|---|---|
+| A declared upstream is down, or has not sent End-of-RIB | Both sides fill together; the comparison is vacuous |
+| A session re-established since the last check | The previous reading described a session that no longer exists — and on UniFi a session flap is what an FRR config upload looks like, which is the one event that can introduce a filter under a running daemon |
+| Something narrows what FRR exports to packetframe — on the peer **or on a peer-group it belongs to** | At a 1% drift tolerance a filter dropping 5,000 prefixes from a million still reads `Converged` |
+
+The export-policy check is a **blacklist**, and its scope is worth
+knowing: `route-map`, `prefix-list`, `filter-list`, `distribute-list`,
+`unsuppress-map` and `maximum-prefix`, in either direction, on the peer
+or on a peer-group it is a member of. A narrowing directive outside
+that set would not be caught. Widening it means enumerating FRR's whole
+per-neighbor grammar — every directive missing from such a list refuses
+a valid config — so it is a measurement task rather than an edit.
+
+One more condition reports as *unknown* rather than disqualified: an
+upstream that is Established with End-of-RIB but for which FRR gives no
+`peerUptimeEstablishedEpoch`. Readiness with no session generation
+behind it cannot be tied to the session running now, so it is not acted
+on — but nothing disqualifying was observed either, so a standing
+eligibility is retained rather than withdrawn.
+
+Disqualification is **sticky**: it survives a `vtysh` timeout,
+unparseable output, and a clean check whose counts still disagree.
+Only a clean, agreeing, non-stale check restores it — "readiness came
+back" is not "the mirror is now right". A re-established session
+therefore costs exactly one interval, not a latch.
+
+`packetframe feasibility` probes both preconditions before a rollout
+window: `fast-path.integrity-authority.vtysh` (is vtysh there and
+answering) and `fast-path.integrity-authority.upstreams` (does FRR know
+every address you declared). A typo'd upstream is the quiet failure —
+it reads as "not Established" on every check, so the authority revokes
+forever and nothing ever steers.
+
+**Not supported with a BMP route source**, and config validation
+refuses the combination rather than downgrading it. The counts and the
+End-of-RIB checks would work, but export-policy validation has no
+session to inspect — what narrows a BMP feed is FRR's `bmp targets`
+configuration, which this release cannot read — and accepting it would
+silently drop the one conjunct the counts cannot substitute for.
+
+Session liveness, unchanged:
+
+```sh
+vtysh -c 'show bgp neighbor 10.255.0.2'
+```
+
+```sh
+ss -Htnp state established "( sport = :1179 )"
+```
 
 ### Is a specific prefix forwarding through custom-fib?
 

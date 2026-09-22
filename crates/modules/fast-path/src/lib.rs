@@ -15,6 +15,9 @@ use packetframe_common::module::{
     ModuleConfig, ModuleError, ModuleResult,
 };
 
+pub mod probe_authority;
+pub use probe_authority::run_frr_authority_probes;
+
 pub mod breaker;
 pub mod fib;
 pub mod metrics;

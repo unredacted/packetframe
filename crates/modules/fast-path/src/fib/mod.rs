@@ -29,6 +29,11 @@ pub mod anyip;
 #[cfg(target_os = "linux")]
 pub mod controller;
 
+/// The FRR authority's loop. Linux-gated because it runs `vtysh`; its
+/// grammar lives ungated in `frr`.
+#[cfg(target_os = "linux")]
+pub mod frr_authority;
+
 #[cfg(target_os = "linux")]
 pub mod inspect;
 

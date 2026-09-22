@@ -195,7 +195,8 @@ pub const STEER_MAX_REPORT_AGE: std::time::Duration = std::time::Duration::from_
 /// One comparison of the mirror against its authority.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompletenessReport {
-    /// What the authority (bird) says it has.
+    /// What the authority says it has — whichever daemon
+    /// `integrity-authority` names.
     pub authority_routes: u64,
     /// What our mirror holds.
     pub mirror_routes: u64,
@@ -241,6 +242,9 @@ pub enum Completeness {
     Stale { age: std::time::Duration },
     /// No report at all, or none that supports a judgement.
     Unknown { why: &'static str },
+    /// Disqualified regardless of the counts — see [`Revocation`].
+    /// Sticky: it clears only on a clean, converged observation.
+    Ineligible(Revocation),
 }
 
 /// Why an otherwise-successful sample still cannot judge completeness:
@@ -278,6 +282,12 @@ impl Completeness {
         match self {
             Completeness::AuthorityMismatch { .. } => true,
             Completeness::Unknown { why } => *why == ZERO_ROUTE_AUTHORITY,
+            // The authority is working correctly here — it is the
+            // deployment it is describing that is disqualified. Calling
+            // this an authority fault would send an operator to check
+            // vtysh when the answer is in their BGP config or in an
+            // upstream that has not finished loading.
+            Completeness::Ineligible(_) => false,
             Completeness::Converged { .. }
             | Completeness::Incomplete { .. }
             | Completeness::Stale { .. } => false,
@@ -314,7 +324,9 @@ impl Completeness {
             Completeness::AuthorityMismatch { authority, mirror } => format!(
                 "the route mirror holds {mirror} routes but the authority reports only \
                  {authority} — that is not the authority feeding this mirror. Check which \
-                 bird `birdc` is talking to; on a box whose routes come from elsewhere, \
+                 daemon `integrity-authority` reads — `birdc` asks the local bird, `frr` \
+                 asks the local FRR through vtysh — and whether that is the one this \
+                 box's routes come from. Where they legitimately come from elsewhere, \
                  `require-table-complete off` is the right answer — but it is read once at \
                  bring-up, so the daemon has to be RESTARTED for it. A reload is refused by \
                  name rather than accepted and ignored, so there is nothing to try first"
@@ -324,6 +336,12 @@ impl Completeness {
                 age.as_secs()
             ),
             Completeness::Unknown { why } => format!("completeness is unknown: {why}"),
+            Completeness::Ineligible(r) => format!(
+                "the authority disqualifies this mirror: {}. Not a count problem, and \
+                 waiting will not clear it — it clears only when a full check comes \
+                 back clean AND the counts agree",
+                r.describe()
+            ),
         }
     }
 }
@@ -385,21 +403,141 @@ pub fn assess(
 ///
 /// The loader owns it and hands the same object to both, exactly as it
 /// does for the route feed and the allowlist.
+/// Why the mirror is disqualified regardless of what the counts say.
+///
+/// A count comparison answers "is the mirror as big as the authority's
+/// table". These are the conditions under which that question is not
+/// the one that matters, because the authority's own table is not yet
+/// the whole table or is not the one feeding us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revocation {
+    /// An upstream the operator declared has not finished loading for
+    /// its CURRENT session. Both sides then fill together and the
+    /// counts agree the whole way up, so the comparison is vacuous.
+    UpstreamNotReady(String),
+    /// Something narrows what the authority exports to us, so its table
+    /// and our mirror are not supposed to match and the drift figure
+    /// means nothing. Invisible to the counts: at a 1% tolerance a
+    /// filter dropping 5,000 of a million still reads Converged.
+    UnsupportedExport(String),
+}
+
+impl Revocation {
+    pub fn describe(&self) -> &str {
+        match self {
+            Revocation::UpstreamNotReady(why) | Revocation::UnsupportedExport(why) => why,
+        }
+    }
+}
+
+/// What one run of an authority check saw.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthorityObservation {
+    /// Read in full, nothing disqualifying, here is the comparison.
+    Clean(CompletenessReport),
+    /// Read, and something disqualifies the mirror.
+    Disqualified(Revocation),
+    /// Could not be read at all — a timeout, unparseable output. Says
+    /// nothing about the mirror either way.
+    Unreadable,
+}
+
 #[derive(Debug, Default)]
-pub struct TableCompleteness(std::sync::RwLock<Option<CompletenessReport>>);
+struct CompletenessState {
+    report: Option<CompletenessReport>,
+    /// Sticky. Survives every observation that is not a clean,
+    /// converged one.
+    revoked: Option<Revocation>,
+}
+
+/// Where the route mirror publishes how complete it is, for the second
+/// forwarding tier to read before diverting traffic.
+///
+/// A shared handle rather than a copy, and a `std` lock rather than
+/// tokio's, because the two ends live in different worlds: the publisher
+/// is the fast-path's async integrity checker, the reader is
+/// vpp-offload's synchronous supervision loop. Neither should have to
+/// adopt the other's runtime to answer one question.
+///
+/// The loader owns it and hands the same object to both, exactly as it
+/// does for the route feed and the allowlist.
+///
+/// **Eligibility lives in the same lock payload as the report**, and
+/// not beside it, for the reason [`Self::latest_verdict`] exists: a
+/// consumer reading the two separately can have a publish land between
+/// them and pair one observation's verdict with another's evidence.
+#[derive(Debug, Default)]
+pub struct TableCompleteness(std::sync::RwLock<CompletenessState>);
 
 impl TableCompleteness {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record a comparison. The integrity checker is the only writer.
+    /// Record a comparison from an authority that cannot disqualify.
+    ///
+    /// `birdc` is the case: it reports two counts and has no notion of
+    /// eligibility, so a report is the whole of what it observes. It
+    /// deliberately leaves `revoked` alone rather than clearing it —
+    /// not as a courtesy, but because an authority that cannot *set*
+    /// revocation has no standing to lift one. The two writers are
+    /// never both live (the authority is chosen once, at load, and
+    /// `integrity-authority` is restart-only), so in practice a handle
+    /// written through here has no revocation to leave.
     pub fn publish(&self, report: CompletenessReport) {
-        *self.0.write().expect("completeness lock") = Some(report);
+        self.0.write().expect("completeness lock").report = Some(report);
     }
 
+    /// Record one run of an authority that can disqualify the mirror.
+    ///
+    /// Revocation is **sticky**. It survives later timeouts,
+    /// unparseable output and partial reads, and clears only on an
+    /// observation that is clean AND whose counts agree — because
+    /// "readiness came back" is not the same as "the mirror is now
+    /// right", and a retained report must never become renewed
+    /// permission.
+    pub fn record(&self, obs: AuthorityObservation) {
+        let mut st = self.0.write().expect("completeness lock");
+        match obs {
+            AuthorityObservation::Clean(report) => {
+                // Judged here rather than by the caller so the clearing
+                // rule lives in one place, next to the field it
+                // guards.
+                let converged = matches!(
+                    assess(
+                        Some(report),
+                        std::time::Instant::now(),
+                        STEER_MAX_DRIFT,
+                        STEER_MAX_REPORT_AGE,
+                    ),
+                    Completeness::Converged { .. }
+                );
+                st.report = Some(report);
+                if converged {
+                    st.revoked = None;
+                }
+            }
+            AuthorityObservation::Disqualified(r) => st.revoked = Some(r),
+            // Deliberately nothing. An observation failure is not
+            // evidence about the mirror, so the previous report stands
+            // under the ordinary age policy — and a standing revocation
+            // stands too.
+            AuthorityObservation::Unreadable => {}
+        }
+    }
+
+    /// Deliberately **no** `revocation()` accessor.
+    ///
+    /// It existed for one draft and was the exact hazard
+    /// [`Self::latest_verdict`] was written to close, reintroduced one
+    /// method over: a consumer reading eligibility and the report
+    /// separately can have a `record` land between the two and pair one
+    /// observation's disqualification with another's evidence. Anything
+    /// that needs to know reads `Completeness::Ineligible` off the
+    /// verdict, which comes out of the same lock acquisition as the
+    /// report it overrides.
     pub fn latest(&self) -> Option<CompletenessReport> {
-        *self.0.read().expect("completeness lock")
+        self.0.read().expect("completeness lock").report
     }
 
     /// The verdict now, under the steering policy.
@@ -417,7 +555,14 @@ impl TableCompleteness {
     /// landing between the two returns a verdict from one report and a
     /// timestamp from the next.
     pub fn latest_verdict(&self) -> (Option<CompletenessReport>, Completeness) {
-        let latest = *self.0.read().expect("completeness lock");
+        let st = self.0.read().expect("completeness lock");
+        let latest = st.report;
+        // A revocation outranks the counts, and is read under the same
+        // lock acquisition as the report it overrides — the whole
+        // reason this method exists.
+        if let Some(r) = &st.revoked {
+            return (latest, Completeness::Ineligible(r.clone()));
+        }
         (
             latest,
             assess(
@@ -1155,6 +1300,173 @@ mod tests {
         fn a_mirror_a_hair_ahead_is_still_converged() {
             let v = verdict(Some(report(1_000_000, 1_000_500, Duration::ZERO)));
             assert!(v.permits_steering(), "{v:?}");
+        }
+    }
+
+    /// Eligibility: what revokes it, what does NOT clear it, and what
+    /// does.
+    ///
+    /// The rule this guards is that **a retained report must never
+    /// become renewed permission**. `STEER_MAX_REPORT_AGE` is 900 s and
+    /// its own reasoning rests on "a table does not un-converge while
+    /// nobody is looking" — true for a count-only authority, false the
+    /// moment readiness is a conjunct. Without revocation, an upstream
+    /// reloading behind a previously-positive report would go on
+    /// permitting steering for fifteen minutes.
+    mod eligibility {
+        use super::super::*;
+        use std::time::{Duration, Instant};
+
+        fn agreeing() -> CompletenessReport {
+            CompletenessReport {
+                authority_routes: 1_000_000,
+                mirror_routes: 1_000_000,
+                at: Instant::now(),
+            }
+        }
+
+        fn not_ready() -> Revocation {
+            Revocation::UpstreamNotReady("upstream 192.0.2.1 is not Established".into())
+        }
+
+        /// The baseline both halves below are measured against.
+        #[test]
+        fn a_clean_agreeing_observation_permits_steering() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Clean(agreeing()));
+            assert!(h.verdict().permits_steering(), "{:?}", h.verdict());
+        }
+
+        /// Revocation beats the counts, and it beats them *at
+        /// observation* rather than 900 s later.
+        #[test]
+        fn a_disqualification_overrides_an_agreeing_report() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Clean(agreeing()));
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+
+            let (report, v) = h.latest_verdict();
+            assert!(matches!(v, Completeness::Ineligible(_)), "{v:?}");
+            assert!(!v.permits_steering());
+            assert!(
+                report.is_some(),
+                "the report is retained as evidence — it is the PERMISSION that is \
+                 withdrawn, and an operator still needs to see the counts"
+            );
+            assert!(
+                !v.authority_is_at_fault(),
+                "the authority is working; it is the deployment it describes that is \
+                 disqualified. Calling this an authority fault sends an operator to \
+                 check vtysh when the answer is in their BGP config"
+            );
+        }
+
+        /// Sticky through an observation failure.
+        ///
+        /// The tempting implementation treats "could not read" as
+        /// "nothing to report" and lets the old state stand — which is
+        /// right for the REPORT and wrong for the revocation only if
+        /// the two are handled by one rule. They are not: an unreadable
+        /// run is not evidence the disqualifying condition cleared.
+        #[test]
+        fn a_revocation_survives_a_failed_observation() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Clean(agreeing()));
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+            h.record(AuthorityObservation::Unreadable);
+            assert!(matches!(h.verdict(), Completeness::Ineligible(_)));
+        }
+
+        /// And through a clean observation whose counts DISAGREE.
+        ///
+        /// "Readiness came back" is not "the mirror is now right". This
+        /// is the case the plan calls out by name: readiness restored
+        /// but the comparison still short must stay revoked, or the
+        /// first tick after an upstream reload would hand back
+        /// permission over a mirror that is still filling.
+        #[test]
+        fn readiness_returning_without_agreement_does_not_clear_it() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+            h.record(AuthorityObservation::Clean(CompletenessReport {
+                authority_routes: 1_000_000,
+                mirror_routes: 400_000,
+                at: Instant::now(),
+            }));
+
+            let (report, v) = h.latest_verdict();
+            assert!(
+                matches!(v, Completeness::Ineligible(_)),
+                "still revoked, not Incomplete: {v:?}"
+            );
+            assert_eq!(
+                report.map(|r| r.mirror_routes),
+                Some(400_000),
+                "but the fresh counts ARE recorded — the operator watching the mirror \
+                 fill needs to see it filling"
+            );
+        }
+
+        /// A clean, agreeing observation is the only thing that clears
+        /// it — and then steering is permitted again.
+        #[test]
+        fn a_clean_agreeing_observation_clears_it() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+            assert!(!h.verdict().permits_steering());
+
+            h.record(AuthorityObservation::Clean(agreeing()));
+            assert!(
+                h.verdict().permits_steering(),
+                "re-eligible: {:?}",
+                h.verdict()
+            );
+        }
+
+        /// A clean, agreeing, but STALE observation does not clear it.
+        ///
+        /// `assess` is the judge, so the clearing rule inherits the age
+        /// policy for free — and it must, because a report that is too
+        /// old to permit steering on its own is certainly too old to
+        /// restore an eligibility that was explicitly withdrawn.
+        #[test]
+        fn an_agreeing_but_stale_observation_does_not_clear_it() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+            h.record(AuthorityObservation::Clean(CompletenessReport {
+                authority_routes: 1_000_000,
+                mirror_routes: 1_000_000,
+                at: Instant::now() - (STEER_MAX_REPORT_AGE + Duration::from_secs(60)),
+            }));
+            assert!(matches!(h.verdict(), Completeness::Ineligible(_)));
+        }
+
+        /// A later disqualification replaces an earlier one rather than
+        /// being ignored, so the reason an operator reads is the reason
+        /// that is true now.
+        #[test]
+        fn the_reported_reason_is_the_current_one() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+            h.record(AuthorityObservation::Disqualified(
+                Revocation::UnsupportedExport("neighbor 192.0.2.9 route-map OUT out".into()),
+            ));
+            let Completeness::Ineligible(r) = h.verdict() else {
+                panic!("expected Ineligible");
+            };
+            assert!(r.describe().contains("route-map"), "{}", r.describe());
+        }
+
+        /// The operator-facing line says it will not clear on its own.
+        ///
+        /// Every other non-permitting verdict here is something you
+        /// wait out; this one is not, and a row that reads like the
+        /// others invites exactly the wrong response.
+        #[test]
+        fn the_description_says_waiting_will_not_help() {
+            let d = Completeness::Ineligible(not_ready()).describe();
+            assert!(d.contains("not Established"), "{d}");
+            assert!(d.contains("waiting will not clear it"), "{d}");
         }
     }
 }

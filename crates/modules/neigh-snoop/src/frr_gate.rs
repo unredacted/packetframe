@@ -323,85 +323,28 @@ impl GateState {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{gate_task, GateInput, RealVtysh, Vtysh};
+pub use linux::{gate_task, GateInput};
+/// Re-exported so this module's callers keep one name for it while the
+/// implementation lives in `packetframe-common`. It is shared with the
+/// custom-FIB's FRR completeness authority, which asks FRR different
+/// questions through the same bounded child process — and, more to the
+/// point, honours the same `PACKETFRAME_VTYSH` override, which is how
+/// `snoop_netns`'s fake gets in front of both.
+pub use packetframe_common::frr::{RealVtysh, Vtysh};
 
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::future::Future;
-    use std::path::PathBuf;
-    use std::pin::Pin;
     use std::sync::Arc;
 
     use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, info, warn};
 
+    use packetframe_common::frr::Vtysh;
+
     use crate::engine::EngineMsg;
     use crate::snapshot::GateSnapshot;
-
-    /// `vtysh -c <cmd> [-c <cmd> …]`. One method so a fake is one
-    /// method; the real one is a bounded child process.
-    pub trait Vtysh: Send + Sync {
-        fn run<'a>(
-            &'a self,
-            commands: &'a [String],
-        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
-    }
-
-    /// The real `vtysh`. Path from `PACKETFRAME_VTYSH` (tests point it at
-    /// a fake) else `/usr/bin/vtysh`. `kill_on_drop` makes the timeout
-    /// mean something: a wedged vtysh is killed, not orphaned.
-    pub struct RealVtysh {
-        path: PathBuf,
-        timeout: Duration,
-    }
-
-    impl RealVtysh {
-        pub fn from_env(timeout: Duration) -> Self {
-            let path = std::env::var_os("PACKETFRAME_VTYSH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/usr/bin/vtysh"));
-            Self { path, timeout }
-        }
-
-        pub fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    impl Vtysh for RealVtysh {
-        fn run<'a>(
-            &'a self,
-            commands: &'a [String],
-        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-            Box::pin(async move {
-                let mut cmd = tokio::process::Command::new(&self.path);
-                for c in commands {
-                    cmd.arg("-c").arg(c);
-                }
-                cmd.stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .kill_on_drop(true);
-                let child = cmd
-                    .spawn()
-                    .map_err(|e| format!("spawn {}: {e}", self.path.display()))?;
-                let out = tokio::time::timeout(self.timeout, child.wait_with_output())
-                    .await
-                    .map_err(|_| format!("vtysh timed out after {:?}", self.timeout))?
-                    .map_err(|e| format!("vtysh wait: {e}"))?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "vtysh exited {}: {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
-                }
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-            })
-        }
-    }
 
     /// What the engine publishes to the gate task every housekeeping
     /// tick.
