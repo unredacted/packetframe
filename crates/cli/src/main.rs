@@ -371,6 +371,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
         vpp_exempts,
         guard_ifaces,
         snoop_inputs,
+        frr_authority,
     ) = match &config {
         Some(path) => match Config::from_file(path) {
             Ok(c) => {
@@ -401,6 +402,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                 let vpp_exempts = feasibility::vpp_steer_exempts_from_config(&c);
                 let guard_ifaces = feasibility::guard_ifaces_from_config(&c);
                 let snoop_inputs = feasibility::neigh_snoop_probe_inputs_from_config(&c);
+                let frr_authority = feasibility::frr_authority_from_config(&c);
                 (
                     c.global.bpffs_root,
                     ifaces,
@@ -414,6 +416,7 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     vpp_exempts,
                     guard_ifaces,
                     snoop_inputs,
+                    frr_authority,
                 )
             }
             Err(e) => {
@@ -434,12 +437,17 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             Vec::new(),
             Vec::new(),
             feasibility::NeighSnoopProbeInputs::default(),
+            None,
         ),
     };
 
     let report = feasibility::probe_and_render(
         &bpffs_root,
-        &attach_ifaces,
+        &feasibility::FastPathProbeInputs {
+            attach_ifaces: &attach_ifaces,
+            allowlist: &allowlist,
+            frr_authority: frr_authority.as_ref(),
+        },
         &feasibility::VppProbeInputs {
             ports: &vpp_ports,
             steer_ports: &vpp_steer_ports,
@@ -449,7 +457,6 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
             steer_directions: &vpp_dirs,
             steer_exempts: &vpp_exempts,
         },
-        &allowlist,
         &guard_ifaces,
         &snoop_inputs,
         human,

@@ -166,12 +166,76 @@ neighbor 10.255.0.2 timers connect 10
 
 Startup refuses an `anyip` address some interface already owns —
 that shape can never establish (FRR would reject the neighbor), so
-failing attach loudly beats converging into a dead feed. Session
-liveness checks are the FRR flavors of the bird ones above:
-`vtysh -c 'show bgp neighbor 10.255.0.2'` should report Established,
-and `ss -Htnp state established "( sport = :1179 )"` one line.
-Remember `integrity-authority none` — there is no birdc to
-cross-check against and the default would fail blind every 300 s.
+failing attach loudly beats converging into a dead feed. The session
+should report Established, and `ss` one line.
+### The completeness authority on an FRR-fed box
+
+`integrity-authority` names the daemon packetframe cross-checks its
+mirror against, and on an FRR box that is **`frr`**, not the `birdc`
+default and not `none`:
+
+```
+integrity-authority frr upstream 192.0.2.1 upstream 192.0.2.2
+```
+
+`none` was the only honest answer before this variant existed — a
+`birdc` that is not installed fails blind every 300 s — and it is still
+what the fleet's configs say. It is also refused alongside
+`require-table-complete on`, because a gate waiting on an attestation
+nothing produces defers a first steer forever.
+
+`upstream` is **mandatory and declared, never inferred.** Only the
+operator knows which sessions carry the table as opposed to consuming
+it. **Do not list packetframe's own session** — that is the thing being
+attested, and listing it makes the authority wait on its own answer.
+
+Why upstreams at all, when `birdc` gets by on a count: before an
+upstream has finished loading, FRR's table and packetframe's mirror
+fill *together*, so the counts agree the whole way up and the
+comparison is vacuous. Measured on the lab gateway (FRR 10.1.2,
+2026-09-22): two seconds after `clear bgp` the peer read `Established`
+with `endOfRibRecv=false`. Session state alone would have called that
+table complete. So the authority also requires End-of-RIB from every
+declared upstream, scoped to the **current** session.
+
+Three things disqualify the mirror outright, whatever the counts say,
+and they report as `Ineligible` rather than as drift:
+
+| Condition | Why counts cannot see it |
+|---|---|
+| A declared upstream is down, or has not sent End-of-RIB | Both sides fill together; the comparison is vacuous |
+| A session re-established since the last check | The previous reading described a session that no longer exists — and on UniFi a session flap is what an FRR config upload looks like, which is the one event that can introduce a filter under a running daemon |
+| Something narrows what FRR exports to packetframe | At a 1% drift tolerance a filter dropping 5,000 prefixes from a million still reads `Converged` |
+
+Disqualification is **sticky**: it survives a `vtysh` timeout,
+unparseable output, and a clean check whose counts still disagree.
+Only a clean, agreeing, non-stale check restores it — "readiness came
+back" is not "the mirror is now right". A re-established session
+therefore costs exactly one interval, not a latch.
+
+`packetframe feasibility` probes both preconditions before a rollout
+window: `fast-path.integrity-authority.vtysh` (is vtysh there and
+answering) and `fast-path.integrity-authority.upstreams` (does FRR know
+every address you declared). A typo'd upstream is the quiet failure —
+it reads as "not Established" on every check, so the authority revokes
+forever and nothing ever steers.
+
+**Not supported with a BMP route source**, and config validation
+refuses the combination rather than downgrading it. The counts and the
+End-of-RIB checks would work, but export-policy validation has no
+session to inspect — what narrows a BMP feed is FRR's `bmp targets`
+configuration, which this release cannot read — and accepting it would
+silently drop the one conjunct the counts cannot substitute for.
+
+Session liveness, unchanged:
+
+```sh
+vtysh -c 'show bgp neighbor 10.255.0.2'
+```
+
+```sh
+ss -Htnp state established "( sport = :1179 )"
+```
 
 ### Is a specific prefix forwarding through custom-fib?
 
