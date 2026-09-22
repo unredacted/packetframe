@@ -410,6 +410,13 @@ Traffic returns to the eBPF fast-path. Membership stays, the FIB stays
 synced, VPP keeps running — you land on rung 0, which is a state you
 have already soaked.
 
+"At any time" includes **while a convergence or an adopted deferral is
+in flight**, which is the case that matters: a deferral can hold
+indefinitely, and it holds with the traffic on VPP. A full `steer off`
+is admitted there and does not disturb the convergence; a steer is
+still refused until it lands. See the deferral section for the limits
+(all-ports-off only, and what a refused removal leaves behind).
+
 One thing about this path is deliberate: an allowlist that has outgrown
 the MCAM budget does not block it. The budget check
 only applies when rules are about to be installed, because `unsteer`
@@ -1707,11 +1714,40 @@ line counts RPKI tables and means nothing for this comparison — read
 `master4`. And a box can have bird *running* and still be useless as an
 authority, which is not the same as having no bird at all.
 
-What makes it more than cosmetic is what `AdoptedResyncing` refuses:
-**steering changes, which includes `steer off`.** For the length of the
-deferral an operator cannot roll traffic off VPP with `packetframe
-reconfigure` — it answers "not converged". The eBPF tier is not
-carrying that traffic; VPP still is.
+**`steer off` works during a deferral. Everything else does not.**
+
+This asymmetry is deliberate and is the rollback lever. A deferral can
+hold indefinitely, and for its whole length the traffic is on VPP, not
+on the eBPF tier — so an operator has to be able to take it off without
+waiting for a convergence that may never land:
+
+```bash
+# every port `steer off`, then:
+packetframe reconfigure
+```
+
+Admitted from `Syncing`, `AdoptedResyncing` and `Verifying`. It removes
+the MCAM rules, leaves the convergence in flight alone, and — the part
+that matters if the deferral later releases — is not undone by the
+verify that eventually lands. A steer, by contrast, is still refused
+with "not converged": a diversion that fires mid-convergence may not be
+what you asked for by the time it takes effect, while a removal always
+is.
+
+Two limits worth knowing before you reach for it:
+
+- **It is all-ports-off, not per-port.** The lever is the whole config
+  asking for nothing steered. A reconfigure that still steers some port
+  is an ordinary steering change and waits for `Ready`.
+- **A removal the NIC refuses leaves the rules in place**, exactly as
+  from `Ready`: `steered` stays true so every later teardown keeps
+  trying and keeps withholding the VF. `reconfigure` reports the
+  failure; re-run it, or clear the slots by hand
+  (`ethtool -N <iface> delete <loc>`).
+
+If the daemon is not running at all — `Stopped`, `Backoff`, `Starting` —
+this path has no VPP to ask and says so. There the teardown owns it:
+stop the daemon, then `packetframe detach --all`.
 
 - **`fib-synced` now names the veto** rather than pointing at
   quiescence. Until this was fixed the line read "the diff runs once the

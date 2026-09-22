@@ -878,17 +878,42 @@ fn apply_steering(
     req: &SteeringRequest,
 ) -> Result<(), String> {
     let state = driver.state();
-    if !state.accepts_steering_changes() {
+    // Removal is admitted from a converging state; anything that could
+    // divert traffic is not. `want_steer == false` is the whole config
+    // asking for nothing steered — the rollback landing zone — so this
+    // is an all-ports-off lever, never a per-port one. A request that
+    // still steers SOME port is a steering change like any other and
+    // waits for `Ready`.
+    let admitted = if req.want_steer {
+        state.accepts_steering_changes()
+    } else {
+        state.accepts_steering_removal()
+    };
+    if !admitted {
         // Deliberately refused rather than queued. A steer request that
         // outlives a crash and fires against the replacement is not what
         // the operator asked for, and the replacement re-steers on its
         // own if steering was wanted. The new config is on disk either
         // way, so the next attach picks it up.
-        return Err(format!(
-            "vpp-offload is {state:?}, not converged — steering changes apply only from \
-             Ready or Steered. The new configuration is on disk and takes effect at the \
-             next successful convergence"
-        ));
+        //
+        // A REMOVAL reaching here means there is no process to ask at
+        // all (Stopped/Backoff/Starting), which is a different remedy
+        // from "wait for the convergence" — the rules a record names
+        // are removed by the teardown, not by this path.
+        return Err(if req.want_steer {
+            format!(
+                "vpp-offload is {state:?}, not converged — steering changes apply only \
+                 from Ready or Steered. The new configuration is on disk and takes \
+                 effect at the next successful convergence"
+            )
+        } else {
+            format!(
+                "vpp-offload is {state:?}: there is no running VPP to remove steering \
+                 from. If the NIC still holds rules, `packetframe detach --all` after \
+                 stopping the daemon is what clears them — it reads each recorded \
+                 location back before deleting it"
+            )
+        });
     }
     runtime.retarget(req.targets.clone());
     // STAGED here, committed where a steering action succeeds. The
@@ -1010,6 +1035,23 @@ fn apply_steering(
         }
         Event::SteerRequested
     } else {
+        // With no rules in the NIC no `Action::Unsteer` will run, and
+        // `unsteer` is the only thing on this path that commits a
+        // staged scope. Nothing downstream would do it either: the
+        // request clears `steer_wanted`, so `VerifyPassed` emits no
+        // `Steer`. The scope would sit pending indefinitely and the
+        // drift scan would keep predicting from the PREVIOUS config
+        // while `reconfigure` reported success — the failure mode the
+        // staleness machinery exists to make impossible.
+        //
+        // Same remedy as the no-action first-canary path above, and
+        // deliberately not conditioned on the state: this hole is
+        // older than the converging-state admission that exposed it,
+        // and an all-off reconfigure from `Ready` with nothing steered
+        // reaches it the same way.
+        if !runtime.steering_rules_installed() {
+            runtime.commit_drift_scope();
+        }
         Event::UnsteerRequested
     };
 

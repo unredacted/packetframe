@@ -137,6 +137,31 @@ impl State {
     pub fn accepts_steering_changes(self) -> bool {
         matches!(self, State::Ready | State::Steered)
     }
+
+    /// Whether traffic may be taken OFF from here — a strictly wider
+    /// set than [`Self::accepts_steering_changes`].
+    ///
+    /// The asymmetry is deliberate. A steer that fires mid-convergence
+    /// may not be what the operator asked for by the time it lands, so
+    /// it is refused; a REMOVAL is always what they asked for, and
+    /// refusing it is what left an adopted deferral holding traffic on
+    /// VPP with no graceful way off. That deferral can hold
+    /// indefinitely — a feed whose churn never yields the quiet the
+    /// release gate needs never releases it — and for its whole length
+    /// `steer off` answered "not converged" while the eBPF tier was
+    /// NOT carrying the traffic. The blunt teardown still worked, but
+    /// "stop the daemon" is not a rollback lever.
+    ///
+    /// Converging states only. `Stopped`/`Backoff`/`Starting` are
+    /// excluded because there is no process to ask, and the teardown
+    /// path emits its own `Unsteer` for the rules a record names.
+    pub fn accepts_steering_removal(self) -> bool {
+        self.accepts_steering_changes()
+            || matches!(
+                self,
+                State::Syncing | State::AdoptedResyncing | State::Verifying
+            )
+    }
 }
 // NOTE: there is deliberately no `State::is_converging()`. Deriving
 // "a resync is in flight" from the lifecycle state is what broke rule
@@ -837,6 +862,33 @@ impl Supervisor {
                     vec![]
                 }
             }
+            // The same request, from a state that is still converging.
+            // See [`State::accepts_steering_removal`] for why removal is
+            // admitted here when nothing else is.
+            //
+            // **The state deliberately does not change.** Collapsing to
+            // `Ready` would discard a deferral that still owes a FIB
+            // dump, and would report a convergence as finished while its
+            // resync task is live — the exact shape of the bug that put
+            // the NOTE about `State::is_converging()` above this block.
+            //
+            // `steer_wanted` clears, and that is what makes the request
+            // outlive the cycle already in flight: `VerifyPassed` re-steers
+            // on `steer_intended()`, so without this the convergence would
+            // land a few seconds later and put back exactly what the
+            // operator just took off.
+            //
+            // `steered` is left for the `Unsteered` acknowledgement,
+            // exactly as in the arm above — a refused removal must keep
+            // the VF withheld and keep every later teardown trying.
+            (Syncing | AdoptedResyncing | Verifying, UnsteerRequested) => {
+                self.steer_wanted = false;
+                if self.steered {
+                    vec![Action::Unsteer]
+                } else {
+                    vec![]
+                }
+            }
 
             // --- death and wedging ---
             (s, ProcessExited { .. }) if s.has_process() => {
@@ -1101,6 +1153,116 @@ mod tests {
             vec![Action::AttachDevices, Action::StartResync],
             "device attach must precede the resync"
         );
+    }
+
+    /// The rollback lever works during an adopted deferral — the state
+    /// this arm exists for.
+    ///
+    /// A deferral can hold indefinitely (a feed whose churn never yields
+    /// the release gate's quiet), and for its whole length `steer off`
+    /// used to answer "not converged" while traffic was still on VPP.
+    #[test]
+    fn an_operator_can_take_traffic_off_during_an_adopted_deferral() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        assert_eq!(s.state(), State::AdoptedResyncing);
+
+        assert_eq!(
+            s.on(Event::UnsteerRequested),
+            vec![Action::Unsteer],
+            "the removal is emitted, not refused"
+        );
+        assert_eq!(
+            s.state(),
+            State::AdoptedResyncing,
+            "the convergence in flight is untouched — collapsing to Ready would \
+             discard a deferral that still owes a FIB dump"
+        );
+        assert!(
+            s.is_steered(),
+            "steered clears only on the acknowledgement, so a refused removal keeps \
+             the VF withheld"
+        );
+    }
+
+    /// ...and the convergence that was already running must not put it
+    /// back when it lands.
+    #[test]
+    fn a_released_deferral_does_not_re_steer_what_the_operator_removed() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::UnsteerRequested);
+        s.on(Event::Unsteered);
+
+        // The deferral now releases on its own and the cycle completes.
+        s.on(Event::SyncComplete);
+        assert_eq!(s.state(), State::Verifying);
+        assert!(
+            !s.on(Event::VerifyPassed).contains(&Action::Steer),
+            "the operator pulled traffic off; a convergence landing afterwards must \
+             not reinstate it"
+        );
+        assert!(!s.is_steered());
+        assert_eq!(s.state(), State::Ready);
+    }
+
+    /// A removal the NIC refuses part-way leaves the rules recorded, so
+    /// every later teardown keeps trying and keeps withholding the VF —
+    /// the same contract as a refused removal from `Ready`.
+    #[test]
+    fn a_refused_removal_mid_deferral_keeps_the_rules_and_the_vf() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+
+        assert!(s.is_steered(), "traffic is still diverted");
+        assert_eq!(
+            s.state(),
+            State::AdoptedResyncing,
+            "a refused removal does not end the convergence either"
+        );
+        // Re-askable: the operator runs `reconfigure` again.
+        assert_eq!(s.on(Event::UnsteerRequested), vec![Action::Unsteer]);
+        // And the teardown still owes an Unsteer.
+        assert!(s.on(Event::StopRequested).contains(&Action::Unsteer));
+    }
+
+    /// VPP dying mid-removal re-arms the want, because rules are still
+    /// in the NIC and completing them beats leaving half a diversion —
+    /// the established rule for a death while steered. The operator's
+    /// `steer off` is not lost, though: it is the CONFIG that decides
+    /// what the replacement reconciles to, and with no port steering
+    /// the reconcile removes.
+    #[test]
+    fn a_death_mid_removal_follows_the_death_rule_not_the_request() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::UnsteerRequested);
+        s.on(Event::UnsteerFailed);
+        s.on(Event::ProcessExited { status: None });
+        assert!(
+            s.steer_intended(),
+            "rules are still in the NIC, so the replacement owns finishing the job"
+        );
+    }
+
+    /// Removal is admitted while converging; anything that could divert
+    /// traffic is not. The asymmetry is the whole design.
+    #[test]
+    fn converging_states_admit_removal_but_not_steering() {
+        for st in [State::Syncing, State::AdoptedResyncing, State::Verifying] {
+            assert!(!st.accepts_steering_changes(), "{st:?}");
+            assert!(st.accepts_steering_removal(), "{st:?}");
+        }
+        for st in [State::Ready, State::Steered] {
+            assert!(st.accepts_steering_changes(), "{st:?}");
+            assert!(st.accepts_steering_removal(), "{st:?}");
+        }
+        // No process to ask: the teardown owns these, not this lever.
+        for st in [State::Stopped, State::Backoff, State::Starting] {
+            assert!(!st.accepts_steering_removal(), "{st:?}");
+        }
     }
 
     #[test]

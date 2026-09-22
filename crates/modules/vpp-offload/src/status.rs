@@ -1247,14 +1247,32 @@ impl StatusSnapshot {
             // nothing. The comment at the top of this selection had
             // already written down the rule; the last sentence of this
             // arm broke it, and no test compared the two.
-            "a convergence re-applies steering only if it verifies clean — one that ends \
-             with routes withheld or unresolvable parks in the staging state and emits no \
-             steer at all, and a steer that IS emitted can still be refused by the \
-             completeness gate. Both settle in the staging state with the want \
-             remembered, and from there the module re-attempts the steer by itself once \
-             both gates permit. Until it converges there is nothing to ask: `packetframe \
-             reconfigure` answers \"not converged\" from here and changes no steering"
-                .to_string()
+            //
+            // The last sentence is state-dependent for the same reason
+            // the rest of this arm is careful: since removal became
+            // admissible from a converging state, "changes no steering"
+            // is true of `Starting`/`Backoff` and false of the three
+            // that are actually converging. One sentence for both would
+            // be wrong somewhere, and this line's history is entirely
+            // about being wrong somewhere.
+            let tail = if self.state.accepts_steering_removal() {
+                "Turning steering ON has to wait for that, and `packetframe reconfigure` \
+                 answers \"not converged\" if you ask for it here. Taking it OFF does \
+                 not: a reconfigure with every port `steer off` is admitted while \
+                 converging, precisely so a deferral cannot strand traffic on VPP with \
+                 no lever"
+            } else {
+                "Until it converges there is nothing to ask: `packetframe reconfigure` \
+                 answers \"not converged\" from here and changes no steering"
+            };
+            format!(
+                "a convergence re-applies steering only if it verifies clean — one that \
+                 ends with routes withheld or unresolvable parks in the staging state and \
+                 emits no steer at all, and a steer that IS emitted can still be refused \
+                 by the completeness gate. Both settle in the staging state with the want \
+                 remembered, and from there the module re-attempts the steer by itself \
+                 once both gates permit. {tail}"
+            )
         };
         // Stray rules do NOT share that remedy, and sharing it was a
         // P1. The two complaints differ in what waiting costs: a
