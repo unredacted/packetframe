@@ -340,6 +340,49 @@ pub enum Eligibility {
     Unknown(String),
 }
 
+/// How far forward `peerUptimeEstablishedEpoch` must move before it
+/// means a different session.
+///
+/// The field is not a stored timestamp. FRR derives it from two clocks
+/// that tick at different points within each second, so ONE session
+/// reads one lower when the read lands in a narrow window at the top of
+/// a second. Measured on the lab gateway (FRR 10.1.2, 2026-09-22), one
+/// idle session over six checker ticks:
+///
+/// | read at (s past the minute) | epoch |
+/// |---|---|
+/// | 12.68 | 1790066204 |
+/// | 12.99 | 1790066203 |
+/// | 13.31 | 1790066204 |
+/// | 13.63 | 1790066204 |
+/// | 13.94 | 1790066203 |
+/// | 14.26 | 1790066204 |
+///
+/// The checker's period is its interval plus the check's own duration,
+/// so every tick lands ~0.3 s later than the last and sweeps the whole
+/// second — while twenty back-to-back manual reads all missed the
+/// window. Exact comparison revoked the mirror on four of those six
+/// ticks: near-permanent ineligibility on a perfectly stable box, which
+/// on the primary would have refused essentially every steer.
+///
+/// Five seconds absorbs that and a small clock slew. What a tolerance
+/// costs is a session that lived for less than it before being
+/// replaced — every sustained session, and every replacement caused by
+/// a bgpd restart (a UniFi upload), moves the epoch by the old session's
+/// whole lifetime, which is minutes at least.
+pub const EPOCH_TOLERANCE_SECS: u64 = 5;
+
+/// Is `now` the epoch of a DIFFERENT session from `prev`?
+///
+/// Only a forward move beyond the tolerance. A replacement session is
+/// established after the one it replaces, so its epoch is later by at
+/// least the old session's lifetime; a BACKWARD move is never a new
+/// session — it is the derivation's jitter, or the wall clock stepping
+/// back, and treating it as a flap is how an idle box revoked itself.
+pub fn is_new_session(prev: u64, now: u64) -> bool {
+    now > prev.saturating_add(EPOCH_TOLERANCE_SECS)
+}
+
 /// Decide eligibility from one tick's readings.
 ///
 /// `seen_epochs` is read AND updated here, because the session-
@@ -430,7 +473,7 @@ pub fn classify_eligibility(
             continue;
         };
         if let Some(prev) = seen_epochs.insert(*peer, epoch) {
-            if prev != epoch && moved.is_none() {
+            if is_new_session(prev, epoch) && moved.is_none() {
                 moved = Some(format!(
                     "upstream {peer} re-established since the last check (epoch \
                      {prev} → {epoch}); on this platform an FRR configuration \
@@ -1089,6 +1132,46 @@ router bgp 65000
                 ),
                 Eligibility::Ok
             );
+        }
+
+        /// The lab rig's exact readings: one idle session, two ticks,
+        /// the epoch one second LOWER on the second. Exact comparison
+        /// revoked the mirror for it (2026-09-22).
+        #[test]
+        fn epoch_jitter_on_an_idle_session_is_not_a_re_establishment() {
+            let mut seen = HashMap::new();
+            for epoch in [1_790_066_204, 1_790_066_203, 1_790_066_204, 1_790_066_203] {
+                assert_eq!(
+                    classify_eligibility(
+                        Ok(ExportPolicy::Unfiltered),
+                        &[ready(peer(1), Some(epoch))],
+                        &mut seen
+                    ),
+                    Eligibility::Ok,
+                    "a reading alternating by a second is one session, not a flap per tick"
+                );
+            }
+        }
+
+        /// Backward is never a new session, however far — it is the
+        /// wall clock stepping back, not a session established earlier
+        /// than the one it replaced.
+        #[test]
+        fn a_backward_epoch_move_is_never_a_new_session() {
+            assert!(!is_new_session(1_000_000, 999_000));
+            assert!(!is_new_session(1_000_000, 999_999));
+        }
+
+        /// The tolerance boundary, both sides.
+        #[test]
+        fn only_a_forward_move_beyond_the_tolerance_is_a_new_session() {
+            let t = EPOCH_TOLERANCE_SECS;
+            assert!(!is_new_session(1_000, 1_000));
+            assert!(!is_new_session(1_000, 1_000 + t));
+            assert!(is_new_session(1_000, 1_000 + t + 1));
+            // What a real flap looks like on the rig: `clear bgp` moved
+            // it by ~4 hours of session lifetime.
+            assert!(is_new_session(1_790_052_235, 1_790_066_204));
         }
 
         /// The FIRST sighting of a peer is not a move.
