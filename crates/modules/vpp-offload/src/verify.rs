@@ -142,6 +142,28 @@ impl VerifyOutcome {
         self.sampled > 0 && self.mismatches.is_empty() && self.unresolvable == 0
     }
 
+    /// Whether a teardown is the remedy — **the** restart-worthy
+    /// predicate, and the only one.
+    ///
+    /// A mismatch means VPP answered a probe and disagreed with the
+    /// ledger, and a fresh resync rebuilds a wrong FIB. Every other way
+    /// of failing [`Self::fib_correct`] is a condition a restart cannot
+    /// change, and each has produced a kill-respawn loop by being
+    /// treated as one — see [`crate::engine::Verdict::event`], which
+    /// lists the three and what they cost.
+    ///
+    /// Lives here rather than inline at its callers because it has two:
+    /// the supervisor event and the health surface. They disagreed —
+    /// `Verdict::event` honoured the distinction and routed an
+    /// incomplete verify to a hold, while
+    /// [`crate::status::FibSync::from_outcome`] folded every non-pass
+    /// into one `Failed` and paged on it. So a box whose verify ran
+    /// before the feed landed reported UNHEALTHY with a summary that
+    /// said, in the same line, "no restart".
+    pub fn restart_worthy(&self) -> bool {
+        !self.mismatches.is_empty()
+    }
+
     /// Pass criteria for *steering*: the FIB is correct AND every dark
     /// member is idle — no installed route can egress an interface
     /// that cannot forward. The halves fail differently — see

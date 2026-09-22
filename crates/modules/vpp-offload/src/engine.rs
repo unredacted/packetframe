@@ -361,7 +361,7 @@ impl Verdict {
     /// primary's eth5 is the motivating case).
     pub fn event(&self) -> crate::supervisor::Event {
         let blocking_dark = self.outcome.dead_interfaces.iter().any(|d| d.in_use);
-        if !self.outcome.mismatches.is_empty() {
+        if self.outcome.restart_worthy() {
             crate::supervisor::Event::VerifyFailed
         } else if self.outcome.fib_correct() && self.may_steer && !blocking_dark {
             crate::supervisor::Event::VerifyPassed
@@ -543,6 +543,21 @@ pub struct ConvergenceEngine {
 
     phase: Option<Phase>,
     last_verify: Option<VerifyOutcome>,
+    /// The most recent FRESH dead-member scan, from whenever the steer
+    /// gate last ran one.
+    ///
+    /// `last_verify`'s `dead_interfaces` is a RECORDING, and verify does
+    /// not re-run in steady state — so on a box whose member went dark,
+    /// failed verify, then had its cable restored and steered on the
+    /// strength of the gate's own fresh scan, the recording still said
+    /// the port was down. `port_links` read the link flags from it while
+    /// reading `in_use` live, and the pair made a restored port look
+    /// like a live blackhole for as long as the process ran (review
+    /// finding, PR #231).
+    ///
+    /// Cleared with `last_verify` on process change: it describes a VPP,
+    /// not a box.
+    last_dead_scan: Option<Vec<crate::verify::DeadInterface>>,
     /// Unit-test seam for [`Self::dead_members`]: the real scan needs a
     /// live transport, which in-crate unit tests of the steer gate do
     /// not have (the fake VPP lives in the integration-test crate).
@@ -611,6 +626,7 @@ impl ConvergenceEngine {
             api_incompatible: false,
             phase: None,
             last_verify: None,
+            last_dead_scan: None,
             #[cfg(test)]
             test_dead_members: None,
             null_drops: None,
@@ -758,10 +774,19 @@ impl ConvergenceEngine {
     /// read that feeds the steer gate), so the health surface reads it
     /// live rather than as a recording.
     pub fn port_links(&self) -> Vec<PortLink> {
+        // The freshest observation available, and the scan wins when
+        // there is one: it is what the steer gate acted on, so a port
+        // restored between the last verify and the last steer reads as
+        // restored here too. Falling back to the verify's recording
+        // covers the window before any gate has run.
         let dead = self
-            .last_verify
-            .as_ref()
-            .map(|v| v.dead_interfaces.as_slice())
+            .last_dead_scan
+            .as_deref()
+            .or_else(|| {
+                self.last_verify
+                    .as_ref()
+                    .map(|v| v.dead_interfaces.as_slice())
+            })
             .unwrap_or_default();
         let active = self.active_egress_indices();
         self.attached
@@ -1782,15 +1807,24 @@ impl ConvergenceEngine {
     /// rather than the last verify's recorded outcome.
     pub fn dead_members(&mut self) -> Result<Vec<crate::verify::DeadInterface>, EngineError> {
         #[cfg(test)]
-        if let Some(dead) = &self.test_dead_members {
-            return Ok(dead.clone());
+        if let Some(dead) = self.test_dead_members.clone() {
+            // Caches like the real path, or a test would exercise a
+            // `port_links` that never sees a scan.
+            self.last_dead_scan = Some(dead.clone());
+            return Ok(dead);
         }
         let active = self.active_egress_indices();
         let Some(t) = self.transport.as_mut() else {
             return Err(EngineError::NotConnected);
         };
-        crate::verify::dead_interface_scan(t, &self.port_index.indices(), &active)
-            .map_err(EngineError::Transport)
+        let scan = crate::verify::dead_interface_scan(t, &self.port_index.indices(), &active)
+            .map_err(EngineError::Transport)?;
+        // Kept for the health surface. A FAILED scan deliberately leaves
+        // the previous one standing rather than clearing it: "we could
+        // not look" is not evidence a dark port came back, and the
+        // steer gate refuses on that error anyway.
+        self.last_dead_scan = Some(scan.clone());
+        Ok(scan)
     }
 
     /// Interfaces at least one static neighbour lives on — the set of
@@ -1857,6 +1891,7 @@ impl ConvergenceEngine {
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;
         self.last_verify = None;
+        self.last_dead_scan = None;
     }
 
     fn ledger_capacity(&self) -> Capacity {
@@ -2316,6 +2351,107 @@ mod tests {
                     not-a-count          null-node             garbage                    error\n";
         assert_eq!(parse_null_drops(text), 117_027);
         assert_eq!(parse_null_drops(""), 0);
+    }
+
+    /// A restored cable must not read as dark forever.
+    ///
+    /// `last_verify.dead_interfaces` is a RECORDING and verify does not
+    /// re-run in steady state, so the sequence — member goes dark,
+    /// verify fails on it, cable restored, steer gate's own FRESH scan
+    /// says the port is up and permits the steer — left `port_links`
+    /// reporting the recorded down flags beside a live `in_use`. That
+    /// pair is `blackhole()`, which `steered_but_broken()` reads, so the
+    /// box paged as the worst state in the system over a port that had
+    /// been working since before it was steered (review finding, PR
+    /// #231).
+    ///
+    /// The gate's scan is the freshest thing there is, and now it is
+    /// what the health surface reads.
+    #[test]
+    fn a_fresh_dead_scan_supersedes_the_recorded_verify() {
+        use crate::verify::DeadInterface;
+        let mut e = engine();
+        e.attached.push(AttachedPort {
+            port: "eth4".into(),
+            dev_index: Some(0),
+            sw_if_index: 3,
+            subifs: vec![],
+        });
+
+        // Verify recorded it dark.
+        e.last_verify = Some(VerifyOutcome {
+            sampled: 64,
+            dead_interfaces: vec![DeadInterface {
+                sw_if_index: 3,
+                name: "eth4".into(),
+                admin_up: true,
+                link_up: false,
+                in_use: true,
+            }],
+            ..Default::default()
+        });
+        assert!(
+            !e.port_links()[0].link_up,
+            "the recording is used until a scan runs"
+        );
+
+        // The cable goes back in, and the steer gate looks: no dark
+        // members. That scan is what it acted on, so it is what health
+        // must report.
+        e.test_dead_members = Some(Vec::new());
+        e.dead_members().expect("scan");
+        assert!(
+            e.port_links()[0].link_up,
+            "a port the gate just proved forwarding must not still read dark"
+        );
+
+        // And the scan is authoritative in the other direction too — a
+        // port that goes dark AFTER the last verify shows up without
+        // waiting for a verify that never comes.
+        e.test_dead_members = Some(vec![DeadInterface {
+            sw_if_index: 3,
+            name: "eth4".into(),
+            admin_up: false,
+            link_up: false,
+            in_use: true,
+        }]);
+        e.dead_members().expect("scan");
+        assert!(!e.port_links()[0].link_up);
+    }
+
+    /// A scan that FAILED leaves the previous observation standing.
+    ///
+    /// "We could not look" is not evidence a dark port came back, and
+    /// the steer gate refuses on that error anyway — so clearing the
+    /// cache here would turn an unreadable transport into a health
+    /// surface claiming every port forwards.
+    #[test]
+    fn a_failed_scan_does_not_clear_what_the_last_one_saw() {
+        use crate::verify::DeadInterface;
+        let mut e = engine();
+        e.attached.push(AttachedPort {
+            port: "eth4".into(),
+            dev_index: Some(0),
+            sw_if_index: 3,
+            subifs: vec![],
+        });
+        e.test_dead_members = Some(vec![DeadInterface {
+            sw_if_index: 3,
+            name: "eth4".into(),
+            admin_up: false,
+            link_up: false,
+            in_use: true,
+        }]);
+        e.dead_members().expect("scan");
+        assert!(!e.port_links()[0].link_up);
+
+        // No transport: the scan errors.
+        e.test_dead_members = None;
+        e.dead_members().expect_err("no transport");
+        assert!(
+            !e.port_links()[0].link_up,
+            "the last real observation stands"
+        );
     }
 
     /// Link state must come from an observation. An earlier version
