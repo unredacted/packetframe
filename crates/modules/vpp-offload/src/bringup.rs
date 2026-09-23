@@ -445,36 +445,72 @@ pub fn bring_up(
     // first primary attach (2026-08-13), where six poll-mode workers
     // landed on CPUs carrying production rx-queue IRQs: load ~10,
     // management ssh dropped, birdc past its budget, and VPP itself
-    // starved into a supervisor restart loop. Still pure/read-only —
-    // a refused config must cost no sysfs writes.
+    // starved into a supervisor restart loop.
+    //
+    // Then it became a refusal with the fix spelled out for an operator
+    // to apply by hand. That was the right invariant and the wrong
+    // owner: on the fleet a hand-written affinity is gone at the next
+    // reboot, provision cycle or ring resize, so the refusal fired after
+    // every one of them — fifteen times under systemd auto-restart on the
+    // primary after a ring resize (2026-08-14). So the module applies the
+    // fix itself and keeps the refusal for the case it cannot fix: a
+    // kernel that does not deliver where it was told.
+    //
+    // No longer strictly a pure phase: this writes `smp_affinity_list`
+    // before later checks that may still refuse. That is acceptable
+    // because the write is harmless whether or not VPP then starts — it
+    // only keeps IRQs off CPUs a poll-mode thread would take — and it is
+    // idempotent across retries. It writes nothing else.
     let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _, _, _)| i.clone()).collect();
     let mut vpp_cores = vec![core_map.main];
     vpp_cores.extend(&core_map.workers);
-    let conflicts = cores::nic_irq_conflicts(
-        &paths.sys.sysfs_net,
-        &paths.proc_irq,
-        &member_ifaces,
-        &vpp_cores,
-    )?;
+    let find = || {
+        cores::nic_irq_conflicts(
+            &paths.sys.sysfs_net,
+            &paths.proc_irq,
+            &member_ifaces,
+            &vpp_cores,
+        )
+    };
+    let conflicts = find()?;
     if !conflicts.is_empty() {
-        let sample: Vec<String> = conflicts
-            .iter()
-            .take(8)
-            .map(|c| format!("{} irq {} -> cpu {:?}", c.iface, c.irq, c.cpus))
-            .collect();
-        return Err(format!(
-            "{} NIC queue IRQ(s) currently fire on the cores derived for VPP (main {}, \
-             workers {:?}): {}{}. Six hot pollers sharing CPUs with production rx-queue \
-             IRQs is how the first primary attach starved the box into a restart loop. \
-             Move these IRQs off the VPP cores first — for each: \
-             `echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list` — \
-             then re-attach (docs/runbooks/vpp-offload.md, \"IRQ affinity before attach\")",
-            conflicts.len(),
-            core_map.main,
-            core_map.workers,
-            sample.join(", "),
-            if conflicts.len() > 8 { ", ..." } else { "" },
-        ));
+        let (online, isolated) = cores::read_cpu_topology(&paths.sysfs_cpu)?;
+        let safe = cores::irq_safe_cpus(&online, &isolated, &vpp_cores);
+        let moved = cores::move_irqs_off(&paths.proc_irq, &conflicts, &safe)?;
+        for m in &moved {
+            tracing::info!(
+                iface = %m.iface,
+                irq = m.irq,
+                was = %m.was,
+                now = %m.now,
+                "moved a NIC queue IRQ off the cores VPP will poll"
+            );
+        }
+        // The written mask is permission; where the IRQ fires is the
+        // fact. Re-read it rather than trusting the write.
+        let still = find()?;
+        if !still.is_empty() {
+            let sample: Vec<String> = still
+                .iter()
+                .take(8)
+                .map(|c| format!("{} irq {} -> cpu {:?}", c.iface, c.irq, c.cpus))
+                .collect();
+            return Err(format!(
+                "{} NIC queue IRQ(s) still fire on the cores derived for VPP (main {}, \
+                 workers {:?}) after packetframe re-pinned them onto {}: {}{}. The kernel \
+                 accepted the new mask but did not move delivery, so the IRQ is \
+                 probably kernel-managed or pinned by its driver. Six hot pollers sharing \
+                 CPUs with production rx-queue IRQs is how the first primary attach \
+                 starved the box into a restart loop, so attach refuses \
+                 (docs/runbooks/vpp-offload.md, \"IRQ affinity before attach\")",
+                still.len(),
+                core_map.main,
+                core_map.workers,
+                cores::format_cpu_list(&safe),
+                sample.join(", "),
+                if still.len() > 8 { ", ..." } else { "" },
+            ));
+        }
     }
 
     // VFIO must be IOMMU-isolated. With no active IOMMU the vfio-pci

@@ -101,17 +101,47 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
                 .take(8)
                 .map(|x| format!("{} irq {} -> cpu {:?}", x.iface, x.irq, x.cpus))
                 .collect();
-            Capability::fail(
+            // Attach re-pins these itself now, so a conflict it CAN fix
+            // passes — failing feasibility over something attach
+            // corrects would block a rollout for nothing. What it cannot
+            // fix is having nowhere to put them, and that still fails.
+            // Read-only: the probe reports the move, it never makes it.
+            let safe = match crate::cores::read_cpu_topology(Path::new(crate::cores::SYSFS_CPU)) {
+                Ok((online, isolated)) => {
+                    crate::cores::irq_safe_cpus(&online, &isolated, &vpp_cores)
+                }
+                Err(e) => {
+                    return Capability::unknown(name, format!("read CPU topology: {e}"), true)
+                }
+            };
+            if safe.is_empty() {
+                return Capability::fail(
+                    name,
+                    format!(
+                        "{} NIC queue IRQ(s) fire on the derived VPP cores (main {}, workers \
+                         {:?}): {}{} — and no CPU is left outside VPP's cores and the \
+                         isolated set to move them to, so attach will refuse. Reduce the \
+                         `cores` totals or free an isolated CPU",
+                        c.len(),
+                        map.main,
+                        map.workers,
+                        sample.join(", "),
+                        if c.len() > 8 { ", ..." } else { "" },
+                    ),
+                    true,
+                );
+            }
+            Capability::pass(
                 name,
                 format!(
-                    "{} NIC queue IRQ(s) fire on the derived VPP cores (main {}, workers \
-                     {:?}): {}{} — attach will refuse; move them first: `echo <cpu-list \
-                     outside the VPP cores> > /proc/irq/<N>/smp_affinity_list`",
+                    "{} NIC queue IRQ(s) currently fire on the derived VPP cores (main {}, \
+                     workers {:?}): {}{} — attach re-pins them onto {} before starting VPP",
                     c.len(),
                     map.main,
                     map.workers,
                     sample.join(", "),
                     if c.len() > 8 { ", ..." } else { "" },
+                    crate::cores::format_cpu_list(&safe),
                 ),
                 true,
             )

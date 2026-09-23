@@ -316,7 +316,62 @@ fn a_fresh_attach_acquires_renders_and_supervises() {
     );
 }
 
-/// A config that cannot work must cost nothing. The rollback path exists,
+/// The fix the old refusal asked an operator for, applied by attach.
+///
+/// Reproduced on the lab rig (2026-09-23): one of eth3's queue IRQs on
+/// VPP's main core, the state every reboot leaves because IRQ affinity
+/// does not persist. The attach used to refuse — and until the loader
+/// learned to degrade, took the fast-path down with it. Now it re-pins
+/// the IRQ onto CPUs that are neither VPP's nor isolated and proceeds.
+///
+/// The fixture holds only `smp_affinity_list`, so the conflict check's
+/// fallback reads what was written — a kernel that honours the mask.
+#[test]
+fn an_irq_on_a_vpp_core_is_moved_and_the_attach_proceeds() {
+    let fake = fake_vpp::Fake::start("bringup-irq-move");
+    let host = Host::new("irqmove", &[("eth4", "0002:07:00.0")], fake.path.clone());
+
+    // 18 online, cpu12 isolated, one worker => main 16, worker 17.
+    let msi = host
+        .paths
+        .sys
+        .sysfs_net
+        .join("eth4")
+        .join("device")
+        .join("msi_irqs");
+    fs::create_dir_all(&msi).unwrap();
+    fs::write(msi.join("602"), "").unwrap();
+    let d = host.paths.proc_irq.join("602");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("smp_affinity_list"), "0-17\n").unwrap();
+
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        None,
+        &McamBudget::default(),
+        &[],
+    )
+    .expect("the IRQ is packetframe's to move now, not a refusal");
+
+    let now = fs::read_to_string(d.join("smp_affinity_list")).unwrap();
+    assert_eq!(
+        now.trim(),
+        "0-11,13-15",
+        "the old mask minus VPP's cores ({:?} + {}) and the isolated cpu12",
+        attached.cores.workers,
+        attached.cores.main
+    );
+
+    let last = attached.service.stop().published.expect("final status");
+    assert!(!last.resources_leaked, "{:?}", last.teardown_failures);
+}
+
+/// A config that cannot work must cost nothing. The rollback path exists,/// A config that cannot work must cost nothing. The rollback path exists,
 /// but it should not be reachable by an ordinary operator typo — so the
 /// pure checks all run before the first sysfs write.
 #[test]
@@ -461,14 +516,19 @@ fn an_inactive_iommu_is_refused_before_any_mutation() {
     );
 }
 
-/// The incident gate (primary, 2026-08-13): a NIC queue IRQ whose
-/// effective affinity lands on a derived VPP core refuses the attach —
-/// six hot pollers sharing CPUs with production rx-queue IRQs starved
-/// the box AND the VPP into a supervisor restart loop, and the only
-/// guard was an advice line in the attach log. Refusal happens in the
-/// pure phase: nothing may have been acquired.
+/// The incident gate (primary, 2026-08-13), in the case it still has
+/// to refuse: a NIC queue IRQ on a derived VPP core that packetframe
+/// re-pins and the kernel does NOT move. Six hot pollers sharing CPUs
+/// with production rx-queue IRQs starved the box and the VPP into a
+/// supervisor restart loop, so an IRQ that will not leave is still a
+/// refusal — just no longer the first resort.
+///
+/// The fixture reproduces "the kernel did not follow" for free: it has
+/// only `effective_affinity_list`, which nothing but a kernel updates,
+/// so the re-check after the write still sees cpu17. Nothing may have
+/// been acquired: the IRQ phase runs before the first VF.
 #[test]
-fn an_irq_on_a_vpp_core_refuses_the_attach() {
+fn an_irq_the_kernel_will_not_move_still_refuses_the_attach() {
     let fake = fake_vpp::Fake::start("bringup-irq");
     let host = Host::new("irq", &[("eth4", "0002:07:00.0")], fake.path.clone());
 
@@ -502,6 +562,10 @@ fn an_irq_on_a_vpp_core_refuses_the_attach() {
     .expect("must fail");
     assert!(e.contains("NIC queue IRQ"), "{e}");
     assert!(e.contains("irq 270"), "the refusal must name the IRQ: {e}");
+    assert!(
+        e.contains("did not move delivery"),
+        "and say packetframe tried, so nobody re-runs the manual fix it already applied: {e}"
+    );
 
     // Pure-phase refusal: no VF, no reservation, no record.
     assert!(host.state().is_none(), "a refused attach left a state file");
