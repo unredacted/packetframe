@@ -1432,8 +1432,9 @@ impl StatusSnapshot {
             (true, _) => (
                 HealthState::Healthy,
                 Some(
-                    "steered — MCAM rules are diverting allowlisted traffic to VPP; \
-                     `ethtool -n <iface>` lists them"
+                    "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
+                     (IPv6 stays on the eBPF tier: this NIC cannot steer it); \
+                     `ethtool -n <iface>` lists the rules"
                         .into(),
                 ),
             ),
@@ -3219,6 +3220,9 @@ mod tests {
         assert_eq!(row.state, HealthState::Healthy);
         let msg = row.message.expect("a message, not a bare healthy");
         assert!(msg.starts_with("steered"), "{msg}");
+        // Scoped to what steering covers: `RuleSet::plan` skips every v6
+        // prefix, so "allowlisted traffic" alone would overstate it.
+        assert!(msg.contains("IPv4"), "{msg}");
     }
 
     /// The two ways to be unsteered must not print the same line.
