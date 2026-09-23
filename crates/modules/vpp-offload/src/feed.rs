@@ -129,6 +129,9 @@ struct Inner {
     /// **unresolvable**, so without this a genuinely new nexthop would
     /// black-hole its routes until the next full resync.
     neigh_pending: HashMap<IpAddr, Option<([u8; 6], u32)>>,
+    /// Set by [`RouteFeed::disconnect`]: the consumer is gone for the
+    /// life of the process, so the writer's calls become no-ops.
+    disconnected: bool,
 }
 
 impl Inner {
@@ -166,6 +169,24 @@ impl RouteFeed {
         }
     }
 
+    /// Stop mirroring, for good, and free what the mirror holds.
+    ///
+    /// For the loader's degrade path: vpp-offload failed to come up, the
+    /// fast-path it shares this feed with keeps running, and nothing will
+    /// ever drain the feed again in this process. Left connected, the
+    /// fast-path's programmer would go on maintaining a second copy of
+    /// the whole table — `routes` plus an undrained `pending` of the same
+    /// size, ~1.05M prefixes each at full scale — for a consumer that
+    /// cannot return until a restart. One-way: there is no reconnect,
+    /// because a feed that missed deltas cannot be trusted as a mirror.
+    pub fn disconnect(&self) {
+        let mut g = self.lock();
+        *g = Inner {
+            disconnected: true,
+            ..Inner::default()
+        };
+    }
+
     /// `PoisonError` cannot mean what it usually means here.
     ///
     /// Every critical section is a map insert or a bounded copy, with no
@@ -182,6 +203,9 @@ impl RouteFeed {
 impl ResolvedRouteSink for RouteFeed {
     fn route_resolved(&self, prefix: IpPrefix, nexthops: &[IpAddr]) {
         let mut g = self.lock();
+        if g.disconnected {
+            return;
+        }
         g.seq += 1;
         let id = g.intern(nexthops);
         let key = PrefixKey::from(prefix);
@@ -191,6 +215,9 @@ impl ResolvedRouteSink for RouteFeed {
 
     fn route_withdrawn(&self, prefix: IpPrefix) {
         let mut g = self.lock();
+        if g.disconnected {
+            return;
+        }
         g.seq += 1;
         let key = PrefixKey::from(prefix);
         g.routes.remove(&key);
@@ -205,6 +232,9 @@ impl ResolvedRouteSink for RouteFeed {
 
     fn neighbour_resolved(&self, nh: IpAddr, mac: [u8; 6], ifindex: u32) {
         let mut g = self.lock();
+        if g.disconnected {
+            return;
+        }
         g.seq += 1;
         g.neighbours.insert(nh, (mac, ifindex));
         g.neigh_pending.insert(nh, Some((mac, ifindex)));
@@ -212,6 +242,9 @@ impl ResolvedRouteSink for RouteFeed {
 
     fn neighbour_lost(&self, nh: IpAddr) {
         let mut g = self.lock();
+        if g.disconnected {
+            return;
+        }
         g.seq += 1;
         g.neighbours.remove(&nh);
         // Queued even if the map held nothing, for the same reason a
@@ -450,6 +483,29 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0], (v4(192, 0), Some(vec![nh(99)])), "newest wins");
         assert_eq!(f.stats().pending, 0, "drain removes what it returned");
+    }
+
+    /// A disconnected feed frees the mirror and ignores the writer from
+    /// then on — the loader's degrade path, where the fast-path keeps
+    /// writing and nothing will ever drain.
+    #[test]
+    fn a_disconnected_feed_holds_nothing_and_stays_empty() {
+        let f = RouteFeed::new();
+        f.route_resolved(v4(192, 0), &[nh(1)]);
+        f.neighbour_resolved(nh(1), [0x02, 0, 0, 0, 0, 1], 7);
+
+        f.disconnect();
+        assert_eq!(f.stats(), FeedStats::default(), "the mirror is freed");
+
+        f.route_resolved(v4(198, 18), &[nh(2)]);
+        f.route_withdrawn(v4(198, 19));
+        f.neighbour_resolved(nh(2), [0x02, 0, 0, 0, 0, 2], 7);
+        f.neighbour_lost(nh(1));
+        assert_eq!(
+            f.stats(),
+            FeedStats::default(),
+            "and later writes are dropped, not queued for a consumer that is gone"
+        );
     }
 
     /// A withdrawal after an upsert replaces it, and vice versa — the

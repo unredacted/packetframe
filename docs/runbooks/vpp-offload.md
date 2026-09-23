@@ -2328,9 +2328,55 @@ echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list
 
 Re-run feasibility until `vpp.irq-affinity` passes; then attach. The
 affinity write does not persist across reboot — a box that reboots
-into a VPP config re-runs the refusal, which is the reminder. (udapi
-provision cycles may also rewrite affinities; if attach starts refusing
-on a box that used to pass, that is the first place to look.)
+into a VPP config re-runs the refusal. (udapi provision cycles may also
+rewrite affinities; if attach starts refusing on a box that used to
+pass, that is the first place to look.)
+
+**A refusal no longer takes the fast-path down with it.** It used to.
+Any module that failed to come up made the loader unwind every module
+attached before it and exit, so a vpp-offload refusal removed the eBPF
+tier too — the daemon exited, systemd looped on restarts, and the box
+forwarded through the kernel with no fast-path at all. The 2026-08-14
+primary incident below was fifteen of exactly that; the lab rig
+reproduced it on demand (2026-09-23) by moving one member IRQ onto a
+VPP core. A reboot of any box with packetframe enabled at boot and
+vpp-offload configured would have done it every time.
+
+Now vpp-offload's failure to load or attach **degrades** the daemon
+instead: the fast-path stays attached and forwarding, and vpp-offload
+is reported, not omitted —
+
+```
+  vpp-offload: DEGRADED
+    startup  DEGRADED — did not come up at startup: <the refusal>. The eBPF
+             fast-path is forwarding on its own and nothing is offloaded ...
+```
+
+— and `packetframe reconfigure` names it the same way rather than as
+"added to config". `packetframe_vpp_health{state="degraded"}` reads
+`1` and `packetframe_vpp_steered` reads `0`, so the healthy-series
+alert fires rather than finding no series.
+
+Before running on, the loader releases whatever an earlier daemon left
+for adoption, from vpp-offload's state file — the same routine
+`packetframe detach` runs: MCAM steering removed, the recorded VPP
+killed, VFs and hugepages handed back. A preserved VPP still carrying
+steered traffic is exactly what a bring-up that fails before adoption
+would otherwise leave behind, unsupervised, on a frozen table. **If
+that release fails, the daemon does not degrade**: it aborts as before,
+and the error carries both the refusal and why the release failed.
+
+Fix the cause, then run the full sequence — **not** a bare restart:
+
+```bash
+systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
+```
+
+A reload cannot start a module that failed to attach, and a plain
+`systemctl restart` preserves the fast-path's pins on the way down,
+which the next start then refuses — turning a degraded daemon into a
+stopped one. Every other module keeps the all-or-nothing rule; see
+`DEGRADE_ON_START_FAILURE` in the loader for why.
 
 **`ethtool -G` resets it too.** Resizing a ring tears down and
 rebuilds the port's queues, and the driver re-spreads the rebuilt
