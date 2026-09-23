@@ -33,7 +33,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use packetframe_common::module::{HealthCtx, HealthReport, MetricsWriter, Module};
+use packetframe_common::module::{
+    HealthCtx, HealthReport, HealthState, MetricsWriter, Module, SubsystemHealth,
+};
 use serde::{Deserialize, Serialize};
 
 /// Sub-path under `state-dir`.
@@ -80,6 +82,69 @@ impl Snapshot {
     }
 }
 
+/// A module the config declares that did not come up at startup, and
+/// why.
+///
+/// Only modules whose startup failure DEGRADES the daemon rather than
+/// aborting it ever land here — see `DEGRADE_ON_START_FAILURE` in the
+/// loader. The daemon keeps running without them, so the one thing that
+/// must not happen is for them to vanish from every surface an operator
+/// reads: no health row, no reconfigure line, only a journal entry from
+/// boot that nobody is watching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotAttached {
+    pub module: String,
+    pub reason: String,
+}
+
+/// The health row for a module that did not come up.
+///
+/// **Degraded, not Unhealthy**, and the choice is not a softening. The
+/// modules that degrade this way are second tiers: the eBPF fast-path
+/// is forwarding on its own, which is the designed fallback, and
+/// vpp-offload's own health doctrine already reports "dead and
+/// unsteered" as Degraded for exactly that reason — paging as the
+/// worst state in the system for a router that is forwarding correctly
+/// is how alerts get muted. Degraded is still not-healthy, so the
+/// sustained-not-healthy page fires; it just fires as what it is.
+pub fn not_attached_entry(n: &NotAttached) -> ModuleEntry {
+    ModuleEntry {
+        module: n.module.clone(),
+        report: Some(HealthReport {
+            overall: HealthState::Degraded,
+            subsystems: vec![SubsystemHealth {
+                name: "startup".into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "did not come up at startup: {}. The eBPF fast-path is forwarding on its \
+                     own and nothing is offloaded to this module. Fix the cause and restart \
+                     the daemon — a reload cannot start a module that failed to attach",
+                    n.reason
+                )),
+                last_success_age_seconds: None,
+            }],
+        }),
+        error: None,
+    }
+}
+
+/// What `packetframe reconfigure` reports for a module that did not
+/// come up.
+///
+/// Without it, the reload's "is every configured module running?" check
+/// saw a section with no module and called it "added to config (restart
+/// required)" — true in its remedy and false in its cause, on every
+/// SIGHUP for as long as the daemon ran. The operator would go looking
+/// for a config edit they never made.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn not_attached_reconfigure_line(n: &NotAttached) -> String {
+    format!(
+        "{}: not running — it failed to come up at startup ({}); fix the cause and \
+         restart the daemon",
+        n.module, n.reason
+    )
+}
+
 /// Ask every module how it is and what it wants published.
 ///
 /// The call site that was missing: nothing in the CLI invoked
@@ -106,10 +171,19 @@ impl Snapshot {
 // invisible to every host gate, which is the trap this project has hit
 // twice.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn poll(state_dir: &Path, modules: &[(String, Box<dyn Module>)], gauges: &Mutex<String>) {
+pub fn poll(
+    state_dir: &Path,
+    modules: &[(String, Box<dyn Module>)],
+    not_attached: &[NotAttached],
+    gauges: &Mutex<String>,
+) {
     let ctx = HealthCtx::new();
-    let mut entries = Vec::with_capacity(modules.len());
+    let mut entries = Vec::with_capacity(modules.len() + not_attached.len());
     let mut rendered = String::new();
+
+    // First, so `packetframe status` leads with the module that is
+    // missing rather than burying it under the ones that are fine.
+    entries.extend(not_attached.iter().map(not_attached_entry));
 
     for (name, module) in modules {
         entries.push(match module.health_check(&ctx) {
@@ -223,7 +297,6 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use packetframe_common::module::{HealthState, SubsystemHealth};
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("pf-health-{tag}-{}", std::process::id()));
@@ -409,7 +482,7 @@ mod tests {
         )];
         let slot = Mutex::new(String::new());
 
-        poll(&dir, &modules, &slot);
+        poll(&dir, &modules, &[], &slot);
 
         assert_eq!(
             slot.lock().unwrap().as_str(),
@@ -421,6 +494,68 @@ mod tests {
         assert_eq!(r.overall, HealthState::Degraded);
         assert_eq!(r.subsystems[0].name, "steering");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A module that did not come up still has a row — first, Degraded,
+    /// and saying what is forwarding instead.
+    ///
+    /// The daemon keeps running without it (the loader's degrade path),
+    /// so this row is the only place an operator reading `status` learns
+    /// it is missing. Asserted on the published snapshot, which is what
+    /// `packetframe status` renders, rather than on the entry builder.
+    #[test]
+    fn a_module_that_did_not_come_up_is_reported_not_omitted() {
+        let dir = tmpdir("not-attached");
+        let modules: Vec<(String, Box<dyn Module>)> = vec![(
+            "fast-path".into(),
+            Box::new(Fake {
+                name: "fast-path",
+                health: Some(HealthReport::healthy()),
+                gauges: Some(""),
+            }),
+        )];
+        let missing = NotAttached {
+            module: "vpp-offload".into(),
+            reason: "1 NIC queue IRQ(s) currently fire on the cores derived for VPP".into(),
+        };
+        let slot = Mutex::new(String::new());
+
+        poll(&dir, &modules, std::slice::from_ref(&missing), &slot);
+
+        let snap = load(&dir).unwrap().expect("published");
+        assert_eq!(snap.modules.len(), 2, "both modules appear");
+        let row = &snap.modules[0];
+        assert_eq!(row.module, "vpp-offload", "the missing one leads");
+        let r = row.report.as_ref().expect("a report, not a check error");
+        assert_eq!(
+            r.overall,
+            HealthState::Degraded,
+            "the fast-path is forwarding — Degraded, not the worst state in the system"
+        );
+        let msg = r.subsystems[0].message.as_deref().expect("a message");
+        assert!(
+            msg.contains("NIC queue IRQ"),
+            "the reason is carried: {msg}"
+        );
+        assert!(
+            msg.contains("fast-path is forwarding"),
+            "and what still works: {msg}"
+        );
+        assert!(msg.contains("restart the daemon"), "and the remedy: {msg}");
+        assert_eq!(snap.modules[1].module, "fast-path");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The reload line names the real cause, not "added to config".
+    #[test]
+    fn reconfigure_reports_the_startup_failure_not_a_config_edit() {
+        let line = not_attached_reconfigure_line(&NotAttached {
+            module: "vpp-offload".into(),
+            reason: "vpp binary not found".into(),
+        });
+        assert!(line.starts_with("vpp-offload: not running"), "{line}");
+        assert!(line.contains("vpp binary not found"), "{line}");
+        assert!(!line.contains("added to config"), "{line}");
     }
 
     /// One module's failure must not cost another module its gauges.
@@ -452,7 +587,7 @@ mod tests {
         ];
         let slot = Mutex::new(String::new());
 
-        poll(&dir, &modules, &slot);
+        poll(&dir, &modules, &[], &slot);
 
         assert_eq!(
             slot.lock().unwrap().as_str(),
@@ -493,8 +628,8 @@ mod tests {
         )];
         let slot = Mutex::new(String::new());
 
-        poll(&dir, &modules, &slot);
-        poll(&dir, &modules, &slot);
+        poll(&dir, &modules, &[], &slot);
+        poll(&dir, &modules, &[], &slot);
 
         assert_eq!(
             slot.lock().unwrap().as_str(),

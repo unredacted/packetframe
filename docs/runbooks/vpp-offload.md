@@ -2328,9 +2328,35 @@ echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list
 
 Re-run feasibility until `vpp.irq-affinity` passes; then attach. The
 affinity write does not persist across reboot — a box that reboots
-into a VPP config re-runs the refusal, which is the reminder. (udapi
-provision cycles may also rewrite affinities; if attach starts refusing
-on a box that used to pass, that is the first place to look.)
+into a VPP config re-runs the refusal. (udapi provision cycles may also
+rewrite affinities; if attach starts refusing on a box that used to
+pass, that is the first place to look.)
+
+**A refusal no longer takes the fast-path down with it.** It used to.
+Any module that failed to come up made the loader unwind every module
+attached before it and exit, so a vpp-offload refusal removed the eBPF
+tier too — the daemon exited, systemd looped on restarts, and the box
+forwarded through the kernel with no fast-path at all. The 2026-08-14
+primary incident below was fifteen of exactly that; the lab rig
+reproduced it on demand (2026-09-23) by moving one member IRQ onto a
+VPP core. A reboot of any box with packetframe enabled at boot and
+vpp-offload configured would have done it every time.
+
+Now vpp-offload's failure to load or attach **degrades** the daemon
+instead: the fast-path stays attached and forwarding, and vpp-offload
+is reported, not omitted —
+
+```
+  vpp-offload: DEGRADED
+    startup  DEGRADED — did not come up at startup: <the refusal>. The eBPF
+             fast-path is forwarding on its own and nothing is offloaded ...
+```
+
+— and `packetframe reconfigure` names it the same way rather than as
+"added to config". Fix the cause, then **restart** the daemon: a
+reload cannot start a module that failed to attach. Every other module
+keeps the all-or-nothing rule; see `DEGRADE_ON_START_FAILURE` in the
+loader for why.
 
 **`ethtool -G` resets it too.** Resizing a ring tears down and
 rebuilds the port's queues, and the driver re-spreads the rebuilt
