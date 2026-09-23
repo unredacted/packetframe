@@ -59,6 +59,11 @@ pub struct SysPaths {
     pub hugetlbfs: PathBuf,
     /// Where the state file lives (`<state-dir>`).
     pub state_dir: PathBuf,
+    /// This boot's `/proc/sys/kernel/random/boot_id`, or `None` when it
+    /// could not be read. Compared against the state file's to tell a
+    /// record of THIS boot's resources from one a reboot has already
+    /// released — see [`recorded_on_an_earlier_boot`].
+    pub boot_id: Option<String>,
 }
 
 impl SysPaths {
@@ -83,8 +88,36 @@ impl SysPaths {
             hugepage_bytes,
             hugetlbfs: PathBuf::from("/dev/hugepages"),
             state_dir: state_dir.into(),
+            boot_id: crate::process::boot_id().ok(),
         }
     }
+}
+
+/// Whether a state file describes resources from an EARLIER boot — and
+/// so describes nothing that still exists.
+///
+/// Everything the record names is per-boot: the VFs (`sriov_numvfs`
+/// resets to 0), their vfio bindings, the hugepage reservation
+/// (`nr_hugepages` resets), the VPP process, and the MCAM rules (the
+/// NIC's classifier is reprogrammed when its driver probes). The file
+/// is the one thing that survives, because it lives under the
+/// persistent state directory — and the daemon's ordinary SIGTERM exit,
+/// which a reboot delivers, deliberately keeps it for adoption.
+///
+/// Reading it as live made every reboot of a box with vpp-offload
+/// configured refuse at attach ("state records VF … but no VF exists"),
+/// the recorded ports checked against VFs the reboot had removed (lab
+/// rig, D5a, 2026-09-23). The degrade path kept the fast-path up, but
+/// VPP never came back without a hand-run `detach --all`.
+///
+/// The record's own `boot_id` is authoritative; files written before it
+/// existed fall back to `vpp_boot_id`, which is present whenever a VPP
+/// was running when the file was last written — the reboot case. Only a
+/// POSITIVE mismatch counts: an unknown on either side keeps the
+/// adoption checks, which refuse rather than guess.
+pub fn recorded_on_an_earlier_boot(state: &ResourceState, current: Option<&str>) -> bool {
+    let recorded = state.boot_id.as_deref().or(state.vpp_boot_id.as_deref());
+    matches!((recorded, current), (Some(r), Some(c)) if r != c)
 }
 
 /// What acquisition produced, and how.
@@ -135,9 +168,36 @@ pub fn acquire(
     // whose VF already exists converges on the same result.
     let mut resume_from = 0usize;
 
-    let mut state = match ResourceState::load(&paths.state_dir)? {
+    let loaded = match ResourceState::load(&paths.state_dir)? {
+        // A reboot released everything it names; the file is all that
+        // is left. Discarded, and acquisition starts fresh.
+        Some(prior) if recorded_on_an_earlier_boot(&prior, paths.boot_id.as_deref()) => {
+            tracing::info!(
+                recorded_boot = prior
+                    .boot_id
+                    .as_deref()
+                    .or(prior.vpp_boot_id.as_deref())
+                    .unwrap_or("?"),
+                ports = prior.ports.len(),
+                steer_rules = prior.steer_rules.len(),
+                "vpp-offload state file is from an earlier boot; everything it records \
+                 was released by the reboot, so it is discarded and resources are \
+                 acquired fresh"
+            );
+            ResourceState::remove(&paths.state_dir)?;
+            None
+        }
+        other => other,
+    };
+    let mut state = match loaded {
         Some(mut state) => {
             resume_from = verify_adoptable(paths, &state, ports)?;
+            // Verified live, so these are this boot's resources. Stamped
+            // for records written before the field existed; a later save
+            // persists it.
+            if state.boot_id.is_none() {
+                state.boot_id = paths.boot_id.clone();
+            }
 
             // Sizing identity. Checked alongside the pool identity below
             // and for the same reason: both describe memory a running
@@ -224,6 +284,7 @@ pub fn acquire(
         None => {
             let mut state = ResourceState::empty();
             state.expected_routes = expected_routes;
+            state.boot_id = paths.boot_id.clone();
             // Hugepages first. Record the PRIOR count before touching
             // the pool: release restores this value, because zeroing
             // is only correct when the reservation was created from
@@ -809,6 +870,7 @@ mod tests {
                 hugepage_bytes: 512 << 20,
                 hugetlbfs,
                 state_dir: base.join("state"),
+                boot_id: Some(BOOT.into()),
             };
             Self { base, paths }
         }
@@ -828,6 +890,82 @@ mod tests {
     /// stability matters to most of them; the tests that care about the
     /// sizing-identity check pass their own.
     const ROUTES: u64 = 1_600_000;
+
+    /// The boot these fixtures run in.
+    const BOOT: &str = "boot-now";
+
+    /// The D5a reboot, as a unit: a record from an earlier boot names
+    /// VFs that no longer exist. It is discarded and acquisition starts
+    /// fresh — not refused as a mismatch, which is what every reboot of
+    /// a box with vpp-offload configured did.
+    #[test]
+    fn a_record_from_an_earlier_boot_is_discarded_not_refused() {
+        let f = Fixture::new(
+            "reboot",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let mut stale = ResourceState::empty();
+        stale.expected_routes = ROUTES;
+        stale.boot_id = Some("boot-before".into());
+        stale.ports = vec![crate::resources::PortState {
+            iface: "eth2".into(),
+            cores: 1,
+            vf_pci: "0002:04:00.1".into(),
+            sw_if_index: Some(1),
+        }];
+        stale.steer_rules = vec![("eth2".into(), vec![3, 4])];
+        stale.save(&f.paths.state_dir).unwrap();
+
+        let (state, how) = acquire(&f.paths, &two_ports(), 8, ROUTES).unwrap();
+        assert_eq!(how, Acquired::Fresh);
+        assert_eq!(
+            state.boot_id.as_deref(),
+            Some(BOOT),
+            "stamped with this boot"
+        );
+        assert_eq!(state.ports.len(), 2);
+        assert!(state.steer_rules.is_empty(), "no rules survive a reboot");
+        assert!(state.vpp_pid.is_none());
+    }
+
+    /// A file from before the `boot_id` field falls back to the VPP's
+    /// recorded boot — present whenever a VPP was running at shutdown.
+    #[test]
+    fn an_older_record_falls_back_to_the_vpp_boot_id() {
+        let mut s = ResourceState::empty();
+        s.vpp_boot_id = Some("boot-before".into());
+        assert!(recorded_on_an_earlier_boot(&s, Some(BOOT)));
+        s.vpp_boot_id = Some(BOOT.into());
+        assert!(!recorded_on_an_earlier_boot(&s, Some(BOOT)));
+    }
+
+    /// Only a positive mismatch discards. Unknown on either side keeps
+    /// the adoption checks, which refuse rather than guess.
+    #[test]
+    fn an_unknown_boot_is_not_an_earlier_one() {
+        let mut s = ResourceState::empty();
+        assert!(
+            !recorded_on_an_earlier_boot(&s, Some(BOOT)),
+            "record unknown"
+        );
+        s.boot_id = Some("boot-before".into());
+        assert!(!recorded_on_an_earlier_boot(&s, None), "current unknown");
+
+        // And end to end: an unknown-boot record over missing VFs is
+        // still the refusal it always was.
+        let f = Fixture::new("unknownboot", &[("eth2", "0002:07:00.0")]);
+        let mut stale = ResourceState::empty();
+        stale.expected_routes = ROUTES;
+        stale.ports = vec![crate::resources::PortState {
+            iface: "eth2".into(),
+            cores: 1,
+            vf_pci: "0002:04:00.1".into(),
+            sw_if_index: None,
+        }];
+        stale.save(&f.paths.state_dir).unwrap();
+        let err = acquire(&f.paths, &[("eth2".into(), 1)], 8, ROUTES).unwrap_err();
+        assert!(err.contains("does not match reality"), "{err}");
+    }
 
     /// The fixture's `bind` files are plain files; a real kernel responds
     /// to the bind write by creating the `driver` symlink that

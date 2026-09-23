@@ -210,6 +210,14 @@ pub struct ResourceState {
     /// adoption", which costs one restart and cannot mis-target.
     #[serde(default)]
     pub vpp_boot_id: Option<String>,
+    /// `/proc/sys/kernel/random/boot_id` of the boot these resources
+    /// were acquired in. Unlike `vpp_boot_id` it is set whether or not a
+    /// VPP is running, so a record can always be told apart from a
+    /// previous boot's — see [`crate::acquire::recorded_on_an_earlier_boot`].
+    /// `serde(default)`: older files parse, and fall back to
+    /// `vpp_boot_id`.
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 impl ResourceState {
@@ -226,6 +234,7 @@ impl ResourceState {
             vpp_pid: None,
             vpp_start_ticks: None,
             vpp_boot_id: None,
+            boot_id: None,
         }
     }
 
