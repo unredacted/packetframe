@@ -1424,7 +1424,19 @@ impl StatusSnapshot {
             };
         }
         let (state, message) = match (self.steered, self.steer_intended) {
-            (true, _) => (HealthState::Healthy, None),
+            // Named, like every other arm. It printed a bare `healthy`,
+            // so the one state that moves traffic was the one row that
+            // did not say what it was: the rig's first steer
+            // (2026-09-23) read `steering healthy` beside four rules in
+            // the NIC, and only `ethtool -n` said traffic was diverted.
+            (true, _) => (
+                HealthState::Healthy,
+                Some(
+                    "steered — MCAM rules are diverting allowlisted traffic to VPP; \
+                     `ethtool -n <iface>` lists them"
+                        .into(),
+                ),
+            ),
             // Intended but absent: a failed steer, or steering torn down
             // by trouble and not yet restored.
             //
@@ -3179,6 +3191,34 @@ mod tests {
                 "{state:?}: nothing is armed here — the repair is the convergence: {msg}"
             );
         }
+    }
+
+    /// Steered says so: it was the one steering state with no message.
+    #[test]
+    fn a_steered_row_names_the_state() {
+        let led = ledger_with(10, 0, 0);
+        let sup = ready_supervisor();
+        let mut snap = StatusSnapshot::observe(
+            &sup,
+            led.counts(),
+            &PendingMap::new(),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            ports_up(),
+            true,
+        );
+        snap.steered = true;
+        let row = snap
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|x| x.name == SUBSYS_STEERING)
+            .unwrap();
+        assert_eq!(row.state, HealthState::Healthy);
+        let msg = row.message.expect("a message, not a bare healthy");
+        assert!(msg.starts_with("steered"), "{msg}");
     }
 
     /// The two ways to be unsteered must not print the same line.
