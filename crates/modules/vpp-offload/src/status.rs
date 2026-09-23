@@ -1091,7 +1091,7 @@ impl StatusSnapshot {
                         "fresh convergence: routes install as the source loads (mirror \
                          holds {have}); verify waits for the completeness authority's \
                          first report (require-table-complete). On a full-table feed \
-                         this holds for the length of bird's dump — minutes — by design"
+                         this holds for the length of the route source's initial dump — minutes — by design"
                     )
                 } else {
                     format!(
@@ -1099,7 +1099,7 @@ impl StatusSnapshot {
                          holds {have} of the authority's {want}); verify runs once over \
                          the complete table when the authority confirms it \
                          (require-table-complete). On a full-table feed this holds for \
-                         the length of bird's dump — minutes — by design"
+                         the length of the route source's initial dump — minutes — by design"
                     )
                 };
                 (HealthState::Degraded, Some(msg))
