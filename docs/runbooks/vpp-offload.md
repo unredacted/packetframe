@@ -2307,30 +2307,55 @@ past its 10 s budget, and VPP itself starved into a supervisor restart
 loop. Traffic stayed on the eBPF tier throughout — the fallback design
 held — but the box was degraded until the daemon was stopped.
 
-So the overlap is a **checked precondition**: `packetframe feasibility`
-reports it (`vpp.irq-affinity`, listing each conflicting IRQ and the
-derived cores), and attach **refuses** while any member port's queue
-IRQ has its *effective* affinity on a VPP core. With a config that
-declares the module, the check is `required`: a conflict makes the
-summary read "vpp-offload attach BLOCKED" (exit non-zero) rather than
-PASS — do not trust a bare PASS memory from builds before this; one
-did read PASS over a failing line (edge1-mci1-net, 2026-08-21). Effective, not
+So the overlap is a **checked precondition**, and **attach fixes it
+itself**: any member port's queue IRQ whose *effective* affinity is on
+a VPP core is re-pinned onto the CPUs that are neither VPP's nor
+isolated, keeping whatever of its existing mask survives, and the
+attach log says so (`moved a NIC queue IRQ off the cores VPP will
+poll`). An IRQ with nothing surviving (the default spread pins one per
+core) gets a single CPU, and consecutive ones get different CPUs, cpu0
+last — a controller handed a wide mask delivers to one CPU in it, so
+writing the same wide mask for each would pile them all onto cpu0.
+Attach then re-reads where each IRQ actually fires and **refuses** only
+if the kernel did not follow — a kernel-managed or driver-pinned IRQ.
+When attach adopts a surviving VPP whose threads are observed on cores
+outside the derived map, it runs the same move against those too; there
+a kernel that does not follow is a warning, not a refusal, because
+refusing after adoption would leave that VPP unsupervised.
+
+`packetframe feasibility` reports a planned move as a non-blocking
+**WARN** on `vpp.irq-affinity`, not a pass: whether the kernel honours
+the mask is only known once it is written, which a probe never does.
+It **fails, required**, only when there is no CPU left to move to.
+
+This used to be a refusal with the fix spelled out for an operator to
+apply by hand. On UniFi a hand-written affinity is gone at the next
+reboot, provision cycle or ring resize, so the refusal fired after
+every one of them. The moves are not undone on detach: putting an IRQ
+back on a CPU VPP no longer uses would only re-create the conflict for
+the next attach. With a config that
+declares the module, the no-CPU-left failure is `required`: it makes
+the summary read "vpp-offload attach BLOCKED" (exit non-zero) rather
+than PASS. Effective, not
 permitted: a `0-17` wildcard mask still delivers to exactly one CPU,
 and that CPU either is or is not about to become a hot poller.
 
-Remediation, before the maintenance window:
+Manual remediation is now only for the case attach refuses — the
+kernel did not move delivery. Try a CPU by hand to see whether the IRQ
+moves at all:
 
 ```bash
-# Which cores VPP will take: run feasibility, read vpp.irq-affinity —
-# it names main + workers. Then, for each conflicting IRQ it lists:
 echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list
+cat /proc/irq/<N>/effective_affinity_list
 ```
 
-Re-run feasibility until `vpp.irq-affinity` passes; then attach. The
-affinity write does not persist across reboot — a box that reboots
-into a VPP config re-runs the refusal. (udapi provision cycles may also
-rewrite affinities; if attach starts refusing on a box that used to
-pass, that is the first place to look.)
+If the effective CPU does not change, the IRQ is not movable from
+userspace and VPP cannot share that host's cores with it. The affinity
+write does not persist across reboot; attach re-applies it every time.
+(udapi provision cycles and ring resizes can also re-spread affinities
+**while VPP is running** — attach only corrects them at attach, so a
+long-lived VPP can end up sharing a core with a re-spread IRQ until the
+next restart.)
 
 **A refusal no longer takes the fast-path down with it.** It used to.
 Any module that failed to come up made the loader unwind every module
@@ -2384,8 +2409,11 @@ queues' IRQs across all CPUs — silently undoing the pinning. Measured
 on the primary (2026-08-14): a diagnostic ring resize on eth3 the
 previous evening put all seven of its queue IRQs back on the VPP
 cores, and the next attach refused fifteen times under systemd
-auto-restart until the operator re-pinned. Any window harness that
-touches ring sizes should re-assert IRQ affinity as a pre-flight step.
+auto-restart until the operator re-pinned. Attach now re-pins at every
+attach, so a resize no longer blocks the next start — but a resize
+while VPP is running re-spreads its IRQs under a live VPP until the
+next restart, so a window harness that touches ring sizes should still
+restart packetframe (stop → `detach --all` → start) afterwards.
 
 ## Constraints worth knowing before you debug
 

@@ -291,6 +291,32 @@ fn completeness_gate(
     }
 }
 
+/// One attach-log line per re-pinned IRQ.
+fn log_irq_moves(moved: &[cores::IrqMove]) {
+    for m in moved {
+        tracing::info!(
+            iface = %m.iface,
+            irq = m.irq,
+            was = %m.was,
+            now = %m.now,
+            "moved a NIC queue IRQ off the cores VPP will poll"
+        );
+    }
+}
+
+/// Up to eight conflicts, for an error or warning line.
+fn irq_sample(conflicts: &[cores::IrqConflict]) -> String {
+    let mut s: Vec<String> = conflicts
+        .iter()
+        .take(8)
+        .map(|c| format!("{} irq {} -> cpu {:?}", c.iface, c.irq, c.cpus))
+        .collect();
+    if conflicts.len() > 8 {
+        s.push("...".into());
+    }
+    s.join(", ")
+}
+
 /// Acquire, render, adopt-or-arm, and start supervising.
 ///
 /// On any failure after acquisition, everything acquired is released
@@ -445,35 +471,50 @@ pub fn bring_up(
     // first primary attach (2026-08-13), where six poll-mode workers
     // landed on CPUs carrying production rx-queue IRQs: load ~10,
     // management ssh dropped, birdc past its budget, and VPP itself
-    // starved into a supervisor restart loop. Still pure/read-only —
-    // a refused config must cost no sysfs writes.
+    // starved into a supervisor restart loop.
+    //
+    // Then it became a refusal with the fix spelled out for an operator
+    // to apply by hand. That was the right invariant and the wrong
+    // owner: on the fleet a hand-written affinity is gone at the next
+    // reboot, provision cycle or ring resize, so the refusal fired after
+    // every one of them — fifteen times under systemd auto-restart on the
+    // primary after a ring resize (2026-08-14). So the module applies the
+    // fix itself and keeps the refusal for the case it cannot fix: a
+    // kernel that does not deliver where it was told.
+    //
+    // No longer strictly a pure phase: this writes `smp_affinity_list`
+    // before later checks that may still refuse. That is acceptable
+    // because the write is harmless whether or not VPP then starts — it
+    // only keeps IRQs off CPUs a poll-mode thread would take — and it is
+    // idempotent across retries. It writes nothing else.
     let member_ifaces: Vec<String> = cfg.ports.iter().map(|(i, _, _, _, _)| i.clone()).collect();
     let mut vpp_cores = vec![core_map.main];
     vpp_cores.extend(&core_map.workers);
-    let conflicts = cores::nic_irq_conflicts(
+    let irqs = cores::clear_irqs_off(
         &paths.sys.sysfs_net,
         &paths.proc_irq,
+        &paths.sysfs_cpu,
         &member_ifaces,
         &vpp_cores,
     )?;
-    if !conflicts.is_empty() {
-        let sample: Vec<String> = conflicts
-            .iter()
-            .take(8)
-            .map(|c| format!("{} irq {} -> cpu {:?}", c.iface, c.irq, c.cpus))
-            .collect();
+    log_irq_moves(&irqs.moved);
+    // The written mask is permission; where the IRQ fires is the fact.
+    // `clear_irqs_off` re-read it rather than trusting the write.
+    if !irqs.still.is_empty() {
+        let still = &irqs.still;
         return Err(format!(
-            "{} NIC queue IRQ(s) currently fire on the cores derived for VPP (main {}, \
-             workers {:?}): {}{}. Six hot pollers sharing CPUs with production rx-queue \
-             IRQs is how the first primary attach starved the box into a restart loop. \
-             Move these IRQs off the VPP cores first — for each: \
-             `echo <cpu-list outside the VPP cores> > /proc/irq/<N>/smp_affinity_list` — \
-             then re-attach (docs/runbooks/vpp-offload.md, \"IRQ affinity before attach\")",
-            conflicts.len(),
+            "{} NIC queue IRQ(s) still fire on the cores derived for VPP (main {}, \
+             workers {:?}) after packetframe re-pinned them onto {}: {}. The kernel \
+             accepted the new mask but did not move delivery, so the IRQ is \
+             probably kernel-managed or pinned by its driver. Six hot pollers sharing \
+             CPUs with production rx-queue IRQs is how the first primary attach \
+             starved the box into a restart loop, so attach refuses \
+             (docs/runbooks/vpp-offload.md, \"IRQ affinity before attach\")",
+            still.len(),
             core_map.main,
             core_map.workers,
-            sample.join(", "),
-            if conflicts.len() > 8 { ", ..." } else { "" },
+            cores::format_cpu_list(&irqs.safe),
+            irq_sample(still),
         ));
     }
 
@@ -852,6 +893,48 @@ fn finish(
                 error = %e,
                 "could not observe the adopted VPP's placement; vacating the derived map \
                  only — if its real placement differs, resync bursts may preempt its worker"
+            ),
+        }
+    }
+    // The IRQ pass before acquisition knew only the derived map, so an
+    // adopted VPP observed on other cores can still share them with NIC
+    // delivery — and that pass may even have moved an IRQ ONTO one. Run
+    // it again against everything VPP is actually on (review finding,
+    // PR #238).
+    //
+    // Warns rather than refuses, for the reason the vacate above does:
+    // this is after adoption, and refusing now would leave the adopted
+    // VPP unsupervised as the box's only forwarding tier — strictly
+    // worse than a poller contending with an interrupt.
+    let observed_extra = vacate
+        .iter()
+        .any(|c| *c != core_map.main && !core_map.workers.contains(c));
+    if observed_extra {
+        let ifaces: Vec<String> = port_vlans.iter().map(|(i, _)| i.clone()).collect();
+        match cores::clear_irqs_off(
+            &paths.sys.sysfs_net,
+            &paths.proc_irq,
+            &paths.sysfs_cpu,
+            &ifaces,
+            &vacate,
+        ) {
+            Ok(irqs) => {
+                log_irq_moves(&irqs.moved);
+                if !irqs.still.is_empty() {
+                    tracing::warn!(
+                        cores = ?vacate,
+                        irqs = %irq_sample(&irqs.still),
+                        "NIC queue IRQs still fire on the adopted VPP's cores after a \
+                         re-pin; the kernel did not move delivery. Continuing, because \
+                         refusing now would leave that VPP unsupervised"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                cores = ?vacate,
+                error = %e,
+                "could not move NIC queue IRQs off the adopted VPP's observed cores; \
+                 its pollers may contend with interrupt delivery"
             ),
         }
     }
