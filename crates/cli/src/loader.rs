@@ -227,6 +227,146 @@ fn feed_wiring(names: &[&str]) -> Result<bool, String> {
     }
 }
 
+/// Modules whose failure to come up DEGRADES the daemon instead of
+/// aborting it.
+///
+/// The rule everywhere else is all-or-nothing: a module that fails to
+/// load or attach unwinds every module attached before it and the
+/// daemon exits. That unwind exists for a real incident — a later
+/// module's failure used to leave earlier ones attached with no daemon,
+/// so the next start refused the orphaned pins and the box crash-looped
+/// on a frozen FIB (2026-07-31/08-01) — and it is right for a module the
+/// dataplane cannot run without.
+///
+/// It is wrong for vpp-offload, which is a SECOND tier over the eBPF
+/// fast-path, and the difference is not academic. Confirmed on the lab
+/// rig (2026-09-23): with one member-port IRQ on a VPP core — the state
+/// every boot leaves, since IRQ affinity does not persist — vpp-offload's
+/// bring-up correctly refused, the loader unwound fast-path with it, the
+/// daemon exited, and systemd looped on restarts. A box with packetframe
+/// enabled at boot and vpp-offload configured would come up after every
+/// reboot with NO fast-path at all: the conntrack baseline packetframe
+/// exists to prevent. The same for any other bring-up failure — a VPP
+/// binary missing after a firmware upgrade, which has happened.
+///
+/// Degrading here does not reopen the orphaned-pin hole: the daemon
+/// keeps running and owns everything that did attach.
+///
+/// Deliberately a list of names rather than a `Module` trait method: it
+/// is a policy about how the tiers relate, which belongs to the loader
+/// that composes them, and a defaulted trait method is the kind of seam
+/// a future module inherits without anyone deciding it should.
+// Only `run_linux` reads it, so a host build has no production caller
+// and only the test below — cfg the lint, not the code, so the policy
+// test keeps running on the macOS dev loop (the pattern `health::poll`
+// uses for the same reason).
+#[cfg_attr(not(all(target_os = "linux", feature = "fast-path")), allow(dead_code))]
+const DEGRADE_ON_START_FAILURE: &[&str] = &["vpp-offload"];
+
+#[cfg(test)]
+mod degrade_policy_tests {
+    use super::DEGRADE_ON_START_FAILURE;
+
+    /// The two halves of the policy, pinned. vpp-offload degrades
+    /// because the fast-path is its fallback; fast-path must NEVER be
+    /// on this list, because it is the fallback — a fast-path that
+    /// failed to attach and a daemon that kept running would report a
+    /// forwarding box that forwards nothing.
+    #[test]
+    fn only_the_second_tier_degrades() {
+        assert!(DEGRADE_ON_START_FAILURE.contains(&"vpp-offload"));
+        assert!(
+            !DEGRADE_ON_START_FAILURE.contains(&"fast-path"),
+            "fast-path is the dataplane; its failure must abort, not degrade"
+        );
+    }
+}
+
+/// Degrade around a module that failed to come up — or refuse to.
+///
+/// `Ok` = the daemon may run without it; the record keeps it visible.
+/// `Err` = what the module persisted could not be proven gone, and the
+/// caller must fall back to the all-or-nothing abort.
+///
+/// Two releases, because they cover different things:
+///
+/// - `Module::detach` for what THIS attempt got as far as holding. Every
+///   module's `detach` of nothing is required to succeed.
+/// - The module's standalone release from its state file
+///   ([`release_persisted`]) for what an EARLIER process left behind.
+///   A daemon's SIGTERM exit deliberately preserves VPP and its MCAM
+///   steering for adoption (SPEC.md §8.5), and a bring-up that fails
+///   before adopting it — the IRQ check runs before `acquire` — never
+///   sets the flag `detach` consults, so `detach` is a no-op while
+///   traffic is still diverted into a VPP nothing supervises, on a
+///   route table nothing updates. Degrading over that would report "the
+///   eBPF tier is forwarding everything" while it is not (review
+///   finding, PR #237).
+///
+/// So degrading is conditional on the second release succeeding: the
+/// steering removed, the recorded VPP confirmed dead, its VFs and
+/// hugepages handed back. If any of that cannot be done, running on is
+/// the one wrong answer, and aborting is what the loader did before.
+///
+/// Also disconnects the route feed on success: nothing will drain it
+/// again in this process, and the fast-path would otherwise keep
+/// mirroring the whole table into it.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn degrade_on_start_failure(
+    module: &mut Box<dyn packetframe_common::module::Module>,
+    name: &str,
+    stage: &str,
+    err: &dyn std::fmt::Display,
+    state_dir: &Path,
+    #[cfg(feature = "vpp-offload")] feed: Option<&packetframe_vpp_offload::feed::RouteFeed>,
+) -> Result<crate::health::NotAttached, String> {
+    tracing::error!(module = %name, stage, error = %err, "module failed to come up");
+    if let Err(e) = module.detach() {
+        tracing::error!(module = %name, error = %e, "release after a failed start also failed");
+    }
+    release_persisted(name, state_dir)?;
+    #[cfg(feature = "vpp-offload")]
+    let metrics = if name == "vpp-offload" {
+        if let Some(f) = feed {
+            f.disconnect();
+        }
+        packetframe_vpp_offload::status::render_not_attached_metrics(name)
+    } else {
+        String::new()
+    };
+    #[cfg(not(feature = "vpp-offload"))]
+    let metrics = String::new();
+    tracing::error!(
+        module = %name,
+        "continuing WITHOUT it — the eBPF fast-path keeps forwarding (this module's \
+         failure degrades, it does not abort)"
+    );
+    Ok(crate::health::NotAttached {
+        module: name.to_string(),
+        reason: err.to_string(),
+        metrics,
+    })
+}
+
+/// A degrading module's standalone release from its persisted state —
+/// the same routine `packetframe detach` runs for it.
+///
+/// A module on `DEGRADE_ON_START_FAILURE` with no arm here cannot prove
+/// what it left behind is gone, so it is refused rather than degraded.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn release_persisted(name: &str, state_dir: &Path) -> Result<(), String> {
+    match name {
+        #[cfg(feature = "vpp-offload")]
+        "vpp-offload" => detach_vpp_offload(state_dir),
+        other => {
+            let _ = state_dir;
+            Err(format!(
+                "{other} has no standalone release, so nothing it persisted can be proven gone"
+            ))
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // The route feed, built before either module so both can be handed
@@ -407,6 +547,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // different door. Multi-module configs became reachable with the
     // vpp-offload module, so the unwind is no longer hypothetical.
     let mut attached: Vec<usize> = Vec::new();
+    // Modules that did not come up but whose failure DEGRADES the daemon
+    // instead of aborting it. See `DEGRADE_ON_START_FAILURE`.
+    let mut not_attached: Vec<crate::health::NotAttached> = Vec::new();
     macro_rules! unwind_attached {
         ($modules:expr, $attached:expr, $failed:expr) => {
             for idx in $attached.iter().rev() {
@@ -427,6 +570,40 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             }
         };
     }
+    // A degrading module's failure: run on without it, or — when what it
+    // persisted cannot be released — abort exactly as any other module's
+    // failure does.
+    macro_rules! degrade_or_abort {
+        ($module:expr, $name:expr, $stage:expr, $err:expr, $abort:expr) => {
+            match degrade_on_start_failure(
+                $module,
+                &$name,
+                $stage,
+                &$err,
+                &config.global.state_dir,
+                #[cfg(feature = "vpp-offload")]
+                feed.as_deref(),
+            ) {
+                Ok(n) => {
+                    not_attached.push(n);
+                    continue;
+                }
+                Err(why) => {
+                    tracing::error!(
+                        module = %$name,
+                        error = %why,
+                        "cannot degrade: what it left running could not be released; aborting"
+                    );
+                    unwind_attached!(modules, attached, $name);
+                    return Err($abort(format!(
+                        "{}; and the daemon cannot run on without it, because what it \
+                         persisted could not be released: {why}",
+                        $err
+                    )));
+                }
+            }
+        };
+    }
 
     for i in 0..modules.len() {
         let name = modules[i].0.clone();
@@ -438,6 +615,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         let mcfg = ModuleConfig::new(section, &config.global);
         let module = &mut modules[i].1;
         if let Err(e) = module.load(&mcfg, &ctx) {
+            if DEGRADE_ON_START_FAILURE.contains(&name.as_str()) {
+                degrade_or_abort!(module, name, "load", e, RunError::Startup);
+            }
             unwind_attached!(modules, attached, name);
             return Err(RunError::Startup(e.to_string()));
         }
@@ -447,6 +627,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 a
             }
             Err(e) => {
+                if DEGRADE_ON_START_FAILURE.contains(&name.as_str()) {
+                    degrade_or_abort!(module, name, "attach", e, RunError::Runtime);
+                }
                 unwind_attached!(modules, attached, name);
                 return Err(RunError::Runtime(e.to_string()));
             }
@@ -476,6 +659,19 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         }
 
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
+    }
+    // Out of the running set, so nothing downstream — the health poll,
+    // a SIGHUP's reconfigure, shutdown's detach — ever calls into a
+    // module that never came up. They are carried in `not_attached`
+    // instead, which is what keeps them visible.
+    modules.retain(|(n, _)| !not_attached.iter().any(|f| &f.module == n));
+    for f in &not_attached {
+        tracing::warn!(
+            module = %f.module,
+            reason = %f.reason,
+            "running DEGRADED: this module did not come up; the eBPF fast-path is \
+             forwarding on its own"
+        );
     }
 
     // Start the metrics exporter once STATS is pinned (which happens
@@ -566,6 +762,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         config_path,
         &config.global.state_dir,
         &mut modules,
+        &not_attached,
         &module_gauges,
         #[cfg(feature = "vpp-offload")]
         &allowlist,
@@ -963,6 +1160,7 @@ fn drive_signal_loop(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    not_attached: &[crate::health::NotAttached],
     module_gauges: &crate::metrics::ModuleGauges,
     #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) -> Result<Termination, String> {
@@ -988,6 +1186,7 @@ fn drive_signal_loop(
                         config_path,
                         state_dir,
                         modules,
+                        not_attached,
                         module_gauges,
                         #[cfg(feature = "vpp-offload")]
                         allowlist,
@@ -1013,7 +1212,7 @@ fn drive_signal_loop(
 
         let now = Instant::now();
         if now >= next_poll {
-            crate::health::poll(state_dir, modules, module_gauges);
+            crate::health::poll(state_dir, modules, not_attached, module_gauges);
             next_poll = now + MODULE_POLL_INTERVAL;
         }
 
@@ -1032,6 +1231,7 @@ fn reconfigure_from_signal(
     config_path: &Path,
     state_dir: &Path,
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
+    not_attached: &[crate::health::NotAttached],
     module_gauges: &std::sync::Mutex<String>,
     #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
 ) -> Published {
@@ -1118,6 +1318,13 @@ fn reconfigure_from_signal(
     // protection is active when nothing is attached (review finding,
     // PR #206).
     for section in &new_config.modules {
+        if let Some(f) = not_attached.iter().find(|f| f.module == section.name) {
+            // Not "added to config": it was configured all along and
+            // failed to come up. Reporting it as an addition would send
+            // the operator looking for an edit they never made.
+            failures.push(crate::health::not_attached_reconfigure_line(f));
+            continue;
+        }
         if !modules.iter().any(|(name, _)| name == &section.name) {
             tracing::warn!(
                 module = %section.name,
@@ -1128,6 +1335,15 @@ fn reconfigure_from_signal(
                 "{}: added to config (restart required)",
                 section.name
             ));
+        }
+    }
+    for f in not_attached {
+        if !new_config.modules.iter().any(|m| m.name == f.module) {
+            tracing::warn!(
+                module = %f.module,
+                "module that failed at startup removed from config; still reported until restart"
+            );
+            failures.push(crate::health::not_attached_removed_line(f));
         }
     }
     for (name, module) in modules.iter_mut() {
@@ -1163,7 +1379,7 @@ fn reconfigure_from_signal(
     //
     // Same shape as the service's publish-before-answer rule, one layer
     // up: publish the observation, then answer the caller.
-    crate::health::poll(state_dir, modules, module_gauges);
+    crate::health::poll(state_dir, modules, not_attached, module_gauges);
 
     if failures.is_empty() {
         write_reconfigure_marker(&marker_path, "OK");

@@ -1613,6 +1613,41 @@ fn label(value: &str) -> String {
     out
 }
 
+/// The gauges for a vpp-offload that did not come up at startup and
+/// whose failure the loader degraded around.
+///
+/// There is no supervision loop, so no snapshot and nothing for
+/// [`render_metrics`] to read — and emitting nothing would make the
+/// runbook's `packetframe_vpp_health{state="healthy"}` alert see no
+/// series at all rather than a zero. So the health one-hot is emitted
+/// as Degraded (the same verdict the health row carries), plus
+/// `steered 0`: the loader releases any persisted steering before it
+/// degrades, so that is a fact rather than a default. The rest are
+/// omitted rather than zeroed — a zero `unresolvable` would read as a
+/// healthy, converged table.
+pub fn render_not_attached_metrics(module: &str) -> String {
+    let mut out = String::with_capacity(512);
+    gauge(
+        &mut out,
+        "packetframe_vpp_health",
+        "1 for the current overall health state, 0 otherwise",
+    );
+    for (hs, label) in HEALTH_LABELS {
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_health{{module=\"{module}\",state=\"{label}\"}} {}",
+            u8::from(hs == HealthState::Degraded)
+        );
+    }
+    gauge(
+        &mut out,
+        "packetframe_vpp_steered",
+        "1 when MCAM rules are diverting traffic to VPP",
+    );
+    let _ = writeln!(out, "packetframe_vpp_steered{{module=\"{module}\"}} 0");
+    out
+}
+
 /// Render `packetframe_vpp_*` gauges for the Prometheus textfile
 /// collector.
 ///
@@ -1880,6 +1915,36 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::sink::{Capacity, NexthopMap, RouteLedger};
+
+    /// A vpp-offload that never came up still answers the health alert:
+    /// exactly one health series is 1 and it is `degraded`, so an alert
+    /// on the healthy series dropping to zero fires instead of seeing
+    /// no series at all.
+    #[test]
+    fn a_module_that_did_not_come_up_emits_degraded_not_nothing() {
+        let m = render_not_attached_metrics("vpp-offload");
+        let hot: Vec<&str> = m
+            .lines()
+            .filter(|l| l.starts_with("packetframe_vpp_health{") && l.ends_with(" 1"))
+            .collect();
+        assert_eq!(
+            hot,
+            vec!["packetframe_vpp_health{module=\"vpp-offload\",state=\"degraded\"} 1"],
+            "{m}"
+        );
+        assert!(
+            m.contains("packetframe_vpp_health{module=\"vpp-offload\",state=\"healthy\"} 0"),
+            "the healthy series is present at zero, not absent: {m}"
+        );
+        assert!(
+            m.contains("packetframe_vpp_steered{module=\"vpp-offload\"} 0"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("packetframe_vpp_routes"),
+            "no zeroed table gauges that would read as converged: {m}"
+        );
+    }
 
     fn ledger_with(installed: u64, withheld: u64, unresolvable: u64) -> RouteLedger {
         let mut map = NexthopMap::new(vec!["eth4".into()]);
