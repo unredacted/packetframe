@@ -1509,6 +1509,29 @@ the missing prefixes are in none of the `unresolvable`/`withheld`/
 clears as soon as one update lands; look again rather than reconfiguring
 anything.
 
+### After a reboot: "state records VF … but no VF exists"
+
+Builds before the earlier-boot check refused every attach after a
+reboot. A reboot delivers SIGTERM, whose exit keeps
+`vpp-offload.json` for adoption, and the reboot then removes
+everything the file names: VFs, vfio bindings, the hugepage
+reservation, the VPP process and the MCAM rules. The next attach
+checked the recorded ports against VFs that no longer existed and
+refused. The fast-path stayed up (the degrade path), but VPP stayed
+down until someone ran `detach --all`.
+
+The record now carries the `boot_id` it was written under. A record
+from an earlier boot is logged (`state file is from an earlier boot`),
+discarded, and acquisition starts fresh. Files written before the
+field fall back to `vpp_boot_id`, which is present whenever a VPP was
+running at shutdown. If neither side's boot is known, the adoption
+checks still apply, and they refuse rather than guess. On an older
+build, the remedy is the full sequence:
+
+```bash
+systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
+```
+
 ### The offload restarts repeatedly
 
 **Two places carry the reason; read both.** `packetframe status` holds

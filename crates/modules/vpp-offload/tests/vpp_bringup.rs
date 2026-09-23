@@ -144,6 +144,7 @@ impl Host {
                     hugepage_bytes: 512 << 20,
                     hugetlbfs,
                     state_dir: base.join("state"),
+                    boot_id: Some("boot-now".into()),
                 },
                 sysfs_cpu: cpu,
                 // No entries: the fixture's ports have no msi_irqs
