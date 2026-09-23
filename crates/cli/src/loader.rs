@@ -282,34 +282,88 @@ mod degrade_policy_tests {
     }
 }
 
-/// Record a degrading module's startup failure and release whatever it
-/// got as far as holding.
+/// Degrade around a module that failed to come up — or refuse to.
 ///
-/// `detach` is called even though `attach` did not succeed, because a
-/// bring-up can fail after acquiring something; every module's `detach`
-/// of nothing is required to succeed, so this is safe where nothing was
-/// acquired. A detach that fails is logged and the module is still
-/// dropped — it cannot be retried in this process either way.
+/// `Ok` = the daemon may run without it; the record keeps it visible.
+/// `Err` = what the module persisted could not be proven gone, and the
+/// caller must fall back to the all-or-nothing abort.
+///
+/// Two releases, because they cover different things:
+///
+/// - `Module::detach` for what THIS attempt got as far as holding. Every
+///   module's `detach` of nothing is required to succeed.
+/// - The module's standalone release from its state file
+///   ([`release_persisted`]) for what an EARLIER process left behind.
+///   A daemon's SIGTERM exit deliberately preserves VPP and its MCAM
+///   steering for adoption (SPEC.md §8.5), and a bring-up that fails
+///   before adopting it — the IRQ check runs before `acquire` — never
+///   sets the flag `detach` consults, so `detach` is a no-op while
+///   traffic is still diverted into a VPP nothing supervises, on a
+///   route table nothing updates. Degrading over that would report "the
+///   eBPF tier is forwarding everything" while it is not (review
+///   finding, PR #237).
+///
+/// So degrading is conditional on the second release succeeding: the
+/// steering removed, the recorded VPP confirmed dead, its VFs and
+/// hugepages handed back. If any of that cannot be done, running on is
+/// the one wrong answer, and aborting is what the loader did before.
+///
+/// Also disconnects the route feed on success: nothing will drain it
+/// again in this process, and the fast-path would otherwise keep
+/// mirroring the whole table into it.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 fn degrade_on_start_failure(
     module: &mut Box<dyn packetframe_common::module::Module>,
     name: &str,
     stage: &str,
     err: &dyn std::fmt::Display,
-) -> crate::health::NotAttached {
-    tracing::error!(
-        module = %name,
-        stage,
-        error = %err,
-        "module failed to come up; continuing WITHOUT it — the eBPF fast-path keeps \
-         forwarding (this module's failure degrades, it does not abort)"
-    );
+    state_dir: &Path,
+    #[cfg(feature = "vpp-offload")] feed: Option<&packetframe_vpp_offload::feed::RouteFeed>,
+) -> Result<crate::health::NotAttached, String> {
+    tracing::error!(module = %name, stage, error = %err, "module failed to come up");
     if let Err(e) = module.detach() {
         tracing::error!(module = %name, error = %e, "release after a failed start also failed");
     }
-    crate::health::NotAttached {
+    release_persisted(name, state_dir)?;
+    #[cfg(feature = "vpp-offload")]
+    let metrics = if name == "vpp-offload" {
+        if let Some(f) = feed {
+            f.disconnect();
+        }
+        packetframe_vpp_offload::status::render_not_attached_metrics(name)
+    } else {
+        String::new()
+    };
+    #[cfg(not(feature = "vpp-offload"))]
+    let metrics = String::new();
+    tracing::error!(
+        module = %name,
+        "continuing WITHOUT it — the eBPF fast-path keeps forwarding (this module's \
+         failure degrades, it does not abort)"
+    );
+    Ok(crate::health::NotAttached {
         module: name.to_string(),
         reason: err.to_string(),
+        metrics,
+    })
+}
+
+/// A degrading module's standalone release from its persisted state —
+/// the same routine `packetframe detach` runs for it.
+///
+/// A module on `DEGRADE_ON_START_FAILURE` with no arm here cannot prove
+/// what it left behind is gone, so it is refused rather than degraded.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn release_persisted(name: &str, state_dir: &Path) -> Result<(), String> {
+    match name {
+        #[cfg(feature = "vpp-offload")]
+        "vpp-offload" => detach_vpp_offload(state_dir),
+        other => {
+            let _ = state_dir;
+            Err(format!(
+                "{other} has no standalone release, so nothing it persisted can be proven gone"
+            ))
+        }
     }
 }
 
@@ -516,6 +570,40 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             }
         };
     }
+    // A degrading module's failure: run on without it, or — when what it
+    // persisted cannot be released — abort exactly as any other module's
+    // failure does.
+    macro_rules! degrade_or_abort {
+        ($module:expr, $name:expr, $stage:expr, $err:expr, $abort:expr) => {
+            match degrade_on_start_failure(
+                $module,
+                &$name,
+                $stage,
+                &$err,
+                &config.global.state_dir,
+                #[cfg(feature = "vpp-offload")]
+                feed.as_deref(),
+            ) {
+                Ok(n) => {
+                    not_attached.push(n);
+                    continue;
+                }
+                Err(why) => {
+                    tracing::error!(
+                        module = %$name,
+                        error = %why,
+                        "cannot degrade: what it left running could not be released; aborting"
+                    );
+                    unwind_attached!(modules, attached, $name);
+                    return Err($abort(format!(
+                        "{}; and the daemon cannot run on without it, because what it \
+                         persisted could not be released: {why}",
+                        $err
+                    )));
+                }
+            }
+        };
+    }
 
     for i in 0..modules.len() {
         let name = modules[i].0.clone();
@@ -528,8 +616,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         let module = &mut modules[i].1;
         if let Err(e) = module.load(&mcfg, &ctx) {
             if DEGRADE_ON_START_FAILURE.contains(&name.as_str()) {
-                not_attached.push(degrade_on_start_failure(module, &name, "load", &e));
-                continue;
+                degrade_or_abort!(module, name, "load", e, RunError::Startup);
             }
             unwind_attached!(modules, attached, name);
             return Err(RunError::Startup(e.to_string()));
@@ -541,8 +628,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             }
             Err(e) => {
                 if DEGRADE_ON_START_FAILURE.contains(&name.as_str()) {
-                    not_attached.push(degrade_on_start_failure(module, &name, "attach", &e));
-                    continue;
+                    degrade_or_abort!(module, name, "attach", e, RunError::Runtime);
                 }
                 unwind_attached!(modules, attached, name);
                 return Err(RunError::Runtime(e.to_string()));
@@ -1249,6 +1335,15 @@ fn reconfigure_from_signal(
                 "{}: added to config (restart required)",
                 section.name
             ));
+        }
+    }
+    for f in not_attached {
+        if !new_config.modules.iter().any(|m| m.name == f.module) {
+            tracing::warn!(
+                module = %f.module,
+                "module that failed at startup removed from config; still reported until restart"
+            );
+            failures.push(crate::health::not_attached_removed_line(f));
         }
     }
     for (name, module) in modules.iter_mut() {

@@ -95,7 +95,22 @@ impl Snapshot {
 pub struct NotAttached {
     pub module: String,
     pub reason: String,
+    /// The module's gauges for this state, rendered once by the loader.
+    /// Carried because the module itself is gone from the running set,
+    /// so nothing else would emit them — and a missing series is not an
+    /// alert, a zeroed healthy one is.
+    pub metrics: String,
 }
+
+/// How to bring a module that failed at startup back: the full
+/// sequence, never a bare restart.
+///
+/// A plain `systemctl restart` sends SIGTERM, whose exit deliberately
+/// PRESERVES the fast-path's pins (SPEC.md §8.5), and the next start
+/// then refuses them — so the obvious remedy would turn a daemon that is
+/// forwarding in a degraded state into one that is not running at all.
+pub const RESTART_SEQUENCE: &str =
+    "systemctl stop packetframe && packetframe detach --all && systemctl start packetframe";
 
 /// The health row for a module that did not come up.
 ///
@@ -117,8 +132,9 @@ pub fn not_attached_entry(n: &NotAttached) -> ModuleEntry {
                 state: HealthState::Degraded,
                 message: Some(format!(
                     "did not come up at startup: {}. The eBPF fast-path is forwarding on its \
-                     own and nothing is offloaded to this module. Fix the cause and restart \
-                     the daemon — a reload cannot start a module that failed to attach",
+                     own and nothing is offloaded to this module. Fix the cause, then \
+                     `{RESTART_SEQUENCE}` — a reload cannot start a module that failed to \
+                     attach, and a bare restart leaves pins the next start refuses",
                     n.reason
                 )),
                 last_success_age_seconds: None,
@@ -139,9 +155,24 @@ pub fn not_attached_entry(n: &NotAttached) -> ModuleEntry {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn not_attached_reconfigure_line(n: &NotAttached) -> String {
     format!(
-        "{}: not running — it failed to come up at startup ({}); fix the cause and \
-         restart the daemon",
+        "{}: not running — it failed to come up at startup ({}); fix the cause, then \
+         `{RESTART_SEQUENCE}`",
         n.module, n.reason
+    )
+}
+
+/// What `packetframe reconfigure` reports when the section of a module
+/// that did not come up is REMOVED from the config.
+///
+/// Not OK: the daemon still carries it as configured-but-failed, and
+/// keeps reporting it Degraded, until a restart re-reads the module set
+/// — the same restart-only rule a running module's removal gets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn not_attached_removed_line(n: &NotAttached) -> String {
+    format!(
+        "{}: removed from config, but it failed at startup and is still reported until \
+         the daemon restarts (`{RESTART_SEQUENCE}`)",
+        n.module
     )
 }
 
@@ -184,6 +215,9 @@ pub fn poll(
     // First, so `packetframe status` leads with the module that is
     // missing rather than burying it under the ones that are fine.
     entries.extend(not_attached.iter().map(not_attached_entry));
+    for n in not_attached {
+        rendered.push_str(&n.metrics);
+    }
 
     for (name, module) in modules {
         entries.push(match module.health_check(&ctx) {
@@ -517,6 +551,7 @@ mod tests {
         let missing = NotAttached {
             module: "vpp-offload".into(),
             reason: "1 NIC queue IRQ(s) currently fire on the cores derived for VPP".into(),
+            metrics: "vpp_gauge{module=\"vpp-offload\"} 1\n".into(),
         };
         let slot = Mutex::new(String::new());
 
@@ -541,21 +576,51 @@ mod tests {
             msg.contains("fast-path is forwarding"),
             "and what still works: {msg}"
         );
-        assert!(msg.contains("restart the daemon"), "and the remedy: {msg}");
+        assert!(
+            msg.contains(RESTART_SEQUENCE),
+            "and the remedy, as the full sequence: {msg}"
+        );
         assert_eq!(snap.modules[1].module, "fast-path");
+        assert!(
+            slot.lock()
+                .unwrap()
+                .contains("vpp_gauge{module=\"vpp-offload\"} 1"),
+            "its gauges are published although the module is not in the running set"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The reload line names the real cause, not "added to config".
     #[test]
     fn reconfigure_reports_the_startup_failure_not_a_config_edit() {
-        let line = not_attached_reconfigure_line(&NotAttached {
+        let n = NotAttached {
             module: "vpp-offload".into(),
             reason: "vpp binary not found".into(),
-        });
+            metrics: String::new(),
+        };
+        let line = not_attached_reconfigure_line(&n);
         assert!(line.starts_with("vpp-offload: not running"), "{line}");
         assert!(line.contains("vpp binary not found"), "{line}");
         assert!(!line.contains("added to config"), "{line}");
+        assert!(line.contains(RESTART_SEQUENCE), "{line}");
+
+        let removed = not_attached_removed_line(&n);
+        assert!(
+            removed.starts_with("vpp-offload: removed from config"),
+            "{removed}"
+        );
+        assert!(removed.contains(RESTART_SEQUENCE), "{removed}");
+    }
+
+    /// The remedy is never a bare restart: SIGTERM preserves the pins
+    /// and the next start refuses them.
+    #[test]
+    fn the_remedy_detaches_between_stop_and_start() {
+        let stop = RESTART_SEQUENCE.find("stop").unwrap();
+        let detach = RESTART_SEQUENCE.find("detach --all").unwrap();
+        let start = RESTART_SEQUENCE.find("start packetframe").unwrap();
+        assert!(stop < detach && detach < start, "{RESTART_SEQUENCE}");
+        assert!(!RESTART_SEQUENCE.contains("restart"), "{RESTART_SEQUENCE}");
     }
 
     /// One module's failure must not cost another module its gauges.

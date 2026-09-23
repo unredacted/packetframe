@@ -2353,10 +2353,30 @@ is reported, not omitted —
 ```
 
 — and `packetframe reconfigure` names it the same way rather than as
-"added to config". Fix the cause, then **restart** the daemon: a
-reload cannot start a module that failed to attach. Every other module
-keeps the all-or-nothing rule; see `DEGRADE_ON_START_FAILURE` in the
-loader for why.
+"added to config". `packetframe_vpp_health{state="degraded"}` reads
+`1` and `packetframe_vpp_steered` reads `0`, so the healthy-series
+alert fires rather than finding no series.
+
+Before running on, the loader releases whatever an earlier daemon left
+for adoption, from vpp-offload's state file — the same routine
+`packetframe detach` runs: MCAM steering removed, the recorded VPP
+killed, VFs and hugepages handed back. A preserved VPP still carrying
+steered traffic is exactly what a bring-up that fails before adoption
+would otherwise leave behind, unsupervised, on a frozen table. **If
+that release fails, the daemon does not degrade**: it aborts as before,
+and the error carries both the refusal and why the release failed.
+
+Fix the cause, then run the full sequence — **not** a bare restart:
+
+```bash
+systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
+```
+
+A reload cannot start a module that failed to attach, and a plain
+`systemctl restart` preserves the fast-path's pins on the way down,
+which the next start then refuses — turning a degraded daemon into a
+stopped one. Every other module keeps the all-or-nothing rule; see
+`DEGRADE_ON_START_FAILURE` in the loader for why.
 
 **`ethtool -G` resets it too.** Resizing a ring tears down and
 rebuilds the port's queues, and the driver re-spreads the rebuilt
