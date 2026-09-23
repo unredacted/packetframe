@@ -245,8 +245,17 @@ pub struct IrqMove {
 ///
 /// **Narrowing, not replacing.** The new mask is the current mask minus
 /// VPP's cores and the isolated set — an operator who spread an IRQ over
-/// 1-6 keeps it on 1-6 — and only a mask that leaves nothing falls back
-/// to the whole safe set.
+/// 1-6 keeps it on 1-6.
+///
+/// **A mask that leaves nothing gets ONE CPU, and consecutive ones get
+/// different CPUs.** The first version wrote the whole safe set for
+/// each, but an interrupt controller given a mask picks one target from
+/// it rather than balancing — so the queue IRQs pinned one-per-core that
+/// the kernel's default spread produces (every one of VPP's cores
+/// carries one) would all have landed on the same, lowest safe CPU:
+/// cpu0, the housekeeping core. Rotated instead, with cpu0 last in the
+/// rotation so it takes an IRQ only once every other safe CPU has one
+/// (review finding, PR #238).
 ///
 /// **Not restored on detach, deliberately.** Putting an IRQ back on a
 /// CPU VPP no longer uses would re-create the conflict for the next
@@ -264,6 +273,14 @@ pub fn move_irqs_off(
     if safe.is_empty() {
         return Err("no CPU is left for NIC IRQs outside VPP's cores and the isolated set".into());
     }
+    // cpu0 last: it is safe, but it is also the housekeeping core.
+    let rotation: Vec<u16> = safe
+        .iter()
+        .copied()
+        .filter(|c| *c != 0)
+        .chain(safe.iter().copied().filter(|c| *c == 0))
+        .collect();
+    let mut next = 0usize;
     let mut moved = Vec::new();
     let mut failed = Vec::new();
     for c in conflicts {
@@ -276,7 +293,13 @@ pub fn move_irqs_off(
             .into_iter()
             .filter(|cpu| safe.contains(cpu))
             .collect();
-        let now = format_cpu_list(if kept.is_empty() { safe } else { &kept });
+        let now = if kept.is_empty() {
+            let cpu = rotation[next % rotation.len()];
+            next += 1;
+            cpu.to_string()
+        } else {
+            format_cpu_list(&kept)
+        };
         match std::fs::write(&path, format!("{now}\n")) {
             Ok(()) => moved.push(IrqMove {
                 iface: c.iface.clone(),
@@ -295,6 +318,44 @@ pub fn move_irqs_off(
         ));
     }
     Ok(moved)
+}
+
+/// What [`clear_irqs_off`] did and what it could not.
+#[derive(Debug, Default)]
+pub struct IrqClearing {
+    /// What was re-pinned, for the attach log.
+    pub moved: Vec<IrqMove>,
+    /// The set moves drew from. Empty when nothing conflicted.
+    pub safe: Vec<u16>,
+    /// What still fires on the busy cores after the move — re-read, not
+    /// inferred from the writes having succeeded.
+    pub still: Vec<IrqConflict>,
+}
+
+/// Find `ifaces`' queue IRQs delivering on `busy`, move them off, and
+/// read delivery back.
+///
+/// One routine for both passes bring-up makes: before VPP exists,
+/// against the derived map, and again after adopting a surviving VPP
+/// whose threads are observed on cores the derived map does not name.
+/// The caller decides what a non-empty `still` means, because the two
+/// passes answer it differently.
+pub fn clear_irqs_off(
+    sysfs_net: &std::path::Path,
+    proc_irq: &std::path::Path,
+    sysfs_cpu: &std::path::Path,
+    ifaces: &[String],
+    busy: &[u16],
+) -> Result<IrqClearing, String> {
+    let conflicts = nic_irq_conflicts(sysfs_net, proc_irq, ifaces, busy)?;
+    if conflicts.is_empty() {
+        return Ok(IrqClearing::default());
+    }
+    let (online, isolated) = read_cpu_topology(sysfs_cpu)?;
+    let safe = irq_safe_cpus(&online, &isolated, busy);
+    let moved = move_irqs_off(proc_irq, &conflicts, &safe)?;
+    let still = nic_irq_conflicts(sysfs_net, proc_irq, ifaces, busy)?;
+    Ok(IrqClearing { moved, safe, still })
 }
 
 /// Where the CPU topology lives on a running kernel.
@@ -973,8 +1034,8 @@ mod tests {
         assert_eq!(moved.len(), 1);
         assert_eq!(moved[0].was, "15");
         assert_eq!(
-            moved[0].now, "0-11,13-14",
-            "nothing of the old mask survived"
+            moved[0].now, "1",
+            "nothing of the old mask survived: one CPU, and not cpu0"
         );
 
         let after = nic_irq_conflicts(&net, &proc_irq, &["eth9".into()], &vpp).unwrap();
@@ -998,9 +1059,71 @@ mod tests {
         );
         assert_eq!(
             by_irq(701),
-            "0-11,13-14",
-            "nothing survived, so the whole safe set"
+            "1",
+            "nothing survived, so one CPU from the rotation"
         );
+    }
+
+    /// The default spread's shape — one queue IRQ per core, several on
+    /// VPP's — must not pile every moved IRQ onto one CPU, least of all
+    /// cpu0: a controller handed a mask delivers to one target in it.
+    #[test]
+    fn emptied_masks_are_spread_across_the_safe_cpus_with_cpu0_last() {
+        let (net, proc_irq) = irq_fixture_smp(
+            "spread",
+            &[(900, "15"), (901, "16"), (902, "17"), (903, "15")],
+        );
+        let vpp = [15, 16, 17];
+        let c = nic_irq_conflicts(&net, &proc_irq, &["eth9".into()], &vpp).unwrap();
+        let online: Vec<u16> = (0..18).collect();
+        let moved = move_irqs_off(&proc_irq, &c, &irq_safe_cpus(&online, &[12], &vpp)).unwrap();
+        let mut targets: Vec<String> = moved.iter().map(|m| m.now.clone()).collect();
+        targets.sort();
+        assert_eq!(targets, ["1", "2", "3", "4"], "four IRQs, four CPUs");
+
+        // And cpu0 is used only once the rest of the rotation is.
+        let (net, proc_irq) = irq_fixture_smp("spread0", &[(910, "2"), (911, "2"), (912, "2")]);
+        let c = nic_irq_conflicts(&net, &proc_irq, &["eth9".into()], &[2]).unwrap();
+        let moved = move_irqs_off(&proc_irq, &c, &[0, 1]).unwrap();
+        let mut targets: Vec<String> = moved.iter().map(|m| m.now.clone()).collect();
+        targets.sort();
+        assert_eq!(targets, ["0", "1", "1"], "1 first, then 0, then around");
+    }
+
+    /// The post-adoption pass: an adopted VPP observed on cpu5, outside
+    /// the derived 15-17. An IRQ there is moved off, and so is one the
+    /// FIRST pass put on cpu5 because it only knew the derived map.
+    #[test]
+    fn clearing_against_observed_cores_moves_irqs_off_them_too() {
+        let (net, proc_irq) = irq_fixture_smp("observed", &[(920, "5"), (921, "1-5")]);
+        let cpu = net.parent().unwrap().join("cpu");
+        std::fs::create_dir_all(&cpu).unwrap();
+        std::fs::write(cpu.join("online"), "0-17\n").unwrap();
+        std::fs::write(cpu.join("isolated"), "12\n").unwrap();
+        let ifaces = ["eth9".to_string()];
+
+        let first = clear_irqs_off(&net, &proc_irq, &cpu, &ifaces, &[15, 16, 17]).unwrap();
+        assert!(first.moved.is_empty(), "nothing on the derived cores");
+
+        let busy = [5, 15, 16, 17];
+        let second = clear_irqs_off(&net, &proc_irq, &cpu, &ifaces, &busy).unwrap();
+        assert!(second.still.is_empty(), "{:?}", second.still);
+        let by_irq = |i: u32| {
+            second
+                .moved
+                .iter()
+                .find(|m| m.irq == i)
+                .unwrap()
+                .now
+                .clone()
+        };
+        assert_eq!(by_irq(920), "1", "emptied, so one CPU from the rotation");
+        assert_eq!(
+            by_irq(921),
+            "1-4",
+            "narrowed: the observed core is taken out"
+        );
+        assert!(!second.safe.contains(&5));
     }
 
     /// Nowhere to put it is a refusal, not a silent no-op.

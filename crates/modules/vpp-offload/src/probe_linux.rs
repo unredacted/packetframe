@@ -101,11 +101,16 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
                 .take(8)
                 .map(|x| format!("{} irq {} -> cpu {:?}", x.iface, x.irq, x.cpus))
                 .collect();
-            // Attach re-pins these itself now, so a conflict it CAN fix
-            // passes — failing feasibility over something attach
-            // corrects would block a rollout for nothing. What it cannot
-            // fix is having nowhere to put them, and that still fails.
-            // Read-only: the probe reports the move, it never makes it.
+            // Attach re-pins these itself now, so failing feasibility
+            // over them would block a rollout over something attach
+            // usually corrects. But "usually" is all a read-only probe
+            // can say: a kernel-managed IRQ accepts or rejects the mask
+            // only when written, and whether delivery then moves is
+            // only known by reading it back — which attach does, and
+            // refuses on. So a fixable conflict is a non-required WARN,
+            // never a PASS: the probe does not promise what attach will
+            // find (review finding, PR #238). No CPU to move them to is
+            // knowable here, and still fails, required.
             let safe = match crate::cores::read_cpu_topology(Path::new(crate::cores::SYSFS_CPU)) {
                 Ok((online, isolated)) => {
                     crate::cores::irq_safe_cpus(&online, &isolated, &vpp_cores)
@@ -131,11 +136,14 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
                     true,
                 );
             }
-            Capability::pass(
+            Capability::warn(
                 name,
                 format!(
                     "{} NIC queue IRQ(s) currently fire on the derived VPP cores (main {}, \
-                     workers {:?}): {}{} — attach re-pins them onto {} before starting VPP",
+                     workers {:?}): {}{} — attach will re-pin them onto CPUs in {} before \
+                     starting VPP, and refuses if the kernel does not then move delivery \
+                     (a kernel-managed IRQ ignores the mask). That cannot be known without \
+                     writing the mask, which this probe never does",
                     c.len(),
                     map.main,
                     map.workers,
@@ -143,7 +151,7 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
                     if c.len() > 8 { ", ..." } else { "" },
                     crate::cores::format_cpu_list(&safe),
                 ),
-                true,
+                false,
             )
         }
         Err(e) => Capability::unknown(name, e, true),

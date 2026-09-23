@@ -2312,11 +2312,21 @@ itself**: any member port's queue IRQ whose *effective* affinity is on
 a VPP core is re-pinned onto the CPUs that are neither VPP's nor
 isolated, keeping whatever of its existing mask survives, and the
 attach log says so (`moved a NIC queue IRQ off the cores VPP will
-poll`). Attach then re-reads where each IRQ actually fires and
-**refuses** only if the kernel did not follow — a kernel-managed or
-driver-pinned IRQ. `packetframe feasibility` reports the planned move
-as a pass (`vpp.irq-affinity`) and fails only when there is no CPU left
-to move to.
+poll`). An IRQ with nothing surviving (the default spread pins one per
+core) gets a single CPU, and consecutive ones get different CPUs, cpu0
+last — a controller handed a wide mask delivers to one CPU in it, so
+writing the same wide mask for each would pile them all onto cpu0.
+Attach then re-reads where each IRQ actually fires and **refuses** only
+if the kernel did not follow — a kernel-managed or driver-pinned IRQ.
+When attach adopts a surviving VPP whose threads are observed on cores
+outside the derived map, it runs the same move against those too; there
+a kernel that does not follow is a warning, not a refusal, because
+refusing after adoption would leave that VPP unsupervised.
+
+`packetframe feasibility` reports a planned move as a non-blocking
+**WARN** on `vpp.irq-affinity`, not a pass: whether the kernel honours
+the mask is only known once it is written, which a probe never does.
+It **fails, required**, only when there is no CPU left to move to.
 
 This used to be a refusal with the fix spelled out for an operator to
 apply by hand. On UniFi a hand-written affinity is gone at the next
@@ -2324,10 +2334,9 @@ reboot, provision cycle or ring resize, so the refusal fired after
 every one of them. The moves are not undone on detach: putting an IRQ
 back on a CPU VPP no longer uses would only re-create the conflict for
 the next attach. With a config that
-declares the module, the check is `required`: a conflict makes the
-summary read "vpp-offload attach BLOCKED" (exit non-zero) rather than
-PASS — do not trust a bare PASS memory from builds before this; one
-did read PASS over a failing line (edge1-mci1-net, 2026-08-21). Effective, not
+declares the module, the no-CPU-left failure is `required`: it makes
+the summary read "vpp-offload attach BLOCKED" (exit non-zero) rather
+than PASS. Effective, not
 permitted: a `0-17` wildcard mask still delivers to exactly one CPU,
 and that CPU either is or is not about to become a hot poller.
 
