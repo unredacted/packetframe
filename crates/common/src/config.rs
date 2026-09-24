@@ -176,6 +176,16 @@ pub enum ModuleDirective {
     /// frames in two minutes, all punted, zero forwarded. Untagged
     /// ingress (an access port, or the PVID) needs no declaration.
     ///
+    /// `cores` is how many VPP workers poll this port's rx queues
+    /// (one queue per worker). `cores 0` gives the port no worker of
+    /// its own: its single queue is polled by ONE worker shared with
+    /// every other `cores 0` port ([`vpp_worker_count`]). For
+    /// egress-only members — while a port is unsteered its VF receives
+    /// ~nothing, yet a dedicated worker would busy-poll a core for it.
+    /// A `cores 0` port cannot `steer on` (validation refuses it);
+    /// giving it a core of its own is restart-only, like every `cores`
+    /// change.
+    ///
     /// `direction` overrides the global `steer-direction` for this
     /// port's rules. The split a service-edge box wants: `src` on the
     /// service trunk (outbound rides VPP), `dst` on the transit ports
@@ -1045,6 +1055,24 @@ impl std::fmt::Display for VppSteerDirection {
     }
 }
 
+/// VPP worker threads a vpp-offload config needs, from each `port`
+/// line's `cores` in any order.
+///
+/// Every port's `cores`, summed, plus ONE shared worker when any port
+/// declares `cores 0` — all such ports poll their single rx queue from
+/// that one worker. Here, in common, rather than in the module, so the
+/// feasibility probe (built with or without the module) and attach
+/// derive the same core map from the same arithmetic.
+pub fn vpp_worker_count<I: IntoIterator<Item = u16>>(cores: I) -> u32 {
+    let mut dedicated = 0u32;
+    let mut any_shared = false;
+    for c in cores {
+        dedicated += u32::from(c);
+        any_shared |= c == 0;
+    }
+    dedicated + u32::from(any_shared)
+}
+
 /// Tri-state on/off/auto toggle used by driver workarounds.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1613,13 +1641,36 @@ impl Config {
         let mut ports: Vec<(&String, bool, usize)> = Vec::new();
         for d in &vpp.directives {
             if let ModuleDirective::VppPort {
-                iface, steer, line, ..
+                iface,
+                cores,
+                steer,
+                line,
+                ..
             } = d
             {
                 if ports.iter().any(|(i, _, _)| *i == iface) {
                     return Err(ConfigError::parse(
                         *line,
                         format!("duplicate `port {iface}` in module vpp-offload"),
+                    ));
+                }
+                // A `cores 0` port's queue is polled by the worker it
+                // shares with every other egress-only member. Steering
+                // it would land a port's whole ingress on a worker sized
+                // for "receives ~nothing" and shared with others, so it
+                // is refused here — which also refuses a SIGHUP that
+                // flips such a port on, since reconfigure re-validates
+                // the whole file. The fix is a core of its own, and that
+                // is a restart: VPP's worker count is fixed at start.
+                if *cores == 0 && *steer {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "`port {iface}` has `cores 0` and `steer on`: a port with no \
+                             worker of its own cannot take steered traffic (its rx queue \
+                             shares one worker with every other `cores 0` port). Give it \
+                             `cores 1` — a restart-only change — before steering it"
+                        ),
                     ));
                 }
                 ports.push((iface, *steer, *line));
@@ -3133,14 +3184,16 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             if rest.next() != Some("cores") {
                 return Err(ConfigError::parse(line, usage));
             }
+            // 0 is legal: the port gets no worker of its own and its
+            // one rx queue shares the single worker every `cores 0`
+            // port polls from (`vpp_worker_count`). Whether such a port
+            // may steer is a cross-directive rule, checked in
+            // `validate_vpp_offload`.
             let cores: u16 = rest
                 .next()
                 .ok_or_else(|| ConfigError::parse(line, usage))?
                 .parse()
-                .map_err(|_| ConfigError::parse(line, "cores must be a positive integer"))?;
-            if cores == 0 {
-                return Err(ConfigError::parse(line, "cores must be >= 1"));
-            }
+                .map_err(|_| ConfigError::parse(line, "cores must be a non-negative integer"))?;
             if rest.next() != Some("steer") {
                 return Err(ConfigError::parse(line, usage));
             }
@@ -5406,10 +5459,11 @@ module vpp-offload
             ModuleDirective::VppPort { steer, .. } => assert!(steer),
             other => panic!("expected VppPort, got {other:?}"),
         }
-        // Malformed variants: missing keywords, zero cores, trailing junk.
+        // Malformed variants: missing keywords, bad cores, trailing junk.
         for bad in [
             "module vpp-offload\n  port eth4\n",
-            "module vpp-offload\n  port eth4 cores 0 steer on\n",
+            "module vpp-offload\n  port eth4 cores -1 steer off\n",
+            "module vpp-offload\n  port eth4 cores many steer off\n",
             "module vpp-offload\n  port eth4 cores 1\n",
             "module vpp-offload\n  port eth4 cores 1 steer maybe\n",
             "module vpp-offload\n  port eth4 cores 1 steer on extra\n",
@@ -5417,6 +5471,64 @@ module vpp-offload
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
         }
+    }
+
+    /// `cores 0` is an egress-only member: it parses, and validates
+    /// while unsteered alongside a steered port that has its own core.
+    #[test]
+    fn vpp_port_cores_zero_parses_and_validates_unsteered() {
+        let s = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  \
+                 attach eth5 generic\n\nmodule vpp-offload\n  \
+                 loopback-address 198.51.100.1/32\n  port eth4 cores 0 steer off\n  \
+                 port eth5 cores 1 steer on\n";
+        let c = Config::parse(s).unwrap();
+        let vpp = c.modules.iter().find(|m| m.name == "vpp-offload").unwrap();
+        match &vpp.directives[1] {
+            ModuleDirective::VppPort {
+                iface,
+                cores,
+                steer,
+                ..
+            } => {
+                assert_eq!(iface, "eth4");
+                assert_eq!(*cores, 0);
+                assert!(!steer);
+            }
+            other => panic!("expected VppPort, got {other:?}"),
+        }
+        c.validate_vpp_offload().unwrap();
+    }
+
+    /// A port with no worker of its own cannot take steered traffic;
+    /// the refusal names the port and the remedy. Reconfigure runs the
+    /// same validator, so this is also the SIGHUP refusal.
+    #[test]
+    fn vpp_port_cores_zero_with_steer_on_is_refused() {
+        let s = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  \
+                 attach eth5 generic\n\nmodule vpp-offload\n  \
+                 loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  \
+                 port eth5 cores 0 steer on\n";
+        let err = Config::parse(s)
+            .unwrap()
+            .validate_vpp_offload()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("port eth5"), "{err}");
+        assert!(err.contains("cores 0"), "{err}");
+        assert!(err.contains("cannot take steered traffic"), "{err}");
+        assert!(err.contains("cores 1"), "{err}");
+        assert!(err.contains("restart-only"), "{err}");
+    }
+
+    #[test]
+    fn vpp_worker_count_adds_one_shared_worker_for_cores_zero_ports() {
+        assert_eq!(vpp_worker_count([]), 0);
+        assert_eq!(vpp_worker_count([1, 2]), 3);
+        // Any number of cores-0 ports share ONE worker.
+        assert_eq!(vpp_worker_count([0]), 1);
+        assert_eq!(vpp_worker_count([0, 0, 0]), 1);
+        assert_eq!(vpp_worker_count([1, 0, 0, 0]), 2);
+        assert_eq!(vpp_worker_count([0, 2, 0, 1]), 4);
     }
 
     /// `steer-exempt` exists because of w23 on the primary

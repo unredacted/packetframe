@@ -316,7 +316,7 @@ Quick directive index:
 - `driver-workaround rvu-nicpf-head-shift {auto|on|off}`
 
 **Module vpp-offload** (see [the runbook](docs/runbooks/vpp-offload.md) before using)
-- `port <iface> cores <n> steer {on|off}`: one line per interface VPP takes part in; `steer` is the per-interface switch
+- `port <iface> cores <n> steer {on|off}`: one line per interface VPP takes part in; `steer` is the per-interface switch. `cores 0` is for egress-only members: they share one VPP worker and cannot be steered until given a core of their own
 - `expected-routes <n>`: sizes VPP's memory, fixed when it starts
 - `hugepages <n>`, `vpp-binary <path>`
 - `require-table-complete {on|off}`: wait for the routing table to finish loading before steering (default on)

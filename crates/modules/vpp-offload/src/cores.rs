@@ -95,6 +95,59 @@ pub fn derive_core_map(online: &[u16], isolated: &[u16], workers: u32) -> Result
     })
 }
 
+/// One rx queue's worker, as `sw_interface_set_rx_placement` takes it.
+///
+/// `worker_id` is VPP's 0-based WORKER number (`is_main = false`), not a
+/// CPU and not a thread index: worker N runs on the N-th CPU of
+/// `corelist-workers`, which [`CoreMap::workers`] renders ascending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxPlacement {
+    pub queue_id: u32,
+    pub worker_id: u32,
+}
+
+/// Which worker polls which rx queue, per port, in config order.
+///
+/// A port with `cores c >= 1` gets queues `0..c` on `c` distinct,
+/// consecutive workers, allocated in config order from worker 0. Every
+/// `cores 0` port gets queue 0 on the ONE shared worker, whose index is
+/// the sum of the dedicated cores — the last worker, since
+/// `VppOffloadConfig::total_workers` adds exactly one for it. So the
+/// highest worker id this can name is `total_workers() - 1`.
+///
+/// Explicit, because VPP's default is round-robin in queue-creation
+/// order: it would give each `cores 0` port a different worker and
+/// scatter the dedicated ports' queues, which is not what the operator
+/// sized. A pure function so the whole plan is unit-testable here and
+/// the attach step only applies it.
+pub fn rx_placement_plan(ports: &[(&str, u16)]) -> Vec<(String, Vec<RxPlacement>)> {
+    let shared_worker: u32 = ports.iter().map(|(_, c)| u32::from(*c)).sum();
+    let mut next_worker = 0u32;
+    ports
+        .iter()
+        .map(|(iface, cores)| {
+            let queues = if *cores == 0 {
+                vec![RxPlacement {
+                    queue_id: 0,
+                    worker_id: shared_worker,
+                }]
+            } else {
+                (0..u32::from(*cores))
+                    .map(|q| {
+                        let p = RxPlacement {
+                            queue_id: q,
+                            worker_id: next_worker,
+                        };
+                        next_worker += 1;
+                        p
+                    })
+                    .collect()
+            };
+            (iface.to_string(), queues)
+        })
+        .collect()
+}
+
 /// Parse a kernel CPU list: comma-separated singles and `a-b` ranges,
 /// as written by every file under `/sys/devices/system/cpu/`.
 ///
@@ -992,6 +1045,88 @@ mod tests {
             std::fs::write(d.join("smp_affinity_list"), format!("{aff}\n")).unwrap();
         }
         (net, proc_irq)
+    }
+
+    fn rp(queue_id: u32, worker_id: u32) -> RxPlacement {
+        RxPlacement {
+            queue_id,
+            worker_id,
+        }
+    }
+
+    /// The first-rung shape: one steered port with its own worker, the
+    /// egress-only members all on the one shared worker after it.
+    #[test]
+    fn placement_puts_every_cores_zero_port_on_the_one_shared_worker() {
+        let plan = rx_placement_plan(&[("eth2", 0), ("eth3", 1), ("eth4", 0), ("eth5", 0)]);
+        assert_eq!(
+            plan,
+            vec![
+                ("eth2".to_string(), vec![rp(0, 1)]),
+                ("eth3".to_string(), vec![rp(0, 0)]),
+                ("eth4".to_string(), vec![rp(0, 1)]),
+                ("eth5".to_string(), vec![rp(0, 1)]),
+            ]
+        );
+    }
+
+    /// Nothing dedicated: the shared worker is worker 0.
+    #[test]
+    fn placement_with_only_cores_zero_ports_uses_worker_zero() {
+        let plan = rx_placement_plan(&[("eth2", 0), ("eth3", 0)]);
+        assert_eq!(
+            plan,
+            vec![
+                ("eth2".to_string(), vec![rp(0, 0)]),
+                ("eth3".to_string(), vec![rp(0, 0)]),
+            ]
+        );
+    }
+
+    /// Multi-core ports get one queue per worker, consecutive and
+    /// distinct, allocated in config order; the shared worker follows
+    /// the last dedicated one.
+    #[test]
+    fn placement_gives_multi_core_ports_distinct_consecutive_workers() {
+        let plan = rx_placement_plan(&[("eth2", 2), ("eth3", 0), ("eth4", 3)]);
+        assert_eq!(
+            plan,
+            vec![
+                ("eth2".to_string(), vec![rp(0, 0), rp(1, 1)]),
+                ("eth3".to_string(), vec![rp(0, 5)]),
+                ("eth4".to_string(), vec![rp(0, 2), rp(1, 3), rp(2, 4)]),
+            ]
+        );
+        // Without cores-0 ports there is no shared worker at all.
+        let plan = rx_placement_plan(&[("eth2", 1), ("eth3", 2)]);
+        assert_eq!(
+            plan,
+            vec![
+                ("eth2".to_string(), vec![rp(0, 0)]),
+                ("eth3".to_string(), vec![rp(0, 1), rp(1, 2)]),
+            ]
+        );
+    }
+
+    /// Every worker the plan names exists: the highest id is
+    /// `total_workers() - 1`, and every worker is used.
+    #[test]
+    fn placement_names_exactly_the_workers_total_workers_sizes() {
+        for ports in [
+            vec![("a", 1u16), ("b", 0), ("c", 0)],
+            vec![("a", 0)],
+            vec![("a", 2), ("b", 1)],
+            vec![("a", 0), ("b", 3), ("c", 0), ("d", 1)],
+        ] {
+            let total = packetframe_common::config::vpp_worker_count(ports.iter().map(|(_, c)| *c));
+            let mut used: Vec<u32> = rx_placement_plan(&ports)
+                .into_iter()
+                .flat_map(|(_, q)| q.into_iter().map(|p| p.worker_id))
+                .collect();
+            used.sort_unstable();
+            used.dedup();
+            assert_eq!(used, (0..total).collect::<Vec<_>>(), "{ports:?}");
+        }
     }
 
     #[test]

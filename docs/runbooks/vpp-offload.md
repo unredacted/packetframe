@@ -248,6 +248,13 @@ vppctl -s /run/packetframe/vpp/api.sock.cli show interface
 vppctl -s /run/packetframe/vpp/api.sock.cli show threads
 ```
 
+```bash
+# Which worker polls which queue. Dedicated ports' queues sit on their
+# own workers in config order; every `cores 0` port's queue is on the
+# last worker, the shared one.
+vppctl -s /run/packetframe/vpp/api.sock.cli show interface rx-placement
+```
+
 ## The canary ladder
 
 Traffic moves only when you say so. The module never steers on a first
@@ -278,6 +285,31 @@ list on the port line is what creates the subifs, it must name every
 VID the steered prefixes ride (on the reference fleet, eth4 needs
 `vlans 88,1337` — one per service bridge), and it is restart-only:
 declare it before the attach, not at the rung.
+
+**Give egress-only members `cores 0`.** Every VPP worker is a core
+polling at 100% whether or not anything arrives, and at the first rung
+only one port is steered: the other members only *transmit* (steered
+traffic egresses them from the steered port's worker), and with no MCAM
+rules their VFs receive ~nothing. `cores 0` gives a port no worker of
+its own — every `cores 0` port's single rx queue is polled by ONE
+shared worker — so a six-port box at rung 1 runs three VPP threads
+(main + the steered port's worker + the shared worker) instead of
+seven:
+
+```
+  port eth2 cores 0 steer off
+  port eth3 cores 1 steer on     # the canary: its own worker
+  port eth4 cores 0 steer off
+```
+
+A `cores 0` port cannot be steered: load and `packetframe reconfigure`
+both refuse `cores 0` + `steer on`, because its whole ingress would
+land on a worker shared with every other egress-only member. Before a
+port climbs a rung, give it `cores 1` — and that is **restart-only**
+(VPP's worker count is fixed at start), so plan the core layout for
+the next rung at a restart, not at the rung itself. Queue placement is
+explicit and logged at attach (`rx placement planned`); check it with
+`show interface rx-placement` below.
 
 Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
 resync: a restart would cost about 40 seconds with the offload down at
@@ -1745,6 +1777,8 @@ IRQs moved off them pre-attach), and w10's own counters showed the
 eBPF tier matching and forwarding normally throughout
 (`matched_v4` ≈ `rx_total`, `fwd_ok` climbing). Whether ~7 hot cores
 buy enough forwarding is exactly what the steering canary measures.
+Members that only transmit do not need their own: `cores 0` puts all
+of them on one shared worker (see the canary ladder).
 
 Do not stop reading at "the counters are fine", though — the next
 section is about exactly the loss those counters cannot see.
@@ -1784,8 +1818,9 @@ What to do about it, in order:
    maximum-cost-zero-benefit by design — all of VPP's CPU tax, none of
    its forwarding. Schedule attaches and soaks off-peak, and treat
    time-at-rung-0 as a cost to budget, not a neutral holding state.
-4. **The durable fixes** are fewer VPP cores while unsteered (design
-   change, tracked) and climbing to the steered rungs — steering moves
+4. **The durable fixes** are fewer VPP cores while unsteered — give
+   every member that is not about to steer `cores 0`, so they share one
+   worker (restart-only) — and climbing to the steered rungs — steering moves
    allowlisted traffic onto VPP's hardware path *and* removes its XDP
    cost from the squeezed CPUs, which is the intended end state, not a
    workaround.

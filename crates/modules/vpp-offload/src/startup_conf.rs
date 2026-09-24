@@ -113,7 +113,9 @@ pub fn thread_count(workers: u32) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
     pub expected_routes: u64,
-    /// Configured VPP workers (sum of every port's `cores`). Recorded
+    /// Configured VPP workers (`VppOffloadConfig::total_workers`: every
+    /// port's `cores`, plus one shared worker if any port has
+    /// `cores 0`). Recorded
     /// because the stats segment scales with it and because [`render`]
     /// cross-checks it against the core list it is handed — two
     /// independent worker counts is how a segment gets undersized.
@@ -138,7 +140,8 @@ pub struct Sizing {
 /// arithmetic itself).
 ///
 /// `workers` is the **total** across every port — the sum of the
-/// `cores` promises — because VPP's thread count, and therefore its
+/// `cores` promises plus the `cores 0` ports' shared worker
+/// (`VppOffloadConfig::total_workers`) — because VPP's thread count, and therefore its
 /// counter-vector replication, is global rather than per-interface.
 pub fn derive_sizing(expected_routes: u64, workers: u32) -> Result<Sizing, String> {
     let table = expected_routes
@@ -277,7 +280,9 @@ pub fn route_capacity(sizing: &Sizing) -> u64 {
 /// `cores` still means what it meant: the operator's promise, rendered
 /// explicitly rather than left to the scheduler's round-robin default
 /// (plan v5, "cores promises are honored by rendering explicit
-/// rx-placement"). It now lands as `num_rx_queues` at attach.
+/// rx-placement"). It now lands as `num_rx_queues` (at least one) plus
+/// an explicit per-queue worker placement at attach
+/// (`cores::rx_placement_plan`); `cores 0` shares one worker.
 #[derive(Debug, Clone)]
 pub struct PortSpec {
     pub pci_addr: String,

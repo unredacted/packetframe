@@ -76,6 +76,7 @@ use std::time::{Duration, Instant};
 
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::attach::{AttachMode, PortAttach};
+use packetframe_vpp_offload::cores::RxPlacement;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 
@@ -377,6 +378,10 @@ fn measured_convergence_against_a_real_vpp() {
                 pci_addr: pci.clone(),
                 port_id: 0,
                 num_rx_queues: 1,
+                rx_placement: vec![RxPlacement {
+                    queue_id: 0,
+                    worker_id: 0,
+                }],
                 pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                 accept_macs: vec![],
                 vlans: vec![],

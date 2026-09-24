@@ -337,17 +337,20 @@ impl VppOffloadConfig {
         Ok(())
     }
 
-    /// Total VPP worker threads the config promises, across all ports.
+    /// Total VPP worker threads the config promises, across all ports:
+    /// every port's `cores`, plus the ONE worker all `cores 0` ports
+    /// share when any exist
+    /// ([`packetframe_common::config::vpp_worker_count`]).
     ///
     /// VPP's thread count is global, not per-interface, and its counter
     /// vectors replicate per thread — so this, not any single port's
     /// `cores`, is what sizes the stats segment
-    /// (`startup_conf::derive_sizing`).
+    /// (`startup_conf::derive_sizing`), `corelist-workers`, and the
+    /// placement plan's worker indices ([`cores::rx_placement_plan`]).
     pub fn total_workers(&self) -> u32 {
-        self.ports
-            .iter()
-            .map(|(_, cores, _, _, _)| u32::from(*cores))
-            .sum()
+        packetframe_common::config::vpp_worker_count(
+            self.ports.iter().map(|(_, cores, _, _, _)| *cores),
+        )
     }
 }
 
@@ -1397,6 +1400,60 @@ mod tests {
             last_failures: Vec::new(),
             store_error: None,
         }
+    }
+
+    fn with_cores(cores: &[u16]) -> VppOffloadConfig {
+        VppOffloadConfig {
+            ports: cores
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (format!("eth{i}"), *c, false, vec![], None))
+                .collect(),
+            ..VppOffloadConfig::default()
+        }
+    }
+
+    /// Without `cores 0` ports the total is the plain sum; with any,
+    /// ONE shared worker is added however many there are.
+    #[test]
+    fn total_workers_adds_one_shared_worker_for_cores_zero_ports() {
+        assert_eq!(with_cores(&[1, 1, 1]).total_workers(), 3);
+        assert_eq!(with_cores(&[2, 1]).total_workers(), 3);
+        assert_eq!(with_cores(&[1, 0]).total_workers(), 2);
+        assert_eq!(with_cores(&[1, 0, 0, 0, 0]).total_workers(), 2);
+        assert_eq!(with_cores(&[0, 0]).total_workers(), 1);
+        assert_eq!(with_cores(&[2, 0, 1, 0]).total_workers(), 4);
+    }
+
+    /// The rendered startup.conf for a mixed config names exactly the
+    /// workers the placement plan uses: the dedicated ones plus one
+    /// shared, and the sizing agrees (`render` asserts it).
+    #[test]
+    fn startup_conf_for_a_mixed_config_renders_the_shared_worker() {
+        let cfg = with_cores(&[1, 0, 0, 2, 0]);
+        let workers = cfg.total_workers();
+        assert_eq!(workers, 4);
+        let online: Vec<u16> = (0..12).collect();
+        let map = cores::derive_core_map(&online, &[], workers).unwrap();
+        assert_eq!(map.workers, vec![8, 9, 10, 11]);
+        let sizing = startup_conf::derive_sizing(DEFAULT_EXPECTED_ROUTES, workers).unwrap();
+        let conf = startup_conf::render(&sizing, &map.workers, map.main, "/run/pf/api.sock", 0);
+        assert!(conf.contains("main-core 7\n"), "{conf}");
+        assert!(conf.contains("corelist-workers 8,9,10,11\n"), "{conf}");
+        // And every worker the conf starts is one the plan places a
+        // queue on — the shared one last.
+        let ports: Vec<(&str, u16)> = cfg
+            .ports
+            .iter()
+            .map(|(i, c, ..)| (i.as_str(), *c))
+            .collect();
+        let max_worker = cores::rx_placement_plan(&ports)
+            .into_iter()
+            .flat_map(|(_, q)| q)
+            .map(|q| q.worker_id)
+            .max()
+            .unwrap();
+        assert_eq!(max_worker, workers - 1);
     }
 
     /// `attach` asks no NIC when the allowlist has nothing steerable.

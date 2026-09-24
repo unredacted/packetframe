@@ -36,8 +36,9 @@ use packetframe_vpp_offload::vpp_api::generated::{
     IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
     Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddressReply,
     SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetPromiscReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
-    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    SwInterfaceSetPromiscReply, SwInterfaceSetRxPlacement, SwInterfaceSetRxPlacementReply,
+    SwInterfaceSetUnnumberedReply, ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4,
+    FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -381,6 +382,23 @@ fn serve(
             "sw_interface_set_promisc" => {
                 out = reply_head("sw_interface_set_promisc_reply");
                 SwInterfaceSetPromiscReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+            }
+            "sw_interface_set_rx_placement" => {
+                let mut d = Decoder::new(&req);
+                let r = SwInterfaceSetRxPlacement::decode(&mut d)
+                    .expect("decodes as an rx placement op");
+                // Detailed, like `create_vlan_subif`: a test asserts
+                // WHICH queue landed on WHICH worker.
+                let _ = tx.send(Event::Msg(format!(
+                    "sw_interface_set_rx_placement if={} queue={} worker={} main={}",
+                    r.sw_if_index, r.queue_id, r.worker_id, r.is_main
+                )));
+                out = reply_head("sw_interface_set_rx_placement_reply");
+                SwInterfaceSetRxPlacementReply {
                     context: ctx,
                     retval: 0,
                 }
