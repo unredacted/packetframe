@@ -108,9 +108,15 @@ pub fn rule_table_reclaiming(
     let mut ours = Vec::new();
     for &loc in table.occupied.iter().filter(|l| recorded.contains(l)) {
         let Some(got) = read_rule(iface, loc)? else {
-            continue; // emptied since the table read: free already
+            // Emptied since the table read (a controller classifier
+            // reset, say): free now, so it must leave `occupied` too.
+            ours.push(loc);
+            continue;
         };
-        let diverts_to_us = got.ring_cookie == ring_cookie(vf_index);
+        // The VF field, not the whole cookie: a rule into another queue
+        // of our VF is still ours, as `remove_all` already judges it.
+        let diverts_to_us =
+            ring_cookie_vf(got.ring_cookie) == ring_cookie_vf(ring_cookie(vf_index));
         let planned_here = recorded_plan.is_some_and(|plan| {
             plan.rules
                 .iter()
@@ -3367,6 +3373,12 @@ mod tests {
 
         let table = rule_table_reclaiming("eth0", 0, &recorded, Some(&plan)).expect("table");
         assert_eq!(table.occupied, vec![taken]);
+
+        // A rule into ANOTHER QUEUE of our VF is still ours.
+        sys::replace_behind_back_targeting("eth0", taken, ring_cookie(0) | 3);
+        let table = rule_table_reclaiming("eth0", 0, &recorded, Some(&plan)).expect("table");
+        assert!(table.occupied.is_empty(), "{:?}", table.occupied);
+        sys::replace_behind_back("eth0", taken);
 
         // Without the recorded plan, a cookie-zero exemption cannot be
         // told from a stranger's, so it stays occupied too; diversions
