@@ -414,6 +414,23 @@ pub enum Event {
     /// already recorded, so it can never steer a first attach on its
     /// own. [`Supervisor::steer_intended`] holds that distinction.
     SteerUnblocked,
+    /// VPP's FIB holds no routes while traffic is steered into it.
+    ///
+    /// Every steered packet is then dropped inside VPP, where the eBPF
+    /// tier would have handed the same traffic to the kernel — strictly
+    /// worse than the fallback the offload sits in front of. Measured on
+    /// the lab rig (2026-09-24): the FRR feed's nexthop went away, all
+    /// 7,830 routes withdrew, VPP held 0 installed, and every health
+    /// surface stayed green with the port steered, because the verify
+    /// verdict that passed 23 minutes earlier does not re-run in steady
+    /// state. On a production box the same thing is an FRR session drop.
+    ///
+    /// Observed by the driver (the supervisor reads no ledger), only
+    /// from `Steered`. An adopted deferral is not `Steered` and its
+    /// ledger is legitimately empty until the dump, so it never fires
+    /// there. Only a completely empty table triggers it, so ordinary
+    /// churn cannot flap it.
+    TableEmptied,
     /// The operator turned the canary lever OFF — the rollback landing
     /// zone. Membership stays, the FIB stays synced, traffic goes back
     /// to the fallback tier.
@@ -848,6 +865,23 @@ impl Supervisor {
             // `steered == true` and the want set — and that is a steer
             // that did not fully happen, so it wants the same retry.
             (Ready, SteerUnblocked) if self.steer_wanted => vec![Action::Steer],
+            // The module takes steering down itself: an empty FIB drops
+            // what the eBPF tier would forward. Shaped like
+            // `SteerFailed` — the WANT is kept and the state returns to
+            // `Ready` — so the ordinary `SteerUnblocked` retry puts it
+            // back once the table is refilled and every first-steer gate
+            // passes again, an empty table being one of them.
+            // `steered` is left for the `Unsteered` acknowledgement, as
+            // everywhere: a refused removal keeps the VF withheld.
+            (State::Steered, TableEmptied) => {
+                self.steer_wanted = true;
+                self.state = Ready;
+                if self.steered {
+                    vec![Action::Unsteer]
+                } else {
+                    vec![]
+                }
+            }
             // Believed down only on `Unsteered`, exactly as everywhere
             // else. The state returns to `Ready` because that is what
             // membership-without-steering is — the designed staging

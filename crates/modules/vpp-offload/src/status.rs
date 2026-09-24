@@ -594,9 +594,15 @@ impl StatusSnapshot {
         // designed response to a table that outgrew the heap, it has
         // never been "steered but broken", and `fib_health` already
         // reports it as Degraded.
+        //
+        // An EMPTY table counts whatever the verdict says. A verify that
+        // passed stays `Verified` for good, and a table that drains to
+        // nothing afterwards — an FRR session drop — read as healthy
+        // while steered traffic died in VPP (rig, 2026-09-24).
+        let table_empty = self.counts.installed == 0;
         let fib_broken = match &self.fib {
-            FibSync::Unfit { .. } => self.counts.unresolvable > 0 || self.counts.installed == 0,
-            other => !other.verified(),
+            FibSync::Unfit { .. } => self.counts.unresolvable > 0 || table_empty,
+            other => !other.verified() || table_empty,
         };
         let fib_unverified = fib_broken && self.resync_deferred.is_none();
         // BLACKHOLE ports, not dead ones — "under paths that resolve
@@ -795,6 +801,11 @@ impl StatusSnapshot {
             // A complete table. Withheld and unresolvable are real
             // degradation even when everything else is clean.
             && !self.counts.degraded()
+            // And a table at all. An empty one offloads nothing, and
+            // `fib_health` says Degraded for it — `overall` must not
+            // outrank its own subsystems (rig, 2026-09-24: a drained
+            // feed read Healthy on a verify 23 minutes old).
+            && self.counts.installed > 0
             // Membership is all-or-nothing, so "no ports" is not a
             // vacuous pass — it means nothing was ever attached.
             && !self.ports.is_empty()
@@ -1139,7 +1150,33 @@ impl StatusSnapshot {
             ),
             FibSync::Verified { sampled, .. } => {
                 let c = self.counts;
-                if c.degraded() {
+                if c.installed == 0 && self.steered {
+                    // Transient by construction: the driver takes
+                    // steering down on the next tick. Said anyway, since
+                    // a refused unsteer would leave exactly this.
+                    (
+                        HealthState::Unhealthy,
+                        Some(format!(
+                            "0 routes installed while steered — every steered packet is \
+                             dropped in VPP. The module takes steering down on its own; if \
+                             this persists the unsteer was refused (verified on {sampled} \
+                             probes earlier, and verify does not re-run in steady state)"
+                        )),
+                    )
+                } else if c.installed == 0 {
+                    // The route source emptied (a feed session drop, a
+                    // lost nexthop). Degraded, not a fault here: nothing
+                    // is steered into it, and the steering row says
+                    // whether a steer is waiting to come back.
+                    (
+                        HealthState::Degraded,
+                        Some(format!(
+                            "0 routes installed — the route source is empty, so nothing is \
+                             offloaded and a steer is refused until it refills (verified on \
+                             {sampled} probes earlier)"
+                        )),
+                    )
+                } else if c.degraded() {
                     // Both counts, always, and named: "table outgrew the
                     // box" and "nexthop mapping is wrong" are different
                     // pages, and collapsing them hides whichever is
@@ -2730,6 +2767,61 @@ mod tests {
         let r = s.report();
         assert_eq!(r.overall, HealthState::Healthy);
         assert!(r.subsystems.iter().all(|x| x.state == HealthState::Healthy));
+    }
+
+    /// A verify that passed does not make a later empty table healthy.
+    ///
+    /// The rig (2026-09-24): FRR's nexthop went away, all 7,830 routes
+    /// withdrew, and a steered VPP with 0 installed read `fib-synced
+    /// healthy — 0 routes installed` on the strength of a verify 23
+    /// minutes old. Every steered packet was being dropped in VPP.
+    #[test]
+    fn steered_over_an_emptied_verified_table_is_unhealthy() {
+        let led = ledger_with(0, 0, 0);
+        let r = snap_of(
+            &steered_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(1395),
+            ports_up(),
+        )
+        .report();
+        assert_eq!(r.overall, HealthState::Unhealthy, "steered into nothing");
+        let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
+        assert_eq!(fib.state, HealthState::Unhealthy);
+        let msg = fib.message.as_deref().unwrap();
+        assert!(msg.contains("0 routes installed while steered"), "{msg}");
+    }
+
+    /// Once steering is down the same empty table is Degraded, not a
+    /// page: nothing is diverted into it, and the eBPF tier carries the
+    /// traffic.
+    #[test]
+    fn an_emptied_table_unsteered_is_degraded_not_unhealthy() {
+        let led = ledger_with(0, 0, 0);
+        let r = snap_of(
+            &ready_supervisor(),
+            &led,
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(200),
+            },
+            verified(1395),
+            ports_up(),
+        )
+        .report();
+        assert_eq!(r.overall, HealthState::Degraded);
+        let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
+        assert_eq!(fib.state, HealthState::Degraded);
+        assert!(
+            fib.message
+                .as_deref()
+                .unwrap()
+                .contains("route source is empty"),
+            "{:?}",
+            fib.message
+        );
     }
 
     /// The module's whole premise: the eBPF fast-path is a permanent

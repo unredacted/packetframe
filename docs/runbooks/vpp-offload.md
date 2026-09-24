@@ -1252,6 +1252,32 @@ lever-move steers into whatever is loaded at that instant.) `off` is
 the documented opt-out for boxes with no bird to compare against (the
 shadow), not a default to leave alone.
 
+### Steering came down by itself: VPP's table emptied
+
+```
+WARN VPP's FIB is empty while steered — every steered packet would be dropped there; taking steering down so the eBPF tier carries it
+```
+
+If every route drains out of VPP while a port is steered, the module
+takes steering down on its own. The usual cause is an FRR session drop,
+or the feed's nexthop going away. Steered packets would otherwise be
+dropped inside VPP, while the eBPF tier hands the same traffic to the
+kernel. `fib-synced` reads Unhealthy for the tick or two this takes,
+then Degraded (`0 routes installed — the route source is empty`), and
+`steering` reads "steering intended but not in place".
+
+**Steering comes back without anyone touching it.** The want is kept,
+and the ordinary steer retry reinstalls the rules once the table has
+refilled and every first-steer gate passes. An empty table is one of
+those gates, so the retry can't steer back into the same empty table.
+
+Before this, a verify that passed kept `fib-synced` Healthy for good.
+Verify does not re-run in steady state, so on the lab rig
+(2026-09-24) a drained feed read `healthy — 0 routes installed` with
+the port steered and nothing logged. Only a completely empty table
+triggers this, so ordinary churn cannot flap it. A partial drain is the
+completeness authority's business, which gates the first steer.
+
 ### `packetframe status` disagrees with what you just did
 
 `status` reads `module-health.json`, which the loader rewrites every

@@ -1004,6 +1004,17 @@ fn apply_steering(
                 // the lever, or a want already existed. Config intent
                 // alone never gets this far.
                 driver.inject(Instant::now(), Event::SteerDeferred, fx);
+                if counts.installed == 0 && counts.installing == 0 {
+                    return Err(format!(
+                        "refusing the first steer: VPP's FIB is empty (0 routes installed). \
+                         Diverting traffic into it would drop all of it, where the eBPF \
+                         tier passes it to the kernel. The route source is empty or has \
+                         not loaded; `packetframe status` shows fib-integrity. The request \
+                         is remembered: the module steers on its own once the table is back, \
+                         at most {}s later",
+                        crate::driver::STEER_RETRY_EVERY.as_secs()
+                    ));
+                }
                 return Err(format!(
                     "refusing the first steer: the FIB is incomplete ({} unresolvable, {} \
                      withheld, {} still installing). Diverting traffic into it would \

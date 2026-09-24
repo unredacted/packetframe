@@ -2309,6 +2309,10 @@ impl Observe for ObserveView {
             && c.fib_fit_to_steer()
     }
 
+    fn fib_empty(&mut self) -> bool {
+        self.core.borrow().engine.counts().installed == 0
+    }
+
     fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, String> {
         let mut c = self.core.borrow_mut();
         // A deferred adopted resync is re-checked here, on the driver's
@@ -4554,9 +4558,23 @@ mod tests {
         }
 
         // Everything else is as permissive as it gets: no completeness
-        // handle, an empty ledger, a target that asks for a port.
+        // handle, a one-route table with nothing in flight, a target that
+        // asks for a port. One route rather than none, because an empty
+        // table is itself a refusal now — this test is about the backlog.
+        let mut eng = engine();
+        {
+            let mut map = crate::sink::NexthopMap::new(vec!["eth4".into()]);
+            let nh = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+            map.set_device(nh, "eth4");
+            let p = IpPrefix::V4 {
+                addr: [203, 0, 113, 0],
+                prefix_len: 24,
+            };
+            eng.ledger_mut().classify_upsert(p, &[nh], &map);
+            eng.ledger_mut().commit_installed(p);
+        }
         let rt = Runtime::new(
-            engine(),
+            eng,
             Box::new(Backlogged(std::cell::Cell::new(4_096))),
             Box::new(LedgerSteering {
                 configured: 1,

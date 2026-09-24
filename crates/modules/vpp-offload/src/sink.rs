@@ -179,11 +179,20 @@ impl SinkCounts {
     /// steer) it has drained to zero by the time steering is
     /// considered.
     ///
+    /// And an EMPTY table: diverting traffic into a FIB with no routes
+    /// drops every packet of it, while the eBPF tier would have passed
+    /// the same traffic to the kernel. Verify already refused one
+    /// (`sampled == 0`), but the lever and the retry read these counts,
+    /// not a verdict — so without this a retry could steer straight back
+    /// into the table whose emptiness just took steering down (see
+    /// [`crate::supervisor::Event::TableEmptied`]).
+    ///
     /// This deliberately governs only **first-attach**. Once traffic is
     /// steered, a single later withheld route must not tear steering
-    /// down — unsteering a mostly-correct VPP is worse than the gap.
+    /// down — unsteering a mostly-correct VPP is worse than the gap. An
+    /// empty one is not mostly-correct, and has its own event.
     pub fn blocks_first_steer(&self) -> bool {
-        self.unresolvable > 0 || self.withheld > 0 || self.installing > 0
+        self.unresolvable > 0 || self.withheld > 0 || self.installing > 0 || self.installed == 0
     }
 
     /// Health signal. Coincides with [`Self::blocks_first_steer`] on the
@@ -1019,6 +1028,24 @@ mod tests {
 
         install(&mut led, v4(10, 2, 0, 0, 16), &[nh(192, 0, 2, 9)], &map);
         assert!(led.counts().blocks_first_steer());
+    }
+
+    /// An empty table blocks a first steer: every diverted packet would
+    /// be dropped in VPP. And a table that has drained back to empty
+    /// blocks again — the retry after `TableEmptied` reads this.
+    #[test]
+    fn an_empty_table_blocks_first_steer() {
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(10));
+        assert!(led.counts().blocks_first_steer(), "nothing installed");
+
+        let p = v4(10, 0, 0, 0, 8);
+        install(&mut led, p, &[nh(192, 0, 2, 1)], &map);
+        assert!(!led.counts().blocks_first_steer());
+
+        led.forget(p);
+        assert_eq!(led.counts().installed, 0);
+        assert!(led.counts().blocks_first_steer(), "drained back to empty");
     }
 
     #[test]
