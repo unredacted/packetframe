@@ -1532,6 +1532,38 @@ build, the remedy is the full sequence:
 systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
 ```
 
+### VPP is gone after `systemctl stop`, but its steering rules are not
+
+On builds whose unit has `KillMode=mixed`, every stop kills VPP. Look
+for this in the journal:
+
+```
+packetframe: vpp-offload supervision dropped without stop(); VPP is left running and adoptable
+systemd: packetframe.service: Killing process <pid> (vpp_main) with signal SIGKILL.
+```
+
+VPP runs in the unit's cgroup, and `mixed` makes systemd SIGKILL
+whatever is left there once the daemon exits, so preserve-on-exit never
+worked under systemd. Anything steered at that moment keeps its MCAM
+rules while the VF behind them is dead, so that traffic is dropped
+until `packetframe detach --all` removes the rules. After a crash,
+systemd's start limit gives up and nothing removes them. Check with:
+
+```bash
+grep KillMode /lib/systemd/system/packetframe.service
+```
+
+The unit now ships `KillMode=process`, so VPP outlives the daemon as
+designed. The documented teardown (`systemctl stop packetframe &&
+packetframe detach --all`) removes steering before it terminates VPP,
+so it no longer opens a window where traffic goes nowhere. After
+installing a new deb, run `systemctl daemon-reload`, or the old mode
+stays in effect.
+
+The unit also sets `LogsDirectory=packetframe`. VPP logs to
+`/var/log/packetframe/vpp.log` and does not create the directory, so
+on a box without it, VPP ran with no log at all.
+
 ### The offload restarts repeatedly
 
 **Two places carry the reason; read both.** `packetframe status` holds
