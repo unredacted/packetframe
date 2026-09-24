@@ -1010,8 +1010,8 @@ impl StatusSnapshot {
                         "resync deferred: the completeness authority has not attested yet \
                          — no report has arrived, the last one aged out, the mirror is \
                          still short of it, the mirror has grown past the count the last \
-                         sample took (the checker measures both every 300 s, and a loading \
-                         DFZ moves further than that in between), or ONE sample reported a \
+                         sample took (the checker measures both once per `integrity-authority` \
+                         interval, and a loading table moves further than that in between), or ONE sample reported a \
                          count that cannot describe this mirror and no second check has \
                          confirmed it — so release is blocked for now. It releases itself \
                          once a sample agrees; the source holds {have} routes against a \
@@ -1025,9 +1025,10 @@ impl StatusSnapshot {
                         "resync deferred: the route source holds {have} routes, below the \
                          release floor of {want}; the adopted FIB keeps forwarding \
                          untouched. The completeness authority can release this once its \
-                         report agrees with the mirror — expected within one integrity \
-                         interval (300 s). If it persists well beyond that, check the \
-                         integrity checker and bird rather than the sizing"
+                         report agrees with the mirror — expected within one \
+                         `integrity-authority` interval. If it persists well beyond that, \
+                         check the integrity checker and the route daemon rather than the \
+                         sizing"
                     )
                 } else if have < want && self.authority == AuthorityPosture::DemotedByFlap {
                     format!(
