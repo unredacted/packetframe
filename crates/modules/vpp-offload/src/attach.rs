@@ -755,8 +755,8 @@ fn set_unnumbered(
 /// platform (lab rig, 2026-09-23): the first real restart over a
 /// steered VPP re-added the bridge MAC the previous daemon had added,
 /// the attach failed, and the supervisor tore down the VPP it had just
-/// adopted. So on the reuse path (`reasserting`) a refusal is logged
-/// and tolerated: the recorded index is only persisted after a complete
+/// adopted. So on the reuse path (`reasserting`) that refusal, -9 and
+/// only -9, is logged and tolerated: the recorded index is only persisted after a complete
 /// attach, so the previous daemon added it, and -9 is VPP's catch-all
 /// for a device-class failure, so it cannot distinguish "already held"
 /// from "lost and not re-addable" — the same zero-information problem
@@ -770,6 +770,12 @@ fn set_unnumbered(
 /// turns out to program secondaries into hardware after all, the
 /// symptom is w22's — traffic arriving unsteered — and the rung-0
 /// leak check in the runbook is what catches it.
+/// What VPP answered for a re-added secondary on the rig (2026-09-23):
+/// `VNET_API_ERROR_UNIMPLEMENTED`, its catch-all for a device-class
+/// failure. The ONLY refusal tolerated on the reuse path — any other
+/// code is not the observed duplicate, and stays fatal (review finding).
+const DUPLICATE_SECONDARY_RETVAL: i32 = -9;
+
 fn set_accept_macs(
     t: &mut Transport,
     p: &PortAttach,
@@ -785,7 +791,7 @@ fn set_accept_macs(
                 is_add: 1,
             },
         )?;
-        if reply.retval != 0 && reasserting {
+        if reply.retval == DUPLICATE_SECONDARY_RETVAL && reasserting {
             tracing::info!(
                 port = %p.port,
                 secondary_mac = %hex_mac(mac),
