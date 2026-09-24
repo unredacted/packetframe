@@ -236,9 +236,12 @@ pub enum ExportPolicy {
 /// it is a measurement task, not an edit.
 ///
 /// What the blacklist DOES cover is stated so an operator can reason
-/// about the gap: `route-map`, `prefix-list`, `filter-list`,
-/// `distribute-list`, `unsuppress-map` and `maximum-prefix`, in either
-/// direction, on the peer **or on a peer-group it belongs to**.
+/// about the gap: `route-map`, `prefix-list`, `filter-list` and
+/// `distribute-list` applied **outbound** (an `in` policy filters what
+/// packetframe sends FRR, not what FRR exports), plus `unsuppress-map`
+/// and `maximum-prefix-out`, on the peer **or on a peer-group it
+/// belongs to**. Plain `maximum-prefix` caps what the peer may send us
+/// and is not covered.
 ///
 /// Peer-group inheritance is not an extra: FRR keys an inherited policy
 /// by the GROUP name, and the peer's own line reads `neighbor <peer>
