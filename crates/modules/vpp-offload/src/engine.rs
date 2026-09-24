@@ -727,6 +727,13 @@ impl ConvergenceEngine {
         self.ledger.counts()
     }
 
+    /// For fixtures that need a table in a given shape without driving a
+    /// resync against a VPP.
+    #[cfg(test)]
+    pub(crate) fn ledger_mut(&mut self) -> &mut RouteLedger {
+        &mut self.ledger
+    }
+
     pub fn pending(&self) -> &PendingMap {
         &self.pending
     }
@@ -2099,8 +2106,10 @@ mod tests {
         assert!(!e.is_connected());
         // And the empty ledger must not read as a clean table: nothing
         // is installed, so nothing is verified, so steering stays
-        // blocked until a fresh resync says otherwise.
-        assert!(!e.counts().blocks_first_steer());
+        // blocked until a fresh resync says otherwise. (This asserted
+        // the opposite of its own comment until an empty table became
+        // a steer gate.)
+        assert!(e.counts().blocks_first_steer());
         assert!(e.last_verify().is_none());
     }
 
