@@ -38,8 +38,8 @@ use crate::vpp_api::generated::{
     SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
     SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
     SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
-    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    SwInterfaceSetMtu, SwInterfaceSetMtuReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
+    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -114,6 +114,13 @@ pub struct PortAttach {
     /// the first steer of a trunk port punted 8.7M frames in two
     /// minutes with every gauge green. Empty for untagged ports.
     pub vlans: Vec<u16>,
+    /// The kernel port's MTU, to set as the VF's L3 MTU. VPP applies a
+    /// parent's L3 MTU to its subifs too (`vnet_sw_interface_get_mtu`
+    /// reads the sup interface) and falls back to 9000 when none was
+    /// set — so without this, a jumbo frame arriving on a trunk left a
+    /// 1500-byte transit port oversized instead of drawing the ICMP
+    /// frag-needed PMTUD depends on. `None` leaves VPP's default.
+    pub mtu: Option<u32>,
 }
 
 /// A port VPP has accepted, with the index FIB paths must reference.
@@ -316,6 +323,7 @@ pub fn attach_ports(
                 // udapi provisioning can flap interface state under us,
                 // and this is the reconcile point.
                 set_admin_up(t, p, idx)?;
+                set_mtu(t, p, idx)?;
                 // Re-asserted on the reuse path too, for the same
                 // reason admin-up is: a controller deploy or a udapi
                 // provisioning cycle can reset interface state under a
@@ -371,6 +379,7 @@ pub fn attach_ports(
         let dev_index = attach_device(t, p)?;
         let sw_if_index = create_port_if(t, p, dev_index)?;
         set_admin_up(t, p, sw_if_index)?;
+        set_mtu(t, p, sw_if_index)?;
         // Order matters and is not arbitrary: MAC before unnumbered,
         // both before the port is announced as attached. A port handed
         // to the sink before it can forward is a port the FIB will
@@ -957,6 +966,30 @@ fn set_promisc_on(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result
     Ok(())
 }
 
+/// Mirror the kernel port's MTU onto the VF as its L3 MTU. The
+/// per-protocol slots stay 0 so IP4/IP6/MPLS inherit it. Idempotent —
+/// VPP compares before changing — so it is re-asserted on reuse like the
+/// MAC and admin state.
+fn set_mtu(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
+    let Some(mtu) = p.mtu else {
+        return Ok(());
+    };
+    let reply = t.request::<SwInterfaceSetMtu, SwInterfaceSetMtuReply>(SwInterfaceSetMtu {
+        context: 0,
+        sw_if_index,
+        mtu: [mtu, 0, 0, 0],
+    })?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_mtu",
+            port: p.port.clone(),
+            retval: reply.retval,
+            detail: format!("mtu {mtu}"),
+        });
+    }
+    Ok(())
+}
+
 fn set_admin_up(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
     let reply =
         t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
@@ -990,6 +1023,7 @@ mod tests {
             num_rx_queues: 1,
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
+            mtu: None,
             vlans: vec![],
         };
         assert_eq!(format!("pci/{}", p.pci_addr), "pci/0002:07:00.1");

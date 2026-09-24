@@ -97,6 +97,11 @@ const MESSAGES: &[&str] = &[
     //   stored vote, so every future re-evaluation lands enabled.
     "sw_interface_set_promisc",
     "sw_interface_set_promisc_reply",
+    // The L3 MTU, mirrored from the kernel port so VPP's egress MTU check
+    // — and the ICMP frag-needed PMTUD depends on — uses the wire's MTU
+    // rather than VPP's 9000 fallback for an interface nobody set.
+    "sw_interface_set_mtu",
+    "sw_interface_set_mtu_reply",
     "create_loopback",
     "create_loopback_reply",
     "sw_interface_add_del_address",
