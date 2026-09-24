@@ -155,6 +155,8 @@ impl Fake {
             let mut ifaces = ifaces;
             let mut macs: std::collections::HashMap<u32, [u8; 6]> =
                 std::collections::HashMap::new();
+            let mut secondaries: std::collections::HashMap<u32, Vec<[u8; 6]>> =
+                std::collections::HashMap::new();
             let mut addrs: std::collections::HashMap<u32, Vec<Vec<u8>>> = {
                 let mut m = std::collections::HashMap::<u32, Vec<Vec<u8>>>::new();
                 for (idx, key) in addrs {
@@ -349,15 +351,32 @@ impl Fake {
                         // sw_if_index(4) mac(6) is_add(1). Read by
                         // offset — the generated request is encode-only.
                         let idx = u32::from_be_bytes([req[10], req[11], req[12], req[13]]);
-                        let mac = &req[14..20];
+                        let mut mac = [0u8; 6];
+                        mac.copy_from_slice(&req[14..20]);
                         let _ = tx.send(format!(
                             "secondary_mac idx={idx} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} add={}",
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], req[20]
                         ));
+                        // Modelled on the hardware answer, not VPP's
+                        // documentation: re-adding a secondary the
+                        // interface already holds is REFUSED, retval -9
+                        // (lab rig, 2026-09-23 — it tore down an
+                        // adopted VPP). A fake that always said 0 is how
+                        // the "idempotent" assumption shipped.
+                        let held = secondaries.entry(idx).or_default();
+                        let retval = if req[20] == 0 {
+                            held.retain(|m| *m != mac);
+                            0
+                        } else if held.contains(&mac) {
+                            -9
+                        } else {
+                            held.push(mac);
+                            0
+                        };
                         out = reply_head("sw_interface_add_del_mac_address_reply");
                         SwInterfaceAddDelMacAddressReply {
                             context: ctx,
-                            retval: 0,
+                            retval,
                         }
                         .encode(&mut out);
                     }
@@ -904,6 +923,47 @@ fn a_bridge_members_second_mac_is_added_not_substituted() {
         .position(|s| s == "sw_interface_set_mac_address");
     let add_at = seen.iter().position(|s| s.starts_with("secondary_mac"));
     assert!(set_at < add_at, "identity first, then acceptance: {seen:?}");
+}
+
+/// A takeover must survive the secondary it already has.
+///
+/// The rig's first real restart over a steered VPP (2026-09-23) died
+/// here: the reuse path re-added the bridge MAC the previous daemon had
+/// added, VPP refused the duplicate with -9, the attach failed, and the
+/// supervisor tore down the VPP it had just adopted. Same connection,
+/// so the fake still holds the first pass's secondary when the second
+/// pass re-adds it.
+#[test]
+fn adoption_survives_the_secondary_mac_it_already_holds() {
+    let fake = Fake::start_with(
+        "secadopt",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![(7, "octeon0/0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let mut p = ports();
+    p[0].accept_macs = vec![[0x02, 0, 0, 0, 0, 0x0b]];
+    attach_ports(&mut t, &p, &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("first attach");
+
+    let known = vec![("eth3".to_string(), 7u32)];
+    let got = attach_ports(&mut t, &p, &known, AttachMode::Adopted, TEST_LOOP_IDX)
+        .expect("a duplicate secondary must not fail the takeover");
+    assert_eq!(got[0].sw_if_index, 7);
+
+    let adds = fake
+        .observed()
+        .iter()
+        .filter(|s| s.starts_with("secondary_mac idx=7 mac=02:00:00:00:00:0b add=1"))
+        .count();
+    assert_eq!(
+        adds, 2,
+        "still re-asserted on reuse, so a lost one comes back"
+    );
 }
 
 /// A plain L3 port asks for no secondary at all — one fewer thing to

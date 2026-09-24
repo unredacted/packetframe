@@ -311,7 +311,7 @@ pub fn attach_ports(
                 // that silently reverted would punt every steered frame
                 // while every counter stayed healthy.
                 set_mac(t, p, idx, p.pf_mac)?;
-                set_accept_macs(t, p, idx)?;
+                set_accept_macs(t, p, idx, true)?;
                 set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
                 let subifs = ensure_vlan_subifs(t, p, idx, loop_idx, &existing)?;
@@ -365,7 +365,7 @@ pub fn attach_ports(
         // resolve routes onto while every packet dies at
         // `ip4-not-enabled`.
         set_mac(t, p, sw_if_index, p.pf_mac)?;
-        set_accept_macs(t, p, sw_if_index)?;
+        set_accept_macs(t, p, sw_if_index, false)?;
         set_promisc_on(t, p, sw_if_index)?;
         set_unnumbered(t, p, sw_if_index, loop_idx)?;
         // A freshly created parent cannot have subifs, so the dump
@@ -750,16 +750,38 @@ fn set_unnumbered(
 /// exactly the check that punted w21's classified frames, and adds
 /// nothing to what the NIC delivers.
 ///
-/// Idempotent by VPP's own semantics: adding an address the interface
-/// already holds is a no-op, which is what makes this safe on the
-/// adoption path.
+/// **Not idempotent, whatever the API reads like.** Re-adding an address
+/// the interface already holds is refused with retval -9 on this
+/// platform (lab rig, 2026-09-23): the first real restart over a
+/// steered VPP re-added the bridge MAC the previous daemon had added,
+/// the attach failed, and the supervisor tore down the VPP it had just
+/// adopted. So on the reuse path (`reasserting`) that refusal, -9 and
+/// only -9, is logged and tolerated: the recorded index is only persisted after a complete
+/// attach, so the previous daemon added it, and -9 is VPP's catch-all
+/// for a device-class failure, so it cannot distinguish "already held"
+/// from "lost and not re-addable" — the same zero-information problem
+/// `adopt_loopback`'s address re-assert had. The add is still ATTEMPTED
+/// there, so a secondary a provisioning cycle really removed comes
+/// back. On a fresh interface a refusal stays fatal: nothing can
+/// already hold it.
 ///
 /// **Unverified by readback**, unlike the primary: no whitelisted dump
 /// reports an interface's secondary addresses. If the octeon driver
 /// turns out to program secondaries into hardware after all, the
 /// symptom is w22's — traffic arriving unsteered — and the rung-0
 /// leak check in the runbook is what catches it.
-fn set_accept_macs(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
+/// What VPP answered for a re-added secondary on the rig (2026-09-23):
+/// `VNET_API_ERROR_UNIMPLEMENTED`, its catch-all for a device-class
+/// failure. The ONLY refusal tolerated on the reuse path — any other
+/// code is not the observed duplicate, and stays fatal (review finding).
+const DUPLICATE_SECONDARY_RETVAL: i32 = -9;
+
+fn set_accept_macs(
+    t: &mut Transport,
+    p: &PortAttach,
+    sw_if_index: u32,
+    reasserting: bool,
+) -> Result<(), AttachError> {
     for mac in &p.accept_macs {
         let reply = t.request::<SwInterfaceAddDelMacAddress, SwInterfaceAddDelMacAddressReply>(
             SwInterfaceAddDelMacAddress {
@@ -769,6 +791,17 @@ fn set_accept_macs(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Resul
                 is_add: 1,
             },
         )?;
+        if reply.retval == DUPLICATE_SECONDARY_RETVAL && reasserting {
+            tracing::info!(
+                port = %p.port,
+                secondary_mac = %hex_mac(mac),
+                retval = reply.retval,
+                "VPP refused re-adding a secondary MAC on a reused interface — expected on a \
+                 takeover, where the previous daemon already added it; if steered frames to \
+                 this address start punting, `packetframe detach --all` and re-attach"
+            );
+            continue;
+        }
         if reply.retval != 0 {
             return Err(AttachError::Refused {
                 step: "sw_interface_add_del_mac_address",
