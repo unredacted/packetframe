@@ -225,10 +225,13 @@ and they report as `Ineligible` rather than as drift:
 | Something narrows what FRR exports to packetframe — on the peer **or on a peer-group it belongs to** | At a 1% drift tolerance a filter dropping 5,000 prefixes from a million still reads `Converged` |
 
 The export-policy check is a **blacklist**, and its scope is worth
-knowing: `route-map`, `prefix-list`, `filter-list`, `distribute-list`,
-`unsuppress-map` and `maximum-prefix`, in either direction, on the peer
-or on a peer-group it is a member of. A narrowing directive outside
-that set would not be caught. Widening it means enumerating FRR's whole
+knowing: `route-map`, `prefix-list`, `filter-list` and `distribute-list`
+applied **outbound**, plus `unsuppress-map` and `maximum-prefix-out`, on
+the peer or on a peer-group it is a member of. Inbound policies and
+plain `maximum-prefix` govern what packetframe sends FRR — nothing, on
+a passive listener — and are deliberately ignored, since refusing on
+them disqualified a valid config over an inbound route-map. A narrowing
+directive outside that set would not be caught. Widening it means enumerating FRR's whole
 per-neighbor grammar — every directive missing from such a list refuses
 a valid config — so it is a measurement task rather than an edit.
 

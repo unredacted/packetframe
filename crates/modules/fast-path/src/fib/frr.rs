@@ -236,9 +236,12 @@ pub enum ExportPolicy {
 /// it is a measurement task, not an edit.
 ///
 /// What the blacklist DOES cover is stated so an operator can reason
-/// about the gap: `route-map`, `prefix-list`, `filter-list`,
-/// `distribute-list`, `unsuppress-map` and `maximum-prefix`, in either
-/// direction, on the peer **or on a peer-group it belongs to**.
+/// about the gap: `route-map`, `prefix-list`, `filter-list` and
+/// `distribute-list` applied **outbound** (an `in` policy filters what
+/// packetframe sends FRR, not what FRR exports), plus `unsuppress-map`
+/// and `maximum-prefix-out`, on the peer **or on a peer-group it
+/// belongs to**. Plain `maximum-prefix` caps what the peer may send us
+/// and is not covered.
 ///
 /// Peer-group inheritance is not an extra: FRR keys an inherited policy
 /// by the GROUP name, and the peer's own line reads `neighbor <peer>
@@ -253,14 +256,6 @@ pub enum ExportPolicy {
 ///
 /// [D2b]: the discovery gate in the VPP readiness plan
 pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
-    const NARROWING: [&str; 6] = [
-        "route-map",
-        "prefix-list",
-        "filter-list",
-        "distribute-list",
-        "unsuppress-map",
-        "maximum-prefix",
-    ];
     // The peer's own name, plus every peer-group it is a member of.
     // Resolved first, in its own pass, because a `peer-group` line can
     // appear after the group's policy in the rendered config and a
@@ -283,27 +278,53 @@ pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
             let Some(tail) = line.strip_prefix(&needle) else {
                 continue;
             };
-            // Direction matters only for reporting: an INBOUND filter on
-            // this peer is equally disqualifying, because the peer is a
-            // consumer and an inbound filter there means the operator is
-            // running a shape this authority was not designed for.
-            for kw in NARROWING {
-                if tail.starts_with(kw) {
-                    let via = if name == peer {
-                        String::new()
-                    } else {
-                        format!(" (inherited by {peer} from peer-group {name})")
-                    };
-                    return ExportPolicy::Filtered {
-                        why: format!(
-                            "`neighbor {name} {tail}` narrows what this peer receives{via}"
-                        ),
-                    };
-                }
+            if narrows_export(tail) {
+                let via = if name == peer {
+                    String::new()
+                } else {
+                    format!(" (inherited by {peer} from peer-group {name})")
+                };
+                return ExportPolicy::Filtered {
+                    why: format!("`neighbor {name} {tail}` narrows what this peer receives{via}"),
+                };
             }
         }
     }
     ExportPolicy::Unfiltered
+}
+
+/// Whether one `neighbor <x> …` tail narrows what FRR SENDS that peer.
+///
+/// **Outbound only.** An inbound filter on the packetframe peer governs
+/// what packetframe advertises to FRR, which is nothing — it cannot
+/// change the table packetframe receives, so it is no evidence against
+/// the mirror. The first version disqualified inbound filters too, on
+/// the theory that any policy there was an unsupported shape; the
+/// primary's first `frr` attach (2026-09-24) showed the opposite: a
+/// `route-map PACKETFRAME-IN in` hardening the session (accept nothing
+/// from packetframe) is the sensible production shape, and the rule
+/// DISQUALIFIED a converged mirror over it — while its own message
+/// claimed the line narrowed "what this peer receives", which an `in`
+/// filter never does.
+///
+/// Direction is the LAST word of a `route-map`/`prefix-list`/
+/// `filter-list`/`distribute-list` line; anything other than a literal
+/// `in` counts as narrowing, so an unrecognised form errs toward
+/// refusing. `unsuppress-map` and `maximum-prefix-out` only ever shape
+/// the outbound table. Plain `maximum-prefix` limits what the peer
+/// sends US, so it is inbound and ignored.
+fn narrows_export(tail: &str) -> bool {
+    let mut words = tail.split_whitespace();
+    let Some(kw) = words.next() else {
+        return false;
+    };
+    match kw {
+        "route-map" | "prefix-list" | "filter-list" | "distribute-list" => {
+            tail.split_whitespace().last() != Some("in")
+        }
+        "unsuppress-map" | "maximum-prefix-out" => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -827,6 +848,66 @@ router bgp 65000
             parse_export_policy(cfg, "10.255.0.2"),
             ExportPolicy::Filtered { .. }
         ));
+    }
+
+    /// The primary's shape (2026-09-24): an inbound route-map hardening
+    /// the packetframe session. It governs what packetframe advertises
+    /// to FRR — nothing — so it must not disqualify the mirror.
+    #[test]
+    fn an_inbound_filter_on_the_peer_is_not_export_policy() {
+        let cfg = "\
+router bgp 65000
+ neighbor 10.255.0.2 remote-as 65000
+ address-family ipv4 unicast
+  neighbor 10.255.0.2 route-map PACKETFRAME-IN in
+  neighbor 10.255.0.2 prefix-list NOTHING in
+  neighbor 10.255.0.2 maximum-prefix 10
+ exit-address-family
+";
+        assert_eq!(
+            parse_export_policy(cfg, "10.255.0.2"),
+            ExportPolicy::Unfiltered
+        );
+    }
+
+    /// Outbound still disqualifies, beside an inbound one, and via a
+    /// peer-group; so do the outbound-only knobs.
+    #[test]
+    fn outbound_policy_still_disqualifies_beside_an_inbound_one() {
+        let cfg = "\
+  neighbor 10.255.0.2 route-map PACKETFRAME-IN in
+  neighbor 10.255.0.2 route-map TRIM out
+";
+        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "10.255.0.2") else {
+            panic!("an outbound route-map must disqualify");
+        };
+        assert!(why.contains("TRIM out"), "names the outbound line: {why}");
+
+        for tail in [
+            "maximum-prefix-out 100",
+            "unsuppress-map SOME",
+            "distribute-list 10 out",
+            "filter-list AS out",
+        ] {
+            let cfg = format!("  neighbor 10.255.0.2 {tail}\n");
+            assert!(
+                matches!(
+                    parse_export_policy(&cfg, "10.255.0.2"),
+                    ExportPolicy::Filtered { .. }
+                ),
+                "{tail}"
+            );
+        }
+
+        let cfg = "\
+ neighbor PF route-map PF-IN in
+ neighbor 10.255.0.2 peer-group PF
+";
+        assert_eq!(
+            parse_export_policy(cfg, "10.255.0.2"),
+            ExportPolicy::Unfiltered,
+            "an inherited inbound filter is no more export policy than the peer's own"
+        );
     }
 
     /// Another peer's filter says nothing about ours.
