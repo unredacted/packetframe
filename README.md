@@ -18,7 +18,7 @@ One daemon, one config file, and a set of modules. There are three parts.
 
 **The route side.** In custom-FIB mode PacketFrame reads BGP itself — iBGP from `bird` today, or BMP (RFC 7854/9069) — and builds an LPM trie from it, resolving next-hop MACs over netlink. The kernel route table is not involved, so daemons that read it are unaffected and there is no race over BGP attribute updates.
 
-**A second way to forward.** The `vpp-offload` module can hand allowlisted traffic to a VPP process on an SR-IOV virtual function instead, using the same routes. It is written but has not run on real hardware yet; see [below](#second-forwarding-path-vpp-offload).
+**A second way to forward.** The `vpp-offload` module can hand allowlisted traffic to a VPP process on an SR-IOV virtual function instead, using the same routes. It has forwarded production traffic on one steered port but is not deployed today; see [below](#second-forwarding-path-vpp-offload).
 
 Other things the fast path can do:
 
@@ -85,8 +85,9 @@ PacketFrame does not replace a routing daemon. The intended pairing is `bird` (B
 | `probe` module (diagnostic XDP) | Production |
 | tc-ingress datapath (`attach <iface> tc`, custom-fib only) | Built and measured slower: +70% CPU per packet on the reference hardware. Kept for reference, not recommended; see [docs/runbooks/tc-datapath.md](docs/runbooks/tc-datapath.md) |
 | Per-module health + metrics, read by `packetframe status` and the Prometheus textfile | Production (v0.2.7+) |
+| `guard` module (tc-egress frame policer for IX-facing interfaces) | Code-complete, hardware ladder pending; see [docs/runbooks/guard.md](docs/runbooks/guard.md) |
 | `neigh-snoop` module (passive ARP/ND neighbour snooper for IX bridges, NUD_STALE seeding, persisted table, FRR next-hop gate feed) | Code-complete, hardware ladder pending; see [docs/runbooks/neigh-snoop.md](docs/runbooks/neigh-snoop.md) |
-| `vpp-offload` module (VPP-on-VF forwarding vector) | **Code-complete, hardware-unproven** — never run against a real VPP; see [docs/runbooks/vpp-offload.md](docs/runbooks/vpp-offload.md) |
+| `vpp-offload` module (VPP-on-VF forwarding vector) | Forwarded production traffic at rung 1 (one steered port); not currently deployed; see [docs/runbooks/vpp-offload.md](docs/runbooks/vpp-offload.md) |
 | `ddos` module (XDP-time SYN-flood + amplification filter) | Future; sketched in SPEC §5.2 (priority 0–999, security/admission) |
 | `sampler` module (per-flow ringbuf observability) | Future; sketched in SPEC §5.3 (priority 2000–2999, observation) |
 | `randomizer` module (TC egress jitter for NoiseNet anti-correlation) | Future; sketched in SPEC §5.1 (priority ~3000, egress) |
@@ -189,7 +190,7 @@ sudo packetframe reconfigure                # synchronous; exits non-zero on par
 sudo systemctl reload packetframe           # equivalent under systemd; both end up sending SIGHUP
 ```
 
-What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp`, `log-level`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix`/`local-prefix6` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
+What's hot-reloadable: `allow-prefix*`, `block-prefix`, `dry-run`, `forwarding-mode` (between `compare` and `custom-fib` only; to or from `kernel-fib` needs a restart), `mss-clamp`, `log-level`, VLAN-subif resolution, and the redirect devmap. Attach-set changes (interfaces added/removed), `route-source` config, `circuit-breaker` thresholds, and `local-prefix`/`local-prefix6` still require a full restart. See [docs/runbooks/reconfigure.md](docs/runbooks/reconfigure.md).
 
 ### 6. Tear down
 
@@ -246,10 +247,11 @@ whose `SOURCE.json` names the release they came from). For UniFi
 gateways, unmodified upstream VPP is built and published by
 [unredacted/vpp-unifi](https://github.com/unredacted/vpp-unifi).
 
-The code is finished but has never run against a real VPP process or a
-real NIC. Read
-[`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md) before
-turning it on anywhere carrying traffic.
+It has forwarded production traffic with one port steered, but is not
+deployed today. Read
+[`docs/runbooks/vpp-offload.md`](docs/runbooks/vpp-offload.md), which
+records what has and has not been proven on hardware, before turning it
+on anywhere carrying traffic.
 
 ## Attach modes
 
@@ -321,7 +323,7 @@ Quick directive index:
 - `hugepages <n>`, `vpp-binary <path>`
 - `require-table-complete {on|off}`: wait for the routing table to finish loading before steering (default on)
 
-`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, forwarding-mode bits, `log-level`, and vpp-offload's `steer` switches. (`log-level` is the daemon's tracing filter, and `RUST_LOG` in its environment overrides it for the life of the process.) Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, editing `local-prefix`/`local-prefix6`, or changing any vpp-offload directive other than `steer` requires a restart.
+`SIGHUP` (or `packetframe reconfigure` / `systemctl reload packetframe`) applies delta-only changes to allowlists, block-prefix, VLAN-resolve, devmap, mss-clamp, dry-run, `forwarding-mode` between `compare` and `custom-fib`, `log-level`, and vpp-offload's `steer` switches. (`log-level` is the daemon's tracing filter, and `RUST_LOG` in its environment overrides it for the life of the process.) Adding or removing an `attach`, changing `route-source`, mutating `circuit-breaker` thresholds, editing `local-prefix`/`local-prefix6`, or changing any vpp-offload directive other than `steer` requires a restart.
 
 ## Operator tools
 
@@ -338,12 +340,15 @@ Counters export as a Prometheus textfile every 15 s when `metrics-textfile` is s
 ## Documentation
 
 - [`conf/example.conf`](conf/example.conf): annotated reference config
+- Module READMEs: [`fast-path`](crates/modules/fast-path/README.md), [`guard`](crates/modules/guard/README.md), [`neigh-snoop`](crates/modules/neigh-snoop/README.md), [`probe`](crates/modules/probe/README.md), [`vpp-offload`](crates/modules/vpp-offload/README.md)
 
 Runbooks, in `docs/runbooks/`:
 
 | File | Covers |
 |---|---|
 | [`custom-fib.md`](docs/runbooks/custom-fib.md) | Custom-FIB mode: cutover, rollback, integrity checks, triage by symptom |
+| [`guard.md`](docs/runbooks/guard.md) | The guard frame policer: monitor→enforce ladder, counters, triage |
+| [`neigh-snoop.md`](docs/runbooks/neigh-snoop.md) | The neighbour snooper: rollout, counters, FRR next-hop gate, triage |
 | [`reconfigure.md`](docs/runbooks/reconfigure.md) | What SIGHUP applies and what needs a restart |
 | [`mss-clamp.md`](docs/runbooks/mss-clamp.md) | MSS clamping and the iptables-bypass gap it closes |
 | [`tail-call-architecture.md`](docs/runbooks/tail-call-architecture.md) | The two-stage BPF datapath and why it is split |
@@ -374,9 +379,12 @@ packetframe/
 ├── crates/
 │   ├── common/                       # config parser, Module trait, capability probes
 │   ├── cli/                          # the `packetframe` binary
-│   ├── modules/
+│   ├── modules/                      # each module has its own README.md
 │   │   ├── fast-path/                # main forwarding module
 │   │   │   └── bpf/                  # XDP program (nightly toolchain)
+│   │   ├── guard/                    # tc-egress frame policer
+│   │   │   └── bpf/                  # tc classifier
+│   │   ├── neigh-snoop/              # passive ARP/ND snooper (userspace only)
 │   │   ├── probe/                    # diagnostic XDP probe
 │   │   │   └── bpf/                  # probe BPF program
 │   │   └── vpp-offload/              # second forwarding path (supervises VPP)
