@@ -169,6 +169,44 @@ pub fn ensure(ctl: &dyn CapacityControl, iface: &str, want: u16) -> Outcome {
     }
 }
 
+impl Outcome {
+    /// The size to put back if attach fails after this outcome, when the
+    /// table moved: the pool entries a refused attach would otherwise
+    /// hold until reboot, starving the ports and VFs that share it.
+    pub fn changed_from(&self) -> Option<u32> {
+        match self {
+            Self::Raised { from, .. } => Some(*from),
+            Self::Short { from, now, .. } if now != from => Some(*from),
+            _ => None,
+        }
+    }
+}
+
+/// Undo [`ensure`] after a failed attach: return `iface` to `from`.
+///
+/// Skipped, with the reason, on a port that now holds rules — the
+/// driver refuses the resize, and rules there mean something other than
+/// this attach owns the table.
+pub fn release(ctl: &dyn CapacityControl, iface: &str, from: u32) -> Result<(), String> {
+    let table = ctl.table(iface)?;
+    if table.size == from {
+        return Ok(());
+    }
+    if !table.occupied.is_empty() {
+        return Err(format!(
+            "{} ntuple rule(s) installed; left at {} rather than returned to {from}",
+            table.occupied.len(),
+            table.size
+        ));
+    }
+    let from16 = u16::try_from(from).map_err(|_| format!("{from} is not a table size"))?;
+    ctl.set(iface, from16)?;
+    match ctl.table(iface)?.size {
+        now if now == from => Ok(()),
+        now => Err(format!("asked to return to {from}, the table is {now}")),
+    }
+}
+
 /// Best-effort return to `size`; the size actually read back, if any.
 fn restore(ctl: &dyn CapacityControl, iface: &str, size: u32) -> Option<u32> {
     let size16 = u16::try_from(size).ok()?;
@@ -761,6 +799,37 @@ mod tests {
             matches!(&got, Outcome::Failed { why } if why.contains("mailbox timeout") && why.contains("32")),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_attach_hands_the_entries_back() {
+        let port = FakePort::new(16);
+        let got = ensure(&port, "eth4", 64);
+        assert_eq!(got.changed_from(), Some(16));
+        release(&port, "eth4", 16).expect("returned");
+        assert_eq!(*port.size.borrow(), 16);
+        assert_eq!(*port.writes.borrow(), vec![64, 16]);
+
+        // Nothing moved, nothing to hand back.
+        assert_eq!(Outcome::Enough { size: 64 }.changed_from(), None);
+        assert_eq!(
+            Outcome::Short {
+                from: 16,
+                want: 64,
+                now: 16
+            }
+            .changed_from(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_table_holding_rules_is_not_handed_back() {
+        let mut port = FakePort::new(64);
+        port.rules = 3;
+        let e = release(&port, "eth4", 16).expect_err("rules pin the table");
+        assert!(e.contains("3 ntuple rule(s)"), "{e}");
+        assert!(port.writes.borrow().is_empty());
     }
 
     #[test]

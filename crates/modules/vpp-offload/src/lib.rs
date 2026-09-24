@@ -581,20 +581,54 @@ pub struct SteeringTarget {
 /// — and a config that fits the default table attaches exactly as it
 /// did before this directive existed. `cores 0` ports are skipped:
 /// config refuses `steer on` for them, so no rule ever lands there.
-fn apply_steer_capacity(cfg: &VppOffloadConfig, ctl: &dyn capacity::CapacityControl) {
+///
+/// `steer on` ports are served first. The pool is shared and a short
+/// allocation is an ordinary driver outcome, so whatever is left should
+/// go to the ports whose plan attach is about to check, not to a staging
+/// port that happens to come earlier in the file.
+///
+/// Returns `(port, original size)` for every table that moved, for
+/// [`release_steer_capacity`] should attach then refuse.
+fn apply_steer_capacity(
+    cfg: &VppOffloadConfig,
+    ctl: &dyn capacity::CapacityControl,
+) -> Vec<(String, u32)> {
     let Some(want) = cfg.steer_capacity else {
-        return;
+        return Vec::new();
     };
-    for (iface, cores, _, _, _) in &cfg.ports {
-        if *cores == 0 {
-            continue;
-        }
+    let mut order: Vec<&PortLine> = cfg.ports.iter().filter(|p| p.1 > 0).collect();
+    order.sort_by_key(|p| !p.2); // stable: `steer on` first, config order within each
+    let mut moved = Vec::new();
+    for (iface, _, _, _, _) in order {
         let outcome = capacity::ensure(ctl, iface, want);
         let line = outcome.describe(iface, want);
         if outcome.met() {
             tracing::info!(port = %iface, "steer-capacity: {line}");
         } else {
             tracing::warn!(port = %iface, "steer-capacity: {line}");
+        }
+        if let Some(from) = outcome.changed_from() {
+            moved.push((iface.clone(), from));
+        }
+    }
+    moved
+}
+
+/// Return every table [`apply_steer_capacity`] moved to its original
+/// size, after an attach that refused. Best effort: a port that will not
+/// go back is logged and the reboot that resets the driver is the
+/// backstop.
+fn release_steer_capacity(moved: &[(String, u32)], ctl: &dyn capacity::CapacityControl) {
+    for (iface, from) in moved {
+        match capacity::release(ctl, iface, *from) {
+            Ok(()) => tracing::info!(
+                port = %iface,
+                "steer-capacity: attach refused; ntuple table returned to {from}"
+            ),
+            Err(e) => tracing::warn!(
+                port = %iface,
+                "steer-capacity: attach refused and the table was not returned to {from}: {e}"
+            ),
         }
     }
 }
@@ -1073,13 +1107,6 @@ impl Module for VppOffloadModule {
         // which slots exist is an environment read like every other one
         // this function performs before delegating.
         let allowlist = self.allowlist.get();
-        // Size the rule tables BEFORE the budget is read, so the plan is
-        // drawn from the table the NIC actually holds afterwards.
-        apply_steer_capacity(&self.cfg, &capacity::Live);
-        let budget = match steer::McamBudget::for_ifaces(ifaces_to_query(&self.cfg, &allowlist)) {
-            Ok(b) => b,
-            Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
-        };
         // The loader resolves `local-route` against fast-path's
         // `local-prefix` and hands the result to `set_local_routes`.
         // A section carrying lines the module was never handed means
@@ -1098,18 +1125,30 @@ impl Module for VppOffloadModule {
                 ),
             ));
         }
-        let attached = match bringup::bring_up(
-            &self.cfg,
-            &paths,
-            source,
-            &allowlist,
-            self.completeness.clone(),
-            self.feed_session.clone(),
-            &budget,
-            &self.local_routes,
-        ) {
+        // Size the rule tables BEFORE the budget is read, so the plan is
+        // drawn from the table the NIC actually holds afterwards — and
+        // hand the entries back if attach then refuses, since the shared
+        // pool would otherwise stay drained until reboot.
+        let resized = apply_steer_capacity(&self.cfg, &capacity::Live);
+        let brought_up = steer::McamBudget::for_ifaces(ifaces_to_query(&self.cfg, &allowlist))
+            .and_then(|budget| {
+                bringup::bring_up(
+                    &self.cfg,
+                    &paths,
+                    source,
+                    &allowlist,
+                    self.completeness.clone(),
+                    self.feed_session.clone(),
+                    &budget,
+                    &self.local_routes,
+                )
+            });
+        let attached = match brought_up {
             Ok(a) => a,
-            Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
+            Err(e) => {
+                release_steer_capacity(&resized, &capacity::Live);
+                return Err(ModuleError::other(MODULE_NAME, e));
+            }
         };
         // The derived worker placement, logged because it is an operator
         // input: on the reference NIC every CPU carries an rx-queue IRQ
@@ -1450,22 +1489,39 @@ mod tests {
         }
     }
 
-    /// Records which ports `apply_steer_capacity` asked about.
-    struct AskedPorts(std::cell::RefCell<Vec<String>>);
+    /// Records which ports `apply_steer_capacity` asked about, and what
+    /// each one was set to.
+    struct AskedPorts(
+        std::cell::RefCell<Vec<String>>,
+        std::cell::RefCell<std::collections::BTreeMap<String, u32>>,
+    );
+
+    impl AskedPorts {
+        fn new() -> Self {
+            Self(Default::default(), Default::default())
+        }
+        fn size(&self, iface: &str) -> u32 {
+            *self.1.borrow().get(iface).unwrap_or(&16)
+        }
+    }
 
     impl capacity::CapacityControl for AskedPorts {
         fn table(&self, iface: &str) -> Result<ntuple::RuleTable, String> {
-            self.0.borrow_mut().push(iface.to_string());
+            let mut asked = self.0.borrow_mut();
+            if asked.last().map(String::as_str) != Some(iface) {
+                asked.push(iface.to_string());
+            }
             Ok(ntuple::RuleTable {
-                size: 64,
+                size: self.size(iface),
                 occupied: Vec::new(),
             })
         }
-        fn adjustable(&self, _: &str) -> Result<u16, String> {
-            unreachable!("a table already at 64 is never resized")
+        fn adjustable(&self, iface: &str) -> Result<u16, String> {
+            Ok(self.size(iface) as u16)
         }
-        fn set(&self, _: &str, _: u16) -> Result<(), String> {
-            unreachable!("a table already at 64 is never resized")
+        fn set(&self, iface: &str, n: u16) -> Result<(), String> {
+            self.1.borrow_mut().insert(iface.to_string(), u32::from(n));
+            Ok(())
         }
     }
 
@@ -1475,20 +1531,36 @@ mod tests {
         // for them — so resizing their tables would spend shared pool
         // entries on rules that can never exist.
         let mut cfg = with_cores(&[1, 0, 1]);
-        let ctl = AskedPorts(Default::default());
-        apply_steer_capacity(&cfg, &ctl);
+        let ctl = AskedPorts::new();
+        assert!(apply_steer_capacity(&cfg, &ctl).is_empty());
         assert!(ctl.0.borrow().is_empty(), "no directive, no NIC reads");
 
         cfg.steer_capacity = Some(64);
+        let moved = apply_steer_capacity(&cfg, &ctl);
+        assert_eq!(
+            *ctl.0.borrow(),
+            vec!["eth0".to_string(), "eth2".to_string()]
+        );
+        assert_eq!(moved, vec![("eth0".into(), 16), ("eth2".into(), 16)]);
+
+        // A refused attach hands both back.
+        release_steer_capacity(&moved, &ctl);
+        assert_eq!((ctl.size("eth0"), ctl.size("eth2")), (16, 16));
+    }
+
+    #[test]
+    fn steer_capacity_serves_steering_ports_before_staging_ones() {
+        // A short pool must not go to a `steer off` port just because it
+        // comes first in the file.
+        let mut cfg = with_cores(&[1, 1, 1]);
+        cfg.ports[2].2 = true;
+        cfg.steer_capacity = Some(64);
+        let ctl = AskedPorts::new();
         apply_steer_capacity(&cfg, &ctl);
-        let asked = ctl.0.borrow().clone();
-        let expected: Vec<String> = cfg
-            .ports
-            .iter()
-            .filter(|p| p.1 > 0)
-            .map(|p| p.0.clone())
-            .collect();
-        assert_eq!(asked, expected);
+        assert_eq!(
+            *ctl.0.borrow(),
+            vec!["eth2".to_string(), "eth0".to_string(), "eth1".to_string()]
+        );
     }
 
     fn with_cores(cores: &[u16]) -> VppOffloadConfig {
