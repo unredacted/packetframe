@@ -208,6 +208,12 @@ pub enum ModuleDirective {
     /// Must be ≥ the minimum derived from `expected-routes`; the
     /// renderer errors at load otherwise.
     VppHugepages(u32),
+    /// `steer-capacity <n>` — the ntuple rule table each steerable
+    /// member port should hold, raised at attach through the driver's
+    /// `mcam_count` devlink parameter where it has one. A request, not
+    /// a promise: the table the NIC reports afterwards is the budget.
+    /// Never shrinks a table. Bounded by [`VPP_MAX_STEER_CAPACITY`].
+    VppSteerCapacity(u16),
     /// `loopback-address <ip>/<len>` — the address VPP's loopback holds,
     /// which every member port is unnumbered to.
     ///
@@ -1448,6 +1454,16 @@ mod humantime_serde_compat {
 /// adding comments and still 4 orders of magnitude smaller than the
 /// memory primitive the previous behavior exposed.
 pub const MAX_CONFIG_FILE_SIZE: u64 = 1 << 20;
+
+/// The largest `steer-capacity` accepted.
+///
+/// Also the most rule locations vpp-offload will enumerate in one
+/// table read, so the two must move together: a table larger than the
+/// enumeration buffer is refused rather than read short, and a short
+/// read makes occupied slots look free. 256 is ample against a shared
+/// classifier pool of ~1,700 free entries measured on the reference
+/// NIC (2026-09-24), and far past any exemption list worth writing.
+pub const VPP_MAX_STEER_CAPACITY: u16 = 256;
 
 /// Maximum `interface` lines a guard section may declare. Mirrors the
 /// BPF `GUARD_CFG` map's capacity
@@ -3323,6 +3339,15 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 return Err("hugepages must be >= 1".to_string());
             }
             Ok(ModuleDirective::VppHugepages(n))
+        }),
+        "steer-capacity" => parse_single_arg(line, rest, "steer-capacity", |t| {
+            let n: u16 = t.parse().map_err(|_| {
+                format!("steer-capacity must be an integer 1-{VPP_MAX_STEER_CAPACITY}")
+            })?;
+            if !(1..=VPP_MAX_STEER_CAPACITY).contains(&n) {
+                return Err(format!("steer-capacity must be 1-{VPP_MAX_STEER_CAPACITY}"));
+            }
+            Ok(ModuleDirective::VppSteerCapacity(n))
         }),
         "driver-workaround" => parse_driver_workaround(line, rest),
         "forwarding-mode" => parse_single_arg(line, rest, "forwarding-mode", |t| {
@@ -5812,6 +5837,24 @@ module vpp-offload
         ));
         assert!(Config::parse("module vpp-offload\n  expected-routes 0\n").is_err());
         assert!(Config::parse("module vpp-offload\n  hugepages 0\n").is_err());
+    }
+
+    #[test]
+    fn steer_capacity_parses_within_its_bound() {
+        let c = Config::parse("module vpp-offload\n  steer-capacity 64\n").unwrap();
+        assert!(matches!(
+            c.modules[0].directives[0],
+            ModuleDirective::VppSteerCapacity(64)
+        ));
+        let max = format!("module vpp-offload\n  steer-capacity {VPP_MAX_STEER_CAPACITY}\n");
+        assert!(Config::parse(&max).is_ok());
+        for bad in ["0", "257", "-1", "lots", "64 128"] {
+            let s = format!("module vpp-offload\n  steer-capacity {bad}\n");
+            assert!(
+                Config::parse(&s).is_err(),
+                "`steer-capacity {bad}` must be refused"
+            );
+        }
     }
 
     #[test]

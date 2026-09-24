@@ -1391,6 +1391,7 @@ mod completeness_gate_tests {
             require_table_complete: require,
             steer_exempts: vec![],
             local_routes: vec![],
+            steer_capacity: None,
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

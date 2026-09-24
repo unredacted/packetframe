@@ -348,11 +348,11 @@ mod sys {
 
     /// The most locations one query will enumerate.
     ///
-    /// Four times the measured table, so a NIC with a larger one is
-    /// still describable; a driver reporting more rules than this fails
-    /// loudly rather than returning a short list, which would make
-    /// occupied slots look free.
-    const MAX_ENUMERATED_RULES: usize = 64;
+    /// The largest table `steer-capacity` can ask for, so any table this
+    /// module sized is describable; a driver reporting more rules than
+    /// this fails loudly rather than returning a short list, which would
+    /// make occupied slots look free.
+    const MAX_ENUMERATED_RULES: usize = packetframe_common::config::VPP_MAX_STEER_CAPACITY as usize;
 
     /// `struct ethtool_rxnfc` **with its trailing `rule_locs[]`**.
     ///

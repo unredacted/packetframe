@@ -191,9 +191,19 @@ impl McamBudget {
     /// insert time would leave a partially steered port, which is the
     /// one outcome [`RuleSet::plan`] exists to prevent.
     pub fn for_ifaces<'a>(ifaces: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        Self::for_ifaces_with(ifaces, crate::ntuple::rule_table)
+    }
+
+    /// [`Self::for_ifaces`] over tables from `read` — the feasibility
+    /// probe's seam, which plans against the table `steer-capacity`
+    /// will ask for without writing anything.
+    pub fn for_ifaces_with<'a>(
+        ifaces: impl IntoIterator<Item = &'a str>,
+        read: impl Fn(&str) -> Result<crate::ntuple::RuleTable, String>,
+    ) -> Result<Self, String> {
         let mut budget: Option<Self> = None;
         for iface in ifaces {
-            let next = Self::from_table(&crate::ntuple::rule_table(iface)?);
+            let next = Self::from_table(&read(iface)?);
             budget = Some(match budget {
                 None => next,
                 Some(prev) => Self {
