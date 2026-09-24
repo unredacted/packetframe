@@ -439,8 +439,12 @@ VLAN needs a `steer-exempt` line. Budget math per steered port:
 (steerable v4 prefixes × directions) diversions + 2 built-ins + your
 `steer-exempt` entries must fit the port's table — 16 slots by default
 on this hardware, more with `steer-capacity` (see "Raising the rule
-budget" under "Constraints worth knowing before you debug"); the
-refusal message
+budget" under "Constraints worth knowing before you debug"). A
+re-plan over ports that are already steered — a daemon restart that
+adopts a steered VPP, or a reload steering one more port — counts the
+module's own installed rules as free, provided the state file records
+them and the NIC still holds them; an unchanged plan lands on exactly
+the slots it already occupies. The refusal message
 itemises exactly this. While steered, `ethtool -n <port>` shows the
 exemptions at the LOW locations and the diversions at the high ones —
 lower location is higher MCAM priority, which is what makes an
