@@ -1792,7 +1792,7 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
     }
 }
 
-pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
+pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), String> {
     // Refuse to detach while a `packetframe run` daemon is live. The
     // daemon holds PinnedLink FDs in-process; unlinking the bpffs pin
     // paths alone doesn't drop the kernel-side bpf_link refcount, so
@@ -1945,19 +1945,30 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
     #[cfg(not(feature = "fast-path"))]
     let _ = (config_has_fast_path, settle_time);
 
+    // `--keep-vpp` is the restart that keeps the offload: every other
+    // module's pins must go (the next daemon refuses to start over
+    // them), while VPP and its steering rules stay for that daemon to
+    // adopt. Until now the only way to say this was a hand-made copy of
+    // the config with the vpp-offload section cut off, scoped with
+    // `--config` — correct, and easy to get wrong at 3 a.m.
     #[cfg(feature = "vpp-offload")]
-    if all || config_has_vpp {
-        if let Err(e) = detach_vpp_offload(&state_dir) {
-            errors.push(e);
+    match vpp_detach(all, config_has_vpp, keep_vpp) {
+        VppDetach::Keep => tracing::info!(
+            "vpp-offload left running (--keep-vpp): VPP, its VFs, hugepages and MCAM \
+             steering rules stay, and the next `packetframe run` adopts them"
+        ),
+        VppDetach::TearDown => {
+            if let Err(e) = detach_vpp_offload(&state_dir) {
+                errors.push(e);
+            }
         }
-    } else {
-        tracing::info!(
+        VppDetach::OutOfScope => tracing::info!(
             "vpp-offload state left alone: this detach is scoped to the supplied config; \
              use `--all` to tear down modules it does not declare"
-        );
+        ),
     }
     #[cfg(not(feature = "vpp-offload"))]
-    let _ = config_has_vpp;
+    let _ = (config_has_vpp, keep_vpp);
 
     // Same scoping rule as vpp-offload: a detach scoped to a config
     // without a guard section must leave the guard's egress filters
@@ -1983,6 +1994,52 @@ pub fn detach(config: Option<&Path>, all: bool) -> Result<(), String> {
         return Err(errors.join("; AND "));
     }
     Ok(())
+}
+
+/// What `detach` does with vpp-offload.
+#[cfg(feature = "vpp-offload")]
+#[derive(Debug, PartialEq, Eq)]
+enum VppDetach {
+    /// `--keep-vpp`: left running for the next start to adopt, whatever
+    /// `--all` or the config say.
+    Keep,
+    TearDown,
+    /// A scoped detach whose config does not declare the module.
+    OutOfScope,
+}
+
+#[cfg(feature = "vpp-offload")]
+fn vpp_detach(all: bool, config_has_vpp: bool, keep_vpp: bool) -> VppDetach {
+    if keep_vpp {
+        VppDetach::Keep
+    } else if all || config_has_vpp {
+        VppDetach::TearDown
+    } else {
+        VppDetach::OutOfScope
+    }
+}
+
+#[cfg(all(test, feature = "vpp-offload"))]
+mod keep_vpp_tests {
+    use super::*;
+
+    /// `--keep-vpp` wins over both `--all` and a config that declares the
+    /// module — it exists for exactly the restart where both are true.
+    #[test]
+    fn keep_vpp_overrides_all_and_the_config() {
+        for all in [false, true] {
+            for has in [false, true] {
+                assert_eq!(
+                    vpp_detach(all, has, true),
+                    VppDetach::Keep,
+                    "all={all} has={has}"
+                );
+            }
+        }
+        assert_eq!(vpp_detach(true, false, false), VppDetach::TearDown);
+        assert_eq!(vpp_detach(false, true, false), VppDetach::TearDown);
+        assert_eq!(vpp_detach(false, false, false), VppDetach::OutOfScope);
+    }
 }
 
 /// The guard half of `detach`: state-file-driven teardown of the

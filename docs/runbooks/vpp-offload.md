@@ -2595,9 +2595,28 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   to do about it. A daemon whose running config silently differed from
   the file you just edited is how the wrong thing gets debugged for an
   hour.
-- **Restart ordering is stop → detach --all → start.** This bit
-  production twice. A plain `systemctl restart` leaves the previous
-  attachment's pins in place and the next start refuses them.
+- **Restart ordering is stop → detach → start.** This bit production
+  twice. A plain `systemctl restart` leaves the previous attachment's
+  pins in place and the next start refuses them. Two forms, and they are
+  different operations:
+  - `detach --all` tears **everything** down, VPP included: traffic
+    falls back to the eBPF tier and the next start brings VPP up fresh
+    (a full resync, then the canary levers again). The safe form, and
+    the one every recovery message names.
+  - `detach --keep-vpp` tears down every other module's pins and leaves
+    VPP, its VFs, hugepages and steering rules running for the next
+    start to adopt — steered traffic keeps flowing across the restart
+    (measured on the rig: one 0.6 s steering dip while the adoption
+    reconciles). The form for an upgrade or config restart of a steered
+    box:
+
+    ```bash
+    systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
+    ```
+
+    Adoption refuses a VPP whose topology the new config changed
+    (`port` lines, `vlans`, `expected-routes`, …) by name; use
+    `detach --all` for those.
 - **The ntuple table holds 16 rules per port by default, and
   `npc/mcam_info` will not tell you that.** The driver rejects an
   out-of-range `loc` with `EINVAL` rather than assigning one. The module
