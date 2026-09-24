@@ -139,6 +139,12 @@ pub struct VppOffloadConfig {
     /// alone. Restart-only — the driver refuses to resize a table
     /// holding rules, so it is attach-time work (see [`capacity`]).
     pub steer_capacity: Option<u16>,
+    /// Ports declared `vlans all`: their subinterfaces follow the tagged
+    /// VLANs the kernel bridge carries on them — read at attach, then
+    /// kept in step while VPP runs, so a VLAN added on the switch needs
+    /// no restart. Their `vlans` entry in [`Self::ports`] stays empty;
+    /// bring-up fills the attach-time set from the kernel.
+    pub trunk_ports: Vec<String>,
 }
 
 /// One `local-route`, resolved for the engine: the config triple plus
@@ -186,11 +192,16 @@ impl VppOffloadConfig {
                     cores,
                     steer,
                     vlans,
+                    vlans_all,
                     direction,
                     ..
-                } => out
-                    .ports
-                    .push((iface.clone(), *cores, *steer, vlans.clone(), *direction)),
+                } => {
+                    out.ports
+                        .push((iface.clone(), *cores, *steer, vlans.clone(), *direction));
+                    if *vlans_all {
+                        out.trunk_ports.push(iface.clone());
+                    }
+                }
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
@@ -294,6 +305,14 @@ impl VppOffloadConfig {
                 "`hugepages` changed ({:?} → {:?}); the reservation is made at attach and \
                  VPP maps it at start — restart to apply",
                 self.hugepages, new.hugepages
+            ));
+        }
+        if self.trunk_ports != new.trunk_ports {
+            return Err(format!(
+                "which ports are `vlans all` changed ({:?} → {:?}); a trunk port's \
+                 subinterfaces are created from the kernel at attach and followed from \
+                 there — restart to apply",
+                self.trunk_ports, new.trunk_ports
             ));
         }
         if self.steer_capacity != new.steer_capacity {
@@ -1971,6 +1990,7 @@ mod tests {
             steer_exempts: vec![],
             local_routes: vec![],
             steer_capacity: None,
+            trunk_ports: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -2065,6 +2085,7 @@ mod tests {
                     cores: 1,
                     steer: false,
                     vlans: vec![],
+                    vlans_all: false,
                     direction: None,
                     line: 1,
                 },

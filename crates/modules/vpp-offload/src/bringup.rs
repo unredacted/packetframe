@@ -625,10 +625,38 @@ pub fn bring_up(
     // The vlans each member's steered ingress arrives tagged with —
     // config, not acquisition state, so it rides beside `state` rather
     // than inside it.
+    //
+    // A `vlans all` trunk takes the tagged VLANs the kernel bridge
+    // carries on it right now; the engine adds any that appear later.
+    // Unreadable is not fatal: the trunk starts with no subifs and the
+    // runtime reconcile fills them in once the kernel answers.
+    #[cfg(target_os = "linux")]
+    let kernel_vlans = if cfg.trunk_ports.is_empty() {
+        crate::topology::PortVlans::default()
+    } else {
+        match crate::fdb::dump_port_vlans() {
+            Ok(entries) => crate::topology::PortVlans::from_entries(
+                entries.into_iter().map(|e| (e.port, e.vid, e.untagged)),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "bridge port VLANs unreadable at attach; `vlans all` trunks start without subifs");
+                crate::topology::PortVlans::default()
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let kernel_vlans = crate::topology::PortVlans::default();
     let port_vlans: Vec<(String, Vec<u16>)> = cfg
         .ports
         .iter()
-        .map(|(iface, _, _, vlans, _)| (iface.clone(), vlans.clone()))
+        .map(|(iface, _, _, vlans, _)| {
+            let vlans = if cfg.trunk_ports.contains(iface) {
+                kernel_vlans.tagged(iface)
+            } else {
+                vlans.clone()
+            };
+            (iface.clone(), vlans)
+        })
         .collect();
     match finish(
         paths,
@@ -643,6 +671,7 @@ pub fn bring_up(
         feed_session,
         loopback,
         &port_vlans,
+        &cfg.trunk_ports,
         local_routes,
         &cfg.steer_exempts,
         dst_only_scope,
@@ -718,6 +747,7 @@ fn finish(
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     loopback: packetframe_common::config::Ipv4Prefix,
     port_vlans: &[(String, Vec<u16>)],
+    trunk_ports: &[String],
     local_routes: &[crate::LocalRoute],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>>,
@@ -1036,6 +1066,7 @@ fn finish(
     // here rather than passed in: it shares one record between the
     // identity store and the release seam through an `Rc`.
     let local_routes = local_routes.to_vec();
+    let trunk_ports = trunk_ports.to_vec();
     let drift_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
@@ -1084,7 +1115,8 @@ fn finish(
             loopback,
         )
         .with_recorded_indices(recorded)
-        .with_local_routes(local_routes);
+        .with_local_routes(local_routes)
+        .with_trunk_ports(trunk_ports);
         // Per-neighbour placement reads the live kernel on Linux; the
         // default elsewhere treats every device as plain.
         #[cfg(target_os = "linux")]
@@ -1403,6 +1435,7 @@ mod completeness_gate_tests {
             steer_exempts: vec![],
             local_routes: vec![],
             steer_capacity: None,
+            trunk_ports: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

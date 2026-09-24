@@ -155,6 +155,50 @@ impl FdbSnapshot {
     }
 }
 
+/// Each bridge port's VLANs: `(vid, egress untagged)` — what `bridge vlan
+/// show` prints. Decides how a placed neighbour is reached (an untagged
+/// VLAN through the port itself, a tagged one through its subif), and
+/// which subifs a `vlans all` trunk needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortVlans {
+    by_port: HashMap<String, Vec<(u16, bool)>>,
+}
+
+impl PortVlans {
+    /// From `(port, vid, untagged)` entries.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, u16, bool)>) -> Self {
+        let mut by_port: HashMap<String, Vec<(u16, bool)>> = HashMap::new();
+        for (port, vid, untagged) in entries {
+            by_port.entry(port).or_default().push((vid, untagged));
+        }
+        for v in by_port.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        Self { by_port }
+    }
+
+    /// The VLANs `port` carries tagged, ascending.
+    pub fn tagged(&self, port: &str) -> Vec<u16> {
+        self.pick(port, false)
+    }
+
+    /// The VLANs `port` sends untagged, ascending.
+    pub fn untagged(&self, port: &str) -> Vec<u16> {
+        self.pick(port, true)
+    }
+
+    fn pick(&self, port: &str, untagged: bool) -> Vec<u16> {
+        self.by_port
+            .get(port)
+            .into_iter()
+            .flatten()
+            .filter(|(_, u)| *u == untagged)
+            .map(|(v, _)| *v)
+            .collect()
+    }
+}
+
 /// The engine's view of the kernel: classification and the FDB.
 ///
 /// Both answers must be cheap: the engine asks from the supervision
@@ -170,6 +214,9 @@ pub trait Topology {
     /// snapshot they had, since an unreadable table is not evidence
     /// anything moved, and say so.
     fn fdb(&self) -> Result<FdbSnapshot, String>;
+    /// The latest bridge-port VLAN membership, on the same terms as
+    /// [`Self::fdb`].
+    fn port_vlans(&self) -> Result<PortVlans, String>;
 }
 
 /// No kernel to ask: every device is [`DevKind::Plain`] and the FDB is
@@ -184,6 +231,9 @@ impl Topology for NoTopology {
     fn fdb(&self) -> Result<FdbSnapshot, String> {
         Ok(FdbSnapshot::default())
     }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(PortVlans::default())
+    }
 }
 
 /// The live kernel. Classification reads `/proc/net/vlan/config` and the
@@ -193,6 +243,7 @@ impl Topology for NoTopology {
 #[cfg(target_os = "linux")]
 pub struct KernelTopology {
     fdb: std::sync::Arc<std::sync::Mutex<Result<FdbSnapshot, String>>>,
+    vlans: std::sync::Arc<std::sync::Mutex<Result<PortVlans, String>>>,
 }
 
 /// How often the background thread re-dumps the FDB.
@@ -201,26 +252,41 @@ pub const FDB_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(target_os = "linux")]
 impl KernelTopology {
-    /// Read the FDB once, here — at bring-up, before supervision starts,
-    /// so the first resync places neighbours from a real table — then
-    /// keep it fresh on a thread that ends when this is dropped.
+    /// Read the FDB and port VLANs once, here — at bring-up, before
+    /// supervision starts, so the first resync places neighbours from a
+    /// real table — then keep both fresh on a thread that ends when this
+    /// is dropped.
     pub fn start() -> Self {
-        let cell = std::sync::Arc::new(std::sync::Mutex::new(Self::read_fdb()));
-        let weak = std::sync::Arc::downgrade(&cell);
+        let fdb = std::sync::Arc::new(std::sync::Mutex::new(Self::read_fdb()));
+        let vlans = std::sync::Arc::new(std::sync::Mutex::new(Self::read_vlans()));
+        let (wf, wv) = (
+            std::sync::Arc::downgrade(&fdb),
+            std::sync::Arc::downgrade(&vlans),
+        );
         let spawned = std::thread::Builder::new()
             .name("pf-vpp-fdb".into())
             .spawn(move || loop {
                 std::thread::sleep(FDB_REFRESH);
-                let Some(cell) = weak.upgrade() else {
+                let (Some(fdb), Some(vlans)) = (wf.upgrade(), wv.upgrade()) else {
                     return;
                 };
                 let read = Self::read_fdb();
-                *cell.lock().unwrap_or_else(|e| e.into_inner()) = read;
+                *fdb.lock().unwrap_or_else(|e| e.into_inner()) = read;
+                let read = Self::read_vlans();
+                *vlans.lock().unwrap_or_else(|e| e.into_inner()) = read;
             });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "bridge FDB refresh thread would not start; placement uses the bring-up read");
         }
-        Self { fdb: cell }
+        Self { fdb, vlans }
+    }
+
+    fn read_vlans() -> Result<PortVlans, String> {
+        Ok(PortVlans::from_entries(
+            crate::fdb::dump_port_vlans()?
+                .into_iter()
+                .map(|e| (e.port, e.vid, e.untagged)),
+        ))
     }
 
     fn read_fdb() -> Result<FdbSnapshot, String> {
@@ -293,6 +359,10 @@ impl Topology for KernelTopology {
 
     fn fdb(&self) -> Result<FdbSnapshot, String> {
         self.fdb.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        self.vlans.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -429,6 +499,20 @@ mod tests {
             vec!["br3998".to_string(), "br100".to_string()],
             "1337 is carried by no member; plain devices are the members' own business"
         );
+    }
+
+    #[test]
+    fn port_vlans_split_tagged_from_untagged() {
+        let v = PortVlans::from_entries([
+            ("eth4".to_string(), 1, true),
+            ("eth4".to_string(), 1337, false),
+            ("eth4".to_string(), 88, false),
+            ("eth5".to_string(), 3998, false),
+        ]);
+        assert_eq!(v.tagged("eth4"), vec![88, 1337]);
+        assert_eq!(v.untagged("eth4"), vec![1]);
+        assert_eq!(v.tagged("eth5"), vec![3998]);
+        assert!(v.tagged("eth9").is_empty());
     }
 
     #[test]

@@ -1359,15 +1359,16 @@ fn the_neighbours_adj_fib_is_never_adopted_or_withdrawn() {
 // right messages, reach the wire.
 
 use fake_vpp::SUBIF_BASE;
-use packetframe_vpp_offload::topology::{DevKind, FdbSnapshot, Topology};
+use packetframe_vpp_offload::topology::{DevKind, FdbSnapshot, PortVlans, Topology};
 use packetframe_vpp_offload::LocalRoute;
 
 /// A kernel view for the bridge tests: fixed device shapes, and an FDB
-/// the test can move MACs around in.
+/// and bridge-port VLAN table the test can change under the engine.
 struct Kernel {
     kinds: Vec<(&'static str, DevKind)>,
     /// `Err` = the FDB read fails, as a wedged netlink would.
     fdb: std::sync::Arc<std::sync::Mutex<Result<FdbSnapshot, String>>>,
+    vlans: std::sync::Arc<std::sync::Mutex<PortVlans>>,
 }
 
 impl Topology for Kernel {
@@ -1381,6 +1382,9 @@ impl Topology for Kernel {
     }
     fn fdb(&self) -> Result<FdbSnapshot, String> {
         self.fdb.lock().unwrap().clone()
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(self.vlans.lock().unwrap().clone())
     }
 }
 
@@ -1443,6 +1447,7 @@ fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
     .with_topology(Box::new(Kernel {
         kinds: vec![("br1337", bridge_vlan(1337))],
         fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+        vlans: Default::default(),
     }))
 }
 
@@ -1745,6 +1750,7 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
     .with_topology(Box::new(Kernel {
         kinds: vec![("br3998", bridge_vlan(3998))],
         fdb: fdb.clone(),
+        vlans: Default::default(),
     }));
     // Subifs are created in port order: eth4.3998, then eth5.3998.
     let (eth4_sub, eth5_sub) = (SUBIF_BASE, SUBIF_BASE + 1);
@@ -1846,4 +1852,178 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
     *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
     e.refresh_placement(&src).expect("refresh");
     assert_eq!(e.fdb_unreadable(), None, "cleared by the next good read");
+}
+
+/// Trunk mode: a `vlans all` port gains a subif when the kernel bridge
+/// starts carrying a VLAN, with no restart — and a neighbour already
+/// placed behind it on that VLAN, unreachable until then, is programmed
+/// and its routes re-queued.
+#[test]
+fn a_trunk_follows_a_vlan_added_on_the_switch() {
+    use std::cell::RefCell;
+    const PEER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x77];
+    let peer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+    struct Src {
+        requeued: RefCell<Vec<IpAddr>>,
+    }
+    impl RouteSource for Src {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(
+                IpPrefix::V4 {
+                    addr: [203, 0, 113, 0],
+                    prefix_len: 24,
+                },
+                &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20))],
+            );
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)), "br200", PEER);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.requeued.borrow_mut().extend_from_slice(nexthops);
+        }
+        fn route_count(&self) -> u64 {
+            1
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let vlans = std::sync::Arc::new(std::sync::Mutex::new(PortVlans::default()));
+    let fake = Fake::start("trunk-vlan");
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            vlans: vec![],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_trunk_ports(vec!["eth4".into()])
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br200", bridge_vlan(200))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(200, PEER, "eth4")])))),
+        vlans: vlans.clone(),
+    }));
+    let src = Src {
+        requeued: RefCell::new(Vec::new()),
+    };
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 1, "no subif for vlan 200 yet");
+    assert_eq!(
+        e.unplaced_neighbours(),
+        vec![(peer, "br200".to_string(), Some("eth4".to_string()))]
+    );
+    let _ = fake.drain_events();
+
+    // The switch starts carrying VLAN 200 on the trunk.
+    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 200, false)]);
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 1);
+    let events = fake.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Event::Msg(m) if m.starts_with("create_vlan_subif vlan=200"))),
+        "the subif is created while running: {events:?}"
+    );
+    assert!(
+        events.iter().any(
+            |ev| matches!(ev, Event::Neighbour { sw_if_index, is_add: true, .. }
+            if *sw_if_index == SUBIF_BASE)
+        ),
+        "and the neighbour programmed on it: {events:?}"
+    );
+    assert_eq!(*src.requeued.borrow(), vec![peer]);
+    assert!(e.unplaced_neighbours().is_empty());
+
+    // Nothing new on the next pass: no second subif, nothing re-queued.
+    src.requeued.borrow_mut().clear();
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
+    assert!(fake
+        .drain_events()
+        .iter()
+        .all(|ev| !matches!(ev, Event::Msg(m) if m.starts_with("create_vlan_subif"))));
+}
+
+/// A neighbour on the port's UNTAGGED VLAN (br0 over switch0.1 on a UniFi
+/// box) is programmed on the VF itself, not on a tagged subif.
+#[test]
+fn an_untagged_vlan_neighbour_lands_on_the_vf() {
+    const HOST: [u8; 6] = [0x02, 0, 0, 0, 0, 0x88];
+    struct Src;
+    impl RouteSource for Src {
+        fn for_each_route(&self, _visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)), "br0", HOST);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let fake = Fake::start("untagged");
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            vlans: vec![],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br0", bridge_vlan(1))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1, HOST, "eth4")])))),
+        vlans: std::sync::Arc::new(std::sync::Mutex::new(PortVlans::from_entries([(
+            "eth4".to_string(),
+            1,
+            true,
+        )]))),
+    }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&Src);
+    e.program_neighbours(&Src).expect("neighbours");
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(
+            |ev| matches!(ev, Event::Neighbour { sw_if_index, mac, is_add: true, .. }
+            if *sw_if_index == ASSIGNED_INDEX && *mac == HOST)
+        ),
+        "on the VF's own index, untagged: {events:?}"
+    );
+    assert!(e.unplaced_neighbours().is_empty());
 }

@@ -166,3 +166,101 @@ pub fn dump_bridge_fdb() -> Result<Vec<FdbEntry>, String> {
     }
     Ok(out)
 }
+
+/// One bridge port's VLAN membership, from an AF_BRIDGE RTM_GETLINK dump
+/// with `RTEXT_FILTER_BRVLAN`: `(vid, egress untagged)` per VLAN — what
+/// `bridge vlan show` prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortVlanEntry {
+    /// The enslaved port, by name.
+    pub port: String,
+    pub vid: u16,
+    /// The bridge sends this VLAN out of the port without a tag (the
+    /// PVID of an access or trunk port, typically VLAN 1).
+    pub untagged: bool,
+}
+
+/// Every bridge port's VLANs. Blocking, bounded by [`bound_recv`], like
+/// [`dump_bridge_fdb`]; callers run it off the supervision loop.
+#[cfg(target_os = "linux")]
+pub fn dump_port_vlans() -> Result<Vec<PortVlanEntry>, String> {
+    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+    use netlink_packet_route::link::{
+        AfSpecBridge, BridgeVlanInfoFlags, LinkAttribute, LinkExtentMask, LinkMessage,
+    };
+    use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+    use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+    let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    bound_recv(&socket)?;
+    socket
+        .bind_auto()
+        .map_err(|e| format!("netlink bind: {e}"))?;
+    socket
+        .connect(&SocketAddr::new(0, 0))
+        .map_err(|e| format!("netlink connect: {e}"))?;
+
+    let mut link = LinkMessage::default();
+    link.header.interface_family = AddressFamily::Bridge;
+    link.attributes
+        .push(LinkAttribute::ExtMask(vec![LinkExtentMask::Brvlan]));
+    let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetLink(link));
+    msg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+    msg.header.sequence_number = 1;
+    msg.finalize();
+    let mut send_buf = vec![0u8; msg.header.length as usize];
+    msg.serialize(&mut send_buf);
+    socket
+        .send(&send_buf, 0)
+        .map_err(|e| format!("netlink send: {e}"))?;
+
+    let mut out = Vec::new();
+    let mut recv_buf = vec![0u8; 64 * 1024];
+    'dump: loop {
+        let n = socket
+            .recv(&mut &mut recv_buf[..], 0)
+            .map_err(|e| format!("netlink recv: {e}"))?;
+        let mut offset = 0usize;
+        while offset < n {
+            let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
+                .map_err(|e| format!("netlink parse: {e}"))?;
+            let len = pkt.header.length as usize;
+            if len == 0 {
+                break;
+            }
+            match pkt.payload {
+                NetlinkPayload::Done(_) => break 'dump,
+                NetlinkPayload::Error(e) => return Err(format!("netlink error: {e}")),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(m)) => {
+                    // Only enslaved ports: the bridge master reports its
+                    // own "self" VLANs here too, which are not a port's.
+                    let enslaved = m
+                        .attributes
+                        .iter()
+                        .any(|a| matches!(a, LinkAttribute::Controller(_)));
+                    if !enslaved {
+                        offset += len;
+                        continue;
+                    }
+                    let port = ifname(m.header.index);
+                    for a in &m.attributes {
+                        if let LinkAttribute::AfSpecBridge(specs) = a {
+                            for spec in specs {
+                                if let AfSpecBridge::VlanInfo(v) = spec {
+                                    out.push(PortVlanEntry {
+                                        port: port.clone(),
+                                        vid: v.vid,
+                                        untagged: v.flags.contains(BridgeVlanInfoFlags::Untagged),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            offset += len;
+        }
+    }
+    Ok(out)
+}

@@ -686,9 +686,22 @@ Degraded until a read succeeds.
 
 Two things to get right in config:
 
-- **Declare the vid on every trunk that can carry it.** A neighbour
-  learned behind a port without that subif cannot be reached, and its
-  routes stay unresolvable (which blocks a first steer, by design).
+- **Declare the vid on every trunk that can carry it** — or declare the
+  trunks `vlans all`. A neighbour learned behind a port without that
+  subif cannot be reached, and its routes stay unresolvable (which
+  blocks a first steer, by design). With `port eth4 … vlans all`, the
+  port gets a subif for every tagged VLAN the kernel bridge carries on
+  it at attach, and the engine adds one within seconds of the switch
+  adding a VLAN (`trunk carries new VLAN(s); subinterfaces added` in the
+  journal) — a neighbour already placed on it is then programmed and
+  its routes re-queued. Add-only: a VLAN removed on the switch leaves an
+  idle subif until the next restart. A VLAN the bridge sends untagged on
+  the port (its PVID) needs no subif at all: neighbours on it are
+  reached through the VF.
+- A new VLAN's **connected subnet** is not delivered automatically: VPP
+  reaches next hops on it, not arbitrary hosts. The exemption tripwire
+  reports the connected route until a `local-route` (with its fast-path
+  `local-prefix`) or a `steer-exempt` covers it.
 - The FDB learns from frames the KERNEL sees. Steered frames go to the
   VF, so a host whose every frame is steered would eventually age out —
   in practice ARP, IPv6 and control traffic keep it fresh. The
