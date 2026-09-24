@@ -178,10 +178,14 @@ pub enum ModuleDirective {
     ///
     /// `cores` is how many VPP workers poll this port's rx queues
     /// (one queue per worker). `cores 0` gives the port no worker of
-    /// its own: its single queue is polled by ONE worker shared with
-    /// every other `cores 0` port ([`vpp_worker_count`]). For
-    /// egress-only members — while a port is unsteered its VF receives
-    /// ~nothing, yet a dedicated worker would busy-poll a core for it.
+    /// its own: ONE shared worker is added for all such ports
+    /// ([`vpp_worker_count`]), and the first `cores 0` port's queue is
+    /// polled there. VPP's octeon driver places queues round-robin in
+    /// creation order and offers no way to move them, so any further
+    /// `cores 0` ports' queues wrap onto the dedicated workers — see
+    /// the module's `cores::rx_placement_plan`. For egress-only members
+    /// — while a port is unsteered its VF receives ~nothing, yet a
+    /// dedicated worker would busy-poll a core for it.
     /// A `cores 0` port cannot `steer on` (validation refuses it);
     /// giving it a core of its own is restart-only, like every `cores`
     /// change.
@@ -1065,8 +1069,8 @@ impl std::fmt::Display for VppSteerDirection {
 /// line's `cores` in any order.
 ///
 /// Every port's `cores`, summed, plus ONE shared worker when any port
-/// declares `cores 0` — all such ports poll their single rx queue from
-/// that one worker. Here, in common, rather than in the module, so the
+/// declares `cores 0` — the worker the first such port's queue lands
+/// on. Here, in common, rather than in the module, so the
 /// feasibility probe (built with or without the module) and attach
 /// derive the same core map from the same arithmetic.
 pub fn vpp_worker_count<I: IntoIterator<Item = u16>>(cores: I) -> u32 {
@@ -3200,9 +3204,9 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             if rest.next() != Some("cores") {
                 return Err(ConfigError::parse(line, usage));
             }
-            // 0 is legal: the port gets no worker of its own and its
-            // one rx queue shares the single worker every `cores 0`
-            // port polls from (`vpp_worker_count`). Whether such a port
+            // 0 is legal: the port gets no worker of its own; its one
+            // rx queue is polled by a worker shared with other ports
+            // (`vpp_worker_count`). Whether such a port
             // may steer is a cross-directive rule, checked in
             // `validate_vpp_offload`.
             let cores: u16 = rest

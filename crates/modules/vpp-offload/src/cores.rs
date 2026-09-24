@@ -95,54 +95,67 @@ pub fn derive_core_map(online: &[u16], isolated: &[u16], workers: u32) -> Result
     })
 }
 
-/// One rx queue's worker, as `sw_interface_set_rx_placement` takes it.
+/// One rx queue's worker.
 ///
-/// `worker_id` is VPP's 0-based WORKER number (`is_main = false`), not a
-/// CPU and not a thread index: worker N runs on the N-th CPU of
-/// `corelist-workers`, which [`CoreMap::workers`] renders ascending.
+/// `worker_id` is VPP's 0-based WORKER number, not a CPU and not a
+/// thread index: worker N runs on the N-th CPU of `corelist-workers`,
+/// which [`CoreMap::workers`] renders ascending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RxPlacement {
     pub queue_id: u32,
     pub worker_id: u32,
 }
 
-/// Which worker polls which rx queue, per port, in config order.
+/// The order ports are created in VPP: every port with dedicated
+/// `cores`, in config order, then every `cores 0` port.
 ///
-/// A port with `cores c >= 1` gets queues `0..c` on `c` distinct,
-/// consecutive workers, allocated in config order from worker 0. Every
-/// `cores 0` port gets queue 0 on the ONE shared worker, whose index is
-/// the sum of the dedicated cores — the last worker, since
-/// `VppOffloadConfig::total_workers` adds exactly one for it. So the
-/// highest worker id this can name is `total_workers() - 1`.
+/// This order IS the placement mechanism. The octeon driver runs on
+/// VPP's `vnet_dev` framework, which hands rx queues to workers
+/// round-robin as ports are created — one global counter from worker 0,
+/// wrapping after the last — and never registers them with the generic
+/// rx-placement machinery, so `sw_interface_set_rx_placement` refuses
+/// every octeon queue ("unknown queue 0", measured on the rig
+/// 2026-09-24; `vnet_dev_port_if_create`, VPP v26.06). Creating the
+/// dedicated ports first gives them consecutive workers from 0, and the
+/// first `cores 0` port then lands on the shared worker
+/// `VppOffloadConfig::total_workers` adds after them.
 ///
-/// Explicit, because VPP's default is round-robin in queue-creation
-/// order: it would give each `cores 0` port a different worker and
-/// scatter the dedicated ports' queues, which is not what the operator
-/// sized. A pure function so the whole plan is unit-testable here and
-/// the attach step only applies it.
+/// Indices into `ports`.
+pub fn creation_order(ports: &[(&str, u16)]) -> Vec<usize> {
+    let dedicated = (0..ports.len()).filter(|&i| ports[i].1 > 0);
+    let shared = (0..ports.len()).filter(|&i| ports[i].1 == 0);
+    dedicated.chain(shared).collect()
+}
+
+/// Where VPP will poll each port's rx queues, per port, in
+/// [`creation_order`] — a prediction of `vnet_dev`'s round-robin, for
+/// the attach log, since nothing can set it.
+///
+/// A port with `cores c >= 1` gets queues `0..c` on consecutive
+/// workers from worker 0 in config order. The first `cores 0` port gets
+/// the shared worker, the last one. **A second `cores 0` port does
+/// not**: the counter has wrapped, so its queue lands on worker 0, the
+/// third's on worker 1, and so on — egress-only queues joining dedicated
+/// workers. That costs those workers one near-empty poll per loop (an
+/// egress-only port receives only what the NIC leaks to its VF, ~2 pps
+/// measured), and it is what this VPP can express.
 pub fn rx_placement_plan(ports: &[(&str, u16)]) -> Vec<(String, Vec<RxPlacement>)> {
-    let shared_worker: u32 = ports.iter().map(|(_, c)| u32::from(*c)).sum();
-    let mut next_worker = 0u32;
-    ports
-        .iter()
-        .map(|(iface, cores)| {
-            let queues = if *cores == 0 {
-                vec![RxPlacement {
-                    queue_id: 0,
-                    worker_id: shared_worker,
-                }]
-            } else {
-                (0..u32::from(*cores))
-                    .map(|q| {
-                        let p = RxPlacement {
-                            queue_id: q,
-                            worker_id: next_worker,
-                        };
-                        next_worker += 1;
-                        p
-                    })
-                    .collect()
-            };
+    let workers = packetframe_common::config::vpp_worker_count(ports.iter().map(|(_, c)| *c));
+    let mut next = 0u32;
+    creation_order(ports)
+        .into_iter()
+        .map(|i| {
+            let (iface, cores) = ports[i];
+            let queues = (0..u32::from(cores.max(1)))
+                .map(|q| {
+                    let p = RxPlacement {
+                        queue_id: q,
+                        worker_id: next,
+                    };
+                    next = (next + 1) % workers.max(1);
+                    p
+                })
+                .collect();
             (iface.to_string(), queues)
         })
         .collect()
@@ -1054,23 +1067,48 @@ mod tests {
         }
     }
 
-    /// The first-rung shape: one steered port with its own worker, the
-    /// egress-only members all on the one shared worker after it.
+    /// The reference primary's shape: dedicated ports first on their own
+    /// workers, the one egress-only port on the shared worker after them.
     #[test]
-    fn placement_puts_every_cores_zero_port_on_the_one_shared_worker() {
+    fn a_single_cores_zero_port_lands_on_the_shared_worker() {
+        let ports = [
+            ("eth0", 0),
+            ("eth2", 1),
+            ("eth3", 1),
+            ("eth4", 1),
+            ("eth5", 1),
+        ];
+        assert_eq!(creation_order(&ports), vec![1, 2, 3, 4, 0]);
+        assert_eq!(
+            rx_placement_plan(&ports),
+            vec![
+                ("eth2".to_string(), vec![rp(0, 0)]),
+                ("eth3".to_string(), vec![rp(0, 1)]),
+                ("eth4".to_string(), vec![rp(0, 2)]),
+                ("eth5".to_string(), vec![rp(0, 3)]),
+                ("eth0".to_string(), vec![rp(0, 4)]),
+            ]
+        );
+    }
+
+    /// Round-robin wraps: only the first `cores 0` port gets the shared
+    /// worker, the rest join dedicated workers in turn. Predicted, not
+    /// wished for — this is what `vnet_dev` does.
+    #[test]
+    fn further_cores_zero_ports_wrap_onto_dedicated_workers() {
         let plan = rx_placement_plan(&[("eth2", 0), ("eth3", 1), ("eth4", 0), ("eth5", 0)]);
         assert_eq!(
             plan,
             vec![
-                ("eth2".to_string(), vec![rp(0, 1)]),
                 ("eth3".to_string(), vec![rp(0, 0)]),
-                ("eth4".to_string(), vec![rp(0, 1)]),
+                ("eth2".to_string(), vec![rp(0, 1)]),
+                ("eth4".to_string(), vec![rp(0, 0)]),
                 ("eth5".to_string(), vec![rp(0, 1)]),
             ]
         );
     }
 
-    /// Nothing dedicated: the shared worker is worker 0.
+    /// Nothing dedicated: one worker polls everything.
     #[test]
     fn placement_with_only_cores_zero_ports_uses_worker_zero() {
         let plan = rx_placement_plan(&[("eth2", 0), ("eth3", 0)]);
@@ -1084,8 +1122,8 @@ mod tests {
     }
 
     /// Multi-core ports get one queue per worker, consecutive and
-    /// distinct, allocated in config order; the shared worker follows
-    /// the last dedicated one.
+    /// distinct, in config order; the shared worker follows the last
+    /// dedicated one. Without `cores 0` ports nothing is reordered.
     #[test]
     fn placement_gives_multi_core_ports_distinct_consecutive_workers() {
         let plan = rx_placement_plan(&[("eth2", 2), ("eth3", 0), ("eth4", 3)]);
@@ -1093,14 +1131,14 @@ mod tests {
             plan,
             vec![
                 ("eth2".to_string(), vec![rp(0, 0), rp(1, 1)]),
-                ("eth3".to_string(), vec![rp(0, 5)]),
                 ("eth4".to_string(), vec![rp(0, 2), rp(1, 3), rp(2, 4)]),
+                ("eth3".to_string(), vec![rp(0, 5)]),
             ]
         );
-        // Without cores-0 ports there is no shared worker at all.
-        let plan = rx_placement_plan(&[("eth2", 1), ("eth3", 2)]);
+        let ports = [("eth2", 1), ("eth3", 2)];
+        assert_eq!(creation_order(&ports), vec![0, 1], "config order kept");
         assert_eq!(
-            plan,
+            rx_placement_plan(&ports),
             vec![
                 ("eth2".to_string(), vec![rp(0, 0)]),
                 ("eth3".to_string(), vec![rp(0, 1), rp(1, 2)]),

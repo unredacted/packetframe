@@ -277,12 +277,11 @@ pub fn route_capacity(sizing: &Sizing) -> u64 {
 /// anyway — detach and reattach need no config rewrite, and the
 /// supervisor can sequence attach inside its resync pipeline.
 ///
-/// `cores` still means what it meant: the operator's promise, rendered
-/// explicitly rather than left to the scheduler's round-robin default
-/// (plan v5, "cores promises are honored by rendering explicit
-/// rx-placement"). It now lands as `num_rx_queues` (at least one) plus
-/// an explicit per-queue worker placement at attach
-/// (`cores::rx_placement_plan`); `cores 0` shares one worker.
+/// `cores` still means what it meant: the operator's promise. It lands
+/// as `num_rx_queues` (at least one), and placement comes from the
+/// order ports are created in, since the octeon driver's queues follow
+/// VPP's round-robin and cannot be moved afterwards
+/// (`cores::creation_order`); `cores 0` gets no worker of its own.
 #[derive(Debug, Clone)]
 pub struct PortSpec {
     pub pci_addr: String,

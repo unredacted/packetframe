@@ -1943,7 +1943,6 @@ fn next_seed(prev: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cores::RxPlacement;
     use std::net::Ipv4Addr;
 
     fn v4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpPrefix {
@@ -1997,10 +1996,6 @@ mod tests {
                 pci_addr: "0002:07:00.1".into(),
                 port_id: 0,
                 num_rx_queues: 1,
-                rx_placement: vec![RxPlacement {
-                    queue_id: 0,
-                    worker_id: 0,
-                }],
                 pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                 accept_macs: vec![],
                 vlans: vec![],

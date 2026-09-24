@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use fake_vpp::{Behaviour, Fake, ASSIGNED_INDEX, MAC};
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::attach::PortAttach;
-use packetframe_vpp_offload::cores::RxPlacement;
 use packetframe_vpp_offload::driver::Driver;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
@@ -69,10 +68,6 @@ fn runtime_custom(
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
@@ -331,10 +326,6 @@ fn a_persist_that_recovers_clears_the_recorded_failure() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
@@ -507,10 +498,6 @@ fn a_route_learned_after_convergence_still_reaches_vpp() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
@@ -671,10 +658,6 @@ fn a_refused_neighbour_does_not_cost_the_batch_its_routes() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
@@ -817,10 +800,6 @@ fn a_nexthop_first_seen_after_convergence_gets_its_adjacency() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
