@@ -62,6 +62,14 @@ pub struct KernelRoute {
     /// no local delivery and cannot reproduce a broadcast, so
     /// steered traffic to any of them dies unless exempted.
     pub kernel_delivers: bool,
+    /// The route forwards via a GATEWAY (`RTA_GATEWAY`, or one in any
+    /// multipath hop) rather than onto a connected segment. The
+    /// distinction decides bridge-VLAN coverage: VPP reaches a gateway
+    /// on a bridge VLAN by per-neighbour placement, but has no route at
+    /// all for the connected subnet itself unless a `local-route`
+    /// delivers it — so a connected route out a bridged device stays a
+    /// finding.
+    pub gatewayed: bool,
     /// The route names a NEXTHOP OBJECT (`ip route ... nhid N`,
     /// `RTA_NH_ID`) instead of carrying its devices inline. Those
     /// routes are opaque here: the vendored netlink crate does not
@@ -100,16 +108,17 @@ pub struct VppReach {
     pub local_devices: Vec<String>,
     /// VLAN and bridge devices VPP reaches through a member's subif
     /// ([`crate::topology::reachable_devices`]): an IX LAN bridge, say,
-    /// whose next hops VPP places per neighbour. A route out one is a
-    /// path VPP can take.
+    /// whose next hops VPP places per neighbour. A route VIA A GATEWAY
+    /// out one is a path VPP can take; the device's connected subnet is
+    /// not, unless it is also a `local_devices` entry.
     pub bridged_devices: Vec<String>,
 }
 
 impl VppReach {
-    fn covers_device(&self, dev: &str) -> bool {
+    fn covers_device(&self, dev: &str, gatewayed: bool) -> bool {
         self.members.iter().any(|m| m == dev)
             || self.local_devices.iter().any(|d| d == dev)
-            || self.bridged_devices.iter().any(|d| d == dev)
+            || (gatewayed && self.bridged_devices.iter().any(|d| d == dev))
     }
 }
 
@@ -420,7 +429,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
                 if !reach.local_devices.iter().any(|d| d == oif) {
                     continue;
                 }
-            } else if r.oifs.iter().any(|d| reach.covers_device(d)) {
+            } else if r.oifs.iter().any(|d| reach.covers_device(d, r.gatewayed)) {
                 continue;
             }
         }
@@ -859,12 +868,14 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                     let mut dst: Option<std::net::Ipv4Addr> = None;
                     let mut oifs: Vec<u32> = Vec::new();
                     let mut nexthop_object = false;
+                    let mut gatewayed = false;
                     let mut encap: Option<String> = None;
                     let mut table = u32::from(m.header.table);
                     for attr in &m.attributes {
                         match attr {
                             RouteAttribute::Destination(RouteAddress::Inet(a)) => dst = Some(*a),
                             RouteAttribute::Oif(i) => oifs.push(*i),
+                            RouteAttribute::Gateway(_) => gatewayed = true,
                             // `RTA_ENCAP_TYPE`: the route hands the
                             // packet to a lightweight tunnel before it
                             // leaves. See `KernelRoute::encap` for why
@@ -881,6 +892,11 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             // (review finding).
                             RouteAttribute::MultiPath(hops) => {
                                 oifs.extend(hops.iter().map(|h| h.interface_index));
+                                gatewayed |= hops.iter().any(|h| {
+                                    h.attributes
+                                        .iter()
+                                        .any(|a| matches!(a, RouteAttribute::Gateway(_)))
+                                });
                                 // Encapsulation is per PATH, and ECMP
                                 // puts each path's attributes here. A
                                 // route with one plain path and one
@@ -932,6 +948,7 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             RouteType::Local | RouteType::Broadcast | RouteType::Anycast
                         ),
                         via_nexthop_object: nexthop_object,
+                        gatewayed,
                         encap,
                     });
                 }
@@ -1072,6 +1089,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            gatewayed: false,
             encap: None,
         }
     }
@@ -1106,16 +1124,28 @@ mod tests {
             route(p(0, 0, 0, 0, 0), "eth3"),        // default via a member: fine
             route(p(23, 191, 200, 0, 24), "br1337"), // local delivery: fine
             route(p(10, 0, 0, 0, 8), "eth4"),       // member: fine
-            route(p(198, 51, 100, 0, 24), "br3998"), // IX next hop, placed per neighbour: fine
+            {
+                // Via an IX peer on a bridge VLAN a member carries:
+                // placed per neighbour, so fine.
+                let mut r = route(p(198, 51, 100, 0, 24), "br3998");
+                r.gatewayed = true;
+                r
+            },
+            // The same bridge's CONNECTED subnet: VPP has no route for it
+            // without a local-route, so it is a finding.
+            route(p(192, 0, 2, 0, 24), "br3998"),
             route(p(203, 0, 113, 0, 24), "br4040"), // a bridge no member carries: finding
         ];
         let found = find(&routes, &[]);
-        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found.len(), 4, "{found:?}");
         assert!(found.iter().any(|u| u.to_string().contains("via br4040")));
-        assert!(!found.iter().any(|u| u.to_string().contains("br3998")));
+        assert!(found.iter().any(|u| u.to_string().contains("192.0.2.0/24")));
+        assert!(!found
+            .iter()
+            .any(|u| u.to_string().contains("198.51.100.0/24")));
         let found: Vec<_> = found
             .into_iter()
-            .filter(|u| !u.to_string().contains("br4040"))
+            .filter(|u| !u.to_string().contains("br4040") && !u.to_string().contains("br3998"))
             .collect();
         assert!(found.iter().all(|u| u.to_string().contains("via vti64")));
 
@@ -1123,6 +1153,7 @@ mod tests {
             p(23, 191, 201, 0, 24),
             p(23, 191, 200, 2, 32),
             p(203, 0, 113, 0, 24),
+            p(192, 0, 2, 0, 24),
         ];
         assert!(find(&routes, &exempts).is_empty());
     }
@@ -1243,6 +1274,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            gatewayed: false,
             encap: None,
         };
         assert_eq!(find(&[all_tunnel], &[]).len(), 1);
@@ -1254,6 +1286,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            gatewayed: false,
             encap: None,
         };
         assert!(
@@ -1301,6 +1334,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: false,
+            gatewayed: false,
             encap: Some("SRv6".into()),
         };
         assert_eq!(find(&[mixed], &[]).len(), 1);
@@ -1489,6 +1523,7 @@ mod tests {
             drops: false,
             kernel_delivers: false,
             via_nexthop_object: true,
+            gatewayed: false,
             encap: None,
         };
         let found = find(&[opaque.clone(), opaque.clone()], &[]);
