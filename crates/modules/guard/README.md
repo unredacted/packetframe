@@ -29,12 +29,17 @@ dropped) or enforce:
 | Any other broadcast/multicast | `bcast-mcast-ratelimit` | Coarse per-interface rate limit |
 
 The expected source MAC is read from the interface when it is attached,
-so no MAC is written into the config and HA role changes need no edits.
+so no MAC is written into the config. It is a snapshot, though: a
+reload keeps the attach-time MAC. **If the interface's MAC changes (an
+HA role change that moves MACs, say), restart the daemon**, or
+`foreign-src … drop` will drop the interface's own frames.
 
 Rate limiting uses GCRA: one deadline per bucket, in a shared
-direct-mapped array with no per-CPU copies and no atomics. Monitor mode
-runs the same limiter, so its counts predict exactly what enforce would
-drop.
+direct-mapped array with no per-CPU copies and no atomics. Buckets are
+keyless. ARP/NS targets hash into 4096 slots, so "per target" is an
+approximation: targets (or interfaces) that collide share one budget
+and are policed more strictly, never less. Monitor mode runs the same
+limiter, so its counts predict exactly what enforce would drop.
 
 ## Configuration
 
@@ -48,8 +53,9 @@ module guard
 ```
 
 `burst 3` covers the kernel's full resolution cycle (three probes one
-second apart), so normal neighbour resolution is never clamped. A
-daemon that re-probes the same target forever gets one frame per 20 s.
+second apart), so normal neighbour resolution is not clamped unless its
+target shares a bucket with another busy one. A daemon that re-probes
+the same target forever gets one frame per 20 s.
 
 - `interface` lines are **restart-only** (stop → `packetframe detach`
   → start). Class rules are **hot**: rates, bursts and monitor/enforce

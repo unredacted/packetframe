@@ -66,9 +66,14 @@ module vpp-offload
   `cores 0` puts egress-only members on one shared worker, and such a
   port cannot be steered. Trunk ports need `vlans` before they can be
   steered.
-- `steer-exempt` keeps traffic to addresses on the router itself, and
-  to anything the kernel sends through a device VPP does not own (VTIs,
-  WireGuard), on the kernel path.
+- `steer-exempt` keeps a destination on the kernel path. Nothing is
+  exempted automatically beyond broadcast and multicast, so **list
+  every one**: each address that terminates on the router for a
+  steered VLAN, and every destination the kernel sends through a device
+  VPP does not own (VTIs, WireGuard, other tunnels). An unlisted one is
+  steered into VPP and blackholed. The `packetframe_vpp_exempt_drift`
+  gauge reports kernel paths that are missing an exemption; it does not
+  add them.
 - `local-route`, `steer-direction`, `require-table-complete` and
   `vpp-binary` cover delivery to local prefixes, which side of a flow
   is steered, the wait for a converged table, and the binary path.

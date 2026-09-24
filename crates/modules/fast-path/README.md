@@ -2,9 +2,12 @@
 
 PacketFrame's forwarding module. An eBPF program at XDP ingress takes
 allowlisted traffic off the kernel's conntrack/netfilter path and
-redirects it straight to the egress NIC. Anything it does not match, or
-cannot forward, gets `XDP_PASS` and goes through normal kernel
-forwarding, so the kernel stays the fallback for every packet.
+redirects it straight to the egress NIC. Anything it does not match
+gets `XDP_PASS` and goes through normal kernel forwarding, as does
+matched traffic it cannot forward itself (no neighbour yet, fragmentation
+needed). The exceptions are drops: a destination the FIB marks
+blackhole, unreachable or prohibit, and any `block-prefix` match, are
+dropped at XDP and never reach the kernel.
 
 **Status:** production.
 
@@ -83,9 +86,12 @@ hardware and is kept for reference only
 ([tc-datapath.md](../../../docs/runbooks/tc-datapath.md)).
 
 **Reloads.** `packetframe reconfigure` (SIGHUP) applies allowlist,
-`block-prefix`, `dry-run`, `forwarding-mode`, `mss-clamp` and VLAN
-changes as deltas. Changing the attach set, `route-source`,
-`circuit-breaker` or `local-prefix` needs a restart. The full list is in
+`block-prefix`, `dry-run`, `mss-clamp` and VLAN changes as deltas.
+`forwarding-mode` is hot only between `compare` and `custom-fib`: the
+route controller exists only if the daemon started in one of those, so
+a change to or from `kernel-fib` is refused and needs a restart.
+Changing the attach set, `route-source`, `circuit-breaker` or
+`local-prefix` also needs a restart. The full list is in
 [reconfigure.md](../../../docs/runbooks/reconfigure.md).
 
 ## Operating it

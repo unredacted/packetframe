@@ -22,11 +22,14 @@ whose MAC it already holds, and after a reboot that can take hours.
 2. **Learns** `(ip, mac)` pairs from third-party ARP requests/replies
    and ICMPv6 NS/NA inside the configured prefixes. Its own addresses
    and MACs are refused, as is anything on the deny list.
-3. **Installs** missing or `FAILED` kernel neighbours as `NUD_STALE`,
-   rate limited. A STALE entry forwards immediately, and the kernel
-   confirms it with a *unicast* probe that the ACL permits. It never
-   overrides a MAC the kernel has confirmed and never installs
-   `PERMANENT` or `REACHABLE`.
+3. **Installs** kernel neighbours as `NUD_STALE`, rate limited: when
+   the entry is missing, `NONE`, `INCOMPLETE` or `FAILED`, and also when
+   a `STALE` entry holds a different MAC, once a 30-second holddown
+   since the last install has passed. A STALE entry forwards
+   immediately, and the kernel confirms it with a *unicast* probe that
+   the ACL permits. It never overrides a MAC the kernel has confirmed
+   (`REACHABLE`, `DELAY`, `PROBE`), never touches `PERMANENT` or
+   `NOARP` entries, and never installs anything but STALE.
 4. **Persists** the table as one JSON file per bridge and re-seeds the
    kernel on start and whenever the bridge comes back. Bridges are
    tracked **by name**, because platform daemons destroy and recreate
