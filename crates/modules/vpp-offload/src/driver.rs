@@ -206,6 +206,10 @@ pub struct Driver {
     /// the next one: a refusal that arrives a minute after the last
     /// success is looked at on the very next tick.
     last_steer_retry: Option<Instant>,
+    /// When the empty-table unsteer was last attempted from `Ready`, so
+    /// a NIC that keeps refusing the removal is re-asked on
+    /// [`STEER_RETRY_EVERY`], not every tick. See `poll_emptied`.
+    last_empty_unsteer: Option<Instant>,
 }
 
 impl Default for Driver {
@@ -222,6 +226,7 @@ impl Driver {
             reconnect_wanted: false,
             detector: None,
             last_steer_retry: None,
+            last_empty_unsteer: None,
         }
     }
 
@@ -438,7 +443,7 @@ impl Driver {
             }
 
             events.extend(self.poll_liveness(now, obs));
-            events.extend(self.poll_emptied(obs));
+            events.extend(self.poll_emptied(now, obs));
             events.extend(self.poll_steer_retry(now, drain_proved_idle, obs));
         }
 
@@ -534,21 +539,43 @@ impl Driver {
     /// Take steering down when the table under it is empty. See
     /// [`Event::TableEmptied`].
     ///
-    /// Level-triggered like the retry, and needing no pacing: it fires
-    /// only from `Steered`, and the transition leaves `Steered`, so it
-    /// cannot repeat until the retry has steered again — which the
-    /// empty-table gate refuses while the table is still empty.
-    fn poll_emptied(&mut self, obs: &mut dyn Observe) -> Vec<Event> {
-        if self.sup.state() == State::Steered && self.sup.is_steered() && obs.fib_empty() {
+    /// Level-triggered like the retry. From `Steered` it fires at once;
+    /// the transition leaves `Steered`, so it does not repeat there. From
+    /// `Ready` it fires only while rules REMAIN — an unsteer the NIC
+    /// refused — and is paced on [`STEER_RETRY_EVERY`], so a NIC that
+    /// keeps refusing is re-asked, not hammered (review finding: without
+    /// the `Ready` half, one refused removal left traffic diverted into
+    /// the empty table until it refilled).
+    fn poll_emptied(&mut self, now: Instant, obs: &mut dyn Observe) -> Vec<Event> {
+        let state = self.sup.state();
+        if !self.sup.is_steered() || !matches!(state, State::Steered | State::Ready) {
+            self.last_empty_unsteer = None;
+            return Vec::new();
+        }
+        if !obs.fib_empty() {
+            self.last_empty_unsteer = None;
+            return Vec::new();
+        }
+        if state == State::Ready {
+            if self
+                .last_empty_unsteer
+                .is_some_and(|t| now.duration_since(t) < STEER_RETRY_EVERY)
+            {
+                return Vec::new();
+            }
+            tracing::warn!(
+                "VPP's FIB is still empty and steering rules remain after a refused removal; \
+                 asking the NIC again"
+            );
+        } else {
             tracing::warn!(
                 "VPP's FIB is empty while steered — every steered packet would be dropped \
                  there; taking steering down so the eBPF tier carries it. It returns on its \
                  own once the table is back and every steer gate passes"
             );
-            vec![Event::TableEmptied]
-        } else {
-            Vec::new()
         }
+        self.last_empty_unsteer = Some(now);
+        vec![Event::TableEmptied]
     }
 
     /// Re-attempt a steer the module wants and does not have, once the
@@ -829,6 +856,8 @@ mod tests {
         /// The steer path refusing on its own terms — the completeness
         /// gate, or a NIC that will not take the insert.
         steer_fails: bool,
+        /// How many upcoming unsteers the NIC refuses.
+        unsteer_refusals: usize,
     }
 
     impl Effects for Fx {
@@ -843,6 +872,10 @@ mod tests {
         }
         fn unsteer(&mut self) -> Result<(), String> {
             self.calls.push("unsteer");
+            if let Some(n) = self.unsteer_refusals.checked_sub(1) {
+                self.unsteer_refusals = n;
+                return Err("ethtool: EIO".into());
+            }
             Ok(())
         }
         fn steer(&mut self) -> Result<SteerOutcome, String> {
@@ -1994,6 +2027,59 @@ mod tests {
             fx.calls
         );
         assert_eq!(d.state(), State::Steered);
+    }
+
+    /// A refused safety unsteer is asked again, paced — not dropped.
+    ///
+    /// The first version moved to `Ready` and then only watched
+    /// `Steered`, so one refused removal left the rules steering traffic
+    /// into the empty table until it refilled (review finding).
+    #[test]
+    fn a_refused_empty_table_unsteer_is_retried_on_the_interval() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            steer_permitted: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, &mut fx);
+        d.inject(at(t0, 21), Event::SteerRequested, &mut fx);
+        assert_eq!(d.state(), State::Steered);
+
+        fx.calls.clear();
+        fx.unsteer_refusals = 1;
+        w.fib_empty = true;
+        w.steer_permitted = false;
+        d.tick(at(t0, 1_000), &mut w, &mut fx);
+        assert_eq!(fx.calls.iter().filter(|c| **c == "unsteer").count(), 1);
+
+        // Within the interval: not re-asked every tick.
+        for ms in (1_100..1_000 + STEER_RETRY_EVERY.as_millis() as u64).step_by(100) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert_eq!(
+            fx.calls.iter().filter(|c| **c == "unsteer").count(),
+            1,
+            "paced: {:?}",
+            fx.calls
+        );
+
+        // After it: asked again, and this time the NIC takes it.
+        let after = 1_000 + STEER_RETRY_EVERY.as_millis() as u64 + 1_000;
+        d.tick(at(t0, after), &mut w, &mut fx);
+        assert_eq!(fx.calls.iter().filter(|c| **c == "unsteer").count(), 2);
+
+        // And once the rules are gone it stops asking.
+        fx.calls.clear();
+        for ms in (after + 1_000..after + 3 * STEER_RETRY_EVERY.as_millis() as u64).step_by(1_000) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(!fx.calls.contains(&"unsteer"), "{:?}", fx.calls);
     }
 
     /// An event the supervisor ignores must not produce actions.

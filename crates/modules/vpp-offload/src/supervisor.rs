@@ -873,7 +873,13 @@ impl Supervisor {
             // passes again, an empty table being one of them.
             // `steered` is left for the `Unsteered` acknowledgement, as
             // everywhere: a refused removal keeps the VF withheld.
-            (State::Steered, TableEmptied) => {
+            //
+            // From `Ready` too, and only while rules remain: a refused
+            // unsteer leaves `steered` set after the state has already
+            // moved, and without this arm nothing would ask again — the
+            // ordinary retry is blocked by the very empty table that
+            // started it (review finding). The driver paces that repeat.
+            (State::Steered | Ready, TableEmptied) => {
                 self.steer_wanted = true;
                 self.state = Ready;
                 if self.steered {

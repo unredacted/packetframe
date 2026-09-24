@@ -1129,6 +1129,19 @@ impl StatusSnapshot {
             // still the last word. Reading `INCOMPLETE ... sampled=0`
             // against 69k installed routes and no way to tell which is
             // current is the shape this row is answering for.
+            // Same escalation as the `Verified` arm: steered into an
+            // empty table is the fault now, whatever the stale verdict
+            // says, and the row must agree with `overall` (review
+            // finding).
+            FibSync::Unfit { .. } if self.counts.installed == 0 && self.steered => (
+                HealthState::Unhealthy,
+                Some(
+                    "0 routes installed while steered — every steered packet is dropped in \
+                     VPP. The module takes steering down on its own; if this persists the \
+                     unsteer was refused"
+                        .into(),
+                ),
+            ),
             FibSync::Unfit { summary, age } => {
                 let c = self.counts;
                 (
@@ -2872,6 +2885,42 @@ mod tests {
     /// So: `Degraded`, the age, and the CURRENT counts beside the
     /// summary, which is what lets an operator see the contradiction
     /// resolve itself rather than chase it.
+    /// The same stale `Unfit` verdict over a table that has since
+    /// drained to nothing, while steered: the row escalates with
+    /// `overall` instead of quoting the old verdict (review finding).
+    #[test]
+    fn a_stale_unfit_row_over_an_emptied_steered_table_is_unhealthy() {
+        let stale = FibSync::Unfit {
+            age: Duration::from_secs(1847),
+            summary: VerifyOutcome::default().summary(),
+        };
+        let r = snap_of(
+            &steered_supervisor(),
+            &ledger_with(0, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            stale,
+            ports_up(),
+        )
+        .report();
+        assert_eq!(r.overall, HealthState::Unhealthy);
+        let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
+        assert_eq!(
+            fib.state,
+            HealthState::Unhealthy,
+            "the row agrees with overall"
+        );
+        assert!(
+            fib.message
+                .as_deref()
+                .unwrap()
+                .contains("0 routes installed while steered"),
+            "{:?}",
+            fib.message
+        );
+    }
+
     #[test]
     fn a_verify_that_its_own_recovery_outran_is_degraded_and_dated() {
         let stale = FibSync::Unfit {
