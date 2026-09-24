@@ -192,7 +192,8 @@ current value without a mapping table:
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
-| `packetframe_vpp_fdb_misplaced` | `> 0` — a service-VLAN host sits behind a port its `local-route` does not declare |
+| `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
+| `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
 | `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
 
@@ -612,7 +613,10 @@ One line does three things at attach:
    like the loopback), so resyncs never withdraw it.
 2. **The neighbour mirror**: kernel neighbours on the backing bridge
    (the `via` of the covering fast-path `local-prefix`) become VPP
-   static neighbours on the subif. VPP never ARPs — a host the kernel
+   static neighbours, each on the subif of the member port the bridge
+   FDB learned that host behind (see "Bridge neighbours" below), so
+   hosts split across two trunks are all reachable; `port` names only
+   where the attached route sits. VPP never ARPs — a host the kernel
    has never resolved drops in VPP where the kernel would ARP-queue.
    Service hosts are static; if one ever matters, ping it from the
    router once.
@@ -655,23 +659,52 @@ itemises them per direction (divert + keep counts against the free
 slots). The exemptions install on every steered port, so
 internet→gateway traffic stays kernel-side on the transit ports too.
 
-### The FDB tripwire
+### Bridge neighbours: placed per neighbour from the FDB
 
-`local-route` names THE port a VLAN's hosts sit behind. If a host
-moves behind another member of the same bridge, the kernel follows it
-and VPP does not — so a per-minute AF_BRIDGE scan compares the
-kernel's FDB against the declarations and degrades health with the
-host named:
+A next hop on a bridge VLAN — an IX peer on `br3998`, a service host on
+`br1337`, a switch on an inter-VLAN routing VLAN — is reached through a
+member port's dot1q subif, and which port is not a property of the
+device. On a box with two trunks into one VLAN-aware bridge, spanning
+tree decides which trunk each neighbour is behind, and can change it.
+The one place that says is the kernel bridge's FDB.
+
+So each neighbour is **placed**: the module classifies the device (a
+bridge whose only member is `switch0.3998`, a VLAN device on the
+VLAN-aware bridge `switch0`), looks the neighbour's MAC up in `switch0`'s
+FDB for VLAN 3998, and programs the static neighbour on that port's
+3998 subif. Routes through it install on the same subif. A background
+thread re-reads the FDB every 2 s (never the supervision loop, which
+must not wait on netlink), and placement is checked against it every
+2 s. A neighbour that moved is added on the new subif at once, its
+routes are re-programmed (their paths name the interface, so nothing
+else would move them), and the old adjacency is removed only once they
+have — so the old trunk keeps forwarding in the meantime. An FDB entry
+that ages out or is flushed keeps the last known port — the host's own
+traffic re-teaches the bridge within moments. If the FDB stops being
+readable, placements hold at the last good read and the `fdb` row goes
+Degraded until a read succeeds.
+
+Two things to get right in config:
+
+- **Declare the vid on every trunk that can carry it.** A neighbour
+  learned behind a port without that subif cannot be reached, and its
+  routes stay unresolvable (which blocks a first steer, by design).
+- The FDB learns from frames the KERNEL sees. Steered frames go to the
+  VF, so a host whose every frame is steered would eventually age out —
+  in practice ARP, IPv6 and control traffic keep it fresh. The
+  last-known-port rule covers the gap, and the gauges below say when it
+  is not enough.
 
 ```
-fdb: degraded — the kernel bridge FDB contradicts local-route:
-  02:...:07 vlan 1337 learned on eth5 (local-route declares eth4)
+fdb: degraded — bridge neighbour(s) the kernel FDB has not placed behind
+any member port: 198.51.100.6 on br3998 — VPP cannot reach them, …
 ```
 
-`packetframe_vpp_fdb_misplaced` carries the count. Remedies, in
-order: move the host back; fix the declaration; or the topology has
-outgrown single-port delivery and needs per-host subif selection
-(B3 v2 — scoped, deliberately unbuilt until this fires).
+`packetframe_vpp_neighbours_unplaced` counts neighbours VPP cannot
+reach — never seen in the FDB, or seen behind a port that is not a
+member or lacks the VLAN's subif (the row names that port); `packetframe_vpp_neighbour_moves` counts
+moves VPP followed since start. The exemption tripwire counts a route
+out a bridge VLAN some member carries as a path VPP can take.
 
 ### Dashboards under-count steered traffic — where it went
 

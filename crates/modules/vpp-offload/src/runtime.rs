@@ -562,13 +562,10 @@ struct Core {
     /// Same real-clock pacing argument as `last_steer_audit`: a
     /// metrics poll, not a supervision deadline.
     last_null_sample: Option<std::time::Instant>,
-    /// The bridge-FDB tripwire, installed by bringup when local-routes
-    /// exist (Linux only). `None` everywhere else — tests, non-Linux,
-    /// configs with no local delivery — and silent there on purpose,
-    /// like the rx-mode kick: a missing scan is visible by its absent
-    /// log lines, not impersonated by a stub.
-    fdb_watch: Option<Box<dyn crate::fdb::FdbWatch>>,
-    last_fdb_scan: Option<std::time::Instant>,
+    /// When bridge-neighbour placement was last refreshed from the FDB
+    /// ([`ConvergenceEngine::refresh_placement`]). Real clock, paced by
+    /// [`PLACEMENT_EVERY`]: a kernel read, not a supervision deadline.
+    last_placement: Option<std::time::Instant>,
     /// The exemption tripwire: kernel paths VPP cannot take that no
     /// `steer-exempt` covers. Installed on Linux whenever steering is
     /// configured at all — the hole it finds opens the moment a port
@@ -634,9 +631,6 @@ struct Core {
     /// while blind, which is the shape it exists to catch (review
     /// finding). Same rule as the null-drop gauge's absent-not-zero.
     drift_unreadable: Option<String>,
-    /// The last completed scan's findings; kept across a failed scan
-    /// (an unreadable kernel is not evidence the hosts moved back).
-    fdb_misplaced: Vec<String>,
     steer_missing: usize,
     /// Rules still steering a port the config asks to leave unsteered,
     /// as of the last audit. Its own count because it points the other
@@ -1343,9 +1337,7 @@ impl Runtime {
                 rx_kick: Box::new(NoKick),
                 last_steer_audit: None,
                 last_null_sample: None,
-                fdb_watch: None,
-                last_fdb_scan: None,
-                fdb_misplaced: Vec::new(),
+                last_placement: None,
                 drift_scanner: None,
                 drift_uncovered: Vec::new(),
                 drift_routes: 0,
@@ -1413,13 +1405,6 @@ impl Runtime {
     /// Install the kernel rx-mode kick. The attach wiring installs the
     /// ioctl-backed [`AllmultiKick`] on Linux; everything else keeps
     /// [`NoKick`]. See [`RxModeKick`] for why this exists.
-    /// Install the bridge-FDB tripwire. Same wiring rule as the
-    /// rx-mode kick: bringup installs the real one on Linux when
-    /// local-routes exist, and nothing pretends elsewhere.
-    pub fn fdb_watch(&self, w: Box<dyn crate::fdb::FdbWatch>) {
-        self.core.borrow_mut().fdb_watch = Some(w);
-    }
-
     /// Install the exemption tripwire. Same wiring rule as the others.
     pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch + Send>) {
         self.core.borrow_mut().drift_scanner =
@@ -1696,31 +1681,6 @@ impl Runtime {
                     }
                 }
             }
-            let due = c
-                .last_fdb_scan
-                .is_none_or(|t| now.duration_since(t) >= FDB_SCAN_EVERY);
-            if due && c.fdb_watch.is_some() {
-                c.last_fdb_scan = Some(now);
-                let result = c.fdb_watch.as_mut().expect("checked above").misplaced();
-                match result {
-                    Ok(found) => {
-                        if !found.is_empty() && c.fdb_misplaced != found {
-                            tracing::warn!(
-                                hosts = ?found,
-                                "service-VLAN host(s) are behind a different member port \
-                                 than their local-route declares; VPP is delivering their \
-                                 prefix to the declared port. Move the host back, fix the \
-                                 declaration, or this topology needs per-host delivery \
-                                 (B3 v2)"
-                            );
-                        }
-                        c.fdb_misplaced = found;
-                    }
-                    // Keep the previous verdict: an unreadable kernel
-                    // is not evidence the hosts moved back.
-                    Err(e) => tracing::debug!(error = %e, "bridge-FDB scan failed"),
-                }
-            }
         }
         let c = self.core.borrow();
         // ONE reading, used for both the verdict and the question of
@@ -1758,7 +1718,17 @@ impl Runtime {
             steer_audit_error: c.steer_audit_error.clone(),
             shadowed_routes: c.engine.shadowed_routes(),
             null_drops: c.engine.null_drops(),
-            fdb_misplaced: c.fdb_misplaced.clone(),
+            neighbours_unplaced: c
+                .engine
+                .unplaced_neighbours()
+                .into_iter()
+                .map(|(nh, dev, port)| match port {
+                    None => format!("{nh} on {dev}"),
+                    Some(p) => format!("{nh} on {dev} (behind {p}, which has no subif for it)"),
+                })
+                .collect(),
+            neighbour_moves: c.engine.placement_moves(),
+            fdb_unreadable: c.engine.fdb_unreadable().map(str::to_string),
             drift_uncovered: c.drift_uncovered.clone(),
             drift_routes: c.drift_routes,
             drift_pending: c.drift_pending,
@@ -1812,7 +1782,11 @@ const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
 /// other than their `local-route` declaration. One netlink dump; a
 /// moved host is a provisioning-scale event, so a minute of latency
 /// on the tripwire costs nothing.
-const FDB_SCAN_EVERY: Duration = Duration::from_secs(60);
+/// How often bridge-neighbour placement is checked against the FDB. Cheap
+/// on this thread — the kernel topology serves a snapshot its own thread
+/// keeps fresh (`topology::FDB_REFRESH`) — so the move-detection window
+/// is the two intervals together, a few seconds.
+const PLACEMENT_EVERY: Duration = Duration::from_secs(2);
 
 /// How often to check the kernel's routes against the exemptions.
 ///
@@ -1939,10 +1913,14 @@ pub struct RuntimeStatus {
     pub shadowed_routes: u64,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
-    /// Hosts the bridge FDB places behind a different port than their
-    /// `local-route` declares, one line each. Empty = the tripwire is
-    /// quiet (or not installed).
-    pub fdb_misplaced: Vec<String>,
+    /// Bridge neighbours the FDB has never placed behind a member port,
+    /// `"<nexthop> on <device>"` each: their routes are unresolvable.
+    pub neighbours_unplaced: Vec<String>,
+    /// Neighbours moved behind another bridge port since start.
+    pub neighbour_moves: u64,
+    /// Why the bridge FDB cannot be read, if it cannot: placements hold at
+    /// the last good read, and a move made meanwhile goes unfollowed.
+    pub fdb_unreadable: Option<String>,
     /// Kernel paths VPP cannot take that no `steer-exempt` covers.
     pub drift_uncovered: Vec<String>,
     /// How many routes those findings stand for — the gauge's value.
@@ -2727,8 +2705,20 @@ impl Observe for ObserveView {
             last_drain_error,
             completeness,
             fresh_hold,
+            last_placement,
             ..
         } = &mut *c;
+        // Follow bridge neighbours spanning tree moved, before this
+        // batch: a move re-queues the neighbour's routes into the source,
+        // and they go out in the same drain as everything else.
+        let placement_due = last_placement.is_none_or(|t| t.elapsed() >= PLACEMENT_EVERY);
+        if placement_due {
+            *last_placement = Some(std::time::Instant::now());
+            if let Err(e) = engine.refresh_placement(source.as_ref()) {
+                *last_drain_error = Some(e.to_string());
+                return Err(e.to_string());
+            }
+        }
         // `?`-equivalent: a failed neighbour programming must not be
         // followed by a route drain that installs paths through the
         // adjacency that just failed to land.
@@ -2744,6 +2734,17 @@ impl Observe for ObserveView {
                     }
                 })
                 .map_err(|e| e.to_string()),
+        };
+        // Every re-queued route of a moved neighbour has gone out once the
+        // drain is idle with nothing left in the source: only now does
+        // the old adjacency stop carrying traffic, so only now is it
+        // removed.
+        let r = match r {
+            Ok(crate::driver::Drain::Idle) if source.backlog() == 0 => engine
+                .settle_moves()
+                .map(|()| crate::driver::Drain::Idle)
+                .map_err(|e| e.to_string()),
+            other => other,
         };
         // Set on failure and cleared on success, in one place, for the
         // same reason `note_persist` is: a field that only ever gets set

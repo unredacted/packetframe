@@ -239,23 +239,49 @@ impl Capacity {
 pub enum NexthopTarget {
     /// A member port's VF — the ordinary case.
     Vf { port: String },
-    /// A VLAN nexthop (the br1337 / FDB-pin topology) → VPP sub-interface
-    /// on the member VF.
+    /// A VLAN nexthop → VPP sub-interface on the member VF: fixed by the
+    /// device for [`DevKind::PortVlan`], chosen per neighbour from the
+    /// bridge FDB for [`DevKind::BridgeVlan`] (see [`crate::topology`]).
     Subif { port: String, vlan: u16 },
 }
 
+use crate::topology::DevKind;
+
 /// Kernel-device → VPP-interface policy. Devices that are neither a
-/// member port nor a known VLAN nexthop (management, tunnels) are
-/// **explicitly excluded** rather than guessed at, and every route
-/// resolving only through them counts as `Unresolvable`.
+/// member port nor reachable through one (management, tunnels, a bridge
+/// of unknown shape) are **explicitly excluded** rather than guessed at,
+/// and every route resolving only through them counts as `Unresolvable`.
 #[derive(Debug, Clone, Default)]
 pub struct NexthopMap {
     /// Nexthop address → egress device, learned from the NeighborResolver.
     device_of: BTreeMap<IpAddr, String>,
     /// Member ports (the `port` config lines).
     members: Vec<String>,
-    /// VLAN device name → (underlying member port, vid).
-    vlans: BTreeMap<String, (String, u16)>,
+    /// Each member's declared `vlans`: the only subifs attach creates, so
+    /// the only VLAN targets that can resolve.
+    port_vlans: BTreeMap<String, Vec<u16>>,
+    /// Devices classified by [`crate::topology::classify`]. `Some(None)`
+    /// is a shape VPP cannot reach through; a device with no entry at all
+    /// is treated as [`DevKind::Plain`], which is what every device was
+    /// before placement existed.
+    kinds: BTreeMap<String, Option<DevKind>>,
+    /// `BridgeVlan` neighbour → the member port its MAC was last learned
+    /// behind, and on which bridge and VLAN. Kept across an FDB entry
+    /// ageing out or a spanning-tree flush — the last known port beats
+    /// no port, and the host's own traffic re-teaches the bridge within a
+    /// moment — and replaced only by a fresh sighting elsewhere. Scoped
+    /// to the bridge and VLAN it was seen on: a nexthop that reappears on
+    /// a different one has no last known port there.
+    placed: BTreeMap<IpAddr, Placement>,
+}
+
+/// Where a bridge neighbour was last seen: `port`, in `bridge`'s FDB for
+/// `vid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub bridge: String,
+    pub vid: u16,
+    pub port: String,
 }
 
 impl NexthopMap {
@@ -266,9 +292,27 @@ impl NexthopMap {
         }
     }
 
-    /// Register a VLAN device as a sub-interface of a member port.
-    pub fn add_vlan(&mut self, dev: impl Into<String>, port: impl Into<String>, vid: u16) {
-        self.vlans.insert(dev.into(), (port.into(), vid));
+    /// Declare which VLAN subifs each member carries (its `vlans`).
+    pub fn with_port_vlans(mut self, vlans: impl IntoIterator<Item = (String, Vec<u16>)>) -> Self {
+        self.port_vlans = vlans.into_iter().collect();
+        self
+    }
+
+    /// Record what a device is. See [`Self::kinds`].
+    pub fn set_kind(&mut self, dev: impl Into<String>, kind: Option<DevKind>) {
+        self.kinds.insert(dev.into(), kind);
+    }
+
+    /// Whether `dev` has been classified.
+    pub fn classified(&self, dev: &str) -> bool {
+        self.kinds.contains_key(dev)
+    }
+
+    /// Forget every classification, so the next sighting re-reads the
+    /// kernel: UniFi provisioning can recreate interfaces, and a resync
+    /// is where the engine starts from what is true now.
+    pub fn forget_kinds(&mut self) {
+        self.kinds.clear();
     }
 
     /// Record which device a nexthop address egresses through. Fed by
@@ -276,6 +320,45 @@ impl NexthopMap {
     /// neighbors.
     pub fn set_device(&mut self, nexthop: IpAddr, dev: impl Into<String>) {
         self.device_of.insert(nexthop, dev.into());
+    }
+
+    /// Record where a `BridgeVlan` neighbour was seen.
+    pub fn place(&mut self, nexthop: IpAddr, placement: Placement) {
+        self.placed.insert(nexthop, placement);
+    }
+
+    /// The port a neighbour was last seen behind on `bridge`/`vid` — the
+    /// scope check that keeps a nexthop moved to another bridge from
+    /// inheriting its old trunk.
+    pub fn placement_on(&self, nexthop: &IpAddr, bridge: &str, vid: u16) -> Option<&str> {
+        self.placed
+            .get(nexthop)
+            .filter(|p| p.bridge == bridge && p.vid == vid)
+            .map(|p| p.port.as_str())
+    }
+
+    /// The port a neighbour is placed behind on its CURRENT device's
+    /// bridge and VLAN, if any.
+    pub fn placement(&self, nexthop: &IpAddr) -> Option<&str> {
+        let (bridge, vid) = self.bridge_vlan(nexthop)?;
+        self.placement_on(nexthop, bridge, vid)
+    }
+
+    /// `(bridge, vid)` when `nexthop`'s device is a [`DevKind::BridgeVlan`].
+    pub fn bridge_vlan(&self, nexthop: &IpAddr) -> Option<(&str, u16)> {
+        match self.kind_of(self.device_of.get(nexthop)?)? {
+            DevKind::BridgeVlan { bridge, vid } => Some((bridge.as_str(), *vid)),
+            _ => None,
+        }
+    }
+
+    /// Every known nexthop on a `BridgeVlan` device, with that device.
+    pub fn bridge_nexthops(&self) -> Vec<(IpAddr, String)> {
+        self.device_of
+            .iter()
+            .filter(|(nh, _)| self.bridge_vlan(nh).is_some())
+            .map(|(nh, dev)| (*nh, dev.clone()))
+            .collect()
     }
 
     /// Forget every learned nexthop→device pair, keeping the members and
@@ -290,6 +373,10 @@ impl NexthopMap {
     /// verification cannot catch it: verification checks that a route
     /// exists on an interface we own, deliberately not that its nexthop
     /// is still the one we intended.
+    ///
+    /// Placements survive: they describe where a MAC was last seen, not
+    /// whether the source still reports the neighbour, and a resync that
+    /// re-learns it re-reads the FDB anyway.
     pub fn forget_devices(&mut self) {
         self.device_of.clear();
     }
@@ -301,43 +388,63 @@ impl NexthopMap {
     /// path is insert-only, so a nexthop the source reports as lost keeps
     /// its last known device until the next full resync, and routes
     /// naming it resolve as reachable through a stale interface rather
-    /// than being classified unresolvable.
+    /// than being classified unresolvable. A lost neighbour's placement
+    /// goes with it.
     pub fn forget_device(&mut self, nexthop: &IpAddr) {
         self.device_of.remove(nexthop);
+        self.placed.remove(nexthop);
     }
 
-    /// Resolve one nexthop, or `None` if its device is excluded.
+    /// Resolve one nexthop, or `None` if its device is excluded or, for
+    /// a bridge neighbour, not yet placed behind a member.
     pub fn resolve(&self, nexthop: &IpAddr) -> Option<NexthopTarget> {
-        self.target_for_device(self.device_of.get(nexthop)?)
+        let dev = self.device_of.get(nexthop)?;
+        self.target(dev, self.placement(nexthop))
     }
 
-    /// The same mapping policy, applied to a device name this map has not
-    /// been told about yet.
+    /// The same mapping policy for a device and candidate placement this
+    /// map has not been told about yet.
     ///
     /// Exists so the delta path can ask "where would this nexthop land?"
     /// before committing the nexthop→device pair. Programming the
     /// adjacency has to happen first, and recording the mapping in order
     /// to look the interface up would make every route through the
     /// nexthop installable before VPP had acknowledged anything.
-    pub fn target_for_device(&self, dev: &str) -> Option<NexthopTarget> {
-        if let Some((port, vlan)) = self.vlans.get(dev) {
-            // A VLAN whose underlying port was never made a member is
-            // still excluded: the subif has nothing to sit on.
-            return self
-                .members
-                .iter()
-                .any(|m| m == port)
+    pub fn target(&self, dev: &str, placed: Option<&str>) -> Option<NexthopTarget> {
+        let subif = |port: &str, vlan: u16| {
+            (self.is_member(port) && self.port_vlans.get(port).is_some_and(|v| v.contains(&vlan)))
                 .then(|| NexthopTarget::Subif {
-                    port: port.clone(),
-                    vlan: *vlan,
-                });
-        }
-        self.members
-            .iter()
-            .any(|m| m == dev)
-            .then(|| NexthopTarget::Vf {
+                    port: port.to_string(),
+                    vlan,
+                })
+        };
+        match self.kind_of(dev)? {
+            DevKind::Plain => self.is_member(dev).then(|| NexthopTarget::Vf {
                 port: dev.to_string(),
-            })
+            }),
+            // A VLAN whose port was never made a member, or never given
+            // that vid, is still excluded: the subif has nothing to sit on.
+            DevKind::PortVlan { port, vid } => subif(port, *vid),
+            DevKind::BridgeVlan { vid, .. } => subif(placed?, *vid),
+        }
+    }
+
+    /// What `dev` is, treating an unclassified device as
+    /// [`DevKind::Plain`]; `None` for a shape VPP cannot reach through.
+    pub fn kind(&self, dev: &str) -> Option<&DevKind> {
+        self.kind_of(dev)
+    }
+
+    fn kind_of(&self, dev: &str) -> Option<&DevKind> {
+        const PLAIN: DevKind = DevKind::Plain;
+        match self.kinds.get(dev) {
+            Some(k) => k.as_ref(),
+            None => Some(&PLAIN),
+        }
+    }
+
+    fn is_member(&self, port: &str) -> bool {
+        self.members.iter().any(|m| m == port)
     }
 
     /// Resolve a whole nexthop set. Returns only the resolvable targets;
@@ -843,8 +950,12 @@ mod tests {
 
     #[test]
     fn vlan_nexthop_maps_to_subif_only_when_port_is_a_member() {
-        let mut m = member_map();
-        m.add_vlan("br1337", "eth4", 1337);
+        let port_vlan = Some(DevKind::PortVlan {
+            port: "eth4".into(),
+            vid: 1337,
+        });
+        let mut m = member_map().with_port_vlans([("eth4".to_string(), vec![1337])]);
+        m.set_kind("br1337", port_vlan.clone());
         m.set_device(nh(192, 0, 2, 20), "br1337");
         assert_eq!(
             m.resolve(&nh(192, 0, 2, 20)),
@@ -856,10 +967,83 @@ mod tests {
 
         // Same VLAN over a non-member port: the subif has nothing to sit
         // on, so it must be excluded rather than silently invented.
-        let mut orphan = NexthopMap::new(vec!["eth5".into()]);
-        orphan.add_vlan("br1337", "eth4", 1337);
+        let mut orphan = NexthopMap::new(vec!["eth5".into()])
+            .with_port_vlans([("eth4".to_string(), vec![1337])]);
+        orphan.set_kind("br1337", port_vlan.clone());
         orphan.set_device(nh(192, 0, 2, 20), "br1337");
         assert_eq!(orphan.resolve(&nh(192, 0, 2, 20)), None);
+
+        // A member that does not carry the vid has no subif for it.
+        let mut undeclared = member_map();
+        undeclared.set_kind("br1337", port_vlan);
+        undeclared.set_device(nh(192, 0, 2, 20), "br1337");
+        assert_eq!(undeclared.resolve(&nh(192, 0, 2, 20)), None);
+    }
+
+    /// The trunk case: one bridge VLAN, neighbours behind either port,
+    /// each resolving to the subif of the port its MAC is placed behind.
+    #[test]
+    fn bridge_vlan_neighbours_resolve_to_where_they_are_placed() {
+        let bridge = Some(DevKind::BridgeVlan {
+            bridge: "switch0".into(),
+            vid: 3998,
+        });
+        let mut m = member_map().with_port_vlans([
+            ("eth4".to_string(), vec![3998]),
+            ("eth5".to_string(), vec![3998]),
+        ]);
+        m.set_kind("br3998", bridge);
+        let (a, b, c) = (nh(192, 0, 2, 31), nh(192, 0, 2, 32), nh(192, 0, 2, 33));
+        for n in [a, b, c] {
+            m.set_device(n, "br3998");
+        }
+        let at = |port: &str| Placement {
+            bridge: "switch0".into(),
+            vid: 3998,
+            port: port.into(),
+        };
+        m.place(a, at("eth4"));
+        m.place(b, at("eth5"));
+        let sub = |port: &str| {
+            Some(NexthopTarget::Subif {
+                port: port.into(),
+                vlan: 3998,
+            })
+        };
+        assert_eq!(m.resolve(&a), sub("eth4"));
+        assert_eq!(m.resolve(&b), sub("eth5"));
+        assert_eq!(m.resolve(&c), None, "never seen in the FDB: unplaced");
+        assert_eq!(m.bridge_nexthops().len(), 3);
+
+        // A move is a re-placement.
+        m.place(a, at("eth5"));
+        assert_eq!(m.resolve(&a), sub("eth5"));
+
+        // Reappearing on another bridge VLAN, the old trunk does not
+        // follow it there.
+        m.set_kind(
+            "br3999",
+            Some(DevKind::BridgeVlan {
+                bridge: "switch0".into(),
+                vid: 3999,
+            }),
+        );
+        m.set_device(a, "br3999");
+        assert_eq!(m.placement(&a), None);
+        assert_eq!(m.resolve(&a), None);
+        m.set_device(a, "br3998");
+
+        // A lost neighbour loses its placement.
+        m.forget_device(&a);
+        assert_eq!(m.placement(&a), None);
+    }
+
+    #[test]
+    fn an_unreachable_shape_is_excluded() {
+        let mut m = member_map();
+        m.set_kind("brwide", None);
+        m.set_device(nh(192, 0, 2, 40), "brwide");
+        assert_eq!(m.resolve(&nh(192, 0, 2, 40)), None);
     }
 
     #[test]

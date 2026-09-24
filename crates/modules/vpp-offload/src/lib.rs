@@ -75,6 +75,7 @@ pub mod startup_conf;
 pub mod status;
 pub mod steer;
 pub mod supervisor;
+pub mod topology;
 pub mod verify;
 pub mod vpp_api;
 

@@ -186,6 +186,21 @@ pub trait RouteSource {
     /// exactly the bug above, back again.
     fn requeue(&self, changes: SourceChanges);
 
+    /// Queue every route through any of `nexthops` for re-programming.
+    ///
+    /// For a neighbour that moved behind another bridge port: its routes
+    /// were installed on the old port's subif, VPP paths name their
+    /// interface explicitly, and nothing about the ROUTE changed — so the
+    /// source would never re-announce them. Fill-if-absent, like
+    /// [`Self::requeue`]: a route already queued is newer and wins.
+    ///
+    /// A default no-op, because only the live feed can answer and every
+    /// static fixture has nothing to queue. The delegating
+    /// `Arc<RouteFeed>` forwards it explicitly, and a test pins that —
+    /// the no-default rule on `requeue` exists because that wrapper once
+    /// inherited a default and silently dropped work.
+    fn requeue_via(&self, _nexthops: &[IpAddr]) {}
+
     /// How many changes are queued but not yet handed over.
     ///
     /// Reported so a source that is filling faster than the engine drains
@@ -488,6 +503,29 @@ pub struct ConvergenceEngine {
     pending: PendingMap,
     ledger: RouteLedger,
     nexthops: NexthopMap,
+    /// Where kernel devices lead and which bridge port a MAC is behind
+    /// ([`crate::topology`]). [`NoTopology`](crate::topology::NoTopology)
+    /// unless bring-up installs the kernel's.
+    topology: Box<dyn crate::topology::Topology>,
+    /// The last good FDB. Placement consults it; a failed read keeps it.
+    fdb: crate::topology::FdbSnapshot,
+    /// Why the latest FDB read failed, until one succeeds — health says
+    /// placements are running on a stale table, because a spanning-tree
+    /// move made while blind would otherwise leave routes on the old
+    /// trunk with every surface clean.
+    fdb_error: Option<String>,
+    /// Old adjacencies of moved neighbours, `(sw_if_index, nexthop)`,
+    /// removed only once the routes naming them have been re-programmed
+    /// ([`Self::settle_moves`]). Deleting first would leave every route
+    /// still on the old subif without an adjacency for as long as the
+    /// re-programming takes; kept, the old trunk forwards where it still
+    /// can until nothing uses it.
+    moved_from: Vec<(u32, IpAddr)>,
+    /// Neighbours moved behind a different bridge port since start.
+    placement_moves: u64,
+    /// Bridge neighbours whose placement the delta path just changed,
+    /// for `apply_changes` to hand to [`RouteSource::requeue_via`].
+    placement_changed: Vec<IpAddr>,
     /// Static neighbours VPP has ACKNOWLEDGED holding, keyed by
     /// `(sw_if_index, nexthop)` with the MAC as the value.
     ///
@@ -604,6 +642,10 @@ impl ConvergenceEngine {
         families: FamilyPolicy,
         loopback: packetframe_common::config::Ipv4Prefix,
     ) -> Self {
+        let port_vlans: Vec<(String, Vec<u16>)> = ports
+            .iter()
+            .map(|p| (p.port.clone(), p.vlans.clone()))
+            .collect();
         Self {
             api_socket: api_socket.into(),
             transport: None,
@@ -617,7 +659,13 @@ impl ConvergenceEngine {
             port_index: PortIndex::default(),
             pending: PendingMap::new(),
             ledger: RouteLedger::new(Capacity::new(high_water_routes)),
-            nexthops: NexthopMap::new(members),
+            nexthops: NexthopMap::new(members).with_port_vlans(port_vlans),
+            topology: Box::new(crate::topology::NoTopology),
+            fdb: crate::topology::FdbSnapshot::default(),
+            fdb_error: None,
+            moved_from: Vec::new(),
+            placement_moves: 0,
+            placement_changed: Vec::new(),
             neighbours_installed: std::collections::HashMap::new(),
             neighbours_unacked: std::collections::HashSet::new(),
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
@@ -641,24 +689,222 @@ impl ConvergenceEngine {
         self
     }
 
-    /// Declare the locally terminated prefixes this engine delivers.
-    ///
-    /// This is the ONLY caller of [`NexthopMap::add_vlan`], and the
-    /// preconditions the old NOTE here demanded now hold by
-    /// construction: `create_vlan_subif` is whitelisted, attach creates
-    /// the subifs from the same config that names them here, and
-    /// `attach_devices` records the indices VPP assigns into
-    /// [`PortIndex`] under `(port, Some(vid))` — so a `Subif` target
-    /// resolves instead of deferring its routes forever. Registered at
-    /// construction because the VLAN policy is static config;
-    /// `forget_devices` deliberately keeps it.
+    /// Declare the locally terminated prefixes this engine delivers:
+    /// the attached route and the shadowing. Their hosts' neighbours are
+    /// placed like any other bridge neighbour — per host, from the FDB —
+    /// through [`Self::with_topology`].
     pub fn with_local_routes(mut self, routes: Vec<crate::LocalRoute>) -> Self {
-        for lr in &routes {
-            self.nexthops
-                .add_vlan(lr.kernel_dev.clone(), lr.port.clone(), lr.vlan);
-        }
         self.local_routes = routes;
         self
+    }
+
+    /// Install the kernel view placement reads ([`crate::topology`]).
+    pub fn with_topology(mut self, topology: Box<dyn crate::topology::Topology>) -> Self {
+        self.topology = topology;
+        self
+    }
+
+    /// Classify `dev` on first sight. A failed read is NOT cached: the
+    /// device stays unclassified, and the next sighting — every placement
+    /// refresh walks the neighbours — asks again.
+    fn classify(&mut self, dev: &str) {
+        if self.nexthops.classified(dev) {
+            return;
+        }
+        match self.topology.classify(dev) {
+            Ok(kind) => self.nexthops.set_kind(dev, kind),
+            Err(e) => {
+                tracing::debug!(device = %dev, error = %e, "device classification unreadable; will retry")
+            }
+        }
+    }
+
+    /// Take the latest FDB. A failed read keeps the last snapshot — an
+    /// unreadable kernel is not evidence anything moved — and is kept as
+    /// [`Self::fdb_unreadable`] until a read succeeds.
+    fn read_fdb(&mut self) {
+        match self.topology.fdb() {
+            Ok(fdb) => {
+                self.fdb = fdb;
+                self.fdb_error = None;
+            }
+            Err(e) => {
+                if self.fdb_error.is_none() {
+                    tracing::warn!(error = %e, "bridge FDB unreadable; placements hold at the last good read");
+                }
+                self.fdb_error = Some(e);
+            }
+        }
+    }
+
+    /// Why the bridge FDB cannot be read right now, if it cannot.
+    pub fn fdb_unreadable(&self) -> Option<&str> {
+        self.fdb_error.as_deref()
+    }
+
+    /// Where the FDB puts `(dev, mac)`, for a `BridgeVlan` device — or
+    /// `nh`'s existing placement on the same bridge and VLAN when the FDB
+    /// has no entry (aged out, flushed by a spanning-tree change): the
+    /// last known port.
+    ///
+    /// `reread` takes the latest FDB on a miss, for the delta path, where
+    /// a neighbour can be learned between refreshes. Cheap: the live
+    /// topology serves a snapshot its own thread keeps fresh.
+    fn placement_for(
+        &mut self,
+        nh: IpAddr,
+        dev: &str,
+        mac: [u8; 6],
+        reread: bool,
+    ) -> Option<crate::sink::Placement> {
+        let Some(crate::topology::DevKind::BridgeVlan { bridge, vid }) =
+            self.nexthops.kind(dev).cloned()
+        else {
+            return None;
+        };
+        let at = |port: &str| crate::sink::Placement {
+            bridge: bridge.clone(),
+            vid,
+            port: port.to_string(),
+        };
+        if let Some(p) = self.fdb.port_of(&bridge, vid, mac) {
+            return Some(at(p));
+        }
+        if reread {
+            self.read_fdb();
+            if let Some(p) = self.fdb.port_of(&bridge, vid, mac) {
+                return Some(at(p));
+            }
+        }
+        self.nexthops.placement_on(&nh, &bridge, vid).map(at)
+    }
+
+    /// Follow neighbours that moved behind a different bridge port.
+    ///
+    /// Takes the latest FDB and re-places every `BridgeVlan` neighbour:
+    /// the adjacency is added on the new port's subif, every route
+    /// through the neighbour is handed back to the source for
+    /// re-programming — its VPP paths name the old interface, and nothing
+    /// about the route itself changed, so nothing else would move them —
+    /// and the old adjacency is removed by [`Self::settle_moves`] once
+    /// they have. A neighbour seen in the FDB for the first time is
+    /// placed the same way: its routes were unresolvable until now.
+    ///
+    /// Returns how many neighbours were (re)placed. A neighbour missing
+    /// from the FDB keeps its last port.
+    pub fn refresh_placement(&mut self, src: &dyn RouteSource) -> Result<usize, EngineError> {
+        // Disconnected: nothing can be programmed, and recording a move
+        // whose adjacency never landed would make every later refresh see
+        // it as done. Reconnection resyncs, which places from scratch.
+        if self.transport.is_none() {
+            return Ok(0);
+        }
+        self.read_fdb();
+        let mut seen: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
+        src.for_each_neighbour(&mut |ip, dev, mac| seen.push((ip, dev.to_string(), mac)));
+        let mut changed = Vec::new();
+        for (ip, dev, mac) in seen {
+            // Retries a classification an earlier read could not make.
+            self.classify(&dev);
+            if self.nexthops.bridge_vlan(&ip).is_none() {
+                continue;
+            }
+            let Some(placed) = self.placement_for(ip, &dev, mac, false) else {
+                continue;
+            };
+            let before = self.nexthops.placement(&ip).map(str::to_string);
+            if before.as_deref() == Some(placed.port.as_str()) {
+                continue;
+            }
+            let to = placed.port.clone();
+            self.move_neighbour(ip, &dev, mac, placed)?;
+            if let Some(from) = before {
+                self.placement_moves += 1;
+                tracing::info!(
+                    nexthop = %ip, device = %dev, from = %from, to = %to,
+                    "neighbour moved behind another bridge port; re-programming its routes"
+                );
+            }
+            changed.push(ip);
+        }
+        if !changed.is_empty() {
+            src.requeue_via(&changed);
+        }
+        Ok(changed.len())
+    }
+
+    /// Put `ip`'s adjacency behind its new port: add it on the new
+    /// subif, record the placement once VPP acknowledged, and leave the
+    /// old adjacency for [`Self::settle_moves`] to remove once the routes
+    /// have moved.
+    fn move_neighbour(
+        &mut self,
+        ip: IpAddr,
+        dev: &str,
+        mac: [u8; 6],
+        placed: crate::sink::Placement,
+    ) -> Result<(), EngineError> {
+        let old = self
+            .nexthops
+            .resolve(&ip)
+            .and_then(|t| self.port_index.get(&t));
+        let new = self
+            .nexthops
+            .target(dev, Some(&placed.port))
+            .and_then(|t| self.port_index.get(&t));
+        if let Some(idx) = new {
+            if self.neighbours_installed.get(&(idx, ip)) != Some(&mac) {
+                self.send_neighbour(ip, idx, mac, true)?;
+            }
+        }
+        if let Some(idx) = old.filter(|o| Some(*o) != new) {
+            self.moved_from.push((idx, ip));
+        }
+        self.nexthops.place(ip, placed);
+        Ok(())
+    }
+
+    /// Remove the old adjacencies of moved neighbours, now that the
+    /// routes naming them have been re-programmed. The runtime calls
+    /// this when the drain is idle and the source has nothing queued —
+    /// the moment every re-queued route has gone out. An entry whose
+    /// neighbour has since moved BACK to that subif is kept.
+    pub fn settle_moves(&mut self) -> Result<(), EngineError> {
+        while let Some((idx, ip)) = self.moved_from.pop() {
+            let current = self
+                .nexthops
+                .resolve(&ip)
+                .and_then(|t| self.port_index.get(&t));
+            if current == Some(idx) || !self.neighbours_installed.contains_key(&(idx, ip)) {
+                continue;
+            }
+            if let Err(e) = self.send_neighbour(ip, idx, [0; 6], false) {
+                self.moved_from.push((idx, ip));
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Bridge neighbours VPP cannot reach, as `(nexthop, device, port)`:
+    /// never seen in the FDB (`port` `None`), or seen behind a port that
+    /// is not a member or does not carry the VLAN (`port` named). Either
+    /// way routes through them are unresolvable.
+    pub fn unplaced_neighbours(&self) -> Vec<(IpAddr, String, Option<String>)> {
+        self.nexthops
+            .bridge_nexthops()
+            .into_iter()
+            .filter(|(nh, _)| self.nexthops.resolve(nh).is_none())
+            .map(|(nh, dev)| {
+                let port = self.nexthops.placement(&nh).map(str::to_string);
+                (nh, dev, port)
+            })
+            .collect()
+    }
+
+    /// Neighbours moved behind another bridge port since start.
+    pub fn placement_moves(&self) -> u64 {
+        self.placement_moves
     }
 
     /// Whether the mirror's view of `p` is suppressed by a local-route.
@@ -1184,6 +1430,19 @@ impl ConvergenceEngine {
             });
         }
 
+        // A neighbour VPP holds on one of our interfaces other than the
+        // one it is placed behind now — it moved while nobody was
+        // programming. Left, VPP would hold it on two subifs.
+        let placed_on: std::collections::HashMap<IpAddr, u32> =
+            wanted.iter().map(|(ip, idx, _)| (*ip, *idx)).collect();
+        let moved_away: Vec<(u32, IpAddr)> = existing
+            .iter()
+            .filter(|(idx, ip, _)| {
+                placed_on.get(ip).is_some_and(|w| w != idx) && self.port_index.owns(*idx)
+            })
+            .map(|(idx, ip, _)| (*idx, *ip))
+            .collect();
+
         let mut programmed = 0u64;
         let mut kept = 0u64;
         for (ip, sw_if_index, mac_address) in wanted {
@@ -1194,6 +1453,8 @@ impl ConvergenceEngine {
             self.send_neighbour(ip, sw_if_index, mac_address, true)?;
             programmed += 1;
         }
+        // Removed once the resync's routes are out, like any move.
+        self.moved_from.extend(moved_away);
         if kept > 0 {
             tracing::info!(
                 kept,
@@ -1546,6 +1807,9 @@ impl ConvergenceEngine {
                 return Err(e);
             }
         }
+        if !self.placement_changed.is_empty() {
+            src.requeue_via(&std::mem::take(&mut self.placement_changed));
+        }
         for (prefix, nhs) in changes.routes {
             // Shadowed by a local-route: the mirror's view inside a
             // locally delivered prefix never reaches the pending map,
@@ -1593,11 +1857,17 @@ impl ConvergenceEngine {
                 // when the send FAILED: the mapping survived the error,
                 // so the next drain resolved every pending route through
                 // an adjacency VPP had refused and installed them clean.
-                if let Some(idx) = self
+                self.classify(&dev);
+                let placed = self.placement_for(nh, &dev, mac, true);
+                let old = self
                     .nexthops
-                    .target_for_device(&dev)
-                    .and_then(|t| self.port_index.get(&t))
-                {
+                    .resolve(&nh)
+                    .and_then(|t| self.port_index.get(&t));
+                let new = self
+                    .nexthops
+                    .target(&dev, placed.as_ref().map(|p| p.port.as_str()))
+                    .and_then(|t| self.port_index.get(&t));
+                if let Some(idx) = new {
                     // Identical to what VPP acknowledged: nothing to
                     // send. The delta path re-learning a neighbour at
                     // daemon start is routine — the resolver re-reads
@@ -1608,6 +1878,24 @@ impl ConvergenceEngine {
                     if self.neighbours_installed.get(&(idx, nh)) != Some(&mac) {
                         self.send_neighbour(nh, idx, mac, true)?;
                     }
+                }
+                // Behind a different port than before: the old adjacency
+                // goes once its routes have moved (`settle_moves`), or VPP
+                // would hold the neighbour on two subifs.
+                if let Some(idx) = old.filter(|o| Some(*o) != new) {
+                    self.moved_from.push((idx, nh));
+                }
+                if let Some(port) = placed {
+                    // Placed somewhere new — moved, or seen in the FDB for
+                    // the first time: its routes were installed on the old
+                    // subif or not at all, and need re-programming.
+                    if new.is_some() && old != new {
+                        if old.is_some() {
+                            self.placement_moves += 1;
+                        }
+                        self.placement_changed.push(nh);
+                    }
+                    self.nexthops.place(nh, port);
                 }
                 // Recorded even for a device VPP does not own, where the
                 // send above never happened: `resolve` answers `None` for
@@ -1659,7 +1947,19 @@ impl ConvergenceEngine {
         // neighbour source is broken. Silently keeping stale mappings
         // would forward into the hole instead.
         self.nexthops.forget_devices();
-        src.for_each_neighbour(&mut |nh, dev, _mac| self.nexthops.set_device(nh, dev));
+        // Re-read from the kernel: interfaces can be recreated under a
+        // running daemon, and a resync starts from what is true now.
+        self.nexthops.forget_kinds();
+        self.read_fdb();
+        let mut seen: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
+        src.for_each_neighbour(&mut |nh, dev, mac| seen.push((nh, dev.to_string(), mac)));
+        for (nh, dev, mac) in seen {
+            self.classify(&dev);
+            if let Some(port) = self.placement_for(nh, &dev, mac, false) {
+                self.nexthops.place(nh, port);
+            }
+            self.nexthops.set_device(nh, dev);
+        }
 
         let mut plan = ResyncPlan::default();
         // The source's prefix set, so withdrawals are everything the
@@ -1889,6 +2189,7 @@ impl ConvergenceEngine {
         self.loop_index = None;
         // The neighbour ledger describes the dead instance's table.
         self.neighbours_installed.clear();
+        self.moved_from.clear();
         // And so does the doubt about it: whatever the dead VPP did or did
         // not apply is moot, and carrying the keys over would make the
         // replacement's first delta pay for a dump that can only confirm
