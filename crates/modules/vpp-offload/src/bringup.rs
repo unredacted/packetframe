@@ -1038,22 +1038,33 @@ fn finish(
     let local_routes = local_routes.to_vec();
     let drift_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
-        // The FDB tripwire's declarations, cloned out before the engine
-        // consumes the resolved set.
-        let fdb_declared: Vec<(u16, String)> = local_routes
-            .iter()
-            .map(|lr| (lr.vlan, lr.port.clone()))
-            .collect();
         // What VPP can egress, for the exemption tripwire: the member
-        // ports plus the kernel bridges `local-route` delivers into.
-        // Everything else the kernel routes through is a path VPP
-        // cannot take.
+        // ports, the kernel bridges `local-route` delivers into, and the
+        // VLAN and bridge devices a member's subif reaches (next hops
+        // placed per neighbour). Everything else the kernel routes
+        // through is a path VPP cannot take.
+        let port_vlans: Vec<(String, Vec<u16>)> = port_attach
+            .iter()
+            .map(|p| (p.port.clone(), p.vlans.clone()))
+            .collect();
+        #[cfg(target_os = "linux")]
+        let bridged_devices = crate::topology::reachable_devices(
+            &crate::topology::KernelTopology,
+            &crate::topology::all_netdevs(),
+            &port_vlans,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let bridged_devices = {
+            let _ = &port_vlans;
+            Vec::new()
+        };
         let drift_reach = crate::drift::VppReach {
             members: members.clone(),
             local_devices: local_routes
                 .iter()
                 .map(|lr| lr.kernel_dev.clone())
                 .collect(),
+            bridged_devices,
         };
         let engine = ConvergenceEngine::new(
             api_socket_path,
@@ -1065,6 +1076,10 @@ fn finish(
         )
         .with_recorded_indices(recorded)
         .with_local_routes(local_routes);
+        // Per-neighbour placement reads the live kernel on Linux; the
+        // default elsewhere treats every device as plain.
+        #[cfg(target_os = "linux")]
+        let engine = engine.with_topology(Box::new(crate::topology::KernelTopology));
         // Counted before the record moves into the owner: the log line
         // below needs it, and reaching for it afterwards is what the
         // borrow checker just refused.
@@ -1093,18 +1108,6 @@ fn finish(
         // log is itself the diagnostic.
         #[cfg(target_os = "linux")]
         runtime.rx_mode_kick(Box::new(crate::runtime::AllmultiKick));
-        // The B3 v1 tripwire: installed exactly when local-routes exist,
-        // because it scans for hosts contradicting THEIR declarations —
-        // no declarations, nothing to contradict. Linux-only like the
-        // kick, and silent when absent for the same reason.
-        #[cfg(target_os = "linux")]
-        if !fdb_declared.is_empty() {
-            runtime.fdb_watch(Box::new(crate::fdb::KernelFdbWatch {
-                declared: fdb_declared,
-            }));
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = fdb_declared;
         // The exemption tripwire, installed whenever this box could
         // steer at all — the hole it names opens the instant a port
         // does, so an operator wants it BEFORE the canary rather than

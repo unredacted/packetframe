@@ -306,6 +306,38 @@ impl RouteSource for RouteFeed {
     /// deferral open for as long as VPP kept refusing — an adopted VPP
     /// left forwarding an unreconciled table by the very mechanism that
     /// exists to protect it.
+    /// Every mirrored route whose nexthop set names any of `nexthops`,
+    /// back into `pending` — fill-if-absent, and `seq` untouched, for the
+    /// reasons [`Self::requeue`] gives: nothing about the source changed.
+    /// One pass over the interned sets, then one over the routes that use
+    /// a matching set; bounded by table size, and it runs only when a
+    /// bridge neighbour was placed somewhere new.
+    fn requeue_via(&self, nexthops: &[IpAddr]) {
+        let mut g = self.lock();
+        if g.disconnected || nexthops.is_empty() {
+            return;
+        }
+        let ids: std::collections::HashSet<SetId> = g
+            .sets
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| set.iter().any(|nh| nexthops.contains(nh)))
+            .map(|(i, _)| i as SetId)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let owed: Vec<(PrefixKey, SetId)> = g
+            .routes
+            .iter()
+            .filter(|(_, id)| ids.contains(id))
+            .map(|(k, id)| (*k, *id))
+            .collect();
+        for (key, id) in owed {
+            g.pending.entry(key).or_insert(Some(id));
+        }
+    }
+
     fn requeue(&self, changes: SourceChanges) {
         let mut g = self.lock();
         for (nh, state) in changes.neighbours {
@@ -415,6 +447,9 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn requeue(&self, changes: SourceChanges) {
         (**self).requeue(changes)
+    }
+    fn requeue_via(&self, nexthops: &[IpAddr]) {
+        (**self).requeue_via(nexthops)
     }
     fn backlog(&self) -> u64 {
         (**self).backlog()
@@ -757,6 +792,38 @@ mod tests {
         let mut after = 0;
         f.for_each_neighbour(&mut |_, _, _| after += 1);
         assert_eq!(after, 0);
+    }
+
+    /// A moved neighbour's routes come back for re-programming — every
+    /// route whose nexthop set names it, and only those — without
+    /// clobbering a newer queued change, and through the `Arc` the
+    /// loader actually boxes.
+    #[test]
+    fn requeue_via_queues_exactly_the_routes_through_those_nexthops() {
+        let f = std::sync::Arc::new(RouteFeed::new());
+        f.route_resolved(v4(192, 0), &[nh(1)]);
+        f.route_resolved(v4(192, 1), &[nh(1), nh(2)]);
+        f.route_resolved(v4(192, 2), &[nh(2)]);
+        f.route_resolved(v4(192, 3), &[nh(3)]);
+        let _ = f.drain_changes(64);
+        let seq = f.change_seq();
+
+        // A newer withdrawal is already queued for one of them.
+        f.route_withdrawn(v4(192, 1));
+        let src: &dyn RouteSource = &f;
+        src.requeue_via(&[nh(1)]);
+        let mut got = f.drain_changes(64).routes;
+        got.sort_by_key(|(p, _)| format!("{p:?}"));
+        assert_eq!(
+            got,
+            vec![(v4(192, 0), Some(vec![nh(1)])), (v4(192, 1), None)],
+            "192.0 requeued; 192.1's newer withdrawal wins; 192.2/192.3 untouched"
+        );
+        assert_eq!(
+            f.change_seq(),
+            seq + 1,
+            "only the withdrawal is source activity"
+        );
     }
 
     /// A neighbour whose link is gone is skipped, not reported with a

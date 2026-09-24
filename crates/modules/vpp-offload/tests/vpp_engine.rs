@@ -1359,7 +1359,44 @@ fn the_neighbours_adj_fib_is_never_adopted_or_withdrawn() {
 // right messages, reach the wire.
 
 use fake_vpp::SUBIF_BASE;
+use packetframe_vpp_offload::topology::{DevKind, FdbSnapshot, Topology};
 use packetframe_vpp_offload::LocalRoute;
+
+/// A kernel view for the bridge tests: fixed device shapes, and an FDB
+/// the test can move MACs around in.
+struct Kernel {
+    kinds: Vec<(&'static str, DevKind)>,
+    fdb: std::sync::Arc<std::sync::Mutex<FdbSnapshot>>,
+}
+
+impl Topology for Kernel {
+    fn classify(&self, dev: &str) -> Option<DevKind> {
+        Some(
+            self.kinds
+                .iter()
+                .find(|(d, _)| *d == dev)
+                .map_or(DevKind::Plain, |(_, k)| k.clone()),
+        )
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(self.fdb.lock().unwrap().clone())
+    }
+}
+
+fn bridge_vlan(vid: u16) -> DevKind {
+    DevKind::BridgeVlan {
+        bridge: "switch0".into(),
+        vid,
+    }
+}
+
+fn fdb_with(entries: &[(u16, [u8; 6], &str)]) -> FdbSnapshot {
+    FdbSnapshot::from_learned(
+        entries
+            .iter()
+            .map(|(vid, mac, port)| ("switch0".to_string(), *vid, *mac, port.to_string())),
+    )
+}
 
 fn local_route() -> LocalRoute {
     LocalRoute {
@@ -1402,6 +1439,10 @@ fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
         },
     )
     .with_local_routes(vec![local_route()])
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br1337", bridge_vlan(1337))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(fdb_with(&[(1337, MAC, "eth4")]))),
+    }))
 }
 
 /// The attached route goes out at attach, onto the SUBIF's index — a
@@ -1462,8 +1503,8 @@ fn a_local_route_installs_attached_and_shadows_the_mirror() {
 }
 
 /// Kernel neighbours on the backing bridge become static neighbours on
-/// the subif — the mapping `local-route` registers is what turns the
-/// device name the feed reports into the subif's own index.
+/// the subif of the port the FDB places them behind — that is what
+/// turns the device name the feed reports into a subif's own index.
 #[test]
 fn a_bridge_neighbour_mirrors_onto_the_subif() {
     struct BridgeNeigh;
@@ -1631,4 +1672,146 @@ fn null_drops_sample_over_cli_inband() {
         None,
         "the counters died with the process; a stale total would read as quiet"
     );
+}
+
+/// B3 v2: a bridge neighbour lands on the subif of the trunk the FDB
+/// learned it behind, and follows it when spanning tree moves it — the
+/// adjacency added on the new subif and removed from the old, and its
+/// routes handed back for re-programming (their paths name the old
+/// subif, and nothing about the route changed).
+#[test]
+fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
+    use std::cell::RefCell;
+    const PEER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x55];
+    const GHOST: [u8; 6] = [0x02, 0, 0, 0, 0, 0x66];
+    let peer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5));
+    let ghost = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 6));
+
+    struct Ix {
+        requeued: RefCell<Vec<IpAddr>>,
+    }
+    impl RouteSource for Ix {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(
+                IpPrefix::V4 {
+                    addr: [203, 0, 113, 0],
+                    prefix_len: 24,
+                },
+                &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
+            );
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)), "br3998", PEER);
+            // Known to the resolver, never seen by the bridge.
+            visit(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 6)), "br3998", GHOST);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.requeued.borrow_mut().extend_from_slice(nexthops);
+        }
+        fn route_count(&self) -> u64 {
+            1
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let trunk = |port: &str, n: u8| PortAttach {
+        port: port.into(),
+        pci_addr: format!("0002:07:00.{n}"),
+        port_id: 0,
+        num_rx_queues: 1,
+        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n],
+        accept_macs: vec![],
+        vlans: vec![3998],
+    };
+    let fdb = std::sync::Arc::new(std::sync::Mutex::new(fdb_with(&[(3998, PEER, "eth5")])));
+    let fake = Fake::start("placement");
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![trunk("eth4", 1), trunk("eth5", 2)],
+        vec!["eth4".into(), "eth5".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br3998", bridge_vlan(3998))],
+        fdb: fdb.clone(),
+    }));
+    // Subifs are created in port order: eth4.3998, then eth5.3998.
+    let (eth4_sub, eth5_sub) = (SUBIF_BASE, SUBIF_BASE + 1);
+    let src = Ix {
+        requeued: RefCell::new(Vec::new()),
+    };
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(
+            |ev| matches!(ev, Event::Neighbour { sw_if_index, mac, is_add: true, .. }
+            if *sw_if_index == eth5_sub && *mac == PEER)
+        ),
+        "placed behind eth5: {events:?}"
+    );
+    let route = events
+        .iter()
+        .find_map(|ev| match ev {
+            Event::Route(r) if r.addr == [203, 0, 113, 0] => Some(r.clone()),
+            _ => None,
+        })
+        .expect("the IX route installs");
+    assert_eq!(route.path_indices, vec![eth5_sub]);
+    assert_eq!(
+        e.unplaced_neighbours(),
+        vec![(ghost, "br3998".to_string())],
+        "a neighbour the bridge never saw is reported, not guessed at"
+    );
+
+    // Spanning tree moves the peer behind eth4.
+    *fdb.lock().unwrap() = fdb_with(&[(3998, PEER, "eth4")]);
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 1);
+    let events = fake.drain_events();
+    let neigh: Vec<(u32, bool)> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Neighbour {
+                sw_if_index,
+                is_add,
+                ..
+            } => Some((*sw_if_index, *is_add)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        neigh,
+        vec![(eth4_sub, true), (eth5_sub, false)],
+        "added on the new subif first, then removed from the old"
+    );
+    assert_eq!(*src.requeued.borrow(), vec![peer]);
+    assert_eq!(e.placement_moves(), 1);
+
+    // Nothing moved: nothing sent, nothing re-queued.
+    src.requeued.borrow_mut().clear();
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
+    assert!(fake
+        .drain_events()
+        .iter()
+        .all(|ev| !matches!(ev, Event::Neighbour { .. })));
+    assert!(src.requeued.borrow().is_empty());
+
+    // The entry ages out of the FDB: the last known port stands.
+    *fdb.lock().unwrap() = fdb_with(&[]);
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
+    assert!(e.unplaced_neighbours().iter().all(|(nh, _)| *nh != peer));
 }

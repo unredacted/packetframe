@@ -391,14 +391,13 @@ pub struct StatusSnapshot {
     /// before declaring any floor benign (runbook, "The null-drop
     /// gauge").
     pub null_drops: Option<u64>,
-    /// Hosts the bridge FDB places behind a different member port than
-    /// their `local-route` declares, one line each. Non-empty is a
-    /// topology contradiction: the kernel delivers those hosts via a
-    /// port VPP is not delivering their prefix to, so steered inbound
-    /// for them is going to the wrong wire. Degraded, host named — the
-    /// v1 tripwire whose firing is what makes per-host delivery (v2)
-    /// real work instead of speculation.
-    pub fdb_misplaced: Vec<String>,
+    /// Bridge neighbours the FDB has never placed behind a member port
+    /// (`"<nexthop> on <device>"`): VPP cannot reach them, so their
+    /// routes are unresolvable. Degraded, neighbour named.
+    pub neighbours_unplaced: Vec<String>,
+    /// Neighbours moved behind another bridge port since start — each
+    /// one a spanning-tree change VPP followed.
+    pub neighbour_moves: u64,
     /// Kernel paths VPP cannot take (tunnels, and the router's own
     /// addresses) that no `steer-exempt` covers — steered traffic for
     /// them dies at VPP's default route where the kernel would have
@@ -482,6 +481,7 @@ impl StatusSnapshot {
             0,
             None,
             Vec::new(),
+            0,
             Vec::new(),
             0,
             // The shorthand has no scanner behind it, so nothing is
@@ -516,7 +516,8 @@ impl StatusSnapshot {
         audit: SteerAudit,
         shadowed_routes: u64,
         null_drops: Option<u64>,
-        fdb_misplaced: Vec<String>,
+        neighbours_unplaced: Vec<String>,
+        neighbour_moves: u64,
         drift_uncovered: Vec<String>,
         drift_routes: usize,
         drift_pending: bool,
@@ -547,7 +548,8 @@ impl StatusSnapshot {
             source_backlog,
             shadowed_routes,
             null_drops,
-            fdb_misplaced,
+            neighbours_unplaced,
+            neighbour_moves,
             drift_uncovered,
             drift_routes,
             drift_pending,
@@ -711,16 +713,17 @@ impl StatusSnapshot {
                 last_success_age_seconds: None,
             });
         }
-        if !self.fdb_misplaced.is_empty() {
+        if !self.neighbours_unplaced.is_empty() {
             subsystems.push(SubsystemHealth {
                 name: SUBSYS_FDB.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "the kernel bridge FDB contradicts local-route: {} — steered inbound \
-                     for these hosts egresses the declared port, not the one the kernel \
-                     learned them on. Move the host, fix the declaration, or this \
-                     topology needs per-host delivery (B3 v2)",
-                    self.fdb_misplaced.join("; ")
+                    "bridge neighbour(s) the kernel FDB has not placed behind any member \
+                     port: {} — VPP cannot reach them, so routes through them are \
+                     unresolvable. Declare the VLAN on every member port its bridge \
+                     spans (`port … vlans`), or check that the neighbour is live on the \
+                     fabric (`bridge fdb show`)",
+                    self.neighbours_unplaced.join("; ")
                 )),
                 last_success_age_seconds: None,
             });
@@ -834,7 +837,7 @@ impl StatusSnapshot {
             // delivered to the wrong wire by VPP right now. Detection
             // only — the remedy is the operator's — but it must not
             // read as healthy while it stands.
-            && self.fdb_misplaced.is_empty()
+            && self.neighbours_unplaced.is_empty()
             // An uncovered kernel path is traffic that will vanish the
             // moment the port steers — and did, for three weeks,
             // under a health surface that said Healthy throughout.
@@ -1847,13 +1850,23 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
 
     gauge(
         &mut out,
-        "packetframe_vpp_fdb_misplaced",
-        "hosts the bridge FDB places behind a different port than their local-route declares",
+        "packetframe_vpp_neighbours_unplaced",
+        "bridge neighbours the FDB has not placed behind a member port (routes through them are unresolvable)",
     );
     let _ = writeln!(
         out,
-        "packetframe_vpp_fdb_misplaced{{module=\"{module}\"}} {}",
-        snap.fdb_misplaced.len()
+        "packetframe_vpp_neighbours_unplaced{{module=\"{module}\"}} {}",
+        snap.neighbours_unplaced.len()
+    );
+    gauge(
+        &mut out,
+        "packetframe_vpp_neighbour_moves",
+        "neighbours moved behind another bridge port since start (spanning-tree changes followed)",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_neighbour_moves{{module=\"{module}\"}} {}",
+        snap.neighbour_moves
     );
 
     gauge(
@@ -4198,11 +4211,11 @@ mod tests {
         assert!(rows[0].message.as_deref().unwrap_or("").contains("vti64"));
     }
 
-    /// The FDB tripwire: quiet = no subsystem row (nothing for an
-    /// operator to learn to ignore); firing = Degraded with the host
+    /// Placement: all placed = no subsystem row (nothing for an operator
+    /// to learn to ignore); an unplaced neighbour = Degraded with it
     /// named on the report AND the gauge counting it, together.
     #[test]
-    fn a_misplaced_fdb_host_degrades_and_is_named_on_both_surfaces() {
+    fn an_unplaced_bridge_neighbour_degrades_and_is_named_on_both_surfaces() {
         let mut s = snap_of(
             &ready_supervisor(),
             &ledger_with(1, 0, 0),
@@ -4214,31 +4227,38 @@ mod tests {
         );
         assert!(
             !s.report().subsystems.iter().any(|x| x.name == SUBSYS_FDB),
-            "quiet tripwire must add no row"
+            "nothing unplaced must add no row"
         );
         let m = render_metrics(&s, "vpp-offload");
         assert!(
-            m.contains("packetframe_vpp_fdb_misplaced{module=\"vpp-offload\"} 0"),
+            m.contains("packetframe_vpp_neighbours_unplaced{module=\"vpp-offload\"} 0"),
             "{m}"
         );
 
-        s.fdb_misplaced =
-            vec!["02:00:00:00:00:07 vlan 1337 learned on eth5 (local-route declares eth4)".into()];
+        s.neighbours_unplaced = vec!["192.0.2.7 on br3998".into()];
+        s.neighbour_moves = 3;
         let report = s.report();
         let row = report
             .subsystems
             .iter()
             .find(|x| x.name == SUBSYS_FDB)
-            .expect("the tripwire row");
+            .expect("the placement row");
         assert_eq!(row.state, HealthState::Degraded);
         assert!(
-            row.message.as_deref().unwrap_or("").contains("eth5"),
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("192.0.2.7 on br3998"),
             "{row:?}"
         );
         assert_ne!(report.overall, HealthState::Healthy);
         let m = render_metrics(&s, "vpp-offload");
         assert!(
-            m.contains("packetframe_vpp_fdb_misplaced{module=\"vpp-offload\"} 1"),
+            m.contains("packetframe_vpp_neighbours_unplaced{module=\"vpp-offload\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("packetframe_vpp_neighbour_moves{module=\"vpp-offload\"} 3"),
             "{m}"
         );
     }

@@ -98,11 +98,18 @@ pub struct VppReach {
     /// delivers those prefixes on a subif, so a kernel route out the
     /// bridge is covered.
     pub local_devices: Vec<String>,
+    /// VLAN and bridge devices VPP reaches through a member's subif
+    /// ([`crate::topology::reachable_devices`]): an IX LAN bridge, say,
+    /// whose next hops VPP places per neighbour. A route out one is a
+    /// path VPP can take.
+    pub bridged_devices: Vec<String>,
 }
 
 impl VppReach {
     fn covers_device(&self, dev: &str) -> bool {
-        self.members.iter().any(|m| m == dev) || self.local_devices.iter().any(|d| d == dev)
+        self.members.iter().any(|m| m == dev)
+            || self.local_devices.iter().any(|d| d == dev)
+            || self.bridged_devices.iter().any(|d| d == dev)
     }
 }
 
@@ -449,7 +456,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
     out
 }
 
-/// The scan seam the runtime holds, mirroring [`crate::fdb::FdbWatch`]:
+/// The scan seam the runtime holds, mirroring [`crate::runtime::RxModeKick`]:
 /// a trait so tests record calls and non-Linux builds never pretend.
 /// What one scan concluded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1073,6 +1080,7 @@ mod tests {
         VppReach {
             members: vec!["eth3".into(), "eth4".into()],
             local_devices: vec!["br1337".into()],
+            bridged_devices: vec!["br3998".into()],
         }
     }
 
@@ -1098,12 +1106,24 @@ mod tests {
             route(p(0, 0, 0, 0, 0), "eth3"),        // default via a member: fine
             route(p(23, 191, 200, 0, 24), "br1337"), // local delivery: fine
             route(p(10, 0, 0, 0, 8), "eth4"),       // member: fine
+            route(p(198, 51, 100, 0, 24), "br3998"), // IX next hop, placed per neighbour: fine
+            route(p(203, 0, 113, 0, 24), "br4040"), // a bridge no member carries: finding
         ];
         let found = find(&routes, &[]);
-        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().any(|u| u.to_string().contains("via br4040")));
+        assert!(!found.iter().any(|u| u.to_string().contains("br3998")));
+        let found: Vec<_> = found
+            .into_iter()
+            .filter(|u| !u.to_string().contains("br4040"))
+            .collect();
         assert!(found.iter().all(|u| u.to_string().contains("via vti64")));
 
-        let exempts = [p(23, 191, 201, 0, 24), p(23, 191, 200, 2, 32)];
+        let exempts = [
+            p(23, 191, 201, 0, 24),
+            p(23, 191, 200, 2, 32),
+            p(203, 0, 113, 0, 24),
+        ];
         assert!(find(&routes, &exempts).is_empty());
     }
 
