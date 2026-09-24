@@ -398,6 +398,10 @@ pub struct StatusSnapshot {
     /// Neighbours moved behind another bridge port since start — each
     /// one a spanning-tree change VPP followed.
     pub neighbour_moves: u64,
+    /// Why the bridge FDB cannot be read, if it cannot. Degraded: the
+    /// placements stand at the last good read, and a spanning-tree move
+    /// made while blind would leave routes on the old trunk unnoticed.
+    pub fdb_unreadable: Option<String>,
     /// Kernel paths VPP cannot take (tunnels, and the router's own
     /// addresses) that no `steer-exempt` covers — steered traffic for
     /// them dies at VPP's default route where the kernel would have
@@ -482,6 +486,7 @@ impl StatusSnapshot {
             None,
             Vec::new(),
             0,
+            None,
             Vec::new(),
             0,
             // The shorthand has no scanner behind it, so nothing is
@@ -518,6 +523,7 @@ impl StatusSnapshot {
         null_drops: Option<u64>,
         neighbours_unplaced: Vec<String>,
         neighbour_moves: u64,
+        fdb_unreadable: Option<String>,
         drift_uncovered: Vec<String>,
         drift_routes: usize,
         drift_pending: bool,
@@ -550,6 +556,7 @@ impl StatusSnapshot {
             null_drops,
             neighbours_unplaced,
             neighbour_moves,
+            fdb_unreadable,
             drift_uncovered,
             drift_routes,
             drift_pending,
@@ -713,18 +720,27 @@ impl StatusSnapshot {
                 last_success_age_seconds: None,
             });
         }
-        if !self.neighbours_unplaced.is_empty() {
+        if !self.neighbours_unplaced.is_empty() || self.fdb_unreadable.is_some() {
+            let mut parts = Vec::new();
+            if !self.neighbours_unplaced.is_empty() {
+                parts.push(format!(
+                    "bridge neighbour(s) VPP cannot reach: {} — routes through them are \
+                     unresolvable. Declare the VLAN on every member port its bridge spans \
+                     (`port … vlans`), or check the neighbour is live on the fabric \
+                     (`bridge fdb show`)",
+                    self.neighbours_unplaced.join("; ")
+                ));
+            }
+            if let Some(e) = &self.fdb_unreadable {
+                parts.push(format!(
+                    "the bridge FDB cannot be read ({e}); placements hold at the last good \
+                     read, and a spanning-tree move made meanwhile is not being followed"
+                ));
+            }
             subsystems.push(SubsystemHealth {
                 name: SUBSYS_FDB.into(),
                 state: HealthState::Degraded,
-                message: Some(format!(
-                    "bridge neighbour(s) the kernel FDB has not placed behind any member \
-                     port: {} — VPP cannot reach them, so routes through them are \
-                     unresolvable. Declare the VLAN on every member port its bridge \
-                     spans (`port … vlans`), or check that the neighbour is live on the \
-                     fabric (`bridge fdb show`)",
-                    self.neighbours_unplaced.join("; ")
-                )),
+                message: Some(parts.join(". ")),
                 last_success_age_seconds: None,
             });
         }
@@ -838,6 +854,7 @@ impl StatusSnapshot {
             // only — the remedy is the operator's — but it must not
             // read as healthy while it stands.
             && self.neighbours_unplaced.is_empty()
+            && self.fdb_unreadable.is_none()
             // An uncovered kernel path is traffic that will vanish the
             // moment the port steers — and did, for three weeks,
             // under a health surface that said Healthy throughout.
@@ -4260,6 +4277,24 @@ mod tests {
         assert!(
             m.contains("packetframe_vpp_neighbour_moves{module=\"vpp-offload\"} 3"),
             "{m}"
+        );
+
+        // A blind FDB degrades on its own, even with nothing unplaced.
+        s.neighbours_unplaced.clear();
+        s.fdb_unreadable = Some("netlink recv: timed out".into());
+        let report = s.report();
+        let row = report
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FDB)
+            .expect("the placement row");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot be read"),
+            "{row:?}"
         );
     }
 

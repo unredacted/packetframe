@@ -668,12 +668,17 @@ So each neighbour is **placed**: the module classifies the device (a
 bridge whose only member is `switch0.3998`, a VLAN device on the
 VLAN-aware bridge `switch0`), looks the neighbour's MAC up in `switch0`'s
 FDB for VLAN 3998, and programs the static neighbour on that port's
-3998 subif. Routes through it install on the same subif. The FDB is
-re-read every 5 s; a neighbour that moved is added on the new subif,
-removed from the old one, and its routes are re-programmed (their paths
-name the interface, so nothing else would move them). An FDB entry that
-ages out or is flushed keeps the last known port — the host's own
-traffic re-teaches the bridge within moments.
+3998 subif. Routes through it install on the same subif. A background
+thread re-reads the FDB every 2 s (never the supervision loop, which
+must not wait on netlink), and placement is checked against it every
+2 s. A neighbour that moved is added on the new subif at once, its
+routes are re-programmed (their paths name the interface, so nothing
+else would move them), and the old adjacency is removed only once they
+have — so the old trunk keeps forwarding in the meantime. An FDB entry
+that ages out or is flushed keeps the last known port — the host's own
+traffic re-teaches the bridge within moments. If the FDB stops being
+readable, placements hold at the last good read and the `fdb` row goes
+Degraded until a read succeeds.
 
 Two things to get right in config:
 
@@ -691,8 +696,9 @@ fdb: degraded — bridge neighbour(s) the kernel FDB has not placed behind
 any member port: 198.51.100.6 on br3998 — VPP cannot reach them, …
 ```
 
-`packetframe_vpp_neighbours_unplaced` counts neighbours never seen in
-the FDB behind a member port; `packetframe_vpp_neighbour_moves` counts
+`packetframe_vpp_neighbours_unplaced` counts neighbours VPP cannot
+reach — never seen in the FDB, or seen behind a port that is not a
+member or lacks the VLAN's subif (the row names that port); `packetframe_vpp_neighbour_moves` counts
 moves VPP followed since start. The exemption tripwire counts a route
 out a bridge VLAN some member carries as a path VPP can take.
 

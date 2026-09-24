@@ -266,11 +266,22 @@ pub struct NexthopMap {
     /// before placement existed.
     kinds: BTreeMap<String, Option<DevKind>>,
     /// `BridgeVlan` neighbour → the member port its MAC was last learned
-    /// behind. Kept across an FDB entry ageing out or a spanning-tree
-    /// flush — the last known port beats no port, and the host's own
-    /// traffic re-teaches the bridge within a moment — and replaced only
-    /// by a fresh sighting elsewhere.
-    placed: BTreeMap<IpAddr, String>,
+    /// behind, and on which bridge and VLAN. Kept across an FDB entry
+    /// ageing out or a spanning-tree flush — the last known port beats
+    /// no port, and the host's own traffic re-teaches the bridge within a
+    /// moment — and replaced only by a fresh sighting elsewhere. Scoped
+    /// to the bridge and VLAN it was seen on: a nexthop that reappears on
+    /// a different one has no last known port there.
+    placed: BTreeMap<IpAddr, Placement>,
+}
+
+/// Where a bridge neighbour was last seen: `port`, in `bridge`'s FDB for
+/// `vid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub bridge: String,
+    pub vid: u16,
+    pub port: String,
 }
 
 impl NexthopMap {
@@ -311,14 +322,26 @@ impl NexthopMap {
         self.device_of.insert(nexthop, dev.into());
     }
 
-    /// Record the port a `BridgeVlan` neighbour was seen behind.
-    pub fn place(&mut self, nexthop: IpAddr, port: impl Into<String>) {
-        self.placed.insert(nexthop, port.into());
+    /// Record where a `BridgeVlan` neighbour was seen.
+    pub fn place(&mut self, nexthop: IpAddr, placement: Placement) {
+        self.placed.insert(nexthop, placement);
     }
 
-    /// The port a neighbour is placed behind, if it is a placed one.
+    /// The port a neighbour was last seen behind on `bridge`/`vid` — the
+    /// scope check that keeps a nexthop moved to another bridge from
+    /// inheriting its old trunk.
+    pub fn placement_on(&self, nexthop: &IpAddr, bridge: &str, vid: u16) -> Option<&str> {
+        self.placed
+            .get(nexthop)
+            .filter(|p| p.bridge == bridge && p.vid == vid)
+            .map(|p| p.port.as_str())
+    }
+
+    /// The port a neighbour is placed behind on its CURRENT device's
+    /// bridge and VLAN, if any.
     pub fn placement(&self, nexthop: &IpAddr) -> Option<&str> {
-        self.placed.get(nexthop).map(String::as_str)
+        let (bridge, vid) = self.bridge_vlan(nexthop)?;
+        self.placement_on(nexthop, bridge, vid)
     }
 
     /// `(bridge, vid)` when `nexthop`'s device is a [`DevKind::BridgeVlan`].
@@ -376,7 +399,7 @@ impl NexthopMap {
     /// a bridge neighbour, not yet placed behind a member.
     pub fn resolve(&self, nexthop: &IpAddr) -> Option<NexthopTarget> {
         let dev = self.device_of.get(nexthop)?;
-        self.target(dev, self.placed.get(nexthop).map(String::as_str))
+        self.target(dev, self.placement(nexthop))
     }
 
     /// The same mapping policy for a device and candidate placement this
@@ -974,8 +997,13 @@ mod tests {
         for n in [a, b, c] {
             m.set_device(n, "br3998");
         }
-        m.place(a, "eth4");
-        m.place(b, "eth5");
+        let at = |port: &str| Placement {
+            bridge: "switch0".into(),
+            vid: 3998,
+            port: port.into(),
+        };
+        m.place(a, at("eth4"));
+        m.place(b, at("eth5"));
         let sub = |port: &str| {
             Some(NexthopTarget::Subif {
                 port: port.into(),
@@ -988,8 +1016,22 @@ mod tests {
         assert_eq!(m.bridge_nexthops().len(), 3);
 
         // A move is a re-placement.
-        m.place(a, "eth5");
+        m.place(a, at("eth5"));
         assert_eq!(m.resolve(&a), sub("eth5"));
+
+        // Reappearing on another bridge VLAN, the old trunk does not
+        // follow it there.
+        m.set_kind(
+            "br3999",
+            Some(DevKind::BridgeVlan {
+                bridge: "switch0".into(),
+                vid: 3999,
+            }),
+        );
+        m.set_device(a, "br3999");
+        assert_eq!(m.placement(&a), None);
+        assert_eq!(m.resolve(&a), None);
+        m.set_device(a, "br3998");
 
         // A lost neighbour loses its placement.
         m.forget_device(&a);

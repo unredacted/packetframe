@@ -156,11 +156,19 @@ impl FdbSnapshot {
 }
 
 /// The engine's view of the kernel: classification and the FDB.
+///
+/// Both answers must be cheap: the engine asks from the supervision
+/// loop, which must never block on the kernel (the steered wedge budget
+/// is 1.5 s). The live implementation reads the FDB on a thread of its
+/// own and serves the latest result.
 pub trait Topology {
-    fn classify(&self, dev: &str) -> Option<DevKind>;
-    /// A fresh FDB read. `Err` = the kernel would not answer; callers
-    /// keep what they had, since an unreadable table is not evidence
-    /// anything moved.
+    /// `Err` when the kernel's answer could not be read — a transient
+    /// state (provisioning recreating VLAN devices) that must not be
+    /// cached as "this device is plain".
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String>;
+    /// The latest FDB. `Err` = the last read failed; callers keep the
+    /// snapshot they had, since an unreadable table is not evidence
+    /// anything moved, and say so.
     fn fdb(&self) -> Result<FdbSnapshot, String>;
 }
 
@@ -170,35 +178,79 @@ pub trait Topology {
 pub struct NoTopology;
 
 impl Topology for NoTopology {
-    fn classify(&self, _dev: &str) -> Option<DevKind> {
-        Some(DevKind::Plain)
+    fn classify(&self, _dev: &str) -> Result<Option<DevKind>, String> {
+        Ok(Some(DevKind::Plain))
     }
     fn fdb(&self) -> Result<FdbSnapshot, String> {
         Ok(FdbSnapshot::default())
     }
 }
 
-/// The live kernel.
+/// The live kernel. Classification reads `/proc/net/vlan/config` and the
+/// bridge sysfs per call (a few small files); the FDB comes from a
+/// background thread dumping it every [`FDB_REFRESH`], so the engine
+/// never waits on AF_BRIDGE netlink.
 #[cfg(target_os = "linux")]
-pub struct KernelTopology;
+pub struct KernelTopology {
+    fdb: std::sync::Arc<std::sync::Mutex<Result<FdbSnapshot, String>>>,
+}
+
+/// How often the background thread re-dumps the FDB.
+#[cfg(target_os = "linux")]
+pub const FDB_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(target_os = "linux")]
 impl KernelTopology {
-    /// `/proc/net/vlan/config`: `name | vid | lower`, after two header
-    /// lines. Read per call — interfaces come and go under UniFi
-    /// provisioning, and the file is a few lines.
-    fn vlans() -> HashMap<String, (u16, String)> {
-        let Ok(text) = std::fs::read_to_string("/proc/net/vlan/config") else {
-            return HashMap::new();
-        };
-        parse_vlan_config(&text)
+    /// Read the FDB once, here — at bring-up, before supervision starts,
+    /// so the first resync places neighbours from a real table — then
+    /// keep it fresh on a thread that ends when this is dropped.
+    pub fn start() -> Self {
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Self::read_fdb()));
+        let weak = std::sync::Arc::downgrade(&cell);
+        let spawned = std::thread::Builder::new()
+            .name("pf-vpp-fdb".into())
+            .spawn(move || loop {
+                std::thread::sleep(FDB_REFRESH);
+                let Some(cell) = weak.upgrade() else {
+                    return;
+                };
+                let read = Self::read_fdb();
+                *cell.lock().unwrap_or_else(|e| e.into_inner()) = read;
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "bridge FDB refresh thread would not start; placement uses the bring-up read");
+        }
+        Self { fdb: cell }
+    }
+
+    fn read_fdb() -> Result<FdbSnapshot, String> {
+        let entries = crate::fdb::dump_bridge_fdb()?;
+        Ok(FdbSnapshot::from_learned(entries.into_iter().filter_map(
+            |e| {
+                if e.permanent {
+                    return None;
+                }
+                Some((
+                    crate::fdb::ifname(e.master?),
+                    e.vlan?,
+                    e.mac,
+                    crate::fdb::ifname(e.port),
+                ))
+            },
+        )))
     }
 }
 
+/// The link facts one classification needs, read once for it.
 #[cfg(target_os = "linux")]
-impl LinkFacts for KernelTopology {
+struct KernelLinks {
+    vlans: HashMap<String, (u16, String)>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinkFacts for KernelLinks {
     fn vlan(&self, dev: &str) -> Option<(u16, String)> {
-        Self::vlans().remove(dev)
+        self.vlans.get(dev).cloned()
     }
     fn is_bridge(&self, dev: &str) -> bool {
         std::path::Path::new("/sys/class/net")
@@ -220,27 +272,27 @@ impl LinkFacts for KernelTopology {
     }
 }
 
+/// The kernel's link facts, or why they could not be read. A missing
+/// `/proc/net/vlan/config` means no 8021q module and so no VLANs — an
+/// answer; any other read error is not.
+#[cfg(target_os = "linux")]
+pub fn kernel_links() -> Result<impl LinkFacts, String> {
+    let vlans = match std::fs::read_to_string("/proc/net/vlan/config") {
+        Ok(text) => parse_vlan_config(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => return Err(format!("/proc/net/vlan/config: {e}")),
+    };
+    Ok(KernelLinks { vlans })
+}
+
 #[cfg(target_os = "linux")]
 impl Topology for KernelTopology {
-    fn classify(&self, dev: &str) -> Option<DevKind> {
-        classify(self, dev)
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        Ok(classify(&kernel_links()?, dev))
     }
 
     fn fdb(&self) -> Result<FdbSnapshot, String> {
-        let entries = crate::fdb::dump_bridge_fdb()?;
-        Ok(FdbSnapshot::from_learned(entries.into_iter().filter_map(
-            |e| {
-                if e.permanent {
-                    return None;
-                }
-                Some((
-                    crate::fdb::ifname(e.master?),
-                    e.vlan?,
-                    e.mac,
-                    crate::fdb::ifname(e.port),
-                ))
-            },
-        )))
+        self.fdb.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 

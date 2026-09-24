@@ -1722,9 +1722,13 @@ impl Runtime {
                 .engine
                 .unplaced_neighbours()
                 .into_iter()
-                .map(|(nh, dev)| format!("{nh} on {dev}"))
+                .map(|(nh, dev, port)| match port {
+                    None => format!("{nh} on {dev}"),
+                    Some(p) => format!("{nh} on {dev} (behind {p}, which has no subif for it)"),
+                })
                 .collect(),
             neighbour_moves: c.engine.placement_moves(),
+            fdb_unreadable: c.engine.fdb_unreadable().map(str::to_string),
             drift_uncovered: c.drift_uncovered.clone(),
             drift_routes: c.drift_routes,
             drift_pending: c.drift_pending,
@@ -1778,10 +1782,11 @@ const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
 /// other than their `local-route` declaration. One netlink dump; a
 /// moved host is a provisioning-scale event, so a minute of latency
 /// on the tripwire costs nothing.
-/// How often bridge-neighbour placement is re-read from the FDB. The
-/// window a spanning-tree move can leave a neighbour's routes on the old
-/// port; one AF_BRIDGE dump of a few hundred entries each time.
-const PLACEMENT_EVERY: Duration = Duration::from_secs(5);
+/// How often bridge-neighbour placement is checked against the FDB. Cheap
+/// on this thread — the kernel topology serves a snapshot its own thread
+/// keeps fresh (`topology::FDB_REFRESH`) — so the move-detection window
+/// is the two intervals together, a few seconds.
+const PLACEMENT_EVERY: Duration = Duration::from_secs(2);
 
 /// How often to check the kernel's routes against the exemptions.
 ///
@@ -1913,6 +1918,9 @@ pub struct RuntimeStatus {
     pub neighbours_unplaced: Vec<String>,
     /// Neighbours moved behind another bridge port since start.
     pub neighbour_moves: u64,
+    /// Why the bridge FDB cannot be read, if it cannot: placements hold at
+    /// the last good read, and a move made meanwhile goes unfollowed.
+    pub fdb_unreadable: Option<String>,
     /// Kernel paths VPP cannot take that no `steer-exempt` covers.
     pub drift_uncovered: Vec<String>,
     /// How many routes those findings stand for — the gauge's value.
@@ -2726,6 +2734,17 @@ impl Observe for ObserveView {
                     }
                 })
                 .map_err(|e| e.to_string()),
+        };
+        // Every re-queued route of a moved neighbour has gone out once the
+        // drain is idle with nothing left in the source: only now does
+        // the old adjacency stop carrying traffic, so only now is it
+        // removed.
+        let r = match r {
+            Ok(crate::driver::Drain::Idle) if source.backlog() == 0 => engine
+                .settle_moves()
+                .map(|()| crate::driver::Drain::Idle)
+                .map_err(|e| e.to_string()),
+            other => other,
         };
         // Set on failure and cleared on success, in one place, for the
         // same reason `note_persist` is: a field that only ever gets set

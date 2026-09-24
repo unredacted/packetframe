@@ -1366,20 +1366,21 @@ use packetframe_vpp_offload::LocalRoute;
 /// the test can move MACs around in.
 struct Kernel {
     kinds: Vec<(&'static str, DevKind)>,
-    fdb: std::sync::Arc<std::sync::Mutex<FdbSnapshot>>,
+    /// `Err` = the FDB read fails, as a wedged netlink would.
+    fdb: std::sync::Arc<std::sync::Mutex<Result<FdbSnapshot, String>>>,
 }
 
 impl Topology for Kernel {
-    fn classify(&self, dev: &str) -> Option<DevKind> {
-        Some(
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        Ok(Some(
             self.kinds
                 .iter()
                 .find(|(d, _)| *d == dev)
                 .map_or(DevKind::Plain, |(_, k)| k.clone()),
-        )
+        ))
     }
     fn fdb(&self) -> Result<FdbSnapshot, String> {
-        Ok(self.fdb.lock().unwrap().clone())
+        self.fdb.lock().unwrap().clone()
     }
 }
 
@@ -1441,7 +1442,7 @@ fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
     .with_local_routes(vec![local_route()])
     .with_topology(Box::new(Kernel {
         kinds: vec![("br1337", bridge_vlan(1337))],
-        fdb: std::sync::Arc::new(std::sync::Mutex::new(fdb_with(&[(1337, MAC, "eth4")]))),
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
     }))
 }
 
@@ -1728,7 +1729,7 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
         accept_macs: vec![],
         vlans: vec![3998],
     };
-    let fdb = std::sync::Arc::new(std::sync::Mutex::new(fdb_with(&[(3998, PEER, "eth5")])));
+    let fdb = std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(3998, PEER, "eth5")]))));
     let fake = Fake::start("placement");
     let mut e = ConvergenceEngine::new(
         &fake.path,
@@ -1774,44 +1775,75 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
     assert_eq!(route.path_indices, vec![eth5_sub]);
     assert_eq!(
         e.unplaced_neighbours(),
-        vec![(ghost, "br3998".to_string())],
+        vec![(ghost, "br3998".to_string(), None)],
         "a neighbour the bridge never saw is reported, not guessed at"
     );
+    let neighbour_ops = |events: Vec<Event>| -> Vec<(u32, bool)> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Neighbour {
+                    sw_if_index,
+                    is_add,
+                    ..
+                } => Some((*sw_if_index, *is_add)),
+                _ => None,
+            })
+            .collect()
+    };
 
-    // Spanning tree moves the peer behind eth4.
-    *fdb.lock().unwrap() = fdb_with(&[(3998, PEER, "eth4")]);
+    // Spanning tree moves the peer behind eth4: added there at once, and
+    // its routes handed back — but the old adjacency stays, since those
+    // routes still name eth5's subif until they are re-programmed.
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
     assert_eq!(e.refresh_placement(&src).expect("refresh"), 1);
-    let events = fake.drain_events();
-    let neigh: Vec<(u32, bool)> = events
-        .iter()
-        .filter_map(|ev| match ev {
-            Event::Neighbour {
-                sw_if_index,
-                is_add,
-                ..
-            } => Some((*sw_if_index, *is_add)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        neigh,
-        vec![(eth4_sub, true), (eth5_sub, false)],
-        "added on the new subif first, then removed from the old"
-    );
+    assert_eq!(neighbour_ops(fake.drain_events()), vec![(eth4_sub, true)]);
     assert_eq!(*src.requeued.borrow(), vec![peer]);
     assert_eq!(e.placement_moves(), 1);
+    // The routes have gone out: now the old adjacency goes.
+    e.settle_moves().expect("settle");
+    assert_eq!(neighbour_ops(fake.drain_events()), vec![(eth5_sub, false)]);
 
     // Nothing moved: nothing sent, nothing re-queued.
     src.requeued.borrow_mut().clear();
     assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
-    assert!(fake
-        .drain_events()
-        .iter()
-        .all(|ev| !matches!(ev, Event::Neighbour { .. })));
+    e.settle_moves().expect("settle");
+    assert!(neighbour_ops(fake.drain_events()).is_empty());
     assert!(src.requeued.borrow().is_empty());
 
+    // Moved and moved back before the routes settled: the adjacency it
+    // came back to is the live one, and is kept.
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth5")]));
+    e.refresh_placement(&src).expect("refresh");
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
+    e.refresh_placement(&src).expect("refresh");
+    let _ = fake.drain_events();
+    e.settle_moves().expect("settle");
+    assert_eq!(
+        neighbour_ops(fake.drain_events()),
+        vec![(eth5_sub, false)],
+        "only eth5's is stale; eth4's (moved away and back) stays"
+    );
+
     // The entry ages out of the FDB: the last known port stands.
-    *fdb.lock().unwrap() = fdb_with(&[]);
+    *fdb.lock().unwrap() = Ok(fdb_with(&[]));
     assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
-    assert!(e.unplaced_neighbours().iter().all(|(nh, _)| *nh != peer));
+    assert!(e.unplaced_neighbours().iter().all(|(nh, _, _)| *nh != peer));
+
+    // Learned behind a port that is not a member: reported as
+    // unreachable, with the port named.
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4"), (3998, GHOST, "eth9")]));
+    e.refresh_placement(&src).expect("refresh");
+    assert_eq!(
+        e.unplaced_neighbours(),
+        vec![(ghost, "br3998".to_string(), Some("eth9".to_string()))]
+    );
+
+    // A failing read is surfaced, and the placements hold.
+    *fdb.lock().unwrap() = Err("netlink recv: timed out".into());
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
+    assert_eq!(e.fdb_unreadable(), Some("netlink recv: timed out"));
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
+    e.refresh_placement(&src).expect("refresh");
+    assert_eq!(e.fdb_unreadable(), None, "cleared by the next good read");
 }

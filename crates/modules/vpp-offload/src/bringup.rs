@@ -1047,12 +1047,21 @@ fn finish(
             .iter()
             .map(|p| (p.port.clone(), p.vlans.clone()))
             .collect();
+        // An unreadable VLAN table at bring-up costs the tripwire its
+        // bridge exemptions (it reports those routes as findings, which
+        // is loud and safe), never forwarding.
         #[cfg(target_os = "linux")]
-        let bridged_devices = crate::topology::reachable_devices(
-            &crate::topology::KernelTopology,
-            &crate::topology::all_netdevs(),
-            &port_vlans,
-        );
+        let bridged_devices = match crate::topology::kernel_links() {
+            Ok(links) => crate::topology::reachable_devices(
+                &links,
+                &crate::topology::all_netdevs(),
+                &port_vlans,
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the VLAN table for the exemption tripwire");
+                Vec::new()
+            }
+        };
         #[cfg(not(target_os = "linux"))]
         let bridged_devices = {
             let _ = &port_vlans;
@@ -1079,7 +1088,7 @@ fn finish(
         // Per-neighbour placement reads the live kernel on Linux; the
         // default elsewhere treats every device as plain.
         #[cfg(target_os = "linux")]
-        let engine = engine.with_topology(Box::new(crate::topology::KernelTopology));
+        let engine = engine.with_topology(Box::new(crate::topology::KernelTopology::start()));
         // Counted before the record moves into the owner: the log line
         // below needs it, and reaching for it afterwards is what the
         // borrow checker just refused.
