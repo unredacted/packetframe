@@ -24,7 +24,6 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::attach::{AttachMode, PortAttach};
-use packetframe_vpp_offload::cores::RxPlacement;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 
@@ -71,10 +70,6 @@ fn engine_for(fake: &Fake) -> ConvergenceEngine {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
@@ -1094,10 +1089,6 @@ fn the_reconciling_dump_covers_every_carried_family() {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
@@ -1398,10 +1389,6 @@ fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![RxPlacement {
-                queue_id: 0,
-                worker_id: 0,
-            }],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![1337],

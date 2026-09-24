@@ -750,39 +750,38 @@ fn finish(
     // is what release will act on, so attaching a device the record does
     // not name would be a VF nothing can hand back.
     //
-    // The rx placement plan comes from the same recorded (iface, cores)
-    // list, in the same order, so its worker indices agree with the
-    // worker count `core_map` was derived for (`total_workers`).
+    // Ports are attached in `cores::creation_order` — dedicated ports
+    // first, `cores 0` last — because that order is the only placement
+    // control this VPP has: the octeon driver assigns rx queues
+    // round-robin as ports are created (see `cores::creation_order`).
+    // Both come from the same recorded (iface, cores) list the worker
+    // count `core_map` was derived for (`total_workers`).
     let recorded_cores: Vec<(&str, u16)> = state
         .ports
         .iter()
         .map(|p| (p.iface.as_str(), p.cores))
         .collect();
-    let placement = cores::rx_placement_plan(&recorded_cores);
     // Worker N runs on the N-th CPU of `core_map.workers`, which the
-    // attach log prints.
-    for (iface, queues) in &placement {
+    // attach log prints. Predicted, not set: nothing can set it.
+    for (iface, queues) in cores::rx_placement_plan(&recorded_cores) {
         let on: Vec<String> = queues
             .iter()
             .map(|q| format!("queue {} → worker {}", q.queue_id, q.worker_id))
             .collect();
-        tracing::info!(port = %iface, placement = %on.join(", "), "rx placement planned");
+        tracing::info!(port = %iface, placement = %on.join(", "), "rx placement (VPP round-robin, creation order)");
     }
-    // `placement` is parallel to `state.ports` by construction.
-    let port_attach: Vec<PortAttach> = state
-        .ports
-        .iter()
-        .zip(&placement)
-        .map(|(p, (_, queues))| {
+    let port_attach: Vec<PortAttach> = cores::creation_order(&recorded_cores)
+        .into_iter()
+        .map(|i| &state.ports[i])
+        .map(|p| {
             let (pf_mac, accept_macs) = port_macs(&paths.sys.sysfs_net, &p.iface)?;
             Ok(PortAttach {
                 port: p.iface.clone(),
                 pci_addr: p.vf_pci.clone(),
                 port_id: 0,
                 // A `cores 0` port still has one queue; it is polled by
-                // the shared worker rather than one of its own.
+                // a shared worker rather than one of its own.
                 num_rx_queues: p.cores.max(1),
-                rx_placement: queues.clone(),
                 pf_mac,
                 accept_macs,
                 // From the config, not the state file: vlans are a

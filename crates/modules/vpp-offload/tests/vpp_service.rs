@@ -16,7 +16,6 @@ use fake_vpp::{Fake, MAC};
 use packetframe_common::fib::IpPrefix;
 use packetframe_common::module::HealthState;
 use packetframe_vpp_offload::attach::PortAttach;
-use packetframe_vpp_offload::cores::RxPlacement;
 use packetframe_vpp_offload::driver::Driver;
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
@@ -65,10 +64,6 @@ fn the_service_converges_publishes_health_and_stops_clean() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -304,10 +299,6 @@ fn an_unpersisted_identity_degrades_health_and_is_named() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -439,10 +430,6 @@ fn a_failing_verifys_teardown_failures_are_published_and_retained() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -648,10 +635,6 @@ fn a_verdict_dies_with_its_process_but_its_reason_does_not() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -786,10 +769,6 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -901,10 +880,6 @@ fn an_episode_keeps_its_root_cause_alongside_the_latest_symptom() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1011,10 +986,6 @@ fn a_teardown_that_outlives_the_budget_is_still_observable() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1148,10 +1119,6 @@ fn the_timeout_correction_survives_the_in_flight_tick() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1330,10 +1297,6 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1469,10 +1432,6 @@ fn an_operator_can_steer_and_unsteer_a_converged_service() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1573,10 +1532,6 @@ fn a_steering_change_before_convergence_is_refused() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1670,10 +1625,6 @@ fn an_all_off_reconfigure_with_no_rules_still_commits_the_drift_scope() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1780,10 +1731,6 @@ fn a_reconfigure_that_did_not_move_the_lever_does_not_steer() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1890,10 +1837,6 @@ fn an_allowlist_change_under_live_steering_is_always_reconciled() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -1995,10 +1938,6 @@ fn a_first_steer_refused_by_the_fib_gate_is_still_remembered() {
                     pci_addr: "0002:07:00.1".into(),
                     port_id: 0,
                     num_rx_queues: 1,
-                    rx_placement: vec![RxPlacement {
-                        queue_id: 0,
-                        worker_id: 0,
-                    }],
                     pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                     accept_macs: vec![],
                     vlans: vec![],
@@ -2138,10 +2077,6 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
                         pci_addr: "0002:07:00.1".into(),
                         port_id: 0,
                         num_rx_queues: 1,
-                        rx_placement: vec![RxPlacement {
-                            queue_id: 0,
-                            worker_id: 0,
-                        }],
                         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
                         accept_macs: vec![],
                         vlans: vec![],
@@ -2154,10 +2089,6 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
                         pci_addr: "0002:07:00.2".into(),
                         port_id: 0,
                         num_rx_queues: 1,
-                        rx_placement: vec![RxPlacement {
-                            queue_id: 0,
-                            worker_id: 0,
-                        }],
                         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
                         accept_macs: vec![],
                         vlans: vec![],

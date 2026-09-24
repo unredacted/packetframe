@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::attach::{attach_ports, AttachError, AttachMode, PortAttach};
-use packetframe_vpp_offload::cores::{rx_placement_plan, RxPlacement};
+use packetframe_vpp_offload::cores::creation_order;
 use packetframe_vpp_offload::fib_sync::{to_prefix, PortIndex};
 use packetframe_vpp_offload::sink::{Capacity, RouteLedger};
 use packetframe_vpp_offload::verify::{verify, Mismatch};
@@ -88,8 +88,6 @@ struct AttachBehaviour {
     /// multi-port attach has distinguishable interfaces. Off, every
     /// create returns `sw_if_index`, which single-port tests rely on.
     sequential_indices: bool,
-    /// Answer `sw_interface_set_rx_placement` with this retval.
-    placement_retval: i32,
 }
 
 /// How the fake answers `ip_route_lookup`.
@@ -415,7 +413,10 @@ impl Fake {
                         out = reply_head("sw_interface_set_rx_placement_reply");
                         SwInterfaceSetRxPlacementReply {
                             context: ctx,
-                            retval: attach.placement_retval,
+                            // What the real octeon port answers: its
+                            // queues are vnet_dev's, unknown to the
+                            // generic placement code.
+                            retval: -9,
                         }
                         .encode(&mut out);
                     }
@@ -562,10 +563,6 @@ fn ports() -> Vec<PortAttach> {
         pci_addr: "0002:07:00.1".into(),
         port_id: 0,
         num_rx_queues: 1,
-        rx_placement: vec![RxPlacement {
-            queue_id: 0,
-            worker_id: 0,
-        }],
         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         accept_macs: vec![],
         vlans: vec![],
@@ -573,18 +570,15 @@ fn ports() -> Vec<PortAttach> {
 }
 
 /// Ports built the way bring-up builds them: `num_rx_queues` at least
-/// one, placement from the pure plan over the ordered `(iface, cores)`.
+/// one, in `cores::creation_order` over the ordered `(iface, cores)`.
 fn planned_ports(spec: &[(&str, u16)]) -> Vec<PortAttach> {
-    rx_placement_plan(spec)
+    creation_order(spec)
         .into_iter()
-        .zip(spec)
-        .enumerate()
-        .map(|(n, ((iface, queues), (_, cores)))| PortAttach {
-            port: iface,
+        .map(|n| PortAttach {
+            port: spec[n].0.to_string(),
             pci_addr: format!("0002:07:00.{}", n + 1),
             port_id: 0,
-            num_rx_queues: (*cores).max(1),
-            rx_placement: queues,
+            num_rx_queues: spec[n].1.max(1),
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n as u8 + 1],
             accept_macs: vec![],
             vlans: vec![],
@@ -596,18 +590,17 @@ fn planned_ports(spec: &[(&str, u16)]) -> Vec<PortAttach> {
 /// cores sum to 2, so workers 0-1 are eth3's and worker 2 is shared.
 const MIXED: &[(&str, u16)] = &[("eth2", 0), ("eth3", 2), ("eth4", 0)];
 
-fn placements(seen: &[String]) -> Vec<&str> {
-    seen.iter()
-        .filter(|s| s.starts_with("rx_placement "))
-        .map(|s| s.as_str())
-        .collect()
-}
-
-/// Every queue lands on the worker the plan names, each cores-0 port
-/// on the ONE shared worker, and each port's placement is asserted
-/// before it is brought admin-up.
+/// Placement is never requested, on either path.
+///
+/// The octeon driver's queues belong to VPP's `vnet_dev` framework,
+/// which the generic rx-placement code does not know: the rig's VPP
+/// answered every `sw_interface_set_rx_placement` with -9 ("unknown
+/// queue 0 on interface octeon0/0"), and treating that as fatal put the
+/// supervisor into a restart loop (2026-09-24). Creation order is the
+/// only lever, so the fake answers -9 exactly as the hardware does and
+/// the attach must never ask.
 #[test]
-fn rx_placement_follows_the_plan_on_a_fresh_attach() {
+fn rx_placement_is_never_requested() {
     let fake = Fake::start_with(
         "rxfresh",
         AttachBehaviour {
@@ -627,47 +620,20 @@ fn rx_placement_follows_the_plan_on_a_fresh_attach() {
         AttachMode::Fresh,
         TEST_LOOP_IDX,
     )
-    .expect("attach");
+    .expect("a fresh attach succeeds against the octeon answer");
+    // Created dedicated-first: eth3 (2 cores), then eth2 and eth4.
     assert_eq!(
-        got.iter().map(|p| p.sw_if_index).collect::<Vec<_>>(),
-        vec![7, 8, 9]
+        got.iter()
+            .map(|p| (p.port.as_str(), p.sw_if_index))
+            .collect::<Vec<_>>(),
+        vec![("eth3", 7), ("eth2", 8), ("eth4", 9)]
     );
-
     let seen = fake.observed();
-    assert_eq!(
-        placements(&seen),
-        vec![
-            "rx_placement if=7 queue=0 worker=2 main=false",
-            "rx_placement if=8 queue=0 worker=0 main=false",
-            "rx_placement if=8 queue=1 worker=1 main=false",
-            "rx_placement if=9 queue=0 worker=2 main=false",
-        ],
-        "full stream: {seen:?}"
+    assert!(
+        !seen.iter().any(|s| s.contains("rx_placement")),
+        "fresh path: {seen:?}"
     );
-    // Placement sits between the create and the admin-up of its port.
-    for (create_n, _) in seen
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| *s == "dev_create_port_if")
-    {
-        let next_up = seen[create_n..]
-            .iter()
-            .position(|s| s == "sw_interface_set_flags")
-            .map(|p| p + create_n)
-            .expect("each port is brought up");
-        assert!(
-            seen[create_n..next_up]
-                .iter()
-                .any(|s| s.starts_with("rx_placement ")),
-            "placement before admin-up: {seen:?}"
-        );
-    }
-}
 
-/// The adopted path re-asserts the same plan on the interfaces it
-/// reuses — nothing attached, nothing created, every queue placed.
-#[test]
-fn rx_placement_is_reasserted_on_the_reuse_path() {
     let fake = Fake::start_with(
         "rxreuse",
         AttachBehaviour::default(),
@@ -680,8 +646,8 @@ fn rx_placement_is_reasserted_on_the_reuse_path() {
     );
     let mut t = fake.connect();
     let known = vec![
-        ("eth2".to_string(), 7u32),
-        ("eth3".to_string(), 8u32),
+        ("eth3".to_string(), 7u32),
+        ("eth2".to_string(), 8u32),
         ("eth4".to_string(), 9u32),
     ];
     attach_ports(
@@ -692,55 +658,11 @@ fn rx_placement_is_reasserted_on_the_reuse_path() {
         TEST_LOOP_IDX,
     )
     .expect("adopt");
-
     let seen = fake.observed();
-    assert!(!seen.iter().any(|s| s == "dev_attach"), "{seen:?}");
-    assert!(!seen.iter().any(|s| s == "dev_create_port_if"), "{seen:?}");
-    assert_eq!(
-        placements(&seen),
-        vec![
-            "rx_placement if=7 queue=0 worker=2 main=false",
-            "rx_placement if=8 queue=0 worker=0 main=false",
-            "rx_placement if=8 queue=1 worker=1 main=false",
-            "rx_placement if=9 queue=0 worker=2 main=false",
-        ],
-        "full stream: {seen:?}"
-    );
-}
-
-/// A refused placement is fatal on the reuse path too — unlike the
-/// secondary-MAC re-add, there is no measured benign refusal, and a
-/// queue VPP will not place means plan and VPP disagree on topology.
-#[test]
-fn a_refused_rx_placement_is_fatal_and_names_the_queue() {
-    let fake = Fake::start_with(
-        "rxrefused",
-        AttachBehaviour {
-            placement_retval: -9,
-            ..Default::default()
-        },
-        LookupBehaviour::Missing,
-        vec![(7, "octeon0/0".into(), 3)],
-    );
-    let mut t = fake.connect();
-    let known = vec![("eth3".to_string(), 7u32)];
-    let err = attach_ports(&mut t, &ports(), &known, AttachMode::Adopted, TEST_LOOP_IDX)
-        .expect_err("must refuse");
     assert!(
-        matches!(
-            err,
-            AttachError::Refused {
-                step: "sw_interface_set_rx_placement",
-                retval: -9,
-                ..
-            }
-        ),
-        "{err:?}"
+        !seen.iter().any(|s| s.contains("rx_placement")),
+        "reuse path: {seen:?}"
     );
-    let msg = err.to_string();
-    assert!(msg.contains("eth3"), "{msg}");
-    assert!(msg.contains("queue 0"), "{msg}");
-    assert!(msg.contains("worker 0"), "{msg}");
 }
 
 /// A surviving VPP's loopback is adopted, not duplicated.
@@ -932,10 +854,6 @@ fn attach_sends_every_message_a_forwarding_port_needs_in_order() {
             "control_ping".to_string(),
             "dev_attach".to_string(),
             "dev_create_port_if".to_string(),
-            // Queue → worker, before the port goes up (the fake records
-            // the name, then the decoded detail).
-            "sw_interface_set_rx_placement".to_string(),
-            "rx_placement if=7 queue=0 worker=0 main=false".to_string(),
             "sw_interface_set_flags".to_string(),
             "sw_interface_set_mac_address".to_string(),
             "sw_interface_dump".to_string(),

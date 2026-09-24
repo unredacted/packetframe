@@ -249,10 +249,13 @@ vppctl -s /run/packetframe/vpp/api.sock.cli show threads
 ```
 
 ```bash
-# Which worker polls which queue. Dedicated ports' queues sit on their
-# own workers in config order; every `cores 0` port's queue is on the
-# last worker, the shared one.
-vppctl -s /run/packetframe/vpp/api.sock.cli show interface rx-placement
+# Which thread polls which queue: "Polling thread is N" under each port,
+# where thread N is worker N-1 (thread 0 is main). Dedicated ports sit
+# on their own workers in config order and the first `cores 0` port on
+# the last, shared one. NOT `show interface rx-placement`: the octeon
+# driver's queues belong to VPP's vnet_dev framework, which that command
+# (and `sw_interface_set_rx_placement`) does not know about.
+vppctl -s /run/packetframe/vpp/api.sock.cli show device
 ```
 
 ## The canary ladder
@@ -291,10 +294,9 @@ polling at 100% whether or not anything arrives, and at the first rung
 only one port is steered: the other members only *transmit* (steered
 traffic egresses them from the steered port's worker), and with no MCAM
 rules their VFs receive ~nothing. `cores 0` gives a port no worker of
-its own — every `cores 0` port's single rx queue is polled by ONE
-shared worker — so a six-port box at rung 1 runs three VPP threads
-(main + the steered port's worker + the shared worker) instead of
-seven:
+its own — ONE shared worker is added for all of them — so a six-port
+box at rung 1 runs three VPP threads (main + the steered port's worker
++ the shared worker) instead of seven:
 
 ```
   port eth2 cores 0 steer off
@@ -307,9 +309,19 @@ both refuse `cores 0` + `steer on`, because its whole ingress would
 land on a worker shared with every other egress-only member. Before a
 port climbs a rung, give it `cores 1` — and that is **restart-only**
 (VPP's worker count is fixed at start), so plan the core layout for
-the next rung at a restart, not at the rung itself. Queue placement is
-explicit and logged at attach (`rx placement planned`); check it with
-`show interface rx-placement` below.
+the next rung at a restart, not at the rung itself.
+
+Placement comes from creation order, not from a setting. VPP's octeon
+driver hands rx queues to workers round-robin as ports are created and
+offers no way to move them afterwards (`sw_interface_set_rx_placement`
+answers "unknown queue" for every octeon port). So the module creates
+dedicated ports first, in config order, and the `cores 0` ports last:
+the dedicated ports get consecutive workers from 0 and the first
+`cores 0` port gets the shared worker. A second `cores 0` port's queue
+wraps onto worker 0, a third onto worker 1, and so on. That's harmless,
+since those queues receive ~nothing, but it is not "all on one worker".
+The attach log prints the resulting placement (`rx placement (VPP
+round-robin, creation order)`); check it with `show device` below.
 
 Each rung is a `steer` edit plus a SIGHUP. There is no restart and no
 resync: a restart would cost about 40 seconds with the offload down at
@@ -1780,8 +1792,8 @@ IRQs moved off them pre-attach), and w10's own counters showed the
 eBPF tier matching and forwarding normally throughout
 (`matched_v4` ≈ `rx_total`, `fwd_ok` climbing). Whether ~7 hot cores
 buy enough forwarding is exactly what the steering canary measures.
-Members that only transmit do not need their own: `cores 0` puts all
-of them on one shared worker (see the canary ladder).
+Members that only transmit do not need their own: `cores 0` gives them
+no worker of their own (see the canary ladder).
 
 Do not stop reading at "the counters are fine", though — the next
 section is about exactly the loss those counters cannot see.
@@ -1822,8 +1834,8 @@ What to do about it, in order:
    its forwarding. Schedule attaches and soaks off-peak, and treat
    time-at-rung-0 as a cost to budget, not a neutral holding state.
 4. **The durable fixes** are fewer VPP cores while unsteered — give
-   every member that is not about to steer `cores 0`, so they share one
-   worker (restart-only) — and climbing to the steered rungs — steering moves
+   every member that is not about to steer `cores 0`, so they add at
+   most one worker between them (restart-only) — and climbing to the steered rungs — steering moves
    allowlisted traffic onto VPP's hardware path *and* removes its XDP
    cost from the squeezed CPUs, which is the intended end state, not a
    workaround.

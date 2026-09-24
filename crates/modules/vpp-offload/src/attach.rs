@@ -12,9 +12,15 @@
 //! sw_interface_set_flags sw_if_index up
 //! ```
 //!
-//! Between the create and the admin-up, each rx queue is placed on the
-//! worker `cores::rx_placement_plan` names (`sw_interface_set_rx_placement`)
-//! — not part of the shadow's proven sequence; it exists for `cores 0`.
+//! Which worker polls each rx queue is decided by the ORDER of the
+//! creates, not by any call here: the octeon driver runs on VPP's
+//! `vnet_dev` framework, which assigns rx queues round-robin across
+//! workers as ports are created and never registers them with the
+//! generic rx-placement machinery — so `sw_interface_set_rx_placement`
+//! answers "unknown queue" for every octeon port (measured on the rig,
+//! 2026-09-24; `vnet_dev_port_if_create` in VPP v26.06). The caller
+//! orders ports so that round-robin lands where the operator sized; see
+//! [`crate::cores::creation_order`].
 //!
 //! **Why this runs before the resync, not after.** A FIB path is
 //! encoded with an `sw_if_index`, and those indices do not exist until
@@ -32,9 +38,8 @@ use crate::vpp_api::generated::{
     SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
     SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
     SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetRxPlacement,
-    SwInterfaceSetRxPlacementReply, SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply,
-    ADDRESS_IP4,
+    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
+    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -80,11 +85,6 @@ pub struct PortAttach {
     /// one, since a `cores 0` port still has a queue (polled by the
     /// shared worker).
     pub num_rx_queues: u16,
-    /// Which worker polls each rx queue, from
-    /// [`crate::cores::rx_placement_plan`]. Asserted on the fresh and
-    /// reuse paths alike; empty asserts nothing and leaves VPP's
-    /// default round-robin in place.
-    pub rx_placement: Vec<crate::cores::RxPlacement>,
     /// The member's PRIMARY MAC — always the PF's own address, from
     /// `/sys/class/net/<port>/address`.
     ///
@@ -312,12 +312,6 @@ pub fn attach_ports(
                 // checks both key on `sw_if_index` — so it stays `None`
                 // rather than being invented.
                 //
-                // Placement too: the plan is a pure function of the
-                // (iface, cores) list, which adoption pins to the one
-                // this interface was created under, so re-asserting it
-                // moves nothing on a healthy takeover — and puts a
-                // queue back if anything moved it.
-                set_rx_placement(t, p, idx)?;
                 // Admin-up is still asserted: controller deploys and
                 // udapi provisioning can flap interface state under us,
                 // and this is the reconcile point.
@@ -376,9 +370,6 @@ pub fn attach_ports(
 
         let dev_index = attach_device(t, p)?;
         let sw_if_index = create_port_if(t, p, dev_index)?;
-        // Before admin-up, so the port starts polling on the workers
-        // the operator sized rather than on VPP's round-robin default.
-        set_rx_placement(t, p, sw_if_index)?;
         set_admin_up(t, p, sw_if_index)?;
         // Order matters and is not arbitrary: MAC before unnumbered,
         // both before the port is announced as attached. A port handed
@@ -966,52 +957,6 @@ fn set_promisc_on(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result
     Ok(())
 }
 
-/// Put each of the port's rx queues on the worker the plan names.
-///
-/// What makes `cores 0` mean anything: without it VPP round-robins
-/// queues over workers in creation order, so the egress-only members
-/// would each land on a different worker instead of sharing one.
-///
-/// **A refusal is fatal on BOTH paths, deliberately.** Unlike
-/// `set_accept_macs`, whose re-add is an insert into a set and was
-/// measured refused as a duplicate on a takeover (-9, lab rig
-/// 2026-09-23), placement is an assignment: VPP's handler looks the
-/// queue up and sets its thread, with no "already placed" branch to
-/// refuse from, so re-asserting an unchanged plan is a no-op rather
-/// than a duplicate. The failures it does have — no such queue, no
-/// such worker, a non-hardware interface — all mean the plan and the
-/// running VPP disagree about topology, which adoption's `(iface,
-/// cores)` pin exists to rule out. There is no hardware evidence of a
-/// benign refusal on the reuse path; if one ever appears, it gets the
-/// treatment `set_accept_macs` got — the one measured code tolerated
-/// on the reuse path only, with the measurement cited.
-fn set_rx_placement(
-    t: &mut Transport,
-    p: &PortAttach,
-    sw_if_index: u32,
-) -> Result<(), AttachError> {
-    for q in &p.rx_placement {
-        let reply = t.request::<SwInterfaceSetRxPlacement, SwInterfaceSetRxPlacementReply>(
-            SwInterfaceSetRxPlacement {
-                context: 0,
-                sw_if_index,
-                queue_id: q.queue_id,
-                worker_id: q.worker_id,
-                is_main: false,
-            },
-        )?;
-        if reply.retval != 0 {
-            return Err(AttachError::Refused {
-                step: "sw_interface_set_rx_placement",
-                port: p.port.clone(),
-                retval: reply.retval,
-                detail: format!("queue {} → worker {}", q.queue_id, q.worker_id),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn set_admin_up(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
     let reply =
         t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
@@ -1043,7 +988,6 @@ mod tests {
             pci_addr: "0002:07:00.1".into(),
             port_id: 0,
             num_rx_queues: 1,
-            rx_placement: vec![],
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
             vlans: vec![],
