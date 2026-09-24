@@ -35,10 +35,35 @@ User=root
 Group=root
 StateDirectory=packetframe
 StateDirectoryMode=0750
+# VPP's startup.conf logs to /var/log/packetframe/vpp.log, and VPP does
+# not create the directory: on the rig it did not exist, so VPP ran with
+# no log at all and its death left no trace. Created at every start.
+LogsDirectory=packetframe
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=packetframe
-KillMode=mixed
+# `process`, not `mixed`: systemd must signal ONLY the daemon.
+#
+# vpp-offload's VPP is the daemon's child, so it lives in this unit's
+# cgroup, and the design keeps it running when the daemon exits
+# (SPEC.md §8.5 preserve-on-exit) so the next daemon adopts it and a
+# restart is not a resync. `mixed` defeated that: once the main process
+# exited, systemd SIGKILLed everything left in the cgroup — VPP
+# included — while its MCAM rules stayed in the NIC, steering traffic
+# into a VF nothing serviced. Measured on the lab rig (2026-09-23):
+# "Killing process … (vpp_main) with signal SIGKILL" one millisecond
+# after the daemon logged "VPP is left running and adoptable". A crash
+# was worse than a stop: the start limit gives up, and the rules stay
+# until someone runs `detach` by hand.
+#
+# With `process`, VPP outlives the daemon as designed: the documented
+# teardown (`stop` then `detach --all`) removes steering first and only
+# then terminates VPP, and a crash leaves VPP forwarding on a frozen FIB
+# — the same accepted state as fast-path's pins. The daemon's other
+# children (vtysh/birdc probes) are short-lived and finish on their own.
+# systemd >= 250 logs a deprecation note for this mode; the fleet runs
+# 247. Moving VPP into its own scope is the longer-term shape.
+KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
