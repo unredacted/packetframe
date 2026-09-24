@@ -308,6 +308,21 @@ pub fn vpp_steer_exempts_from_config(
         .collect()
 }
 
+/// The `steer-capacity` the budget probe plans against; the last line
+/// wins, as it does in the module's own section parse.
+pub fn vpp_steer_capacity_from_config(config: &Config) -> Option<u16> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::VppSteerCapacity(n) => Some(*n),
+            _ => None,
+        })
+        .next_back()
+}
+
 /// The `local-route` lines joined with the fast-path `local-prefix`
 /// that covers each one — the join only the loader can perform, since
 /// `Module` methods see one section. The covering prefix's `via` is the
@@ -422,6 +437,7 @@ pub struct VppProbeInputs {
     pub loopback: Option<std::net::Ipv4Addr>,
     pub steer_directions: Vec<VppSteerDirection>,
     pub steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+    pub steer_capacity: Option<u16>,
 }
 
 /// Everything `probe_and_render` needs from the config, in one named
@@ -478,6 +494,7 @@ impl FeasibilityInputs {
                 loopback: vpp_loopback_from_config(config),
                 steer_directions: vpp_steer_directions_from_config(config),
                 steer_exempts: vpp_steer_exempts_from_config(config),
+                steer_capacity: vpp_steer_capacity_from_config(config),
             },
             snoop: neigh_snoop_probe_inputs_from_config(config),
             frr_authority: frr_authority_from_config(config),
@@ -536,6 +553,7 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
                 allowlist,
                 &vpp.steer_directions,
                 &vpp.steer_exempts,
+                vpp.steer_capacity,
             ) {
                 names.push(cap.name.clone());
                 report.capabilities.push(cap);

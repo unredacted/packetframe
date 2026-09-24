@@ -54,6 +54,7 @@
 pub mod acquire;
 pub mod attach;
 pub mod bringup;
+pub mod capacity;
 pub mod cores;
 pub mod drift;
 pub mod driver;
@@ -132,6 +133,11 @@ pub struct VppOffloadConfig {
     /// via [`VppOffloadModule::set_local_routes`]. Restart-only: the
     /// attached route and the subif it lands on are attach-time work.
     pub local_routes: Vec<(packetframe_common::config::Ipv4Prefix, String, u16)>,
+    /// `steer-capacity`: the ntuple table size to ask each steerable
+    /// member port for at attach. `None` leaves the driver's default
+    /// alone. Restart-only — the driver refuses to resize a table
+    /// holding rules, so it is attach-time work (see [`capacity`]).
+    pub steer_capacity: Option<u16>,
 }
 
 /// One `local-route`, resolved for the engine: the config triple plus
@@ -187,6 +193,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
+                ModuleDirective::VppSteerCapacity(n) => out.steer_capacity = Some(*n),
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
                 ModuleDirective::VppSteerExempt(p) => out.steer_exempts.push(*p),
@@ -286,6 +293,14 @@ impl VppOffloadConfig {
                 "`hugepages` changed ({:?} → {:?}); the reservation is made at attach and \
                  VPP maps it at start — restart to apply",
                 self.hugepages, new.hugepages
+            ));
+        }
+        if self.steer_capacity != new.steer_capacity {
+            return Err(format!(
+                "`steer-capacity` changed ({:?} → {:?}); the driver resizes a port's rule \
+                 table only while it holds no rules, so it is applied at attach — restart \
+                 to apply",
+                self.steer_capacity, new.steer_capacity
             ));
         }
         if self.loopback_address != new.loopback_address {
@@ -555,6 +570,33 @@ pub struct SteeringTarget {
     pub targets: Vec<(String, u32, steer::RuleSet)>,
     /// Whether traffic should be diverted once the target is in place.
     pub want_steer: bool,
+}
+
+/// Ask every port that can steer for `steer-capacity` rule entries.
+///
+/// Advisory by construction: a port left short is logged, never fatal.
+/// The budget read that follows plans against the table the NIC really
+/// holds, so a shortfall surfaces where it matters — as the existing
+/// over-budget refusal when a plan does not fit, naming the free slots
+/// — and a config that fits the default table attaches exactly as it
+/// did before this directive existed. `cores 0` ports are skipped:
+/// config refuses `steer on` for them, so no rule ever lands there.
+fn apply_steer_capacity(cfg: &VppOffloadConfig, ctl: &dyn capacity::CapacityControl) {
+    let Some(want) = cfg.steer_capacity else {
+        return;
+    };
+    for (iface, cores, _, _, _) in &cfg.ports {
+        if *cores == 0 {
+            continue;
+        }
+        let outcome = capacity::ensure(ctl, iface, want);
+        let line = outcome.describe(iface, want);
+        if outcome.met() {
+            tracing::info!(port = %iface, "steer-capacity: {line}");
+        } else {
+            tracing::warn!(port = %iface, "steer-capacity: {line}");
+        }
+    }
 }
 
 /// Derive the steering target.
@@ -1031,6 +1073,9 @@ impl Module for VppOffloadModule {
         // which slots exist is an environment read like every other one
         // this function performs before delegating.
         let allowlist = self.allowlist.get();
+        // Size the rule tables BEFORE the budget is read, so the plan is
+        // drawn from the table the NIC actually holds afterwards.
+        apply_steer_capacity(&self.cfg, &capacity::Live);
         let budget = match steer::McamBudget::for_ifaces(ifaces_to_query(&self.cfg, &allowlist)) {
             Ok(b) => b,
             Err(e) => return Err(ModuleError::other(MODULE_NAME, e)),
@@ -1316,6 +1361,7 @@ pub fn run_feasibility_probes(
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+    steer_capacity: Option<u16>,
 ) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
@@ -1328,6 +1374,7 @@ pub fn run_feasibility_probes(
             allowlist,
             directions,
             steer_exempts,
+            steer_capacity,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -1341,6 +1388,7 @@ pub fn run_feasibility_probes(
             allowlist,
             directions,
             steer_exempts,
+            steer_capacity,
         );
         Vec::new()
     }
@@ -1400,6 +1448,47 @@ mod tests {
             last_failures: Vec::new(),
             store_error: None,
         }
+    }
+
+    /// Records which ports `apply_steer_capacity` asked about.
+    struct AskedPorts(std::cell::RefCell<Vec<String>>);
+
+    impl capacity::CapacityControl for AskedPorts {
+        fn table(&self, iface: &str) -> Result<ntuple::RuleTable, String> {
+            self.0.borrow_mut().push(iface.to_string());
+            Ok(ntuple::RuleTable {
+                size: 64,
+                occupied: Vec::new(),
+            })
+        }
+        fn adjustable(&self, _: &str) -> Result<u16, String> {
+            unreachable!("a table already at 64 is never resized")
+        }
+        fn set(&self, _: &str, _: u16) -> Result<(), String> {
+            unreachable!("a table already at 64 is never resized")
+        }
+    }
+
+    #[test]
+    fn steer_capacity_asks_only_ports_that_can_steer() {
+        // `cores 0` members are egress-only — config refuses `steer on`
+        // for them — so resizing their tables would spend shared pool
+        // entries on rules that can never exist.
+        let mut cfg = with_cores(&[1, 0, 1]);
+        let ctl = AskedPorts(Default::default());
+        apply_steer_capacity(&cfg, &ctl);
+        assert!(ctl.0.borrow().is_empty(), "no directive, no NIC reads");
+
+        cfg.steer_capacity = Some(64);
+        apply_steer_capacity(&cfg, &ctl);
+        let asked = ctl.0.borrow().clone();
+        let expected: Vec<String> = cfg
+            .ports
+            .iter()
+            .filter(|p| p.1 > 0)
+            .map(|p| p.0.clone())
+            .collect();
+        assert_eq!(asked, expected);
     }
 
     fn with_cores(cores: &[u16]) -> VppOffloadConfig {
@@ -1772,6 +1861,7 @@ mod tests {
             require_table_complete: true,
             steer_exempts: vec![],
             local_routes: vec![],
+            steer_capacity: None,
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -2080,6 +2170,19 @@ mod tests {
             .restart_only_delta(&pages)
             .expect_err("hugepages")
             .contains("`hugepages` changed"));
+
+        // The driver refuses to resize a table holding rules, so a
+        // reload that claimed to apply this would be reporting a size
+        // the NIC never took.
+        let mut capacity = base.clone();
+        capacity.steer_capacity = Some(64);
+        let e = base
+            .restart_only_delta(&capacity)
+            .expect_err("steer-capacity");
+        assert!(
+            e.contains("`steer-capacity` changed") && e.contains("restart"),
+            "{e}"
+        );
 
         let mut binary = base.clone();
         binary.vpp_binary = Some("/opt/vpp/bin/vpp".into());

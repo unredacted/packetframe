@@ -423,9 +423,12 @@ five steered minutes, plus 3,200 multicast frames (IGMP among them)
 RPF-dropped away from the kernel bridge's snooping. The exemptions are
 higher-priority MCAM rules that deliver matches to the kernel instead:
 broadcast and multicast are built in; each gateway IP of a steered
-VLAN needs a `steer-exempt` line. Budget math per steered port on this
-hardware: 16 slots = (steerable v4 prefixes × directions) diversions
-+ 2 built-ins + your `steer-exempt` entries; the refusal message
+VLAN needs a `steer-exempt` line. Budget math per steered port:
+(steerable v4 prefixes × directions) diversions + 2 built-ins + your
+`steer-exempt` entries must fit the port's table — 16 slots by default
+on this hardware, more with `steer-capacity` (see "Raising the rule
+budget" under "Constraints worth knowing before you debug"); the
+refusal message
 itemises exactly this. While steered, `ethtool -n <port>` shows the
 exemptions at the LOW locations and the diversions at the high ones —
 lower location is higher MCAM priority, which is what makes an
@@ -770,7 +773,7 @@ What it reports, and what it deliberately does not:
   NOT consulted for these, since the interface named on a local route
   owns the address rather than being a path.
 - **Out of scope, on purpose:** local addresses elsewhere (transit
-  port IPs, mgmt, loopback). The 16-slot MCAM budget cannot hold an
+  port IPs, mgmt, loopback). The per-port MCAM budget cannot hold an
   exemption for every address on the box, and an alarm with no
   available remedy is one operators learn to ignore. The null-drop
   gauge is the backstop for that remainder.
@@ -848,7 +851,7 @@ NIC diverts.
 
 It is detection only. Deriving the exemptions automatically was
 considered and rejected for v1: it would change forwarding without an
-operator asking and could exhaust the 16-slot budget silently.
+operator asking and could exhaust the MCAM budget silently.
 
 ### The null-drop gauge
 
@@ -1674,7 +1677,7 @@ Be precise about this when reasoning about an incident.
 | Stats segment | 97 B/route | **at two threads** — counter vectors are per-thread, so every per-route figure is a two-thread figure |
 | Live table | 1,053,360 v4 (1,301,000 v4+v6) | 2026-08-02 |
 | Nexthop spread | eth3 1,248,508 / eth2 52,492 | the full-table decision rests on this |
-| ntuple `loc` space | **16 per port** (0..=15) | measured on the shadow's eth1 2026-08-05, by insert-and-read-back. At 2 rules per prefix → **8 steerable IPv4 prefixes per port**. Production's allowlist is 2. |
+| ntuple `loc` space | **16 per port** (0..=15) at the driver default; up to 256 with `steer-capacity` | measured on the shadow's eth1 2026-08-05, by insert-and-read-back; the default is the driver's `mcam_count`, raised and re-measured on the rig 2026-09-24 (`loc 40` refused at 16, accepted at 256). |
 | NPC MCAM block | 2048 entries, ~1689 free, 31 allocated per PF | from `npc/mcam_info`. **This is not the `loc` space** and must never be used to size one — doing so is what produced `base: 1024`, an out-of-range slot that failed the first steer this module ever attempted. |
 | First steer | **4 rules installed and readback-verified** | 2026-08-06, shadow eth1, locs 15/14/13/12, src+dst × 2 prefixes → VF 0. Installation only: eth1 carries the interconnect, so zero packets match. |
 | Steered-idle soak | **5 h 17 m**, rules intact, no restarts | 2026-08-06 overnight. Proves nothing wiped them; does **not** prove they survive a UniFi provisioning push — the re-assert path is still untested. |
@@ -2546,14 +2549,30 @@ restart packetframe (stop → `detach --all` → start) afterwards.
 - **Restart ordering is stop → detach --all → start.** This bit
   production twice. A plain `systemctl restart` leaves the previous
   attachment's pins in place and the next start refuses them.
-- **The ntuple table holds 16 rules per port, and `npc/mcam_info` will
-  not tell you that.** The driver rejects an out-of-range `loc` with
-  `EINVAL` rather than assigning one. The module asks the NIC via
-  `ETHTOOL_GRXCLSRLALL` and takes the highest free slots; the debugfs
-  figures (2048 entries, 1689 available) describe the NPC block across
-  all six PFs and govern nothing here. Ceiling: **8 IPv4 prefixes per
-  steered port**, and `packetframe feasibility` reports the real free
-  count under `vpp.steering.budget`.
+- **The ntuple table holds 16 rules per port by default, and
+  `npc/mcam_info` will not tell you that.** The driver rejects an
+  out-of-range `loc` with `EINVAL` rather than assigning one. The module
+  asks the NIC via `ETHTOOL_GRXCLSRLALL` and takes the highest free
+  slots. The debugfs figures (2,048 entries, ~1,700 available) are the
+  classifier pool every PF and VF draws from, not any one port's table.
+  `packetframe feasibility` reports the real free count under
+  `vpp.steering.budget`.
+- **Raising the rule budget: `steer-capacity`.** The 16 is octeontx2's
+  default carve-out from that pool, exposed as the runtime devlink
+  parameter `mcam_count`. With `steer-capacity N` the module sets it on
+  every steerable member at attach, before the budget is read. Verified
+  on the EFG (2026-09-24): 32 through 256 accepted, and a rule at
+  `loc 40` — refused at the default — inserted afterwards. Three driver
+  facts to know: it will not resize a table holding rules (so an
+  adopted, steered port keeps its table until it is unsteered and the
+  module restarted — the attach log says so); a short allocation is
+  silent, so the module judges by reading the table back and restores
+  the old size if the table shrank; and the value resets at reboot,
+  which is why the module asserts it at every attach rather than
+  leaving it as hand state. By hand, on a port holding no rules:
+  `devlink dev param show pci/<addr> name mcam_count` (this iproute2
+  needs `name`), where `<addr>` is the target of
+  `/sys/class/net/<port>/device`.
 - **A port must be administratively UP before it can be steered.**
   `otx2_get_rxnfc` gates on `netif_running`, so a down port answers
   `EOPNOTSUPP` to both the insert and the rule-count query — which reads

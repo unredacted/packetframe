@@ -33,6 +33,7 @@ pub(crate) fn run(
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+    steer_capacity: Option<u16>,
 ) -> Vec<Capability> {
     let mut caps = Vec::with_capacity(6 + ports.len());
     caps.push(probe_iommu());
@@ -57,6 +58,7 @@ pub(crate) fn run(
         allowlist,
         directions,
         steer_exempts,
+        steer_capacity,
     ));
     caps
 }
@@ -190,8 +192,22 @@ fn probe_steering_budget(
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+    steer_capacity: Option<u16>,
 ) -> Capability {
     use crate::steer::McamBudget;
+
+    // Tables as attach will find them once `steer-capacity` has been
+    // applied: a resizable, empty table is planned at the requested
+    // size. Nothing is written — the probe runs against a live box.
+    let predicted = std::cell::Cell::new(false);
+    let read = |iface: &str| {
+        crate::capacity::predicted_table(&crate::capacity::Live, iface, steer_capacity).map(
+            |(t, p)| {
+                predicted.set(predicted.get() | p);
+                t
+            },
+        )
+    };
 
     let name = "vpp.steering.budget";
     // Whether this probe's verdicts gate attach: `bring_up` refuses an
@@ -233,7 +249,8 @@ fn probe_steering_budget(
     // attach has nothing to say about, and never about the ones it
     // does.
     if !steer_ports.is_empty() {
-        let budget = match McamBudget::for_ifaces(steer_ports.iter().map(String::as_str)) {
+        let budget = match McamBudget::for_ifaces_with(steer_ports.iter().map(String::as_str), read)
+        {
             Ok(b) => b,
             Err(e) => {
                 return Capability::fail(
@@ -253,6 +270,7 @@ fn probe_steering_budget(
             steer_ports.iter().map(String::as_str).collect(),
             Vec::new(),
             false,
+            requested_note(predicted.get(), steer_capacity),
             allowlist,
             directions,
             steer_exempts,
@@ -276,7 +294,7 @@ fn probe_steering_budget(
     let mut consulted: Vec<&str> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for iface in member_ports {
-        match crate::ntuple::rule_table(iface) {
+        match read(iface) {
             Ok(table) => {
                 let next = McamBudget::from_table(&table);
                 budget = Some(match budget {
@@ -321,10 +339,23 @@ fn probe_steering_budget(
         consulted,
         skipped,
         true,
+        requested_note(predicted.get(), steer_capacity),
         allowlist,
         directions,
         steer_exempts,
     )
+}
+
+/// Said whenever the budget above rests on a size `steer-capacity` has
+/// yet to obtain, because the shared pool can give fewer at attach.
+fn requested_note(predicted: bool, steer_capacity: Option<u16>) -> String {
+    match (predicted, steer_capacity) {
+        (true, Some(n)) => format!(
+            "; planned at steer-capacity {n}, which attach requests from the driver — the \
+             shared classifier pool can give fewer, and attach plans against what it gives"
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Plan every configured direction against `budget` and render the
@@ -338,6 +369,7 @@ fn plan_and_report(
     consulted: Vec<&str>,
     skipped: Vec<String>,
     staging: bool,
+    requested: String,
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
@@ -388,7 +420,7 @@ fn plan_and_report(
         }
     }
     let detail = format!(
-        "{}; {} free slot(s) across {} {}{}{}",
+        "{}; {} free slot(s) across {} {}{}{}{}",
         details.join("; "),
         free,
         if staging {
@@ -409,7 +441,8 @@ fn plan_and_report(
             )
         } else {
             String::new()
-        }
+        },
+        requested,
     );
     Capability::pass(name, detail, required)
 }
@@ -706,7 +739,7 @@ mod steering_probe_tests {
     fn an_allowlist_that_steers_nothing_never_passes() {
         // The allowlist verdict needs no NIC and is reached before any
         // ioctl, so these run on a host with no rvu hardware.
-        let empty = probe_steering_budget(&[], &[], &[], Default::default(), &[]);
+        let empty = probe_steering_budget(&[], &[], &[], Default::default(), &[], None);
         assert_eq!(empty.status, CapabilityStatus::Fail, "{empty:?}");
         assert!(
             empty.detail.contains("allowlist is empty"),
@@ -726,6 +759,7 @@ mod steering_probe_tests {
             &[],
             Default::default(),
             &[],
+            None,
         );
         assert_eq!(gated.status, CapabilityStatus::Fail, "{gated:?}");
         assert!(
@@ -742,6 +776,7 @@ mod steering_probe_tests {
             }],
             Default::default(),
             &[],
+            None,
         );
         assert_eq!(v6_only.status, CapabilityStatus::Fail, "{v6_only:?}");
         assert!(
@@ -778,7 +813,7 @@ mod steering_probe_tests {
         // 1. No candidate anywhere: nothing was measured, so nothing
         //    is claimed.
         sys::reset();
-        let none = probe_steering_budget(&[], &[], &steerable, dirs, &[]);
+        let none = probe_steering_budget(&[], &[], &steerable, dirs, &[], None);
         assert_eq!(none.status, CapabilityStatus::Unknown, "{none:?}");
         assert!(
             !none.detail.contains("free slot(s) across"),
@@ -796,6 +831,7 @@ mod steering_probe_tests {
             &steerable,
             dirs,
             &[],
+            None,
         );
         assert_eq!(all_dark.status, CapabilityStatus::Unknown, "{all_dark:?}");
         assert!(all_dark.detail.contains("eth4"), "{}", all_dark.detail);
@@ -812,6 +848,7 @@ mod steering_probe_tests {
             &steerable,
             dirs,
             &[],
+            None,
         );
         assert_eq!(partial.status, CapabilityStatus::Pass, "{partial:?}");
         assert!(
@@ -830,6 +867,7 @@ mod steering_probe_tests {
             &steerable,
             dirs,
             &[],
+            None,
         );
         assert_eq!(
             steered_dark.status,
@@ -860,6 +898,7 @@ mod steering_probe_tests {
             &steerable,
             dirs,
             &[],
+            None,
         );
         assert_eq!(steered_ok.status, CapabilityStatus::Pass, "{steered_ok:?}");
         assert!(steered_ok.required, "{steered_ok:?}");
