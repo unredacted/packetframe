@@ -41,6 +41,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "sw_interface_set_mac_address_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_promisc", crc: "0xd40860d4", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_promisc_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_set_mtu", crc: "0x5cbe85e5", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_set_mtu_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "create_loopback", crc: "0x42bb5d22", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "create_loopback_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_add_del_address", crc: "0x5463d73b", context_offset: 6, client_index_prefix: true },
@@ -1316,6 +1318,87 @@ impl Decode for SwInterfaceSetPromiscReply {
 
 impl Message for SwInterfaceSetPromiscReply {
     const NAME: &'static str = "sw_interface_set_promisc_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_mtu` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetMtu {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub mtu: [u32; 4],
+}
+
+impl Encode for SwInterfaceSetMtu {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        for it in self.mtu.iter() {
+        buf.extend_from_slice(&(*it).to_be_bytes());
+        }
+    }
+}
+
+impl Decode for SwInterfaceSetMtu {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let mtu = {
+            let mut a = <[_; 4]>::default();
+            for slot in a.iter_mut() {
+                *slot = d.u32()?;
+            }
+            a
+        };
+        Ok(Self {
+            context,
+            sw_if_index,
+            mtu,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetMtu {
+    const NAME: &'static str = "sw_interface_set_mtu";
+    const CRC: &'static str = "0x5cbe85e5";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_mtu_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetMtuReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for SwInterfaceSetMtuReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceSetMtuReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetMtuReply {
+    const NAME: &'static str = "sw_interface_set_mtu_reply";
     const CRC: &'static str = "0xe8d4e804";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;

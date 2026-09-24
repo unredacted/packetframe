@@ -72,6 +72,7 @@ fn engine_for(fake: &Fake) -> ConvergenceEngine {
             num_rx_queues: 1,
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
+            mtu: None,
             vlans: vec![],
         }],
         vec!["eth4".into()],
@@ -1091,6 +1092,7 @@ fn the_reconciling_dump_covers_every_carried_family() {
             num_rx_queues: 1,
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
+            mtu: None,
             vlans: vec![],
         }],
         vec!["eth4".into()],
@@ -1433,6 +1435,7 @@ fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
             num_rx_queues: 1,
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             accept_macs: vec![],
+            mtu: None,
             vlans: vec![1337],
         }],
         vec!["eth4".into()],
@@ -1732,6 +1735,7 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
         num_rx_queues: 1,
         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n],
         accept_macs: vec![],
+        mtu: None,
         vlans: vec![3998],
     };
     let fdb = std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(3998, PEER, "eth5")]))));

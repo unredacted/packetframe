@@ -2635,6 +2635,16 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   `devlink dev param show pci/<addr> name mcam_count` (this iproute2
   needs `name`), where `<addr>` is the target of
   `/sys/class/net/<port>/device`.
+- **VPP's egress MTU is the kernel port's MTU, mirrored at attach.** VPP
+  applies a parent's L3 MTU to its subifs and falls back to 9000 for an
+  interface nobody set, so the module sets each VF's L3 MTU from
+  `/sys/class/net/<port>/mtu` (re-asserted on adoption). That is what
+  makes a jumbo frame from a trunk draw ICMP frag-needed — sourced from
+  `loopback-address` — at a 1500-byte transit port instead of leaving
+  oversized. One MTU per port: a VLAN on a trunk whose kernel MTU is
+  lower than the port's is not mirrored separately. An MTU changed on the
+  kernel side takes effect in VPP at the next attach.
+  `vppctl show interface` prints each interface's `mtu`.
 - **A port must be administratively UP before it can be steered.**
   `otx2_get_rxnfc` gates on `netif_running`, so a down port answers
   `EOPNOTSUPP` to both the insert and the rule-count query — which reads

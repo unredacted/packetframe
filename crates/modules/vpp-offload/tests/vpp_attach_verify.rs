@@ -40,9 +40,9 @@ use packetframe_vpp_offload::vpp_api::generated::{
     ControlPingReply, CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply, DevAttachReply,
     DevCreatePortIfReply, FibPath, IpRoute, IpRouteLookupReply, MessageTableEntry,
     SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddressReply,
-    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetPromiscReply, SwInterfaceSetRxPlacement, SwInterfaceSetRxPlacementReply,
-    SwInterfaceSetUnnumberedReply, MESSAGE_META,
+    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetMtu,
+    SwInterfaceSetMtuReply, SwInterfaceSetPromiscReply, SwInterfaceSetRxPlacement,
+    SwInterfaceSetRxPlacementReply, SwInterfaceSetUnnumberedReply, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::Transport;
 
@@ -400,6 +400,17 @@ impl Fake {
                         }
                         .encode(&mut out);
                     }
+                    "sw_interface_set_mtu" => {
+                        let mut d = Decoder::new(&req);
+                        let r = SwInterfaceSetMtu::decode(&mut d).expect("decodes as an mtu op");
+                        let _ = tx.send(format!("mtu if={} l3={}", r.sw_if_index, r.mtu[0]));
+                        out = reply_head("sw_interface_set_mtu_reply");
+                        SwInterfaceSetMtuReply {
+                            context: ctx,
+                            retval: 0,
+                        }
+                        .encode(&mut out);
+                    }
                     "sw_interface_set_rx_placement" => {
                         let mut d = Decoder::new(&req);
                         let r = SwInterfaceSetRxPlacement::decode(&mut d)
@@ -565,6 +576,7 @@ fn ports() -> Vec<PortAttach> {
         num_rx_queues: 1,
         pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         accept_macs: vec![],
+        mtu: None,
         vlans: vec![],
     }]
 }
@@ -581,6 +593,7 @@ fn planned_ports(spec: &[(&str, u16)]) -> Vec<PortAttach> {
             num_rx_queues: spec[n].1.max(1),
             pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n as u8 + 1],
             accept_macs: vec![],
+            mtu: None,
             vlans: vec![],
         })
         .collect()
@@ -589,6 +602,72 @@ fn planned_ports(spec: &[(&str, u16)]) -> Vec<PortAttach> {
 /// An egress-only member on each side of a two-core port: the dedicated
 /// cores sum to 2, so workers 0-1 are eth3's and worker 2 is shared.
 const MIXED: &[(&str, u16)] = &[("eth2", 0), ("eth3", 2), ("eth4", 0)];
+
+/// The kernel port's MTU becomes the VF's L3 MTU, on the fresh path and
+/// re-asserted on reuse — VPP's 9000 fallback on an interface nobody set
+/// would let a jumbo frame leave a 1500-byte port unfragmented, with no
+/// ICMP frag-needed for PMTUD. `None` sends nothing.
+#[test]
+fn the_kernel_mtu_is_mirrored_onto_the_vf() {
+    let with_mtu = || {
+        let mut p = ports();
+        p[0].mtu = Some(1500);
+        p
+    };
+    let fake = Fake::start_with(
+        "mtu-fresh",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![],
+    );
+    let mut t = fake.connect();
+    attach_ports(&mut t, &with_mtu(), &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
+    let seen = fake.observed();
+    assert!(
+        seen.iter().any(|s| s == "mtu if=7 l3=1500"),
+        "fresh: {seen:?}"
+    );
+
+    let fake = Fake::start_with(
+        "mtu-reuse",
+        AttachBehaviour::default(),
+        LookupBehaviour::Missing,
+        vec![(7, "octeon0/0".into(), 3)],
+    );
+    let mut t = fake.connect();
+    let known = vec![("eth3".to_string(), 7u32)];
+    attach_ports(
+        &mut t,
+        &with_mtu(),
+        &known,
+        AttachMode::Adopted,
+        TEST_LOOP_IDX,
+    )
+    .expect("adopt");
+    let seen = fake.observed();
+    assert!(
+        seen.iter().any(|s| s == "mtu if=7 l3=1500"),
+        "reuse: {seen:?}"
+    );
+
+    let fake = Fake::start_with(
+        "mtu-none",
+        AttachBehaviour {
+            dev_index: 3,
+            sw_if_index: 7,
+            ..Default::default()
+        },
+        LookupBehaviour::Missing,
+        vec![],
+    );
+    let mut t = fake.connect();
+    attach_ports(&mut t, &ports(), &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
+    assert!(!fake.observed().iter().any(|s| s.contains("mtu")));
+}
 
 /// Placement is never requested, on either path.
 ///
