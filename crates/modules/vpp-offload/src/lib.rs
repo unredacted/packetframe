@@ -633,6 +633,35 @@ fn release_steer_capacity(moved: &[(String, u32)], ctl: &dyn capacity::CapacityC
     }
 }
 
+/// How planning reads a port's rule table: with this module's own
+/// recorded rules counted as free ([`ntuple::rule_table_reclaiming`]).
+///
+/// The ledger comes from the state file, which every steer persists, so
+/// the attach of an adopting restart and a reload of a running module
+/// read the same record. An unreadable or absent file reclaims nothing
+/// — planning then sees the raw table, as it always did, which can only
+/// refuse, never overwrite.
+fn planning_table(
+    state_dir: &std::path::Path,
+) -> impl Fn(&str) -> Result<ntuple::RuleTable, String> {
+    let ledger = resources::ResourceState::load(state_dir).ok().flatten();
+    move |iface: &str| {
+        let Some(st) = &ledger else {
+            return ntuple::rule_table(iface);
+        };
+        let recorded: Vec<u32> = st
+            .steer_rules
+            .iter()
+            .filter(|(i, _)| i == iface)
+            .flat_map(|(_, locs)| locs.iter().copied())
+            .collect();
+        let plan = st.steer_plans.iter().find(|(i, _, _)| i == iface);
+        // VF 0: `acquire` creates exactly one per PF.
+        let vf = plan.map_or(0, |(_, vf, _)| *vf);
+        ntuple::rule_table_reclaiming(iface, vf, &recorded, plan.map(|(_, _, p)| p))
+    }
+}
+
 /// Derive the steering target.
 ///
 /// A free function so the one rule that is easy to get backwards is
@@ -650,6 +679,7 @@ fn release_steer_capacity(moved: &[(String, u32)], ctl: &dyn capacity::CapacityC
 fn steering_target(
     cfg: &VppOffloadConfig,
     allowlist: &[packetframe_common::fib::IpPrefix],
+    table: impl Fn(&str) -> Result<ntuple::RuleTable, String>,
 ) -> Result<SteeringTarget, String> {
     // VF 0 because `acquire` creates exactly one per PF.
     let ports: Vec<(String, u32, VppSteerDirection)> = cfg
@@ -666,7 +696,10 @@ fn steering_target(
             want_steer: false,
         });
     }
-    let budget = steer::McamBudget::for_ifaces(ports.iter().map(|(iface, _, _)| iface.as_str()))?;
+    let budget = steer::McamBudget::for_ifaces_with(
+        ports.iter().map(|(iface, _, _)| iface.as_str()),
+        table,
+    )?;
     // One plan per DISTINCT effective direction, all drawn from the
     // shared free-slot intersection so a location number names the
     // same slot on every steering port. Locations are per-interface,
@@ -1130,19 +1163,22 @@ impl Module for VppOffloadModule {
         // hand the entries back if attach then refuses, since the shared
         // pool would otherwise stay drained until reboot.
         let resized = apply_steer_capacity(&self.cfg, &capacity::Live);
-        let brought_up = steer::McamBudget::for_ifaces(ifaces_to_query(&self.cfg, &allowlist))
-            .and_then(|budget| {
-                bringup::bring_up(
-                    &self.cfg,
-                    &paths,
-                    source,
-                    &allowlist,
-                    self.completeness.clone(),
-                    self.feed_session.clone(),
-                    &budget,
-                    &self.local_routes,
-                )
-            });
+        let brought_up = steer::McamBudget::for_ifaces_with(
+            ifaces_to_query(&self.cfg, &allowlist),
+            planning_table(&self.state_dir),
+        )
+        .and_then(|budget| {
+            bringup::bring_up(
+                &self.cfg,
+                &paths,
+                source,
+                &allowlist,
+                self.completeness.clone(),
+                self.feed_session.clone(),
+                &budget,
+                &self.local_routes,
+            )
+        });
         let attached = match brought_up {
             Ok(a) => a,
             Err(e) => {
@@ -1205,7 +1241,7 @@ impl Module for VppOffloadModule {
             return Ok(());
         };
 
-        let target = steering_target(&new, &self.allowlist.get())
+        let target = steering_target(&new, &self.allowlist.get(), planning_table(&self.state_dir))
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Did the operator actually turn the lever, or does the config
         // merely still say `steer on`?
@@ -2363,7 +2399,7 @@ mod tests {
 
         // Steering ON is refused, and names the true requirement.
         let on = cfg(&[("eth4", 1, true)], 1_600_000);
-        let e = steering_target(&on, &allow).expect_err("cannot fit");
+        let e = steering_target(&on, &allow, ntuple::rule_table).expect_err("cannot fit");
         // 600 diversions plus the two built-in kernel exemptions.
         assert!(e.contains("602 MCAM rule(s)"), "{e}");
 
@@ -2371,11 +2407,71 @@ mod tests {
         // assertion that matters: the rollback path must not consult a
         // budget it does not spend.
         let off = cfg(&[("eth4", 1, false)], 1_600_000);
-        let t = steering_target(&off, &allow).expect("rollback must be possible");
+        let t =
+            steering_target(&off, &allow, ntuple::rule_table).expect("rollback must be possible");
         assert!(t.targets.is_empty() && !t.want_steer);
     }
 
     /// A `steer on` port with a v6-only allowlist is refused, not
+    /// A reload that steers a second port while the first one's rules
+    /// fill most of the table: the launch sequence's second `steer on`.
+    ///
+    /// Every steering port's table is intersected, so the steered
+    /// port's own 13 rules left 3 free slots of 16 and the reload
+    /// refused (the Codex finding on #249, reload flavour). Reading the
+    /// tables through the state file's ledger counts those rules as
+    /// ours, and the steered port's plan comes back unchanged.
+    #[test]
+    fn a_reload_steering_a_second_port_reuses_the_first_ports_slots() {
+        use crate::runtime::Steering as _;
+        ntuple::sys::reset();
+        let allow = vec![
+            packetframe_common::fib::IpPrefix::V4 {
+                addr: [198, 51, 100, 0],
+                prefix_len: 24,
+            },
+            packetframe_common::fib::IpPrefix::V4 {
+                addr: [203, 0, 113, 0],
+                prefix_len: 24,
+            },
+        ];
+        let mut first = cfg(&[("eth4", 1, true), ("eth3", 1, false)], 1_600_000);
+        first.steer_exempts = (1..=7u8)
+            .map(|h| packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, h),
+                prefix_len: 32,
+            })
+            .collect();
+        let t1 = steering_target(&first, &allow, ntuple::rule_table).expect("fits");
+        assert_eq!(t1.targets[0].2.rules.len(), 13);
+        let mut steering = ntuple::NtupleSteering::new(
+            vec![("eth4".into(), 0), ("eth3".into(), 0)],
+            t1.targets.clone(),
+        );
+        steering.steer().expect("eth4 steers");
+
+        // What every steer persists: the ledger and the plan it holds.
+        let dir = std::env::temp_dir().join(format!("pf-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut st = resources::ResourceState::empty();
+        st.steer_rules = resources::group_steer_rules(&steering.installed());
+        st.steer_plans = t1.targets.clone();
+        st.save(&dir).unwrap();
+
+        let mut second = first.clone();
+        second.ports[1].2 = true;
+        steering_target(&second, &allow, ntuple::rule_table)
+            .expect_err("the raw tables leave 3 free slots");
+        let t2 = steering_target(&second, &allow, planning_table(&dir))
+            .expect("eth4's own slots count as free");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            t2.targets[0], t1.targets[0],
+            "eth4's plan is the one already installed: nothing moves"
+        );
+        assert_eq!(t2.targets[1].0, "eth3");
+    }
+
     /// The bidirectional service edge: per-port `direction` yields
     /// per-port plans — src diverts on the trunk, dst diverts on the
     /// transit — with the built-in Keep exemptions on both, drawn from
@@ -2390,7 +2486,7 @@ mod tests {
             addr: [23, 191, 200, 0],
             prefix_len: 24,
         }];
-        let t = steering_target(&on, &allow).expect("both plans fit");
+        let t = steering_target(&on, &allow, ntuple::rule_table).expect("both plans fit");
         assert!(t.want_steer);
         assert_eq!(t.targets.len(), 2);
         let plan_of = |iface: &str| {
@@ -2435,7 +2531,7 @@ mod tests {
             prefix_len: 32,
         }];
         let on = cfg(&[("eth4", 1, true)], 1_600_000);
-        let e = steering_target(&on, &allow).expect_err("must refuse");
+        let e = steering_target(&on, &allow, ntuple::rule_table).expect_err("must refuse");
         assert!(e.contains("no steerable rules"), "{e}");
         assert!(
             e.contains("reporting Healthy"),

@@ -78,6 +78,58 @@ const ETH_RX_NFC_IP4: u8 = 1;
 /// what put `base: 1024` in this file.
 pub const FALLBACK_TABLE_SIZE: u32 = 16;
 
+/// [`rule_table`], with this module's own rules counted as free.
+///
+/// Planning excludes every occupied slot, and on a port that is already
+/// steered most of the occupants are OURS — so a re-plan (a daemon
+/// restart adopting a steered VPP, or a reload that steers one more
+/// port, since every steering port's table is intersected) could use
+/// only the slots its own rules left over. Any plan filling more than
+/// half the table then refused to re-plan at all: at the default 16
+/// slots, 13 installed rules left 3 (Codex on #249). Planning is
+/// deterministic over the free set, so counting our slots as free makes
+/// an unchanged plan land on exactly the locations it already holds —
+/// `steer` then finds nothing stale and nothing to move.
+///
+/// A slot is ours only if the durable ledger (`recorded`) names it AND
+/// the NIC still holds our rule there: a diversion into our VF
+/// (`ring_cookie` names `vf_index`), or a rule matching the recorded
+/// plan's rule for that location, which is how a cookie-zero
+/// exemption is told from a stranger's. A slot somebody took while we
+/// were down stays occupied — the ledger is a candidate list, never the
+/// authority.
+pub fn rule_table_reclaiming(
+    iface: &str,
+    vf_index: u32,
+    recorded: &[u32],
+    recorded_plan: Option<&RuleSet>,
+) -> Result<RuleTable, String> {
+    let mut table = rule_table(iface)?;
+    let mut ours = Vec::new();
+    for &loc in table.occupied.iter().filter(|l| recorded.contains(l)) {
+        let Some(got) = read_rule(iface, loc)? else {
+            // Emptied since the table read (a controller classifier
+            // reset, say): free now, so it must leave `occupied` too.
+            ours.push(loc);
+            continue;
+        };
+        // The VF field, not the whole cookie: a rule into another queue
+        // of our VF is still ours, as `remove_all` already judges it.
+        let diverts_to_us =
+            ring_cookie_vf(got.ring_cookie) == ring_cookie_vf(ring_cookie(vf_index));
+        let planned_here = recorded_plan.is_some_and(|plan| {
+            plan.rules
+                .iter()
+                .any(|r| r.location == loc && audit_matches(&flow_spec(r, vf_index), &got))
+        });
+        if diverts_to_us || planned_here {
+            ours.push(loc);
+        }
+    }
+    table.occupied.retain(|l| !ours.contains(l));
+    Ok(table)
+}
+
 /// The `loc` space one interface actually offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleTable {
@@ -528,7 +580,7 @@ mod sys {
 /// NIC — and it is still unrun. This substitutes for a NIC's
 /// *behaviour*, not for its *layout*.
 #[cfg(test)]
-pub(super) mod sys {
+pub(crate) mod sys {
     use super::{Rxnfc, ETHTOOL_GRXCLSRULE, ETHTOOL_SRXCLSRLDEL, ETHTOOL_SRXCLSRLINS};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1858,7 +1910,7 @@ impl crate::runtime::Steering for NtupleSteering {
 mod tests {
     use super::*;
     use crate::steer::{McamBudget, RuleSet};
-    use packetframe_common::config::VppSteerDirection;
+    use packetframe_common::config::{Ipv4Prefix, VppSteerDirection};
     use packetframe_common::fib::IpPrefix;
     use std::net::Ipv4Addr;
 
@@ -3249,6 +3301,95 @@ mod tests {
             "while the inherited rule that IS ours still comes out: {:?}",
             sys::rules()
         );
+    }
+
+    /// A re-plan over a steered port lands on the slots it already holds.
+    ///
+    /// The Codex finding on #249, at the default table: a plan filling
+    /// more than half of it could not be re-planned while installed,
+    /// because planning saw only what our own rules left free.
+    #[test]
+    fn a_replan_over_our_own_rules_reuses_their_slots() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        // Enough exemptions that the plan fills 13 of 16 slots.
+        let allow = vec![
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 0],
+                prefix_len: 24,
+            },
+            IpPrefix::V4 {
+                addr: [203, 0, 113, 0],
+                prefix_len: 24,
+            },
+        ];
+        let exempts: Vec<Ipv4Prefix> = (1..=7u8)
+            .map(|h| Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, h),
+                prefix_len: 32,
+            })
+            .collect();
+        let budget = McamBudget::from_table(&rule_table("eth0").expect("table"));
+        let plan = RuleSet::plan(&allow, &exempts, budget, VppSteerDirection::Both)
+            .expect("13 rules fit an empty 16-slot table");
+        assert_eq!(plan.rules.len(), 13);
+        let mut before = steering(vec![("eth0".into(), 0)], plan.clone());
+        before.steer().expect("installs");
+        let recorded: Vec<u32> = before.installed().into_iter().map(|(_, l)| l).collect();
+
+        // Planning against the raw table is the bug: 3 free.
+        let raw = McamBudget::from_table(&rule_table("eth0").expect("table"));
+        RuleSet::plan(&allow, &exempts, raw, VppSteerDirection::Both)
+            .expect_err("our own rules crowd out the re-plan");
+
+        // Reclaiming ours, the re-plan is the plan we already installed.
+        let table = rule_table_reclaiming("eth0", 0, &recorded, Some(&plan)).expect("table");
+        assert!(table.occupied.is_empty(), "{:?}", table.occupied);
+        let again = RuleSet::plan(
+            &allow,
+            &exempts,
+            McamBudget::from_table(&table),
+            VppSteerDirection::Both,
+        )
+        .expect("fits");
+        assert_eq!(
+            again, plan,
+            "same rules at the same locations: nothing to move"
+        );
+    }
+
+    /// A recorded slot somebody else took while we were down is not
+    /// reclaimed — the ledger nominates, the NIC decides.
+    #[test]
+    fn a_recorded_slot_holding_a_strangers_rule_stays_occupied() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
+        let mut before = steering(vec![("eth0".into(), 0)], plan.clone());
+        before.steer().expect("installs");
+        let recorded: Vec<u32> = before.installed().into_iter().map(|(_, l)| l).collect();
+        let taken = recorded[0];
+        sys::replace_behind_back("eth0", taken);
+
+        let table = rule_table_reclaiming("eth0", 0, &recorded, Some(&plan)).expect("table");
+        assert_eq!(table.occupied, vec![taken]);
+
+        // A rule into ANOTHER QUEUE of our VF is still ours.
+        sys::replace_behind_back_targeting("eth0", taken, ring_cookie(0) | 3);
+        let table = rule_table_reclaiming("eth0", 0, &recorded, Some(&plan)).expect("table");
+        assert!(table.occupied.is_empty(), "{:?}", table.occupied);
+        sys::replace_behind_back("eth0", taken);
+
+        // Without the recorded plan, a cookie-zero exemption cannot be
+        // told from a stranger's, so it stays occupied too; diversions
+        // are still recognised by their cookie.
+        let bare = rule_table_reclaiming("eth0", 0, &recorded, None).expect("table");
+        let keeps = plan
+            .rules
+            .iter()
+            .filter(|r| r.action == crate::steer::RuleAction::Keep)
+            .count();
+        assert_eq!(bare.occupied.len(), keeps + 1, "{:?}", bare.occupied);
     }
 
     /// With no VF known for the interface, removal is by location, as it
