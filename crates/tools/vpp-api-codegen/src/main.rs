@@ -124,6 +124,15 @@ const MESSAGES: &[&str] = &[
     //   dot1q) is what gives those frames an interface to classify to.
     "create_vlan_subif",
     "create_vlan_subif_reply",
+    //   Explicit rx-queue → worker placement. A port may declare
+    //   `cores 0` (an egress-only member: its VF receives ~nothing
+    //   while unsteered, yet a dedicated worker would poll it at 100%),
+    //   and every such port shares ONE worker. VPP's default placement
+    //   is round-robin over workers in queue-creation order, which
+    //   would not put all the cores-0 queues on the one worker sized
+    //   for them, so placement is asserted per queue at attach.
+    "sw_interface_set_rx_placement",
+    "sw_interface_set_rx_placement_reply",
     // Interface discovery + link state. `sw_interface_dump` is a DUMP:
     // it streams `sw_interface_details` and is terminated by trailing a
     // `control_ping`. Two jobs neither of which is optional — adoption

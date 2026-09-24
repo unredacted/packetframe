@@ -51,6 +51,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "sw_interface_add_del_mac_address_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "create_vlan_subif", crc: "0xaf34ac8b", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "create_vlan_subif_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_set_rx_placement", crc: "0xdb65f3c9", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_set_rx_placement_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_dump", crc: "0xaa610c27", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_details", crc: "0x6c221fc7", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "dev_attach", crc: "0x44b725fc", context_offset: 6, client_index_prefix: true },
@@ -1700,6 +1702,87 @@ impl Decode for CreateVlanSubifReply {
 impl Message for CreateVlanSubifReply {
     const NAME: &'static str = "create_vlan_subif_reply";
     const CRC: &'static str = "0x5383d31f";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_rx_placement` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetRxPlacement {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub queue_id: u32,
+    pub worker_id: u32,
+    pub is_main: bool,
+}
+
+impl Encode for SwInterfaceSetRxPlacement {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.queue_id).to_be_bytes());
+        buf.extend_from_slice(&(self.worker_id).to_be_bytes());
+        buf.push(if self.is_main { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for SwInterfaceSetRxPlacement {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let queue_id = d.u32()?;
+        let worker_id = d.u32()?;
+        let is_main = d.bool()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            queue_id,
+            worker_id,
+            is_main,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetRxPlacement {
+    const NAME: &'static str = "sw_interface_set_rx_placement";
+    const CRC: &'static str = "0xdb65f3c9";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_rx_placement_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetRxPlacementReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for SwInterfaceSetRxPlacementReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceSetRxPlacementReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetRxPlacementReply {
+    const NAME: &'static str = "sw_interface_set_rx_placement_reply";
+    const CRC: &'static str = "0xe8d4e804";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

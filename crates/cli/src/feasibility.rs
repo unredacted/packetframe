@@ -177,23 +177,24 @@ pub fn vpp_ports_from_config(config: &Config) -> Vec<String> {
     ports
 }
 
-/// Total VPP workers the config asks for — the sum of every `port`
-/// line's `cores`. The IRQ-affinity probe needs it to derive the same
-/// core map attach would, so the probe and the attach refusal cannot
-/// disagree about which CPUs are at stake.
+/// Total VPP workers the config asks for — every `port` line's
+/// `cores`, plus the one worker `cores 0` ports share, through the same
+/// [`packetframe_common::config::vpp_worker_count`] attach uses. The
+/// IRQ-affinity probe needs it to derive the same core map attach
+/// would, so the probe and the attach refusal cannot disagree about
+/// which CPUs are at stake.
 pub fn vpp_workers_from_config(config: &Config) -> u32 {
-    let mut workers = 0u32;
-    for m in &config.modules {
-        if m.name != "vpp-offload" {
-            continue;
-        }
-        for d in &m.directives {
-            if let ModuleDirective::VppPort { cores, .. } = d {
-                workers += u32::from(*cores);
-            }
-        }
-    }
-    workers
+    packetframe_common::config::vpp_worker_count(
+        config
+            .modules
+            .iter()
+            .filter(|m| m.name == "vpp-offload")
+            .flat_map(|m| &m.directives)
+            .filter_map(|d| match d {
+                ModuleDirective::VppPort { cores, .. } => Some(*cores),
+                _ => None,
+            }),
+    )
 }
 
 /// The ports configured `steer on` — the set whose NICs the budget
@@ -953,6 +954,24 @@ fn print_row(cap: &Capability, name_w: usize) {
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+
+    /// The probe's worker count is attach's, `cores 0` shared worker
+    /// included — a probe that summed cores alone would derive a core
+    /// map one worker short of what attach renders.
+    #[cfg(feature = "vpp-offload")]
+    #[test]
+    fn worker_count_matches_attach_with_a_shared_worker() {
+        let config = Config::parse(
+            "module vpp-offload\n  port vp0 cores 2 steer off\n  port vp1 cores 0 steer off\n  \
+             port vp2 cores 0 steer off\n",
+        )
+        .expect("parse");
+        let runtime = packetframe_vpp_offload::VppOffloadConfig::from_directives(
+            &config.modules[0].directives,
+        );
+        assert_eq!(vpp_workers_from_config(&config), 3);
+        assert_eq!(vpp_workers_from_config(&config), runtime.total_workers());
+    }
 
     /// The scalar extractors resolve repeated directives exactly as
     /// `VppOffloadConfig::from_directives` does (last wins) — asserted
