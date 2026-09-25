@@ -680,15 +680,33 @@ routes are re-programmed (their paths name the interface, so nothing
 else would move them), and the old adjacency is removed only once they
 have — so the old trunk keeps forwarding in the meantime. An FDB entry
 that ages out or is flushed keeps the last known port — the host's own
-traffic re-teaches the bridge within moments. If the FDB stops being
-readable, placements hold at the last good read and the `fdb` row goes
-Degraded until a read succeeds.
+traffic re-teaches the bridge within moments. If the FDB or the
+bridge-port VLAN table stops being readable, placements and VLAN
+membership hold at the last good read and the `fdb` row goes Degraded
+until a read succeeds.
 
 Two things to get right in config:
 
-- **Declare the vid on every trunk that can carry it.** A neighbour
-  learned behind a port without that subif cannot be reached, and its
-  routes stay unresolvable (which blocks a first steer, by design).
+- **Declare the vid on every trunk that can carry it** — or declare the
+  trunks `vlans all`. A neighbour learned behind a port without that
+  subif cannot be reached, and its routes stay unresolvable (which
+  blocks a first steer, by design). With `port eth4 … vlans all`, the
+  port gets a subif for every tagged VLAN the kernel bridge carries on
+  it at attach, and the engine adds one within seconds of the switch
+  adding a VLAN (`trunk carries new VLAN(s); subinterfaces added` in the
+  journal) — a neighbour already placed on it is then programmed and
+  its routes re-queued. Add-only: a VLAN removed on the switch leaves an
+  idle subif until the next restart. A VLAN the bridge sends untagged on
+  the port (its PVID) needs no subif at all: neighbours on it, and a
+  `local-route` naming it, are reached through the VF. If it stops being
+  untagged on that port, its neighbours' routes go unresolvable and the
+  VF adjacency is retired.
+- A new VLAN's **connected subnet** is not delivered automatically: VPP
+  reaches next hops on it, not arbitrary hosts. The exemption tripwire
+  reports the connected route until a `local-route` (with its fast-path
+  `local-prefix`) or a `steer-exempt` covers it. Gatewayed routes over
+  the new VLAN are covered from the tripwire's next scan: it re-reads
+  which VLANs each member carries every time.
 - The FDB learns from frames the KERNEL sees. Steered frames go to the
   VF, so a host whose every frame is steered would eventually age out —
   in practice ARP, IPv6 and control traffic keep it fresh. The
@@ -2595,9 +2613,47 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   to do about it. A daemon whose running config silently differed from
   the file you just edited is how the wrong thing gets debugged for an
   hour.
-- **Restart ordering is stop → detach --all → start.** This bit
-  production twice. A plain `systemctl restart` leaves the previous
-  attachment's pins in place and the next start refuses them.
+- **Restart ordering is stop → detach → start.** This bit production
+  twice. A plain `systemctl restart` leaves the previous attachment's
+  pins in place and the next start refuses them. Two forms, and they are
+  different operations:
+  - `detach --all` tears **everything** down, VPP included: traffic
+    falls back to the eBPF tier and the next start brings VPP up fresh
+    (a full resync, then the canary levers again). The safe form, and
+    the one every recovery message names.
+  - `detach --keep-vpp` tears down every other module's pins and leaves
+    VPP, its VFs, hugepages and steering rules running for the next
+    start to adopt — steered traffic keeps flowing across the restart
+    (measured on the rig: one 0.6 s steering dip while the adoption
+    reconciles). The form for an upgrade or config restart of a steered
+    box:
+
+    ```bash
+    systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
+    ```
+
+    Every module other than vpp-offload comes down whatever the config
+    declares — it is a restart, so a module the edit removed does not
+    stay behind. VPP is kept only for a restart that can adopt it, and
+    `detach --keep-vpp` checks that before tearing anything down,
+    refusing by name when:
+    - the edit changed something VPP fixes at attach: `port` lines
+      (including `cores` and `vlans`), `expected-routes`, `hugepages`,
+      `steer-capacity`, `loopback-address`, `vpp-binary` or
+      `local-route`. Adoption neither applies nor undoes these — a
+      dropped VLAN's subif would keep taking steered ingress, unmanaged.
+      Steering levers and `steer-direction` are fine; adoption applies
+      them;
+    - the config no longer has a `vpp-offload` section;
+    - there is no vpp-offload record in the config's `state-dir` — no
+      VPP running, or a `state-dir` edit the next start would look past.
+      The same goes for `bpffs-root`: a path edit needs `detach --all`
+      under the **old** config, then start;
+    - the record predates this check (first restart after upgrading to
+      it).
+
+    The daemon's adoption applies the same checks, so a restart that
+    skipped the preflight fails the start rather than adopting.
 - **The ntuple table holds 16 rules per port by default, and
   `npc/mcam_info` will not tell you that.** The driver rejects an
   out-of-range `loc` with `EINVAL` rather than assigning one. The module

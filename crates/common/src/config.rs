@@ -200,6 +200,10 @@ pub enum ModuleDirective {
         cores: u16,
         steer: bool,
         vlans: Vec<u16>,
+        /// `vlans all`: the port's subinterfaces follow the tagged VLANs
+        /// the kernel bridge carries on it, including ones added while
+        /// VPP runs. `vlans` is empty when this is set.
+        vlans_all: bool,
         direction: Option<VppSteerDirection>,
         line: usize,
     },
@@ -1790,11 +1794,14 @@ impl Config {
                 }
                 let port_vlans = vpp.directives.iter().find_map(|d| match d {
                     ModuleDirective::VppPort {
-                        iface: pi, vlans, ..
-                    } if pi == iface => Some(vlans),
+                        iface: pi,
+                        vlans,
+                        vlans_all,
+                        ..
+                    } if pi == iface => Some((vlans, *vlans_all)),
                     _ => None,
                 });
-                let Some(port_vlans) = port_vlans else {
+                let Some((port_vlans, port_vlans_all)) = port_vlans else {
                     return Err(ConfigError::parse(
                         *line,
                         format!(
@@ -1803,7 +1810,9 @@ impl Config {
                         ),
                     ));
                 };
-                if !port_vlans.contains(vlan) {
+                // `vlans all` follows the kernel, which decides at attach
+                // whether the vid exists; an explicit list must name it.
+                if !port_vlans_all && !port_vlans.contains(vlan) {
                     return Err(ConfigError::parse(
                         *line,
                         format!(
@@ -3199,7 +3208,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .next()
                 .ok_or_else(|| ConfigError::parse(line, "port requires an interface"))?;
             validate_iface_name(line, "port", iface)?;
-            let usage = "port takes: <iface> cores <n> steer on|off [vlans <id>[,<id>...]] \
+            let usage = "port takes: <iface> cores <n> steer on|off [vlans <id>[,<id>...]|all] \
                          [direction src|dst|both]";
             if rest.next() != Some("cores") {
                 return Err(ConfigError::parse(line, usage));
@@ -3223,13 +3232,19 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 _ => return Err(ConfigError::parse(line, "steer expects on|off")),
             };
             let mut vlans: Vec<u16> = Vec::new();
+            let mut vlans_all = false;
             let mut direction: Option<VppSteerDirection> = None;
             let mut tail = rest.next();
             if tail == Some("vlans") {
                 let csv = rest.next().ok_or_else(|| {
-                    ConfigError::parse(line, "vlans requires a comma-separated id list")
+                    ConfigError::parse(line, "vlans requires a comma-separated id list or `all`")
                 })?;
-                for tok in csv.split(',') {
+                // `all`: follow whatever tagged VLANs the kernel bridge
+                // carries on this port, now and as they are added.
+                if csv == "all" {
+                    vlans_all = true;
+                }
+                for tok in csv.split(',').filter(|_| !vlans_all) {
                     let vid: u16 = tok.parse().map_err(|_| {
                         ConfigError::parse(line, "vlans ids must be integers 1-4094")
                     })?;
@@ -3263,6 +3278,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 cores,
                 steer,
                 vlans,
+                vlans_all,
                 direction,
                 line,
             })
@@ -5619,8 +5635,20 @@ module vpp-offload
             "module vpp-offload\n  port eth4 cores 1 steer off vlans 88,\n",
             "module vpp-offload\n  port eth4 cores 1 steer off vlans 88 99\n",
             "module vpp-offload\n  port eth4 cores 1 steer off tags 88\n",
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans all,88\n",
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+        // `vlans all` → the flag, and no explicit list.
+        let c = Config::parse(
+            "module vpp-offload\n  port eth4 cores 1 steer off vlans all direction both\n",
+        )
+        .unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppPort {
+                vlans, vlans_all, ..
+            } => assert!(vlans.is_empty() && *vlans_all),
+            other => panic!("expected VppPort, got {other:?}"),
         }
     }
 

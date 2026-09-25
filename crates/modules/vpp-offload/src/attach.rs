@@ -924,6 +924,26 @@ fn ensure_vlan_subifs(
     Ok(out)
 }
 
+/// Give an attached port subifs for `vids`, while VPP runs — how a
+/// `vlans all` trunk follows a VLAN added on the switch without a
+/// restart. Same routine attach uses, over a fresh interface dump, so a
+/// subif that already exists (a previous pass, an adopted VPP) is reused
+/// and re-asserted rather than duplicated.
+pub fn add_vlan_subifs(
+    t: &mut Transport,
+    p: &PortAttach,
+    parent_idx: u32,
+    loop_idx: u32,
+    vids: &[u16],
+) -> Result<Vec<(u16, u32)>, AttachError> {
+    let existing = interfaces(t)?;
+    let scoped = PortAttach {
+        vlans: vids.to_vec(),
+        ..p.clone()
+    };
+    ensure_vlan_subifs(t, &scoped, parent_idx, loop_idx, &existing)
+}
+
 /// Promiscuous mode on the member VF — a shared-LMAC VOTE, not a local
 /// flag, and the fix for the primary bridge-blackout (2026-08-14).
 ///

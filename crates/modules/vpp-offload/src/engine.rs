@@ -514,6 +514,11 @@ pub struct ConvergenceEngine {
     /// move made while blind would otherwise leave routes on the old
     /// trunk with every surface clean.
     fdb_error: Option<String>,
+    /// Why the latest bridge-port VLAN read failed, until one succeeds.
+    /// Read separately from the FDB, so a good FDB read says nothing
+    /// about it: `vlans all` stops following new VLANs and untagged
+    /// changes while it stands, and health says so.
+    vlans_error: Option<String>,
     /// Old adjacencies of moved neighbours, `(sw_if_index, nexthop)`,
     /// removed only once the routes naming them have been re-programmed
     /// ([`Self::settle_moves`]). Deleting first would leave every route
@@ -521,6 +526,8 @@ pub struct ConvergenceEngine {
     /// re-programming takes; kept, the old trunk forwards where it still
     /// can until nothing uses it.
     moved_from: Vec<(u32, IpAddr)>,
+    /// Ports declared `vlans all`, whose subifs follow the kernel bridge.
+    trunk_ports: Vec<String>,
     /// Neighbours moved behind a different bridge port since start.
     placement_moves: u64,
     /// Bridge neighbours whose placement the delta path just changed,
@@ -663,7 +670,9 @@ impl ConvergenceEngine {
             topology: Box::new(crate::topology::NoTopology),
             fdb: crate::topology::FdbSnapshot::default(),
             fdb_error: None,
+            vlans_error: None,
             moved_from: Vec::new(),
+            trunk_ports: Vec::new(),
             placement_moves: 0,
             placement_changed: Vec::new(),
             neighbours_installed: std::collections::HashMap::new(),
@@ -696,6 +705,98 @@ impl ConvergenceEngine {
     pub fn with_local_routes(mut self, routes: Vec<crate::LocalRoute>) -> Self {
         self.local_routes = routes;
         self
+    }
+
+    /// Declare the `vlans all` ports ([`crate::VppOffloadConfig::trunk_ports`]).
+    pub fn with_trunk_ports(mut self, ports: Vec<String>) -> Self {
+        self.trunk_ports = ports;
+        self
+    }
+
+    /// Bring VLAN facts in step with the kernel bridge: every member's
+    /// untagged VLANs (a neighbour placed on one is reached through the
+    /// VF, not a subif), and a subif on each `vlans all` trunk for every
+    /// tagged VLAN it now carries. Add-only: a VLAN removed on the switch
+    /// leaves an idle subif until the next restart, which costs nothing —
+    /// nothing can be placed on a VLAN the FDB no longer has.
+    fn reconcile_vlans(&mut self) -> Result<(), EngineError> {
+        let Some(pv) = self.refresh_untagged() else {
+            return Ok(());
+        };
+        let Some(loop_idx) = self.loop_index else {
+            return Ok(());
+        };
+        for port in self.trunk_ports.clone() {
+            let missing: Vec<u16> = pv
+                .tagged(&port)
+                .into_iter()
+                .filter(|v| {
+                    self.port_index
+                        .get(&crate::sink::NexthopTarget::Subif {
+                            port: port.clone(),
+                            vlan: *v,
+                        })
+                        .is_none()
+                })
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let Some(p) = self.ports.iter().find(|p| p.port == port).cloned() else {
+                continue;
+            };
+            let Some(parent) = self
+                .port_index
+                .get(&crate::sink::NexthopTarget::Vf { port: port.clone() })
+            else {
+                continue;
+            };
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            let added = match crate::attach::add_vlan_subifs(t, &p, parent, loop_idx, &missing) {
+                Ok(a) => a,
+                Err(e) => {
+                    if matches!(e, AttachError::Transport(_)) {
+                        self.disconnect();
+                    }
+                    return Err(e.into());
+                }
+            };
+            tracing::info!(port = %port, vlans = ?missing, "trunk carries new VLAN(s); subinterfaces added");
+            let vids: Vec<u16> = added.iter().map(|(v, _)| *v).collect();
+            for &(vid, idx) in &added {
+                self.port_index.insert(port.clone(), Some(vid), idx);
+            }
+            self.nexthops.add_port_vlans(&port, &vids);
+            if let Some(a) = self.attached.iter_mut().find(|a| a.port == port) {
+                a.subifs.extend(added);
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the members' untagged VLANs from the kernel bridge, and hand
+    /// back the snapshot. `None` when it is unreadable — kept, like an
+    /// unreadable FDB: nothing is evidence the VLANs changed. Reported
+    /// through [`Self::fdb_unreadable`] until a read succeeds.
+    fn refresh_untagged(&mut self) -> Option<crate::topology::PortVlans> {
+        let pv = match self.topology.port_vlans() {
+            Ok(pv) => {
+                self.vlans_error = None;
+                pv
+            }
+            Err(e) => {
+                if self.vlans_error.is_none() {
+                    tracing::warn!(error = %e, "bridge port VLANs unreadable; keeping what we had");
+                }
+                self.vlans_error = Some(e);
+                return None;
+            }
+        };
+        for p in &self.ports {
+            self.nexthops
+                .set_port_untagged(&p.port, pv.untagged(&p.port));
+        }
+        Some(pv)
     }
 
     /// Install the kernel view placement reads ([`crate::topology`]).
@@ -737,9 +838,15 @@ impl ConvergenceEngine {
         }
     }
 
-    /// Why the bridge FDB cannot be read right now, if it cannot.
-    pub fn fdb_unreadable(&self) -> Option<&str> {
-        self.fdb_error.as_deref()
+    /// Why the bridge tables — the FDB, or the port VLANs — cannot be
+    /// read right now, if they cannot.
+    pub fn fdb_unreadable(&self) -> Option<String> {
+        match (&self.fdb_error, &self.vlans_error) {
+            (None, None) => None,
+            (Some(f), None) => Some(f.clone()),
+            (None, Some(v)) => Some(format!("port VLANs: {v}")),
+            (Some(f), Some(v)) => Some(format!("{f}; port VLANs: {v}")),
+        }
     }
 
     /// Where the FDB puts `(dev, mac)`, for a `BridgeVlan` device — or
@@ -781,14 +888,16 @@ impl ConvergenceEngine {
 
     /// Follow neighbours that moved behind a different bridge port.
     ///
-    /// Takes the latest FDB and re-places every `BridgeVlan` neighbour:
-    /// the adjacency is added on the new port's subif, every route
-    /// through the neighbour is handed back to the source for
-    /// re-programming — its VPP paths name the old interface, and nothing
-    /// about the route itself changed, so nothing else would move them —
-    /// and the old adjacency is removed by [`Self::settle_moves`] once
-    /// they have. A neighbour seen in the FDB for the first time is
-    /// placed the same way: its routes were unresolvable until now.
+    /// Takes the latest FDB and bridge-port VLANs ([`Self::reconcile_vlans`])
+    /// and re-places every `BridgeVlan` neighbour: the adjacency is added
+    /// on the new port's interface, every route through the neighbour is
+    /// handed back to the source for re-programming — its VPP paths name
+    /// the old interface, and nothing about the route itself changed, so
+    /// nothing else would move them — and the old adjacency is removed by
+    /// [`Self::settle_moves`] once they have. A neighbour seen in the FDB
+    /// for the first time, or reachable now where it was not (a trunk
+    /// gained its VLAN's subif), is programmed the same way: its routes
+    /// were unresolvable until now.
     ///
     /// Returns how many neighbours were (re)placed. A neighbour missing
     /// from the FDB keeps its last port.
@@ -800,6 +909,7 @@ impl ConvergenceEngine {
             return Ok(0);
         }
         self.read_fdb();
+        self.reconcile_vlans()?;
         let mut seen: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
         src.for_each_neighbour(&mut |ip, dev, mac| seen.push((ip, dev.to_string(), mac)));
         let mut changed = Vec::new();
@@ -813,19 +923,55 @@ impl ConvergenceEngine {
                 continue;
             };
             let before = self.nexthops.placement(&ip).map(str::to_string);
-            if before.as_deref() == Some(placed.port.as_str()) {
+            if before.as_deref() != Some(placed.port.as_str()) {
+                let to = placed.port.clone();
+                self.move_neighbour(ip, &dev, mac, placed)?;
+                if let Some(from) = before {
+                    self.placement_moves += 1;
+                    tracing::info!(
+                        nexthop = %ip, device = %dev, from = %from, to = %to,
+                        "neighbour moved behind another bridge port; re-programming its routes"
+                    );
+                }
+                changed.push(ip);
                 continue;
             }
-            let to = placed.port.clone();
-            self.move_neighbour(ip, &dev, mac, placed)?;
-            if let Some(from) = before {
-                self.placement_moves += 1;
-                tracing::info!(
-                    nexthop = %ip, device = %dev, from = %from, to = %to,
-                    "neighbour moved behind another bridge port; re-programming its routes"
-                );
+            // Same port, but the interface that reaches it may have
+            // changed under it: a subif that did not exist, or a VLAN
+            // that became untagged (VF) or tagged (subif).
+            let Some(idx) = self
+                .nexthops
+                .resolve(&ip)
+                .and_then(|t| self.port_index.get(&t))
+            else {
+                // The interface that reached it is gone — an untagged
+                // VLAN removed from its port, say. Its routes are
+                // re-queued to go unresolvable, and the adjacency is
+                // retired once they have (review finding).
+                let stale: Vec<(u32, IpAddr)> = self
+                    .neighbours_installed
+                    .keys()
+                    .filter(|(i, n)| *n == ip && self.port_index.owns(*i))
+                    .filter(|k| !self.moved_from.contains(k))
+                    .copied()
+                    .collect();
+                if !stale.is_empty() {
+                    self.moved_from.extend(stale);
+                    changed.push(ip);
+                }
+                continue;
+            };
+            if self.neighbours_installed.get(&(idx, ip)) != Some(&mac) {
+                self.send_neighbour(ip, idx, mac, true)?;
+                let stale: Vec<(u32, IpAddr)> = self
+                    .neighbours_installed
+                    .keys()
+                    .filter(|(i, n)| *n == ip && *i != idx && self.port_index.owns(*i))
+                    .copied()
+                    .collect();
+                self.moved_from.extend(stale);
+                changed.push(ip);
             }
-            changed.push(ip);
         }
         if !changed.is_empty() {
             src.requeue_via(&changed);
@@ -1271,6 +1417,9 @@ impl ConvergenceEngine {
             }
         }
         self.attached = attached;
+        // Which VLANs are untagged decides where a `local-route` on a
+        // trunk lands, so it is read before the routes go in.
+        self.refresh_untagged();
         self.install_attached_routes()
     }
 
@@ -1298,16 +1447,25 @@ impl ConvergenceEngine {
         }
         let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
         for lr in &self.local_routes {
-            let target = crate::sink::NexthopTarget::Subif {
-                port: lr.port.clone(),
-                vlan: lr.vlan,
+            // A `vlans all` trunk's untagged VLAN has no subif: the
+            // bridge sends it bare, so its prefix is delivered on the VF,
+            // like its neighbours (review finding).
+            let target = if self.nexthops.is_untagged(&lr.port, lr.vlan) {
+                crate::sink::NexthopTarget::Vf {
+                    port: lr.port.clone(),
+                }
+            } else {
+                crate::sink::NexthopTarget::Subif {
+                    port: lr.port.clone(),
+                    vlan: lr.vlan,
+                }
             };
             let Some(sw_if_index) = self.port_index.get(&target) else {
-                // Config guarantees the port declares this vlan, and
-                // attach just created every declared subif — a miss
-                // here is an ordering bug, not an operator error, and
-                // installing onto index 0 would route the prefix to
-                // local0.
+                // Config guarantees the port declares this vlan (or
+                // carries it, for `vlans all`), and attach just created
+                // every subif — a miss here is an ordering bug, not an
+                // operator error, and installing onto index 0 would
+                // route the prefix to local0.
                 return Err(EngineError::AttachedRouteFailed {
                     prefix: format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
                     detail: format!("no subif index for {}.{}", lr.port, lr.vlan),
@@ -1960,6 +2118,7 @@ impl ConvergenceEngine {
         // running daemon, and a resync starts from what is true now.
         self.nexthops.forget_kinds();
         self.read_fdb();
+        self.refresh_untagged();
         let mut seen: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
         src.for_each_neighbour(&mut |nh, dev, mac| seen.push((nh, dev.to_string(), mac)));
         for (nh, dev, mac) in seen {
