@@ -106,6 +106,13 @@ enum Command {
         /// just the one in the supplied config.
         #[arg(long)]
         all: bool,
+        /// Leave vpp-offload running — VPP, its VFs, hugepages and MCAM
+        /// steering rules — and tear down every other module (implies
+        /// `--all` for them), so the next
+        /// `packetframe run` adopts it and steered traffic keeps flowing
+        /// across the restart: stop, `detach --keep-vpp`, start.
+        #[arg(long)]
+        keep_vpp: bool,
     },
 
     /// Show attach state and live counter values.
@@ -289,19 +296,25 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Detach { config, all } => {
+        Command::Detach {
+            config,
+            all,
+            keep_vpp,
+        } => {
             // `detach --all` with no config is still meaningful (rip
             // every pin we can find). Only default the path for the
             // scoped case where `config` is expected to name the
             // module whose pins to tear down.
             let path = config.or_else(|| {
-                if all {
+                // `--keep-vpp` checks the running VPP against the config
+                // the next start reads, so it always has one.
+                if all && !keep_vpp {
                     None
                 } else {
                     Some(PathBuf::from(DEFAULT_CONFIG_PATH))
                 }
             });
-            match loader::detach(path.as_deref(), all) {
+            match loader::detach(path.as_deref(), all, keep_vpp) {
                 Ok(()) => ExitCode::from(EXIT_OK),
                 Err(e) => {
                     tracing::error!(error = %e);

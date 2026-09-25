@@ -2595,9 +2595,47 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   to do about it. A daemon whose running config silently differed from
   the file you just edited is how the wrong thing gets debugged for an
   hour.
-- **Restart ordering is stop → detach --all → start.** This bit
-  production twice. A plain `systemctl restart` leaves the previous
-  attachment's pins in place and the next start refuses them.
+- **Restart ordering is stop → detach → start.** This bit production
+  twice. A plain `systemctl restart` leaves the previous attachment's
+  pins in place and the next start refuses them. Two forms, and they are
+  different operations:
+  - `detach --all` tears **everything** down, VPP included: traffic
+    falls back to the eBPF tier and the next start brings VPP up fresh
+    (a full resync, then the canary levers again). The safe form, and
+    the one every recovery message names.
+  - `detach --keep-vpp` tears down every other module's pins and leaves
+    VPP, its VFs, hugepages and steering rules running for the next
+    start to adopt — steered traffic keeps flowing across the restart
+    (measured on the rig: one 0.6 s steering dip while the adoption
+    reconciles). The form for an upgrade or config restart of a steered
+    box:
+
+    ```bash
+    systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
+    ```
+
+    Every module other than vpp-offload comes down whatever the config
+    declares — it is a restart, so a module the edit removed does not
+    stay behind. VPP is kept only for a restart that can adopt it, and
+    `detach --keep-vpp` checks that before tearing anything down,
+    refusing by name when:
+    - the edit changed something VPP fixes at attach: `port` lines
+      (including `cores` and `vlans`), `expected-routes`, `hugepages`,
+      `steer-capacity`, `loopback-address`, `vpp-binary` or
+      `local-route`. Adoption neither applies nor undoes these — a
+      dropped VLAN's subif would keep taking steered ingress, unmanaged.
+      Steering levers and `steer-direction` are fine; adoption applies
+      them;
+    - the config no longer has a `vpp-offload` section;
+    - there is no vpp-offload record in the config's `state-dir` — no
+      VPP running, or a `state-dir` edit the next start would look past.
+      The same goes for `bpffs-root`: a path edit needs `detach --all`
+      under the **old** config, then start;
+    - the record predates this check (first restart after upgrading to
+      it).
+
+    The daemon's adoption applies the same checks, so a restart that
+    skipped the preflight fails the start rather than adopting.
 - **The ntuple table holds 16 rules per port by default, and
   `npc/mcam_info` will not tell you that.** The driver rejects an
   out-of-range `loc` with `EINVAL` rather than assigning one. The module

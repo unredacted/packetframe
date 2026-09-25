@@ -353,6 +353,34 @@ impl VppOffloadConfig {
         Ok(())
     }
 
+    /// What a running VPP cannot take a change to, recorded at attach
+    /// ([`resources::ResourceState::restart_only`]) and compared on
+    /// adoption — the restart counterpart of [`Self::restart_only_delta`],
+    /// which guards the reload.
+    ///
+    /// The fields are that function's, less two: `expected-routes` has
+    /// its own adoption check, and `require-table-complete` is runtime
+    /// wiring a new daemon builds afresh. Steering levers and directions
+    /// are left out because adoption does apply them.
+    pub fn restart_only(&self) -> resources::RestartOnly {
+        let ports: Vec<(&str, u16, &[u16])> = self
+            .ports
+            .iter()
+            .map(|(i, c, _, v, _)| (i.as_str(), *c, v.as_slice()))
+            .collect();
+        [
+            ("port", format!("{ports:?}")),
+            ("hugepages", format!("{:?}", self.hugepages)),
+            ("steer-capacity", format!("{:?}", self.steer_capacity)),
+            ("loopback-address", format!("{:?}", self.loopback_address)),
+            ("vpp-binary", format!("{:?}", self.vpp_binary)),
+            ("local-route", format!("{:?}", self.local_routes)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
     /// Total VPP worker threads the config promises, across all ports:
     /// every port's `cores`, plus the ONE worker all `cores 0` ports
     /// share when any exist
@@ -2316,6 +2344,60 @@ mod tests {
         let e = base.restart_only_delta(&lr).expect_err("local-route");
         assert!(e.contains("`local-route` lines changed"), "{e}");
         assert!(e.contains("restart"), "{e}");
+    }
+
+    /// Every field `restart_only` records moves the record, and the
+    /// hot-reloadable levers do not. Kept beside the reload test above
+    /// because the two lists must not drift apart: a restart-only field
+    /// missing here is one `detach --keep-vpp` adopts as if applied.
+    #[test]
+    fn the_adoption_record_tracks_the_restart_only_fields() {
+        let base = cfg(&[("eth4", 1, false)], 1_600_000);
+        let record = base.restart_only();
+        let mut changes: Vec<VppOffloadConfig> = Vec::new();
+        let mut c = base.clone();
+        c.ports[0].3 = vec![1337];
+        changes.push(c);
+        let mut c = base.clone();
+        c.ports[0].1 = 2;
+        changes.push(c);
+        let mut c = base.clone();
+        c.hugepages = Some(12);
+        changes.push(c);
+        let mut c = base.clone();
+        c.steer_capacity = Some(64);
+        changes.push(c);
+        let mut c = base.clone();
+        c.loopback_address = Some(packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(192, 0, 2, 254),
+            prefix_len: 32,
+        });
+        changes.push(c);
+        let mut c = base.clone();
+        c.vpp_binary = Some("/opt/vpp/bin/vpp".into());
+        changes.push(c);
+        let mut c = base.clone();
+        c.local_routes.push((
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(192, 0, 2, 0),
+                prefix_len: 24,
+            },
+            "eth4".into(),
+            1337,
+        ));
+        changes.push(c);
+        for c in &changes {
+            assert!(
+                base.restart_only_delta(c).is_err(),
+                "not restart-only: {c:?}"
+            );
+            assert_ne!(c.restart_only(), record, "not recorded: {c:?}");
+        }
+
+        let mut lever = base.clone();
+        lever.ports[0].2 = true;
+        lever.steer_direction = packetframe_common::config::VppSteerDirection::Both;
+        assert_eq!(lever.restart_only(), record);
     }
 
     /// A reordered port list is a change, not a permutation.
