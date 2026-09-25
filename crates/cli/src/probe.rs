@@ -183,11 +183,16 @@ fn summarize(samples: &[ProbeEvent]) -> String {
                 "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
                 , with no plausible ethertype behind it; suggests a driver descriptor."
             ));
-        } else {
+        } else if pct >= 90 {
             lines.push(format!(
                 "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
                 , ethertypes look plausible, so this fits traffic from a single L2 neighbour \
                 (fixed MACs) rather than a descriptor."
+            ));
+        } else {
+            lines.push(format!(
+                "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
+                ; with mixed ethertypes this is inconclusive, compare against `--mode generic`."
             ));
         }
     }
@@ -243,6 +248,32 @@ mod tests {
         assert!(out.contains("Common 16-byte prefix"), "{out}");
         assert!(!out.contains("suggests a driver descriptor"), "{out}");
         assert!(out.contains("single L2 neighbour"), "{out}");
+    }
+
+    #[test]
+    fn fixed_prefix_with_mixed_ethertypes_stays_inconclusive() {
+        // A descriptor-prefixed stream where one sample in four happens
+        // to carry 0x0800 at [12..14]: neither verdict may be claimed.
+        let samples: Vec<_> = (0u8..4)
+            .map(|i| {
+                let mut head = [
+                    0xde, 0xad, 0xbe, 0xef, 0x00, 0x10, 0x00, 0x00, // descriptor
+                    i, i, i, i, // varying
+                    0x12, i, // implausible "ethertype"
+                    i, i,
+                ];
+                if i == 0 {
+                    head[12..14].copy_from_slice(&[0x08, 0x00]);
+                }
+                event(head)
+            })
+            .collect();
+        let out = summarize(&samples);
+        assert!(out.contains("Summary: 25% of samples"), "{out}");
+        assert!(out.contains("Common 8-byte prefix"), "{out}");
+        assert!(out.contains("inconclusive"), "{out}");
+        assert!(!out.contains("suggests a driver descriptor"), "{out}");
+        assert!(!out.contains("single L2 neighbour"), "{out}");
     }
 
     #[test]
