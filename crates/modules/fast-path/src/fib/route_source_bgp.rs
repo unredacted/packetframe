@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn open_encoder_roundtrip() {
-        let bytes = encode_open(401401, 90, Ipv4Addr::new(103, 17, 154, 7));
+        let bytes = encode_open(401401, 90, Ipv4Addr::new(198, 51, 100, 7));
         // Marker check.
         assert_eq!(&bytes[..16], &BGP_MARKER);
         // Length matches buffer.
@@ -1090,7 +1090,7 @@ mod tests {
         // Hold time.
         assert_eq!(u16::from_be_bytes([bytes[22], bytes[23]]), 90);
         // Router ID.
-        assert_eq!(&bytes[24..28], &[103, 17, 154, 7]);
+        assert_eq!(&bytes[24..28], &[198, 51, 100, 7]);
         // Parse it back via bgpkit-parser to confirm wire validity.
         let mut b = Bytes::copy_from_slice(&bytes);
         let parsed = parse_bgp_message(&mut b, false, &AsnLength::Bits32).expect("parse");
@@ -1098,7 +1098,7 @@ mod tests {
             BgpMessage::Open(o) => {
                 assert_eq!(o.version, 4);
                 assert_eq!(o.hold_time, 90);
-                assert_eq!(o.bgp_identifier, Ipv4Addr::new(103, 17, 154, 7));
+                assert_eq!(o.bgp_identifier, Ipv4Addr::new(198, 51, 100, 7));
             }
             other => panic!("expected Open, got {:?}", other.msg_type()),
         }
@@ -1518,7 +1518,7 @@ mod tests {
     fn elem_to_route_event_uses_fallback_when_next_hop_missing() {
         use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
-        let elem = make_test_elem(ElemType::ANNOUNCE, "23.191.200.0/24", None);
+        let elem = make_test_elem(ElemType::ANNOUNCE, "192.0.2.0/24", None);
         let peer_id = PeerId(0xdeadbeef);
         let fallback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let event = elem_to_route_event(&elem, peer_id, fallback)
@@ -1535,7 +1535,7 @@ mod tests {
                 assert!(matches!(
                     prefix,
                     IpPrefix::V4 {
-                        addr: [23, 191, 200, 0],
+                        addr: [192, 0, 2, 0],
                         prefix_len: 24
                     }
                 ));
@@ -1553,7 +1553,7 @@ mod tests {
     fn elem_to_route_event_prefers_decoded_next_hop_over_fallback() {
         use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
-        let real_nh = IpAddr::V4(Ipv4Addr::new(194, 110, 60, 50)); // Macarne-style nh
+        let real_nh = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 50)); // transit-style nh
         let elem = make_test_elem(ElemType::ANNOUNCE, "1.1.1.0/24", Some(real_nh));
         let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
             .expect("elem with valid prefix must yield an event");
@@ -1571,7 +1571,7 @@ mod tests {
     fn elem_to_route_event_withdraw_unaffected_by_fallback() {
         use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
-        let elem = make_test_elem(ElemType::WITHDRAW, "23.191.200.0/24", None);
+        let elem = make_test_elem(ElemType::WITHDRAW, "192.0.2.0/24", None);
         let event = elem_to_route_event(&elem, PeerId(0), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
             .expect("withdraw with valid prefix must yield an event");
         assert!(matches!(event, RouteEvent::Del { .. }));

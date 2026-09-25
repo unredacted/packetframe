@@ -524,7 +524,7 @@ fn prefix_of(p: Ipv4Prefix) -> Prefix {
     }
 }
 
-/// `58:d6:1f:4f:cd:56`, for error messages an operator compares against
+/// `02:55:66:77:88:56`, for error messages an operator compares against
 /// `ip link` output.
 fn hex_mac(m: &[u8; 6]) -> String {
     m.iter()

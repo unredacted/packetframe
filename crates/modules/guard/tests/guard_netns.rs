@@ -290,7 +290,7 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
     // ENOBUFS sendto failure (see send_frame) and never reaches the
     // peer. The loop takes ~ms against a 200 ms/token refill, so at
     // most a token or two beyond the burst can be legitimately earned.
-    let target_a = [206, 81, 82, 21];
+    let target_a = [198, 51, 100, 21];
     let storm = common::arp_request(SRC_MAC, target_a);
     let accepted = (0..40)
         .filter(|_| send_frame(&tx, ifindex_a, &storm))
@@ -346,7 +346,7 @@ fn arp_storm_is_clamped_at_egress_and_monitor_passes() {
         ..Default::default()
     };
     h.set_guard_cfg(ifindex_a, GuardIfCfg::compile([0; 6], &rules_mon));
-    let target_b = [206, 81, 81, 10];
+    let target_b = [198, 51, 100, 10];
     let storm = common::arp_request(SRC_MAC, target_b);
     let accepted_mon = (0..40)
         .filter(|_| send_frame(&tx, ifindex_a, &storm))

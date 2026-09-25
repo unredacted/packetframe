@@ -414,10 +414,10 @@ mod tests {
             lldp: Some(ActionRule { monitor: false }),
             foreign_src: None,
         };
-        let mac = [0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7];
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0xc7];
         let cfg = GuardIfCfg::compile(mac, &rules);
-        assert_eq!(cfg.mac_hi, u32::from_ne_bytes([0x28, 0x70, 0x4e, 0x47]));
-        assert_eq!(cfg.mac_lo, u16::from_ne_bytes([0x69, 0xc7]));
+        assert_eq!(cfg.mac_hi, u32::from_ne_bytes([0x02, 0x11, 0x22, 0x33]));
+        assert_eq!(cfg.mac_lo, u16::from_ne_bytes([0x44, 0xc7]));
         assert_eq!(cfg.act_arp, ACTION_ENFORCE);
         assert_eq!(cfg.act_ns, ACTION_ENFORCE);
         assert_eq!(cfg.act_lldp, ACTION_ENFORCE);

@@ -1408,7 +1408,7 @@ fn fdb_with(entries: &[(u16, [u8; 6], &str)]) -> FdbSnapshot {
 fn local_route() -> LocalRoute {
     LocalRoute {
         prefix: packetframe_common::config::Ipv4Prefix {
-            addr: Ipv4Addr::new(23, 191, 200, 0),
+            addr: Ipv4Addr::new(203, 0, 113, 0),
             prefix_len: 24,
         },
         port: "eth4".into(),
@@ -1420,7 +1420,7 @@ fn local_route() -> LocalRoute {
 /// A prefix inside the local-route's footprint.
 fn svc(last: u8, len: u8) -> IpPrefix {
     IpPrefix::V4 {
-        addr: [23, 191, 200, last],
+        addr: [203, 0, 113, last],
         prefix_len: len,
     }
 }
@@ -1479,7 +1479,7 @@ fn a_local_route_installs_attached_and_shadows_the_mirror() {
     );
     let r = &at_attach[0];
     assert!(r.is_add);
-    assert_eq!((r.addr, r.len), ([23, 191, 200, 0], 24));
+    assert_eq!((r.addr, r.len), ([203, 0, 113, 0], 24));
     assert_eq!(
         r.path_indices,
         vec![SUBIF_BASE],
@@ -1506,7 +1506,7 @@ fn a_local_route_installs_attached_and_shadows_the_mirror() {
         })
         .collect();
     assert!(
-        after.iter().all(|r| r.addr != [23, 191, 200, 7]),
+        after.iter().all(|r| r.addr != [203, 0, 113, 7]),
         "the shadowed host route must never reach the wire: {after:?}"
     );
 }
@@ -1520,7 +1520,7 @@ fn a_bridge_neighbour_mirrors_onto_the_subif() {
     impl RouteSource for BridgeNeigh {
         fn for_each_route(&self, _visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
-            visit(IpAddr::V4(Ipv4Addr::new(23, 191, 200, 7)), "br1337", MAC);
+            visit(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), "br1337", MAC);
         }
         fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
             unreachable!("static source")
@@ -1623,7 +1623,7 @@ fn a_stale_install_inside_the_local_prefix_is_withdrawn() {
     let fake = Fake::start_behaving(
         "stale-shadowed",
         Behaviour {
-            existing_routes: &[([23, 191, 200, 7], 32, ASSIGNED_INDEX, true)],
+            existing_routes: &[([203, 0, 113, 7], 32, ASSIGNED_INDEX, true)],
             ..Default::default()
         },
     );
@@ -1651,7 +1651,7 @@ fn a_stale_install_inside_the_local_prefix_is_withdrawn() {
         })
         .collect();
     assert!(
-        deletes.iter().any(|r| r.addr == [23, 191, 200, 7]),
+        deletes.iter().any(|r| r.addr == [203, 0, 113, 7]),
         "the stale in-prefix install must be withdrawn from VPP: {deletes:?}"
     );
 }

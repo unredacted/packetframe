@@ -1336,7 +1336,7 @@ fn reject_non_harvestable_prefix(line: usize, p: &Ipv6Prefix) -> Result<(), Conf
             "local-prefix6: `::/0` is not a valid connected prefix. It would harvest every \
              entry in the neighbour table, including multicast and link-local, and burn one \
              NEXTHOPS slot each. Declare the connected prefix instead (e.g. \
-             `local-prefix6 2602:f7d8:0:1337::/64 via br1337`)",
+             `local-prefix6 2001:db8:0:1337::/64 via br1337`)",
         ));
     }
     for (class, reason) in FORBIDDEN_V6_CLASSES {
@@ -2869,7 +2869,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         "local-prefix" => {
             // Grammar: local-prefix <cidr> via <iface> [arp-scavenge]
             let cidr_tok = rest.next().ok_or_else(|| {
-                ConfigError::parse(line, "local-prefix requires a CIDR (e.g. 23.191.200.0/24)")
+                ConfigError::parse(line, "local-prefix requires a CIDR (e.g. 192.0.2.0/24)")
             })?;
             let via_tok = rest.next().ok_or_else(|| {
                 ConfigError::parse(line, "local-prefix requires `via <iface>` after the CIDR")
@@ -2937,7 +2937,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let cidr_tok = rest.next().ok_or_else(|| {
                 ConfigError::parse(
                     line,
-                    "local-prefix6 requires a CIDR (e.g. 2602:f7d8:0:1337::/64)",
+                    "local-prefix6 requires a CIDR (e.g. 2001:db8:0:1337::/64)",
                 )
             })?;
             let via_tok = rest.next().ok_or_else(|| {
@@ -4788,7 +4788,7 @@ module fast-path
   attach eth3 native
   attach eth4 native
   attach eth5 native
-  allow-prefix  23.191.200.0/24
+  allow-prefix  192.0.2.0/24
   allow-prefix6 2001:db8::/48
   dry-run on
   circuit-breaker drop-ratio 0.01 of matched window 5s threshold 5
@@ -5582,11 +5582,11 @@ module vpp-offload
     /// itself has to stay on the kernel path.
     #[test]
     fn steer_exempt_parses_and_duplicates_are_refused() {
-        let s = "module vpp-offload\n  steer-exempt 23.191.200.1/32\n  steer-exempt 10.88.1.1/32\n";
+        let s = "module vpp-offload\n  steer-exempt 192.0.2.1/32\n  steer-exempt 198.51.100.1/32\n";
         let c = Config::parse(s).unwrap();
         match &c.modules[0].directives[0] {
             ModuleDirective::VppSteerExempt(p) => {
-                assert_eq!(p.addr, std::net::Ipv4Addr::new(23, 191, 200, 1));
+                assert_eq!(p.addr, std::net::Ipv4Addr::new(192, 0, 2, 1));
                 assert_eq!(p.prefix_len, 32);
             }
             other => panic!("expected VppSteerExempt, got {other:?}"),
@@ -5598,13 +5598,13 @@ module vpp-offload
         let dup = "module fast-path\n  attach eth4 generic\n  allow-prefix 10.0.0.0/8\n\
                    module vpp-offload\n  loopback-address 198.51.100.254/32\n\
                    port eth4 cores 1 steer off\n\
-                   steer-exempt 10.88.1.1/32\n  steer-exempt 10.88.1.1/32\n";
+                   steer-exempt 198.51.100.1/32\n  steer-exempt 198.51.100.1/32\n";
         let e = Config::parse(dup)
             .unwrap()
             .validate_vpp_offload()
             .unwrap_err();
         assert!(
-            format!("{e}").contains("duplicate `steer-exempt 10.88.1.1/32`"),
+            format!("{e}").contains("duplicate `steer-exempt 198.51.100.1/32`"),
             "{e}"
         );
     }
@@ -5691,7 +5691,7 @@ module vpp-offload
 
     #[test]
     fn local_route_parses_and_rejects_malformed() {
-        let s = "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 1337\n";
+        let s = "module vpp-offload\n  local-route 192.0.2.0/24 port eth4 vlan 1337\n";
         let c = Config::parse(s).unwrap();
         match &c.modules[0].directives[0] {
             ModuleDirective::VppLocalRoute {
@@ -5700,7 +5700,7 @@ module vpp-offload
                 vlan,
                 ..
             } => {
-                assert_eq!(prefix.addr, std::net::Ipv4Addr::new(23, 191, 200, 0));
+                assert_eq!(prefix.addr, std::net::Ipv4Addr::new(192, 0, 2, 0));
                 assert_eq!(prefix.prefix_len, 24);
                 assert_eq!(iface, "eth4");
                 assert_eq!(*vlan, 1337);
@@ -5709,14 +5709,14 @@ module vpp-offload
         }
         for bad in [
             "module vpp-offload\n  local-route\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 0\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 4095\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24 vlan 1337 port eth4\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24 port eth4\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24 port eth4 vlan\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24 port eth4 vlan 0\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24 port eth4 vlan 4095\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24 vlan 1337 port eth4\n",
             "module vpp-offload\n  local-route not-a-cidr port eth4 vlan 1337\n",
-            "module vpp-offload\n  local-route 23.191.200.0/24 port eth4 vlan 1337 x\n",
+            "module vpp-offload\n  local-route 192.0.2.0/24 port eth4 vlan 1337 x\n",
         ] {
             assert!(Config::parse(bad).is_err(), "should reject: {bad}");
         }
@@ -5727,13 +5727,14 @@ module vpp-offload
     /// broken declaration is a broken attach.
     #[test]
     fn local_route_cross_validation() {
-        let base = "module fast-path\n  attach eth4 generic\n  local-prefix 23.191.200.0/24 via br1337\n\n\
+        let base =
+            "module fast-path\n  attach eth4 generic\n  local-prefix 192.0.2.0/24 via br1337\n\n\
                     module vpp-offload\n  loopback-address 198.51.100.254/32\n";
 
         // Happy: port declares the vlan, prefix inside the local-prefix.
         let good = format!(
             "{base}  port eth4 cores 1 steer off vlans 1337\n  \
-             local-route 23.191.200.0/24 port eth4 vlan 1337\n"
+             local-route 192.0.2.0/24 port eth4 vlan 1337\n"
         );
         Config::parse(&good)
             .unwrap()
@@ -5743,7 +5744,7 @@ module vpp-offload
         // Port named by the local-route has no port line.
         let no_port = format!(
             "{base}  port eth4 cores 1 steer off vlans 1337\n  \
-             local-route 23.191.200.0/24 port eth9 vlan 1337\n"
+             local-route 192.0.2.0/24 port eth9 vlan 1337\n"
         );
         let e = Config::parse(&no_port)
             .unwrap()
@@ -5754,7 +5755,7 @@ module vpp-offload
         // The port exists but does not declare the vlan.
         let no_vlan = format!(
             "{base}  port eth4 cores 1 steer off vlans 88\n  \
-             local-route 23.191.200.0/24 port eth4 vlan 1337\n"
+             local-route 192.0.2.0/24 port eth4 vlan 1337\n"
         );
         let e = Config::parse(&no_vlan)
             .unwrap()
@@ -5776,8 +5777,8 @@ module vpp-offload
         // Overlapping local-routes: refused.
         let overlap = format!(
             "{base}  port eth4 cores 1 steer off vlans 88,1337\n  \
-             local-route 23.191.200.0/24 port eth4 vlan 1337\n  \
-             local-route 23.191.200.0/25 port eth4 vlan 88\n"
+             local-route 192.0.2.0/24 port eth4 vlan 1337\n  \
+             local-route 192.0.2.0/25 port eth4 vlan 88\n"
         );
         let e = Config::parse(&overlap)
             .unwrap()
@@ -5792,8 +5793,8 @@ module vpp-offload
     #[test]
     fn dst_direction_requires_local_route_coverage() {
         let fp = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
-                  attach eth4 generic\n  allow-prefix 23.191.200.0/24\n  \
-                  local-prefix 23.191.200.0/24 via br1337\n\n";
+                  attach eth4 generic\n  allow-prefix 192.0.2.0/24\n  \
+                  local-prefix 192.0.2.0/24 via br1337\n\n";
         let vpp_base = "module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
                         port eth3 cores 1 steer on direction dst\n";
 
@@ -5808,7 +5809,7 @@ module vpp-offload
         // Same but covered: valid.
         let covered = format!(
             "{fp}{vpp_base}  port eth4 cores 1 steer off vlans 1337\n  \
-             local-route 23.191.200.0/24 port eth4 vlan 1337\n"
+             local-route 192.0.2.0/24 port eth4 vlan 1337\n"
         );
         Config::parse(&covered)
             .unwrap()
@@ -5819,7 +5820,7 @@ module vpp-offload
         // both present → the pair covers the /24 and it is valid.
         let half = format!(
             "{fp}{vpp_base}  port eth4 cores 1 steer off vlans 88,1337\n  \
-             local-route 23.191.200.0/25 port eth4 vlan 1337\n"
+             local-route 192.0.2.0/25 port eth4 vlan 1337\n"
         );
         assert!(Config::parse(&half)
             .unwrap()
@@ -5827,8 +5828,8 @@ module vpp-offload
             .is_err());
         let tiled = format!(
             "{fp}{vpp_base}  port eth4 cores 1 steer off vlans 88,1337\n  \
-             local-route 23.191.200.0/25 port eth4 vlan 1337\n  \
-             local-route 23.191.200.128/25 port eth4 vlan 88\n"
+             local-route 192.0.2.0/25 port eth4 vlan 1337\n  \
+             local-route 192.0.2.128/25 port eth4 vlan 88\n"
         );
         Config::parse(&tiled)
             .unwrap()
@@ -6082,12 +6083,12 @@ module fast-path
 
     #[test]
     fn v4_contains_addr_basic() {
-        let p = v4("23.191.200.0/24");
-        assert!(p.contains_addr("23.191.200.0".parse().unwrap()));
-        assert!(p.contains_addr("23.191.200.10".parse().unwrap()));
-        assert!(p.contains_addr("23.191.200.255".parse().unwrap()));
-        assert!(!p.contains_addr("23.191.201.0".parse().unwrap()));
-        assert!(!p.contains_addr("23.191.199.255".parse().unwrap()));
+        let p = v4("192.0.2.0/24");
+        assert!(p.contains_addr("192.0.2.0".parse().unwrap()));
+        assert!(p.contains_addr("192.0.2.10".parse().unwrap()));
+        assert!(p.contains_addr("192.0.2.255".parse().unwrap()));
+        assert!(!p.contains_addr("203.0.113.0".parse().unwrap()));
+        assert!(!p.contains_addr("198.51.100.255".parse().unwrap()));
     }
 
     #[test]
@@ -6108,18 +6109,18 @@ module fast-path
 
     #[test]
     fn v4_contains_addr_ignores_declared_host_bits() {
-        let p = v4("23.191.200.5/24");
-        assert!(p.contains_addr("23.191.200.10".parse().unwrap()));
-        assert_eq!(p.network(), "23.191.200.0".parse::<Ipv4Addr>().unwrap());
+        let p = v4("192.0.2.5/24");
+        assert!(p.contains_addr("192.0.2.10".parse().unwrap()));
+        assert_eq!(p.network(), "192.0.2.0".parse::<Ipv4Addr>().unwrap());
     }
 
     #[test]
     fn v6_contains_addr_basic() {
-        let p = v6("2602:f7d8:0:1337::/64");
-        assert!(p.contains_addr("2602:f7d8:0:1337::1".parse().unwrap()));
-        assert!(p.contains_addr("2602:f7d8:0:1337:dead:beef::42".parse().unwrap()));
-        assert!(!p.contains_addr("2602:f7d8:0:1338::1".parse().unwrap()));
-        assert!(!p.contains_addr("2602:f7d8:1::1".parse().unwrap()));
+        let p = v6("2001:db8:0:1337::/64");
+        assert!(p.contains_addr("2001:db8:0:1337::1".parse().unwrap()));
+        assert!(p.contains_addr("2001:db8:0:1337:dead:beef::42".parse().unwrap()));
+        assert!(!p.contains_addr("2001:db8:0:1338::1".parse().unwrap()));
+        assert!(!p.contains_addr("2001:db8:1::1".parse().unwrap()));
     }
 
     #[test]
@@ -6142,11 +6143,11 @@ module fast-path
 
     #[test]
     fn v6_contains_addr_ignores_declared_host_bits() {
-        let p = v6("2602:f7d8:0:1337::5/64");
-        assert!(p.contains_addr("2602:f7d8:0:1337::10".parse().unwrap()));
+        let p = v6("2001:db8:0:1337::5/64");
+        assert!(p.contains_addr("2001:db8:0:1337::10".parse().unwrap()));
         assert_eq!(
             p.network(),
-            "2602:f7d8:0:1337::".parse::<Ipv6Addr>().unwrap()
+            "2001:db8:0:1337::".parse::<Ipv6Addr>().unwrap()
         );
     }
 
@@ -6163,9 +6164,9 @@ module fast-path
 
     #[test]
     fn contains_prefix_v6() {
-        assert!(v6("2602:f7d8::/48").contains_prefix(&v6("2602:f7d8:0:1337::/64")));
-        assert!(!v6("2602:f7d8::/48").contains_prefix(&v6("2602:f7d8:1::/48")));
-        assert!(!v6("2602:f7d8:0:1337::/64").contains_prefix(&v6("2602:f7d8::/48")));
+        assert!(v6("2001:db8::/48").contains_prefix(&v6("2001:db8:0:1337::/64")));
+        assert!(!v6("2001:db8::/48").contains_prefix(&v6("2001:db8:1::/48")));
+        assert!(!v6("2001:db8:0:1337::/64").contains_prefix(&v6("2001:db8::/48")));
         assert!(v6("::/0").contains_prefix(&v6("2001:db8::/32")));
     }
 
@@ -6294,7 +6295,7 @@ module fast-path
 
     #[test]
     fn route_source_bgp_parses_full_form() {
-        let s = "  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 103.17.154.7\n";
+        let s = "  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 198.51.100.7\n";
         match extract_route_source(s) {
             RouteSourceSpec::Bgp {
                 addr,
@@ -6311,7 +6312,7 @@ module fast-path
                 assert_eq!(port, 1179);
                 assert_eq!(local_as, 401401);
                 assert_eq!(peer_as, 401401);
-                assert_eq!(router_id, Some("103.17.154.7".parse().unwrap()));
+                assert_eq!(router_id, Some("198.51.100.7".parse().unwrap()));
                 assert!(!allow_remote, "loopback default does not need opt-in");
                 assert!(peer_from.is_empty());
                 assert!(peer_ip.is_none());
@@ -6818,18 +6819,18 @@ module fast-path
 
     #[test]
     fn local_prefix_parses_basic_form() {
-        let lp = extract_local_prefixes("  local-prefix 23.191.200.0/24 via br1337\n");
+        let lp = extract_local_prefixes("  local-prefix 192.0.2.0/24 via br1337\n");
         assert_eq!(lp.len(), 1);
         let (cidr, iface) = &lp[0];
-        assert_eq!(cidr.addr, "23.191.200.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(cidr.addr, "192.0.2.0".parse::<Ipv4Addr>().unwrap());
         assert_eq!(cidr.prefix_len, 24);
         assert_eq!(iface, "br1337");
     }
 
     #[test]
     fn local_prefix_multiple_directives_accumulate() {
-        let body = "  local-prefix 23.191.200.0/24 via br1337\n\
-                    local-prefix 10.88.1.0/24 via br88\n\
+        let body = "  local-prefix 192.0.2.0/24 via br1337\n\
+                    local-prefix 198.51.100.0/24 via br88\n\
                     local-prefix 10.10.1.0/24 via br0\n";
         let lp = extract_local_prefixes(body);
         assert_eq!(lp.len(), 3);
@@ -6839,7 +6840,7 @@ module fast-path
 
     #[test]
     fn local_prefix_missing_via_keyword_errors() {
-        let e = parse_module_body("  local-prefix 23.191.200.0/24 br1337\n").unwrap_err();
+        let e = parse_module_body("  local-prefix 192.0.2.0/24 br1337\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("expected `via`"), "message was: {message}");
@@ -6850,7 +6851,7 @@ module fast-path
 
     #[test]
     fn local_prefix_missing_iface_errors() {
-        let e = parse_module_body("  local-prefix 23.191.200.0/24 via\n").unwrap_err();
+        let e = parse_module_body("  local-prefix 192.0.2.0/24 via\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
     }
 
@@ -6862,8 +6863,7 @@ module fast-path
 
     #[test]
     fn local_prefix_extra_arg_errors() {
-        let e =
-            parse_module_body("  local-prefix 23.191.200.0/24 via br1337 garbage\n").unwrap_err();
+        let e = parse_module_body("  local-prefix 192.0.2.0/24 via br1337 garbage\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("unknown tail flag"), "msg: {message}");
@@ -6874,13 +6874,13 @@ module fast-path
 
     #[test]
     fn local_prefix_bad_cidr_errors() {
-        let e = parse_module_body("  local-prefix 23.191.200.0 via br1337\n").unwrap_err();
+        let e = parse_module_body("  local-prefix 192.0.2.0 via br1337\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
     }
 
     #[test]
     fn local_prefix_arp_scavenge_flag_parses() {
-        let m = parse_module_body("  local-prefix 23.191.200.0/24 via br1337 arp-scavenge\n")
+        let m = parse_module_body("  local-prefix 192.0.2.0/24 via br1337 arp-scavenge\n")
             .expect("parse");
         let lp = m
             .directives
@@ -6902,7 +6902,7 @@ module fast-path
 
     #[test]
     fn local_prefix_arp_scavenge_omitted_defaults_off() {
-        let m = parse_module_body("  local-prefix 23.191.200.0/24 via br1337\n").expect("parse");
+        let m = parse_module_body("  local-prefix 192.0.2.0/24 via br1337\n").expect("parse");
         let arp = m.directives.iter().find_map(|d| match d {
             ModuleDirective::LocalPrefix { arp_scavenge, .. } => Some(*arp_scavenge),
             _ => None,
@@ -6949,8 +6949,8 @@ module fast-path
         // Note: br88 is deliberately missing.
         let cfg = Config::parse(
             "module fast-path\n  attach br1337 generic\n  \
-             local-prefix 23.191.200.0/24 via br1337\n  \
-             local-prefix 10.88.1.0/24 via br88\n",
+             local-prefix 192.0.2.0/24 via br1337\n  \
+             local-prefix 198.51.100.0/24 via br88\n",
         )
         .expect("parse ok; validation runs separately");
         let err = cfg.validate_interfaces_in(&dir).unwrap_err();
@@ -6978,11 +6978,11 @@ module fast-path
 
     #[test]
     fn local_prefix6_parses_basic_form() {
-        let lp = extract_local_prefixes6("  local-prefix6 2602:f7d8:0:1337::/64 via br1337\n");
+        let lp = extract_local_prefixes6("  local-prefix6 2001:db8:0:1337::/64 via br1337\n");
         assert_eq!(lp.len(), 1);
         assert_eq!(
             lp[0].0.addr,
-            "2602:f7d8:0:1337::".parse::<Ipv6Addr>().unwrap()
+            "2001:db8:0:1337::".parse::<Ipv6Addr>().unwrap()
         );
         assert_eq!(lp[0].0.prefix_len, 64);
         assert_eq!(lp[0].1, "br1337");
@@ -6990,8 +6990,8 @@ module fast-path
 
     #[test]
     fn local_prefix6_multiple_directives_accumulate() {
-        let body = "  local-prefix6 2602:f7d8:0:1337::/64 via br1337\n\
-                    local-prefix6 2602:f7d8:0:88::/64 via br88\n\
+        let body = "  local-prefix6 2001:db8:0:1337::/64 via br1337\n\
+                    local-prefix6 2001:db8:0:88::/64 via br88\n\
                     local-prefix6 fd00:1::/64 via br0\n";
         let lp = extract_local_prefixes6(body);
         assert_eq!(lp.len(), 3);
@@ -7009,8 +7009,8 @@ module fast-path
 
     #[test]
     fn local_prefix6_and_v4_coexist_without_cross_contamination() {
-        let body = "  local-prefix 23.191.200.0/24 via br1337\n\
-                    local-prefix6 2602:f7d8:0:1337::/64 via br1337\n";
+        let body = "  local-prefix 192.0.2.0/24 via br1337\n\
+                    local-prefix6 2001:db8:0:1337::/64 via br1337\n";
         let v4 = extract_local_prefixes(body);
         let v6 = extract_local_prefixes6(body);
         assert_eq!(v4.len(), 1, "v4 extractor must see only the v4 directive");
@@ -7061,7 +7061,7 @@ module fast-path
 
     #[test]
     fn local_prefix6_rejects_arp_scavenge_with_reason() {
-        let e = parse_module_body("  local-prefix6 2602:f7d8:0:1337::/64 via br0 arp-scavenge\n")
+        let e = parse_module_body("  local-prefix6 2001:db8:0:1337::/64 via br0 arp-scavenge\n")
             .unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("IPv4-only"), "got: {msg}");
@@ -7070,13 +7070,13 @@ module fast-path
 
     #[test]
     fn local_prefix6_missing_via_keyword_errors() {
-        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 br0\n").unwrap_err();
+        let e = parse_module_body("  local-prefix6 2001:db8::/48 br0\n").unwrap_err();
         assert!(format!("{e}").contains("expected `via`"));
     }
 
     #[test]
     fn local_prefix6_missing_iface_errors() {
-        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 via\n").unwrap_err();
+        let e = parse_module_body("  local-prefix6 2001:db8::/48 via\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
     }
 
@@ -7088,13 +7088,13 @@ module fast-path
 
     #[test]
     fn local_prefix6_unknown_tail_flag_errors() {
-        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 via br0 garbage\n").unwrap_err();
+        let e = parse_module_body("  local-prefix6 2001:db8::/48 via br0 garbage\n").unwrap_err();
         assert!(format!("{e}").contains("unknown tail flag"));
     }
 
     #[test]
     fn local_prefix6_iface_sanitized() {
-        let e = parse_module_body("  local-prefix6 2602:f7d8::/48 via has space\n").unwrap_err();
+        let e = parse_module_body("  local-prefix6 2001:db8::/48 via has space\n").unwrap_err();
         assert!(matches!(e, ConfigError::Parse { .. }));
     }
 
@@ -7116,12 +7116,12 @@ module fast-path
     #[test]
     fn local_prefix_family_mismatch_hints_at_other_directive() {
         // v6 CIDR under the v4 keyword.
-        let e = parse_module_body("  local-prefix 2602:f7d8::/48 via br0\n").unwrap_err();
+        let e = parse_module_body("  local-prefix 2001:db8::/48 via br0\n").unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("local-prefix6"), "got: {msg}");
 
         // v4 CIDR under the v6 keyword.
-        let e = parse_module_body("  local-prefix6 23.191.200.0/24 via br0\n").unwrap_err();
+        let e = parse_module_body("  local-prefix6 192.0.2.0/24 via br0\n").unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("did you mean `local-prefix`"), "got: {msg}");
     }
@@ -7140,8 +7140,8 @@ module fast-path
         // Note: br88 is deliberately missing.
         let cfg = Config::parse(
             "module fast-path\n  attach br1337 generic\n  \
-             local-prefix6 2602:f7d8:0:1337::/64 via br1337\n  \
-             local-prefix6 2602:f7d8:0:88::/64 via br88\n",
+             local-prefix6 2001:db8:0:1337::/64 via br1337\n  \
+             local-prefix6 2001:db8:0:88::/64 via br88\n",
         )
         .expect("parse ok; validation runs separately");
         let err = cfg.validate_interfaces_in(&dir).unwrap_err();
@@ -7171,8 +7171,8 @@ module fast-path
             );
         }
         for a in [
-            "2602:f7d8:0:1337::42",
-            "2602:f7d8:0:1337::", // subnet-router anycast: a real address
+            "2001:db8:0:1337::42",
+            "2001:db8:0:1337::", // subnet-router anycast: a real address
             "2001:db8::1",
             "fd00:1::1", // unique-local is fine
         ] {
@@ -7206,10 +7206,10 @@ module fast-path
     #[test]
     fn covered_local_prefixes_produce_no_warnings() {
         let w = warnings_for(
-            "  allow-prefix 23.191.200.0/24\n\
-             allow-prefix6 2602:f7d8::/48\n\
-             local-prefix 23.191.200.0/24 via br1337\n\
-             local-prefix6 2602:f7d8:0:1337::/64 via br1337\n",
+            "  allow-prefix 192.0.2.0/24\n\
+             allow-prefix6 2001:db8::/48\n\
+             local-prefix 192.0.2.0/24 via br1337\n\
+             local-prefix6 2001:db8:0:1337::/64 via br1337\n",
         );
         assert!(w.is_empty(), "unexpected warnings: {w:?}");
     }
@@ -7219,9 +7219,9 @@ module fast-path
     #[test]
     fn local_prefix6_without_allow_prefix6_warns() {
         let w = warnings_for(
-            "  allow-prefix 23.191.200.0/24\n\
-             local-prefix 23.191.200.0/24 via br1337\n\
-             local-prefix6 2602:f7d8:0:1337::/64 via br1337\n",
+            "  allow-prefix 192.0.2.0/24\n\
+             local-prefix 192.0.2.0/24 via br1337\n\
+             local-prefix6 2001:db8:0:1337::/64 via br1337\n",
         );
         assert_eq!(w.len(), 1, "got: {w:?}");
         assert!(w[0].contains("local-prefix6"), "got: {}", w[0]);
@@ -7230,17 +7230,21 @@ module fast-path
 
     #[test]
     fn local_prefix_v4_without_allow_warns() {
-        let w = warnings_for("  local-prefix 10.88.1.0/24 via br88\n");
+        let w = warnings_for("  local-prefix 198.51.100.0/24 via br88\n");
         assert_eq!(w.len(), 1, "got: {w:?}");
-        assert!(w[0].contains("local-prefix 10.88.1.0/24"), "got: {}", w[0]);
+        assert!(
+            w[0].contains("local-prefix 198.51.100.0/24"),
+            "got: {}",
+            w[0]
+        );
     }
 
     #[test]
     fn cross_family_allow_does_not_cover() {
         // A v4 allowlist must not silence the v6 warning or vice versa.
         let w = warnings_for(
-            "  allow-prefix6 2602:f7d8::/48\n\
-             local-prefix 23.191.200.0/24 via br1337\n",
+            "  allow-prefix6 2001:db8::/48\n\
+             local-prefix 192.0.2.0/24 via br1337\n",
         );
         assert_eq!(w.len(), 1, "got: {w:?}");
     }
@@ -7250,8 +7254,8 @@ module fast-path
         // An allow entry narrower than the local prefix still means the
         // operator wired the two together; only zero overlap warns.
         let w = warnings_for(
-            "  allow-prefix 23.191.200.128/25\n\
-             local-prefix 23.191.200.0/24 via br1337\n",
+            "  allow-prefix 192.0.2.128/25\n\
+             local-prefix 192.0.2.0/24 via br1337\n",
         );
         assert!(w.is_empty(), "narrower allow overlaps, no warn: {w:?}");
     }
@@ -7260,7 +7264,7 @@ module fast-path
 
     #[test]
     fn fallback_default_parses_basic_form() {
-        let m = parse_module_body("  fallback-default via eth3 nexthop 194.110.60.50\n")
+        let m = parse_module_body("  fallback-default via eth3 nexthop 198.51.100.50\n")
             .expect("parse");
         let fbd = m.directives.iter().find_map(|d| match d {
             ModuleDirective::FallbackDefault { iface, nexthop, .. } => {
@@ -7272,14 +7276,14 @@ module fast-path
             fbd,
             Some((
                 "eth3".to_string(),
-                "194.110.60.50".parse::<Ipv4Addr>().unwrap()
+                "198.51.100.50".parse::<Ipv4Addr>().unwrap()
             ))
         );
     }
 
     #[test]
     fn fallback_default_missing_via_errors() {
-        let e = parse_module_body("  fallback-default eth3 nexthop 194.110.60.50\n").unwrap_err();
+        let e = parse_module_body("  fallback-default eth3 nexthop 198.51.100.50\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("expected `via`"), "msg: {message}");
@@ -7290,7 +7294,7 @@ module fast-path
 
     #[test]
     fn fallback_default_missing_nexthop_keyword_errors() {
-        let e = parse_module_body("  fallback-default via eth3 194.110.60.50\n").unwrap_err();
+        let e = parse_module_body("  fallback-default via eth3 198.51.100.50\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("expected `nexthop`"), "msg: {message}");
@@ -7420,12 +7424,12 @@ module fast-path
 
     #[test]
     fn mss_clamp_per_prefix_v4() {
-        let m = parse_module_body("  mss-clamp 23.191.201.0/24 1280\n").expect("parse");
+        let m = parse_module_body("  mss-clamp 203.0.113.0/24 1280\n").expect("parse");
         let v = extract_mss_clamps(&m);
         assert_eq!(v.len(), 1);
         match v[0].0.as_ref().unwrap() {
             MssClampPrefix::V4(p) => {
-                assert_eq!(p.addr.octets(), [23, 191, 201, 0]);
+                assert_eq!(p.addr.octets(), [203, 0, 113, 0]);
                 assert_eq!(p.prefix_len, 24);
             }
             other => panic!("expected V4, got {other:?}"),
@@ -7447,7 +7451,7 @@ module fast-path
 
     #[test]
     fn mss_clamp_prefix_plus_iface() {
-        let m = parse_module_body("  mss-clamp 23.191.201.0/24 via eth2 1280\n").expect("parse");
+        let m = parse_module_body("  mss-clamp 203.0.113.0/24 via eth2 1280\n").expect("parse");
         let v = extract_mss_clamps(&m);
         assert_eq!(v.len(), 1);
         assert!(matches!(v[0].0, Some(MssClampPrefix::V4(_))));
@@ -7459,7 +7463,7 @@ module fast-path
     fn mss_clamp_multiple_lines_accumulate() {
         let body = "  mss-clamp 1360\n\
                     mss-clamp via eth2 1400\n\
-                    mss-clamp 23.191.201.0/24 1280\n";
+                    mss-clamp 203.0.113.0/24 1280\n";
         let m = parse_module_body(body).expect("parse");
         assert_eq!(extract_mss_clamps(&m).len(), 3);
     }

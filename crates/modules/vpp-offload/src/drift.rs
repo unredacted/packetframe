@@ -1202,11 +1202,11 @@ mod tests {
     #[test]
     fn tunnel_paths_are_findings_until_an_exemption_covers_them() {
         let routes = vec![
-            route(p(23, 191, 201, 0, 24), "vti64"), // remote site: finding
-            route(p(23, 191, 200, 2, 32), "vti64"), // host inside the local /24
-            route(p(0, 0, 0, 0, 0), "eth3"),        // default via a member: fine
-            route(p(23, 191, 200, 0, 24), "br1337"), // local delivery: fine
-            route(p(10, 0, 0, 0, 8), "eth4"),       // member: fine
+            route(p(198, 51, 100, 128, 25), "vti64"), // remote site: finding
+            route(p(198, 51, 100, 2, 32), "vti64"),   // host inside the local /25
+            route(p(0, 0, 0, 0, 0), "eth3"),          // default via a member: fine
+            route(p(198, 51, 100, 0, 25), "br1337"),  // local delivery: fine
+            route(p(10, 0, 0, 0, 8), "eth4"),         // member: fine
             {
                 // Via an IX peer on a bridge VLAN a member carries:
                 // placed per neighbour, so fine.
@@ -1233,25 +1233,25 @@ mod tests {
         assert!(found.iter().all(|u| u.to_string().contains("via vti64")));
 
         let exempts = [
-            p(23, 191, 201, 0, 24),
-            p(23, 191, 200, 2, 32),
+            p(198, 51, 100, 128, 25),
+            p(198, 51, 100, 2, 32),
             p(203, 0, 113, 0, 24),
             p(192, 0, 2, 0, 24),
         ];
         assert!(find(&routes, &exempts).is_empty());
     }
 
-    /// Containment, not overlap: a /32 exemption inside a /24 route
-    /// does NOT cover the /24.
+    /// Containment, not overlap: a /32 exemption inside a /25 route
+    /// does NOT cover the /25.
     #[test]
     fn an_exemption_must_contain_the_route_not_merely_overlap_it() {
-        let routes = vec![route(p(23, 191, 201, 0, 24), "vti64")];
+        let routes = vec![route(p(203, 0, 113, 0, 25), "vti64")];
         assert_eq!(
-            find(&routes, &[p(23, 191, 201, 5, 32)]).len(),
+            find(&routes, &[p(203, 0, 113, 5, 32)]).len(),
             1,
-            "a /32 inside the route must not silence the /24"
+            "a /32 inside the route must not silence the /25"
         );
-        assert!(find(&routes, &[p(23, 191, 0, 0, 16)]).is_empty());
+        assert!(find(&routes, &[p(203, 0, 113, 0, 24)]).is_empty());
     }
 
     /// Routes the kernel drops itself are not findings: VPP dropping
@@ -1284,7 +1284,7 @@ mod tests {
     /// whose docs claimed to cover it (review finding).
     #[test]
     fn a_local_address_on_a_service_bridge_is_a_finding_despite_the_device() {
-        let mut gw = route(p(23, 191, 200, 1, 32), "br1337");
+        let mut gw = route(p(192, 0, 2, 1, 32), "br1337");
         gw.kernel_delivers = true;
         gw.table = 255;
         let found = find(&[gw.clone()], &[]);
@@ -1304,7 +1304,7 @@ mod tests {
             found[0]
         );
         // And the exemption an operator would add silences it.
-        assert!(find(&[gw], &[p(23, 191, 200, 1, 32)]).is_empty());
+        assert!(find(&[gw], &[p(192, 0, 2, 1, 32)]).is_empty());
     }
 
     /// A service bridge's directed broadcast (`.255`) is
@@ -1315,7 +1315,7 @@ mod tests {
     /// thing was fixed for `RTN_LOCAL`).
     #[test]
     fn a_service_bridges_directed_broadcast_is_kernel_delivery_too() {
-        let mut bcast = route(p(23, 191, 200, 255, 32), "br1337");
+        let mut bcast = route(p(192, 0, 2, 255, 32), "br1337");
         bcast.kernel_delivers = true;
         bcast.table = 255;
         let found = find(std::slice::from_ref(&bcast), &[]);
@@ -1325,7 +1325,7 @@ mod tests {
             "{}",
             found[0]
         );
-        assert!(find(&[bcast], &[p(23, 191, 200, 255, 32)]).is_empty());
+        assert!(find(&[bcast], &[p(192, 0, 2, 255, 32)]).is_empty());
     }
 
     /// Local addresses NOT on a steered segment are deliberately out
@@ -1335,7 +1335,7 @@ mod tests {
     /// gauge as the backstop.
     #[test]
     fn local_addresses_off_the_steered_segments_are_out_of_scope() {
-        let mut transit = route(p(194, 110, 60, 51, 32), "eth3");
+        let mut transit = route(p(198, 51, 100, 51, 32), "eth3");
         transit.kernel_delivers = true;
         let mut loopback = route(p(127, 0, 0, 1, 32), "lo");
         loopback.kernel_delivers = true;
@@ -1431,11 +1431,11 @@ mod tests {
     fn dst_only_steering_scopes_the_scan_to_divertible_destinations() {
         use packetframe_common::fib::IpPrefix;
         let allow = [IpPrefix::V4 {
-            addr: [23, 191, 200, 0],
+            addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
         let routes = vec![
-            route(p(23, 191, 200, 2, 32), "vti64"), // inside the allowlist
+            route(p(192, 0, 2, 2, 32), "vti64"),    // inside the allowlist
             route(p(198, 51, 100, 0, 24), "vti64"), // outside it
         ];
         let scoped = uncovered_paths(
@@ -1448,10 +1448,7 @@ mod tests {
             },
         );
         assert_eq!(scoped.len(), 1, "{scoped:?}");
-        assert!(
-            scoped[0].to_string().contains("23.191.200.2/32"),
-            "{scoped:?}"
-        );
+        assert!(scoped[0].to_string().contains("192.0.2.2/32"), "{scoped:?}");
 
         // A src rule anywhere means any destination can be diverted.
         assert_eq!(find(&routes, &[]).len(), 2);
@@ -1465,7 +1462,7 @@ mod tests {
     /// re-opens the hole this scan closes.
     #[test]
     fn routes_in_tables_no_rule_selects_are_not_findings() {
-        let mut in_use = route(p(23, 191, 201, 0, 24), "vti64");
+        let mut in_use = route(p(203, 0, 113, 0, 24), "vti64");
         in_use.table = 100;
         let mut orphan = route(p(198, 51, 100, 0, 24), "vti64");
         orphan.table = 4242;
@@ -1516,7 +1513,7 @@ mod tests {
         use packetframe_common::config::VppSteerDirection as D;
         use packetframe_common::fib::IpPrefix;
         let allow = [IpPrefix::V4 {
-            addr: [23, 191, 200, 0],
+            addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
         let port = |steer: bool, dir: Option<D>| ("eth4".to_string(), 1u16, steer, Vec::new(), dir);
@@ -1556,10 +1553,10 @@ mod tests {
         // One host of a tunnel-backed /24 is allowlisted, so only that
         // host can be diverted at all.
         let allow = [IpPrefix::V4 {
-            addr: [23, 191, 201, 7],
+            addr: [203, 0, 113, 7],
             prefix_len: 32,
         }];
-        let routes = [route(p(23, 191, 201, 0, 24), "vti64")];
+        let routes = [route(p(203, 0, 113, 0, 24), "vti64")];
         let scoped = |exempts: &[Ipv4Prefix]| {
             uncovered_paths(
                 &routes,
@@ -1573,7 +1570,7 @@ mod tests {
         };
         assert_eq!(scoped(&[]).len(), 1, "uncovered: the /32 can be diverted");
         assert!(
-            scoped(&[p(23, 191, 201, 7, 32)]).is_empty(),
+            scoped(&[p(203, 0, 113, 7, 32)]).is_empty(),
             "exempting the one divertible host covers the whole hazard"
         );
 
@@ -1583,7 +1580,7 @@ mod tests {
             &routes,
             &Scope {
                 reach: &reach(),
-                exempts: &[p(23, 191, 201, 7, 32)],
+                exempts: &[p(203, 0, 113, 7, 32)],
                 divertible: Divertible::Any,
                 selected_tables: None,
             },
@@ -1780,9 +1777,9 @@ mod tests {
     /// what, out of where, and which table to look in.
     #[test]
     fn a_finding_names_prefix_device_and_table() {
-        let found = find(&[route(p(23, 191, 201, 0, 24), "vti64")], &[]);
+        let found = find(&[route(p(203, 0, 113, 0, 24), "vti64")], &[]);
         let line = found[0].to_string();
-        assert!(line.contains("23.191.201.0/24"), "{line}");
+        assert!(line.contains("203.0.113.0/24"), "{line}");
         assert!(line.contains("vti64"), "{line}");
         assert!(line.contains("table 100"), "{line}");
     }
