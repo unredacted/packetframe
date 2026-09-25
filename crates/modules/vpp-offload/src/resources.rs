@@ -218,7 +218,28 @@ pub struct ResourceState {
     /// `vpp_boot_id`.
     #[serde(default)]
     pub boot_id: Option<String>,
+    /// The restart-only half of the config this VPP was attached under
+    /// ([`crate::VppOffloadConfig::restart_only`]), checked on adoption
+    /// by [`Self::check_restart_only`].
+    ///
+    /// `packetframe detach --keep-vpp` hands a running VPP to whatever
+    /// config the next daemon reads, and most of what that config can
+    /// change is fixed at attach — the subifs `vlans` creates, the
+    /// loopback, the rule-table size. Adoption re-applies none of it,
+    /// and removes none of what the old config created, so an edit there
+    /// would be adopted as if applied: a dropped VLAN's subif still
+    /// taking steered ingress, unmanaged. Recorded so the edit is refused
+    /// instead. `None` (a file written before this field) is refused
+    /// too: the attach-time config is then unknown, the same call as
+    /// `expected_routes == 0`.
+    #[serde(default)]
+    pub restart_only: Option<RestartOnly>,
 }
+
+/// Config field name → its rendered value, for the fields a running VPP
+/// cannot take a change to. Rendered rather than typed so the record
+/// needs no serde on config types and names each field in a refusal.
+pub type RestartOnly = std::collections::BTreeMap<String, String>;
 
 impl ResourceState {
     pub fn empty() -> Self {
@@ -235,7 +256,45 @@ impl ResourceState {
             vpp_start_ticks: None,
             vpp_boot_id: None,
             boot_id: None,
+            restart_only: None,
         }
+    }
+
+    /// Refuse to adopt under a config whose restart-only fields differ
+    /// from the ones this VPP was attached under, naming each.
+    pub fn check_restart_only(&self, now: &RestartOnly) -> Result<(), String> {
+        let Some(recorded) = &self.restart_only else {
+            return Err(
+                "state records no attach-time config (written by an older packetframe), so \
+                 whether the running VPP matches this config cannot be established — run \
+                 `packetframe detach --all` and start fresh"
+                    .into(),
+            );
+        };
+        let changed: Vec<&str> = recorded
+            .keys()
+            .chain(now.keys())
+            .filter(|k| recorded.get(*k) != now.get(*k))
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let detail: Vec<String> = changed
+            .iter()
+            .map(|k| {
+                let show = |m: &RestartOnly| m.get(*k).cloned().unwrap_or_else(|| "-".into());
+                format!("`{k}` {} → {}", show(recorded), show(now))
+            })
+            .collect();
+        Err(format!(
+            "the running VPP was attached under a different config: {}; VPP fixes these at \
+             attach and adoption would neither apply nor undo them — run `packetframe detach \
+             --all` under the OLD config, then start",
+            detail.join(", ")
+        ))
     }
 
     pub fn path_in(state_dir: &Path) -> PathBuf {

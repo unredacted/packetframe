@@ -107,7 +107,8 @@ enum Command {
         #[arg(long)]
         all: bool,
         /// Leave vpp-offload running — VPP, its VFs, hugepages and MCAM
-        /// steering rules — whatever else is torn down, so the next
+        /// steering rules — and tear down every other module (implies
+        /// `--all` for them), so the next
         /// `packetframe run` adopts it and steered traffic keeps flowing
         /// across the restart: stop, `detach --keep-vpp`, start.
         #[arg(long)]
@@ -305,7 +306,9 @@ fn main() -> ExitCode {
             // scoped case where `config` is expected to name the
             // module whose pins to tear down.
             let path = config.or_else(|| {
-                if all {
+                // `--keep-vpp` checks the running VPP against the config
+                // the next start reads, so it always has one.
+                if all && !keep_vpp {
                     None
                 } else {
                     Some(PathBuf::from(DEFAULT_CONFIG_PATH))

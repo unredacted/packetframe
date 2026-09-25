@@ -1808,6 +1808,9 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     // alone — the first version of this teardown ran unconditionally and
     // would have terminated a VPP the operator never asked about, purely
     // because it shares the state dir.
+    let parsed = config
+        .map(|p| Config::from_file(p).map_err(|e| format!("config parse: {e}")))
+        .transpose()?;
     let (
         bpffs_root,
         state_dir,
@@ -1816,9 +1819,8 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
         config_has_vpp,
         config_has_guard,
         config_has_neigh_snoop,
-    ) = match config {
-        Some(p) => {
-            let c = Config::from_file(p).map_err(|e| format!("config parse: {e}"))?;
+    ) = match parsed.clone() {
+        Some(c) => {
             let has_fast_path = c.modules.iter().any(|m| m.name == "fast-path");
             let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
             let has_guard = c.modules.iter().any(|m| m.name == "guard");
@@ -1885,6 +1887,18 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
             ));
         }
     }
+
+    // Checked before anything is torn down, so a refusal leaves the box
+    // exactly as the stop left it.
+    #[cfg(feature = "vpp-offload")]
+    if keep_vpp {
+        keep_vpp_preflight(parsed.as_ref(), &state_dir)?;
+    }
+    // `--keep-vpp` is a restart: every other module goes, whatever the
+    // config declares. Scoping it to the edited config would leave a
+    // module the edit removed — a guard's egress filters, say — installed
+    // and unsupervised under the new daemon.
+    let all = all || keep_vpp;
 
     // `--all` used to be a no-op with a comment saying it would "become
     // meaningful once a second module ships". A second module has now
@@ -1996,6 +2010,54 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     Ok(())
 }
 
+/// Refuse a `--keep-vpp` the next start could not adopt, before any
+/// teardown. A refusal after the other modules came down would be
+/// harmless; a VPP the next daemon cannot adopt is not — it keeps its
+/// VFs and steering rules with nothing supervising them, and the start
+/// fails on resources it does not know are taken.
+#[cfg(feature = "vpp-offload")]
+fn keep_vpp_preflight(config: Option<&Config>, state_dir: &Path) -> Result<(), String> {
+    use packetframe_vpp_offload::resources::ResourceState;
+    use packetframe_vpp_offload::VppOffloadConfig;
+
+    let Some(config) = config else {
+        return Err(
+            "--keep-vpp checks the running VPP against the config the next start reads; \
+             name it with --config"
+                .into(),
+        );
+    };
+    let Some(section) = config.modules.iter().find(|m| m.name == "vpp-offload") else {
+        return Err(
+            "--keep-vpp: this config declares no vpp-offload section, so the next start \
+             would leave the running VPP unsupervised — use `detach --all`"
+                .into(),
+        );
+    };
+    // Read from the directory the NEXT start will look in. A `state-dir`
+    // edit moves it, and a record the new daemon cannot find is a VPP it
+    // cannot adopt.
+    let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
+        return Err(format!(
+            "--keep-vpp: no vpp-offload record in {} — there is no running VPP to keep, or \
+             `state-dir` changed and the next start would not find it. Use `detach --all` \
+             (under the OLD config, if `state-dir` changed)",
+            state_dir.display()
+        ));
+    };
+    let cfg = VppOffloadConfig::from_directives(&section.directives);
+    if state.expected_routes != cfg.expected_routes {
+        return Err(format!(
+            "--keep-vpp: the running VPP was sized for expected-routes {} and this config \
+             says {}; VPP fixes that at start — use `detach --all`",
+            state.expected_routes, cfg.expected_routes
+        ));
+    }
+    state
+        .check_restart_only(&cfg.restart_only())
+        .map_err(|e| format!("--keep-vpp: {e}"))
+}
+
 /// What `detach` does with vpp-offload.
 #[cfg(feature = "vpp-offload")]
 #[derive(Debug, PartialEq, Eq)]
@@ -2039,6 +2101,65 @@ mod keep_vpp_tests {
         assert_eq!(vpp_detach(true, false, false), VppDetach::TearDown);
         assert_eq!(vpp_detach(false, true, false), VppDetach::TearDown);
         assert_eq!(vpp_detach(false, false, false), VppDetach::OutOfScope);
+    }
+
+    fn conf(vlans: &str, vpp: bool) -> Config {
+        let mut c = String::from(
+            "module fast-path\n  attach eth2 generic\n  allow-prefix 203.0.113.0/24\n",
+        );
+        if vpp {
+            c.push_str(&format!(
+                "\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  \
+                 port eth2 cores 1 steer on{vlans}\n  require-table-complete off\n"
+            ));
+        }
+        Config::parse(&c).expect("parses")
+    }
+
+    fn record(dir: &Path, cfg: &Config) {
+        use packetframe_vpp_offload::resources::ResourceState;
+        use packetframe_vpp_offload::VppOffloadConfig;
+        let section = cfg
+            .modules
+            .iter()
+            .find(|m| m.name == "vpp-offload")
+            .unwrap();
+        let vpp = VppOffloadConfig::from_directives(&section.directives);
+        let mut state = ResourceState::empty();
+        state.expected_routes = vpp.expected_routes;
+        state.restart_only = Some(vpp.restart_only());
+        state.save(dir).unwrap();
+    }
+
+    /// `--keep-vpp` refuses, before tearing anything down, a restart the
+    /// next start could not adopt: no record where that start will look
+    /// (nothing running, or `state-dir` moved), a config that dropped
+    /// the section, or an attach-time field it changed.
+    #[test]
+    fn keep_vpp_refuses_what_the_next_start_could_not_adopt() {
+        let dir = std::env::temp_dir().join(format!("pf-keep-vpp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let steered = conf(" vlans 88,1337", true);
+        let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
+        assert!(
+            e.contains("no vpp-offload record") && e.contains("state-dir"),
+            "{e}"
+        );
+
+        record(&dir, &steered);
+        keep_vpp_preflight(Some(&steered), &dir).expect("unchanged config adopts");
+
+        let e = keep_vpp_preflight(Some(&conf("", false)), &dir).unwrap_err();
+        assert!(e.contains("no vpp-offload section"), "{e}");
+
+        let e = keep_vpp_preflight(Some(&conf(" vlans 1337", true)), &dir).unwrap_err();
+        assert!(e.contains("`port`") && e.contains("detach --all"), "{e}");
+
+        let e = keep_vpp_preflight(None, &dir).unwrap_err();
+        assert!(e.contains("--config"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

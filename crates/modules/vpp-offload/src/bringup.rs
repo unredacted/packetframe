@@ -616,7 +616,13 @@ pub fn bring_up(
         return Err(err);
     }
 
-    let (state, acquired) = acquire::acquire(&paths.sys, &ports, pages, cfg.expected_routes)?;
+    let (state, acquired) = acquire::acquire(
+        &paths.sys,
+        &ports,
+        pages,
+        cfg.expected_routes,
+        &cfg.restart_only(),
+    )?;
 
     // From here, every failure releases. `?` would return holding VFs
     // and a hugepage reservation that only the state file knows about —

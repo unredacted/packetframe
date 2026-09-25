@@ -2614,9 +2614,28 @@ restart packetframe (stop → `detach --all` → start) afterwards.
     systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
     ```
 
-    Adoption refuses a VPP whose topology the new config changed
-    (`port` lines, `vlans`, `expected-routes`, …) by name; use
-    `detach --all` for those.
+    Every module other than vpp-offload comes down whatever the config
+    declares — it is a restart, so a module the edit removed does not
+    stay behind. VPP is kept only for a restart that can adopt it, and
+    `detach --keep-vpp` checks that before tearing anything down,
+    refusing by name when:
+    - the edit changed something VPP fixes at attach: `port` lines
+      (including `cores` and `vlans`), `expected-routes`, `hugepages`,
+      `steer-capacity`, `loopback-address`, `vpp-binary` or
+      `local-route`. Adoption neither applies nor undoes these — a
+      dropped VLAN's subif would keep taking steered ingress, unmanaged.
+      Steering levers and `steer-direction` are fine; adoption applies
+      them;
+    - the config no longer has a `vpp-offload` section;
+    - there is no vpp-offload record in the config's `state-dir` — no
+      VPP running, or a `state-dir` edit the next start would look past.
+      The same goes for `bpffs-root`: a path edit needs `detach --all`
+      under the **old** config, then start;
+    - the record predates this check (first restart after upgrading to
+      it).
+
+    The daemon's adoption applies the same checks, so a restart that
+    skipped the preflight fails the start rather than adopting.
 - **The ntuple table holds 16 rules per port by default, and
   `npc/mcam_info` will not tell you that.** The driver rejects an
   out-of-range `loc` with `EINVAL` rather than assigning one. The module
