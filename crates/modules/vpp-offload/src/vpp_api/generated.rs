@@ -43,6 +43,20 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "sw_interface_set_promisc_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_mtu", crc: "0x5cbe85e5", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_mtu_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "create_loopback_instance", crc: "0xd36a3ee2", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "create_loopback_instance_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "bridge_domain_add_del_v2", crc: "0x600b7170", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "bridge_domain_add_del_v2_reply", crc: "0xfcb1e980", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_set_l2_bridge", crc: "0xd0678b13", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_set_l2_bridge_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "l2_interface_vlan_tag_rewrite", crc: "0x62cc0bbc", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "l2_interface_vlan_tag_rewrite_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "l2fib_add_del", crc: "0xeddda487", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "l2fib_add_del_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "bridge_domain_dump", crc: "0x74396a43", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "bridge_domain_details", crc: "0x0fa506fd", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "l2_fib_table_dump", crc: "0xc25fdce6", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "l2_fib_table_details", crc: "0xa44ef6b8", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "create_loopback", crc: "0x42bb5d22", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "create_loopback_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_add_del_address", crc: "0x5463d73b", context_offset: 6, client_index_prefix: true },
@@ -121,6 +135,11 @@ pub const IP_API_NEIGHBOR_FLAG_NONE: u8 = 0;
 pub const IP_API_NEIGHBOR_FLAG_STATIC: u8 = 1;
 pub const IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY: u8 = 2;
 
+// enum l2_port_type : u32
+pub const L2_API_PORT_TYPE_NORMAL: u32 = 0;
+pub const L2_API_PORT_TYPE_BVI: u32 = 1;
+pub const L2_API_PORT_TYPE_UU_FWD: u32 = 2;
+
 // enum link_duplex : u32
 pub const LINK_DUPLEX_API_UNKNOWN: u32 = 0;
 pub const LINK_DUPLEX_API_HALF: u32 = 1;
@@ -175,6 +194,35 @@ impl Decode for Address {
         Ok(Self {
             af,
             un,
+        })
+    }
+}
+
+/// `bridge_domain_sw_if` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BridgeDomainSwIf {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub shg: u8,
+}
+
+impl Encode for BridgeDomainSwIf {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.shg).to_be_bytes());
+    }
+}
+
+impl Decode for BridgeDomainSwIf {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let shg = d.u8()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            shg,
         })
     }
 }
@@ -1400,6 +1448,690 @@ impl Decode for SwInterfaceSetMtuReply {
 impl Message for SwInterfaceSetMtuReply {
     const NAME: &'static str = "sw_interface_set_mtu_reply";
     const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `create_loopback_instance` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CreateLoopbackInstance {
+    pub context: u32,
+    pub mac_address: [u8; 6],
+    pub is_specified: bool,
+    pub user_instance: u32,
+}
+
+impl Encode for CreateLoopbackInstance {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&self.mac_address[..]);
+        buf.push(if self.is_specified { 1u8 } else { 0u8 });
+        buf.extend_from_slice(&(self.user_instance).to_be_bytes());
+    }
+}
+
+impl Decode for CreateLoopbackInstance {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let mac_address = d.bytes::<6>()?;
+        let is_specified = d.bool()?;
+        let user_instance = d.u32()?;
+        Ok(Self {
+            context,
+            mac_address,
+            is_specified,
+            user_instance,
+        })
+    }
+}
+
+impl Message for CreateLoopbackInstance {
+    const NAME: &'static str = "create_loopback_instance";
+    const CRC: &'static str = "0xd36a3ee2";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `create_loopback_instance_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CreateLoopbackInstanceReply {
+    pub context: u32,
+    pub retval: i32,
+    pub sw_if_index: u32,
+}
+
+impl Encode for CreateLoopbackInstanceReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+    }
+}
+
+impl Decode for CreateLoopbackInstanceReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        let sw_if_index = d.u32()?;
+        Ok(Self {
+            context,
+            retval,
+            sw_if_index,
+        })
+    }
+}
+
+impl Message for CreateLoopbackInstanceReply {
+    const NAME: &'static str = "create_loopback_instance_reply";
+    const CRC: &'static str = "0x5383d31f";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `bridge_domain_add_del_v2` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BridgeDomainAddDelV2 {
+    pub context: u32,
+    pub bd_id: u32,
+    pub flood: bool,
+    pub uu_flood: bool,
+    pub forward: bool,
+    pub learn: bool,
+    pub arp_term: bool,
+    pub arp_ufwd: bool,
+    pub mac_age: u8,
+    pub bd_tag: String,
+    pub is_add: bool,
+}
+
+impl Encode for BridgeDomainAddDelV2 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+        buf.push(if self.flood { 1u8 } else { 0u8 });
+        buf.push(if self.uu_flood { 1u8 } else { 0u8 });
+        buf.push(if self.forward { 1u8 } else { 0u8 });
+        buf.push(if self.learn { 1u8 } else { 0u8 });
+        buf.push(if self.arp_term { 1u8 } else { 0u8 });
+        buf.push(if self.arp_ufwd { 1u8 } else { 0u8 });
+        buf.extend_from_slice(&(self.mac_age).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.bd_tag.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        buf.push(if self.is_add { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for BridgeDomainAddDelV2 {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let bd_id = d.u32()?;
+        let flood = d.bool()?;
+        let uu_flood = d.bool()?;
+        let forward = d.bool()?;
+        let learn = d.bool()?;
+        let arp_term = d.bool()?;
+        let arp_ufwd = d.bool()?;
+        let mac_age = d.u8()?;
+        let bd_tag = d.string_fixed(64)?;
+        let is_add = d.bool()?;
+        Ok(Self {
+            context,
+            bd_id,
+            flood,
+            uu_flood,
+            forward,
+            learn,
+            arp_term,
+            arp_ufwd,
+            mac_age,
+            bd_tag,
+            is_add,
+        })
+    }
+}
+
+impl Message for BridgeDomainAddDelV2 {
+    const NAME: &'static str = "bridge_domain_add_del_v2";
+    const CRC: &'static str = "0x600b7170";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `bridge_domain_add_del_v2_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BridgeDomainAddDelV2Reply {
+    pub context: u32,
+    pub retval: i32,
+    pub bd_id: u32,
+}
+
+impl Encode for BridgeDomainAddDelV2Reply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+    }
+}
+
+impl Decode for BridgeDomainAddDelV2Reply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        let bd_id = d.u32()?;
+        Ok(Self {
+            context,
+            retval,
+            bd_id,
+        })
+    }
+}
+
+impl Message for BridgeDomainAddDelV2Reply {
+    const NAME: &'static str = "bridge_domain_add_del_v2_reply";
+    const CRC: &'static str = "0xfcb1e980";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_l2_bridge` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetL2Bridge {
+    pub context: u32,
+    pub rx_sw_if_index: u32,
+    pub bd_id: u32,
+    pub port_type: u32,
+    pub shg: u8,
+    pub enable: bool,
+}
+
+impl Encode for SwInterfaceSetL2Bridge {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.rx_sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+        buf.extend_from_slice(&(self.port_type as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.shg).to_be_bytes());
+        buf.push(if self.enable { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for SwInterfaceSetL2Bridge {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let rx_sw_if_index = d.u32()?;
+        let bd_id = d.u32()?;
+        let port_type = d.u32()?;
+        let shg = d.u8()?;
+        let enable = d.bool()?;
+        Ok(Self {
+            context,
+            rx_sw_if_index,
+            bd_id,
+            port_type,
+            shg,
+            enable,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetL2Bridge {
+    const NAME: &'static str = "sw_interface_set_l2_bridge";
+    const CRC: &'static str = "0xd0678b13";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_set_l2_bridge_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceSetL2BridgeReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for SwInterfaceSetL2BridgeReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceSetL2BridgeReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for SwInterfaceSetL2BridgeReply {
+    const NAME: &'static str = "sw_interface_set_l2_bridge_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `l2_interface_vlan_tag_rewrite` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L2InterfaceVlanTagRewrite {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub vtr_op: u32,
+    pub push_dot1q: u32,
+    pub tag1: u32,
+    pub tag2: u32,
+}
+
+impl Encode for L2InterfaceVlanTagRewrite {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.vtr_op).to_be_bytes());
+        buf.extend_from_slice(&(self.push_dot1q).to_be_bytes());
+        buf.extend_from_slice(&(self.tag1).to_be_bytes());
+        buf.extend_from_slice(&(self.tag2).to_be_bytes());
+    }
+}
+
+impl Decode for L2InterfaceVlanTagRewrite {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let vtr_op = d.u32()?;
+        let push_dot1q = d.u32()?;
+        let tag1 = d.u32()?;
+        let tag2 = d.u32()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            vtr_op,
+            push_dot1q,
+            tag1,
+            tag2,
+        })
+    }
+}
+
+impl Message for L2InterfaceVlanTagRewrite {
+    const NAME: &'static str = "l2_interface_vlan_tag_rewrite";
+    const CRC: &'static str = "0x62cc0bbc";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `l2_interface_vlan_tag_rewrite_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L2InterfaceVlanTagRewriteReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for L2InterfaceVlanTagRewriteReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for L2InterfaceVlanTagRewriteReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for L2InterfaceVlanTagRewriteReply {
+    const NAME: &'static str = "l2_interface_vlan_tag_rewrite_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `l2fib_add_del` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L2fibAddDel {
+    pub context: u32,
+    pub mac: [u8; 6],
+    pub bd_id: u32,
+    pub sw_if_index: u32,
+    pub is_add: bool,
+    pub static_mac: bool,
+    pub filter_mac: bool,
+    pub bvi_mac: bool,
+}
+
+impl Encode for L2fibAddDel {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&self.mac[..]);
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.push(if self.is_add { 1u8 } else { 0u8 });
+        buf.push(if self.static_mac { 1u8 } else { 0u8 });
+        buf.push(if self.filter_mac { 1u8 } else { 0u8 });
+        buf.push(if self.bvi_mac { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for L2fibAddDel {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let mac = d.bytes::<6>()?;
+        let bd_id = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let is_add = d.bool()?;
+        let static_mac = d.bool()?;
+        let filter_mac = d.bool()?;
+        let bvi_mac = d.bool()?;
+        Ok(Self {
+            context,
+            mac,
+            bd_id,
+            sw_if_index,
+            is_add,
+            static_mac,
+            filter_mac,
+            bvi_mac,
+        })
+    }
+}
+
+impl Message for L2fibAddDel {
+    const NAME: &'static str = "l2fib_add_del";
+    const CRC: &'static str = "0xeddda487";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `l2fib_add_del_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L2fibAddDelReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for L2fibAddDelReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for L2fibAddDelReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for L2fibAddDelReply {
+    const NAME: &'static str = "l2fib_add_del_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `bridge_domain_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BridgeDomainDump {
+    pub context: u32,
+    pub bd_id: u32,
+    pub sw_if_index: u32,
+}
+
+impl Encode for BridgeDomainDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+    }
+}
+
+impl Decode for BridgeDomainDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let bd_id = d.u32()?;
+        let sw_if_index = d.u32()?;
+        Ok(Self {
+            context,
+            bd_id,
+            sw_if_index,
+        })
+    }
+}
+
+impl Message for BridgeDomainDump {
+    const NAME: &'static str = "bridge_domain_dump";
+    const CRC: &'static str = "0x74396a43";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `bridge_domain_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BridgeDomainDetails {
+    pub context: u32,
+    pub bd_id: u32,
+    pub flood: bool,
+    pub uu_flood: bool,
+    pub forward: bool,
+    pub learn: bool,
+    pub arp_term: bool,
+    pub arp_ufwd: bool,
+    pub mac_age: u8,
+    pub bd_tag: String,
+    pub bvi_sw_if_index: u32,
+    pub uu_fwd_sw_if_index: u32,
+    pub n_sw_ifs: u32,
+    pub sw_if_details: Vec<BridgeDomainSwIf>,
+}
+
+impl Encode for BridgeDomainDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+        buf.push(if self.flood { 1u8 } else { 0u8 });
+        buf.push(if self.uu_flood { 1u8 } else { 0u8 });
+        buf.push(if self.forward { 1u8 } else { 0u8 });
+        buf.push(if self.learn { 1u8 } else { 0u8 });
+        buf.push(if self.arp_term { 1u8 } else { 0u8 });
+        buf.push(if self.arp_ufwd { 1u8 } else { 0u8 });
+        buf.extend_from_slice(&(self.mac_age).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.bd_tag.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        buf.extend_from_slice(&(self.bvi_sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.uu_fwd_sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_details.len() as u32).to_be_bytes());
+        for it in &self.sw_if_details {
+        it.encode(buf);
+        }
+    }
+}
+
+impl Decode for BridgeDomainDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let bd_id = d.u32()?;
+        let flood = d.bool()?;
+        let uu_flood = d.bool()?;
+        let forward = d.bool()?;
+        let learn = d.bool()?;
+        let arp_term = d.bool()?;
+        let arp_ufwd = d.bool()?;
+        let mac_age = d.u8()?;
+        let bd_tag = d.string_fixed(64)?;
+        let bvi_sw_if_index = d.u32()?;
+        let uu_fwd_sw_if_index = d.u32()?;
+        let n_sw_ifs = d.u32()?;
+        let sw_if_details = {
+            let n = n_sw_ifs as usize;
+            let mut v = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                v.push(BridgeDomainSwIf::decode(d)?);
+            }
+            v
+        };
+        Ok(Self {
+            context,
+            bd_id,
+            flood,
+            uu_flood,
+            forward,
+            learn,
+            arp_term,
+            arp_ufwd,
+            mac_age,
+            bd_tag,
+            bvi_sw_if_index,
+            uu_fwd_sw_if_index,
+            n_sw_ifs,
+            sw_if_details,
+        })
+    }
+}
+
+impl Message for BridgeDomainDetails {
+    const NAME: &'static str = "bridge_domain_details";
+    const CRC: &'static str = "0x0fa506fd";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `l2_fib_table_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L2FibTableDump {
+    pub context: u32,
+    pub bd_id: u32,
+}
+
+impl Encode for L2FibTableDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+    }
+}
+
+impl Decode for L2FibTableDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let bd_id = d.u32()?;
+        Ok(Self {
+            context,
+            bd_id,
+        })
+    }
+}
+
+impl Message for L2FibTableDump {
+    const NAME: &'static str = "l2_fib_table_dump";
+    const CRC: &'static str = "0xc25fdce6";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `l2_fib_table_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L2FibTableDetails {
+    pub context: u32,
+    pub bd_id: u32,
+    pub mac: [u8; 6],
+    pub sw_if_index: u32,
+    pub static_mac: bool,
+    pub filter_mac: bool,
+    pub bvi_mac: bool,
+}
+
+impl Encode for L2FibTableDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.bd_id).to_be_bytes());
+        buf.extend_from_slice(&self.mac[..]);
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.push(if self.static_mac { 1u8 } else { 0u8 });
+        buf.push(if self.filter_mac { 1u8 } else { 0u8 });
+        buf.push(if self.bvi_mac { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for L2FibTableDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let bd_id = d.u32()?;
+        let mac = d.bytes::<6>()?;
+        let sw_if_index = d.u32()?;
+        let static_mac = d.bool()?;
+        let filter_mac = d.bool()?;
+        let bvi_mac = d.bool()?;
+        Ok(Self {
+            context,
+            bd_id,
+            mac,
+            sw_if_index,
+            static_mac,
+            filter_mac,
+            bvi_mac,
+        })
+    }
+}
+
+impl Message for L2FibTableDetails {
+    const NAME: &'static str = "l2_fib_table_details";
+    const CRC: &'static str = "0xa44ef6b8";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

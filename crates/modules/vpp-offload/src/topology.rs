@@ -199,6 +199,53 @@ impl PortVlans {
     }
 }
 
+/// The kernel's L3 device for one bridged VLAN: what its frames leave
+/// from (a BVI must carry the same MAC) and its MTU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeL3 {
+    pub mac: [u8; 6],
+    pub mtu: Option<u32>,
+}
+
+/// One device classifying to a bridged VLAN, for [`pick_bridge_l3`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3Candidate {
+    pub dev: String,
+    /// Holds an IPv4 address, or a global IPv6 one.
+    pub addressed: bool,
+    /// Enslaved to a bridge — `switch0.3998` under `br3998`: a lower
+    /// device, never where the router's frames leave from.
+    pub enslaved: bool,
+}
+
+/// Which device is a bridged VLAN's L3 device: the addressed one —
+/// `br3998` rather than the bare `switch0.3998` beneath it — else one no
+/// bridge has enslaved, else the first. The middle rule is what keeps an
+/// IPv6-only (or not yet addressed) bridge from losing to its lower
+/// device by name order, which would hand the BVI a MAC the kernel does
+/// not send from (review finding). Pure, for the tests.
+pub fn pick_bridge_l3(candidates: &[L3Candidate]) -> Option<&str> {
+    candidates
+        .iter()
+        .find(|c| c.addressed)
+        .or_else(|| candidates.iter().find(|c| !c.enslaved))
+        .or_else(|| candidates.first())
+        .map(|c| c.dev.as_str())
+}
+
+/// Devices holding a global (non-link-local) IPv6 address, from
+/// `/proc/net/if_inet6`. Link-local is left out: every up device has
+/// one, lower devices included, so it says nothing about L3.
+pub fn parse_if_inet6_global(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            // addr, ifindex, prefix len, scope, flags, name
+            (cols.len() == 6 && cols[3] == "00").then(|| cols[5].to_string())
+        })
+        .collect()
+}
+
 /// The engine's view of the kernel: classification and the FDB.
 ///
 /// Both answers must be cheap: the engine asks from the supervision
@@ -217,6 +264,11 @@ pub trait Topology {
     /// The latest bridge-port VLAN membership, on the same terms as
     /// [`Self::fdb`].
     fn port_vlans(&self) -> Result<PortVlans, String>;
+    /// The bridge `port` is enslaved to, if any.
+    fn master_of(&self, port: &str) -> Option<String>;
+    /// The kernel's L3 device for `bridge`/`vid`, if the router has one —
+    /// a VLAN with no L3 device on the router has no neighbours to reach.
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3>;
     /// `dev`'s current MTU, or `None` when it cannot be read. Read at
     /// every VPP attach rather than once at bring-up: a supervised VPP
     /// restart re-attaches with the kernel's MTU as it is then.
@@ -239,6 +291,12 @@ impl Topology for NoTopology {
     }
     fn port_vlans(&self) -> Result<PortVlans, String> {
         Ok(PortVlans::default())
+    }
+    fn master_of(&self, _port: &str) -> Option<String> {
+        None
+    }
+    fn bridge_l3(&self, _bridge: &str, _vid: u16) -> Option<BridgeL3> {
+        None
     }
 }
 
@@ -371,9 +429,56 @@ impl Topology for KernelTopology {
         self.vlans.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    fn master_of(&self, port: &str) -> Option<String> {
+        let link = std::fs::read_link(format!("/sys/class/net/{port}/master")).ok()?;
+        Some(link.file_name()?.to_str()?.to_string())
+    }
+
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
+        let links = kernel_links().ok()?;
+        let mut addressed: std::collections::HashSet<String> = crate::bringup::kernel_v4_addrs()
+            .into_iter()
+            .map(|(dev, _)| dev)
+            .collect();
+        addressed.extend(parse_if_inet6_global(
+            &std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default(),
+        ));
+        let want = DevKind::BridgeVlan {
+            bridge: bridge.to_string(),
+            vid,
+        };
+        let candidates: Vec<L3Candidate> = all_netdevs()
+            .into_iter()
+            .filter(|d| classify(&links, d).as_ref() == Some(&want))
+            .map(|dev| L3Candidate {
+                addressed: addressed.contains(&dev),
+                enslaved: self.master_of(&dev).is_some(),
+                dev,
+            })
+            .collect();
+        let dev = pick_bridge_l3(&candidates)?;
+        let base = std::path::Path::new("/sys/class/net").join(dev);
+        let mac = parse_mac(&std::fs::read_to_string(base.join("address")).ok()?)?;
+        let mtu = std::fs::read_to_string(base.join("mtu"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        Some(BridgeL3 { mac, mtu })
+    }
+
     fn mtu(&self, dev: &str) -> Option<u32> {
         crate::attach::kernel_mtu(std::path::Path::new("/sys/class/net"), dev)
     }
+}
+
+/// `aa:bb:cc:dd:ee:ff` as sysfs writes it.
+#[cfg(target_os = "linux")]
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.trim().split(':');
+    for b in &mut out {
+        *b = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// Parse `/proc/net/vlan/config`. Separate from the read so the format
@@ -523,6 +628,41 @@ mod tests {
         assert_eq!(v.untagged("eth4"), vec![1]);
         assert_eq!(v.tagged("eth5"), vec![3998]);
         assert!(v.tagged("eth9").is_empty());
+    }
+
+    #[test]
+    fn the_addressed_device_is_a_bridged_vlans_l3_device() {
+        let cand = |dev: &str, addressed, enslaved| L3Candidate {
+            dev: dev.into(),
+            addressed,
+            enslaved,
+        };
+        let c = vec![
+            cand("br3998", true, false),
+            cand("switch0.3998", false, true),
+        ];
+        assert_eq!(pick_bridge_l3(&c), Some("br3998"));
+        // Unaddressed as far as IPv4 goes (IPv6-only, say): the device no
+        // bridge enslaves wins, whatever the name order.
+        let c = [cand("abr3998", false, false), cand("aa.3998", false, true)];
+        assert_eq!(pick_bridge_l3(&c[..]), Some("abr3998"));
+        let c = vec![cand("aa.3998", false, true), cand("br3998", false, false)];
+        assert_eq!(pick_bridge_l3(&c), Some("br3998"));
+        let c = vec![cand("switch0.3998", false, false)];
+        assert_eq!(pick_bridge_l3(&c), Some("switch0.3998"));
+        assert_eq!(pick_bridge_l3(&[]), None);
+    }
+
+    #[test]
+    fn global_ipv6_addresses_mark_a_device_addressed() {
+        let text = "\
+20010db8000000000000000000000001 0c 40 00 80 br3998
+fe800000000000000000000000000001 0d 40 20 80 switch0.3998
+fe800000000000000000000000000002 0c 40 20 80 br3998
+";
+        let got = parse_if_inet6_global(text);
+        assert!(got.contains("br3998"), "{got:?}");
+        assert!(!got.contains("switch0.3998"), "link-local only: {got:?}");
     }
 
     #[test]

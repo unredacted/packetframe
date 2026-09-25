@@ -36,13 +36,15 @@ its head bytes in hex, then a verdict:
 - **≤ 10 %**: the head is not Ethernet, which usually means a driver
   descriptor prefix. Run again with `--mode generic` to compare with
   what the kernel sees.
-- The report also flags a prefix of 8 or more bytes shared by every
-  sample as a possible descriptor. Treat that warning with care: traffic
-  arriving from a single neighbour has the same destination and source
-  MAC on every frame, and often the same ethertype and IP header start,
-  so a conformant driver can share all 16 bytes. On its own it proves
-  nothing; go by the ethertype percentage and the `--mode generic`
-  comparison.
+- The report also prints any prefix of 8 or more bytes shared by every
+  sample. It calls that prefix a likely descriptor only when the
+  ethertypes are also implausible (≤ 10 %), calls it inconclusive when
+  they are mixed, and with plausible ethertypes (≥ 90 %) says the prefix
+  fits a single L2 neighbour instead: traffic from one neighbour has
+  the same destination and source MAC on every frame, and often the
+  same ethertype and IP header start, so a conformant driver can share
+  all 16 bytes. The shared prefix on its own proves nothing;
+  go by the ethertype percentage and the `--mode generic` comparison.
 
 The usual workflow is to compare `native` against `generic` on the same
 interface, then use `--offset` to find where the real Ethernet header

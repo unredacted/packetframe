@@ -500,8 +500,8 @@ list, so keep the list to a handful (the reference EFG has 6).
 ```sh
 # 1. Confirm /32s landed in the FIB. Should see one entry per
 # kernel ARP entry within each declared local-prefix.
-sudo packetframe fib dump-v4 | grep -E '^23\.191\.200\.[0-9]+/32' | head
-sudo packetframe fib dump-v4 | grep -E '^10\.88\.1\.[0-9]+/32'   | head
+sudo packetframe fib dump-v4 | grep -E '^198\.51\.100\.[0-9]+/32' | head
+sudo packetframe fib dump-v4 | grep -E '^203\.0\.113\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])/32' | head
 
 # 2. Lookup a specific host. Should report state=resolved with the
 # host's actual MAC and the iface's ifindex.

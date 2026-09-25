@@ -1,0 +1,2809 @@
+{
+    "module": "l2",
+    "types": [
+        [
+            "address",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_address_union_t",
+                "un",
+                {
+                    "discriminator": "af"
+                }
+            ]
+        ],
+        [
+            "prefix",
+            [
+                "vl_api_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_address_and_mask",
+            [
+                "vl_api_ip4_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip4_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "ip6_address_and_mask",
+            [
+                "vl_api_ip6_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "mprefix",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u16",
+                "grp_address_length"
+            ],
+            [
+                "vl_api_address_union_t",
+                "grp_address"
+            ],
+            [
+                "vl_api_address_union_t",
+                "src_address"
+            ]
+        ],
+        [
+            "ip6_prefix",
+            [
+                "vl_api_ip6_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_prefix",
+            [
+                "vl_api_ip4_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "prefix_matcher",
+            [
+                "u8",
+                "le"
+            ],
+            [
+                "u8",
+                "ge"
+            ],
+            {
+                "comment": "/** \\brief A context for matching prefixes against.  (Think ip prefix list.)\n    The meaning (exact match / want subnets) of an unset matcher is left to the implementer.\n    @param le - le mut be <= to prefix.len. Default: 255 (not set).\n    @param ge - ge must be greater than le and <= max_size of prefix. Default: 255 (not set).\n\n*/"
+            }
+        ],
+        [
+            "mac_entry",
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac_addr"
+            ],
+            [
+                "vl_api_mac_event_action_t",
+                "action"
+            ],
+            [
+                "u8",
+                "flags"
+            ],
+            {
+                "comment": "/** \\brief Entry for learned or aged MAC in L2 MAC Events\n    @param sw_if_index - sw_if_index in the domain\n    @param mac_addr - mac_address\n    @param action - 0 => newly learned MAC, 1 => MAC deleted by ager\n                    2 => MAC move (sw_if_index changed)\n    @param flags - flag bits to provide other info, not yet used\n*/"
+            }
+        ],
+        [
+            "bridge_domain_sw_if",
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u8",
+                "shg"
+            ],
+            {
+                "comment": "/** \\brief L2 bridge domain sw interface operational state response\n    @param bd_id - the bridge domain id\n    @param sw_if_index - sw_if_index in the domain\n    @param shg - split horizon group for the interface\n*/"
+            }
+        ],
+        [
+            "bd_ip_mac",
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "vl_api_address_t",
+                "ip"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac"
+            ]
+        ]
+    ],
+    "messages": [
+        [
+            "l2_xconnect_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "rx_sw_if_index"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "tx_sw_if_index"
+            ],
+            {
+                "crc": "0x472b6b67",
+                "options": {},
+                "comment": "/** \\brief Reply to l2_xconnect_dump\n    @param context - sender context which was passed in the request\n    @param rx_sw_if_index - Receive interface index\n    @param tx_sw_if_index - Transmit interface index\n */"
+            }
+        ],
+        [
+            "l2_xconnect_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief Dump L2 XConnects\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "l2_fib_table_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "static_mac"
+            ],
+            [
+                "bool",
+                "filter_mac"
+            ],
+            [
+                "bool",
+                "bvi_mac"
+            ],
+            {
+                "crc": "0xa44ef6b8",
+                "options": {},
+                "comment": "/** \\brief l2 fib table details structure\n    @param bd_id - the l2 fib / bridge domain table id\n    @param mac - the entry's mac address\n    @param sw_if_index - index of the interface\n    @param static_mac - the entry is statically configured.\n    @param filter_mac - the entry is a mac filter entry.\n    @param bvi_mac - the mac address is a bridge virtual interface\n*/"
+            }
+        ],
+        [
+            "l2_fib_table_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            {
+                "crc": "0xc25fdce6",
+                "options": {},
+                "comment": "/** \\brief Dump l2 fib (aka bridge domain) table\n    @param client_index - opaque cookie to identify the sender\n    @param bd_id - the l2 fib / bridge domain table identifier\n*/"
+            }
+        ],
+        [
+            "l2_fib_clear_table",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief L2 fib clear table request, clear all mac entries in the l2 fib\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "l2_fib_clear_table_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2fib_flush_all",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief L2 FIB flush all  entries\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "l2fib_flush_all_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2fib_flush_bd",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            {
+                "crc": "0xc25fdce6",
+                "options": {},
+                "comment": "/** \\brief L2 FIB flush bridge domain entries\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the entry's bridge domain id\n*/"
+            }
+        ],
+        [
+            "l2fib_flush_bd_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2fib_flush_int",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief L2 FIB flush interface entries\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the entry's bridge domain id\n*/"
+            }
+        ],
+        [
+            "l2fib_flush_int_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2fib_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "bool",
+                "static_mac"
+            ],
+            [
+                "bool",
+                "filter_mac"
+            ],
+            [
+                "bool",
+                "bvi_mac"
+            ],
+            {
+                "crc": "0xeddda487",
+                "options": {},
+                "comment": "/** \\brief L2 FIB add entry request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param mac - the entry's mac address\n    @param bd_id - the entry's bridge domain id\n    @param sw_if_index - the interface\n    @param is_add - If non zero add the entry, else delete it\n    @param static_mac -\n    @param filter_mac -\n    @param bvi_mac -\n*/"
+            }
+        ],
+        [
+            "l2fib_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "want_l2_macs_events",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "learn_limit",
+                {
+                    "default": 1000
+                }
+            ],
+            [
+                "u8",
+                "scan_delay",
+                {
+                    "default": 10
+                }
+            ],
+            [
+                "u8",
+                "max_macs_in_event",
+                {
+                    "default": 10
+                }
+            ],
+            [
+                "bool",
+                "enable_disable",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            {
+                "crc": "0x9aabdfde",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Register to receive L2 MAC events for learned and aged MAC\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param learn_limit - MAC learn limit\n    @param scan_delay - event scan delay in 10 msec unit\n    @param max_macs_in_event - in units of 10 mac entries\n    @param enable_disable - 1 => register for MAC events, 0 => cancel registration\n    @param pid - sender's pid\n*/"
+            }
+        ],
+        [
+            "want_l2_macs_events_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "want_l2_macs_events2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u8",
+                "max_macs_in_event",
+                {
+                    "default": 10
+                }
+            ],
+            [
+                "bool",
+                "enable_disable",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            {
+                "crc": "0xcc1377b0",
+                "options": {},
+                "comment": "/** \\brief Register to receive L2 MAC events for learned and aged MAC\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param max_macs_in_event - in units of 10 mac entries\n    @param enable_disable - 1 => register for MAC events, 0 => cancel registration\n    @param pid - sender's pid\n*/"
+            }
+        ],
+        [
+            "want_l2_macs_events2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2fib_set_scan_delay",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u16",
+                "scan_delay",
+                {
+                    "default": 10
+                }
+            ],
+            {
+                "crc": "0xa3b968a4",
+                "options": {},
+                "comment": "/** \\brief set l2 table scan delay\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param scan_delay - event scan delay in 10 msec unit\n*/"
+            }
+        ],
+        [
+            "l2fib_set_scan_delay_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2_macs_event",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "u32",
+                "n_macs"
+            ],
+            [
+                "vl_api_mac_entry_t",
+                "mac",
+                0,
+                "n_macs"
+            ],
+            {
+                "crc": "0x44b8fd64",
+                "options": {},
+                "comment": "/** \\brief L2 MAC event for a list of learned or aged MACs\n    @param client_index - opaque cookie to identify the sender\n    @param pid - client pid registered to receive notification\n    @param n_macs - number of learned/aged MAC entries\n    @param mac - array of learned/aged MAC entries\n*/"
+            }
+        ],
+        [
+            "l2_flags",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_set"
+            ],
+            [
+                "u32",
+                "feature_bitmap"
+            ],
+            {
+                "crc": "0xfc41cfe8",
+                "options": {},
+                "comment": "/** \\brief Set interface L2 flags (such as L2_LEARN, L2_FWD,\n    L2_FLOOD, L2_UU_FLOOD, or L2_ARP_TERM bits). This can be used\n    to disable one or more of the features represented by the\n    flag bits on an interface to override what is set as default\n    for all interfaces in the bridge domain\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface\n    @param is_set - if non-zero, set the bits, else clear them\n    @param feature_bitmap - non-zero bits (as above) to set or clear\n*/"
+            }
+        ],
+        [
+            "l2_flags_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "resulting_feature_bitmap"
+            ],
+            {
+                "crc": "0x29b2a2b3",
+                "options": {},
+                "comment": "/** \\brief Set interface L2 flags response\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for the set l2 bits request\n    @param resulting_feature_bitmap - the internal l2 feature bitmap after the request is implemented\n*/"
+            }
+        ],
+        [
+            "l2_flags_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief Get interface L2 flags (companion getter for l2_flags)\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to query\n*/"
+            }
+        ],
+        [
+            "l2_flags_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "input_feature_bitmap"
+            ],
+            [
+                "u32",
+                "output_feature_bitmap"
+            ],
+            {
+                "crc": "0x35cb810f",
+                "options": {},
+                "comment": "/** \\brief Get interface L2 flags response\n    @param context - sender context, to match reply w/ request\n    @param retval - return code\n    @param input_feature_bitmap - raw internal L2 input feature bitmap for the interface\n    @param output_feature_bitmap - raw internal L2 output feature bitmap for the interface\n*/"
+            }
+        ],
+        [
+            "l2_flags_set",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_set"
+            ],
+            [
+                "u32",
+                "input_feature_bitmap"
+            ],
+            [
+                "u32",
+                "output_feature_bitmap"
+            ],
+            {
+                "crc": "0xd4030647",
+                "options": {},
+                "comment": "/** \\brief Set interface L2 flags (upgraded companion setter for l2_flags_get).\n    Sets or clears raw feature bitmap bits on both the input and output paths.\n    Pass zero for a bitmap to leave that direction unchanged.\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to modify\n    @param is_set - if non-zero set the bits, else clear them\n    @param input_feature_bitmap - input feature bits to set or clear\n    @param output_feature_bitmap - output feature bits to set or clear\n*/"
+            }
+        ],
+        [
+            "l2_flags_set_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2_interface_feat_flags_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief Get L2 per-interface feature flags\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to query\n*/"
+            }
+        ],
+        [
+            "l2_interface_feat_flags_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_l2_intf_feat_flags_t",
+                "flags"
+            ],
+            {
+                "crc": "0xa4149215",
+                "options": {},
+                "comment": "/** \\brief Reply for l2_interface_feat_flags_get\n    @param context - sender context, to match reply w/ request\n    @param retval - return code\n    @param flags - current feature flags active on this interface\n*/"
+            }
+        ],
+        [
+            "l2_interface_feat_flags_set",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "is_set"
+            ],
+            [
+                "vl_api_l2_intf_feat_flags_t",
+                "flags"
+            ],
+            {
+                "crc": "0xc4e2865c",
+                "options": {},
+                "comment": "/** \\brief Set or clear L2 per-interface feature flags\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to modify\n    @param is_set - true to enable the given flags, false to disable them\n    @param flags - which feature flags to enable or disable\n*/"
+            }
+        ],
+        [
+            "l2_interface_feat_flags_set_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bridge_domain_set_mac_age",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "u8",
+                "mac_age"
+            ],
+            {
+                "crc": "0xb537ad7b",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain set mac age\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the bridge domain to create\n    @param mac_age - mac aging time in min, 0 for disabled\n*/"
+            }
+        ],
+        [
+            "bridge_domain_set_mac_age_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bridge_domain_set_default_learn_limit",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "learn_limit"
+            ],
+            {
+                "crc": "0xf097ffce",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain set default learn limit\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param learn limit - maximum number of entries by default for bridge domains\n*/"
+            }
+        ],
+        [
+            "bridge_domain_set_default_learn_limit_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bridge_domain_set_learn_limit",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "u32",
+                "learn_limit"
+            ],
+            {
+                "crc": "0x89c52b5f",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain set learn limit\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the bridge domain idenntifier\n    @param learn limit - maximum number of entries for this bd\n*/"
+            }
+        ],
+        [
+            "bridge_domain_set_learn_limit_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bridge_domain_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "bool",
+                "flood"
+            ],
+            [
+                "bool",
+                "uu_flood"
+            ],
+            [
+                "bool",
+                "forward"
+            ],
+            [
+                "bool",
+                "learn"
+            ],
+            [
+                "bool",
+                "arp_term"
+            ],
+            [
+                "bool",
+                "arp_ufwd"
+            ],
+            [
+                "u8",
+                "mac_age"
+            ],
+            [
+                "string",
+                "bd_tag",
+                64
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x600b7170",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief L2 bridge domain add or delete request - will be deprecated\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the bridge domain to create\n    @param flood - enable/disable bcast/mcast flooding in the bd\n    @param uu_flood - enable/disable unknown unicast flood in the bd\n    @param forward - enable/disable forwarding on all interfaces in the bd\n    @param learn - enable/disable learning on all interfaces in the bd\n    @param arp_term - enable/disable arp termination in the bd\n    @param arp_ufwd - enable/disable arp unicast forwarding in the bd\n    @param mac_age - mac aging time in min, 0 for disabled\n    @param is_add - add or delete flag\n*/"
+            }
+        ],
+        [
+            "bridge_domain_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "deprecated": null
+                }
+            }
+        ],
+        [
+            "bridge_domain_add_del_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "bool",
+                "flood"
+            ],
+            [
+                "bool",
+                "uu_flood"
+            ],
+            [
+                "bool",
+                "forward"
+            ],
+            [
+                "bool",
+                "learn"
+            ],
+            [
+                "bool",
+                "arp_term"
+            ],
+            [
+                "bool",
+                "arp_ufwd"
+            ],
+            [
+                "u8",
+                "mac_age"
+            ],
+            [
+                "string",
+                "bd_tag",
+                64
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x600b7170",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain add delete request version 2\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id -  if the id == ~0 creates a bridge domain with an unused id\n              if the id != ~0 the id of the bridge domain to create/delete\n    @param flood - enable/disable bcast/mcast flooding in the bd\n    @param uu_flood - enable/disable unknown unicast flood in the bd\n    @param forward - enable/disable forwarding on all interfaces in the bd\n    @param learn - enable/disable learning on all interfaces in the bd\n    @param arp_term - enable/disable arp termination in the bd\n    @param arp_ufwd - enable/disable arp unicast forwarding in the bd\n    @param mac_age - mac aging time in min, 0 for disabled\n    @param is_add - add or delete flag\n*/"
+            }
+        ],
+        [
+            "bridge_domain_add_del_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            {
+                "crc": "0xfcb1e980",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain add delete version 2 response\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for the set bridge flags request\n    @param resulting_id - the id for the new bridge domain\n*/"
+            }
+        ],
+        [
+            "bridge_domain_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id",
+                {
+                    "default": 4294967295
+                }
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0x74396a43",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain request operational state details\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the bridge domain id desired or ~0 to request all bds\n    @param sw_if_index - filter by sw_if_index UNIMPLEMENTED\n*/"
+            }
+        ],
+        [
+            "bridge_domain_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "bool",
+                "flood"
+            ],
+            [
+                "bool",
+                "uu_flood"
+            ],
+            [
+                "bool",
+                "forward"
+            ],
+            [
+                "bool",
+                "learn"
+            ],
+            [
+                "bool",
+                "arp_term"
+            ],
+            [
+                "bool",
+                "arp_ufwd"
+            ],
+            [
+                "u8",
+                "mac_age"
+            ],
+            [
+                "string",
+                "bd_tag",
+                64
+            ],
+            [
+                "vl_api_interface_index_t",
+                "bvi_sw_if_index"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "uu_fwd_sw_if_index"
+            ],
+            [
+                "u32",
+                "n_sw_ifs"
+            ],
+            [
+                "vl_api_bridge_domain_sw_if_t",
+                "sw_if_details",
+                0,
+                "n_sw_ifs"
+            ],
+            {
+                "crc": "0x0fa506fd",
+                "options": {},
+                "comment": "/** \\brief L2 bridge domain operational state response\n    @param bd_id - the bridge domain id\n    @param flood - bcast/mcast flooding state on all interfaces in the bd\n    @param uu_flood - unknown unicast flooding state on all interfaces in the bd\n    @param forward - forwarding state on all interfaces in the bd\n    @param learn - learning state on all interfaces in the bd\n    @param arp_term - arp termination state on all interfaces in the bd\n    @param arp_ufwd - arp unicast forwarding state on all interfaces in the bd\n    @param mac_age - mac aging time in min, 0 for disabled\n    @param bd_tag - optional textual tag for the bridge domain\n    @param n_sw_ifs - number of sw_if_index's in the domain\n*/"
+            }
+        ],
+        [
+            "bridge_flags",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "bool",
+                "is_set"
+            ],
+            [
+                "vl_api_bd_flags_t",
+                "flags"
+            ],
+            {
+                "crc": "0x1b0c5fbd",
+                "options": {},
+                "comment": "/** \\brief Set bridge flags request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param bd_id - the bridge domain to set the flags for\n    @param is_set - if non-zero, set the flags, else clear them\n    @param flags - flags that are non-zero to set or clear\n*/"
+            }
+        ],
+        [
+            "bridge_flags_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "resulting_feature_bitmap"
+            ],
+            {
+                "crc": "0x29b2a2b3",
+                "options": {},
+                "comment": "/** \\brief Set bridge flags response\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for the set bridge flags request\n    @param resulting_feature_bitmap - the internal L2 feature bitmap after the request is implemented\n*/"
+            }
+        ],
+        [
+            "l2_interface_vlan_tag_rewrite",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "vtr_op"
+            ],
+            [
+                "u32",
+                "push_dot1q"
+            ],
+            [
+                "u32",
+                "tag1"
+            ],
+            [
+                "u32",
+                "tag2"
+            ],
+            {
+                "crc": "0x62cc0bbc",
+                "options": {},
+                "comment": "/** \\brief L2 interface vlan tag rewrite configure request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface the operation is applied to\n    @param vtr_op - Choose from l2_vtr_op_t enum values\n    @param push_dot1q - first pushed flag dot1q id set, else dot1ad\n    @param tag1 - Needed for any push or translate vtr op\n    @param tag2 - Needed for any push 2 or translate x-2 vtr ops\n*/"
+            }
+        ],
+        [
+            "l2_interface_vlan_tag_rewrite_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2_interface_pbb_tag_rewrite",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "vtr_op"
+            ],
+            [
+                "u16",
+                "outer_tag"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "b_dmac"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "b_smac"
+            ],
+            [
+                "u16",
+                "b_vlanid"
+            ],
+            [
+                "u32",
+                "i_sid"
+            ],
+            {
+                "crc": "0x38e802a8",
+                "options": {},
+                "comment": "/** \\brief L2 interface pbb tag rewrite configure request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface the operation is applied to\n    @param vtr_op - Choose from l2_vtr_op_t enum values\n    @param inner_tag - needed for translate_qinq vtr op only\n    @param outer_tag - needed for translate_qinq vtr op only\n    @param b_dmac - B-tag remote mac address, needed for any push or translate_qinq vtr op\n    @param b_smac - B-tag local mac address, needed for any push or translate qinq vtr op\n    @param b_vlanid - B-tag vlanid, needed for any push or translate qinq vtr op\n    @param i_sid - I-tag service id, needed for any push or translate qinq vtr op\n*/"
+            }
+        ],
+        [
+            "l2_interface_pbb_tag_rewrite_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2_patch_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "rx_sw_if_index"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "tx_sw_if_index"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0xa1f6a6f3",
+                "options": {},
+                "comment": "/** \\brief L2 interface patch add / del request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param rx_sw_if_index - receive side interface\n    @param tx_sw_if_index - transmit side interface\n    @param is_add - if non-zero set up the interface patch, else remove it\n*/"
+            }
+        ],
+        [
+            "l2_patch_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_set_l2_xconnect",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "rx_sw_if_index"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "tx_sw_if_index"
+            ],
+            [
+                "bool",
+                "enable",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x4fa28a85",
+                "options": {},
+                "comment": "/** \\brief Set L2 XConnect between two interfaces request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param rx_sw_if_index - Receive interface index\n    @param tx_sw_if_index - Transmit interface index\n    @param enable - enable xconnect if not 0, else set to L3 mode\n*/"
+            }
+        ],
+        [
+            "sw_interface_set_l2_xconnect_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_set_l2_bridge",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "rx_sw_if_index"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            [
+                "vl_api_l2_port_type_t",
+                "port_type"
+            ],
+            [
+                "u8",
+                "shg"
+            ],
+            [
+                "bool",
+                "enable",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0xd0678b13",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_set_l2_bridge_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bd_ip_mac_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "vl_api_bd_ip_mac_t",
+                "entry"
+            ],
+            {
+                "crc": "0x0257c869",
+                "options": {}
+            }
+        ],
+        [
+            "bd_ip_mac_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bd_ip_mac_flush",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            {
+                "crc": "0xc25fdce6",
+                "options": {},
+                "comment": "/** \\brief Flush bridge domain IP to MAC entries\n    @param client_index - opaque cookie to identify the sender\n    @param bd_id - bridge domain identifier\n*/"
+            }
+        ],
+        [
+            "bd_ip_mac_flush_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bd_ip_mac_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_bd_ip_mac_t",
+                "entry"
+            ],
+            {
+                "crc": "0x545af86a",
+                "options": {},
+                "comment": "/** \\brief bridge domain IP to MAC entry details structure\n    @param bd_id - bridge domain table id\n    @param is_ipv6 - if non-zero, ipv6 address, else ipv4 address\n    @param ip_address - ipv4 or ipv6 address\n    @param mac_address - MAC address\n*/"
+            }
+        ],
+        [
+            "bd_ip_mac_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "bd_id"
+            ],
+            {
+                "crc": "0xc25fdce6",
+                "options": {},
+                "comment": "/** \\brief Dump bridge domain IP to MAC entries\n    @param client_index - opaque cookie to identify the sender\n    @param bd_id - bridge domain identifier\n*/"
+            }
+        ],
+        [
+            "l2_interface_efp_filter",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "enable_disable",
+                {
+                    "default": "true"
+                }
+            ],
+            {
+                "crc": "0x5501adee",
+                "options": {},
+                "comment": "/** \\brief L2 interface ethernet flow point filtering enable/disable request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface to enable/disable filtering on\n    @param enable_disable - if non-zero enable filtering, else disable\n*/"
+            }
+        ],
+        [
+            "l2_interface_efp_filter_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_set_vpath",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "enable",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0xae6cfcfb",
+                "options": {},
+                "comment": "/** \\brief Interface set vpath request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - interface used to reach neighbor\n    @param enable - if non-zero enable, else disable\n*/"
+            }
+        ],
+        [
+            "sw_interface_set_vpath_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "bvi_create",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac"
+            ],
+            [
+                "u32",
+                "user_instance",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0xf5398559",
+                "options": {},
+                "comment": "/** \\brief Create BVI interface instance request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param mac_address - mac addr to assign to the interface if none-zero\n    @param user_instance - requested instance, ~0 => dynamically allocate\n*/"
+            }
+        ],
+        [
+            "bvi_create_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0x5383d31f",
+                "options": {},
+                "comment": "/** \\brief Create BVI interface instance response\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - sw index of the interface that was created\n    @param retval - return code for the request\n*/"
+            }
+        ],
+        [
+            "bvi_delete",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief Delete BVI interface request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - sw index of the interface that was created\n*/"
+            }
+        ],
+        [
+            "bvi_delete_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "want_l2_arp_term_events",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            {
+                "crc": "0x3ec6d6c2",
+                "options": {},
+                "comment": "/** \\brief Register for IP4 ARP resolution event on receiving ARP reply or\n           MAC/IP info from ARP requests in L2 BDs\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param enable - 1 => register for events, 0 => cancel registration\n    @param pid - sender's pid\n*/"
+            }
+        ],
+        [
+            "want_l2_arp_term_events_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "l2_arp_term_event",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "pid"
+            ],
+            [
+                "vl_api_address_t",
+                "ip"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "mac"
+            ],
+            {
+                "crc": "0x6963e07a",
+                "options": {},
+                "comment": "/** \\brief Tell client about an IP4 ARP resolution event or\n           MAC/IP info from ARP requests in L2 BDs\n    @param client_index - opaque cookie to identify the sender\n    @param pid - client pid registered to receive notification\n    @param ip - IP address of new ARP term entry\n    @param sw_if_index - interface of new ARP term entry\n    @param mac - MAC address of new ARP term entry\n*/"
+            }
+        ]
+    ],
+    "unions": [
+        [
+            "address_union",
+            [
+                "vl_api_ip4_address_t",
+                "ip4",
+                {
+                    "case": "ADDRESS_IP4"
+                }
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip6",
+                {
+                    "case": "ADDRESS_IP6"
+                }
+            ]
+        ]
+    ],
+    "enums": [
+        [
+            "address_family",
+            [
+                "ADDRESS_IP4",
+                0
+            ],
+            [
+                "ADDRESS_IP6",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_feature_location",
+            [
+                "IP_API_FEATURE_INPUT",
+                0
+            ],
+            [
+                "IP_API_FEATURE_OUTPUT",
+                1
+            ],
+            [
+                "IP_API_FEATURE_LOCAL",
+                2
+            ],
+            [
+                "IP_API_FEATURE_PUNT",
+                3
+            ],
+            [
+                "IP_API_FEATURE_DROP",
+                4
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_ecn",
+            [
+                "IP_API_ECN_NONE",
+                0
+            ],
+            [
+                "IP_API_ECN_ECT0",
+                1
+            ],
+            [
+                "IP_API_ECN_ECT1",
+                2
+            ],
+            [
+                "IP_API_ECN_CE",
+                3
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_dscp",
+            [
+                "IP_API_DSCP_CS0",
+                0
+            ],
+            [
+                "IP_API_DSCP_CS1",
+                8
+            ],
+            [
+                "IP_API_DSCP_AF11",
+                10
+            ],
+            [
+                "IP_API_DSCP_AF12",
+                12
+            ],
+            [
+                "IP_API_DSCP_AF13",
+                14
+            ],
+            [
+                "IP_API_DSCP_CS2",
+                16
+            ],
+            [
+                "IP_API_DSCP_AF21",
+                18
+            ],
+            [
+                "IP_API_DSCP_AF22",
+                20
+            ],
+            [
+                "IP_API_DSCP_AF23",
+                22
+            ],
+            [
+                "IP_API_DSCP_CS3",
+                24
+            ],
+            [
+                "IP_API_DSCP_AF31",
+                26
+            ],
+            [
+                "IP_API_DSCP_AF32",
+                28
+            ],
+            [
+                "IP_API_DSCP_AF33",
+                30
+            ],
+            [
+                "IP_API_DSCP_CS4",
+                32
+            ],
+            [
+                "IP_API_DSCP_AF41",
+                34
+            ],
+            [
+                "IP_API_DSCP_AF42",
+                36
+            ],
+            [
+                "IP_API_DSCP_AF43",
+                38
+            ],
+            [
+                "IP_API_DSCP_CS5",
+                40
+            ],
+            [
+                "IP_API_DSCP_EF",
+                46
+            ],
+            [
+                "IP_API_DSCP_CS6",
+                48
+            ],
+            [
+                "IP_API_DSCP_CS7",
+                50
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_proto",
+            [
+                "IP_API_PROTO_HOPOPT",
+                0
+            ],
+            [
+                "IP_API_PROTO_ICMP",
+                1
+            ],
+            [
+                "IP_API_PROTO_IGMP",
+                2
+            ],
+            [
+                "IP_API_PROTO_TCP",
+                6
+            ],
+            [
+                "IP_API_PROTO_UDP",
+                17
+            ],
+            [
+                "IP_API_PROTO_GRE",
+                47
+            ],
+            [
+                "IP_API_PROTO_ESP",
+                50
+            ],
+            [
+                "IP_API_PROTO_AH",
+                51
+            ],
+            [
+                "IP_API_PROTO_ICMP6",
+                58
+            ],
+            [
+                "IP_API_PROTO_EIGRP",
+                88
+            ],
+            [
+                "IP_API_PROTO_OSPF",
+                89
+            ],
+            [
+                "IP_API_PROTO_SCTP",
+                132
+            ],
+            [
+                "IP_API_PROTO_RESERVED",
+                255
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "if_status_flags",
+            [
+                "IF_STATUS_API_FLAG_ADMIN_UP",
+                1
+            ],
+            [
+                "IF_STATUS_API_FLAG_LINK_UP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mtu_proto",
+            [
+                "MTU_PROTO_API_L3",
+                0
+            ],
+            [
+                "MTU_PROTO_API_IP4",
+                1
+            ],
+            [
+                "MTU_PROTO_API_IP6",
+                2
+            ],
+            [
+                "MTU_PROTO_API_MPLS",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "link_duplex",
+            [
+                "LINK_DUPLEX_API_UNKNOWN",
+                0
+            ],
+            [
+                "LINK_DUPLEX_API_HALF",
+                1
+            ],
+            [
+                "LINK_DUPLEX_API_FULL",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "sub_if_flags",
+            [
+                "SUB_IF_API_FLAG_NO_TAGS",
+                1
+            ],
+            [
+                "SUB_IF_API_FLAG_ONE_TAG",
+                2
+            ],
+            [
+                "SUB_IF_API_FLAG_TWO_TAGS",
+                4
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AD",
+                8
+            ],
+            [
+                "SUB_IF_API_FLAG_EXACT_MATCH",
+                16
+            ],
+            [
+                "SUB_IF_API_FLAG_DEFAULT",
+                32
+            ],
+            [
+                "SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY",
+                64
+            ],
+            [
+                "SUB_IF_API_FLAG_INNER_VLAN_ID_ANY",
+                128
+            ],
+            [
+                "SUB_IF_API_FLAG_MASK_VNET",
+                254
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AH",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "rx_mode",
+            [
+                "RX_MODE_API_UNKNOWN",
+                0
+            ],
+            [
+                "RX_MODE_API_POLLING",
+                1
+            ],
+            [
+                "RX_MODE_API_INTERRUPT",
+                2
+            ],
+            [
+                "RX_MODE_API_ADAPTIVE",
+                3
+            ],
+            [
+                "RX_MODE_API_DEFAULT",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_type",
+            [
+                "IF_API_TYPE_HARDWARE",
+                0
+            ],
+            [
+                "IF_API_TYPE_SUB",
+                1
+            ],
+            [
+                "IF_API_TYPE_P2P",
+                2
+            ],
+            [
+                "IF_API_TYPE_PIPE",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "direction",
+            [
+                "RX",
+                0
+            ],
+            [
+                "TX",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "mac_event_action",
+            [
+                "MAC_EVENT_ACTION_API_ADD",
+                0
+            ],
+            [
+                "MAC_EVENT_ACTION_API_DELETE",
+                1
+            ],
+            [
+                "MAC_EVENT_ACTION_API_MOVE",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "l2_intf_feat_flags",
+            [
+                "L2_INTF_FEAT_NONE",
+                0
+            ],
+            [
+                "L2_INTF_FEAT_LEARN",
+                1
+            ],
+            [
+                "L2_INTF_FEAT_FWD",
+                2
+            ],
+            [
+                "L2_INTF_FEAT_FLOOD",
+                4
+            ],
+            [
+                "L2_INTF_FEAT_UU_FLOOD",
+                8
+            ],
+            [
+                "L2_INTF_FEAT_ARP_TERM",
+                16
+            ],
+            [
+                "L2_INTF_FEAT_ARP_UFWD",
+                32
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "bd_flags",
+            [
+                "BRIDGE_API_FLAG_NONE",
+                0
+            ],
+            [
+                "BRIDGE_API_FLAG_LEARN",
+                1
+            ],
+            [
+                "BRIDGE_API_FLAG_FWD",
+                2
+            ],
+            [
+                "BRIDGE_API_FLAG_FLOOD",
+                4
+            ],
+            [
+                "BRIDGE_API_FLAG_UU_FLOOD",
+                8
+            ],
+            [
+                "BRIDGE_API_FLAG_ARP_TERM",
+                16
+            ],
+            [
+                "BRIDGE_API_FLAG_ARP_UFWD",
+                32
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "l2_port_type",
+            [
+                "L2_API_PORT_TYPE_NORMAL",
+                0
+            ],
+            [
+                "L2_API_PORT_TYPE_BVI",
+                1
+            ],
+            [
+                "L2_API_PORT_TYPE_UU_FWD",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ]
+    ],
+    "enumflags": [],
+    "services": {
+        "want_l2_macs_events": {
+            "reply": "want_l2_macs_events_reply",
+            "events": [
+                "l2_macs_event"
+            ]
+        },
+        "want_l2_arp_term_events": {
+            "reply": "want_l2_arp_term_events_reply",
+            "events": [
+                "l2_arp_term_event"
+            ]
+        },
+        "l2_xconnect_dump": {
+            "reply": "l2_xconnect_details",
+            "stream": true
+        },
+        "l2_fib_table_dump": {
+            "reply": "l2_fib_table_details",
+            "stream": true
+        },
+        "l2_fib_clear_table": {
+            "reply": "l2_fib_clear_table_reply"
+        },
+        "l2fib_flush_all": {
+            "reply": "l2fib_flush_all_reply"
+        },
+        "l2fib_flush_bd": {
+            "reply": "l2fib_flush_bd_reply"
+        },
+        "l2fib_flush_int": {
+            "reply": "l2fib_flush_int_reply"
+        },
+        "l2fib_add_del": {
+            "reply": "l2fib_add_del_reply"
+        },
+        "want_l2_macs_events2": {
+            "reply": "want_l2_macs_events2_reply"
+        },
+        "l2fib_set_scan_delay": {
+            "reply": "l2fib_set_scan_delay_reply"
+        },
+        "l2_flags": {
+            "reply": "l2_flags_reply"
+        },
+        "l2_flags_get": {
+            "reply": "l2_flags_get_reply"
+        },
+        "l2_flags_set": {
+            "reply": "l2_flags_set_reply"
+        },
+        "l2_interface_feat_flags_get": {
+            "reply": "l2_interface_feat_flags_get_reply"
+        },
+        "l2_interface_feat_flags_set": {
+            "reply": "l2_interface_feat_flags_set_reply"
+        },
+        "bridge_domain_set_mac_age": {
+            "reply": "bridge_domain_set_mac_age_reply"
+        },
+        "bridge_domain_set_default_learn_limit": {
+            "reply": "bridge_domain_set_default_learn_limit_reply"
+        },
+        "bridge_domain_set_learn_limit": {
+            "reply": "bridge_domain_set_learn_limit_reply"
+        },
+        "bridge_domain_add_del": {
+            "reply": "bridge_domain_add_del_reply"
+        },
+        "bridge_domain_add_del_v2": {
+            "reply": "bridge_domain_add_del_v2_reply"
+        },
+        "bridge_domain_dump": {
+            "reply": "bridge_domain_details",
+            "stream": true
+        },
+        "bridge_flags": {
+            "reply": "bridge_flags_reply"
+        },
+        "l2_interface_vlan_tag_rewrite": {
+            "reply": "l2_interface_vlan_tag_rewrite_reply"
+        },
+        "l2_interface_pbb_tag_rewrite": {
+            "reply": "l2_interface_pbb_tag_rewrite_reply"
+        },
+        "l2_patch_add_del": {
+            "reply": "l2_patch_add_del_reply"
+        },
+        "sw_interface_set_l2_xconnect": {
+            "reply": "sw_interface_set_l2_xconnect_reply"
+        },
+        "sw_interface_set_l2_bridge": {
+            "reply": "sw_interface_set_l2_bridge_reply"
+        },
+        "bd_ip_mac_add_del": {
+            "reply": "bd_ip_mac_add_del_reply"
+        },
+        "bd_ip_mac_flush": {
+            "reply": "bd_ip_mac_flush_reply"
+        },
+        "bd_ip_mac_dump": {
+            "reply": "bd_ip_mac_details",
+            "stream": true
+        },
+        "l2_interface_efp_filter": {
+            "reply": "l2_interface_efp_filter_reply"
+        },
+        "sw_interface_set_vpath": {
+            "reply": "sw_interface_set_vpath_reply"
+        },
+        "bvi_create": {
+            "reply": "bvi_create_reply"
+        },
+        "bvi_delete": {
+            "reply": "bvi_delete_reply"
+        }
+    },
+    "options": {
+        "version": "3.3.0"
+    },
+    "aliases": {
+        "ip4_address": {
+            "type": "u8",
+            "length": 4
+        },
+        "ip6_address": {
+            "type": "u8",
+            "length": 16
+        },
+        "address_with_prefix": {
+            "type": "vl_api_prefix_t"
+        },
+        "ip4_address_with_prefix": {
+            "type": "vl_api_ip4_prefix_t"
+        },
+        "ip6_address_with_prefix": {
+            "type": "vl_api_ip6_prefix_t"
+        },
+        "mac_address": {
+            "type": "u8",
+            "length": 6
+        },
+        "interface_index": {
+            "type": "u32"
+        }
+    },
+    "vl_api_version": "0x1a53d6cc",
+    "imports": [
+        "vnet/ip/ip_types.api",
+        "vnet/ethernet/ethernet_types.api",
+        "vnet/interface_types.api"
+    ],
+    "counters": [],
+    "paths": []
+}

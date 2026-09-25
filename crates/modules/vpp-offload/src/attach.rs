@@ -33,12 +33,16 @@
 use packetframe_common::config::Ipv4Prefix;
 
 use crate::vpp_api::generated::{
-    Address, AddressUnion, CreateLoopback, CreateLoopbackReply, CreateVlanSubif,
-    CreateVlanSubifReply, DevAttach, DevAttachReply, DevCreatePortIf, DevCreatePortIfReply, Prefix,
-    SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
+    Address, AddressUnion, BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply, BridgeDomainDetails,
+    BridgeDomainDump, CreateLoopback, CreateLoopbackInstance, CreateLoopbackInstanceReply,
+    CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply, DevAttach, DevAttachReply,
+    DevCreatePortIf, DevCreatePortIfReply, L2FibTableDetails, L2FibTableDump,
+    L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply, L2fibAddDel, L2fibAddDelReply,
+    Prefix, SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
     SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
-    SwInterfaceSetFlagsReply, SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply,
-    SwInterfaceSetMtu, SwInterfaceSetMtuReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
+    SwInterfaceSetFlagsReply, SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply,
+    SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply, SwInterfaceSetMtu,
+    SwInterfaceSetMtuReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
     SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
@@ -942,6 +946,366 @@ pub fn add_vlan_subifs(
         ..p.clone()
     };
     ensure_vlan_subifs(t, &scoped, parent_idx, loop_idx, &existing)
+}
+
+/// One bridged VLAN's VPP side: a bridge domain, its BVI, and the trunk
+/// subifs that carry the VLAN.
+///
+/// **Why a BVI.** VPP transmits from an interface's own MAC, and a
+/// member VF's MAC must stay the port's own — making it the kernel
+/// bridge's captured all gateway traffic into VPP (w22, a hardware RX
+/// filter on this NIC). So a subif routing directly sends from the
+/// PORT's MAC, while the kernel sends the same VLAN from the BRIDGE's —
+/// the MAC an IX registers, and an IX drops (SIX) or shuts the port
+/// (KCIX) on a foreign one. A BVI is a loopback, software-only, so it
+/// can carry the bridge's MAC without filtering anything: VPP routes
+/// onto the BVI, the frame leaves with the bridge MAC through the
+/// bridge domain, and the member subif pushes the tag back on.
+///
+/// Members join with split-horizon group 1, so VPP never forwards
+/// between them — the kernel bridge does all real bridging. A trunk
+/// subif pops its tag on ingress (pushes it on egress); a port that
+/// sends the VLAN untagged joins with its VF, bare. Learning is off: placement
+/// programs static L2FIB entries from the kernel's FDB, and an unknown
+/// destination floods to every member, as the kernel bridge would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSpec {
+    pub vid: u16,
+    /// The kernel bridge-VLAN L3 device's MAC — what the kernel sends
+    /// this VLAN from.
+    pub mac: [u8; 6],
+    pub mtu: Option<u32>,
+    pub members: Vec<BridgeMember>,
+}
+
+/// One member port of a bridged VLAN's domain.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BridgeMember {
+    pub port: String,
+    pub sw_if_index: u32,
+    /// A trunk subif, whose tag is popped and pushed — or `false`: the
+    /// VF itself, for a VLAN the port sends untagged. Such a VF is an L2
+    /// port while it is a member: every untagged frame on a bridge port
+    /// belongs to its untagged VLAN, so nothing routed on the VF is lost.
+    pub tagged: bool,
+}
+
+impl BridgeMember {
+    fn label(&self, vid: u16) -> String {
+        if self.tagged {
+            format!("{}.{vid}", self.port)
+        } else {
+            format!("{} (untagged vlan {vid})", self.port)
+        }
+    }
+}
+
+/// VPP's `VNET_API_ERROR_NO_SUCH_ENTRY`.
+const NO_SUCH_ENTRY: i32 = -6;
+
+/// VPP's "bridge domain already exists" — a surviving VPP's, re-asserted.
+const BD_ALREADY_EXISTS: i32 = -119;
+/// VPP's "bridge domain already has a BVI" — ours, from a previous run.
+const BD_ALREADY_HAS_BVI: i32 = -152;
+/// `L2_VTR_POP_1`: pop one tag on ingress, push it back on egress.
+const L2_VTR_POP_1: u32 = 3;
+/// `L2_API_PORT_TYPE_NORMAL` / `_BVI`.
+const L2_PORT_NORMAL: u32 = 0;
+const L2_PORT_BVI: u32 = 1;
+/// The split-horizon group every trunk member shares: no forwarding
+/// between them inside VPP.
+const TRUNK_SHG: u8 = 1;
+
+/// Create (or reuse) `spec`'s bridge domain, BVI and member wiring, and
+/// return the BVI's index. Idempotent: a surviving VPP's domain, BVI
+/// (found by its deterministic name, `loop<vid>`) and memberships are
+/// re-asserted rather than duplicated.
+pub fn ensure_bridge_domain(
+    t: &mut Transport,
+    spec: &BridgeSpec,
+    loop_idx: u32,
+) -> Result<u32, AttachError> {
+    let label = format!("bridge vlan {}", spec.vid);
+    let refused = |step: &'static str, retval: i32, detail: String| AttachError::Refused {
+        step,
+        port: label.clone(),
+        retval,
+        detail,
+    };
+    let bd_id = u32::from(spec.vid);
+    let reply =
+        t.request::<BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply>(BridgeDomainAddDelV2 {
+            context: 0,
+            bd_id,
+            flood: true,
+            uu_flood: true,
+            forward: true,
+            learn: false,
+            arp_term: false,
+            arp_ufwd: false,
+            mac_age: 0,
+            bd_tag: String::new(),
+            is_add: true,
+        })?;
+    if reply.retval != 0 && reply.retval != BD_ALREADY_EXISTS {
+        return Err(refused(
+            "bridge_domain_add_del_v2",
+            reply.retval,
+            String::new(),
+        ));
+    }
+
+    let name = format!("loop{}", spec.vid);
+    let existing = interfaces(t)?;
+    let bvi = match existing.iter().find(|i| i.name == name) {
+        // A surviving VPP's BVI. The kernel bridge's MAC may have changed
+        // since it was made, and a BVI on the old one sends every frame
+        // from a MAC the IX no longer knows — so it is re-asserted and
+        // read back, like a member port's (review finding).
+        Some(i) if i.l2_address != spec.mac => {
+            let r = t.request::<SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply>(
+                SwInterfaceSetMacAddress {
+                    context: 0,
+                    sw_if_index: i.sw_if_index,
+                    mac_address: spec.mac,
+                },
+            )?;
+            let now = interfaces(t)?
+                .into_iter()
+                .find(|x| x.sw_if_index == i.sw_if_index)
+                .map(|x| x.l2_address);
+            if r.retval != 0 || now != Some(spec.mac) {
+                return Err(refused(
+                    "sw_interface_set_mac_address",
+                    r.retval,
+                    format!("{name} to {}", hex_mac(&spec.mac)),
+                ));
+            }
+            i.sw_if_index
+        }
+        Some(i) => i.sw_if_index,
+        None => {
+            let reply = t.request::<CreateLoopbackInstance, CreateLoopbackInstanceReply>(
+                CreateLoopbackInstance {
+                    context: 0,
+                    mac_address: spec.mac,
+                    is_specified: true,
+                    user_instance: u32::from(spec.vid),
+                },
+            )?;
+            if reply.retval != 0 || reply.sw_if_index == 0 {
+                return Err(refused(
+                    "create_loopback_instance",
+                    reply.retval,
+                    format!("{name} for the BVI"),
+                ));
+            }
+            reply.sw_if_index
+        }
+    };
+    let up = t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
+        context: 0,
+        sw_if_index: bvi,
+        flags: IF_STATUS_ADMIN_UP,
+    })?;
+    if up.retval != 0 {
+        return Err(refused("sw_interface_set_flags", up.retval, name.clone()));
+    }
+    let un = t.request::<SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply>(
+        SwInterfaceSetUnnumbered {
+            context: 0,
+            sw_if_index: loop_idx,
+            unnumbered_sw_if_index: bvi,
+            is_add: true,
+        },
+    )?;
+    if un.retval != 0 {
+        return Err(refused(
+            "sw_interface_set_unnumbered",
+            un.retval,
+            name.clone(),
+        ));
+    }
+    if let Some(mtu) = spec.mtu {
+        let r = t.request::<SwInterfaceSetMtu, SwInterfaceSetMtuReply>(SwInterfaceSetMtu {
+            context: 0,
+            sw_if_index: bvi,
+            mtu: [mtu, 0, 0, 0],
+        })?;
+        if r.retval != 0 {
+            return Err(refused(
+                "sw_interface_set_mtu",
+                r.retval,
+                format!("{name} mtu {mtu}"),
+            ));
+        }
+    }
+    let join = |t: &mut Transport, sw: u32, port_type: u32, shg: u8| {
+        t.request::<SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply>(SwInterfaceSetL2Bridge {
+            context: 0,
+            rx_sw_if_index: sw,
+            bd_id,
+            port_type,
+            shg,
+            enable: true,
+        })
+    };
+    let r = join(t, bvi, L2_PORT_BVI, 0)?;
+    if r.retval != 0 && r.retval != BD_ALREADY_HAS_BVI {
+        return Err(refused(
+            "sw_interface_set_l2_bridge",
+            r.retval,
+            format!("{name} as BVI"),
+        ));
+    }
+    for m in &spec.members {
+        bridge_join(t, spec.vid, m)?;
+    }
+    tracing::info!(
+        vlan = spec.vid,
+        bvi = %name,
+        mac = %hex_mac(&spec.mac),
+        members = ?spec.members.iter().map(|m| m.label(spec.vid)).collect::<Vec<_>>(),
+        "bridged VLAN routes through its BVI — frames leave from the kernel bridge's MAC"
+    );
+    Ok(bvi)
+}
+
+/// Join `m` to bridge domain `vid`: split-horizon group 1, and for a
+/// trunk subif, pop the tag on ingress and push it on egress.
+pub fn bridge_join(t: &mut Transport, vid: u16, m: &BridgeMember) -> Result<(), AttachError> {
+    let refused = |step: &'static str, retval: i32, detail: String| AttachError::Refused {
+        step,
+        port: format!("bridge vlan {vid}"),
+        retval,
+        detail,
+    };
+    let r =
+        t.request::<SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply>(SwInterfaceSetL2Bridge {
+            context: 0,
+            rx_sw_if_index: m.sw_if_index,
+            bd_id: u32::from(vid),
+            port_type: L2_PORT_NORMAL,
+            shg: TRUNK_SHG,
+            enable: true,
+        })?;
+    if r.retval != 0 {
+        return Err(refused(
+            "sw_interface_set_l2_bridge",
+            r.retval,
+            format!("{} into the bridge domain", m.label(vid)),
+        ));
+    }
+    if m.tagged {
+        let r = t.request::<L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply>(
+            L2InterfaceVlanTagRewrite {
+                context: 0,
+                sw_if_index: m.sw_if_index,
+                vtr_op: L2_VTR_POP_1,
+                push_dot1q: 0,
+                tag1: 0,
+                tag2: 0,
+            },
+        )?;
+        if r.retval != 0 {
+            return Err(refused(
+                "l2_interface_vlan_tag_rewrite",
+                r.retval,
+                format!("{} pop 1", m.label(vid)),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Take `sw_if_index` out of bridge domain `vid`, back to L3.
+pub fn bridge_leave(t: &mut Transport, vid: u16, sw_if_index: u32) -> Result<(), AttachError> {
+    let r =
+        t.request::<SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply>(SwInterfaceSetL2Bridge {
+            context: 0,
+            rx_sw_if_index: sw_if_index,
+            bd_id: u32::from(vid),
+            port_type: L2_PORT_NORMAL,
+            shg: 0,
+            enable: false,
+        })?;
+    if r.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_set_l2_bridge",
+            port: format!("bridge vlan {vid}"),
+            retval: r.retval,
+            detail: format!("sw_if_index {sw_if_index} out of the bridge domain"),
+        });
+    }
+    Ok(())
+}
+
+/// The non-BVI members bridge domain `vid` holds, as VPP reports them —
+/// what a surviving VPP carries over from a previous daemon.
+pub fn bridge_members(t: &mut Transport, vid: u16) -> Result<Vec<u32>, TransportError> {
+    let details: Vec<BridgeDomainDetails> = t.dump(BridgeDomainDump {
+        context: 0,
+        bd_id: u32::from(vid),
+        sw_if_index: u32::MAX,
+    })?;
+    Ok(details
+        .into_iter()
+        .filter(|d| d.bd_id == u32::from(vid))
+        .flat_map(|d| {
+            let bvi = d.bvi_sw_if_index;
+            d.sw_if_details
+                .into_iter()
+                .map(|m| m.sw_if_index)
+                .filter(move |i| *i != bvi)
+        })
+        .collect())
+}
+
+/// The static, non-BVI L2FIB entries in bridge domain `vid`:
+/// `(mac, sw_if_index)`.
+pub fn l2fib_statics(t: &mut Transport, vid: u16) -> Result<Vec<([u8; 6], u32)>, TransportError> {
+    let details: Vec<L2FibTableDetails> = t.dump(L2FibTableDump {
+        context: 0,
+        bd_id: u32::from(vid),
+    })?;
+    Ok(details
+        .into_iter()
+        .filter(|d| d.bd_id == u32::from(vid) && d.static_mac && !d.bvi_mac)
+        .map(|d| (d.mac, d.sw_if_index))
+        .collect())
+}
+
+/// Point `mac` at `subif` in bridge domain `vid` (static), or remove the
+/// entry so the MAC floods to every member again.
+pub fn l2fib_set(
+    t: &mut Transport,
+    vid: u16,
+    mac: [u8; 6],
+    subif: u32,
+    is_add: bool,
+) -> Result<(), AttachError> {
+    let r = t.request::<L2fibAddDel, L2fibAddDelReply>(L2fibAddDel {
+        context: 0,
+        mac,
+        bd_id: u32::from(vid),
+        sw_if_index: subif,
+        is_add,
+        static_mac: true,
+        filter_mac: false,
+        bvi_mac: false,
+    })?;
+    // Deleting an entry that is not there is the postcondition already;
+    // any other refusal leaves it pinned, and the caller must keep it on
+    // the books to retry (review finding).
+    if r.retval != 0 && (is_add || r.retval != NO_SUCH_ENTRY) {
+        return Err(AttachError::Refused {
+            step: "l2fib_add_del",
+            port: format!("bridge vlan {vid}"),
+            retval: r.retval,
+            detail: hex_mac(&mac),
+        });
+    }
+    Ok(())
 }
 
 /// Promiscuous mode on the member VF — a shared-LMAC VOTE, not a local

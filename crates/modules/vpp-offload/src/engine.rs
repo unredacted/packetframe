@@ -528,6 +528,17 @@ pub struct ConvergenceEngine {
     moved_from: Vec<(u32, IpAddr)>,
     /// Ports declared `vlans all`, whose subifs follow the kernel bridge.
     trunk_ports: Vec<String>,
+    /// Static L2FIB entries programmed into bridged VLANs' domains, keyed
+    /// `(vid, mac)` → the member subif, with the nexthops that share the
+    /// MAC (one router, several addresses): the entry goes only when the
+    /// last of them does.
+    l2fib: std::collections::HashMap<(u16, [u8; 6]), (u32, std::collections::BTreeSet<IpAddr>)>,
+    /// Which `(vid, mac)` entry each bridged nexthop holds a share of.
+    l2fib_of: std::collections::HashMap<IpAddr, (u16, [u8; 6])>,
+    /// Per BVI'd VLAN, the member interfaces joined to its bridge domain
+    /// (not the BVI). Reconciled against what the kernel bridge says the
+    /// members carry on every VLAN refresh ([`Self::ensure_bridges`]).
+    bd_members: std::collections::BTreeMap<u16, std::collections::BTreeSet<u32>>,
     /// Neighbours moved behind a different bridge port since start.
     placement_moves: u64,
     /// Bridge neighbours whose placement the delta path just changed,
@@ -673,6 +684,9 @@ impl ConvergenceEngine {
             vlans_error: None,
             moved_from: Vec::new(),
             trunk_ports: Vec::new(),
+            l2fib: std::collections::HashMap::new(),
+            l2fib_of: std::collections::HashMap::new(),
+            bd_members: std::collections::BTreeMap::new(),
             placement_moves: 0,
             placement_changed: Vec::new(),
             neighbours_installed: std::collections::HashMap::new(),
@@ -714,11 +728,11 @@ impl ConvergenceEngine {
     }
 
     /// Bring VLAN facts in step with the kernel bridge: every member's
-    /// untagged VLANs (a neighbour placed on one is reached through the
-    /// VF, not a subif), and a subif on each `vlans all` trunk for every
-    /// tagged VLAN it now carries. Add-only: a VLAN removed on the switch
-    /// leaves an idle subif until the next restart, which costs nothing —
-    /// nothing can be placed on a VLAN the FDB no longer has.
+    /// untagged VLANs, a subif on each `vlans all` trunk for every tagged
+    /// VLAN it now carries, and the bridge domains' members. Subifs are
+    /// add-only: a VLAN removed on the switch leaves an idle subif until
+    /// the next restart, which costs nothing — nothing can be placed on a
+    /// VLAN the FDB no longer has.
     fn reconcile_vlans(&mut self) -> Result<(), EngineError> {
         let Some(pv) = self.refresh_untagged() else {
             return Ok(());
@@ -771,7 +785,10 @@ impl ConvergenceEngine {
                 a.subifs.extend(added);
             }
         }
-        Ok(())
+        // A new bridged VLAN gets its domain and BVI, a domain gains the
+        // trunks and untagged ports now carrying it, and a port that
+        // stopped carrying it leaves. Sends nothing when nothing changed.
+        self.ensure_bridges()
     }
 
     /// Take the members' untagged VLANs from the kernel bridge, and hand
@@ -925,17 +942,22 @@ impl ConvergenceEngine {
             let before = self.nexthops.placement(&ip).map(str::to_string);
             if before.as_deref() != Some(placed.port.as_str()) {
                 let to = placed.port.clone();
-                self.move_neighbour(ip, &dev, mac, placed)?;
+                let rerouted = self.move_neighbour(ip, &dev, mac, placed)?;
                 if let Some(from) = before {
                     self.placement_moves += 1;
                     tracing::info!(
                         nexthop = %ip, device = %dev, from = %from, to = %to,
-                        "neighbour moved behind another bridge port; re-programming its routes"
+                        "neighbour moved behind another bridge port"
                     );
                 }
-                changed.push(ip);
+                if rerouted {
+                    changed.push(ip);
+                }
                 continue;
             }
+            // Same port: keep the L2FIB entry in step (a BVI created since,
+            // an entry lost with a reconnect).
+            self.sync_l2fib(ip, &dev, mac)?;
             // Same port, but the interface that reaches it may have
             // changed under it: a subif that did not exist, or a VLAN
             // that became untagged (VF) or tagged (subif).
@@ -979,17 +1001,20 @@ impl ConvergenceEngine {
         Ok(changed.len())
     }
 
-    /// Put `ip`'s adjacency behind its new port: add it on the new
-    /// subif, record the placement once VPP acknowledged, and leave the
-    /// old adjacency for [`Self::settle_moves`] to remove once the routes
-    /// have moved.
+    /// Put `ip`'s adjacency behind its new port. Through a BVI the
+    /// adjacency does not move at all — only the L2FIB entry does
+    /// ([`Self::sync_l2fib`]) — so nothing is re-queued. Otherwise: add it
+    /// on the new interface, record the placement once VPP acknowledged,
+    /// and leave the old adjacency for [`Self::settle_moves`] to remove
+    /// once the routes have moved. Returns whether the interface routes
+    /// name changed, i.e. whether those routes need re-programming.
     fn move_neighbour(
         &mut self,
         ip: IpAddr,
         dev: &str,
         mac: [u8; 6],
         placed: crate::sink::Placement,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         let old = self
             .nexthops
             .resolve(&ip)
@@ -1007,6 +1032,276 @@ impl ConvergenceEngine {
             self.moved_from.push((idx, ip));
         }
         self.nexthops.place(ip, placed);
+        self.sync_l2fib(ip, dev, mac)?;
+        Ok(old != new)
+    }
+
+    /// Bring every bridged VLAN's domain in step with the kernel bridge:
+    /// a bridge domain + BVI for each VLAN a member carries — tagged
+    /// (its subif joins) or untagged (its VF joins, bare) — that the
+    /// router has an L3 device on ([`crate::attach::BridgeSpec`] says
+    /// why), and each domain's members joined or taken out as the
+    /// kernel's VLANs change. Taking an untagged VF out matters: left in,
+    /// it would flood this VLAN's frames bare onto a port whose untagged
+    /// VLAN is now another. Cheap when nothing changed — no request is
+    /// sent.
+    ///
+    /// Keyed by vid, because VPP's bridge domain id is: two VLAN-aware
+    /// bridges sharing a vid are not supported, only the first gets a
+    /// BVI, and the sink resolves a device to it only on that bridge
+    /// ([`crate::sink::NexthopMap::set_bvi`]).
+    fn ensure_bridges(&mut self) -> Result<(), EngineError> {
+        use crate::attach::BridgeMember;
+        let Some(loop_idx) = self.loop_index else {
+            return Ok(());
+        };
+        let mut specs: std::collections::BTreeMap<u16, (String, Vec<BridgeMember>)> =
+            std::collections::BTreeMap::new();
+        for a in &self.attached {
+            let Some(master) = self.topology.master_of(&a.port) else {
+                continue;
+            };
+            let tagged = a.subifs.iter().map(|&(vid, idx)| (vid, idx, true));
+            let untagged = self
+                .nexthops
+                .untagged_of(&a.port)
+                .into_iter()
+                .map(|vid| (vid, a.sw_if_index, false));
+            for (vid, sw_if_index, tagged) in tagged.chain(untagged) {
+                let entry = specs
+                    .entry(vid)
+                    .or_insert_with(|| (master.clone(), Vec::new()));
+                if entry.0 != master {
+                    tracing::debug!(vlan = vid, port = %a.port, bridge = %master, first = %entry.0,
+                        "vlan carried by two different bridges; only the first gets a BVI");
+                    continue;
+                }
+                entry.1.push(BridgeMember {
+                    port: a.port.clone(),
+                    sw_if_index,
+                    tagged,
+                });
+            }
+        }
+        // A domain whose VLAN no member carries any more keeps its BVI —
+        // the kernel can reach nothing on it either — but loses every
+        // member.
+        let emptied: Vec<u16> = self
+            .bd_members
+            .iter()
+            .filter(|(vid, m)| !m.is_empty() && !specs.contains_key(vid))
+            .map(|(vid, _)| *vid)
+            .collect();
+        for vid in emptied {
+            if let Some(bridge) = self.nexthops.bvi_bridge(vid).map(str::to_string) {
+                specs.insert(vid, (bridge, Vec::new()));
+            }
+        }
+        for (vid, (bridge, members)) in specs {
+            let want: std::collections::BTreeSet<u32> =
+                members.iter().map(|m| m.sw_if_index).collect();
+            if self
+                .port_index
+                .get(&crate::sink::NexthopTarget::Bvi { vlan: vid })
+                .is_none()
+            {
+                let Some(l3) = self.topology.bridge_l3(&bridge, vid) else {
+                    continue;
+                };
+                let spec = crate::attach::BridgeSpec {
+                    vid,
+                    mac: l3.mac,
+                    mtu: l3.mtu,
+                    members,
+                };
+                let bvi = match self.transport.as_mut() {
+                    None => return Err(EngineError::NotConnected),
+                    Some(t) => {
+                        crate::attach::ensure_bridge_domain(t, &spec, loop_idx).and_then(|bvi| {
+                            // A surviving VPP's domain may hold members a
+                            // previous daemon joined that this view does
+                            // not want.
+                            let held = crate::attach::bridge_members(t, vid)?;
+                            for stray in held.into_iter().filter(|i| !want.contains(i)) {
+                                crate::attach::bridge_leave(t, vid, stray)?;
+                            }
+                            Ok(bvi)
+                        })
+                    }
+                };
+                let bvi = match bvi {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if matches!(e, AttachError::Transport(_)) {
+                            self.disconnect();
+                        }
+                        return Err(e.into());
+                    }
+                };
+                self.port_index.insert_bvi(vid, bvi);
+                self.nexthops.set_bvi(vid, &bridge);
+                self.bd_members.insert(vid, want);
+                continue;
+            }
+            let have = self.bd_members.get(&vid).cloned().unwrap_or_default();
+            let joins: Vec<BridgeMember> = members
+                .into_iter()
+                .filter(|m| !have.contains(&m.sw_if_index))
+                .collect();
+            let leaves: Vec<u32> = have.difference(&want).copied().collect();
+            if joins.is_empty() && leaves.is_empty() {
+                continue;
+            }
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            let result = joins
+                .iter()
+                .try_for_each(|m| crate::attach::bridge_join(t, vid, m))
+                .and_then(|()| {
+                    leaves
+                        .iter()
+                        .try_for_each(|i| crate::attach::bridge_leave(t, vid, *i))
+                });
+            if let Err(e) = result {
+                if matches!(e, AttachError::Transport(_)) {
+                    self.disconnect();
+                }
+                return Err(e.into());
+            }
+            tracing::info!(vlan = vid, joined = ?joins.iter().map(|m| &m.port).collect::<Vec<_>>(),
+                left = ?leaves, "bridge domain members follow the kernel bridge's VLANs");
+            self.bd_members.insert(vid, want);
+        }
+        Ok(())
+    }
+
+    /// Point a bridged nexthop's MAC at the member subif it is placed
+    /// behind — or, unplaced, remove the entry so it floods to every
+    /// member as the kernel bridge would. No-op outside a BVI.
+    fn sync_l2fib(&mut self, nh: IpAddr, dev: &str, mac: [u8; 6]) -> Result<(), EngineError> {
+        let Some(crate::topology::DevKind::BridgeVlan { bridge, vid }) =
+            self.nexthops.kind(dev).cloned()
+        else {
+            return Ok(());
+        };
+        if self.nexthops.bvi_bridge(vid) != Some(bridge.as_str())
+            || self
+                .port_index
+                .get(&crate::sink::NexthopTarget::Bvi { vlan: vid })
+                .is_none()
+        {
+            return Ok(());
+        }
+        // A share moved to a different entry (a new MAC) leaves the old.
+        if self.l2fib_of.get(&nh).is_some_and(|k| *k != (vid, mac)) {
+            self.release_l2fib(nh)?;
+        }
+        // Placement on THIS device's bridge and VLAN, not whatever the
+        // neighbour's recorded device was: a delta moving it between
+        // VLANs reaches here before the device map does, and the old
+        // VLAN's port must not be pinned in the new domain (review
+        // finding). The member it lands on is that port's subif — or its
+        // VF, where the port sends the VLAN untagged.
+        let members = self.bd_members.get(&vid);
+        let want = self
+            .nexthops
+            .placement_on(&nh, &bridge, vid)
+            .and_then(|port| {
+                let subif = self.port_index.get(&crate::sink::NexthopTarget::Subif {
+                    port: port.to_string(),
+                    vlan: vid,
+                });
+                let vf = self
+                    .nexthops
+                    .is_untagged(port, vid)
+                    .then(|| {
+                        self.port_index.get(&crate::sink::NexthopTarget::Vf {
+                            port: port.to_string(),
+                        })
+                    })
+                    .flatten();
+                subif.or(vf)
+            })
+            .filter(|idx| members.is_some_and(|m| m.contains(idx)));
+        let have = self.l2fib.get(&(vid, mac)).map(|(idx, _)| *idx);
+        match want {
+            Some(idx) => {
+                if have != Some(idx) {
+                    let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+                    crate::attach::l2fib_set(t, vid, mac, idx, true)?;
+                }
+                let entry = self
+                    .l2fib
+                    .entry((vid, mac))
+                    .or_insert_with(|| (idx, Default::default()));
+                entry.0 = idx;
+                entry.1.insert(nh);
+                self.l2fib_of.insert(nh, (vid, mac));
+            }
+            None => self.release_l2fib(nh)?,
+        }
+        Ok(())
+    }
+
+    /// Drop `nh`'s share of its L2FIB entry, deleting the entry with the
+    /// last share so the MAC floods again.
+    ///
+    /// The books change only once VPP has acknowledged the delete: a
+    /// refused or unanswered one keeps the share, so the next pass
+    /// retries rather than finding nothing to withdraw while VPP keeps
+    /// the MAC pinned to the old member (review finding).
+    fn release_l2fib(&mut self, nh: IpAddr) -> Result<(), EngineError> {
+        let Some(key) = self.l2fib_of.get(&nh).copied() else {
+            return Ok(());
+        };
+        let last = match self.l2fib.get(&key) {
+            None => None,
+            Some((idx, sharers)) => sharers.iter().all(|s| *s == nh).then_some(*idx),
+        };
+        if let Some(idx) = last {
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            if let Err(e) = crate::attach::l2fib_set(t, key.0, key.1, idx, false) {
+                if matches!(e, AttachError::Transport(_)) {
+                    self.disconnect();
+                }
+                return Err(e.into());
+            }
+            self.l2fib.remove(&key);
+        } else if let Some((_, sharers)) = self.l2fib.get_mut(&key) {
+            sharers.remove(&nh);
+        }
+        self.l2fib_of.remove(&nh);
+        Ok(())
+    }
+
+    /// Withdraw every static L2FIB entry our BVI domains hold that the
+    /// books do not — a surviving VPP's entries from a previous daemon,
+    /// which nothing else would ever remove (review finding). Run at the
+    /// end of an authoritative resync, once the books are complete.
+    fn withdraw_stale_l2fib(&mut self) -> Result<(), EngineError> {
+        let vids: Vec<u16> = self.bd_members.keys().copied().collect();
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        let mut withdrawn = 0usize;
+        let result = vids.iter().try_for_each(|&vid| {
+            for (mac, idx) in crate::attach::l2fib_statics(t, vid)? {
+                if self.l2fib.get(&(vid, mac)).map(|(i, _)| *i) != Some(idx) {
+                    crate::attach::l2fib_set(t, vid, mac, idx, false)?;
+                    withdrawn += 1;
+                }
+            }
+            Ok::<(), AttachError>(())
+        });
+        if let Err(e) = result {
+            if matches!(e, AttachError::Transport(_)) {
+                self.disconnect();
+            }
+            return Err(e.into());
+        }
+        if withdrawn > 0 {
+            tracing::info!(
+                withdrawn,
+                "stale L2FIB entries a previous run left in the bridge domains withdrawn"
+            );
+        }
         Ok(())
     }
 
@@ -1046,6 +1341,22 @@ impl ConvergenceEngine {
                 (nh, dev, port)
             })
             .collect()
+    }
+
+    /// Bridged neighbours reached through a BVI with no L2FIB entry —
+    /// the FDB has not placed them, so their frames flood to every trunk
+    /// member, as the kernel bridge floods an unknown MAC.
+    pub fn flooding_neighbours(&self) -> usize {
+        self.nexthops
+            .bridge_nexthops()
+            .iter()
+            .filter(|(nh, _)| {
+                matches!(
+                    self.nexthops.resolve(nh),
+                    Some(crate::sink::NexthopTarget::Bvi { .. })
+                ) && !self.l2fib_of.contains_key(nh)
+            })
+            .count()
     }
 
     /// Neighbours moved behind another bridge port since start.
@@ -1417,9 +1728,11 @@ impl ConvergenceEngine {
             }
         }
         self.attached = attached;
-        // Which VLANs are untagged decides where a `local-route` on a
-        // trunk lands, so it is read before the routes go in.
+        // Which VLANs are untagged decides the bridge domains' members
+        // and where a `local-route` on a trunk lands, so it is read
+        // before either.
         self.refresh_untagged();
+        self.ensure_bridges()?;
         self.install_attached_routes()
     }
 
@@ -1447,10 +1760,14 @@ impl ConvergenceEngine {
         }
         let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
         for lr in &self.local_routes {
-            // A `vlans all` trunk's untagged VLAN has no subif: the
-            // bridge sends it bare, so its prefix is delivered on the VF,
-            // like its neighbours (review finding).
-            let target = if self.nexthops.is_untagged(&lr.port, lr.vlan) {
+            // A bridged VLAN delivers through its BVI (the bridge's MAC,
+            // hosts behind any member); a trunk's untagged VLAN with no
+            // BVI through the VF, which the bridge sends it bare on; a
+            // plain port's VLAN through the subif.
+            let bvi = crate::sink::NexthopTarget::Bvi { vlan: lr.vlan };
+            let target = if self.port_index.get(&bvi).is_some() {
+                bvi
+            } else if self.nexthops.is_untagged(&lr.port, lr.vlan) {
                 crate::sink::NexthopTarget::Vf {
                     port: lr.port.clone(),
                 }
@@ -1622,6 +1939,13 @@ impl ConvergenceEngine {
         }
         // Removed once the resync's routes are out, like any move.
         self.moved_from.extend(moved_away);
+        // Bridged neighbours: their MACs' L2FIB entries, from placement.
+        let mut bridged: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
+        src.for_each_neighbour(&mut |ip, dev, mac| bridged.push((ip, dev.to_string(), mac)));
+        for (ip, dev, mac) in bridged {
+            self.sync_l2fib(ip, &dev, mac)?;
+        }
+        self.withdraw_stale_l2fib()?;
         if kept > 0 {
             tracing::info!(
                 kept,
@@ -2064,6 +2388,7 @@ impl ConvergenceEngine {
                     }
                     self.nexthops.place(nh, port);
                 }
+                self.sync_l2fib(nh, &dev, mac)?;
                 // Recorded even for a device VPP does not own, where the
                 // send above never happened: `resolve` answers `None` for
                 // an excluded device either way, so the entry cannot make
@@ -2089,6 +2414,7 @@ impl ConvergenceEngine {
                 {
                     self.send_neighbour(nh, idx, [0; 6], false)?;
                 }
+                self.release_l2fib(nh)?;
                 self.nexthops.forget_device(&nh);
                 Ok(())
             }
@@ -2308,12 +2634,30 @@ impl ConvergenceEngine {
     /// neighbours count too: "VPP might hold an adjacency here" is
     /// enough to treat the interface as in use, in the direction that
     /// over-blocks rather than under-blocks a steer.
+    ///
+    /// A BVI is always up, so through one the egress is the member the
+    /// neighbour's L2FIB entry pins — or, for one that floods, every
+    /// member. Those are what the link gate must see as in use; the BVI
+    /// alone would let a steer start over a dark trunk (review finding).
     fn active_egress_indices(&self) -> std::collections::HashSet<u32> {
-        self.neighbours_installed
+        let on: Vec<(u32, IpAddr)> = self
+            .neighbours_installed
             .keys()
-            .map(|(idx, _)| *idx)
-            .chain(self.neighbours_unacked.iter().map(|(idx, _)| *idx))
-            .collect()
+            .copied()
+            .chain(self.neighbours_unacked.iter().copied())
+            .collect();
+        let mut active: std::collections::HashSet<u32> = on.iter().map(|(i, _)| *i).collect();
+        for (vid, bvi) in self.port_index.bvis() {
+            for (_, nh) in on.iter().filter(|(i, _)| *i == bvi) {
+                match self.l2fib_of.get(nh).and_then(|k| self.l2fib.get(k)) {
+                    Some((member, _)) => {
+                        active.insert(*member);
+                    }
+                    None => active.extend(self.bd_members.get(&vid).into_iter().flatten()),
+                }
+            }
+        }
+        active
     }
 
     /// Abandon whatever convergence step is in flight.
@@ -2358,6 +2702,10 @@ impl ConvergenceEngine {
         // The neighbour ledger describes the dead instance's table.
         self.neighbours_installed.clear();
         self.moved_from.clear();
+        self.l2fib.clear();
+        self.l2fib_of.clear();
+        self.bd_members.clear();
+        self.nexthops.forget_bvis();
         // And so does the doubt about it: whatever the dead VPP did or did
         // not apply is moot, and carrying the keys over would make the
         // replacement's first delta pay for a dump that can only confirm
