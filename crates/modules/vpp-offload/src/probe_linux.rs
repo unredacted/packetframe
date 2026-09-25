@@ -59,6 +59,7 @@ pub(crate) fn run(
         directions,
         steer_exempts,
         steer_capacity,
+        &crate::topology::kernel_receive_macs,
     ));
     caps
 }
@@ -193,6 +194,7 @@ fn probe_steering_budget(
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     steer_capacity: Option<u16>,
+    receive_macs: &dyn Fn(&str) -> Vec<[u8; 6]>,
 ) -> Capability {
     use crate::steer::McamBudget;
 
@@ -264,6 +266,27 @@ fn probe_steering_budget(
                 )
             }
         };
+        // The receive MACs attach will scope each port's diversions to,
+        // and its refusal when a port's cannot be read. Planned with the
+        // largest set, whose copies cost the most slots.
+        let mut dmacs: Vec<[u8; 6]> = Vec::new();
+        for port in steer_ports {
+            let macs = receive_macs(port);
+            if macs.is_empty() {
+                return Capability::fail(
+                    name,
+                    format!(
+                        "cannot read the MAC(s) frames to this router arrive with on {port}; \
+                         attach refuses to steer it, since rules without them would divert \
+                         frames the kernel is only bridging"
+                    ),
+                    true,
+                );
+            }
+            if macs.len() > dmacs.len() {
+                dmacs = macs;
+            }
+        }
         return plan_and_report(
             name,
             budget,
@@ -274,6 +297,7 @@ fn probe_steering_budget(
             allowlist,
             directions,
             steer_exempts,
+            &dmacs,
         );
     }
 
@@ -333,6 +357,13 @@ fn probe_steering_budget(
             false,
         );
     };
+    // Any consulted member could be the one turned on: plan with the
+    // largest receive-MAC set among them.
+    let dmacs = consulted
+        .iter()
+        .map(|p| receive_macs(p))
+        .max_by_key(Vec::len)
+        .unwrap_or_default();
     plan_and_report(
         name,
         budget,
@@ -343,6 +374,7 @@ fn probe_steering_budget(
         allowlist,
         directions,
         steer_exempts,
+        &dmacs,
     )
 }
 
@@ -373,6 +405,7 @@ fn plan_and_report(
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+    dmacs: &[[u8; 6]],
 ) -> Capability {
     use crate::steer::{RuleAction, RuleSet};
 
@@ -402,7 +435,7 @@ fn plan_and_report(
     let mut details = Vec::with_capacity(directions.len());
     let mut skipped_v6 = 0u32;
     for direction in directions {
-        match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction, &[]) {
+        match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction, dmacs) {
             Ok(set) => {
                 skipped_v6 = set.skipped_v6;
                 let diverts = set
@@ -716,6 +749,11 @@ pub(crate) fn default_hugepage_bytes() -> u64 {
 #[cfg(test)]
 mod steering_probe_tests {
     use super::*;
+
+    /// One receive MAC per port, as a plain L3 port has.
+    fn one_mac(_port: &str) -> Vec<[u8; 6]> {
+        vec![[0x02, 0, 0, 0, 0, 1]]
+    }
     use packetframe_common::fib::IpPrefix;
     use packetframe_common::probe::CapabilityStatus;
 
@@ -739,7 +777,7 @@ mod steering_probe_tests {
     fn an_allowlist_that_steers_nothing_never_passes() {
         // The allowlist verdict needs no NIC and is reached before any
         // ioctl, so these run on a host with no rvu hardware.
-        let empty = probe_steering_budget(&[], &[], &[], Default::default(), &[], None);
+        let empty = probe_steering_budget(&[], &[], &[], Default::default(), &[], None, &one_mac);
         assert_eq!(empty.status, CapabilityStatus::Fail, "{empty:?}");
         assert!(
             empty.detail.contains("allowlist is empty"),
@@ -760,6 +798,7 @@ mod steering_probe_tests {
             Default::default(),
             &[],
             None,
+            &one_mac,
         );
         assert_eq!(gated.status, CapabilityStatus::Fail, "{gated:?}");
         assert!(
@@ -777,6 +816,7 @@ mod steering_probe_tests {
             Default::default(),
             &[],
             None,
+            &one_mac,
         );
         assert_eq!(v6_only.status, CapabilityStatus::Fail, "{v6_only:?}");
         assert!(
@@ -813,7 +853,7 @@ mod steering_probe_tests {
         // 1. No candidate anywhere: nothing was measured, so nothing
         //    is claimed.
         sys::reset();
-        let none = probe_steering_budget(&[], &[], &steerable, dirs, &[], None);
+        let none = probe_steering_budget(&[], &[], &steerable, dirs, &[], None, &one_mac);
         assert_eq!(none.status, CapabilityStatus::Unknown, "{none:?}");
         assert!(
             !none.detail.contains("free slot(s) across"),
@@ -832,6 +872,7 @@ mod steering_probe_tests {
             dirs,
             &[],
             None,
+            &one_mac,
         );
         assert_eq!(all_dark.status, CapabilityStatus::Unknown, "{all_dark:?}");
         assert!(all_dark.detail.contains("eth4"), "{}", all_dark.detail);
@@ -849,6 +890,7 @@ mod steering_probe_tests {
             dirs,
             &[],
             None,
+            &one_mac,
         );
         assert_eq!(partial.status, CapabilityStatus::Pass, "{partial:?}");
         assert!(
@@ -868,6 +910,7 @@ mod steering_probe_tests {
             dirs,
             &[],
             None,
+            &one_mac,
         );
         assert_eq!(
             steered_dark.status,
@@ -899,9 +942,30 @@ mod steering_probe_tests {
             dirs,
             &[],
             None,
+            &one_mac,
         );
         assert_eq!(steered_ok.status, CapabilityStatus::Pass, "{steered_ok:?}");
         assert!(steered_ok.required, "{steered_ok:?}");
+
+        // 6. Readable, but its receive MACs are not: attach refuses to
+        //    steer a port it cannot scope, so this must fail too.
+        sys::reset();
+        let unscoped = probe_steering_budget(
+            &["eth4".to_string()],
+            &["eth4".to_string()],
+            &steerable,
+            dirs,
+            &[],
+            None,
+            &|_: &str| Vec::new(),
+        );
+        assert_eq!(unscoped.status, CapabilityStatus::Fail, "{unscoped:?}");
+        assert!(
+            unscoped.detail.contains("only bridging"),
+            "{}",
+            unscoped.detail
+        );
+        assert!(unscoped.required, "{unscoped:?}");
     }
 
     /// The SR-IOV probe answers the question attach asks, not just the

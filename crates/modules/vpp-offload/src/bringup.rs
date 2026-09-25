@@ -416,7 +416,7 @@ pub fn bring_up(
     // disagree about what fits — each divert rule scoped to the MACs the
     // router receives on for that port.
     let steer_targets = crate::plan_targets(cfg, allowlist, budget, &|port: &str| {
-        crate::topology::sysfs_receive_macs(&paths.sys.sysfs_net, port)
+        crate::topology::kernel_receive_macs_in(&paths.sys.sysfs_net, port)
     })?;
     // Every member port, unfiltered, so removal can attribute a
     // location's occupant on a port this config leaves unsteered. That
