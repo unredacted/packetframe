@@ -1183,6 +1183,7 @@ fn run_loop(
             rs.null_drops,
             rs.neighbours_unplaced,
             rs.neighbour_moves,
+            rs.neighbours_flooded,
             rs.fdb_unreadable,
             rs.drift_uncovered,
             rs.drift_routes,

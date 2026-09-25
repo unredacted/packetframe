@@ -102,6 +102,27 @@ const MESSAGES: &[&str] = &[
     // rather than VPP's 9000 fallback for an interface nobody set.
     "sw_interface_set_mtu",
     "sw_interface_set_mtu_reply",
+    // Bridged VLANs route through a BVI: a loopback carrying the kernel
+    // bridge's MAC in a bridge domain with the trunk subifs, so frames
+    // leave from the MAC an IX registers (a foreign source MAC gets an IX
+    // port dropped, or shut). Placement becomes a static L2FIB entry.
+    "create_loopback_instance",
+    "create_loopback_instance_reply",
+    "bridge_domain_add_del_v2",
+    "bridge_domain_add_del_v2_reply",
+    "sw_interface_set_l2_bridge",
+    "sw_interface_set_l2_bridge_reply",
+    "l2_interface_vlan_tag_rewrite",
+    "l2_interface_vlan_tag_rewrite_reply",
+    "l2fib_add_del",
+    "l2fib_add_del_reply",
+    // What a surviving VPP's bridge domains already hold — members and
+    // static MACs a previous daemon left — so adoption and resync can
+    // withdraw what the current view no longer wants.
+    "bridge_domain_dump",
+    "bridge_domain_details",
+    "l2_fib_table_dump",
+    "l2_fib_table_details",
     "create_loopback",
     "create_loopback_reply",
     "sw_interface_add_del_address",
@@ -184,6 +205,7 @@ const FILES: &[&str] = &[
     "interface_types",
     "mfib_types",
     "vlib",
+    "l2",
 ];
 
 /// One field of a message or composite type.

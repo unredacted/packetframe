@@ -394,6 +394,10 @@ impl VppOffloadConfig {
             ("loopback-address", format!("{:?}", self.loopback_address)),
             ("vpp-binary", format!("{:?}", self.vpp_binary)),
             ("local-route", format!("{:?}", self.local_routes)),
+            // `vlans all`: which ports follow the kernel bridge's VLANs
+            // is wiring the adopted engine is built with, and a port
+            // leaving trunk mode would keep the subifs it gained.
+            ("vlans-all", format!("{:?}", self.trunk_ports)),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -2406,6 +2410,9 @@ mod tests {
             "eth4".into(),
             1337,
         ));
+        changes.push(c);
+        let mut c = base.clone();
+        c.trunk_ports = vec!["eth4".into()];
         changes.push(c);
         for c in &changes {
             assert!(
