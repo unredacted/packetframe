@@ -41,6 +41,10 @@ pub const KERNEL_VF_DRIVER: &str = "rvu_nicvf";
 pub struct SysPaths {
     /// `/sys/class/net`
     pub sysfs_net: PathBuf,
+    /// `/proc/net/vlan/config`: the VLAN devices, for the MACs steering
+    /// scopes each port's rules to. Root-only on a stock kernel, which is
+    /// why it is a path here rather than a constant.
+    pub vlan_config: PathBuf,
     /// `/sys/bus/pci/devices`
     pub pci_devices: PathBuf,
     /// `/sys/bus/pci/drivers`
@@ -79,6 +83,7 @@ impl SysPaths {
     pub fn live(state_dir: impl Into<PathBuf>, hugepage_bytes: u64) -> Self {
         Self {
             sysfs_net: PathBuf::from("/sys/class/net"),
+            vlan_config: PathBuf::from("/proc/net/vlan/config"),
             pci_devices: PathBuf::from("/sys/bus/pci/devices"),
             pci_drivers: PathBuf::from("/sys/bus/pci/drivers"),
             hugepage_pool: PathBuf::from(format!(
@@ -867,6 +872,7 @@ mod tests {
             fs::create_dir_all(&hugetlbfs).unwrap();
             let paths = SysPaths {
                 sysfs_net: net,
+                vlan_config: base.join("proc-net-vlan-config"),
                 pci_devices: devices,
                 pci_drivers: drivers,
                 hugepage_pool: pool,

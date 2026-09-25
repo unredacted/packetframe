@@ -215,14 +215,18 @@ pub fn sysfs_receive_macs(
 }
 
 /// [`sysfs_receive_macs`] under `sysfs_net`, with the VLAN table from
-/// `/proc/net/vlan/config` and the port's VLAN membership from the kernel
-/// bridge. An unreadable VLAN table answers nothing — the planner then
+/// `vlan_config` (`/proc/net/vlan/config`) and the port's VLAN membership
+/// from the kernel bridge. An unreadable VLAN table answers nothing — the planner then
 /// refuses to steer the port — rather than a partial set that would
 /// leave some of the port's L3 MACs unsteered while it reports steered.
 /// An unreadable membership takes every VLAN (extra MACs only cost
 /// rules).
-pub fn kernel_receive_macs_in(sysfs_net: &std::path::Path, port: &str) -> Vec<[u8; 6]> {
-    let vlans = match std::fs::read_to_string("/proc/net/vlan/config") {
+pub fn kernel_receive_macs_in(
+    sysfs_net: &std::path::Path,
+    vlan_config: &std::path::Path,
+    port: &str,
+) -> Vec<[u8; 6]> {
+    let vlans = match std::fs::read_to_string(vlan_config) {
         Ok(text) => parse_vlan_config(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(_) => return Vec::new(),
@@ -242,7 +246,11 @@ pub fn kernel_receive_macs_in(sysfs_net: &std::path::Path, port: &str) -> Vec<[u
 
 /// [`kernel_receive_macs_in`] against the live kernel.
 pub fn kernel_receive_macs(port: &str) -> Vec<[u8; 6]> {
-    kernel_receive_macs_in(std::path::Path::new("/sys/class/net"), port)
+    kernel_receive_macs_in(
+        std::path::Path::new("/sys/class/net"),
+        std::path::Path::new("/proc/net/vlan/config"),
+        port,
+    )
 }
 
 /// Every netdev on the box, for [`reachable_devices`].

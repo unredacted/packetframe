@@ -138,6 +138,8 @@ impl Host {
             paths: AttachPaths {
                 sys: SysPaths {
                     sysfs_net: net,
+                    // Absent: no 8021q, no VLAN devices.
+                    vlan_config: base.join("proc-net-vlan-config"),
                     pci_devices: devices,
                     pci_drivers: drivers,
                     hugepage_pool: pool,
