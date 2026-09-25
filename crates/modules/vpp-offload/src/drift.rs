@@ -695,7 +695,13 @@ impl Drop for DriftScanner {
 /// The production scan: dump every IPv4 route in every table, compare.
 #[cfg(target_os = "linux")]
 pub struct KernelDriftWatch {
+    /// `bridged_devices` is recomputed on every scan
+    /// ([`Self::refresh_bridged`]); the rest is config.
     pub reach: VppReach,
+    /// Each member's declared (or attach-time) tagged VLANs.
+    pub port_vlans: Vec<(String, Vec<u16>)>,
+    /// `vlans all` members, whose tagged VLANs follow the kernel bridge.
+    pub trunk_ports: Vec<String>,
     /// The CURRENT exemptions. `steer-exempt` is hot-reloadable, so
     /// this is refreshed on every accepted reconfigure — a watcher
     /// frozen at attach would call a newly-unexempted path covered
@@ -710,8 +716,51 @@ pub struct KernelDriftWatch {
 }
 
 #[cfg(target_os = "linux")]
+impl KernelDriftWatch {
+    /// The VLAN and bridge devices VPP reaches now: each member's
+    /// declared VLANs, every VLAN it sends untagged (reached through the
+    /// VF), and — on a `vlans all` trunk — every VLAN the kernel bridge
+    /// has it carry. Frozen at attach, a VLAN a trunk gained later would
+    /// stay a finding until restart, degrading health and asking for
+    /// exemptions nothing needs (review finding). An unreadable table
+    /// keeps the last answer.
+    fn refresh_bridged(&mut self) {
+        let live = crate::fdb::dump_port_vlans().map(|e| {
+            crate::topology::PortVlans::from_entries(
+                e.into_iter().map(|v| (v.port, v.vid, v.untagged)),
+            )
+        });
+        let port_vlans: Vec<(String, Vec<u16>)> = self
+            .port_vlans
+            .iter()
+            .map(|(port, declared)| {
+                let mut v = declared.clone();
+                if let Ok(pv) = &live {
+                    v.extend(pv.untagged(port));
+                    if self.trunk_ports.contains(port) {
+                        v.extend(pv.tagged(port));
+                    }
+                }
+                (port.clone(), v)
+            })
+            .collect();
+        match crate::topology::kernel_links() {
+            Ok(links) => {
+                self.reach.bridged_devices = crate::topology::reachable_devices(
+                    &links,
+                    &crate::topology::all_netdevs(),
+                    &port_vlans,
+                )
+            }
+            Err(e) => tracing::debug!(error = %e, "VLAN table unreadable; keeping the last reach"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl DriftWatch for KernelDriftWatch {
     fn uncovered(&mut self) -> Result<DriftFindings, String> {
+        self.refresh_bridged();
         let routes = dump_routes()?;
         // A rule dump that fails filters nothing rather than failing
         // the scan: the routes are the finding, the rules only narrow

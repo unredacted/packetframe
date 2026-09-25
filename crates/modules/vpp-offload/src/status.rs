@@ -741,8 +741,9 @@ impl StatusSnapshot {
             }
             if let Some(e) = &self.fdb_unreadable {
                 parts.push(format!(
-                    "the bridge FDB cannot be read ({e}); placements hold at the last good \
-                     read, and a spanning-tree move made meanwhile is not being followed"
+                    "the bridge tables cannot be read ({e}); placements and VLAN membership \
+                     hold at the last good read, and a spanning-tree move or VLAN change made \
+                     meanwhile is not being followed"
                 ));
             }
             subsystems.push(SubsystemHealth {

@@ -242,6 +242,12 @@ pub trait Topology {
     /// The kernel's L3 device for `bridge`/`vid`, if the router has one —
     /// a VLAN with no L3 device on the router has no neighbours to reach.
     fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3>;
+    /// `dev`'s current MTU, or `None` when it cannot be read. Read at
+    /// every VPP attach rather than once at bring-up: a supervised VPP
+    /// restart re-attaches with the kernel's MTU as it is then.
+    fn mtu(&self, _dev: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// No kernel to ask: every device is [`DevKind::Plain`] and the FDB is
@@ -426,6 +432,10 @@ impl Topology for KernelTopology {
             .ok()
             .and_then(|s| s.trim().parse().ok());
         Some(BridgeL3 { mac, mtu })
+    }
+
+    fn mtu(&self, dev: &str) -> Option<u32> {
+        crate::attach::kernel_mtu(std::path::Path::new("/sys/class/net"), dev)
     }
 }
 

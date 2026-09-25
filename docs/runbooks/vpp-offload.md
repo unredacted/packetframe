@@ -695,8 +695,10 @@ it every 2 s. **A move is one L2FIB update** — the neighbour and every
 route through it stay on the BVI. An FDB entry that ages out or is
 flushed keeps the last known trunk; a neighbour the FDB has never shown
 gets no entry and **floods to every member**, exactly as the kernel
-bridge floods an unknown MAC. If the FDB stops being readable,
-placements hold and the `fdb` row goes Degraded until a read succeeds.
+bridge floods an unknown MAC. If the FDB or the
+bridge-port VLAN table stops being readable, placements and VLAN
+membership hold at the last good read and the `fdb` row goes Degraded
+until a read succeeds.
 `vppctl show bridge-domain <vid> detail` and `show l2fib verbose` show
 the domain, its BVI and the pinned MACs.
 
@@ -712,12 +714,16 @@ Two things to get right in config:
   journal) — a neighbour already placed on it is then programmed and
   its routes re-queued. Add-only: a VLAN removed on the switch leaves an
   idle subif until the next restart. A VLAN the bridge sends untagged on
-  the port (its PVID) needs no subif at all: neighbours on it are
-  reached through the VF.
+  the port (its PVID) needs no subif at all: neighbours on it, and a
+  `local-route` naming it, are reached through the VF. If it stops being
+  untagged on that port, its neighbours' routes go unresolvable and the
+  VF adjacency is retired.
 - A new VLAN's **connected subnet** is not delivered automatically: VPP
   reaches next hops on it, not arbitrary hosts. The exemption tripwire
   reports the connected route until a `local-route` (with its fast-path
-  `local-prefix`) or a `steer-exempt` covers it.
+  `local-prefix`) or a `steer-exempt` covers it. Gatewayed routes over
+  the new VLAN are covered from the tripwire's next scan: it re-reads
+  which VLANs each member carries every time.
 - The FDB learns from frames the KERNEL sees. Steered frames go to the
   VF, so a host whose every frame is steered would eventually age out —
   in practice ARP, IPv6 and control traffic keep it fresh. The
@@ -2660,7 +2666,8 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   `loopback-address` — at a 1500-byte transit port instead of leaving
   oversized. One MTU per port: a VLAN on a trunk whose kernel MTU is
   lower than the port's is not mirrored separately. An MTU changed on the
-  kernel side takes effect in VPP at the next attach.
+  kernel side takes effect in VPP at the next attach — a supervised VPP
+  restart re-reads it — not while VPP keeps running.
   `vppctl show interface` prints each interface's `mtu`.
 - **A port must be administratively UP before it can be steered.**
   `otx2_get_rxnfc` gates on `netif_running`, so a down port answers
