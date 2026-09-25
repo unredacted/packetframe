@@ -170,6 +170,41 @@ pub fn dump_bridge_fdb() -> Result<Vec<FdbEntry>, String> {
 /// One bridge port's VLAN membership, from an AF_BRIDGE RTM_GETLINK dump
 /// with `RTEXT_FILTER_BRVLAN`: `(vid, egress untagged)` per VLAN — what
 /// `bridge vlan show` prints.
+/// One `IFLA_BRIDGE_VLAN_INFO` record, as far as membership needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VlanInfo {
+    pub vid: u16,
+    pub untagged: bool,
+    pub range_begin: bool,
+    pub range_end: bool,
+}
+
+/// `(vid, untagged)` for every VLAN the records name, expanding a
+/// `RANGE_BEGIN`…`RANGE_END` pair into each vid between. The
+/// `RTEXT_FILTER_BRVLAN` dump reports VLANs one per record today (ranges
+/// are `RTEXT_FILTER_BRVLAN_COMPRESSED`'s), but a range read as two
+/// VLANs would leave every VLAN inside it without a subif, punting its
+/// steered frames — so it is expanded rather than assumed away. A range
+/// takes its flags from its first record; one left open is dropped.
+pub fn expand_vlan_ranges(infos: &[VlanInfo]) -> Vec<(u16, bool)> {
+    let mut out = Vec::new();
+    let mut begin: Option<VlanInfo> = None;
+    for i in infos {
+        match (begin, i.range_end) {
+            (Some(b), true) => {
+                out.extend((b.vid..=i.vid).map(|vid| (vid, b.untagged)));
+                begin = None;
+            }
+            _ if i.range_begin => begin = Some(*i),
+            _ => {
+                begin = None;
+                out.push((i.vid, i.untagged));
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortVlanEntry {
     /// The enslaved port, by name.
@@ -243,19 +278,32 @@ pub fn dump_port_vlans() -> Result<Vec<PortVlanEntry>, String> {
                         continue;
                     }
                     let port = ifname(m.header.index);
+                    let mut infos = Vec::new();
                     for a in &m.attributes {
                         if let LinkAttribute::AfSpecBridge(specs) = a {
                             for spec in specs {
                                 if let AfSpecBridge::VlanInfo(v) = spec {
-                                    out.push(PortVlanEntry {
-                                        port: port.clone(),
+                                    infos.push(VlanInfo {
                                         vid: v.vid,
                                         untagged: v.flags.contains(BridgeVlanInfoFlags::Untagged),
+                                        range_begin: v
+                                            .flags
+                                            .contains(BridgeVlanInfoFlags::RangeBegin),
+                                        range_end: v.flags.contains(BridgeVlanInfoFlags::RangeEnd),
                                     });
                                 }
                             }
                         }
                     }
+                    out.extend(
+                        expand_vlan_ranges(&infos)
+                            .into_iter()
+                            .map(|(vid, untagged)| PortVlanEntry {
+                                port: port.clone(),
+                                vid,
+                                untagged,
+                            }),
+                    );
                 }
                 _ => {}
             }
@@ -263,4 +311,43 @@ pub fn dump_port_vlans() -> Result<Vec<PortVlanEntry>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(vid: u16, untagged: bool, range_begin: bool, range_end: bool) -> VlanInfo {
+        VlanInfo {
+            vid,
+            untagged,
+            range_begin,
+            range_end,
+        }
+    }
+
+    /// `vid 2-5` arrives as a begin/end pair and means every vid between;
+    /// singles pass through with their own flags (review finding).
+    #[test]
+    fn a_vlan_range_expands_to_every_vid() {
+        let got = expand_vlan_ranges(&[
+            info(1, true, false, false),
+            info(2, false, true, false),
+            info(5, false, false, true),
+            info(88, false, false, false),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                (1, true),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (88, false)
+            ]
+        );
+        // A range never closed names nothing it can vouch for.
+        assert!(expand_vlan_ranges(&[info(2, false, true, false)]).is_empty());
+    }
 }

@@ -1076,40 +1076,26 @@ fn finish(
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` delivers into, and the
-        // VLAN and bridge devices a member's subif reaches (next hops
-        // placed per neighbour). Everything else the kernel routes
-        // through is a path VPP cannot take.
-        let port_vlans: Vec<(String, Vec<u16>)> = port_attach
+        // VLAN and bridge devices a member reaches (next hops placed per
+        // neighbour) — the last recomputed by the watch on every scan,
+        // since a trunk's VLANs change under a running daemon.
+        // Everything else the kernel routes through is a path VPP cannot
+        // take.
+        let drift_port_vlans: Vec<(String, Vec<u16>)> = port_attach
             .iter()
             .map(|p| (p.port.clone(), p.vlans.clone()))
             .collect();
-        // An unreadable VLAN table at bring-up costs the tripwire its
-        // bridge exemptions (it reports those routes as findings, which
-        // is loud and safe), never forwarding.
-        #[cfg(target_os = "linux")]
-        let bridged_devices = match crate::topology::kernel_links() {
-            Ok(links) => crate::topology::reachable_devices(
-                &links,
-                &crate::topology::all_netdevs(),
-                &port_vlans,
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read the VLAN table for the exemption tripwire");
-                Vec::new()
-            }
-        };
+        let drift_trunks = trunk_ports.clone();
+        // The watch that reads them is Linux-only.
         #[cfg(not(target_os = "linux"))]
-        let bridged_devices = {
-            let _ = &port_vlans;
-            Vec::new()
-        };
+        let _ = (&drift_port_vlans, &drift_trunks);
         let drift_reach = crate::drift::VppReach {
             members: members.clone(),
             local_devices: local_routes
                 .iter()
                 .map(|lr| lr.kernel_dev.clone())
                 .collect(),
-            bridged_devices,
+            bridged_devices: Vec::new(),
         };
         let engine = ConvergenceEngine::new(
             api_socket_path,
@@ -1161,6 +1147,8 @@ fn finish(
         #[cfg(target_os = "linux")]
         runtime.drift_watch(Box::new(crate::drift::KernelDriftWatch {
             reach: drift_reach,
+            port_vlans: drift_port_vlans,
+            trunk_ports: drift_trunks,
             exempts: drift_exempts,
             dst_only: dst_only_scope,
         }));

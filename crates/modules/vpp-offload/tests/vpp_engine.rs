@@ -1852,7 +1852,10 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
     // A failing read is surfaced, and the placements hold.
     *fdb.lock().unwrap() = Err("netlink recv: timed out".into());
     assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
-    assert_eq!(e.fdb_unreadable(), Some("netlink recv: timed out"));
+    assert_eq!(
+        e.fdb_unreadable().as_deref(),
+        Some("netlink recv: timed out")
+    );
     *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
     e.refresh_placement(&src).expect("refresh");
     assert_eq!(e.fdb_unreadable(), None, "cleared by the next good read");
@@ -2084,4 +2087,177 @@ fn each_attach_sends_the_current_kernel_mtu() {
     *mtu.lock().unwrap() = None;
     e.attach_devices(AttachMode::Adopted).expect("re-attach");
     assert_eq!(sent(&fake), vec!["mtu if=3 l3=9000".to_string()]);
+}
+
+/// An eth4 member engine for the untagged-VLAN tests, over `kernel`.
+fn untagged_engine(fake: &Fake, kernel: Kernel) -> ConvergenceEngine {
+    ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_trunk_ports(vec!["eth4".into()])
+    .with_topology(Box::new(kernel))
+}
+
+/// A VLAN that stops being untagged on the neighbour's port leaves it no
+/// interface. Its routes are re-queued to go unresolvable, and its
+/// adjacency on the VF is retired once they have — not left forwarding
+/// onto a VLAN the port no longer sends bare (review finding).
+#[test]
+fn a_neighbour_whose_untagged_vlan_goes_is_retired() {
+    use std::cell::RefCell;
+    const HOST: [u8; 6] = [0x02, 0, 0, 0, 0, 0x88];
+    let host = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+    struct Src {
+        requeued: RefCell<Vec<IpAddr>>,
+    }
+    impl RouteSource for Src {
+        fn for_each_route(&self, _visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)), "br0", HOST);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.requeued.borrow_mut().extend_from_slice(nexthops);
+        }
+        fn route_count(&self) -> u64 {
+            0
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let vlans = std::sync::Arc::new(std::sync::Mutex::new(PortVlans::from_entries([(
+        "eth4".to_string(),
+        1,
+        true,
+    )])));
+    let fake = Fake::start("untagged-gone");
+    let mut e = untagged_engine(
+        &fake,
+        Kernel {
+            kinds: vec![("br0", bridge_vlan(1))],
+            fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1, HOST, "eth4")])))),
+            vlans: vlans.clone(),
+        },
+    );
+    let src = Src {
+        requeued: RefCell::new(Vec::new()),
+    };
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    let _ = fake.drain_events();
+
+    // VLAN 1 leaves eth4 altogether; the FDB entry ages out with it.
+    *vlans.lock().unwrap() = PortVlans::default();
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 1);
+    assert_eq!(*src.requeued.borrow(), vec![host]);
+    // Once, not on every pass.
+    src.requeued.borrow_mut().clear();
+    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
+
+    e.settle_moves().expect("settle");
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(
+            |ev| matches!(ev, Event::Neighbour { sw_if_index, is_add: false, .. }
+            if *sw_if_index == ASSIGNED_INDEX)
+        ),
+        "the VF adjacency is retired: {events:?}"
+    );
+}
+
+/// A `local-route` on a trunk's untagged VLAN lands on the VF: the
+/// bridge sends that VLAN bare, so there is no subif to put it on, and
+/// attach must not fail looking for one (review finding).
+#[test]
+fn a_local_route_on_an_untagged_vlan_lands_on_the_vf() {
+    const HOST: [u8; 6] = [0x02, 0, 0, 0, 0, 0x88];
+    let fake = Fake::start("untagged-local-route");
+    let mut e = untagged_engine(
+        &fake,
+        Kernel {
+            kinds: vec![("br0", bridge_vlan(1))],
+            fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1, HOST, "eth4")])))),
+            vlans: std::sync::Arc::new(std::sync::Mutex::new(PortVlans::from_entries([(
+                "eth4".to_string(),
+                1,
+                true,
+            )]))),
+        },
+    )
+    .with_local_routes(vec![LocalRoute {
+        prefix: packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(192, 0, 2, 0),
+            prefix_len: 24,
+        },
+        port: "eth4".into(),
+        vlan: 1,
+        kernel_dev: "br0".into(),
+    }]);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let routes: Vec<WireRoute> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(routes.len(), 1, "{routes:?}");
+    assert_eq!((routes[0].addr, routes[0].len), ([192, 0, 2, 0], 24));
+    assert_eq!(routes[0].path_indices, vec![ASSIGNED_INDEX]);
+}
+
+/// A kernel whose FDB reads but whose port-VLAN table does not.
+struct VlansFailKernel;
+
+impl Topology for VlansFailKernel {
+    fn classify(&self, _dev: &str) -> Result<Option<DevKind>, String> {
+        Ok(Some(DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(FdbSnapshot::default())
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Err("netlink recv: timed out".into())
+    }
+}
+
+/// The two tables are read separately, so a good FDB read must not hide
+/// an unreadable VLAN table: `vlans all` stops following the switch
+/// while it lasts, and health has to say so (review finding).
+#[test]
+fn an_unreadable_vlan_table_is_reported_despite_a_good_fdb() {
+    let fake = Fake::start("vlans-fail");
+    let mut e = engine_for(&fake).with_topology(Box::new(VlansFailKernel));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert_eq!(
+        e.fdb_unreadable().as_deref(),
+        Some("port VLANs: netlink recv: timed out")
+    );
 }

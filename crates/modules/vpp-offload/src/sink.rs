@@ -318,6 +318,14 @@ impl NexthopMap {
         self.port_untagged.insert(port.to_string(), vlans);
     }
 
+    /// Whether the kernel bridge sends `vid` out of `port` untagged —
+    /// reached through the VF itself, with no subif.
+    pub fn is_untagged(&self, port: &str, vid: u16) -> bool {
+        self.port_untagged
+            .get(port)
+            .is_some_and(|v| v.contains(&vid))
+    }
+
     /// Record what a device is. See [`Self::kinds`].
     pub fn set_kind(&mut self, dev: impl Into<String>, kind: Option<DevKind>) {
         self.kinds.insert(dev.into(), kind);

@@ -680,9 +680,10 @@ routes are re-programmed (their paths name the interface, so nothing
 else would move them), and the old adjacency is removed only once they
 have — so the old trunk keeps forwarding in the meantime. An FDB entry
 that ages out or is flushed keeps the last known port — the host's own
-traffic re-teaches the bridge within moments. If the FDB stops being
-readable, placements hold at the last good read and the `fdb` row goes
-Degraded until a read succeeds.
+traffic re-teaches the bridge within moments. If the FDB or the
+bridge-port VLAN table stops being readable, placements and VLAN
+membership hold at the last good read and the `fdb` row goes Degraded
+until a read succeeds.
 
 Two things to get right in config:
 
@@ -696,12 +697,16 @@ Two things to get right in config:
   journal) — a neighbour already placed on it is then programmed and
   its routes re-queued. Add-only: a VLAN removed on the switch leaves an
   idle subif until the next restart. A VLAN the bridge sends untagged on
-  the port (its PVID) needs no subif at all: neighbours on it are
-  reached through the VF.
+  the port (its PVID) needs no subif at all: neighbours on it, and a
+  `local-route` naming it, are reached through the VF. If it stops being
+  untagged on that port, its neighbours' routes go unresolvable and the
+  VF adjacency is retired.
 - A new VLAN's **connected subnet** is not delivered automatically: VPP
   reaches next hops on it, not arbitrary hosts. The exemption tripwire
   reports the connected route until a `local-route` (with its fast-path
-  `local-prefix`) or a `steer-exempt` covers it.
+  `local-prefix`) or a `steer-exempt` covers it. Gatewayed routes over
+  the new VLAN are covered from the tripwire's next scan: it re-reads
+  which VLANs each member carries every time.
 - The FDB learns from frames the KERNEL sees. Steered frames go to the
   VF, so a host whose every frame is steered would eventually age out —
   in practice ARP, IPv6 and control traffic keep it fresh. The
