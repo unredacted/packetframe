@@ -602,13 +602,13 @@ them.
 ```
 module vpp-offload
   port eth4 cores 1 steer on vlans 88,1337
-  local-route 23.191.200.0/24 port eth4 vlan 1337
+  local-route 192.0.2.0/24 port eth4 vlan 1337
 ```
 
 One line does three things at attach:
 
 1. **An attached route** for the prefix onto the port's dot1q subif —
-   `show ip fib 23.191.200.0/24` shows the subif adjacency, not a
+   `show ip fib 192.0.2.0/24` shows the subif adjacency, not a
    drop. Installed outside the route ledger (module-owned topology,
    like the loopback), so resyncs never withdraw it.
 2. **The neighbour mirror**: kernel neighbours on the backing bridge
@@ -828,7 +828,7 @@ across all tables and reports any path VPP cannot take that no
 
 ```
 exempt-drift: degraded — kernel path(s) VPP cannot take, with no
-  `steer-exempt` covering them: 23.191.201.0/24 via vti64 (table 100)
+  `steer-exempt` covering them: 203.0.113.128/25 via vti64 (table 100)
   — steered traffic for these dies at VPP's default route instead of
   falling back to the kernel that would deliver it.
 ```

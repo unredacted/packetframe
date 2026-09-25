@@ -4201,7 +4201,7 @@ fn parse_route_source<'a>(
     let kind = rest.next().ok_or_else(|| {
         ConfigError::parse(
             line,
-            "route-source requires a kind + args (e.g. `bgp 127.0.0.1:1179 local-as 401401 peer-as 401401`)",
+            "route-source requires a kind + args (e.g. `bgp 127.0.0.1:1179 local-as 65551 peer-as 65551`)",
         )
     })?;
     match kind {
@@ -4533,7 +4533,7 @@ fn parse_endpoint(
         )
     })?;
     // Brackets are IPv6 endpoint syntax. A bracketed IPv4 —
-    // `[10.255.0.2]:1179` — passed every validation (they all strip
+    // `[192.0.2.202]:1179` — passed every validation (they all strip
     // brackets) but reached consumers with the brackets stored:
     // SocketAddr parsing silently dropped the feed, and the anyip
     // preflight panicked on an addr its own validator had accepted
@@ -6295,7 +6295,7 @@ module fast-path
 
     #[test]
     fn route_source_bgp_parses_full_form() {
-        let s = "  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 198.51.100.7\n";
+        let s = "  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 router-id 198.51.100.7\n";
         match extract_route_source(s) {
             RouteSourceSpec::Bgp {
                 addr,
@@ -6310,8 +6310,8 @@ module fast-path
             } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 1179);
-                assert_eq!(local_as, 401401);
-                assert_eq!(peer_as, 401401);
+                assert_eq!(local_as, 65551);
+                assert_eq!(peer_as, 65551);
                 assert_eq!(router_id, Some("198.51.100.7".parse().unwrap()));
                 assert!(!allow_remote, "loopback default does not need opt-in");
                 assert!(peer_from.is_empty());
@@ -6333,8 +6333,7 @@ module fast-path
 
     #[test]
     fn route_source_bgp_missing_local_as_errors() {
-        let e =
-            parse_module_body("  route-source bgp 127.0.0.1:1179 peer-as 401401\n").unwrap_err();
+        let e = parse_module_body("  route-source bgp 127.0.0.1:1179 peer-as 65551\n").unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
                 assert!(message.contains("local-as"), "msg was: {message}");
@@ -6445,7 +6444,7 @@ module fast-path
 
     #[test]
     fn route_source_bracketed_ipv4_rejected() {
-        let e = parse_module_body("  route-source bgp [10.255.0.2]:1179 local-as 1 peer-as 1\n")
+        let e = parse_module_body("  route-source bgp [192.0.2.202]:1179 local-as 1 peer-as 1\n")
             .unwrap_err();
         match e {
             ConfigError::Parse { message, .. } => {
@@ -6475,8 +6474,8 @@ module fast-path
 
     #[test]
     fn route_source_bgp_anyip_parses() {
-        let s = "  route-source bgp 10.255.0.2:1179 local-as 401401 peer-as 401401 \
-                 allow-remote peer-from 10.255.0.1/32 anyip\n";
+        let s = "  route-source bgp 192.0.2.202:1179 local-as 65551 peer-as 65551 \
+                 allow-remote peer-from 192.0.2.201/32 anyip\n";
         match extract_route_source(s) {
             RouteSourceSpec::Bgp {
                 addr,
@@ -6485,7 +6484,7 @@ module fast-path
                 anyip,
                 ..
             } => {
-                assert_eq!(addr, "10.255.0.2");
+                assert_eq!(addr, "192.0.2.202");
                 assert!(allow_remote);
                 assert_eq!(peer_from.len(), 1);
                 assert!(anyip);

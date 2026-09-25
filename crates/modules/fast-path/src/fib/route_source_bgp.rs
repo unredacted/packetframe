@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn open_encoder_roundtrip() {
-        let bytes = encode_open(401401, 90, Ipv4Addr::new(198, 51, 100, 7));
+        let bytes = encode_open(65551, 90, Ipv4Addr::new(198, 51, 100, 7));
         // Marker check.
         assert_eq!(&bytes[..16], &BGP_MARKER);
         // Length matches buffer.
@@ -1085,7 +1085,7 @@ mod tests {
         assert_eq!(bytes[18], MSG_TYPE_OPEN);
         // Version.
         assert_eq!(bytes[19], 4);
-        // My AS = AS_TRANS because 401401 > 65535.
+        // My AS = AS_TRANS because 65551 > 65535.
         assert_eq!(u16::from_be_bytes([bytes[20], bytes[21]]), AS_TRANS);
         // Hold time.
         assert_eq!(u16::from_be_bytes([bytes[22], bytes[23]]), 90);
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn open_advertises_4byte_asn_and_mp_bgp() {
-        let bytes = encode_open(401401, 90, Ipv4Addr::new(1, 2, 3, 4));
+        let bytes = encode_open(65551, 90, Ipv4Addr::new(1, 2, 3, 4));
         // Walk to opt params: header(19) + version(1) + my_as(2) + hold(2) + router_id(4) = 28
         let opt_param_len = bytes[28] as usize;
         assert!(opt_param_len > 0, "OPEN without opt params");
@@ -1188,7 +1188,7 @@ mod tests {
         assert!(saw_mp_v6, "missing MP-BGP IPv6 unicast capability");
         assert_eq!(
             saw_4byte_asn,
-            Some(401401),
+            Some(65551),
             "missing or wrong 4-octet ASN capability"
         );
         assert!(
@@ -1206,7 +1206,7 @@ mod tests {
         // We never originate routes, so we don't want bird sending us
         // ROUTE-REFRESH. Verify capability code 2 (Route Refresh) is
         // absent from our OPEN.
-        let bytes = encode_open(401401, 90, Ipv4Addr::new(1, 2, 3, 4));
+        let bytes = encode_open(65551, 90, Ipv4Addr::new(1, 2, 3, 4));
         let opt_param_len = bytes[28] as usize;
         let opt_params = &bytes[29..29 + opt_param_len];
         let caps = &opt_params[2..];
@@ -1221,8 +1221,8 @@ mod tests {
 
     #[test]
     fn synthetic_peer_id_stable_for_same_inputs() {
-        let a = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 401401);
-        let b = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 401401);
+        let a = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 65551);
+        let b = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 65551);
         assert_eq!(a, b);
         let c = synthetic_peer_id("127.0.0.1:1179".parse().unwrap(), 64512);
         assert_ne!(a, c);
@@ -1347,7 +1347,7 @@ mod tests {
         // Receive-only on our side and conclude that WE will not Send
         // multipath, so add_path_in_effect must be false. This guards
         // against accidentally flipping the encoded direction to Send.
-        let bytes = encode_open(401401, 90, Ipv4Addr::new(1, 2, 3, 4));
+        let bytes = encode_open(65551, 90, Ipv4Addr::new(1, 2, 3, 4));
         let mut b = Bytes::copy_from_slice(&bytes);
         let parsed =
             parse_bgp_message(&mut b, false, &AsnLength::Bits32).expect("OPEN parses cleanly");

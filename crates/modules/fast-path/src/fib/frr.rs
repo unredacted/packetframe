@@ -697,7 +697,7 @@ mod tests {
     }"#;
 
     const SUMMARY: &str = r#"{
-      "routerId":"10.255.0.1",
+      "routerId":"192.0.2.201",
       "as":65000,
       "ribCount":5,
       "peers":{
@@ -706,7 +706,7 @@ mod tests {
           "pfxRcd":3,
           "peerUptimeEstablishedEpoch":1790045332
         },
-        "10.255.0.2":{"state":"Active","pfxRcd":0}
+        "192.0.2.202":{"state":"Active","pfxRcd":0}
       }
     }"#;
 
@@ -802,7 +802,7 @@ mod tests {
             Some(1790045332)
         );
         assert_eq!(
-            parse_established_epoch(SUMMARY, "10.255.0.2"),
+            parse_established_epoch(SUMMARY, "192.0.2.202"),
             None,
             "a peer that has never come up has no epoch"
         );
@@ -813,13 +813,13 @@ mod tests {
     fn next_hop_self_alone_is_unfiltered() {
         let cfg = "\
 router bgp 65000
- neighbor 10.255.0.2 remote-as 65000
+ neighbor 192.0.2.202 remote-as 65000
  address-family ipv4 unicast
-  neighbor 10.255.0.2 next-hop-self force
+  neighbor 192.0.2.202 next-hop-self force
  exit-address-family
 ";
         assert_eq!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Unfiltered
         );
     }
@@ -832,10 +832,10 @@ router bgp 65000
         let cfg = "\
 router bgp 65000
  address-family ipv4 unicast
-  neighbor 10.255.0.2 route-map TRIM out
+  neighbor 192.0.2.202 route-map TRIM out
  exit-address-family
 ";
-        match parse_export_policy(cfg, "10.255.0.2") {
+        match parse_export_policy(cfg, "192.0.2.202") {
             ExportPolicy::Filtered { why } => assert!(why.contains("route-map"), "{why}"),
             other => panic!("expected Filtered, got {other:?}"),
         }
@@ -843,9 +843,9 @@ router bgp 65000
 
     #[test]
     fn a_prefix_list_is_filtering() {
-        let cfg = "  neighbor 10.255.0.2 prefix-list ONLY-SOME out\n";
+        let cfg = "  neighbor 192.0.2.202 prefix-list ONLY-SOME out\n";
         assert!(matches!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Filtered { .. }
         ));
     }
@@ -857,15 +857,15 @@ router bgp 65000
     fn an_inbound_filter_on_the_peer_is_not_export_policy() {
         let cfg = "\
 router bgp 65000
- neighbor 10.255.0.2 remote-as 65000
+ neighbor 192.0.2.202 remote-as 65000
  address-family ipv4 unicast
-  neighbor 10.255.0.2 route-map PACKETFRAME-IN in
-  neighbor 10.255.0.2 prefix-list NOTHING in
-  neighbor 10.255.0.2 maximum-prefix 10
+  neighbor 192.0.2.202 route-map PACKETFRAME-IN in
+  neighbor 192.0.2.202 prefix-list NOTHING in
+  neighbor 192.0.2.202 maximum-prefix 10
  exit-address-family
 ";
         assert_eq!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Unfiltered
         );
     }
@@ -875,10 +875,10 @@ router bgp 65000
     #[test]
     fn outbound_policy_still_disqualifies_beside_an_inbound_one() {
         let cfg = "\
-  neighbor 10.255.0.2 route-map PACKETFRAME-IN in
-  neighbor 10.255.0.2 route-map TRIM out
+  neighbor 192.0.2.202 route-map PACKETFRAME-IN in
+  neighbor 192.0.2.202 route-map TRIM out
 ";
-        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "10.255.0.2") else {
+        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "192.0.2.202") else {
             panic!("an outbound route-map must disqualify");
         };
         assert!(why.contains("TRIM out"), "names the outbound line: {why}");
@@ -889,10 +889,10 @@ router bgp 65000
             "distribute-list 10 out",
             "filter-list AS out",
         ] {
-            let cfg = format!("  neighbor 10.255.0.2 {tail}\n");
+            let cfg = format!("  neighbor 192.0.2.202 {tail}\n");
             assert!(
                 matches!(
-                    parse_export_policy(&cfg, "10.255.0.2"),
+                    parse_export_policy(&cfg, "192.0.2.202"),
                     ExportPolicy::Filtered { .. }
                 ),
                 "{tail}"
@@ -901,10 +901,10 @@ router bgp 65000
 
         let cfg = "\
  neighbor PF route-map PF-IN in
- neighbor 10.255.0.2 peer-group PF
+ neighbor 192.0.2.202 peer-group PF
 ";
         assert_eq!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Unfiltered,
             "an inherited inbound filter is no more export policy than the peer's own"
         );
@@ -915,7 +915,7 @@ router bgp 65000
     fn a_filter_on_a_different_peer_is_ignored() {
         let cfg = "  neighbor 192.168.10.1 route-map UPSTREAM in\n";
         assert_eq!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Unfiltered
         );
     }
@@ -1390,13 +1390,13 @@ router bgp 65000
 router bgp 65000
  neighbor TRANSIT peer-group
  neighbor TRANSIT remote-as 65001
- neighbor 10.255.0.2 peer-group TRANSIT
- neighbor 10.255.0.2 port 1179
+ neighbor 192.0.2.202 peer-group TRANSIT
+ neighbor 192.0.2.202 port 1179
  address-family ipv4 unicast
   neighbor TRANSIT route-map ONLY-CUSTOMERS out
  exit-address-family
 ";
-        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "10.255.0.2") else {
+        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "192.0.2.202") else {
             panic!("an inherited route-map must disqualify");
         };
         assert!(why.contains("ONLY-CUSTOMERS"), "{why}");
@@ -1415,10 +1415,10 @@ router bgp 65000
     fn peer_group_membership_is_resolved_before_the_scan() {
         let cfg = "\
  neighbor TRANSIT route-map OUT out
- neighbor 10.255.0.2 peer-group TRANSIT
+ neighbor 192.0.2.202 peer-group TRANSIT
 ";
         assert!(matches!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Filtered { .. }
         ));
     }
@@ -1433,11 +1433,11 @@ router bgp 65000
  neighbor TRANSIT peer-group
  neighbor TRANSIT remote-as 65001
  neighbor TRANSIT timers 3 9
- neighbor 10.255.0.2 peer-group TRANSIT
- neighbor 10.255.0.2 next-hop-self
+ neighbor 192.0.2.202 peer-group TRANSIT
+ neighbor 192.0.2.202 next-hop-self
 ";
         assert_eq!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Unfiltered
         );
     }
@@ -1448,10 +1448,10 @@ router bgp 65000
         let cfg = "\
  neighbor CUSTOMERS route-map NARROW out
  neighbor 192.0.2.7 peer-group CUSTOMERS
- neighbor 10.255.0.2 remote-as 65000
+ neighbor 192.0.2.202 remote-as 65000
 ";
         assert_eq!(
-            parse_export_policy(cfg, "10.255.0.2"),
+            parse_export_policy(cfg, "192.0.2.202"),
             ExportPolicy::Unfiltered
         );
     }
