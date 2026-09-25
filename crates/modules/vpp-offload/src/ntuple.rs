@@ -63,6 +63,11 @@ const ETHTOOL_GRXCLSRULE: u32 = 0x0000_002f;
 /// not mention protocols at all.
 const IP_USER_FLOW: u32 = 0x0d;
 
+/// `FLOW_MAC_EXT`, or'd into `flow_type`: the rule also matches
+/// `h_ext.h_dest` under `m_ext.h_dest`. The otx2 driver turns it into an
+/// NPC `DMAC` match (`otx2_prepare_flow_request`).
+const FLOW_MAC_EXT: u32 = 0x4000_0000;
+
 /// `ip_ver` within `ethtool_usrip4_spec` — after ip4src, ip4dst,
 /// l4_4_bytes and tos.
 const IP_VER_OFFSET: usize = 13;
@@ -332,6 +337,12 @@ fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
     // by this NIC carries it, and matching a proven-good sample byte for
     // byte costs nothing.
     fs.h_u.hdata[IP_VER_OFFSET] = ETH_RX_NFC_IP4;
+    // Only frames addressed to the router: see `SteerRule::dmac`.
+    if let Some(mac) = rule.dmac {
+        fs.flow_type |= FLOW_MAC_EXT;
+        fs.h_ext.h_dest = mac;
+        fs.m_ext.h_dest = [0xff; 6];
+    }
     fs
 }
 
@@ -380,6 +391,10 @@ fn matches(asked: &RxFlowSpec, got: &RxFlowSpec) -> bool {
         && asked.ring_cookie == got.ring_cookie
         && asked.h_u.hdata[..8] == got.h_u.hdata[..8]
         && asked.m_u.hdata[..8] == got.m_u.hdata[..8]
+        // The MAC scope decides breadth as much as the addresses do: a
+        // rule that lost it diverts bridged frames.
+        && asked.h_ext.h_dest == got.h_ext.h_dest
+        && asked.m_ext.h_dest == got.m_ext.h_dest
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -1921,6 +1936,7 @@ mod tests {
             side,
             location: loc,
             action: crate::steer::RuleAction::Divert,
+            dmac: None,
         }
     }
 
@@ -2002,6 +2018,45 @@ mod tests {
         assert_eq!(src.m_u.hdata[IP_VER_OFFSET], 0, "and masked off");
     }
 
+    /// A divert rule scoped to a receive MAC asks for `FLOW_MAC_EXT` and
+    /// a full-width destination-MAC match, and the readback holds the NIC
+    /// to it: a rule that came back without the scope would divert frames
+    /// the kernel is only bridging. An unscoped rule leaves the extension
+    /// untouched.
+    #[test]
+    fn a_mac_scoped_rule_matches_only_frames_to_that_mac() {
+        const MAC: [u8; 6] = [0x02, 0, 0, 0, 0x69, 0xc7];
+        let mut scoped = rule(Side::Dst, 12);
+        scoped.dmac = Some(MAC);
+        let fs = flow_spec(&scoped, 0);
+        assert_eq!(fs.flow_type, IP_USER_FLOW | FLOW_MAC_EXT);
+        assert_eq!(fs.h_ext.h_dest, MAC);
+        assert_eq!(
+            fs.m_ext.h_dest, [0xff; 6],
+            "every bit of the MAC must match"
+        );
+        assert_eq!(
+            &fs.h_u.hdata[4..8],
+            &[192, 0, 2, 0],
+            "the address match is unchanged"
+        );
+
+        let mut lost = fs;
+        lost.m_ext.h_dest = [0; 6];
+        assert!(
+            !matches(&fs, &lost),
+            "a rule that lost its MAC scope is not ours"
+        );
+        let mut other = fs;
+        other.h_ext.h_dest = [0x02, 0, 0, 0, 0, 1];
+        assert!(!matches(&fs, &other), "nor one scoped to another MAC");
+
+        let plain = flow_spec(&rule(Side::Dst, 12), 0);
+        assert_eq!(plain.flow_type, IP_USER_FLOW);
+        assert_eq!(plain.h_ext.h_dest, [0; 6]);
+        assert_eq!(plain.m_ext.h_dest, [0; 6]);
+    }
+
     /// The readback comparison must reject the differences that change
     /// behaviour and tolerate the ones that do not.
     #[test]
@@ -2080,6 +2135,7 @@ mod tests {
             &[],
             small,
             VppSteerDirection::Both,
+            &[],
         )
         .expect_err("eight rules cannot fit four slots");
         assert!(e.contains("only 4 slot(s) are free"), "{e}");
@@ -2181,10 +2237,22 @@ mod tests {
             addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
-        let src = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Src)
-            .expect("src plan");
-        let dst = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Dst)
-            .expect("dst plan");
+        let src = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Src,
+            &[],
+        )
+        .expect("src plan");
+        let dst = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Dst,
+            &[],
+        )
+        .expect("dst plan");
         let mut s = NtupleSteering::new(
             vec![("eth0".into(), 0), ("eth1".into(), 0)],
             vec![
@@ -2386,7 +2454,8 @@ mod tests {
             addr: [198, 18, 0, 0],
             prefix_len: 24,
         }];
-        let fresh_plan = RuleSet::plan(&allow, &[], budget, VppSteerDirection::Both).expect("fits");
+        let fresh_plan =
+            RuleSet::plan(&allow, &[], budget, VppSteerDirection::Both, &[]).expect("fits");
         for r in &fresh_plan.rules {
             assert!(
                 !inherited.iter().any(|(_, l)| *l == r.location),
@@ -3330,7 +3399,7 @@ mod tests {
             })
             .collect();
         let budget = McamBudget::from_table(&rule_table("eth0").expect("table"));
-        let plan = RuleSet::plan(&allow, &exempts, budget, VppSteerDirection::Both)
+        let plan = RuleSet::plan(&allow, &exempts, budget, VppSteerDirection::Both, &[])
             .expect("13 rules fit an empty 16-slot table");
         assert_eq!(plan.rules.len(), 13);
         let mut before = steering(vec![("eth0".into(), 0)], plan.clone());
@@ -3339,7 +3408,7 @@ mod tests {
 
         // Planning against the raw table is the bug: 3 free.
         let raw = McamBudget::from_table(&rule_table("eth0").expect("table"));
-        RuleSet::plan(&allow, &exempts, raw, VppSteerDirection::Both)
+        RuleSet::plan(&allow, &exempts, raw, VppSteerDirection::Both, &[])
             .expect_err("our own rules crowd out the re-plan");
 
         // Reclaiming ours, the re-plan is the plan we already installed.
@@ -3350,6 +3419,7 @@ mod tests {
             &exempts,
             McamBudget::from_table(&table),
             VppSteerDirection::Both,
+            &[],
         )
         .expect("fits");
         assert_eq!(
@@ -3451,8 +3521,14 @@ mod tests {
             addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
-        let plan = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
-            .expect("fits");
+        let plan = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Both,
+            &[],
+        )
+        .expect("fits");
         let mut s = steering(vec![("eth0".into(), 0)], plan);
         assert!(
             s.installed().is_empty(),
@@ -3523,7 +3599,14 @@ mod tests {
                 prefix_len: 24,
             })
             .collect();
-        RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both).expect("fits")
+        RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Both,
+            &[],
+        )
+        .expect("fits")
     }
 
     /// The exemptions' whole journey: planned at the LOW slots, encoded

@@ -728,10 +728,61 @@ fn planning_table(
 /// operator must always be able to make, since it is how traffic comes
 /// off a misbehaving VPP. An allowlist growing past the budget is a
 /// plausible way to arrive at wanting exactly that.
+/// `(PF iface, VF index, rules)` for every `steer on` port: one plan per
+/// distinct (effective direction, receive MACs), all drawn from the shared
+/// free-slot intersection so a location number names the same slot on
+/// every steering port. Locations are per-interface, so ports of
+/// different plans reusing the same numbers do not collide — and each
+/// port's budget requirement is its OWN plan's size, not the union's.
+///
+/// The one derivation attach and reconfigure share: if they disagreed
+/// about what fits, a config that attached could refuse its first reload.
+///
+/// A steering port whose receive MACs cannot be read is refused: rules
+/// without them would divert frames the kernel is only bridging.
+pub(crate) fn plan_targets(
+    cfg: &VppOffloadConfig,
+    allowlist: &[packetframe_common::fib::IpPrefix],
+    budget: &steer::McamBudget,
+    receive_macs: &dyn Fn(&str) -> Vec<[u8; 6]>,
+) -> Result<Vec<(String, u32, steer::RuleSet)>, String> {
+    type PlanKey = (VppSteerDirection, Vec<[u8; 6]>);
+    let mut plans: Vec<(PlanKey, steer::RuleSet)> = Vec::new();
+    let mut targets = Vec::new();
+    for (iface, _, steer_on, _, dir) in &cfg.ports {
+        if !steer_on {
+            continue;
+        }
+        let macs = receive_macs(iface);
+        if macs.is_empty() {
+            return Err(format!(
+                "cannot read the MAC(s) frames to this router arrive with on {iface}; \
+                 steering it without them would divert frames the kernel is only bridging \
+                 between hosts, and VPP would drop them"
+            ));
+        }
+        let key: PlanKey = (dir.unwrap_or(cfg.steer_direction), macs);
+        if !plans.iter().any(|(k, _)| *k == key) {
+            let plan =
+                steer::RuleSet::plan(allowlist, &cfg.steer_exempts, budget.clone(), key.0, &key.1)?;
+            plans.push((key.clone(), plan));
+        }
+        let plan = plans
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, p)| p.clone())
+            .expect("planned above");
+        // VF 0 because `acquire` creates exactly one per PF.
+        targets.push((iface.clone(), 0u32, plan));
+    }
+    Ok(targets)
+}
+
 fn steering_target(
     cfg: &VppOffloadConfig,
     allowlist: &[packetframe_common::fib::IpPrefix],
     table: impl Fn(&str) -> Result<ntuple::RuleTable, String>,
+    receive_macs: &dyn Fn(&str) -> Vec<[u8; 6]>,
 ) -> Result<SteeringTarget, String> {
     // VF 0 because `acquire` creates exactly one per PF.
     let ports: Vec<(String, u32, VppSteerDirection)> = cfg
@@ -752,44 +803,19 @@ fn steering_target(
         ports.iter().map(|(iface, _, _)| iface.as_str()),
         table,
     )?;
-    // One plan per DISTINCT effective direction, all drawn from the
-    // shared free-slot intersection so a location number names the
-    // same slot on every steering port. Locations are per-interface,
-    // so ports of different directions reusing the same numbers do
-    // not collide — and each port's budget requirement is its OWN
-    // plan's size, not the union's.
-    let mut plans: Vec<(VppSteerDirection, steer::RuleSet)> = Vec::new();
-    for (_, _, d) in &ports {
-        if !plans.iter().any(|(pd, _)| pd == d) {
-            plans.push((
-                *d,
-                steer::RuleSet::plan(allowlist, &cfg.steer_exempts, budget.clone(), *d)?,
-            ));
-        }
-    }
+    let targets = plan_targets(cfg, allowlist, &budget, receive_macs)?;
     // `steer on` with nothing steerable is refused for the same reason
     // `bring_up` refuses it: steering would divert nothing while every
     // surface reported it on. All plans share the allowlist, so one
     // empty means all empty.
-    if plans.iter().all(|(_, p)| p.rules.is_empty()) {
-        let skipped = plans.first().map_or(0, |(_, p)| p.skipped_v6);
+    if targets.iter().all(|(_, _, p)| p.rules.is_empty()) {
+        let skipped = targets.first().map_or(0, |(_, _, p)| p.skipped_v6);
         return Err(format!(
             "port(s) are configured `steer on`, but the allowlist produces no steerable \
              rules ({skipped} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this \
              NIC). Steering would divert nothing while reporting Healthy"
         ));
     }
-    let targets = ports
-        .into_iter()
-        .map(|(iface, vf, d)| {
-            let plan = plans
-                .iter()
-                .find(|(pd, _)| *pd == d)
-                .map(|(_, p)| p.clone())
-                .expect("every port's direction was planned above");
-            (iface, vf, plan)
-        })
-        .collect();
     Ok(SteeringTarget {
         targets,
         want_steer: true,
@@ -1293,8 +1319,13 @@ impl Module for VppOffloadModule {
             return Ok(());
         };
 
-        let target = steering_target(&new, &self.allowlist.get(), planning_table(&self.state_dir))
-            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        let target = steering_target(
+            &new,
+            &self.allowlist.get(),
+            planning_table(&self.state_dir),
+            &topology::kernel_receive_macs,
+        )
+        .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Did the operator actually turn the lever, or does the config
         // merely still say `steer on`?
         //
@@ -1539,6 +1570,64 @@ pub fn default_hugepage_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One receive MAC per port, distinct per port, as a plain L3 box has.
+    fn test_macs(port: &str) -> Vec<[u8; 6]> {
+        let n = port.bytes().last().unwrap_or(0);
+        vec![[0x02, 0, 0, 0, 0, n]]
+    }
+
+    /// Every divert rule is scoped to the port's receive MAC, so two
+    /// ports with different MACs get plans of their own — over the same
+    /// slots, since locations are per-interface — and a port whose MAC
+    /// cannot be read is refused rather than steered unscoped (it would
+    /// divert frames the kernel is only bridging).
+    #[test]
+    fn divert_rules_carry_each_ports_receive_mac() {
+        use packetframe_common::fib::IpPrefix;
+        let allow = vec![IpPrefix::V4 {
+            addr: [192, 0, 2, 0],
+            prefix_len: 24,
+        }];
+        let on = cfg(&[("eth2", 1, true), ("eth3", 1, true)], 1_600_000);
+        let t = steering_target(
+            &on,
+            &allow,
+            |_: &str| {
+                Ok(ntuple::RuleTable {
+                    size: 16,
+                    occupied: Vec::new(),
+                })
+            },
+            &test_macs,
+        )
+        .expect("fits");
+        for (iface, _, plan) in &t.targets {
+            let want = test_macs(iface)[0];
+            assert!(
+                plan.rules
+                    .iter()
+                    .filter(|r| r.action == steer::RuleAction::Divert)
+                    .all(|r| r.dmac == Some(want)),
+                "{iface}: {plan:?}"
+            );
+        }
+        assert_eq!(t.targets[0].2.locations(), t.targets[1].2.locations());
+
+        let e = steering_target(
+            &on,
+            &allow,
+            |_: &str| {
+                Ok(ntuple::RuleTable {
+                    size: 16,
+                    occupied: Vec::new(),
+                })
+            },
+            &|_: &str| Vec::new(),
+        )
+        .expect_err("must refuse");
+        assert!(e.contains("only bridging"), "{e}");
+    }
     use packetframe_common::module::{HealthState, SubsystemHealth};
     use supervisor::State;
 
@@ -2510,7 +2599,8 @@ mod tests {
 
         // Steering ON is refused, and names the true requirement.
         let on = cfg(&[("eth4", 1, true)], 1_600_000);
-        let e = steering_target(&on, &allow, ntuple::rule_table).expect_err("cannot fit");
+        let e =
+            steering_target(&on, &allow, ntuple::rule_table, &test_macs).expect_err("cannot fit");
         // 600 diversions plus the two built-in kernel exemptions.
         assert!(e.contains("602 MCAM rule(s)"), "{e}");
 
@@ -2518,8 +2608,8 @@ mod tests {
         // assertion that matters: the rollback path must not consult a
         // budget it does not spend.
         let off = cfg(&[("eth4", 1, false)], 1_600_000);
-        let t =
-            steering_target(&off, &allow, ntuple::rule_table).expect("rollback must be possible");
+        let t = steering_target(&off, &allow, ntuple::rule_table, &test_macs)
+            .expect("rollback must be possible");
         assert!(t.targets.is_empty() && !t.want_steer);
     }
 
@@ -2553,7 +2643,7 @@ mod tests {
                 prefix_len: 32,
             })
             .collect();
-        let t1 = steering_target(&first, &allow, ntuple::rule_table).expect("fits");
+        let t1 = steering_target(&first, &allow, ntuple::rule_table, &test_macs).expect("fits");
         assert_eq!(t1.targets[0].2.rules.len(), 13);
         let mut steering = ntuple::NtupleSteering::new(
             vec![("eth4".into(), 0), ("eth3".into(), 0)],
@@ -2571,9 +2661,9 @@ mod tests {
 
         let mut second = first.clone();
         second.ports[1].2 = true;
-        steering_target(&second, &allow, ntuple::rule_table)
+        steering_target(&second, &allow, ntuple::rule_table, &test_macs)
             .expect_err("the raw tables leave 3 free slots");
-        let t2 = steering_target(&second, &allow, planning_table(&dir))
+        let t2 = steering_target(&second, &allow, planning_table(&dir), &test_macs)
             .expect("eth4's own slots count as free");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -2597,7 +2687,8 @@ mod tests {
             addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
-        let t = steering_target(&on, &allow, ntuple::rule_table).expect("both plans fit");
+        let t =
+            steering_target(&on, &allow, ntuple::rule_table, &test_macs).expect("both plans fit");
         assert!(t.want_steer);
         assert_eq!(t.targets.len(), 2);
         let plan_of = |iface: &str| {
@@ -2642,7 +2733,8 @@ mod tests {
             prefix_len: 32,
         }];
         let on = cfg(&[("eth4", 1, true)], 1_600_000);
-        let e = steering_target(&on, &allow, ntuple::rule_table).expect_err("must refuse");
+        let e =
+            steering_target(&on, &allow, ntuple::rule_table, &test_macs).expect_err("must refuse");
         assert!(e.contains("no steerable rules"), "{e}");
         assert!(
             e.contains("reporting Healthy"),

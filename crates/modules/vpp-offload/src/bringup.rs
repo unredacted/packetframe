@@ -49,7 +49,7 @@ use crate::resources::ResourceState;
 use crate::runtime::Runtime;
 use crate::service::{LoopFactory, SupervisionService};
 use crate::startup_conf;
-use crate::steer::{McamBudget, RuleSet};
+use crate::steer::McamBudget;
 use crate::supervisor::Event;
 use crate::{VppOffloadConfig, MODULE_NAME};
 
@@ -411,32 +411,13 @@ pub fn bring_up(
     // designed staging state and the rollback landing zone, so a port
     // left off must get no rules at all — not rules that happen to be
     // unused. VF 0 because `acquire` creates exactly one per PF and
-    // reads it back through `virtfn0`. One planned rule set per
-    // DISTINCT effective direction (per-port `direction` falling back
-    // to the global), all drawn from the shared free-slot intersection
-    // — the same derivation `steering_target` performs on reconfigure,
-    // and it must stay the same arithmetic or attach and reload would
-    // disagree about what fits.
-    let mut steer_plans: Vec<(packetframe_common::config::VppSteerDirection, RuleSet)> = Vec::new();
-    let mut steer_targets: Vec<(String, u32, RuleSet)> = Vec::new();
-    for (iface, _, steer, _, dir) in &cfg.ports {
-        if !steer {
-            continue;
-        }
-        let d = dir.unwrap_or(cfg.steer_direction);
-        if !steer_plans.iter().any(|(pd, _)| *pd == d) {
-            steer_plans.push((
-                d,
-                RuleSet::plan(allowlist, &cfg.steer_exempts, budget.clone(), d)?,
-            ));
-        }
-        let plan = steer_plans
-            .iter()
-            .find(|(pd, _)| *pd == d)
-            .map(|(_, p)| p.clone())
-            .expect("planned above");
-        steer_targets.push((iface.clone(), 0u32, plan));
-    }
+    // reads it back through `virtfn0`. Planned by `plan_targets`, the
+    // derivation reconfigure uses too, so attach and reload cannot
+    // disagree about what fits — each divert rule scoped to the MACs the
+    // router receives on for that port.
+    let steer_targets = crate::plan_targets(cfg, allowlist, budget, &|port: &str| {
+        crate::topology::kernel_receive_macs_in(&paths.sys.sysfs_net, &paths.sys.vlan_config, port)
+    })?;
     // Every member port, unfiltered, so removal can attribute a
     // location's occupant on a port this config leaves unsteered. That
     // is not a hypothetical: a restart whose config turned a port off

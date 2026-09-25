@@ -71,6 +71,15 @@ pub struct SteerRule {
     pub location: u32,
     /// Where a match goes: into VPP, or back to the kernel.
     pub action: RuleAction,
+    /// The destination MAC a `Divert` rule also requires: one the
+    /// router's L3 devices answer to on this port
+    /// ([`crate::topology::receive_macs`]). Without it a bridge member
+    /// diverts frames the kernel is only bridging between two hosts,
+    /// which VPP's split-horizon group then drops. `None` on `Keep`
+    /// rules — delivering to the kernel is right for bridged frames too
+    /// — and on plans read from a state file written before the field.
+    #[serde(default)]
+    pub dmac: Option<[u8; 6]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -276,12 +285,21 @@ impl RuleSet {
     /// a partially steered port forwards some allowlisted traffic
     /// through VPP and the rest through the kernel, which is a policy
     /// nobody chose.
+    /// `dmacs`: the port's receive MACs. Each divert rule is planned once
+    /// per MAC (`None` when the slice is empty, which only planning
+    /// without a port — a probe estimate, a test — does).
     pub fn plan(
         allowlist: &[IpPrefix],
         exempts: &[packetframe_common::config::Ipv4Prefix],
         budget: McamBudget,
         direction: VppSteerDirection,
+        dmacs: &[[u8; 6]],
     ) -> Result<Self, String> {
+        let dmac_slots: Vec<Option<[u8; 6]>> = if dmacs.is_empty() {
+            vec![None]
+        } else {
+            dmacs.iter().copied().map(Some).collect()
+        };
         let sides = sides_for(direction);
         // Partition first, then check capacity, then build. The order is
         // what makes the refusal's numbers true: counting as we go can
@@ -309,19 +327,20 @@ impl RuleSet {
             .copied()
             .chain(exempts.iter().map(|p| (p.addr, p.prefix_len)))
             .collect();
-        let diverts = steerable.len() * sides.len();
+        let diverts = steerable.len() * sides.len() * dmac_slots.len();
         let needed = diverts + keeps.len();
 
         if needed > budget.free.len() {
             return Err(format!(
                 "steering needs {needed} MCAM rule(s) ({} steerable prefix(es) × {} \
-                 direction(s), `steer-direction {direction}`, plus {} kernel exemption(s): \
-                 2 built-in [broadcast, multicast] + {} `steer-exempt`) but only {} slot(s) \
-                 are free on this NIC; steering part of the allowlist would split it across \
-                 both forwarding tiers, so none is installed. The per-port ntuple table on \
-                 this hardware holds 16 rules",
+                 direction(s), `steer-direction {direction}`, × {} receive MAC(s), plus {} \
+                 kernel exemption(s): 2 built-in [broadcast, multicast] + {} `steer-exempt`) \
+                 but only {} slot(s) are free on this NIC; steering part of the allowlist \
+                 would split it across both forwarding tiers, so none is installed. \
+                 `steer-capacity` raises the per-port table from its default of 16",
                 steerable.len(),
                 sides.len(),
+                dmac_slots.len(),
                 keeps.len(),
                 exempts.len(),
                 budget.free.len()
@@ -337,15 +356,20 @@ impl RuleSet {
         // every diversion by construction. A `free` list sorted
         // highest-first makes front ≥ back unconditionally.
         let mut rules = Vec::with_capacity(needed);
-        for (i, (addr, prefix_len)) in steerable.into_iter().enumerate() {
-            for (j, side) in sides.iter().copied().enumerate() {
-                rules.push(SteerRule {
-                    prefix: addr,
-                    prefix_len,
-                    side,
-                    location: budget.free[i * sides.len() + j],
-                    action: RuleAction::Divert,
-                });
+        let mut next = 0usize;
+        for (addr, prefix_len) in steerable {
+            for side in sides.iter().copied() {
+                for dmac in &dmac_slots {
+                    rules.push(SteerRule {
+                        prefix: addr,
+                        prefix_len,
+                        side,
+                        location: budget.free[next],
+                        action: RuleAction::Divert,
+                        dmac: *dmac,
+                    });
+                    next += 1;
+                }
             }
         }
         for (k, (addr, prefix_len)) in keeps.into_iter().enumerate() {
@@ -355,6 +379,7 @@ impl RuleSet {
                 side: Side::Dst,
                 location: budget.free[budget.free.len() - 1 - k],
                 action: RuleAction::Keep,
+                dmac: None,
             });
         }
         Ok(RuleSet { rules, skipped_v6 })
@@ -380,6 +405,60 @@ mod tests {
 
     /// Both directions, in slot order, with v6 counted rather than
     /// silently dropped.
+    /// Each divert rule is planned once per receive MAC, each copy
+    /// scoped to its MAC; exemptions are planned once and unscoped, since
+    /// delivering to the kernel is right for bridged frames too. The
+    /// extra copies count against the budget.
+    #[test]
+    fn divert_rules_are_scoped_to_each_receive_mac() {
+        let (m1, m2) = ([0x02, 0, 0, 0, 0, 1], [0x02, 0, 0, 0, 0, 2]);
+        let allow = vec![v4(192, 0, 2, 0, 24)];
+        let exempt = [packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(192, 0, 2, 1),
+            prefix_len: 32,
+        }];
+        let set = RuleSet::plan(
+            &allow,
+            &exempt,
+            McamBudget::default(),
+            VppSteerDirection::Both,
+            &[m1, m2],
+        )
+        .expect("fits");
+        let diverts: Vec<&SteerRule> = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Divert)
+            .collect();
+        assert_eq!(diverts.len(), 4, "2 sides x 2 MACs");
+        for side in [Side::Src, Side::Dst] {
+            let mut macs: Vec<[u8; 6]> = diverts
+                .iter()
+                .filter(|r| r.side == side)
+                .filter_map(|r| r.dmac)
+                .collect();
+            macs.sort_unstable();
+            assert_eq!(macs, vec![m1, m2], "{side:?}");
+        }
+        assert!(set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Keep)
+            .all(|r| r.dmac.is_none()));
+        let mut locs = set.locations();
+        locs.sort_unstable();
+        locs.dedup();
+        assert_eq!(locs.len(), set.rules.len(), "every copy has its own slot");
+
+        // 5 free slots: 2 sides x 2 MACs + 3 exemptions = 7 does not fit.
+        let tight = McamBudget {
+            free: (0..5).rev().collect(),
+        };
+        let e = RuleSet::plan(&allow, &exempt, tight, VppSteerDirection::Both, &[m1, m2])
+            .expect_err("the copies count");
+        assert!(e.contains("2 receive MAC(s)"), "{e}");
+    }
+
     #[test]
     fn a_plan_covers_both_directions_and_reports_skipped_v6() {
         let allow = vec![
@@ -390,8 +469,14 @@ mod tests {
             },
             v4(198, 51, 100, 0, 24),
         ];
-        let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
-            .expect("fits");
+        let set = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Both,
+            &[],
+        )
+        .expect("fits");
 
         assert_eq!(set.skipped_v6, 1, "the v6 prefix is reported, not hidden");
         assert_eq!(
@@ -445,6 +530,7 @@ mod tests {
             &exempts,
             McamBudget::default(),
             VppSteerDirection::Src,
+            &[],
         )
         .expect("fits");
         let max_keep = set
@@ -504,8 +590,8 @@ mod tests {
         let budget = McamBudget {
             free: (0..5).rev().collect(),
         };
-        let e =
-            RuleSet::plan(&allow, &[], budget, VppSteerDirection::Both).expect_err("must refuse");
+        let e = RuleSet::plan(&allow, &[], budget, VppSteerDirection::Both, &[])
+            .expect_err("must refuse");
 
         assert!(
             e.contains("needs 10 MCAM rule(s)"),
@@ -529,6 +615,7 @@ mod tests {
                 free: (0..10).rev().collect(),
             },
             VppSteerDirection::Both,
+            &[],
         )
         .expect("fits exactly");
         assert_eq!(ok.rules.len(), 10);
@@ -558,6 +645,7 @@ mod tests {
                 free: (0..3).rev().collect(),
             },
             VppSteerDirection::Both,
+            &[],
         )
         .expect_err("must refuse");
         assert!(
@@ -573,8 +661,14 @@ mod tests {
     #[test]
     fn src_only_builds_one_rule_per_prefix() {
         let allow = vec![v4(10, 0, 0, 0, 16), v4(10, 1, 0, 0, 16)];
-        let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Src)
-            .expect("fits");
+        let set = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Src,
+            &[],
+        )
+        .expect("fits");
         assert_eq!(
             set.rules.len(),
             4,
@@ -590,8 +684,14 @@ mod tests {
             set.rules
         );
 
-        let dst = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Dst)
-            .expect("fits");
+        let dst = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Dst,
+            &[],
+        )
+        .expect("fits");
         assert!(
             dst.rules
                 .iter()
@@ -606,10 +706,10 @@ mod tests {
         let tight = McamBudget {
             free: (0..4).rev().collect(),
         };
-        RuleSet::plan(&allow, &[], tight.clone(), VppSteerDirection::Both)
+        RuleSet::plan(&allow, &[], tight.clone(), VppSteerDirection::Both, &[])
             .expect_err("four diverts + two keeps cannot fit four slots");
         let fits =
-            RuleSet::plan(&allow, &[], tight, VppSteerDirection::Src).expect("fits src-only");
+            RuleSet::plan(&allow, &[], tight, VppSteerDirection::Src, &[]).expect("fits src-only");
         assert_eq!(fits.rules.len(), 4);
     }
 
@@ -623,6 +723,7 @@ mod tests {
             &[],
             McamBudget { free: vec![15] },
             VppSteerDirection::Src,
+            &[],
         )
         .expect_err("must refuse");
         assert!(
@@ -638,8 +739,14 @@ mod tests {
             addr: [0x26, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             prefix_len: 32,
         }];
-        let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
-            .expect("no rules is not an error");
+        let set = RuleSet::plan(
+            &allow,
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Both,
+            &[],
+        )
+        .expect("no rules is not an error");
         assert!(
             set.rules.is_empty(),
             "nothing to divert means nothing to exempt from — no keeps either: {:?}",

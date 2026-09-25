@@ -766,6 +766,7 @@ mod tests {
                     side: Side::Dst,
                     location: 15,
                     action: RuleAction::Divert,
+                    dmac: None,
                 },
                 SteerRule {
                     prefix: std::net::Ipv4Addr::new(203, 0, 113, 7),
@@ -773,6 +774,7 @@ mod tests {
                     side: Side::Dst,
                     location: 1,
                     action: RuleAction::Keep,
+                    dmac: None,
                 },
             ],
             skipped_v6: 2,
