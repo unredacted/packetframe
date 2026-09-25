@@ -140,11 +140,12 @@ fn summarize(samples: &[ProbeEvent]) -> String {
         .count();
     let pct = ethertype_plausible * 100 / n;
 
-    // Check for a common-prefix signature: if all N samples share a
-    // fixed first-k-bytes prefix, that prefix is almost certainly a
-    // driver descriptor and not a variable MAC address, which would
-    // differ per-flow. k of 8 is enough to distinguish (two hosts
-    // rarely share the whole first 8 bytes of an Ethernet frame).
+    // Common-prefix signature: every sample sharing a fixed first-k
+    // bytes. On its own this is not descriptor evidence: ingress from
+    // a single L2 neighbour repeats dst MAC, src MAC, ethertype and
+    // often the first IP header bytes, so a conformant driver can share
+    // all 16. It only corroborates a descriptor alongside implausible
+    // ethertypes at [12..14].
     let common_prefix_len = common_prefix_len(samples);
 
     let mut lines = Vec::new();
@@ -177,10 +178,18 @@ fn summarize(samples: &[ProbeEvent]) -> String {
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
             .join(" ");
-        lines.push(format!(
-            "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
-            , unusual for real Ethernet (MACs would vary); suggests a driver descriptor."
-        ));
+        if pct <= 10 {
+            lines.push(format!(
+                "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
+                , with no plausible ethertype behind it; suggests a driver descriptor."
+            ));
+        } else {
+            lines.push(format!(
+                "  Common {common_prefix_len}-byte prefix across all {n} samples: {prefix} \
+                , ethertypes look plausible, so this fits traffic from a single L2 neighbour \
+                (fixed MACs) rather than a descriptor."
+            ));
+        }
     }
 
     lines.join("\n")
@@ -199,4 +208,61 @@ fn common_prefix_len(samples: &[ProbeEvent]) -> usize {
         }
     }
     16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(head: [u8; 16]) -> ProbeEvent {
+        ProbeEvent {
+            ts_ns: 0,
+            pkt_len: 64,
+            head,
+            _pad: [0; 4],
+        }
+    }
+
+    #[test]
+    fn single_neighbour_ipv4_is_not_flagged_as_descriptor() {
+        // One neighbour: fixed dst/src MAC, ethertype 0x0800, IPv4
+        // version/IHL 0x45 and DSCP 0, so the first 16 bytes match on
+        // every frame. Only the total-length bytes that follow differ.
+        let samples: Vec<_> = (0..8)
+            .map(|_| {
+                event([
+                    0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // dst MAC
+                    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, // src MAC
+                    0x08, 0x00, // IPv4
+                    0x45, 0x00, // version/IHL, DSCP/ECN
+                ])
+            })
+            .collect();
+        let out = summarize(&samples);
+        assert!(out.contains("100% of samples"), "{out}");
+        assert!(out.contains("Common 16-byte prefix"), "{out}");
+        assert!(!out.contains("suggests a driver descriptor"), "{out}");
+        assert!(out.contains("single L2 neighbour"), "{out}");
+    }
+
+    #[test]
+    fn fixed_prefix_with_implausible_ethertypes_is_flagged() {
+        // A driver descriptor: the first 8 bytes are constant, the rest
+        // vary per packet and never land a plausible ethertype at
+        // [12..14].
+        let samples: Vec<_> = (0u8..8)
+            .map(|i| {
+                event([
+                    0xde, 0xad, 0xbe, 0xef, 0x00, 0x10, 0x00, 0x00, // descriptor
+                    i, i, i, i, // varying
+                    0x12, i, // implausible "ethertype"
+                    i, i,
+                ])
+            })
+            .collect();
+        let out = summarize(&samples);
+        assert!(out.contains("Summary: 0% of samples"), "{out}");
+        assert!(out.contains("Common 8-byte prefix"), "{out}");
+        assert!(out.contains("suggests a driver descriptor."), "{out}");
+    }
 }
