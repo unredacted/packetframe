@@ -93,12 +93,14 @@ impl Pins {
         std::fs::create_dir_all(pin::maps_dir(&root)).expect("mkdir pin dirs");
         let bytes = aligned_bpf_copy();
         let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
-        for name in [
-            "REDIRECT_DEVMAP",
-            "TC_REDIRECT_TARGETS",
-            "VLAN_RESOLVE",
-            "CFG",
-        ] {
+        // Only what production pins: pinning a map here that attach
+        // never pins is how this test passed while the watcher could not
+        // open in production.
+        for name in pin::REDIRECT_WATCH_MAPS {
+            assert!(
+                pin::MAP_NAMES.contains(&name),
+                "{name} is opened by the watcher but not pinned by attach"
+            );
             let path = pin::map_path(&root, name);
             ebpf.map(name)
                 .unwrap_or_else(|| panic!("{name} map missing from ELF"))
