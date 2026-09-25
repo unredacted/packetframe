@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 23] = [
+pub const MAP_NAMES: [&str; 24] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -61,6 +61,22 @@ pub const MAP_NAMES: [&str; 23] = [
     "FIB_CACHE_V4",
     "FIB_CACHE_V6",
     "FIB_CACHE_CFG",
+    // The tc datapath's mirror of `REDIRECT_DEVMAP`. Pinned whatever the
+    // attach mode because the redirect-target watcher opens it by pin
+    // alongside the devmap; left unpinned, the watcher failed to open at
+    // every start and never ran, so redirect targets only refreshed on
+    // SIGHUP on every box (#220's live tracking, never live).
+    "TC_REDIRECT_TARGETS",
+];
+
+/// The pinned maps the redirect-target watcher opens
+/// (`redirect_watch::Targets::open`). Each must be in [`MAP_NAMES`],
+/// or the watcher cannot start in production.
+pub const REDIRECT_WATCH_MAPS: [&str; 4] = [
+    "REDIRECT_DEVMAP",
+    "TC_REDIRECT_TARGETS",
+    "VLAN_RESOLVE",
+    "CFG",
 ];
 
 /// The fast-path XDP program's pinned basename (attached per-iface).
@@ -278,6 +294,16 @@ mod tests {
             link_path(root, "eth0.1337"),
             Path::new("/sys/fs/bpf/packetframe/fast-path/links/eth0.1337")
         );
+    }
+
+    /// A map the watcher opens by pin but production never pins turns
+    /// the watcher off at every start, with only a warning to show for
+    /// it — how `TC_REDIRECT_TARGETS` went unpinned.
+    #[test]
+    fn every_map_the_redirect_watcher_opens_is_pinned() {
+        for name in REDIRECT_WATCH_MAPS {
+            assert!(MAP_NAMES.contains(&name), "{name} is not in MAP_NAMES");
+        }
     }
 
     #[test]
