@@ -36,8 +36,8 @@ Examples for the typical "clamp customer SYNs leaving the WAN" case:
 
 ```
 mss-clamp via eth2 1360                       # everything leaving eth2
-mss-clamp 23.191.201.0/24 via eth2 1360       # only customer 23.191.201.0/24 leaving eth2
-mss-clamp 23.191.201.0/24 1360                # customer 23.191.201.0/24, any egress
+mss-clamp 203.0.113.128/25 via eth2 1360       # only customer 203.0.113.128/25 leaving eth2
+mss-clamp 203.0.113.128/25 1360                # customer 203.0.113.128/25, any egress
 ```
 
 Prefix matches **src OR dst** (same semantic as `allow-prefix`), so one rule covers both directions of a flow.

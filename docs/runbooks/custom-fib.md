@@ -147,21 +147,21 @@ member ports works), give FRR the gateway address, and point
 packetframe at the unused host address with `anyip`:
 
 ```
-route-source bgp 10.255.0.2:1179 local-as 401401 peer-as 401401 \
-  allow-remote peer-from 10.255.0.1/32 anyip
+route-source bgp 192.0.2.202:1179 local-as 65551 peer-as 65551 \
+  allow-remote peer-from 192.0.2.201/32 anyip
 ```
 
-`anyip` makes packetframe install `local 10.255.0.2/32 dev lo`
+`anyip` makes packetframe install `local 192.0.2.202/32 dev lo`
 (kernel AnyIP) before binding and remove it at shutdown, so the
 route's lifetime never exceeds the daemon's and no hand-installed
 kernel state is needed. The FRR side is an ordinary connected
 neighbor:
 
 ```
-neighbor 10.255.0.2 remote-as <asn>
-neighbor 10.255.0.2 port 1179
-neighbor 10.255.0.2 update-source 10.255.0.1
-neighbor 10.255.0.2 timers connect 10
+neighbor 192.0.2.202 remote-as <asn>
+neighbor 192.0.2.202 port 1179
+neighbor 192.0.2.202 update-source 192.0.2.201
+neighbor 192.0.2.202 timers connect 10
 ```
 
 Startup refuses an `anyip` address some interface already owns —
@@ -290,7 +290,7 @@ silently drop the one conjunct the counts cannot substitute for.
 Session liveness, unchanged:
 
 ```sh
-vtysh -c 'show bgp neighbor 10.255.0.2'
+vtysh -c 'show bgp neighbor 192.0.2.202'
 ```
 
 ```sh
@@ -441,7 +441,7 @@ bird outages.
 
 ### What it solves
 
-Bird's iBGP feed gives us the connected /24 (e.g. `23.191.200.0/24`
+Bird's iBGP feed gives us the connected /24 (e.g. `198.51.100.0/24`
 on `br1337`) with a self-referential BGP NEXT_HOP (the device's local
 IP). The neighbour resolver can't map that to a useful destination
 MAC: it's our own IP. Without the connected fast-path, the LPM
@@ -462,8 +462,8 @@ wins over the /24 in LPM, so XDP redirects directly to the host.
 
 When you're running custom-fib (not kernel-fib) and the box has
 connected /24s carrying meaningful inbound traffic. Typical case
-on the reference EFG: customer LANs (`23.191.200.0/24`), internal
-storage networks (Ceph: `10.88.1.0/24`), and other LAN bridges.
+on the reference EFG: customer LANs (`198.51.100.0/24`), internal
+storage networks (Ceph: `203.0.113.64/26`), and other LAN bridges.
 On the reference EFG with all peers up, expect the bypass rate
 to climb from ~30% to >95% once kernel ARP populates.
 
@@ -472,16 +472,16 @@ to climb from ~30% to >95% once kernel ARP populates.
 ```
 module fast-path
   forwarding-mode custom-fib
-  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401
+  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551
 
   # One line per local prefix you want fast-pathed inbound:
-  local-prefix 23.191.200.0/24 via br1337    # customer LAN
-  local-prefix 10.88.1.0/24    via br88      # Ceph internal
-  local-prefix 10.10.1.0/24    via br0       # other LAN
+  local-prefix 198.51.100.0/24 via br1337    # customer LAN
+  local-prefix 203.0.113.64/26    via br88      # Ceph internal
+  local-prefix 192.0.2.64/26    via br0       # other LAN
 
   # IPv6: same idea, one /128 per NDP neighbour. Declare the prefix
   # actually configured on the iface, not the aggregate you announce.
-  local-prefix6 2602:f7d8:0:1337::/64 via br1337
+  local-prefix6 2001:db8:0:1337::/64 via br1337
 ```
 
 The `via <iface>` is required and must match the kernel iface
@@ -505,7 +505,7 @@ sudo packetframe fib dump-v4 | grep -E '^10\.88\.1\.[0-9]+/32'   | head
 
 # 2. Lookup a specific host. Should report state=resolved with the
 # host's actual MAC and the iface's ifindex.
-sudo packetframe fib lookup 23.191.200.10
+sudo packetframe fib lookup 198.51.100.10
 
 # 3. Watch the resolver stats. `local_arp_routes_added` climbs as
 # the kernel ARPs new hosts; `_removed` climbs on RTM_DELNEIGH
@@ -525,11 +525,11 @@ differs:
 
 ```sh
 # 1. One /128 per NDP neighbour inside each declared local-prefix6.
-sudo packetframe fib dump-v6 | grep '2602:f7d8:0:1337'
+sudo packetframe fib dump-v6 | grep '2001:db8:0:1337'
 
 # 2. A specific host: expect the connected iface's ifindex and that
 # host's own MAC, NOT one of your transit nexthops.
-sudo packetframe fib lookup 2602:f7d8:0:1337::7
+sudo packetframe fib lookup 2001:db8:0:1337::7
 
 # 3. v6 has its own counters in the same stats line, kept separate so
 # a dual-stack segment stays readable.
@@ -547,7 +547,7 @@ entries:
 
 ```sh
 ip -6 neigh show dev br1337 | grep -v fe80
-sudo packetframe fib dump-v6 | grep '2602:f7d8:0:1337'
+sudo packetframe fib dump-v6 | grep '2001:db8:0:1337'
 ```
 
 ### Capacity considerations
@@ -645,7 +645,7 @@ finds nothing.
 The optional tail flag forces a one-shot ARP sweep at startup:
 
 ```
-local-prefix 10.88.1.0/24 via br88 arp-scavenge
+local-prefix 203.0.113.64/26 via br88 arp-scavenge
 ```
 
 Capped at /22 (≤ 1024 hosts) at config-parse time. Rate-limited at
@@ -716,7 +716,7 @@ netfilter / conntrack, and get dropped upstream anyway, wasting
 kernel CPU + conntrack table capacity.
 
 ```
-fallback-default via eth3 nexthop 194.110.60.50
+fallback-default via eth3 nexthop 203.0.113.1
 ```
 
 Injects a `0.0.0.0/0` into FIB_V4 at startup. Every more-specific
@@ -731,7 +731,7 @@ Drop bogon-bound traffic at XDP rather than let it traverse the
 kernel forwarding path:
 
 ```
-allow-prefix 23.191.200.0/24
+allow-prefix 198.51.100.0/24
 block-prefix 10.0.0.0/8
 block-prefix 100.64.0.0/10
 block-prefix 192.168.0.0/16
@@ -842,13 +842,13 @@ config (no template fork needed). Add to `pathvector.yml`:
 
 ```yaml
 global-config: |
-  # iBGP feed to packetframe's BgpListener. AS 401401 is our own
+  # iBGP feed to packetframe's BgpListener. AS 65551 is our own
   # AS; replace with yours. `passive` ensures bird only initiates;
   # we listen on 1179 (NOT 179, to avoid clashing with anyone else
   # who happens to bind 179 on the loopback).
   protocol bgp packetframe {
-    local 127.0.0.1 as 401401;
-    neighbor 127.0.0.1 port 1179 as 401401;
+    local 127.0.0.1 as 65551;
+    neighbor 127.0.0.1 port 1179 as 65551;
     multihop;
     hold time 90;
     # We never want bird to reject our session for failing best-
@@ -971,7 +971,7 @@ NLRI decodes without `path_id`.
 ```
 module fast-path
   forwarding-mode custom-fib              # or `compare` for the soak window
-  route-source bgp 127.0.0.1:1179 local-as 401401 peer-as 401401 router-id 103.17.154.7
+  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 router-id 198.51.100.7
 ```
 
 `router-id` is optional; defaults to the listen-address (v4) or
