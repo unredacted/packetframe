@@ -2115,16 +2115,16 @@ mod tests {
     #[test]
     fn local_prefix_contains_basic_ipv4() {
         let spec = LocalPrefixSpec {
-            addr: "192.0.2.0".parse().unwrap(),
-            prefix_len: 24,
+            addr: "192.0.2.64".parse().unwrap(),
+            prefix_len: 26,
             iface: "br1337".into(),
             arp_scavenge: false,
         };
-        assert!(spec.contains("192.0.2.0".parse().unwrap()));
-        assert!(spec.contains("192.0.2.10".parse().unwrap()));
-        assert!(spec.contains("192.0.2.255".parse().unwrap()));
-        assert!(!spec.contains("203.0.113.0".parse().unwrap()));
-        assert!(!spec.contains("198.51.100.255".parse().unwrap()));
+        assert!(spec.contains("192.0.2.64".parse().unwrap()));
+        assert!(spec.contains("192.0.2.74".parse().unwrap()));
+        assert!(spec.contains("192.0.2.127".parse().unwrap()));
+        assert!(!spec.contains("192.0.2.128".parse().unwrap()));
+        assert!(!spec.contains("192.0.2.63".parse().unwrap()));
     }
 
     #[test]

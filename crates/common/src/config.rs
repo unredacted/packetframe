@@ -6083,12 +6083,12 @@ module fast-path
 
     #[test]
     fn v4_contains_addr_basic() {
-        let p = v4("192.0.2.0/24");
-        assert!(p.contains_addr("192.0.2.0".parse().unwrap()));
-        assert!(p.contains_addr("192.0.2.10".parse().unwrap()));
-        assert!(p.contains_addr("192.0.2.255".parse().unwrap()));
-        assert!(!p.contains_addr("203.0.113.0".parse().unwrap()));
-        assert!(!p.contains_addr("198.51.100.255".parse().unwrap()));
+        let p = v4("192.0.2.64/26");
+        assert!(p.contains_addr("192.0.2.64".parse().unwrap()));
+        assert!(p.contains_addr("192.0.2.74".parse().unwrap()));
+        assert!(p.contains_addr("192.0.2.127".parse().unwrap()));
+        assert!(!p.contains_addr("192.0.2.128".parse().unwrap()));
+        assert!(!p.contains_addr("192.0.2.63".parse().unwrap()));
     }
 
     #[test]
