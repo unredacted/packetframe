@@ -1186,7 +1186,16 @@ impl ConvergenceEngine {
     /// which would burn a whole convergence cycle doing nothing.
     pub fn attach_devices(&mut self, mode: AttachMode) -> Result<(), EngineError> {
         self.arm_timeout();
-        let ports = std::mem::take(&mut self.ports);
+        let mut ports = std::mem::take(&mut self.ports);
+        // The MTU as the kernel has it now, not as it was at bring-up:
+        // this runs again for every VPP the supervisor restarts, and an
+        // MTU changed in between would otherwise reach VPP only at the
+        // next daemon restart. Unreadable keeps the last value.
+        for p in &mut ports {
+            if let Some(mtu) = self.topology.mtu(&p.port) {
+                p.mtu = Some(mtu);
+            }
+        }
         let known = std::mem::take(&mut self.recorded_indices);
         let t = match self.transport.as_mut() {
             Some(t) => t,
