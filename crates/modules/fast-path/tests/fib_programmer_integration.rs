@@ -754,7 +754,7 @@ fn add_single_nexthop_route_writes_fib_v6() {
 #[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
 fn local_prefix6_slash128_self_nexthop_round_trips() {
     let h = ProgrammerHarness::new();
-    let host: std::net::Ipv6Addr = "2602:f7d8:0:1337::7".parse().unwrap();
+    let host: std::net::Ipv6Addr = "2001:db8:0:1337::7".parse().unwrap();
     let peer = PeerId::local_arp(33);
     let prefix = IpPrefix::V6 {
         addr: host.octets(),
@@ -827,11 +827,11 @@ fn peer_down_withdraws_both_families_under_one_local_arp_peer_id() {
     let h = ProgrammerHarness::new();
     let peer = PeerId::local_arp(33);
 
-    let v4_hosts = [[23, 191, 200, 7], [23, 191, 200, 8], [23, 191, 200, 9]];
+    let v4_hosts = [[192, 0, 2, 7], [192, 0, 2, 8], [192, 0, 2, 9]];
     let v6_hosts = [
-        "2602:f7d8:0:1337::7",
-        "2602:f7d8:0:1337::8",
-        "2602:f7d8:0:1337::9",
+        "2001:db8:0:1337::7",
+        "2001:db8:0:1337::8",
+        "2001:db8:0:1337::9",
     ];
 
     h.run(async {
@@ -1751,14 +1751,14 @@ fn the_sink_is_told_the_resolved_union_not_the_advertisements() {
 fn local_arp_routes_do_not_reach_the_sink_as_installs() {
     let (h, sink) = ProgrammerHarness::with_sink();
     let local = IpPrefix::V4 {
-        addr: [23, 191, 200, 50],
+        addr: [192, 0, 2, 50],
         prefix_len: 32,
     };
     let transit = IpPrefix::V4 {
         addr: [203, 0, 113, 0],
         prefix_len: 24,
     };
-    let host = IpAddr::V4(Ipv4Addr::new(23, 191, 200, 50));
+    let host = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
     let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
     h.run(async {

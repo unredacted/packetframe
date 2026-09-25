@@ -177,7 +177,7 @@ pub(crate) fn iommu_active(dir: &Path) -> std::io::Result<Option<std::ffi::OsStr
 /// sourcing the member VF's MAC. If that address is a LIVE kernel
 /// address — the gateway, in the reference incident — two responders
 /// fight over it and hosts learn whichever answered last. Measured on
-/// the primary (w22, 2026-08-14): loop0 held 23.191.200.1, the
+/// the primary (w22, 2026-08-14): loop0 held 192.0.2.1, the
 /// br1337 gateway, and VPP sent 105 ARP replies in 27 minutes against
 /// the kernel's. The address VPP needs is *announced but unassigned*:
 /// routable from outside (ICMP sourcing, PMTUD) with no other claimant
@@ -1315,9 +1315,9 @@ mod loopback_collision_tests {
     fn a_kernel_owned_address_is_refused_naming_the_interface() {
         let owned = vec![
             ("lo".to_string(), Ipv4Addr::new(127, 0, 0, 1)),
-            ("br1337".to_string(), Ipv4Addr::new(23, 191, 200, 1)),
+            ("br1337".to_string(), Ipv4Addr::new(192, 0, 2, 1)),
         ];
-        let err = loopback_collision(Ipv4Addr::new(23, 191, 200, 1), &owned)
+        let err = loopback_collision(Ipv4Addr::new(192, 0, 2, 1), &owned)
             .expect("the w22 config must be refused");
         assert!(err.contains("br1337"), "{err}");
         assert!(err.contains("responder war"), "{err}");
@@ -1325,8 +1325,8 @@ mod loopback_collision_tests {
 
     #[test]
     fn an_unassigned_address_in_the_same_prefix_passes() {
-        let owned = vec![("br1337".to_string(), Ipv4Addr::new(23, 191, 200, 1))];
-        assert!(loopback_collision(Ipv4Addr::new(23, 191, 200, 254), &owned).is_none());
+        let owned = vec![("br1337".to_string(), Ipv4Addr::new(192, 0, 2, 1))];
+        assert!(loopback_collision(Ipv4Addr::new(192, 0, 2, 254), &owned).is_none());
     }
 
     /// Every host has 127.0.0.1, so this smoke-tests the real
@@ -1345,8 +1345,8 @@ mod loopback_collision_tests {
 mod port_mac_tests {
     use super::*;
 
-    const OWN: [u8; 6] = [0x28, 0x70, 0x4e, 0x47, 0x69, 0xca];
-    const BRIDGE: [u8; 6] = [0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7];
+    const OWN: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0xca];
+    const BRIDGE: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0xc7];
 
     fn fixture(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -1358,7 +1358,7 @@ mod port_mac_tests {
 
     fn enslaved(tag: &str, bridge: &str) -> std::path::PathBuf {
         let net = fixture(tag);
-        std::fs::write(net.join("eth4/address"), "28:70:4e:47:69:ca\n").unwrap();
+        std::fs::write(net.join("eth4/address"), "02:11:22:33:44:ca\n").unwrap();
         std::fs::create_dir_all(net.join("eth4/master")).unwrap();
         std::fs::write(net.join("eth4/master/address"), format!("{bridge}\n")).unwrap();
         net
@@ -1375,7 +1375,7 @@ mod port_mac_tests {
     /// bridge address accepted alongside it.
     #[test]
     fn a_bridge_member_keeps_its_own_primary_and_accepts_the_bridges() {
-        let net = enslaved("master", "28:70:4e:47:69:c7");
+        let net = enslaved("master", "02:11:22:33:44:c7");
         let (primary, accept) = port_macs(&net, "eth4").unwrap();
         assert_eq!(
             primary, OWN,
@@ -1392,7 +1392,7 @@ mod port_mac_tests {
     #[test]
     fn a_plain_l3_port_has_no_secondary() {
         let net = fixture("plain");
-        std::fs::write(net.join("eth4/address"), "28:70:4e:47:69:ca\n").unwrap();
+        std::fs::write(net.join("eth4/address"), "02:11:22:33:44:ca\n").unwrap();
         let (primary, accept) = port_macs(&net, "eth4").unwrap();
         assert_eq!(primary, OWN);
         assert!(accept.is_empty(), "no master, nothing extra to accept");
@@ -1404,7 +1404,7 @@ mod port_mac_tests {
     /// secondary would be a duplicate, which some drivers refuse.
     #[test]
     fn a_bridge_wearing_this_ports_mac_adds_nothing() {
-        let net = enslaved("same", "28:70:4e:47:69:ca");
+        let net = enslaved("same", "02:11:22:33:44:ca");
         let (primary, accept) = port_macs(&net, "eth4").unwrap();
         assert_eq!(primary, OWN);
         assert!(accept.is_empty(), "same address — no second entry");

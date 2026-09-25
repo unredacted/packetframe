@@ -290,12 +290,12 @@ pub fn mask_for(prefix_len: u8) -> u32 {
 /// was already right.
 ///
 /// The bytes below are the ground truth, read back with `GRXCLSRULE`
-/// from a rule `ethtool` inserted for source `23.191.200.0/24` to VF 0
+/// from a rule `ethtool` inserted for source `192.0.2.0/24` to VF 0
 /// on 2026-08-06:
 ///
 /// ```text
 /// flow_type  : 0d 00 00 00
-/// h_u[0:16]  : 17 bf c8 00 00 00 00 00 00 00 00 00 00 01 00 00
+/// h_u[0:16]  : c0 00 02 00 00 00 00 00 00 00 00 00 00 01 00 00
 /// m_u[0:16]  : ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00
 /// ring_cookie: 00 00 00 00 01 00 00 00
 /// ```
@@ -1916,7 +1916,7 @@ mod tests {
 
     fn rule(side: Side, loc: u32) -> SteerRule {
         SteerRule {
-            prefix: Ipv4Addr::new(23, 191, 200, 0),
+            prefix: Ipv4Addr::new(192, 0, 2, 0),
             prefix_len: 24,
             side,
             location: loc,
@@ -1954,13 +1954,13 @@ mod tests {
         let src = flow_spec(&rule(Side::Src, 10), 0);
         let dst = flow_spec(&rule(Side::Dst, 11), 0);
 
-        assert_eq!(&src.h_u.hdata[0..4], &[23, 191, 200, 0], "ip4src");
+        assert_eq!(&src.h_u.hdata[0..4], &[192, 0, 2, 0], "ip4src");
         assert_eq!(
             &src.h_u.hdata[4..8],
             &[0, 0, 0, 0],
             "src rule leaves ip4dst unset"
         );
-        assert_eq!(&dst.h_u.hdata[4..8], &[23, 191, 200, 0], "ip4dst");
+        assert_eq!(&dst.h_u.hdata[4..8], &[192, 0, 2, 0], "ip4dst");
         assert_eq!(
             &dst.h_u.hdata[0..4],
             &[0, 0, 0, 0],
@@ -2178,7 +2178,7 @@ mod tests {
         sys::reset();
 
         let allow = [IpPrefix::V4 {
-            addr: [23, 191, 200, 0],
+            addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
         let src = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Src)
@@ -3448,7 +3448,7 @@ mod tests {
     fn adopted_locations_are_what_unsteer_removes() {
         use crate::runtime::Steering as _;
         let allow = vec![IpPrefix::V4 {
-            addr: [23, 191, 200, 0],
+            addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
         let plan = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)

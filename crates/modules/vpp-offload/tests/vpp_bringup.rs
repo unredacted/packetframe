@@ -42,7 +42,7 @@ use packetframe_vpp_offload::VppOffloadConfig;
 /// path has something to plan; these tests keep every port `steer off`
 /// except the one that exercises it.
 const ALLOW: [IpPrefix; 1] = [IpPrefix::V4 {
-    addr: [23, 191, 200, 0],
+    addr: [192, 0, 2, 0],
     prefix_len: 24,
 }];
 
@@ -103,7 +103,7 @@ impl Host {
             let last = iface.as_bytes()[iface.len() - 1];
             fs::write(
                 net.join(iface).join("address"),
-                format!("58:d6:1f:4f:cd:{last:02x}\n"),
+                format!("02:55:66:77:88:{last:02x}\n"),
             )
             .unwrap();
             let pci_dev = devices.join(pci);
@@ -709,7 +709,7 @@ fn a_steer_on_port_with_nothing_steerable_is_refused() {
     let cfg = host.cfg(&[("eth4", 1, false), ("eth5", 1, true)]);
 
     let v6_only = [IpPrefix::V6 {
-        addr: [0x26, 0x02, 0xf7, 0xd8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         prefix_len: 48,
     }];
     let e = bring_up(

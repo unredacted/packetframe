@@ -637,11 +637,11 @@ mod tests {
     #[test]
     fn mac_parses_and_refuses() {
         assert_eq!(
-            parse_mac("28:70:4e:47:69:c7"),
-            Some([0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7])
+            parse_mac("02:11:22:33:44:c7"),
+            Some([0x02, 0x11, 0x22, 0x33, 0x44, 0xc7])
         );
-        assert_eq!(parse_mac("28:70:4e:47:69"), None);
-        assert_eq!(parse_mac("28:70:4e:47:69:c7:00"), None);
+        assert_eq!(parse_mac("02:11:22:33:44"), None);
+        assert_eq!(parse_mac("02:11:22:33:44:c7:00"), None);
         assert_eq!(parse_mac("zz:70:4e:47:69:c7"), None);
         assert_eq!(parse_mac(""), None);
     }

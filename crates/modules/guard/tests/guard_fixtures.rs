@@ -198,7 +198,7 @@ fn arp_burst_depletes_per_target_and_enforces() {
     }
     let mut h = Harness::new();
     h.set_guard_cfg(LO_IFINDEX, full_enforce_cfg());
-    let target_a = common::arp_request(OWN_MAC, [206, 81, 82, 21]);
+    let target_a = common::arp_request(OWN_MAC, [198, 51, 100, 21]);
     // Burst 3: three conforming requests pass...
     for i in 0..3 {
         let (verdict, _) = h.run(&target_a);
@@ -210,7 +210,7 @@ fn arp_burst_depletes_per_target_and_enforces() {
     assert_eq!(verdict, TC_ACT_SHOT);
     assert_eq!(h.stat(idx::ARP_DROP), 1);
     // A different target has its own budget.
-    let (verdict, _) = h.run(&common::arp_request(OWN_MAC, [206, 81, 81, 10]));
+    let (verdict, _) = h.run(&common::arp_request(OWN_MAC, [198, 51, 100, 10]));
     assert_eq!(verdict, TC_ACT_OK);
     assert_eq!(h.stat(idx::ARP_PASS), 4);
 }
@@ -232,7 +232,7 @@ fn arp_monitor_counts_would_drops_identically() {
             },
         ),
     );
-    let pkt = common::arp_request(OWN_MAC, [206, 81, 82, 21]);
+    let pkt = common::arp_request(OWN_MAC, [198, 51, 100, 21]);
     for _ in 0..2 {
         let (verdict, _) = h.run(&pkt);
         assert_eq!(verdict, TC_ACT_OK);
@@ -266,7 +266,7 @@ fn gcra_refills_after_the_interval() {
             },
         ),
     );
-    let pkt = common::arp_request(OWN_MAC, [206, 81, 82, 21]);
+    let pkt = common::arp_request(OWN_MAC, [198, 51, 100, 21]);
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, TC_ACT_OK);
     let (verdict, _) = h.run(&pkt);
@@ -301,7 +301,7 @@ fn ns_is_classified_and_arp_replies_fall_through() {
     // An ARP reply is not a request: it lands in the catch-all
     // (broadcast dst), not the NDP buckets.
     let before = h.snapshot();
-    let (verdict, _) = h.run(&common::arp_reply(OWN_MAC, [206, 81, 82, 21]));
+    let (verdict, _) = h.run(&common::arp_reply(OWN_MAC, [198, 51, 100, 21]));
     assert_eq!(verdict, TC_ACT_OK);
     let after = h.snapshot();
     assert_eq!(
@@ -321,7 +321,7 @@ fn vlan_tagged_arp_is_still_classified() {
     }
     let mut h = Harness::new();
     h.set_guard_cfg(LO_IFINDEX, full_enforce_cfg());
-    let tagged = common::insert_vlan_tag(&common::arp_request(OWN_MAC, [206, 81, 82, 21]), 3998);
+    let tagged = common::insert_vlan_tag(&common::arp_request(OWN_MAC, [198, 51, 100, 21]), 3998);
     let (verdict, _) = h.run(&tagged);
     assert_eq!(verdict, TC_ACT_OK);
     assert_eq!(h.stat(idx::ARP_PASS), 1);
@@ -338,7 +338,7 @@ fn truncated_arp_fails_open_with_its_own_counter() {
     // ARP ethertype, but the header is cut short of the 28-byte
     // minimum. Note the frame still passes foreign-src (own MAC) —
     // fail open means pass, attributed to err_parse_arp.
-    let mut runt = common::arp_request(OWN_MAC, [206, 81, 82, 21]);
+    let mut runt = common::arp_request(OWN_MAC, [198, 51, 100, 21]);
     runt.truncate(24);
     let (verdict, _) = h.run(&runt);
     assert_eq!(verdict, TC_ACT_OK);
@@ -402,12 +402,12 @@ fn every_frame_lands_in_exactly_one_terminal_counter() {
         common::unicast_ipv4(OWN_MAC, [0x02, 0, 0, 0, 0, 9]),
         common::unicast_ipv4(FOREIGN_MAC, [0x02, 0, 0, 0, 0, 9]),
         common::lldp_frame(OWN_MAC),
-        common::arp_request(OWN_MAC, [206, 81, 82, 21]),
-        common::arp_request(OWN_MAC, [206, 81, 82, 21]),
-        common::arp_request(OWN_MAC, [206, 81, 82, 21]),
-        common::arp_request(OWN_MAC, [206, 81, 82, 21]), // 4th: clamp
-        common::arp_request(FOREIGN_MAC, [206, 81, 81, 10]),
-        common::arp_reply(OWN_MAC, [206, 81, 82, 21]),
+        common::arp_request(OWN_MAC, [198, 51, 100, 21]),
+        common::arp_request(OWN_MAC, [198, 51, 100, 21]),
+        common::arp_request(OWN_MAC, [198, 51, 100, 21]),
+        common::arp_request(OWN_MAC, [198, 51, 100, 21]), // 4th: clamp
+        common::arp_request(FOREIGN_MAC, [198, 51, 100, 10]),
+        common::arp_reply(OWN_MAC, [198, 51, 100, 21]),
         common::ns_frame(OWN_MAC, [0x20; 16]),
         common::broadcast_misc(OWN_MAC),
         {

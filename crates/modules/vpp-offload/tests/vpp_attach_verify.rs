@@ -1114,12 +1114,12 @@ fn a_bridge_members_second_mac_is_added_not_substituted() {
     );
     let mut t = fake.connect();
     let mut p = ports();
-    p[0].accept_macs = vec![[0x28, 0x70, 0x4e, 0x47, 0x69, 0xc7]];
+    p[0].accept_macs = vec![[0x02, 0x11, 0x22, 0x33, 0x44, 0xc7]];
     attach_ports(&mut t, &p, &[], AttachMode::Fresh, TEST_LOOP_IDX).expect("attach");
 
     let seen = fake.observed();
     assert!(
-        seen.contains(&"secondary_mac idx=7 mac=28:70:4e:47:69:c7 add=1".to_string()),
+        seen.contains(&"secondary_mac idx=7 mac=02:11:22:33:44:c7 add=1".to_string()),
         "the bridge address must be ADDED to the member: {seen:?}"
     );
     // And the primary is still the port's own — the readback the fake

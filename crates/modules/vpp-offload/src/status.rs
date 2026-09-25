@@ -4070,7 +4070,7 @@ mod tests {
         assert!(render_metrics(&s, "vpp-offload")
             .contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0"));
 
-        s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        s.drift_uncovered = vec!["203.0.113.0/24 via vti64 (table 100)".into()];
         s.drift_routes = 1;
         let report = s.report();
         let row = report
@@ -4200,7 +4200,7 @@ mod tests {
         // stale — presenting the last good list as current hides both
         // a route added since and one already gone (review finding).
         let mut both = s.clone();
-        both.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        both.drift_uncovered = vec!["203.0.113.0/24 via vti64 (table 100)".into()];
         both.drift_routes = 1;
         both.drift_unreadable = Some("netlink recv: EIO".into());
         let msg = both
@@ -4236,7 +4236,7 @@ mod tests {
 
         // Findings outrank the read failure: when the scan DID run and
         // found something, that is the more actionable line.
-        s.drift_uncovered = vec!["23.191.201.0/24 via vti64 (table 100)".into()];
+        s.drift_uncovered = vec!["203.0.113.0/24 via vti64 (table 100)".into()];
         let report = s.report();
         let rows: Vec<_> = report
             .subsystems

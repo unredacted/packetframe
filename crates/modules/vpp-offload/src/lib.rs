@@ -1740,7 +1740,7 @@ mod tests {
         // `steer off` is the staging state and installs nothing, so its
         // table is not a constraint on the plan.
         let v4 = [packetframe_common::fib::IpPrefix::V4 {
-            addr: [10, 88, 1, 0],
+            addr: [198, 51, 100, 0],
             prefix_len: 24,
         }];
         assert_eq!(ifaces_to_query(&cfg, &v4), vec!["eth4"]);
@@ -2360,7 +2360,7 @@ mod tests {
         let mut lr = base.clone();
         lr.local_routes.push((
             packetframe_common::config::Ipv4Prefix {
-                addr: std::net::Ipv4Addr::new(23, 191, 200, 0),
+                addr: std::net::Ipv4Addr::new(192, 0, 2, 0),
                 prefix_len: 24,
             },
             "eth4".into(),
@@ -2594,7 +2594,7 @@ mod tests {
         on.ports[0].4 = Some(packetframe_common::config::VppSteerDirection::Dst);
         on.ports[1].4 = Some(packetframe_common::config::VppSteerDirection::Src);
         let allow = vec![packetframe_common::fib::IpPrefix::V4 {
-            addr: [23, 191, 200, 0],
+            addr: [192, 0, 2, 0],
             prefix_len: 24,
         }];
         let t = steering_target(&on, &allow, ntuple::rule_table).expect("both plans fit");

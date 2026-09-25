@@ -383,12 +383,12 @@ mod tests {
     #[test]
     fn a_plan_covers_both_directions_and_reports_skipped_v6() {
         let allow = vec![
-            v4(23, 191, 200, 0, 24),
+            v4(192, 0, 2, 0, 24),
             IpPrefix::V6 {
-                addr: [0x26, 0x02, 0xf7, 0xd8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 prefix_len: 48,
             },
-            v4(10, 88, 1, 0, 24),
+            v4(198, 51, 100, 0, 24),
         ];
         let set = RuleSet::plan(&allow, &[], McamBudget::default(), VppSteerDirection::Both)
             .expect("fits");
@@ -435,9 +435,9 @@ mod tests {
     #[test]
     fn exemptions_outrank_diversions_and_include_the_operators() {
         use packetframe_common::config::Ipv4Prefix;
-        let allow = vec![v4(23, 191, 200, 0, 24)];
+        let allow = vec![v4(192, 0, 2, 0, 24)];
         let exempts = vec![Ipv4Prefix {
-            addr: std::net::Ipv4Addr::new(23, 191, 200, 1),
+            addr: std::net::Ipv4Addr::new(192, 0, 2, 1),
             prefix_len: 32,
         }];
         let set = RuleSet::plan(
@@ -479,7 +479,7 @@ mod tests {
         assert!(keep_prefixes.contains(&(std::net::Ipv4Addr::new(255, 255, 255, 255), 32)));
         assert!(keep_prefixes.contains(&(std::net::Ipv4Addr::new(224, 0, 0, 0), 4)));
         assert!(
-            keep_prefixes.contains(&(std::net::Ipv4Addr::new(23, 191, 200, 1), 32)),
+            keep_prefixes.contains(&(std::net::Ipv4Addr::new(192, 0, 2, 1), 32)),
             "the operator's gateway exemption is the one that rescues DHCP renews and \
              monitoring replies (w23: 110,917 blackholed in five minutes without it)"
         );

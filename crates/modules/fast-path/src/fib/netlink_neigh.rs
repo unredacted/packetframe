@@ -1347,7 +1347,7 @@ impl NetlinkNeighborResolver {
                 1u32 << host_bits
             };
             // Mask off any host bits the operator left set in the
-            // declared CIDR, treat 23.191.200.5/24 as 23.191.200.0/24.
+            // declared CIDR, treat 192.0.2.5/24 as 192.0.2.0/24.
             let mask: u32 = if plen == 0 {
                 0
             } else {
@@ -2115,16 +2115,16 @@ mod tests {
     #[test]
     fn local_prefix_contains_basic_ipv4() {
         let spec = LocalPrefixSpec {
-            addr: "23.191.200.0".parse().unwrap(),
-            prefix_len: 24,
+            addr: "192.0.2.64".parse().unwrap(),
+            prefix_len: 26,
             iface: "br1337".into(),
             arp_scavenge: false,
         };
-        assert!(spec.contains("23.191.200.0".parse().unwrap()));
-        assert!(spec.contains("23.191.200.10".parse().unwrap()));
-        assert!(spec.contains("23.191.200.255".parse().unwrap()));
-        assert!(!spec.contains("23.191.201.0".parse().unwrap()));
-        assert!(!spec.contains("23.191.199.255".parse().unwrap()));
+        assert!(spec.contains("192.0.2.64".parse().unwrap()));
+        assert!(spec.contains("192.0.2.74".parse().unwrap()));
+        assert!(spec.contains("192.0.2.127".parse().unwrap()));
+        assert!(!spec.contains("192.0.2.128".parse().unwrap()));
+        assert!(!spec.contains("192.0.2.63".parse().unwrap()));
     }
 
     #[test]
@@ -2157,16 +2157,16 @@ mod tests {
 
     #[test]
     fn local_prefix_contains_misalignment_is_treated_as_aligned() {
-        // Operator wrote `local-prefix 23.191.200.5/24` (host bits
+        // Operator wrote `local-prefix 192.0.2.5/24` (host bits
         // set). The mask logic ignores host bits when comparing
-        // semantically the prefix is still 23.191.200.0/24.
+        // semantically the prefix is still 192.0.2.0/24.
         let spec = LocalPrefixSpec {
-            addr: "23.191.200.5".parse().unwrap(),
+            addr: "192.0.2.5".parse().unwrap(),
             prefix_len: 24,
             iface: "br1337".into(),
             arp_scavenge: false,
         };
-        assert!(spec.contains("23.191.200.10".parse().unwrap()));
+        assert!(spec.contains("192.0.2.10".parse().unwrap()));
     }
 
     // --- local-prefix6 (IPv6 connected fast-path) ------------------------
@@ -2182,13 +2182,13 @@ mod tests {
 
     #[test]
     fn local_prefix6_contains_basic() {
-        let spec = spec6("2602:f7d8:0:1337::", 64, "br1337");
-        assert!(spec.contains("2602:f7d8:0:1337::1".parse().unwrap()));
-        assert!(spec.contains("2602:f7d8:0:1337:dead:beef::42".parse().unwrap()));
-        assert!(!spec.contains("2602:f7d8:0:1338::1".parse().unwrap()));
-        // The adjacent /48 must not match: 2602:f7d8:1:: is a different
+        let spec = spec6("2001:db8:0:1337::", 64, "br1337");
+        assert!(spec.contains("2001:db8:0:1337::1".parse().unwrap()));
+        assert!(spec.contains("2001:db8:0:1337:dead:beef::42".parse().unwrap()));
+        assert!(!spec.contains("2001:db8:0:1338::1".parse().unwrap()));
+        // The adjacent /48 must not match: 2001:db8:1:: is a different
         // allocation, not part of this segment.
-        assert!(!spec.contains("2602:f7d8:1::1".parse().unwrap()));
+        assert!(!spec.contains("2001:db8:1::1".parse().unwrap()));
     }
 
     #[test]
@@ -2210,8 +2210,8 @@ mod tests {
 
     #[test]
     fn local_prefix6_contains_misalignment_is_treated_as_aligned() {
-        let spec = spec6("2602:f7d8:0:1337::5", 64, "br1337");
-        assert!(spec.contains("2602:f7d8:0:1337::10".parse().unwrap()));
+        let spec = spec6("2001:db8:0:1337::5", 64, "br1337");
+        assert!(spec.contains("2001:db8:0:1337::10".parse().unwrap()));
     }
 
     /// A spec must never match across families. The resolver walks one
@@ -2221,37 +2221,37 @@ mod tests {
     #[test]
     fn local_prefix_contains_rejects_family_mismatch_both_ways() {
         let v4 = LocalPrefixSpec {
-            addr: "23.191.200.0".parse().unwrap(),
+            addr: "192.0.2.0".parse().unwrap(),
             prefix_len: 24,
             iface: "br1337".into(),
             arp_scavenge: false,
         };
-        assert!(!v4.contains("2602:f7d8:0:1337::1".parse().unwrap()));
+        assert!(!v4.contains("2001:db8:0:1337::1".parse().unwrap()));
 
-        let v6 = spec6("2602:f7d8:0:1337::", 64, "br1337");
-        assert!(!v6.contains("23.191.200.10".parse().unwrap()));
+        let v6 = spec6("2001:db8:0:1337::", 64, "br1337");
+        assert!(!v6.contains("192.0.2.10".parse().unwrap()));
 
         // A v6 /0 spec still must not swallow v4 addresses, even though
         // its mask matches everything within its own family.
         let v6_default = spec6("::", 0, "br0");
-        assert!(!v6_default.contains("23.191.200.10".parse().unwrap()));
+        assert!(!v6_default.contains("192.0.2.10".parse().unwrap()));
     }
 
     #[test]
     fn host_prefix_is_maximally_specific_per_family() {
-        match host_prefix("23.191.200.7".parse().unwrap()) {
+        match host_prefix("192.0.2.7".parse().unwrap()) {
             IpPrefix::V4 { addr, prefix_len } => {
                 assert_eq!(prefix_len, 32);
-                assert_eq!(addr, [23, 191, 200, 7]);
+                assert_eq!(addr, [192, 0, 2, 7]);
             }
             other => panic!("expected V4, got {other:?}"),
         }
-        match host_prefix("2602:f7d8:0:1337::7".parse().unwrap()) {
+        match host_prefix("2001:db8:0:1337::7".parse().unwrap()) {
             IpPrefix::V6 { addr, prefix_len } => {
                 assert_eq!(prefix_len, 128);
                 assert_eq!(
                     addr,
-                    "2602:f7d8:0:1337::7"
+                    "2001:db8:0:1337::7"
                         .parse::<std::net::Ipv6Addr>()
                         .unwrap()
                         .octets()
@@ -2267,7 +2267,7 @@ mod tests {
     #[test]
     fn may_synthesize_gates_v6_but_never_v4() {
         // Every v4 address is fair game, including ones that look odd.
-        for a in ["23.191.200.7", "0.0.0.0", "255.255.255.255", "127.0.0.1"] {
+        for a in ["192.0.2.7", "0.0.0.0", "255.255.255.255", "127.0.0.1"] {
             assert!(may_synthesize(a.parse().unwrap()), "v4 {a}");
         }
         // v6 classes that must be filtered.
@@ -2283,9 +2283,9 @@ mod tests {
         }
         // v6 addresses that are legitimate connected hosts.
         for a in [
-            "2602:f7d8:0:1337::42",
-            "2602:f7d8:0:1337::", // subnet-router anycast
-            "fd00:1::1",          // unique-local
+            "2001:db8:0:1337::42",
+            "2001:db8:0:1337::", // subnet-router anycast
+            "fd00:1::1",         // unique-local
         ] {
             assert!(may_synthesize(a.parse().unwrap()), "v6 {a}");
         }
@@ -2311,11 +2311,11 @@ mod tests {
     #[test]
     fn match_local_prefix_requires_prefix_and_ifindex_to_agree() {
         let r = resolver_with(
-            vec![spec6("2602:f7d8:0:1337::", 64, "br1337")],
+            vec![spec6("2001:db8:0:1337::", 64, "br1337")],
             &[("br1337", 33)],
         );
-        let inside: IpAddr = "2602:f7d8:0:1337::7".parse().unwrap();
-        let outside: IpAddr = "2602:f7d8:0:9999::7".parse().unwrap();
+        let inside: IpAddr = "2001:db8:0:1337::7".parse().unwrap();
+        let outside: IpAddr = "2001:db8:0:9999::7".parse().unwrap();
 
         assert_eq!(
             r.match_local_prefix(inside, 33),
@@ -2338,9 +2338,9 @@ mod tests {
     fn match_local_prefix_returns_none_when_iface_unresolvable() {
         // Operator staged config before the bridge existed: the spec is
         // kept but cannot match until RTM_NEWLINK fills in the ifindex.
-        let r = resolver_with(vec![spec6("2602:f7d8:0:1337::", 64, "br-later")], &[]);
+        let r = resolver_with(vec![spec6("2001:db8:0:1337::", 64, "br-later")], &[]);
         assert_eq!(
-            r.match_local_prefix("2602:f7d8:0:1337::7".parse().unwrap(), 33),
+            r.match_local_prefix("2001:db8:0:1337::7".parse().unwrap(), 33),
             None
         );
     }
@@ -2354,17 +2354,17 @@ mod tests {
         let r = resolver_with(
             vec![
                 LocalPrefixSpec {
-                    addr: "23.191.200.0".parse().unwrap(),
+                    addr: "192.0.2.0".parse().unwrap(),
                     prefix_len: 24,
                     iface: "br1337".into(),
                     arp_scavenge: false,
                 },
-                spec6("2602:f7d8:0:1337::", 64, "br1337"),
+                spec6("2001:db8:0:1337::", 64, "br1337"),
             ],
             &[("br1337", 33)],
         );
-        let v4 = r.match_local_prefix("23.191.200.7".parse().unwrap(), 33);
-        let v6 = r.match_local_prefix("2602:f7d8:0:1337::7".parse().unwrap(), 33);
+        let v4 = r.match_local_prefix("192.0.2.7".parse().unwrap(), 33);
+        let v6 = r.match_local_prefix("2001:db8:0:1337::7".parse().unwrap(), 33);
         assert_eq!(v4, Some(PeerId::local_arp(33)));
         assert_eq!(v6, Some(PeerId::local_arp(33)));
         assert_eq!(v4, v6, "both families must resolve to the same peer");
