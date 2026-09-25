@@ -436,9 +436,25 @@ five steered minutes, plus 3,200 multicast frames (IGMP among them)
 RPF-dropped away from the kernel bridge's snooping. The exemptions are
 higher-priority MCAM rules that deliver matches to the kernel instead:
 broadcast and multicast are built in; each gateway IP of a steered
-VLAN needs a `steer-exempt` line. Budget math per steered port:
-(steerable v4 prefixes × directions) diversions + 2 built-ins + your
-`steer-exempt` entries must fit the port's table — 16 slots by default
+VLAN needs a `steer-exempt` line.
+
+Every diversion is also scoped to the **destination MAC** the router
+receives on for that port: the bridge's MAC (and any distinct MAC of a
+device carrying one of its VLANs) on a bridge member, the port's own MAC
+on a plain port. A bridge member hands the NIC every frame on the
+segment, including frames the kernel is only bridging between two hosts
+on one VLAN behind different trunks; an IP-only rule would divert those
+into VPP, whose split-horizon group drops them. With the MAC scope they
+never match and the kernel bridges them as before. On UniFi every bridge
+shares switch0's MAC, so this costs no extra rules; a box whose VLAN
+bridges carry different MACs gets one copy of each diversion per MAC.
+`ethtool -n <port>` shows the scope as `Dest MAC addr` on each divert
+rule. A port whose MAC cannot be read is refused rather than steered
+unscoped.
+
+Budget math per steered port: (steerable v4 prefixes × directions ×
+receive MACs) diversions + 2 built-ins + your `steer-exempt` entries must
+fit the port's table — 16 slots by default
 on this hardware, more with `steer-capacity` (see "Raising the rule
 budget" under "Constraints worth knowing before you debug"). A
 re-plan over ports that are already steered — a daemon restart that

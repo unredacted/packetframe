@@ -402,7 +402,7 @@ fn plan_and_report(
     let mut details = Vec::with_capacity(directions.len());
     let mut skipped_v6 = 0u32;
     for direction in directions {
-        match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction) {
+        match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction, &[]) {
             Ok(set) => {
                 skipped_v6 = set.skipped_v6;
                 let diverts = set

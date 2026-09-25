@@ -1655,6 +1655,7 @@ mod tests {
                     side: crate::steer::Side::Dst,
                     location: 1024,
                     action: crate::steer::RuleAction::Keep,
+                    dmac: None,
                 }],
                 skipped_v6: 0,
             },

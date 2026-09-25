@@ -3168,6 +3168,7 @@ mod vpp_detach_tests {
                     side: packetframe_vpp_offload::steer::Side::Dst,
                     location: 0,
                     action: packetframe_vpp_offload::steer::RuleAction::Keep,
+                    dmac: None,
                 }],
                 skipped_v6: 0,
             },

@@ -108,6 +108,91 @@ pub fn reachable_devices(
         .collect()
 }
 
+/// The destination MACs a frame addressed to the router carries when it
+/// arrives on `port`, for scoping the steering rules to them.
+///
+/// A bridge member receives more than the router's own frames: the
+/// kernel bridge forwards between its members, and a member in promisc
+/// hands the NIC every frame on the segment. A rule matching on IP alone
+/// would divert host-to-host frames the kernel is only bridging — two
+/// hosts on one VLAN behind different trunks — into VPP, where the
+/// split-horizon group drops them. What the router answers to is its L3
+/// devices' MACs: for a bridge member, the bridge's own MAC and that of
+/// every device carrying one of its VLANs; for a plain port, the port's
+/// own MAC and its VLAN devices'. Deduplicated and sorted: on a box whose
+/// VLAN devices share the bridge's MAC (UniFi) this is one MAC.
+pub fn receive_macs(
+    facts: &dyn LinkFacts,
+    devs: &[String],
+    port: &str,
+    master_of: impl Fn(&str) -> Option<String>,
+    mac_of: impl Fn(&str) -> Option<[u8; 6]>,
+) -> Vec<[u8; 6]> {
+    let master = master_of(port);
+    let root = master.as_deref().unwrap_or(port);
+    let mut macs: Vec<[u8; 6]> = mac_of(root).into_iter().collect();
+    for d in devs {
+        let carries = match (classify(facts, d), &master) {
+            (Some(DevKind::BridgeVlan { bridge, .. }), Some(m)) => &bridge == m,
+            (Some(DevKind::PortVlan { port: p, .. }), None) => p == port,
+            _ => false,
+        };
+        if carries {
+            macs.extend(mac_of(d));
+        }
+    }
+    macs.sort_unstable();
+    macs.dedup();
+    macs
+}
+
+/// [`receive_macs`] from a sysfs `class/net` root (`/sys/class/net` in
+/// production; a fixture in tests), with VLAN facts from the kernel
+/// where there is one. Empty when nothing could be read — the planner
+/// refuses to steer such a port rather than install rules that would
+/// divert bridged frames.
+pub fn sysfs_receive_macs(sysfs_net: &std::path::Path, port: &str) -> Vec<[u8; 6]> {
+    let master_of = |dev: &str| {
+        let link = std::fs::read_link(sysfs_net.join(dev).join("master")).ok()?;
+        Some(link.file_name()?.to_str()?.to_string())
+    };
+    let mac_of =
+        |dev: &str| parse_mac(&std::fs::read_to_string(sysfs_net.join(dev).join("address")).ok()?);
+    let mut devs: Vec<String> = std::fs::read_dir(sysfs_net)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    devs.sort();
+    #[cfg(target_os = "linux")]
+    if let Ok(links) = kernel_links() {
+        return receive_macs(&links, &devs, port, master_of, mac_of);
+    }
+    // No VLAN table: the root device's MAC alone, which is still the one
+    // every frame to the router carries on the common shapes.
+    receive_macs(&NoLinks, &devs, port, master_of, mac_of)
+}
+
+/// [`sysfs_receive_macs`] against the live kernel.
+pub fn kernel_receive_macs(port: &str) -> Vec<[u8; 6]> {
+    sysfs_receive_macs(std::path::Path::new("/sys/class/net"), port)
+}
+
+/// Link facts that know of no VLAN devices and no bridges.
+struct NoLinks;
+
+impl LinkFacts for NoLinks {
+    fn vlan(&self, _dev: &str) -> Option<(u16, String)> {
+        None
+    }
+    fn is_bridge(&self, _dev: &str) -> bool {
+        false
+    }
+    fn bridge_ports(&self, _dev: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// Every netdev on the box, for [`reachable_devices`].
 #[cfg(target_os = "linux")]
 pub fn all_netdevs() -> Vec<String> {
@@ -471,7 +556,6 @@ impl Topology for KernelTopology {
 }
 
 /// `aa:bb:cc:dd:ee:ff` as sysfs writes it.
-#[cfg(target_os = "linux")]
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let mut out = [0u8; 6];
     let mut parts = s.trim().split(':');
@@ -538,6 +622,87 @@ mod tests {
         f.vlans.insert("switch0.1337", (1337, "switch0"));
         f.vlans.insert("eth2.100", (100, "eth2"));
         f
+    }
+
+    /// A bridge member answers to its bridge's MAC and to every device
+    /// carrying one of the bridge's VLANs; a plain port to its own MAC and
+    /// its VLAN devices'. Never to another port's, and each MAC once.
+    #[test]
+    fn a_port_receives_on_its_l3_devices_macs() {
+        let mac = |b: u8| [0x02, 0, 0, 0, 0, b];
+        let devs: Vec<String> = [
+            "switch0",
+            "switch0.3998",
+            "switch0.1337",
+            "br3998",
+            "br1337",
+            "eth2",
+            "eth2.100",
+            "br100",
+            "eth3",
+            "eth4",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let master_of = |d: &str| matches!(d, "eth4" | "eth5").then(|| "switch0".to_string());
+        let mac_of = |d: &str| {
+            Some(match d {
+                "br1337" => mac(2), // a VLAN bridge with its own MAC
+                "switch0" | "switch0.3998" | "switch0.1337" | "br3998" => mac(1),
+                "eth2" | "eth2.100" => mac(0x20),
+                "br100" => mac(0x21),
+                "eth3" => mac(0x30),
+                "eth4" => mac(0x40),
+                _ => return None,
+            })
+        };
+        assert_eq!(
+            receive_macs(&edge(), &devs, "eth4", master_of, mac_of),
+            vec![mac(1), mac(2)],
+            "the bridge's MAC and its VLAN devices', not the port's own"
+        );
+        assert_eq!(
+            receive_macs(&edge(), &devs, "eth2", master_of, mac_of),
+            vec![mac(0x20), mac(0x21)]
+        );
+        assert_eq!(
+            receive_macs(&edge(), &devs, "eth3", master_of, mac_of),
+            vec![mac(0x30)]
+        );
+        assert!(receive_macs(&edge(), &devs, "eth9", master_of, mac_of).is_empty());
+    }
+
+    /// The sysfs-rooted lookup `bring_up` uses: a bridge member reads its
+    /// master's MAC through the `master` link, a plain port its own, and
+    /// a port with no readable address gets nothing (which the planner
+    /// refuses to steer).
+    #[test]
+    fn receive_macs_read_from_a_sysfs_root() {
+        let root = std::env::temp_dir().join(format!("pf-rxmac-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dev, mac) in [
+            ("switch0", "02:00:00:00:69:c7"),
+            ("eth4", "02:00:00:00:69:ca"),
+            ("eth2", "02:00:00:00:69:c8"),
+        ] {
+            std::fs::create_dir_all(root.join(dev)).unwrap();
+            std::fs::write(root.join(dev).join("address"), format!("{mac}\n")).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("switch0"), root.join("eth4").join("master")).unwrap();
+        std::fs::create_dir_all(root.join("eth9")).unwrap();
+
+        assert_eq!(
+            sysfs_receive_macs(&root, "eth4"),
+            vec![[0x02, 0, 0, 0, 0x69, 0xc7]],
+            "a bridge member receives on its bridge's MAC, not its own"
+        );
+        assert_eq!(
+            sysfs_receive_macs(&root, "eth2"),
+            vec![[0x02, 0, 0, 0, 0x69, 0xc8]]
+        );
+        assert!(sysfs_receive_macs(&root, "eth9").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
