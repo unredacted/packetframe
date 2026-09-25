@@ -398,6 +398,10 @@ pub struct StatusSnapshot {
     /// Neighbours moved behind another bridge port since start — each
     /// one a spanning-tree change VPP followed.
     pub neighbour_moves: u64,
+    /// Bridge neighbours placed by inference (never seen in the FDB, put
+    /// where most of their VLAN's learned MACs are). Informational: they
+    /// resolve, and the first real sighting replaces the guess.
+    pub neighbours_inferred: u64,
     /// Why the bridge FDB cannot be read, if it cannot. Degraded: the
     /// placements stand at the last good read, and a spanning-tree move
     /// made while blind would leave routes on the old trunk unnoticed.
@@ -486,6 +490,7 @@ impl StatusSnapshot {
             None,
             Vec::new(),
             0,
+            0,
             None,
             Vec::new(),
             0,
@@ -523,6 +528,7 @@ impl StatusSnapshot {
         null_drops: Option<u64>,
         neighbours_unplaced: Vec<String>,
         neighbour_moves: u64,
+        neighbours_inferred: u64,
         fdb_unreadable: Option<String>,
         drift_uncovered: Vec<String>,
         drift_routes: usize,
@@ -556,6 +562,7 @@ impl StatusSnapshot {
             null_drops,
             neighbours_unplaced,
             neighbour_moves,
+            neighbours_inferred,
             fdb_unreadable,
             drift_uncovered,
             drift_routes,
@@ -1884,6 +1891,16 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         out,
         "packetframe_vpp_neighbour_moves{{module=\"{module}\"}} {}",
         snap.neighbour_moves
+    );
+    gauge(
+        &mut out,
+        "packetframe_vpp_neighbours_inferred",
+        "bridge neighbours never seen in the FDB, placed where most of their VLAN's learned MACs are",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_neighbours_inferred{{module=\"{module}\"}} {}",
+        snap.neighbours_inferred
     );
 
     gauge(

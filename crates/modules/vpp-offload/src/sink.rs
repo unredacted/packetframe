@@ -287,6 +287,10 @@ pub struct Placement {
     pub bridge: String,
     pub vid: u16,
     pub port: String,
+    /// Not seen in the FDB: placed where most of the VLAN's learned MACs
+    /// are ([`crate::topology::FdbSnapshot::inferred_port`]). Replaced by
+    /// the first real sighting.
+    pub inferred: bool,
 }
 
 impl NexthopMap {
@@ -345,6 +349,13 @@ impl NexthopMap {
     /// Record where a `BridgeVlan` neighbour was seen.
     pub fn place(&mut self, nexthop: IpAddr, placement: Placement) {
         self.placed.insert(nexthop, placement);
+    }
+
+    /// The whole placement recorded for a neighbour on `bridge`/`vid`.
+    pub fn placed_on(&self, nexthop: &IpAddr, bridge: &str, vid: u16) -> Option<&Placement> {
+        self.placed
+            .get(nexthop)
+            .filter(|p| p.bridge == bridge && p.vid == vid)
     }
 
     /// The port a neighbour was last seen behind on `bridge`/`vid` — the
@@ -1034,6 +1045,7 @@ mod tests {
             bridge: "switch0".into(),
             vid: 3998,
             port: port.into(),
+            inferred: false,
         };
         m.place(a, at("eth4"));
         m.place(b, at("eth5"));
@@ -1092,6 +1104,7 @@ mod tests {
                 bridge: "switch0".into(),
                 vid: 1,
                 port: "eth4".into(),
+                inferred: false,
             },
         );
         assert_eq!(

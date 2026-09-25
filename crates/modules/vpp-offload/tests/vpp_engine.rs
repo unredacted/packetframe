@@ -2033,3 +2033,101 @@ fn an_untagged_vlan_neighbour_lands_on_the_vf() {
     );
     assert!(e.unplaced_neighbours().is_empty());
 }
+
+/// A neighbour the FDB has never shown — silent longer than the bridge's
+/// ageing time, as many IX routers are between ARP refreshes — is placed
+/// where its VLAN's learned MACs are, marked inferred, and resolves; the
+/// first real sighting replaces the guess (moving it if the guess was
+/// wrong).
+#[test]
+fn a_silent_neighbour_is_inferred_onto_its_vlans_majority_port() {
+    const QUIET: [u8; 6] = [0x02, 0, 0, 0, 0, 0x99];
+    struct Src;
+    impl RouteSource for Src {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(
+                IpPrefix::V4 {
+                    addr: [203, 0, 113, 0],
+                    prefix_len: 24,
+                },
+                &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))],
+            );
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), "br3998", QUIET);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn route_count(&self) -> u64 {
+            1
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let trunk = |port: &str, n: u8| PortAttach {
+        port: port.into(),
+        pci_addr: format!("0002:07:00.{n}"),
+        port_id: 0,
+        num_rx_queues: 1,
+        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n],
+        accept_macs: vec![],
+        mtu: None,
+        vlans: vec![3998],
+    };
+    // Three OTHER peers learned, all behind eth5; the quiet one is not.
+    let others = [
+        (3998, [0x02, 0, 0, 0, 1, 1], "eth5"),
+        (3998, [0x02, 0, 0, 0, 1, 2], "eth5"),
+        (3998, [0x02, 0, 0, 0, 1, 3], "eth5"),
+    ];
+    let fdb = std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&others))));
+    let fake = Fake::start("inferred");
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![trunk("eth4", 1), trunk("eth5", 2)],
+        vec!["eth4".into(), "eth5".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br3998", bridge_vlan(3998))],
+        fdb: fdb.clone(),
+        vlans: Default::default(),
+    }));
+    let (eth4_sub, eth5_sub) = (SUBIF_BASE, SUBIF_BASE + 1);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&Src);
+    e.program_neighbours(&Src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 0, "inferred, so it resolves");
+    assert!(e.unplaced_neighbours().is_empty());
+    assert_eq!(e.inferred_neighbours(), 1);
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(
+            |ev| matches!(ev, Event::Neighbour { sw_if_index, mac, is_add: true, .. }
+            if *sw_if_index == eth5_sub && *mac == QUIET)
+        ),
+        "inferred behind eth5 with the rest of the VLAN: {events:?}"
+    );
+
+    // It speaks up — from behind eth4. The guess was wrong: it moves.
+    let mut learned = others.to_vec();
+    learned.push((3998, QUIET, "eth4"));
+    *fdb.lock().unwrap() = Ok(fdb_with(&learned));
+    assert_eq!(e.refresh_placement(&Src).expect("refresh"), 1);
+    assert_eq!(
+        e.inferred_neighbours(),
+        0,
+        "a real sighting replaces the guess"
+    );
+    assert!(fake.drain_events().iter().any(|ev| matches!(ev,
+        Event::Neighbour { sw_if_index, is_add: true, .. } if *sw_if_index == eth4_sub)));
+}

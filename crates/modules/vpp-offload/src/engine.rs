@@ -831,10 +831,12 @@ impl ConvergenceEngine {
         self.fdb_error.as_deref()
     }
 
-    /// Where the FDB puts `(dev, mac)`, for a `BridgeVlan` device — or
-    /// `nh`'s existing placement on the same bridge and VLAN when the FDB
-    /// has no entry (aged out, flushed by a spanning-tree change): the
-    /// last known port.
+    /// Where `(dev, mac)` is, for a `BridgeVlan` device, in order of
+    /// evidence: the FDB's own entry; else the neighbour's last known port
+    /// on the same bridge and VLAN (aged out, flushed by a spanning-tree
+    /// change); else, for a neighbour the FDB has never shown, the port
+    /// most of that VLAN's learned MACs are behind — marked inferred, and
+    /// replaced by the first real sighting.
     ///
     /// `reread` takes the latest FDB on a miss, for the delta path, where
     /// a neighbour can be learned between refreshes. Cheap: the live
@@ -851,21 +853,25 @@ impl ConvergenceEngine {
         else {
             return None;
         };
-        let at = |port: &str| crate::sink::Placement {
+        let at = |port: &str, inferred: bool| crate::sink::Placement {
             bridge: bridge.clone(),
             vid,
             port: port.to_string(),
+            inferred,
         };
         if let Some(p) = self.fdb.port_of(&bridge, vid, mac) {
-            return Some(at(p));
+            return Some(at(p, false));
         }
         if reread {
             self.read_fdb();
             if let Some(p) = self.fdb.port_of(&bridge, vid, mac) {
-                return Some(at(p));
+                return Some(at(p, false));
             }
         }
-        self.nexthops.placement_on(&nh, &bridge, vid).map(at)
+        if let Some(last) = self.nexthops.placed_on(&nh, &bridge, vid) {
+            return Some(last.clone());
+        }
+        self.fdb.inferred_port(&bridge, vid).map(|p| at(p, true))
     }
 
     /// Follow neighbours that moved behind a different bridge port.
@@ -905,6 +911,18 @@ impl ConvergenceEngine {
                 continue;
             };
             let before = self.nexthops.placement(&ip).map(str::to_string);
+            if before.as_deref() == Some(placed.port.as_str()) {
+                // Same port, now confirmed by the FDB (or the reverse):
+                // the record changes, VPP does not.
+                let (bridge, vid) = (placed.bridge.clone(), placed.vid);
+                if self
+                    .nexthops
+                    .placed_on(&ip, &bridge, vid)
+                    .is_some_and(|p| p.inferred != placed.inferred)
+                {
+                    self.nexthops.place(ip, placed.clone());
+                }
+            }
             if before.as_deref() != Some(placed.port.as_str()) {
                 let to = placed.port.clone();
                 self.move_neighbour(ip, &dev, mac, placed)?;
@@ -1013,6 +1031,22 @@ impl ConvergenceEngine {
                 (nh, dev, port)
             })
             .collect()
+    }
+
+    /// Bridge neighbours placed by inference — never seen in the FDB, put
+    /// where their VLAN's learned MACs are.
+    pub fn inferred_neighbours(&self) -> usize {
+        self.nexthops
+            .bridge_nexthops()
+            .iter()
+            .filter(|(nh, _)| {
+                self.nexthops.bridge_vlan(nh).is_some_and(|(b, v)| {
+                    self.nexthops
+                        .placed_on(nh, b, v)
+                        .is_some_and(|p| p.inferred)
+                })
+            })
+            .count()
     }
 
     /// Neighbours moved behind another bridge port since start.

@@ -713,6 +713,17 @@ fdb: degraded — bridge neighbour(s) the kernel FDB has not placed behind
 any member port: 198.51.100.6 on br3998 — VPP cannot reach them, …
 ```
 
+A neighbour the FDB has **never** shown — silent for longer than the
+bridge's 300 s ageing time, which plenty of routers are between ARP
+refreshes (Cisco's default is four hours) — is placed where its VLAN's
+learned MACs are: on the port holding at least two thirds of them, with
+at least three learned. On an IX VLAN reachable through one trunk that
+is every learned MAC, so the guess is as good as a sighting; on a VLAN
+split across trunks it is a best guess the neighbour's first frame
+corrects. Without it, one quiet IX peer leaves its routes unresolvable
+and blocks the first steer. `packetframe_vpp_neighbours_inferred` counts
+these.
+
 `packetframe_vpp_neighbours_unplaced` counts neighbours VPP cannot
 reach — never seen in the FDB, or seen behind a port that is not a
 member or lacks the VLAN's subif (the row names that port); `packetframe_vpp_neighbour_moves` counts

@@ -125,18 +125,61 @@ pub fn all_netdevs() -> Vec<String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FdbSnapshot {
     ports: HashMap<(String, u16, [u8; 6]), String>,
+    /// Per `(bridge, vid)`: the port holding a clear majority of that
+    /// VLAN's learned MACs, if one does. See [`Self::inferred_port`].
+    majority: HashMap<(String, u16), String>,
 }
+
+/// Fewest learned MACs on a VLAN before its majority port means anything.
+pub const INFER_MIN_LEARNED: usize = 3;
 
 impl FdbSnapshot {
     /// From learned entries only: `(bridge, vid, mac, port)`. Permanent
     /// entries are the bridge's own addresses, not neighbours.
     pub fn from_learned(entries: impl IntoIterator<Item = (String, u16, [u8; 6], String)>) -> Self {
-        Self {
-            ports: entries
-                .into_iter()
-                .map(|(bridge, vid, mac, port)| ((bridge, vid, mac), port))
-                .collect(),
+        let ports: HashMap<(String, u16, [u8; 6]), String> = entries
+            .into_iter()
+            .map(|(bridge, vid, mac, port)| ((bridge, vid, mac), port))
+            .collect();
+        let mut tally: HashMap<(String, u16), HashMap<&str, usize>> = HashMap::new();
+        for ((bridge, vid, _), port) in &ports {
+            *tally
+                .entry((bridge.clone(), *vid))
+                .or_default()
+                .entry(port.as_str())
+                .or_default() += 1;
         }
+        let majority = tally
+            .into_iter()
+            .filter_map(|(key, by_port)| {
+                let total: usize = by_port.values().sum();
+                let (port, top) = by_port
+                    .into_iter()
+                    .max_by_key(|(p, n)| (*n, std::cmp::Reverse(*p)))?;
+                (total >= INFER_MIN_LEARNED && top * 3 >= total * 2)
+                    .then(|| (key, port.to_string()))
+            })
+            .collect();
+        Self { ports, majority }
+    }
+
+    /// Where a MAC the FDB has NOT learned on `bridge`/`vid` most likely
+    /// is: the port holding at least two thirds of that VLAN's learned
+    /// MACs (and at least [`INFER_MIN_LEARNED`] of them).
+    ///
+    /// For the neighbour that has been silent longer than the bridge's
+    /// ageing time — 300 s here, while plenty of routers refresh ARP
+    /// every few hours — so the FDB forgot it while the kernel neighbour
+    /// table (and neigh-snoop) still hold it. Left unplaced, every route
+    /// through it is unresolvable, and one such IX peer blocks the first
+    /// steer. An IX VLAN reachable through one trunk has every learned
+    /// MAC behind that trunk, so the answer there is certain in all but
+    /// name; on a VLAN split across trunks it is a best guess that the
+    /// neighbour's first frame corrects.
+    pub fn inferred_port(&self, bridge: &str, vid: u16) -> Option<&str> {
+        self.majority
+            .get(&(bridge.to_string(), vid))
+            .map(String::as_str)
     }
 
     /// The port `mac` is learned on in `bridge`'s FDB for `vid`.
@@ -513,6 +556,34 @@ mod tests {
         assert_eq!(v.untagged("eth4"), vec![1]);
         assert_eq!(v.tagged("eth5"), vec![3998]);
         assert!(v.tagged("eth9").is_empty());
+    }
+
+    #[test]
+    fn a_vlan_with_a_clear_majority_port_infers_it() {
+        let mac = |n: u8| [0x02, 0, 0, 0, 0, n];
+        let fdb = FdbSnapshot::from_learned(
+            (1..=9)
+                .map(|n| ("switch0".to_string(), 3998, mac(n), "eth5".to_string()))
+                .chain((1..=2).map(|n| ("switch0".to_string(), 1337, mac(n), "eth4".to_string())))
+                .chain((3..=5).map(|n| ("switch0".to_string(), 88, mac(n), "eth4".to_string())))
+                .chain((6..=8).map(|n| ("switch0".to_string(), 88, mac(n), "eth5".to_string()))),
+        );
+        assert_eq!(
+            fdb.inferred_port("switch0", 3998),
+            Some("eth5"),
+            "unanimous"
+        );
+        assert_eq!(
+            fdb.inferred_port("switch0", 1337),
+            None,
+            "too few to mean anything"
+        );
+        assert_eq!(
+            fdb.inferred_port("switch0", 88),
+            None,
+            "an even split is no majority"
+        );
+        assert_eq!(fdb.inferred_port("switch0", 99), None, "nothing learned");
     }
 
     #[test]
