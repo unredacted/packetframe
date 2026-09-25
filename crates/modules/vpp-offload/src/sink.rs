@@ -260,6 +260,11 @@ pub struct NexthopMap {
     /// Each member's declared `vlans`: the only subifs attach creates, so
     /// the only VLAN targets that can resolve.
     port_vlans: BTreeMap<String, Vec<u16>>,
+    /// VLANs each member sends UNTAGGED (its bridge PVID, typically 1):
+    /// a neighbour placed behind the port on one of these is reached
+    /// through the port's own VF, since a tagged subif would put a tag
+    /// on a frame the wire expects bare.
+    port_untagged: BTreeMap<String, Vec<u16>>,
     /// Devices classified by [`crate::topology::classify`]. `Some(None)`
     /// is a shape VPP cannot reach through; a device with no entry at all
     /// is treated as [`DevKind::Plain`], which is what every device was
@@ -296,6 +301,29 @@ impl NexthopMap {
     pub fn with_port_vlans(mut self, vlans: impl IntoIterator<Item = (String, Vec<u16>)>) -> Self {
         self.port_vlans = vlans.into_iter().collect();
         self
+    }
+
+    /// Add subifs a `vlans all` trunk gained while running.
+    pub fn add_port_vlans(&mut self, port: &str, vlans: &[u16]) {
+        let have = self.port_vlans.entry(port.to_string()).or_default();
+        for v in vlans {
+            if !have.contains(v) {
+                have.push(*v);
+            }
+        }
+    }
+
+    /// Replace the VLANs `port` sends untagged, from the kernel bridge.
+    pub fn set_port_untagged(&mut self, port: &str, vlans: Vec<u16>) {
+        self.port_untagged.insert(port.to_string(), vlans);
+    }
+
+    /// Whether the kernel bridge sends `vid` out of `port` untagged —
+    /// reached through the VF itself, with no subif.
+    pub fn is_untagged(&self, port: &str, vid: u16) -> bool {
+        self.port_untagged
+            .get(port)
+            .is_some_and(|v| v.contains(&vid))
     }
 
     /// Record what a device is. See [`Self::kinds`].
@@ -425,7 +453,20 @@ impl NexthopMap {
             // A VLAN whose port was never made a member, or never given
             // that vid, is still excluded: the subif has nothing to sit on.
             DevKind::PortVlan { port, vid } => subif(port, *vid),
-            DevKind::BridgeVlan { vid, .. } => subif(placed?, *vid),
+            DevKind::BridgeVlan { vid, .. } => {
+                let port = placed?;
+                let bare = self
+                    .port_untagged
+                    .get(port)
+                    .is_some_and(|v| v.contains(vid));
+                if bare {
+                    self.is_member(port).then(|| NexthopTarget::Vf {
+                        port: port.to_string(),
+                    })
+                } else {
+                    subif(port, *vid)
+                }
+            }
         }
     }
 
@@ -1036,6 +1077,47 @@ mod tests {
         // A lost neighbour loses its placement.
         m.forget_device(&a);
         assert_eq!(m.placement(&a), None);
+    }
+
+    /// A neighbour on the port's untagged VLAN (the PVID, br0 on a UniFi
+    /// box) is reached through the VF itself — no subif, no tag.
+    #[test]
+    fn an_untagged_vlan_resolves_to_the_port_itself() {
+        let mut m = member_map();
+        m.set_kind(
+            "br0",
+            Some(DevKind::BridgeVlan {
+                bridge: "switch0".into(),
+                vid: 1,
+            }),
+        );
+        m.set_port_untagged("eth4", vec![1]);
+        let n = nh(192, 0, 2, 50);
+        m.set_device(n, "br0");
+        m.place(
+            n,
+            Placement {
+                bridge: "switch0".into(),
+                vid: 1,
+                port: "eth4".into(),
+            },
+        );
+        assert_eq!(
+            m.resolve(&n),
+            Some(NexthopTarget::Vf {
+                port: "eth4".into()
+            })
+        );
+        // Without the untagged fact it would need a (tagged) vid-1 subif,
+        // which no member declares: unresolvable, not mis-tagged.
+        m.set_port_untagged("eth4", vec![]);
+        assert_eq!(m.resolve(&n), None);
+        // A trunk that gains the subif at runtime resolves.
+        m.add_port_vlans("eth4", &[1]);
+        assert!(matches!(
+            m.resolve(&n),
+            Some(NexthopTarget::Subif { vlan: 1, .. })
+        ));
     }
 
     #[test]

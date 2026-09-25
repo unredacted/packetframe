@@ -680,15 +680,33 @@ routes are re-programmed (their paths name the interface, so nothing
 else would move them), and the old adjacency is removed only once they
 have — so the old trunk keeps forwarding in the meantime. An FDB entry
 that ages out or is flushed keeps the last known port — the host's own
-traffic re-teaches the bridge within moments. If the FDB stops being
-readable, placements hold at the last good read and the `fdb` row goes
-Degraded until a read succeeds.
+traffic re-teaches the bridge within moments. If the FDB or the
+bridge-port VLAN table stops being readable, placements and VLAN
+membership hold at the last good read and the `fdb` row goes Degraded
+until a read succeeds.
 
 Two things to get right in config:
 
-- **Declare the vid on every trunk that can carry it.** A neighbour
-  learned behind a port without that subif cannot be reached, and its
-  routes stay unresolvable (which blocks a first steer, by design).
+- **Declare the vid on every trunk that can carry it** — or declare the
+  trunks `vlans all`. A neighbour learned behind a port without that
+  subif cannot be reached, and its routes stay unresolvable (which
+  blocks a first steer, by design). With `port eth4 … vlans all`, the
+  port gets a subif for every tagged VLAN the kernel bridge carries on
+  it at attach, and the engine adds one within seconds of the switch
+  adding a VLAN (`trunk carries new VLAN(s); subinterfaces added` in the
+  journal) — a neighbour already placed on it is then programmed and
+  its routes re-queued. Add-only: a VLAN removed on the switch leaves an
+  idle subif until the next restart. A VLAN the bridge sends untagged on
+  the port (its PVID) needs no subif at all: neighbours on it, and a
+  `local-route` naming it, are reached through the VF. If it stops being
+  untagged on that port, its neighbours' routes go unresolvable and the
+  VF adjacency is retired.
+- A new VLAN's **connected subnet** is not delivered automatically: VPP
+  reaches next hops on it, not arbitrary hosts. The exemption tripwire
+  reports the connected route until a `local-route` (with its fast-path
+  `local-prefix`) or a `steer-exempt` covers it. Gatewayed routes over
+  the new VLAN are covered from the tripwire's next scan: it re-reads
+  which VLANs each member carries every time.
 - The FDB learns from frames the KERNEL sees. Steered frames go to the
   VF, so a host whose every frame is steered would eventually age out —
   in practice ARP, IPv6 and control traffic keep it fresh. The
@@ -2660,6 +2678,17 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   `devlink dev param show pci/<addr> name mcam_count` (this iproute2
   needs `name`), where `<addr>` is the target of
   `/sys/class/net/<port>/device`.
+- **VPP's egress MTU is the kernel port's MTU, mirrored at attach.** VPP
+  applies a parent's L3 MTU to its subifs and falls back to 9000 for an
+  interface nobody set, so the module sets each VF's L3 MTU from
+  `/sys/class/net/<port>/mtu` (re-asserted on adoption). That is what
+  makes a jumbo frame from a trunk draw ICMP frag-needed — sourced from
+  `loopback-address` — at a 1500-byte transit port instead of leaving
+  oversized. One MTU per port: a VLAN on a trunk whose kernel MTU is
+  lower than the port's is not mirrored separately. An MTU changed on the
+  kernel side takes effect in VPP at the next attach — a supervised VPP
+  restart re-reads it — not while VPP keeps running.
+  `vppctl show interface` prints each interface's `mtu`.
 - **A port must be administratively UP before it can be steered.**
   `otx2_get_rxnfc` gates on `netif_running`, so a down port answers
   `EOPNOTSUPP` to both the insert and the rule-count query — which reads

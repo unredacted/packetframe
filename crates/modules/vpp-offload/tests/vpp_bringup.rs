@@ -173,6 +173,7 @@ impl Host {
             steer_exempts: vec![],
             local_routes: vec![],
             steer_capacity: None,
+            trunk_ports: vec![],
             // These fixtures have no route authority to compare
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.

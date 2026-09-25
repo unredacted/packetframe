@@ -1728,7 +1728,7 @@ impl Runtime {
                 })
                 .collect(),
             neighbour_moves: c.engine.placement_moves(),
-            fdb_unreadable: c.engine.fdb_unreadable().map(str::to_string),
+            fdb_unreadable: c.engine.fdb_unreadable(),
             drift_uncovered: c.drift_uncovered.clone(),
             drift_routes: c.drift_routes,
             drift_pending: c.drift_pending,
