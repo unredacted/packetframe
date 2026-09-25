@@ -30,15 +30,18 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
-    Address, AddressUnion, CliInbandReply, ControlPingReply, CreateLoopbackReply, CreateVlanSubif,
-    CreateVlanSubifReply, DevAttachReply, DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor,
-    IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump, IpRoute,
-    IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, MessageTableEntry,
-    Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddressReply,
-    SwInterfaceDetails, SwInterfaceSetFlagsReply, SwInterfaceSetMacAddressReply, SwInterfaceSetMtu,
-    SwInterfaceSetMtuReply, SwInterfaceSetPromiscReply, SwInterfaceSetRxPlacement,
-    SwInterfaceSetRxPlacementReply, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
-    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    Address, AddressUnion, BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply, CliInbandReply,
+    ControlPingReply, CreateLoopbackInstance, CreateLoopbackInstanceReply, CreateLoopbackReply,
+    CreateVlanSubif, CreateVlanSubifReply, DevAttachReply, DevCreatePortIfReply, FibPath,
+    FibPathNh, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails,
+    IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply,
+    L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply, L2fibAddDel, L2fibAddDelReply,
+    MessageTableEntry, Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply,
+    SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
+    SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply, SwInterfaceSetMacAddressReply,
+    SwInterfaceSetMtu, SwInterfaceSetMtuReply, SwInterfaceSetPromiscReply,
+    SwInterfaceSetRxPlacement, SwInterfaceSetRxPlacementReply, SwInterfaceSetUnnumberedReply,
+    ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -53,6 +56,9 @@ pub const SUBIF_BASE: u32 = 100;
 /// The index the fake's `create_loopback` hands out. Distinct from
 /// `ASSIGNED_INDEX` so a test crossing the two would show it.
 pub const LOOPBACK_INDEX: u32 = 11;
+
+/// Base index for `create_loopback_instance` (a bridged VLAN's BVI).
+pub const BVI_BASE: u32 = 200;
 
 /// Link-layer address the fake mirror hands out for its one neighbour.
 pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -307,6 +313,7 @@ fn serve(
     // reconnect re-creates its ports and must land on the same indices.
     let mut ports_created = 0u32;
     let mut subifs_created = 0u32;
+    let mut bvis_created = 0u32;
 
     loop {
         let req = read_frame(sock)?;
@@ -382,6 +389,90 @@ fn serve(
             "sw_interface_set_promisc" => {
                 out = reply_head("sw_interface_set_promisc_reply");
                 SwInterfaceSetPromiscReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+            }
+            "create_loopback_instance" => {
+                let mut d = Decoder::new(&req);
+                let r = CreateLoopbackInstance::decode(&mut d).expect("decodes as a loopback op");
+                let idx = BVI_BASE + bvis_created;
+                bvis_created += 1;
+                let _ = tx.send(Event::Msg(format!(
+                    "bvi loop{} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} if={idx}",
+                    r.user_instance,
+                    r.mac_address[0],
+                    r.mac_address[1],
+                    r.mac_address[2],
+                    r.mac_address[3],
+                    r.mac_address[4],
+                    r.mac_address[5]
+                )));
+                out = reply_head("create_loopback_instance_reply");
+                CreateLoopbackInstanceReply {
+                    context: ctx,
+                    retval: 0,
+                    sw_if_index: idx,
+                }
+                .encode(&mut out);
+            }
+            "bridge_domain_add_del_v2" => {
+                let mut d = Decoder::new(&req);
+                let r = BridgeDomainAddDelV2::decode(&mut d).expect("decodes as a bd op");
+                let _ = tx.send(Event::Msg(format!(
+                    "bd add={} id={} learn={} uu_flood={}",
+                    r.is_add, r.bd_id, r.learn, r.uu_flood
+                )));
+                out = reply_head("bridge_domain_add_del_v2_reply");
+                BridgeDomainAddDelV2Reply {
+                    context: ctx,
+                    retval: 0,
+                    bd_id: r.bd_id,
+                }
+                .encode(&mut out);
+            }
+            "sw_interface_set_l2_bridge" => {
+                let mut d = Decoder::new(&req);
+                let r = SwInterfaceSetL2Bridge::decode(&mut d).expect("decodes as an l2 bridge op");
+                let _ = tx.send(Event::Msg(format!(
+                    "l2 bridge if={} bd={} type={} shg={}",
+                    r.rx_sw_if_index, r.bd_id, r.port_type, r.shg
+                )));
+                out = reply_head("sw_interface_set_l2_bridge_reply");
+                SwInterfaceSetL2BridgeReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+            }
+            "l2_interface_vlan_tag_rewrite" => {
+                let mut d = Decoder::new(&req);
+                let r = L2InterfaceVlanTagRewrite::decode(&mut d).expect("decodes as a vtr op");
+                let _ = tx.send(Event::Msg(format!(
+                    "vtr if={} op={}",
+                    r.sw_if_index, r.vtr_op
+                )));
+                out = reply_head("l2_interface_vlan_tag_rewrite_reply");
+                L2InterfaceVlanTagRewriteReply {
+                    context: ctx,
+                    retval: 0,
+                }
+                .encode(&mut out);
+            }
+            "l2fib_add_del" => {
+                let mut d = Decoder::new(&req);
+                let r = L2fibAddDel::decode(&mut d).expect("decodes as an l2fib op");
+                let _ = tx.send(Event::Msg(format!(
+                    "l2fib {} bd={} mac={:02x} if={} static={}",
+                    if r.is_add { "add" } else { "del" },
+                    r.bd_id,
+                    r.mac[5],
+                    r.sw_if_index,
+                    r.static_mac
+                )));
+                out = reply_head("l2fib_add_del_reply");
+                L2fibAddDelReply {
                     context: ctx,
                     retval: 0,
                 }

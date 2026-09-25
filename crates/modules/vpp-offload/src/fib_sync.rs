@@ -67,6 +67,8 @@ pub struct PortIndex {
     /// port's would install every VLAN route onto the untagged
     /// interface.
     idx: HashMap<(String, Option<u16>), u32>,
+    /// Bridged VLAN → its BVI's index ([`crate::attach::ensure_bridge_domain`]).
+    bvis: HashMap<u16, u32>,
 }
 
 impl PortIndex {
@@ -74,10 +76,15 @@ impl PortIndex {
         self.idx.insert((port.into(), vlan), sw_if_index);
     }
 
+    pub fn insert_bvi(&mut self, vlan: u16, sw_if_index: u32) {
+        self.bvis.insert(vlan, sw_if_index);
+    }
+
     pub fn get(&self, target: &NexthopTarget) -> Option<u32> {
         let key = match target {
             NexthopTarget::Vf { port } => (port.clone(), None),
             NexthopTarget::Subif { port, vlan } => (port.clone(), Some(*vlan)),
+            NexthopTarget::Bvi { vlan } => return self.bvis.get(vlan).copied(),
         };
         self.idx.get(&key).copied()
     }
@@ -92,13 +99,20 @@ impl PortIndex {
     /// anywhere else — most importantly index 0, `local0`, which
     /// forwards nothing while looking installed.
     pub fn indices(&self) -> std::collections::HashSet<u32> {
-        self.idx.values().copied().collect()
+        self.idx
+            .values()
+            .chain(self.bvis.values())
+            .copied()
+            .collect()
     }
 
     /// Whether `sw_if_index` is one of ours. Same source of truth as
     /// [`Self::indices`], without materialising the set for one lookup.
     pub fn owns(&self, sw_if_index: u32) -> bool {
-        self.idx.values().any(|v| *v == sw_if_index)
+        self.idx
+            .values()
+            .chain(self.bvis.values())
+            .any(|v| *v == sw_if_index)
     }
 }
 

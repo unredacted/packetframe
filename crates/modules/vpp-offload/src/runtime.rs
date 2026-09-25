@@ -1728,6 +1728,7 @@ impl Runtime {
                 })
                 .collect(),
             neighbour_moves: c.engine.placement_moves(),
+            neighbours_flooded: c.engine.flooding_neighbours() as u64,
             fdb_unreadable: c.engine.fdb_unreadable().map(str::to_string),
             drift_uncovered: c.drift_uncovered.clone(),
             drift_routes: c.drift_routes,
@@ -1918,6 +1919,8 @@ pub struct RuntimeStatus {
     pub neighbours_unplaced: Vec<String>,
     /// Neighbours moved behind another bridge port since start.
     pub neighbour_moves: u64,
+    /// Bridged neighbours flooding for want of an FDB placement.
+    pub neighbours_flooded: u64,
     /// Why the bridge FDB cannot be read, if it cannot: placements hold at
     /// the last good read, and a move made meanwhile goes unfollowed.
     pub fdb_unreadable: Option<String>,

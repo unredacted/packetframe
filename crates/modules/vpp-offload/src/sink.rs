@@ -243,6 +243,11 @@ pub enum NexthopTarget {
     /// device for [`DevKind::PortVlan`], chosen per neighbour from the
     /// bridge FDB for [`DevKind::BridgeVlan`] (see [`crate::topology`]).
     Subif { port: String, vlan: u16 },
+    /// A bridged VLAN's BVI ([`crate::attach::BridgeSpec`]): routes and
+    /// neighbours land on it whichever trunk the neighbour is behind, and
+    /// frames leave from the kernel bridge's MAC. Placement decides the
+    /// L2FIB entry, not the target.
+    Bvi { vlan: u16 },
 }
 
 use crate::topology::DevKind;
@@ -265,6 +270,10 @@ pub struct NexthopMap {
     /// through the port's own VF, since a tagged subif would put a tag
     /// on a frame the wire expects bare.
     port_untagged: BTreeMap<String, Vec<u16>>,
+    /// Bridged VLANs that have a BVI. A tagged bridged VLAN resolves ONLY
+    /// through one: the per-port subif path would send from the port's
+    /// own MAC, which an IX drops or answers by shutting the port.
+    bvis: std::collections::BTreeSet<u16>,
     /// Devices classified by [`crate::topology::classify`]. `Some(None)`
     /// is a shape VPP cannot reach through; a device with no entry at all
     /// is treated as [`DevKind::Plain`], which is what every device was
@@ -311,6 +320,16 @@ impl NexthopMap {
                 have.push(*v);
             }
         }
+    }
+
+    /// Record that bridged VLAN `vid` has a BVI.
+    pub fn set_bvi(&mut self, vid: u16) {
+        self.bvis.insert(vid);
+    }
+
+    /// Forget every BVI — they died with the VPP process.
+    pub fn forget_bvis(&mut self) {
+        self.bvis.clear();
     }
 
     /// Replace the VLANs `port` sends untagged, from the kernel bridge.
@@ -445,19 +464,23 @@ impl NexthopMap {
             // A VLAN whose port was never made a member, or never given
             // that vid, is still excluded: the subif has nothing to sit on.
             DevKind::PortVlan { port, vid } => subif(port, *vid),
+            // A bridged VLAN with a BVI resolves to it regardless of
+            // placement; a neighbour placed on the port's UNTAGGED VLAN
+            // goes through the VF. A tagged bridged VLAN with no BVI does
+            // not resolve at all — deliberately never to a subif, which
+            // would send from the port's MAC instead of the bridge's.
             DevKind::BridgeVlan { vid, .. } => {
+                if self.bvis.contains(vid) {
+                    return Some(NexthopTarget::Bvi { vlan: *vid });
+                }
                 let port = placed?;
                 let bare = self
                     .port_untagged
                     .get(port)
                     .is_some_and(|v| v.contains(vid));
-                if bare {
-                    self.is_member(port).then(|| NexthopTarget::Vf {
-                        port: port.to_string(),
-                    })
-                } else {
-                    subif(port, *vid)
-                }
+                (bare && self.is_member(port)).then(|| NexthopTarget::Vf {
+                    port: port.to_string(),
+                })
             }
         }
     }
@@ -1013,10 +1036,14 @@ mod tests {
         assert_eq!(undeclared.resolve(&nh(192, 0, 2, 20)), None);
     }
 
-    /// The trunk case: one bridge VLAN, neighbours behind either port,
-    /// each resolving to the subif of the port its MAC is placed behind.
+    /// The trunk case: one bridge VLAN, neighbours behind either port.
+    /// With a BVI every one of them resolves to it — placement only
+    /// decides the L2FIB entry — and WITHOUT one a tagged bridged VLAN
+    /// resolves to nothing at all, never to a port's subif: that path
+    /// would send from the port's MAC, which an IX drops or answers by
+    /// shutting the port.
     #[test]
-    fn bridge_vlan_neighbours_resolve_to_where_they_are_placed() {
+    fn bridge_vlan_neighbours_resolve_through_the_bvi_only() {
         let bridge = Some(DevKind::BridgeVlan {
             bridge: "switch0".into(),
             vid: 3998,
@@ -1037,20 +1064,22 @@ mod tests {
         };
         m.place(a, at("eth4"));
         m.place(b, at("eth5"));
-        let sub = |port: &str| {
-            Some(NexthopTarget::Subif {
-                port: port.into(),
-                vlan: 3998,
-            })
-        };
-        assert_eq!(m.resolve(&a), sub("eth4"));
-        assert_eq!(m.resolve(&b), sub("eth5"));
-        assert_eq!(m.resolve(&c), None, "never seen in the FDB: unplaced");
+        // No BVI: nothing resolves, placed or not — the subifs exist and
+        // are deliberately not used.
+        for n in [a, b, c] {
+            assert_eq!(m.resolve(&n), None, "{n}");
+        }
+        m.set_bvi(3998);
+        let bvi = Some(NexthopTarget::Bvi { vlan: 3998 });
+        assert_eq!(m.resolve(&a), bvi);
+        assert_eq!(m.resolve(&b), bvi);
+        assert_eq!(m.resolve(&c), bvi, "unplaced still resolves: it floods");
         assert_eq!(m.bridge_nexthops().len(), 3);
 
-        // A move is a re-placement.
+        // A move changes the placement, not the target.
         m.place(a, at("eth5"));
-        assert_eq!(m.resolve(&a), sub("eth5"));
+        assert_eq!(m.placement(&a), Some("eth5"));
+        assert_eq!(m.resolve(&a), bvi);
 
         // Reappearing on another bridge VLAN, the old trunk does not
         // follow it there.
@@ -1063,7 +1092,6 @@ mod tests {
         );
         m.set_device(a, "br3999");
         assert_eq!(m.placement(&a), None);
-        assert_eq!(m.resolve(&a), None);
         m.set_device(a, "br3998");
 
         // A lost neighbour loses its placement.
@@ -1100,16 +1128,14 @@ mod tests {
                 port: "eth4".into()
             })
         );
-        // Without the untagged fact it would need a (tagged) vid-1 subif,
-        // which no member declares: unresolvable, not mis-tagged.
+        // Without the untagged fact it is a tagged bridged VLAN: only a
+        // BVI reaches it, never the port's subif.
         m.set_port_untagged("eth4", vec![]);
         assert_eq!(m.resolve(&n), None);
-        // A trunk that gains the subif at runtime resolves.
         m.add_port_vlans("eth4", &[1]);
-        assert!(matches!(
-            m.resolve(&n),
-            Some(NexthopTarget::Subif { vlan: 1, .. })
-        ));
+        assert_eq!(m.resolve(&n), None, "a subif alone is not enough");
+        m.set_bvi(1);
+        assert_eq!(m.resolve(&n), Some(NexthopTarget::Bvi { vlan: 1 }));
     }
 
     #[test]

@@ -1360,17 +1360,22 @@ fn the_neighbours_adj_fib_is_never_adopted_or_withdrawn() {
 // hardware; what these prove is that the right messages, and ONLY the
 // right messages, reach the wire.
 
-use fake_vpp::SUBIF_BASE;
-use packetframe_vpp_offload::topology::{DevKind, FdbSnapshot, PortVlans, Topology};
+use fake_vpp::{BVI_BASE, SUBIF_BASE};
+use packetframe_vpp_offload::topology::{BridgeL3, DevKind, FdbSnapshot, PortVlans, Topology};
 use packetframe_vpp_offload::LocalRoute;
 
-/// A kernel view for the bridge tests: fixed device shapes, and an FDB
-/// and bridge-port VLAN table the test can change under the engine.
+/// A kernel view for the bridge tests: fixed device shapes, bridge
+/// membership and L3 MACs, and an FDB and bridge-port VLAN table the test
+/// can change under the engine.
 struct Kernel {
     kinds: Vec<(&'static str, DevKind)>,
     /// `Err` = the FDB read fails, as a wedged netlink would.
     fdb: std::sync::Arc<std::sync::Mutex<Result<FdbSnapshot, String>>>,
     vlans: std::sync::Arc<std::sync::Mutex<PortVlans>>,
+    /// `(port, bridge)` enslavement.
+    masters: Vec<(&'static str, &'static str)>,
+    /// `(bridge, vid, mac)`: the router has an L3 device on that VLAN.
+    l3: Vec<(&'static str, u16, [u8; 6])>,
 }
 
 impl Topology for Kernel {
@@ -1388,7 +1393,25 @@ impl Topology for Kernel {
     fn port_vlans(&self) -> Result<PortVlans, String> {
         Ok(self.vlans.lock().unwrap().clone())
     }
+    fn master_of(&self, port: &str) -> Option<String> {
+        self.masters
+            .iter()
+            .find(|(p, _)| *p == port)
+            .map(|(_, b)| b.to_string())
+    }
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
+        self.l3
+            .iter()
+            .find(|(b, v, _)| *b == bridge && *v == vid)
+            .map(|(_, _, mac)| BridgeL3 {
+                mac: *mac,
+                mtu: None,
+            })
+    }
 }
+
+/// The kernel bridge's MAC: what a BVI must send from.
+const BRIDGE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0xb0, 0x01];
 
 fn bridge_vlan(vid: u16) -> DevKind {
     DevKind::BridgeVlan {
@@ -1451,6 +1474,8 @@ fn engine_with_local_route(fake: &Fake) -> ConvergenceEngine {
         kinds: vec![("br1337", bridge_vlan(1337))],
         fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
         vlans: Default::default(),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 1337, BRIDGE_MAC)],
     }))
 }
 
@@ -1464,8 +1489,26 @@ fn a_local_route_installs_attached_and_shadows_the_mirror() {
     assert!(e.api_ready());
     e.attach_devices(AttachMode::Fresh).expect("attach");
 
-    let at_attach: Vec<WireRoute> = fake
-        .drain_events()
+    let events = fake.drain_events();
+    // The bridged VLAN's domain: BVI from the kernel bridge's MAC, the
+    // trunk subif a split-horizon member with its tag popped.
+    let msgs: Vec<String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Msg(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect();
+    for want in [
+        "bd add=true id=1337 learn=false uu_flood=true".to_string(),
+        format!("bvi loop1337 mac=02:00:00:00:b0:01 if={BVI_BASE}"),
+        format!("l2 bridge if={BVI_BASE} bd=1337 type=1 shg=0"),
+        format!("l2 bridge if={SUBIF_BASE} bd=1337 type=0 shg=1"),
+        format!("vtr if={SUBIF_BASE} op=3"),
+    ] {
+        assert!(msgs.contains(&want), "missing `{want}`: {msgs:?}");
+    }
+    let at_attach: Vec<WireRoute> = events
         .into_iter()
         .filter_map(|ev| match ev {
             Event::Route(r) => Some(r),
@@ -1482,8 +1525,8 @@ fn a_local_route_installs_attached_and_shadows_the_mirror() {
     assert_eq!((r.addr, r.len), ([23, 191, 200, 0], 24));
     assert_eq!(
         r.path_indices,
-        vec![SUBIF_BASE],
-        "the attached route must land on the subif, not the parent"
+        vec![BVI_BASE],
+        "the attached route lands on the BVI — hosts behind either trunk, the bridge's MAC"
     );
 
     // The mirror carries the poisoned host route (bird's `unreachable`
@@ -1540,24 +1583,34 @@ fn a_bridge_neighbour_mirrors_onto_the_subif() {
     e.begin_resync(&BridgeNeigh);
     e.program_neighbours(&BridgeNeigh).expect("neighbours");
 
-    let neighbours: Vec<(u32, [u8; 6], bool)> = fake
-        .drain_events()
-        .into_iter()
+    let events = fake.drain_events();
+    let neighbours: Vec<(u32, [u8; 6], bool)> = events
+        .iter()
         .filter_map(|ev| match ev {
             Event::Neighbour {
                 sw_if_index,
                 mac,
                 is_add,
                 ..
-            } => Some((sw_if_index, mac, is_add)),
+            } => Some((*sw_if_index, *mac, *is_add)),
             _ => None,
         })
         .collect();
     assert!(
         neighbours
             .iter()
-            .any(|&(idx, mac, add)| idx == SUBIF_BASE && mac == MAC && add),
-        "the bridge host's neighbour must be programmed on the subif index: {neighbours:?}"
+            .any(|&(idx, mac, add)| idx == BVI_BASE && mac == MAC && add),
+        "the bridge host's neighbour is programmed on the BVI: {neighbours:?}"
+    );
+    assert!(
+        neighbours.iter().all(|&(idx, _, _)| idx != SUBIF_BASE),
+        "never on the subif, which would send from the port's MAC: {neighbours:?}"
+    );
+    // Placement is the L2FIB entry: the host's MAC behind eth4's subif.
+    assert!(
+        events.iter().any(|ev| matches!(ev, Event::Msg(m)
+            if *m == format!("l2fib add bd=1337 mac=01 if={SUBIF_BASE} static=true"))),
+        "{events:?}"
     );
 }
 
@@ -1683,18 +1736,16 @@ fn null_drops_sample_over_cli_inband() {
     );
 }
 
-/// B3 v2: a bridge neighbour lands on the subif of the trunk the FDB
-/// learned it behind, and follows it when spanning tree moves it — the
-/// adjacency added on the new subif and removed from the old, and its
-/// routes handed back for re-programming (their paths name the old
-/// subif, and nothing about the route changed).
+/// B3 v2 through a BVI: an IX peer's neighbour and routes sit on the
+/// bridged VLAN's BVI (frames leave from the bridge's MAC), and the trunk
+/// it is behind is an L2FIB entry. When spanning tree moves it, only that
+/// entry moves — no neighbour change, no route re-programming. A peer the
+/// FDB never saw still resolves and floods, as the kernel bridge would.
 #[test]
 fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
     use std::cell::RefCell;
     const PEER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x55];
     const GHOST: [u8; 6] = [0x02, 0, 0, 0, 0, 0x66];
-    let peer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5));
-    let ghost = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 6));
 
     struct Ix {
         requeued: RefCell<Vec<IpAddr>>,
@@ -1707,6 +1758,13 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
                     prefix_len: 24,
                 },
                 &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
+            );
+            visit(
+                IpPrefix::V4 {
+                    addr: [203, 0, 113, 128],
+                    prefix_len: 25,
+                },
+                &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 6))],
             );
         }
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
@@ -1721,7 +1779,7 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
             self.requeued.borrow_mut().extend_from_slice(nexthops);
         }
         fn route_count(&self) -> u64 {
-            1
+            2
         }
         fn change_seq(&self) -> u64 {
             0
@@ -1755,6 +1813,8 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
         kinds: vec![("br3998", bridge_vlan(3998))],
         fdb: fdb.clone(),
         vlans: Default::default(),
+        masters: vec![("eth4", "switch0"), ("eth5", "switch0")],
+        l3: vec![("switch0", 3998, BRIDGE_MAC)],
     }));
     // Subifs are created in port order: eth4.3998, then eth5.3998.
     let (eth4_sub, eth5_sub) = (SUBIF_BASE, SUBIF_BASE + 1);
@@ -1763,95 +1823,106 @@ fn a_bridge_neighbour_follows_the_fdb_between_trunk_ports() {
     };
     assert!(e.api_ready());
     e.attach_devices(AttachMode::Fresh).expect("attach");
+    let msgs = |events: &[Event]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Msg(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let attach = msgs(&fake.drain_events());
+    for sub in [eth4_sub, eth5_sub] {
+        assert!(
+            attach.contains(&format!("l2 bridge if={sub} bd=3998 type=0 shg=1")),
+            "both trunks are split-horizon members: {attach:?}"
+        );
+    }
     e.begin_resync(&src);
     e.program_neighbours(&src).expect("neighbours");
     drain_to_empty(&mut e);
 
     let events = fake.drain_events();
-    assert!(
-        events.iter().any(
-            |ev| matches!(ev, Event::Neighbour { sw_if_index, mac, is_add: true, .. }
-            if *sw_if_index == eth5_sub && *mac == PEER)
-        ),
-        "placed behind eth5: {events:?}"
-    );
-    let route = events
+    let neighbours: Vec<u32> = events
         .iter()
-        .find_map(|ev| match ev {
-            Event::Route(r) if r.addr == [203, 0, 113, 0] => Some(r.clone()),
+        .filter_map(|ev| match ev {
+            Event::Neighbour { sw_if_index, .. } => Some(*sw_if_index),
             _ => None,
         })
-        .expect("the IX route installs");
-    assert_eq!(route.path_indices, vec![eth5_sub]);
-    assert_eq!(
-        e.unplaced_neighbours(),
-        vec![(ghost, "br3998".to_string(), None)],
-        "a neighbour the bridge never saw is reported, not guessed at"
+        .collect();
+    assert!(
+        !neighbours.is_empty() && neighbours.iter().all(|i| *i == BVI_BASE),
+        "every bridged neighbour on the BVI: {neighbours:?}"
     );
-    let neighbour_ops = |events: Vec<Event>| -> Vec<(u32, bool)> {
+    let routes: Vec<WireRoute> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        routes.iter().all(|r| r.path_indices == vec![BVI_BASE]),
+        "{routes:?}"
+    );
+    assert_eq!(
+        e.counts().unresolvable,
+        0,
+        "the unplaced ghost floods, it does not drop"
+    );
+    let m = msgs(&events);
+    assert!(
+        m.contains(&format!(
+            "l2fib add bd=3998 mac=55 if={eth5_sub} static=true"
+        )),
+        "the placed peer pinned behind eth5: {m:?}"
+    );
+    assert!(
+        !m.iter().any(|x| x.contains("mac=66")),
+        "no entry for the ghost: it floods to both trunks: {m:?}"
+    );
+    assert!(e.unplaced_neighbours().is_empty());
+    assert_eq!(e.flooding_neighbours(), 1);
+
+    // Spanning tree moves the peer behind eth4: the L2FIB entry moves,
+    // and that is all.
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
+    e.refresh_placement(&src).expect("refresh");
+    let events = fake.drain_events();
+    assert!(
         events
             .iter()
-            .filter_map(|ev| match ev {
-                Event::Neighbour {
-                    sw_if_index,
-                    is_add,
-                    ..
-                } => Some((*sw_if_index, *is_add)),
-                _ => None,
-            })
-            .collect()
-    };
-
-    // Spanning tree moves the peer behind eth4: added there at once, and
-    // its routes handed back — but the old adjacency stays, since those
-    // routes still name eth5's subif until they are re-programmed.
-    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
-    assert_eq!(e.refresh_placement(&src).expect("refresh"), 1);
-    assert_eq!(neighbour_ops(fake.drain_events()), vec![(eth4_sub, true)]);
-    assert_eq!(*src.requeued.borrow(), vec![peer]);
+            .all(|ev| !matches!(ev, Event::Neighbour { .. })),
+        "no neighbour change: {events:?}"
+    );
+    assert!(
+        msgs(&events).contains(&format!(
+            "l2fib add bd=3998 mac=55 if={eth4_sub} static=true"
+        )),
+        "{events:?}"
+    );
+    assert!(src.requeued.borrow().is_empty(), "no route re-programming");
     assert_eq!(e.placement_moves(), 1);
-    // The routes have gone out: now the old adjacency goes.
-    e.settle_moves().expect("settle");
-    assert_eq!(neighbour_ops(fake.drain_events()), vec![(eth5_sub, false)]);
 
-    // Nothing moved: nothing sent, nothing re-queued.
-    src.requeued.borrow_mut().clear();
-    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
-    e.settle_moves().expect("settle");
-    assert!(neighbour_ops(fake.drain_events()).is_empty());
-    assert!(src.requeued.borrow().is_empty());
-
-    // Moved and moved back before the routes settled: the adjacency it
-    // came back to is the live one, and is kept.
-    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth5")]));
+    // The ghost speaks up behind eth5: pinned, no longer flooding.
+    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4"), (3998, GHOST, "eth5")]));
     e.refresh_placement(&src).expect("refresh");
-    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
-    e.refresh_placement(&src).expect("refresh");
-    let _ = fake.drain_events();
-    e.settle_moves().expect("settle");
-    assert_eq!(
-        neighbour_ops(fake.drain_events()),
-        vec![(eth5_sub, false)],
-        "only eth5's is stale; eth4's (moved away and back) stays"
-    );
+    assert!(msgs(&fake.drain_events()).contains(&format!(
+        "l2fib add bd=3998 mac=66 if={eth5_sub} static=true"
+    )));
+    assert_eq!(e.flooding_neighbours(), 0);
 
-    // The entry ages out of the FDB: the last known port stands.
+    // Entries age out of the FDB: last known ports stand, nothing sent.
     *fdb.lock().unwrap() = Ok(fdb_with(&[]));
-    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
-    assert!(e.unplaced_neighbours().iter().all(|(nh, _, _)| *nh != peer));
-
-    // Learned behind a port that is not a member: reported as
-    // unreachable, with the port named.
-    *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4"), (3998, GHOST, "eth9")]));
     e.refresh_placement(&src).expect("refresh");
-    assert_eq!(
-        e.unplaced_neighbours(),
-        vec![(ghost, "br3998".to_string(), Some("eth9".to_string()))]
-    );
+    assert!(msgs(&fake.drain_events())
+        .iter()
+        .all(|m| !m.starts_with("l2fib")));
 
     // A failing read is surfaced, and the placements hold.
     *fdb.lock().unwrap() = Err("netlink recv: timed out".into());
-    assert_eq!(e.refresh_placement(&src).expect("refresh"), 0);
+    e.refresh_placement(&src).expect("refresh");
     assert_eq!(e.fdb_unreadable(), Some("netlink recv: timed out"));
     *fdb.lock().unwrap() = Ok(fdb_with(&[(3998, PEER, "eth4")]));
     e.refresh_placement(&src).expect("refresh");
@@ -1923,6 +1994,8 @@ fn a_trunk_follows_a_vlan_added_on_the_switch() {
         kinds: vec![("br200", bridge_vlan(200))],
         fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(200, PEER, "eth4")])))),
         vlans: vlans.clone(),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 200, BRIDGE_MAC)],
     }));
     let src = Src {
         requeued: RefCell::new(Vec::new()),
@@ -1950,11 +2023,16 @@ fn a_trunk_follows_a_vlan_added_on_the_switch() {
         "the subif is created while running: {events:?}"
     );
     assert!(
+        events.iter().any(|ev| matches!(ev, Event::Msg(m)
+            if *m == format!("l2 bridge if={SUBIF_BASE} bd=200 type=0 shg=1"))),
+        "the new subif joins the VLAN's new bridge domain: {events:?}"
+    );
+    assert!(
         events.iter().any(
             |ev| matches!(ev, Event::Neighbour { sw_if_index, is_add: true, .. }
-            if *sw_if_index == SUBIF_BASE)
+            if *sw_if_index == BVI_BASE)
         ),
-        "and the neighbour programmed on it: {events:?}"
+        "and the neighbour is programmed on its BVI: {events:?}"
     );
     assert_eq!(*src.requeued.borrow(), vec![peer]);
     assert!(e.unplaced_neighbours().is_empty());
@@ -2018,6 +2096,8 @@ fn an_untagged_vlan_neighbour_lands_on_the_vf() {
             1,
             true,
         )]))),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![],
     }));
     assert!(e.api_ready());
     e.attach_devices(AttachMode::Fresh).expect("attach");

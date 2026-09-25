@@ -398,6 +398,11 @@ pub struct StatusSnapshot {
     /// Neighbours moved behind another bridge port since start — each
     /// one a spanning-tree change VPP followed.
     pub neighbour_moves: u64,
+    /// Bridged neighbours reached through a BVI but not placed by the
+    /// FDB, so flooded to every trunk member — what the kernel bridge does
+    /// for an unknown MAC. Informational; a persistently high count means
+    /// silent neighbours, or an FDB that is not being read.
+    pub neighbours_flooded: u64,
     /// Why the bridge FDB cannot be read, if it cannot. Degraded: the
     /// placements stand at the last good read, and a spanning-tree move
     /// made while blind would leave routes on the old trunk unnoticed.
@@ -486,6 +491,7 @@ impl StatusSnapshot {
             None,
             Vec::new(),
             0,
+            0,
             None,
             Vec::new(),
             0,
@@ -523,6 +529,7 @@ impl StatusSnapshot {
         null_drops: Option<u64>,
         neighbours_unplaced: Vec<String>,
         neighbour_moves: u64,
+        neighbours_flooded: u64,
         fdb_unreadable: Option<String>,
         drift_uncovered: Vec<String>,
         drift_routes: usize,
@@ -556,6 +563,7 @@ impl StatusSnapshot {
             null_drops,
             neighbours_unplaced,
             neighbour_moves,
+            neighbours_flooded,
             fdb_unreadable,
             drift_uncovered,
             drift_routes,
@@ -1884,6 +1892,16 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         out,
         "packetframe_vpp_neighbour_moves{{module=\"{module}\"}} {}",
         snap.neighbour_moves
+    );
+    gauge(
+        &mut out,
+        "packetframe_vpp_neighbours_flooded",
+        "bridged neighbours with no FDB placement, flooded to every trunk member through their BVI",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_neighbours_flooded{{module=\"{module}\"}} {}",
+        snap.neighbours_flooded
     );
 
     gauge(

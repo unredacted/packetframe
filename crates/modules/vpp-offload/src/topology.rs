@@ -199,6 +199,26 @@ impl PortVlans {
     }
 }
 
+/// The kernel's L3 device for one bridged VLAN: what its frames leave
+/// from (a BVI must carry the same MAC) and its MTU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeL3 {
+    pub mac: [u8; 6],
+    pub mtu: Option<u32>,
+}
+
+/// Which device is a bridged VLAN's L3 device: among `candidates` (every
+/// device classifying to that `BridgeVlan`, with whether it holds an
+/// IPv4 address), the addressed one — `br3998` rather than the bare
+/// `switch0.3998` beneath it — else the first. Pure, for the tests.
+pub fn pick_bridge_l3(candidates: &[(String, bool)]) -> Option<&str> {
+    candidates
+        .iter()
+        .find(|(_, addressed)| *addressed)
+        .or_else(|| candidates.first())
+        .map(|(d, _)| d.as_str())
+}
+
 /// The engine's view of the kernel: classification and the FDB.
 ///
 /// Both answers must be cheap: the engine asks from the supervision
@@ -217,6 +237,11 @@ pub trait Topology {
     /// The latest bridge-port VLAN membership, on the same terms as
     /// [`Self::fdb`].
     fn port_vlans(&self) -> Result<PortVlans, String>;
+    /// The bridge `port` is enslaved to, if any.
+    fn master_of(&self, port: &str) -> Option<String>;
+    /// The kernel's L3 device for `bridge`/`vid`, if the router has one —
+    /// a VLAN with no L3 device on the router has no neighbours to reach.
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3>;
 }
 
 /// No kernel to ask: every device is [`DevKind::Plain`] and the FDB is
@@ -233,6 +258,12 @@ impl Topology for NoTopology {
     }
     fn port_vlans(&self) -> Result<PortVlans, String> {
         Ok(PortVlans::default())
+    }
+    fn master_of(&self, _port: &str) -> Option<String> {
+        None
+    }
+    fn bridge_l3(&self, _bridge: &str, _vid: u16) -> Option<BridgeL3> {
+        None
     }
 }
 
@@ -364,6 +395,49 @@ impl Topology for KernelTopology {
     fn port_vlans(&self) -> Result<PortVlans, String> {
         self.vlans.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    fn master_of(&self, port: &str) -> Option<String> {
+        let link = std::fs::read_link(format!("/sys/class/net/{port}/master")).ok()?;
+        Some(link.file_name()?.to_str()?.to_string())
+    }
+
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
+        let links = kernel_links().ok()?;
+        let addressed: std::collections::HashSet<String> = crate::bringup::kernel_v4_addrs()
+            .into_iter()
+            .map(|(dev, _)| dev)
+            .collect();
+        let want = DevKind::BridgeVlan {
+            bridge: bridge.to_string(),
+            vid,
+        };
+        let candidates: Vec<(String, bool)> = all_netdevs()
+            .into_iter()
+            .filter(|d| classify(&links, d).as_ref() == Some(&want))
+            .map(|d| {
+                let a = addressed.contains(&d);
+                (d, a)
+            })
+            .collect();
+        let dev = pick_bridge_l3(&candidates)?;
+        let base = std::path::Path::new("/sys/class/net").join(dev);
+        let mac = parse_mac(&std::fs::read_to_string(base.join("address")).ok()?)?;
+        let mtu = std::fs::read_to_string(base.join("mtu"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        Some(BridgeL3 { mac, mtu })
+    }
+}
+
+/// `aa:bb:cc:dd:ee:ff` as sysfs writes it.
+#[cfg(target_os = "linux")]
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.trim().split(':');
+    for b in &mut out {
+        *b = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// Parse `/proc/net/vlan/config`. Separate from the read so the format
@@ -513,6 +587,18 @@ mod tests {
         assert_eq!(v.untagged("eth4"), vec![1]);
         assert_eq!(v.tagged("eth5"), vec![3998]);
         assert!(v.tagged("eth9").is_empty());
+    }
+
+    #[test]
+    fn the_addressed_device_is_a_bridged_vlans_l3_device() {
+        let c = vec![
+            ("switch0.3998".to_string(), false),
+            ("br3998".to_string(), true),
+        ];
+        assert_eq!(pick_bridge_l3(&c), Some("br3998"));
+        let c = vec![("switch0.3998".to_string(), false)];
+        assert_eq!(pick_bridge_l3(&c), Some("switch0.3998"));
+        assert_eq!(pick_bridge_l3(&[]), None);
     }
 
     #[test]

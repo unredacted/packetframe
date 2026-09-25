@@ -668,21 +668,37 @@ device. On a box with two trunks into one VLAN-aware bridge, spanning
 tree decides which trunk each neighbour is behind, and can change it.
 The one place that says is the kernel bridge's FDB.
 
-So each neighbour is **placed**: the module classifies the device (a
-bridge whose only member is `switch0.3998`, a VLAN device on the
-VLAN-aware bridge `switch0`), looks the neighbour's MAC up in `switch0`'s
-FDB for VLAN 3998, and programs the static neighbour on that port's
-3998 subif. Routes through it install on the same subif. A background
-thread re-reads the FDB every 2 s (never the supervision loop, which
-must not wait on netlink), and placement is checked against it every
-2 s. A neighbour that moved is added on the new subif at once, its
-routes are re-programmed (their paths name the interface, so nothing
-else would move them), and the old adjacency is removed only once they
-have — so the old trunk keeps forwarding in the meantime. An FDB entry
-that ages out or is flushed keeps the last known port — the host's own
-traffic re-teaches the bridge within moments. If the FDB stops being
-readable, placements hold at the last good read and the `fdb` row goes
-Degraded until a read succeeds.
+**Frames on a bridged VLAN must leave from the bridge's MAC.** The
+kernel sends `br3998` traffic from the bridge's MAC (switch0's on a
+UniFi box), and that is the MAC an IX registers: SIX drops a foreign
+source MAC, KCIX shuts the port. VPP transmits from an interface's own
+MAC, and a member VF's MAC must stay the port's own (setting the bridge
+MAC there captures all gateway traffic into VPP — w22). So a bridged
+VLAN is not routed on the trunk subifs at all. Each gets a **bridge
+domain and a BVI**: a software loopback (`loop<vid>`) carrying the
+kernel bridge's MAC, unnumbered to `loopback-address`, with every trunk
+subif carrying the VLAN as a member (split-horizon group 1, so VPP never
+bridges trunk to trunk; tag popped on ingress, pushed on egress).
+Neighbours and routes sit on the BVI; frames leave from the bridge MAC
+through the domain. **A tagged bridged VLAN with no BVI — the router has
+no L3 device on it — never resolves**, rather than falling back to a
+subif that would send from the port's MAC.
+
+Which trunk a neighbour is behind is a **static L2FIB entry** in that
+domain, placed from the kernel bridge's FDB: the module classifies the
+device (a bridge whose only member is `switch0.3998`, a VLAN device on
+the VLAN-aware bridge `switch0`), looks the neighbour's MAC up in
+`switch0`'s FDB for VLAN 3998, and pins it to that trunk's subif. A
+background thread re-reads the FDB every 2 s (never the supervision
+loop, which must not wait on netlink), and placement is checked against
+it every 2 s. **A move is one L2FIB update** — the neighbour and every
+route through it stay on the BVI. An FDB entry that ages out or is
+flushed keeps the last known trunk; a neighbour the FDB has never shown
+gets no entry and **floods to every member**, exactly as the kernel
+bridge floods an unknown MAC. If the FDB stops being readable,
+placements hold and the `fdb` row goes Degraded until a read succeeds.
+`vppctl show bridge-domain <vid> detail` and `show l2fib verbose` show
+the domain, its BVI and the pinned MACs.
 
 Two things to get right in config:
 
@@ -714,8 +730,9 @@ any member port: 198.51.100.6 on br3998 — VPP cannot reach them, …
 ```
 
 `packetframe_vpp_neighbours_unplaced` counts neighbours VPP cannot
-reach — never seen in the FDB, or seen behind a port that is not a
-member or lacks the VLAN's subif (the row names that port); `packetframe_vpp_neighbour_moves` counts
+reach at all (their routes are unresolvable — e.g. a tagged bridged
+VLAN with no BVI); `packetframe_vpp_neighbours_flooded` counts bridged
+neighbours reached through a BVI but not yet pinned by the FDB; `packetframe_vpp_neighbour_moves` counts
 moves VPP followed since start. The exemption tripwire counts a route
 out a bridge VLAN some member carries as a path VPP can take.
 
