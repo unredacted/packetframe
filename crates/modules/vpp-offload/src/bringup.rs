@@ -806,10 +806,9 @@ fn finish(
         .map(|p| {
             let (pf_mac, accept_macs) = port_macs(&paths.sys.sysfs_net, &p.iface)?;
             // The kernel port's MTU, for VPP's egress check and PMTUD.
-            // Unreadable leaves VPP's default rather than failing attach.
-            let mtu = std::fs::read_to_string(paths.sys.sysfs_net.join(&p.iface).join("mtu"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
+            // Unreadable leaves VPP's default rather than failing attach;
+            // the engine re-reads it at every later attach.
+            let mtu = crate::attach::kernel_mtu(&paths.sys.sysfs_net, &p.iface);
             Ok(PortAttach {
                 mtu,
                 port: p.iface.clone(),

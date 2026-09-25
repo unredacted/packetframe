@@ -990,6 +990,14 @@ fn set_promisc_on(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result
 /// per-protocol slots stay 0 so IP4/IP6/MPLS inherit it. Idempotent —
 /// VPP compares before changing — so it is re-asserted on reuse like the
 /// MAC and admin state.
+/// `iface`'s MTU from `<sysfs_net>/<iface>/mtu`; `None` when unreadable,
+/// which leaves VPP's default rather than failing an attach.
+pub fn kernel_mtu(sysfs_net: &std::path::Path, iface: &str) -> Option<u32> {
+    std::fs::read_to_string(sysfs_net.join(iface).join("mtu"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 fn set_mtu(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
     let Some(mtu) = p.mtu else {
         return Ok(());

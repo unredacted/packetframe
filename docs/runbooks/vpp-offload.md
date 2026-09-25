@@ -2643,7 +2643,8 @@ restart packetframe (stop → `detach --all` → start) afterwards.
   `loopback-address` — at a 1500-byte transit port instead of leaving
   oversized. One MTU per port: a VLAN on a trunk whose kernel MTU is
   lower than the port's is not mirrored separately. An MTU changed on the
-  kernel side takes effect in VPP at the next attach.
+  kernel side takes effect in VPP at the next attach — a supervised VPP
+  restart re-reads it — not while VPP keeps running.
   `vppctl show interface` prints each interface's `mtu`.
 - **A port must be administratively UP before it can be steered.**
   `otx2_get_rxnfc` gates on `netif_running`, so a down port answers

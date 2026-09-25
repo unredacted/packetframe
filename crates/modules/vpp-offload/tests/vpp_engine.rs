@@ -2033,3 +2033,55 @@ fn an_untagged_vlan_neighbour_lands_on_the_vf() {
     );
     assert!(e.unplaced_neighbours().is_empty());
 }
+
+/// A kernel whose only fact is a port MTU the test can change.
+struct MtuKernel(std::sync::Arc<std::sync::Mutex<Option<u32>>>);
+
+impl Topology for MtuKernel {
+    fn classify(&self, _dev: &str) -> Result<Option<DevKind>, String> {
+        Ok(Some(DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(FdbSnapshot::default())
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(PortVlans::default())
+    }
+    fn mtu(&self, _dev: &str) -> Option<u32> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// Every attach sends the kernel's MTU as it is at that attach, not as
+/// it was at bring-up: the supervisor re-attaches every VPP it restarts,
+/// and an MTU changed in between must reach the new one (review
+/// finding). An unreadable MTU keeps the last value.
+#[test]
+fn each_attach_sends_the_current_kernel_mtu() {
+    let fake = Fake::start("mtu-refresh");
+    let mtu = std::sync::Arc::new(std::sync::Mutex::new(Some(1500)));
+    let mut e = engine_for(&fake)
+        .with_topology(Box::new(MtuKernel(mtu.clone())))
+        .with_recorded_indices(vec![("eth4".into(), 3)]);
+    assert!(e.api_ready());
+    let sent = |fake: &Fake| -> Vec<String> {
+        fake.drain_events()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                Event::Msg(m) if m.starts_with("mtu ") => Some(m),
+                _ => None,
+            })
+            .collect()
+    };
+
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(sent(&fake), vec!["mtu if=3 l3=1500".to_string()]);
+
+    *mtu.lock().unwrap() = Some(9000);
+    e.attach_devices(AttachMode::Adopted).expect("re-attach");
+    assert_eq!(sent(&fake), vec!["mtu if=3 l3=9000".to_string()]);
+
+    *mtu.lock().unwrap() = None;
+    e.attach_devices(AttachMode::Adopted).expect("re-attach");
+    assert_eq!(sent(&fake), vec!["mtu if=3 l3=9000".to_string()]);
+}

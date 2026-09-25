@@ -217,6 +217,12 @@ pub trait Topology {
     /// The latest bridge-port VLAN membership, on the same terms as
     /// [`Self::fdb`].
     fn port_vlans(&self) -> Result<PortVlans, String>;
+    /// `dev`'s current MTU, or `None` when it cannot be read. Read at
+    /// every VPP attach rather than once at bring-up: a supervised VPP
+    /// restart re-attaches with the kernel's MTU as it is then.
+    fn mtu(&self, _dev: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// No kernel to ask: every device is [`DevKind::Plain`] and the FDB is
@@ -363,6 +369,10 @@ impl Topology for KernelTopology {
 
     fn port_vlans(&self) -> Result<PortVlans, String> {
         self.vlans.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn mtu(&self, dev: &str) -> Option<u32> {
+        crate::attach::kernel_mtu(std::path::Path::new("/sys/class/net"), dev)
     }
 }
 
