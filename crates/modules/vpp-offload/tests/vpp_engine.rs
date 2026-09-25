@@ -2357,3 +2357,330 @@ fn an_unreadable_vlan_table_is_reported_despite_a_good_fdb() {
         Some("port VLANs: netlink recv: timed out")
     );
 }
+
+fn msgs_of(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Msg(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A source with one fixed bridged neighbour and no routes.
+struct OneNeighbour {
+    nh: IpAddr,
+    dev: &'static str,
+    mac: [u8; 6],
+}
+
+impl RouteSource for OneNeighbour {
+    fn for_each_route(&self, _visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(self.nh, self.dev, self.mac);
+    }
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("static source")
+    }
+    fn route_count(&self) -> u64 {
+        0
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+}
+
+/// A bridged VLAN a port sends UNTAGGED joins the domain with the VF
+/// itself, bare — so a neighbour behind that port is pinned to the VF and
+/// its frames still leave from the bridge's MAC through the BVI (review
+/// finding: routed on the VF, they would leave from the port's). The VF
+/// counts as the egress in use for the link gate. When the VLAN stops
+/// being untagged there, the VF leaves the domain rather than flooding
+/// the VLAN bare onto whatever the port's untagged VLAN is now, and the
+/// pin goes with it — retried when VPP refuses the delete, not forgotten.
+#[test]
+fn an_untagged_port_is_a_bare_member_of_the_bridge_domain() {
+    const HOST: [u8; 6] = [0x02, 0, 0, 0, 0, 0x88];
+    let vlans = std::sync::Arc::new(std::sync::Mutex::new(PortVlans::from_entries([(
+        "eth4".to_string(),
+        1,
+        true,
+    )])));
+    let fake = Fake::start_behaving(
+        "untagged-member",
+        Behaviour {
+            reject_l2fib_deletes: 1,
+            ..Default::default()
+        },
+    );
+    let mut e = untagged_engine(
+        &fake,
+        Kernel {
+            kinds: vec![("br0", bridge_vlan(1))],
+            fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1, HOST, "eth4")])))),
+            vlans: vlans.clone(),
+            masters: vec![("eth4", "switch0")],
+            l3: vec![("switch0", 1, BRIDGE_MAC)],
+        },
+    );
+    let src = OneNeighbour {
+        nh: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)),
+        dev: "br0",
+        mac: HOST,
+    };
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let attach = msgs_of(&fake.drain_events());
+    assert!(
+        attach.contains(&format!("l2 bridge if={ASSIGNED_INDEX} bd=1 type=0 shg=1")),
+        "the VF joins bare: {attach:?}"
+    );
+    assert!(
+        !attach
+            .iter()
+            .any(|m| m.starts_with(&format!("vtr if={ASSIGNED_INDEX} "))),
+        "no tag to pop on an untagged member: {attach:?}"
+    );
+
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(
+            |ev| matches!(ev, Event::Neighbour { sw_if_index, is_add: true, .. }
+            if *sw_if_index == BVI_BASE)
+        ),
+        "the neighbour sits on the BVI: {events:?}"
+    );
+    let m = msgs_of(&events);
+    assert!(
+        m.contains(&format!(
+            "l2fib add bd=1 mac=88 if={ASSIGNED_INDEX} static=true"
+        )),
+        "pinned to the VF: {m:?}"
+    );
+    assert!(e.port_links()[0].in_use, "the VF is the egress in use");
+
+    // VLAN 1 stops being untagged on eth4.
+    *vlans.lock().unwrap() = PortVlans::default();
+    e.refresh_placement(&src)
+        .expect_err("VPP refuses the pin's delete");
+    let m = msgs_of(&fake.drain_events());
+    assert!(
+        m.contains(&format!("l2 leave if={ASSIGNED_INDEX} bd=1")),
+        "the VF leaves the domain: {m:?}"
+    );
+    e.refresh_placement(&src).expect("retry");
+    let m = msgs_of(&fake.drain_events());
+    assert!(
+        m.contains(&format!(
+            "l2fib del bd=1 mac=88 if={ASSIGNED_INDEX} static=true"
+        )),
+        "the refused delete is retried: {m:?}"
+    );
+    e.refresh_placement(&src).expect("settled");
+    assert!(
+        !msgs_of(&fake.drain_events())
+            .iter()
+            .any(|m| m.starts_with("l2")),
+        "nothing more once settled"
+    );
+}
+
+/// A surviving VPP's bridge domain can hold members and static MACs a
+/// previous daemon left. Adoption takes out the members this view does
+/// not want, and the resync withdraws the static entries its books do
+/// not hold — nothing else would ever remove them (review finding).
+#[test]
+fn a_surviving_domains_strays_are_withdrawn() {
+    const PEER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x55];
+    const STALE: [u8; 6] = [0x02, 0, 0, 0, 0, 0xab];
+    let fake = Fake::start_behaving(
+        "bd-strays",
+        Behaviour {
+            existing_l2fib: &[(3998, PEER, SUBIF_BASE), (3998, STALE, SUBIF_BASE)],
+            existing_bd_members: &[(3998, SUBIF_BASE), (3998, 999)],
+            ..Default::default()
+        },
+    );
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![3998],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br3998", bridge_vlan(3998))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(3998, PEER, "eth4")])))),
+        vlans: Default::default(),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 3998, BRIDGE_MAC)],
+    }));
+    let src = OneNeighbour {
+        nh: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
+        dev: "br3998",
+        mac: PEER,
+    };
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let m = msgs_of(&fake.drain_events());
+    assert!(m.contains(&"l2 leave if=999 bd=3998".to_string()), "{m:?}");
+    assert!(
+        !m.contains(&format!("l2 leave if={SUBIF_BASE} bd=3998")),
+        "a wanted member stays: {m:?}"
+    );
+
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    let m = msgs_of(&fake.drain_events());
+    assert!(
+        m.contains(&format!(
+            "l2fib del bd=3998 mac=ab if={SUBIF_BASE} static=true"
+        )),
+        "the stale MAC is withdrawn: {m:?}"
+    );
+    assert!(
+        !m.iter()
+            .any(|x| x.starts_with("l2fib del") && x.contains("mac=55")),
+        "the peer's pin is ours and stays: {m:?}"
+    );
+}
+
+/// A neighbour delta that moves a nexthop onto another bridged VLAN is
+/// pinned in the new domain only by a placement on THAT VLAN. Before the
+/// device map moved, the old VLAN's port was used, pinning the MAC in the
+/// new domain where the FDB had never seen it (review finding).
+#[test]
+fn a_neighbour_moved_between_vlans_floods_until_placed_there() {
+    const PEER: [u8; 6] = [0x02, 0, 0, 0, 0, 0x55];
+    let peer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5));
+    let fake = Fake::start("vlan-move");
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![3998, 3999],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br3998", bridge_vlan(3998)), ("br3999", bridge_vlan(3999))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(3998, PEER, "eth4")])))),
+        vlans: Default::default(),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 3998, BRIDGE_MAC), ("switch0", 3999, BRIDGE_MAC)],
+    }));
+    let src = OneNeighbour {
+        nh: peer,
+        dev: "br3998",
+        mac: PEER,
+    };
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    assert!(msgs_of(&fake.drain_events()).contains(&format!(
+        "l2fib add bd=3998 mac=55 if={SUBIF_BASE} static=true"
+    )));
+
+    let moved = QueuedSource::with(packetframe_vpp_offload::engine::SourceChanges {
+        neighbours: vec![(peer, Some(("br3999".into(), PEER)))],
+        routes: Vec::new(),
+    });
+    e.apply_changes(&moved, 64).expect("delta");
+    let m = msgs_of(&fake.drain_events());
+    assert!(
+        !m.iter().any(|x| x.starts_with("l2fib add bd=3999")),
+        "not pinned where the FDB has never seen it: {m:?}"
+    );
+    assert!(
+        m.contains(&format!(
+            "l2fib del bd=3998 mac=55 if={SUBIF_BASE} static=true"
+        )),
+        "the old domain's pin goes: {m:?}"
+    );
+}
+
+/// A surviving VPP's BVI whose MAC is no longer the kernel bridge's is
+/// re-asserted — and read back — rather than reused as it stands: the
+/// whole point of the BVI is the bridge's MAC on the wire (review
+/// finding). One already right is left alone.
+#[test]
+fn an_adopted_bvi_takes_the_bridges_current_mac() {
+    const OLD: [u8; 6] = [0x02, 0, 0, 0, 0xb0, 0x99];
+    for (tag, held, expect_set) in [
+        ("bvi-stale-mac", OLD, true),
+        ("bvi-same-mac", BRIDGE_MAC, false),
+    ] {
+        let fake = Fake::start_behaving(
+            tag,
+            Behaviour {
+                existing_bvi: Some((3998, 250, held)),
+                ..Default::default()
+            },
+        );
+        let mut e = ConvergenceEngine::new(
+            &fake.path,
+            vec![PortAttach {
+                port: "eth4".into(),
+                pci_addr: "0002:07:00.1".into(),
+                port_id: 0,
+                num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                accept_macs: vec![],
+                mtu: None,
+                vlans: vec![3998],
+            }],
+            vec!["eth4".into()],
+            1_000_000,
+            FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
+        )
+        .with_topology(Box::new(Kernel {
+            kinds: vec![("br3998", bridge_vlan(3998))],
+            fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(FdbSnapshot::default()))),
+            vlans: Default::default(),
+            masters: vec![("eth4", "switch0")],
+            l3: vec![("switch0", 3998, BRIDGE_MAC)],
+        }));
+        assert!(e.api_ready());
+        e.attach_devices(AttachMode::Fresh).expect("attach");
+        let m = msgs_of(&fake.drain_events());
+        assert!(
+            !m.iter().any(|x| x.starts_with("bvi loop3998")),
+            "{tag}: reused, not recreated: {m:?}"
+        );
+        let set = format!("set mac if=250 mac={:02x}", BRIDGE_MAC[5]);
+        assert_eq!(m.contains(&set), expect_set, "{tag}: {m:?}");
+    }
+}

@@ -93,6 +93,11 @@ impl PortIndex {
         self.idx.is_empty()
     }
 
+    /// Every `(vlan, BVI index)`.
+    pub fn bvis(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
+        self.bvis.iter().map(|(v, i)| (*v, *i))
+    }
+
     /// Every interface index we own.
     ///
     /// Readback verification uses this to reject a FIB path pointing

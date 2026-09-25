@@ -116,6 +116,13 @@ const MESSAGES: &[&str] = &[
     "l2_interface_vlan_tag_rewrite_reply",
     "l2fib_add_del",
     "l2fib_add_del_reply",
+    // What a surviving VPP's bridge domains already hold — members and
+    // static MACs a previous daemon left — so adoption and resync can
+    // withdraw what the current view no longer wants.
+    "bridge_domain_dump",
+    "bridge_domain_details",
+    "l2_fib_table_dump",
+    "l2_fib_table_details",
     "create_loopback",
     "create_loopback_reply",
     "sw_interface_add_del_address",

@@ -207,16 +207,43 @@ pub struct BridgeL3 {
     pub mtu: Option<u32>,
 }
 
-/// Which device is a bridged VLAN's L3 device: among `candidates` (every
-/// device classifying to that `BridgeVlan`, with whether it holds an
-/// IPv4 address), the addressed one — `br3998` rather than the bare
-/// `switch0.3998` beneath it — else the first. Pure, for the tests.
-pub fn pick_bridge_l3(candidates: &[(String, bool)]) -> Option<&str> {
+/// One device classifying to a bridged VLAN, for [`pick_bridge_l3`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3Candidate {
+    pub dev: String,
+    /// Holds an IPv4 address, or a global IPv6 one.
+    pub addressed: bool,
+    /// Enslaved to a bridge — `switch0.3998` under `br3998`: a lower
+    /// device, never where the router's frames leave from.
+    pub enslaved: bool,
+}
+
+/// Which device is a bridged VLAN's L3 device: the addressed one —
+/// `br3998` rather than the bare `switch0.3998` beneath it — else one no
+/// bridge has enslaved, else the first. The middle rule is what keeps an
+/// IPv6-only (or not yet addressed) bridge from losing to its lower
+/// device by name order, which would hand the BVI a MAC the kernel does
+/// not send from (review finding). Pure, for the tests.
+pub fn pick_bridge_l3(candidates: &[L3Candidate]) -> Option<&str> {
     candidates
         .iter()
-        .find(|(_, addressed)| *addressed)
+        .find(|c| c.addressed)
+        .or_else(|| candidates.iter().find(|c| !c.enslaved))
         .or_else(|| candidates.first())
-        .map(|(d, _)| d.as_str())
+        .map(|c| c.dev.as_str())
+}
+
+/// Devices holding a global (non-link-local) IPv6 address, from
+/// `/proc/net/if_inet6`. Link-local is left out: every up device has
+/// one, lower devices included, so it says nothing about L3.
+pub fn parse_if_inet6_global(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            // addr, ifindex, prefix len, scope, flags, name
+            (cols.len() == 6 && cols[3] == "00").then(|| cols[5].to_string())
+        })
+        .collect()
 }
 
 /// The engine's view of the kernel: classification and the FDB.
@@ -409,20 +436,24 @@ impl Topology for KernelTopology {
 
     fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
         let links = kernel_links().ok()?;
-        let addressed: std::collections::HashSet<String> = crate::bringup::kernel_v4_addrs()
+        let mut addressed: std::collections::HashSet<String> = crate::bringup::kernel_v4_addrs()
             .into_iter()
             .map(|(dev, _)| dev)
             .collect();
+        addressed.extend(parse_if_inet6_global(
+            &std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default(),
+        ));
         let want = DevKind::BridgeVlan {
             bridge: bridge.to_string(),
             vid,
         };
-        let candidates: Vec<(String, bool)> = all_netdevs()
+        let candidates: Vec<L3Candidate> = all_netdevs()
             .into_iter()
             .filter(|d| classify(&links, d).as_ref() == Some(&want))
-            .map(|d| {
-                let a = addressed.contains(&d);
-                (d, a)
+            .map(|dev| L3Candidate {
+                addressed: addressed.contains(&dev),
+                enslaved: self.master_of(&dev).is_some(),
+                dev,
             })
             .collect();
         let dev = pick_bridge_l3(&candidates)?;
@@ -601,14 +632,37 @@ mod tests {
 
     #[test]
     fn the_addressed_device_is_a_bridged_vlans_l3_device() {
+        let cand = |dev: &str, addressed, enslaved| L3Candidate {
+            dev: dev.into(),
+            addressed,
+            enslaved,
+        };
         let c = vec![
-            ("switch0.3998".to_string(), false),
-            ("br3998".to_string(), true),
+            cand("br3998", true, false),
+            cand("switch0.3998", false, true),
         ];
         assert_eq!(pick_bridge_l3(&c), Some("br3998"));
-        let c = vec![("switch0.3998".to_string(), false)];
+        // Unaddressed as far as IPv4 goes (IPv6-only, say): the device no
+        // bridge enslaves wins, whatever the name order.
+        let c = [cand("abr3998", false, false), cand("aa.3998", false, true)];
+        assert_eq!(pick_bridge_l3(&c[..]), Some("abr3998"));
+        let c = vec![cand("aa.3998", false, true), cand("br3998", false, false)];
+        assert_eq!(pick_bridge_l3(&c), Some("br3998"));
+        let c = vec![cand("switch0.3998", false, false)];
         assert_eq!(pick_bridge_l3(&c), Some("switch0.3998"));
         assert_eq!(pick_bridge_l3(&[]), None);
+    }
+
+    #[test]
+    fn global_ipv6_addresses_mark_a_device_addressed() {
+        let text = "\
+20010db8000000000000000000000001 0c 40 00 80 br3998
+fe800000000000000000000000000001 0d 40 20 80 switch0.3998
+fe800000000000000000000000000002 0c 40 20 80 br3998
+";
+        let got = parse_if_inet6_global(text);
+        assert!(got.contains("br3998"), "{got:?}");
+        assert!(!got.contains("switch0.3998"), "link-local only: {got:?}");
     }
 
     #[test]

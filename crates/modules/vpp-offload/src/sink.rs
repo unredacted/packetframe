@@ -273,7 +273,8 @@ pub struct NexthopMap {
     /// Bridged VLANs that have a BVI. A tagged bridged VLAN resolves ONLY
     /// through one: the per-port subif path would send from the port's
     /// own MAC, which an IX drops or answers by shutting the port.
-    bvis: std::collections::BTreeSet<u16>,
+    /// BVI'd VLAN → the bridge whose BVI it is.
+    bvis: BTreeMap<u16, String>,
     /// Devices classified by [`crate::topology::classify`]. `Some(None)`
     /// is a shape VPP cannot reach through; a device with no entry at all
     /// is treated as [`DevKind::Plain`], which is what every device was
@@ -323,8 +324,17 @@ impl NexthopMap {
     }
 
     /// Record that bridged VLAN `vid` has a BVI.
-    pub fn set_bvi(&mut self, vid: u16) {
-        self.bvis.insert(vid);
+    /// Record that `vid` on `bridge` has a BVI. Only devices on that
+    /// bridge resolve to it: a second VLAN-aware bridge reusing the vid
+    /// is a different L2 domain, and resolving it to this BVI would
+    /// flood its traffic into the first (review finding).
+    pub fn set_bvi(&mut self, vid: u16, bridge: &str) {
+        self.bvis.insert(vid, bridge.to_string());
+    }
+
+    /// The bridge `vid`'s BVI belongs to, if it has one.
+    pub fn bvi_bridge(&self, vid: u16) -> Option<&str> {
+        self.bvis.get(&vid).map(String::as_str)
     }
 
     /// Forget every BVI — they died with the VPP process.
@@ -335,6 +345,11 @@ impl NexthopMap {
     /// Replace the VLANs `port` sends untagged, from the kernel bridge.
     pub fn set_port_untagged(&mut self, port: &str, vlans: Vec<u16>) {
         self.port_untagged.insert(port.to_string(), vlans);
+    }
+
+    /// The VLANs the kernel bridge sends out of `port` untagged.
+    pub fn untagged_of(&self, port: &str) -> Vec<u16> {
+        self.port_untagged.get(port).cloned().unwrap_or_default()
     }
 
     /// Whether the kernel bridge sends `vid` out of `port` untagged —
@@ -477,8 +492,8 @@ impl NexthopMap {
             // goes through the VF. A tagged bridged VLAN with no BVI does
             // not resolve at all — deliberately never to a subif, which
             // would send from the port's MAC instead of the bridge's.
-            DevKind::BridgeVlan { vid, .. } => {
-                if self.bvis.contains(vid) {
+            DevKind::BridgeVlan { bridge, vid } => {
+                if self.bvis.get(vid) == Some(bridge) {
                     return Some(NexthopTarget::Bvi { vlan: *vid });
                 }
                 let port = placed?;
@@ -1077,7 +1092,13 @@ mod tests {
         for n in [a, b, c] {
             assert_eq!(m.resolve(&n), None, "{n}");
         }
-        m.set_bvi(3998);
+        // A BVI on another bridge reusing the vid is a different L2
+        // domain: nothing here resolves to it.
+        m.set_bvi(3998, "switch1");
+        for n in [a, b, c] {
+            assert_eq!(m.resolve(&n), None, "{n}");
+        }
+        m.set_bvi(3998, "switch0");
         let bvi = Some(NexthopTarget::Bvi { vlan: 3998 });
         assert_eq!(m.resolve(&a), bvi);
         assert_eq!(m.resolve(&b), bvi);
@@ -1142,7 +1163,7 @@ mod tests {
         assert_eq!(m.resolve(&n), None);
         m.add_port_vlans("eth4", &[1]);
         assert_eq!(m.resolve(&n), None, "a subif alone is not enough");
-        m.set_bvi(1);
+        m.set_bvi(1, "switch0");
         assert_eq!(m.resolve(&n), Some(NexthopTarget::Bvi { vlan: 1 }));
     }
 

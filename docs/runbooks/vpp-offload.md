@@ -678,7 +678,16 @@ VLAN is not routed on the trunk subifs at all. Each gets a **bridge
 domain and a BVI**: a software loopback (`loop<vid>`) carrying the
 kernel bridge's MAC, unnumbered to `loopback-address`, with every trunk
 subif carrying the VLAN as a member (split-horizon group 1, so VPP never
-bridges trunk to trunk; tag popped on ingress, pushed on egress).
+bridges trunk to trunk; tag popped on ingress, pushed on egress). A port
+that sends the VLAN **untagged** joins with its VF itself, bare — so a
+host behind an access-style port still sees the bridge's MAC. Members
+follow the kernel bridge's VLANs within seconds, including a port that
+stops carrying one leaving the domain. The BVI's MAC is re-asserted on
+adoption, so a bridge MAC changed across a restart is picked up; the L3
+device is the addressed one (IPv4 or global IPv6), else the bridge
+rather than the VLAN device beneath it. Two VLAN-aware bridges sharing a
+vid are not supported: only the first gets a BVI, and the second's
+neighbours stay unresolvable rather than borrowing it.
 Neighbours and routes sit on the BVI; frames leave from the bridge MAC
 through the domain. **A tagged bridged VLAN with no BVI — the router has
 no L3 device on it — never resolves**, rather than falling back to a
@@ -695,7 +704,10 @@ it every 2 s. **A move is one L2FIB update** — the neighbour and every
 route through it stay on the BVI. An FDB entry that ages out or is
 flushed keeps the last known trunk; a neighbour the FDB has never shown
 gets no entry and **floods to every member**, exactly as the kernel
-bridge floods an unknown MAC. If the FDB or the
+bridge floods an unknown MAC. Every resync withdraws static entries the
+module did not make (a previous run's, on an adopted VPP). The link gate
+counts the member a neighbour is pinned to — every member, for one that
+floods — as in use, so a dark trunk still blocks a steer. If the FDB or the
 bridge-port VLAN table stops being readable, placements and VLAN
 membership hold at the last good read and the `fdb` row goes Degraded
 until a read succeeds.
