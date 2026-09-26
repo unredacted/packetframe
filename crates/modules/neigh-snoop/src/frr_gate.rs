@@ -92,20 +92,41 @@ impl ParsedList {
 
 /// Parse `show ip prefix-list <name>` / `show ipv6 prefix-list <name>`
 /// text. Tolerates the header line, blank lines and trailing `ge`/`le`
-/// qualifiers; a "Can't find" reply means the list does not exist.
+/// qualifiers.
+///
+/// **The output is per daemon.** vtysh asks every daemon that holds
+/// prefix-lists and concatenates their replies; FRR 10 prefixes each
+/// list header with the daemon (`BGP: ip prefix-list <name>: N
+/// entries`), and a daemon without the list answers with a bare `%
+/// Can't find specified prefix-list`. On a production router where only
+/// bgpd holds the list, zebra's `%` line came first and the first
+/// version returned "absent" on it, so the gate never ran. A `%` line is
+/// therefore one daemon's reply and discards nothing.
+///
+/// When headers carry a daemon prefix, the entries are the `BGP:`
+/// section's: the gate governs bgpd's route-maps, so the list is present
+/// exactly when bgpd holds it, and taking one section keeps a list that
+/// zebra also holds from being counted twice. Without daemon prefixes
+/// (the older, single-daemon form) the whole output is the list. The
+/// list is absent only when no section holds it — a `%` reply alone.
 pub fn parse_prefix_list(text: &str) -> ParsedList {
-    let mut out = ParsedList::default();
+    // One section per list header, keyed by its daemon prefix (`None`
+    // in the single-daemon form). Entries before any header land in an
+    // unnamed section, which is what the single-daemon form is.
+    let mut sections: Vec<(Option<String>, ParsedList)> = vec![(None, ParsedList::default())];
     for line in text.lines() {
         let t = line.trim();
-        if t.is_empty() {
+        if t.is_empty() || t.starts_with('%') {
             continue;
         }
-        if t.starts_with('%') {
-            // "% Can't find specified prefix-list" and friends.
-            return ParsedList::default();
-        }
-        if t.starts_with("ip prefix-list") || t.starts_with("ipv6 prefix-list") {
-            out.present = true;
+        if let Some(daemon) = list_header(t) {
+            sections.push((
+                daemon.map(str::to_ascii_uppercase),
+                ParsedList {
+                    present: true,
+                    entries: Vec::new(),
+                },
+            ));
             continue;
         }
         let mut it = t.split_whitespace();
@@ -123,14 +144,42 @@ pub fn parse_prefix_list(text: &str) -> ParsedList {
         let Some(prefix) = it.next() else {
             continue;
         };
-        out.present = true;
-        out.entries.push(PlEntry {
+        let (_, current) = sections.last_mut().expect("seeded with one section");
+        current.present = true;
+        current.entries.push(PlEntry {
             seq,
             permit,
             prefix: prefix.to_string(),
         });
     }
+
+    if sections.iter().any(|(daemon, _)| daemon.is_some()) {
+        return sections
+            .into_iter()
+            .find(|(daemon, _)| daemon.as_deref() == Some("BGP"))
+            .map(|(_, list)| list)
+            .unwrap_or_default();
+    }
+    let mut out = ParsedList::default();
+    for (_, list) in sections {
+        out.present |= list.present;
+        out.entries.extend(list.entries);
+    }
     out
+}
+
+/// `Some(daemon)` when `line` is a list header — `Some(None)` for the
+/// single-daemon `ip prefix-list <name>: …` form, `Some(Some("BGP"))`
+/// for FRR 10's `BGP: ip prefix-list <name>: …`.
+fn list_header(line: &str) -> Option<Option<&str>> {
+    let is_header = |s: &str| s.starts_with("ip prefix-list") || s.starts_with("ipv6 prefix-list");
+    if is_header(line) {
+        return Some(None);
+    }
+    let (daemon, rest) = line.split_once(':')?;
+    let daemon = daemon.trim();
+    (!daemon.is_empty() && !daemon.contains(char::is_whitespace) && is_header(rest.trim_start()))
+        .then_some(Some(daemon))
 }
 
 /// Removal hysteresis: an address stays desired until it has been
@@ -580,6 +629,76 @@ mod tests {
         let odd =
             parse_prefix_list("ip prefix-list X: 1 entries\n   seq 200 permit 10.0.0.0/8 le 24\n");
         assert!(odd.runtime_hosts().is_empty());
+    }
+
+    /// FRR 10, only bgpd holding the lists: zebra's `%` reply comes
+    /// first, then bgpd's daemon-prefixed section. Verbatim from a
+    /// production router (list names and entries are placeholders
+    /// already).
+    const FRR10_V4_BGP_ONLY: &str = "% Can't find specified prefix-list\n\
+BGP: ip prefix-list IX-RESOLVED-NH: 1 entries\n   seq 5 deny 0.0.0.0/32\n";
+    const FRR10_V6_BGP_ONLY: &str = "% Can't find specified prefix-list\n\
+BGP: ipv6 prefix-list IX-RESOLVED-NH6: 1 entries\n   seq 5 deny ::/128\n";
+
+    #[test]
+    fn a_percent_reply_from_one_daemon_does_not_hide_bgpds_list() {
+        for (text, prefix) in [
+            (FRR10_V4_BGP_ONLY, "0.0.0.0/32"),
+            (FRR10_V6_BGP_ONLY, "::/128"),
+        ] {
+            let l = parse_prefix_list(text);
+            assert!(l.present, "{text}");
+            assert_eq!(
+                l.entries,
+                vec![PlEntry {
+                    seq: 5,
+                    permit: false,
+                    prefix: prefix.into()
+                }]
+            );
+            assert!(!l.has_runtime_entries());
+        }
+    }
+
+    /// Both daemons hold the list: the BGP section is the list, and the
+    /// zebra copy is not counted a second time.
+    #[test]
+    fn with_daemon_prefixes_the_bgp_section_is_the_list() {
+        let text = "ZEBRA: ip prefix-list GATE4: 2 entries\n   seq 5 deny 0.0.0.0/32\n   \
+seq 100 permit 192.0.2.10/32\nBGP: ip prefix-list GATE4: 3 entries\n   seq 5 deny 0.0.0.0/32\n   \
+seq 100 permit 192.0.2.10/32\n   seq 105 permit 192.0.2.11/32\n";
+        let l = parse_prefix_list(text);
+        assert!(l.present);
+        assert_eq!(l.entries.len(), 3, "{:?}", l.entries);
+        assert_eq!(l.runtime_hosts().len(), 2);
+        assert_eq!(l.next_seq(), 110);
+    }
+
+    /// Only zebra holds it, or bgpd answers `%`: bgpd's route-maps have
+    /// no list to consult, so it is absent.
+    #[test]
+    fn a_list_bgpd_does_not_hold_is_absent() {
+        assert!(!parse_prefix_list("% Can't find specified prefix-list\n").present);
+        assert!(
+            !parse_prefix_list(
+                "ZEBRA: ip prefix-list GATE4: 1 entries\n   seq 5 deny 0.0.0.0/32\n\
+% Can't find specified prefix-list\n"
+            )
+            .present
+        );
+    }
+
+    #[test]
+    fn plan_runs_on_the_frr10_multi_daemon_shape() {
+        let v4 = parse_prefix_list(FRR10_V4_BGP_ONLY);
+        let v6 = parse_prefix_list(FRR10_V6_BGP_ONLY);
+        let desired = set(&["192.0.2.10"]);
+        let p = plan(&cfg(), &desired, &desired, &v4, &v6, false);
+        assert!(!p.lists_missing);
+        assert_eq!(
+            p.commands,
+            vec!["ip prefix-list GATE4 seq 100 permit 192.0.2.10/32"]
+        );
     }
 
     #[test]

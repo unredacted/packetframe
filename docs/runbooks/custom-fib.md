@@ -230,7 +230,16 @@ applied **outbound**, plus `unsuppress-map` and `maximum-prefix-out`, on
 the peer or on a peer-group it is a member of. Inbound policies and
 plain `maximum-prefix` govern what packetframe sends FRR — nothing, on
 a passive listener — and are deliberately ignored, since refusing on
-them disqualified a valid config over an inbound route-map. A narrowing
+them disqualified a valid config over an inbound route-map. An outbound
+`route-map` is read rather than refused on sight: it passes when some
+entry is `permit` with no `match` and every lower-sequence entry is a
+`permit` too (`set` clauses rewrite, they do not drop). A `deny` before
+that entry, no such entry, a `call`/`on-match`/`continue`, or a map
+name that is not defined (FRR applies it as deny-all) still narrows.
+Only the families the authority attests count: a line inside
+`address-family ipv6 unicast` does not disqualify a `families v4`
+upstream, and lines outside any address-family block count for every
+family. A narrowing
 directive outside that set would not be caught. Widening it means enumerating FRR's whole
 per-neighbor grammar — every directive missing from such a list refuses
 a valid config — so it is a measurement task rather than an edit.

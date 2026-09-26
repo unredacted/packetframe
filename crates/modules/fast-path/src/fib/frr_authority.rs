@@ -505,7 +505,11 @@ impl FrrAuthorityChecker {
             .run(&["show running-config".to_string()])
             .await
             .map_err(|e| format!("vtysh running-config: {e}"))?;
-        Ok(parse_export_policy(&out, &self.config.pf_peer.to_string()))
+        Ok(parse_export_policy(
+            &out,
+            &self.config.pf_peer.to_string(),
+            &self.config.counted_families(),
+        ))
     }
 }
 
