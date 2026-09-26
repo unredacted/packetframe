@@ -18,7 +18,8 @@ use std::collections::HashSet;
 use aya::maps::{lpm_trie::Key as LpmKey, xdp::DevMapHash, Array, HashMap as AyaHashMap, LpmTrie};
 use packetframe_common::{
     config::ModuleDirective,
-    module::{ModuleConfig, ModuleError, ModuleResult},
+    ethtool::CoalesceSpec,
+    module::{ModuleConfig, ModuleError, ModuleResult, RESTART_SEQUENCE},
 };
 use tracing::{info, warn};
 
@@ -91,10 +92,7 @@ fn refuse_route_source_change(state: &ActiveState, cfg: &ModuleConfig<'_>) -> Mo
     }
     let wanted = crate::linux_impl::route_source_spec_from_cfg(cfg);
     if state.route_source_spec != wanted {
-        return Err(ModuleError::other(
-            MODULE_NAME,
-            "`route-source` changed; the feed listener (and any anyip route it owns) is              built once at attach and cannot be hot-swapped — restart required:              systemctl stop packetframe && packetframe detach --all && systemctl start",
-        ));
+        return Err(ModuleError::other(MODULE_NAME, route_source_refusal()));
     }
     Ok(())
 }
@@ -122,7 +120,7 @@ fn refuse_controller_boundary_change(
     if controller_running != wants_controller {
         return Err(ModuleError::other(
             MODULE_NAME,
-            "`forwarding-mode` change crosses the route-controller boundary (kernel-fib              on one side, custom-fib/compare on the other); the controller and any anyip              route it owns are built once at attach — restart required:              systemctl stop packetframe && packetframe detach --all && systemctl start",
+            controller_boundary_refusal(),
         ));
     }
     Ok(())
@@ -139,22 +137,42 @@ fn refuse_controller_boundary_change(
 fn refuse_coalesce_change(state: &ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
     let wanted = crate::linux_impl::coalesce_spec_from_cfg(cfg);
     if state.coalesce != wanted {
-        let show = |s: &Option<packetframe_common::ethtool::CoalesceSpec>| match s {
-            Some(s) => format!("`coalesce {s}`"),
-            None => "no `coalesce`".to_string(),
-        };
         return Err(ModuleError::other(
             MODULE_NAME,
-            format!(
-                "`coalesce` changed ({} -> {}); it is applied to the NICs once at attach and \
-                 reversed at detach — restart required: \
-                 systemctl stop packetframe && packetframe detach --all && systemctl start",
-                show(&state.coalesce),
-                show(&wanted)
-            ),
+            coalesce_refusal(&state.coalesce, &wanted),
         ));
     }
     Ok(())
+}
+
+fn route_source_refusal() -> String {
+    format!(
+        "`route-source` changed; the feed listener (and any anyip route it owns) is \
+         built once at attach and cannot be hot-swapped — restart required: \
+         {RESTART_SEQUENCE}"
+    )
+}
+
+fn controller_boundary_refusal() -> String {
+    format!(
+        "`forwarding-mode` change crosses the route-controller boundary (kernel-fib \
+         on one side, custom-fib/compare on the other); the controller and any anyip \
+         route it owns are built once at attach — restart required: \
+         {RESTART_SEQUENCE}"
+    )
+}
+
+fn coalesce_refusal(running: &Option<CoalesceSpec>, wanted: &Option<CoalesceSpec>) -> String {
+    let show = |s: &Option<CoalesceSpec>| match s {
+        Some(s) => format!("`coalesce {s}`"),
+        None => "no `coalesce`".to_string(),
+    };
+    format!(
+        "`coalesce` changed ({} -> {}); it is applied to the NICs once at attach and \
+         reversed at detach — restart required: {RESTART_SEQUENCE}",
+        show(running),
+        show(wanted)
+    )
 }
 
 /// Per-map count of entries added and removed during reconcile.
@@ -960,4 +978,29 @@ fn reconcile_mss_iface(
     }
 
     Ok(delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every restart-only refusal must end with the command an operator
+    /// can paste as-is, and must not carry the indentation of a string
+    /// literal wrapped without `\` continuations.
+    #[test]
+    fn restart_refusals_end_with_full_sequence_and_no_whitespace_runs() {
+        let spec = CoalesceSpec {
+            rx_usecs: Some(64),
+            ..Default::default()
+        };
+        for msg in [
+            route_source_refusal(),
+            controller_boundary_refusal(),
+            coalesce_refusal(&None, &Some(spec)),
+        ] {
+            assert!(msg.ends_with(RESTART_SEQUENCE), "{msg}");
+            assert!(msg.ends_with("systemctl start packetframe"), "{msg}");
+            assert!(!msg.contains("  "), "{msg}");
+        }
+    }
 }

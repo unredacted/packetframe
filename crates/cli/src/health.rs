@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use packetframe_common::module::{
-    HealthCtx, HealthReport, HealthState, MetricsWriter, Module, SubsystemHealth,
+    HealthCtx, HealthReport, HealthState, MetricsWriter, Module, SubsystemHealth, RESTART_SEQUENCE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -101,16 +101,6 @@ pub struct NotAttached {
     /// alert, a zeroed healthy one is.
     pub metrics: String,
 }
-
-/// How to bring a module that failed at startup back: the full
-/// sequence, never a bare restart.
-///
-/// A plain `systemctl restart` sends SIGTERM, whose exit deliberately
-/// PRESERVES the fast-path's pins (SPEC.md §8.5), and the next start
-/// then refuses them — so the obvious remedy would turn a daemon that is
-/// forwarding in a degraded state into one that is not running at all.
-pub const RESTART_SEQUENCE: &str =
-    "systemctl stop packetframe && packetframe detach --all && systemctl start packetframe";
 
 /// The health row for a module that did not come up.
 ///

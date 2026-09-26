@@ -13,6 +13,18 @@ use crate::config::{GlobalConfig, ModuleSection};
 
 pub type ModuleResult<T> = std::result::Result<T, ModuleError>;
 
+/// How to bring the daemon back when a change needs a restart: the full
+/// sequence, never a bare restart.
+///
+/// A plain `systemctl restart` sends SIGTERM, whose exit deliberately
+/// PRESERVES the fast-path's pins (SPEC.md §8.5), and the next start
+/// then refuses them — so the obvious remedy would turn a daemon that is
+/// forwarding in a degraded state into one that is not running at all.
+/// Every operator-facing message that says "restart" quotes this, so the
+/// copy-pasteable command cannot drift between surfaces.
+pub const RESTART_SEQUENCE: &str =
+    "systemctl stop packetframe && packetframe detach --all && systemctl start packetframe";
+
 #[derive(Debug, Error)]
 pub enum ModuleError {
     #[error("module `{module}`: {message}")]
