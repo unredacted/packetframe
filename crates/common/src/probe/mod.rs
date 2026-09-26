@@ -905,10 +905,11 @@ fn probe_iface_coalesce(iface: &str) -> Capability {
                     format!(
                         "rx-usecs {rx_usecs} / rx-frames {rx_frames}: effectively one IRQ per \
                          packet at forwarding rates; \
-                         `ethtool -C {iface} rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32` \
-                         measured −10.5% softirq/packet on the reference EFG — settings do not \
-                         survive reboot, see generic-mode-performance runbook §IRQ coalescing \
-                         for persistence"
+                         `rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32` measured −10.5% \
+                         softirq/packet on the reference EFG — the fast-path `coalesce` \
+                         directive applies it at every attach (a daemon running with it \
+                         configured reads as a pass here), see generic-mode-performance \
+                         runbook §IRQ coalescing"
                     ),
                     false,
                 )
@@ -932,77 +933,19 @@ struct CoalesceState {
     adaptive_rx: bool,
 }
 
-#[cfg(target_os = "linux")]
 fn iface_coalesce_state(iface: &str) -> Result<CoalesceState, String> {
-    // uapi `struct ethtool_coalesce`: cmd + 22 u32 parameter fields.
-    // Only rx_coalesce_usecs and rx_max_coalesced_frames are read;
-    // the rest exist so the kernel writes into memory we own.
-    const ETHTOOL_GCOALESCE: u32 = 0x0000_000e;
-    // Width-neutral for the ioctl request cast; see iface_gro_state.
-    const SIOCETHTOOL: u32 = 0x8946;
-    #[repr(C)]
-    #[derive(Default)]
-    struct EthtoolCoalesce {
-        cmd: u32,
-        rx_coalesce_usecs: u32,
-        rx_max_coalesced_frames: u32,
-        rx_coalesce_usecs_irq: u32,
-        rx_max_coalesced_frames_irq: u32,
-        tx_coalesce_usecs: u32,
-        tx_max_coalesced_frames: u32,
-        tx_coalesce_usecs_irq: u32,
-        tx_max_coalesced_frames_irq: u32,
-        stats_block_coalesce_usecs: u32,
-        /// Non-zero means the driver varies the RX settings by packet
-        /// rate, so the resting values above do not describe behavior
-        /// under forwarding load (a resting 50 can become 1 at rate).
-        use_adaptive_rx_coalesce: u32,
-        rest: [u32; 13],
-    }
-
-    let name_bytes = iface.as_bytes();
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    if name_bytes.len() >= ifr.ifr_name.len() {
-        return Err(format!("interface name `{iface}` exceeds IFNAMSIZ"));
-    }
-    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes) {
-        *dst = *src as libc::c_char;
-    }
-
-    let mut value = EthtoolCoalesce {
-        cmd: ETHTOOL_GCOALESCE,
-        ..Default::default()
-    };
-    ifr.ifr_ifru.ifru_data = &mut value as *mut EthtoolCoalesce as *mut libc::c_char;
-
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return Err(format!(
-            "socket(AF_INET, SOCK_DGRAM) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    #[allow(clippy::unnecessary_cast)]
-    let r = unsafe { libc::ioctl(sock, SIOCETHTOOL as _, &mut ifr) };
-    let ioctl_err = std::io::Error::last_os_error();
-    unsafe { libc::close(sock) };
-    if r != 0 {
-        // EOPNOTSUPP is a normal answer (virtual devices, some
-        // drivers); the caller renders it as Unknown, not Fail.
-        return Err(format!(
-            "SIOCETHTOOL/ETHTOOL_GCOALESCE on {iface} failed: {ioctl_err}"
-        ));
-    }
+    use crate::ethtool::CoalesceIo;
+    // EOPNOTSUPP is a normal answer (virtual devices, some drivers);
+    // the caller renders it as Unknown, not Fail. Non-Linux answers
+    // ENOSYS through the same path.
+    let value = crate::ethtool::SiocEthtool
+        .get(iface)
+        .map_err(|e| format!("SIOCETHTOOL/ETHTOOL_GCOALESCE on {iface} failed: {e}"))?;
     Ok(CoalesceState {
         rx_usecs: value.rx_coalesce_usecs,
         rx_frames: value.rx_max_coalesced_frames,
         adaptive_rx: value.use_adaptive_rx_coalesce != 0,
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn iface_coalesce_state(_iface: &str) -> Result<CoalesceState, String> {
-    Err("coalescing probe is Linux-only".to_string())
 }
 
 #[cfg(target_os = "linux")]

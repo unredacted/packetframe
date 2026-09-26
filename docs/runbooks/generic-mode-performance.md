@@ -186,36 +186,58 @@ show: the eth IRQ count collapsed 4× while both softirq and hardirq time went
 **up** (total +9.8% vs coalescing alone). On this SoC a timer interrupt costs
 more than the NIC interrupt it replaces. Tried, rejected, keep both knobs at 0.
 
-**Persistence:** `ethtool -C` state dies on reboot and may not survive a udapi
-provision cycle (unverified). A oneshot unit keeps the fleet honest:
+**Persistence: the `coalesce` directive.** `ethtool -C` state dies on reboot
+and firmware update, and hand-installed host state (a oneshot systemd unit)
+does not survive a firmware update on this platform either. So fast-path
+applies it itself, at every attach:
 
-```ini
-# /etc/systemd/system/packetframe-coalesce.service
-[Unit]
-Description=NIC IRQ coalescing for generic-XDP forwarding (generic-mode-performance runbook)
-# Order AFTER the network is actually up, not merely after
-# network-pre.target: on a box whose network manager creates, renames,
-# or reconfigures these NICs during boot, both it and this unit can run
-# in the same window with no ordering between them — so `ethtool -C`
-# either hits an interface that does not exist yet or gets overwritten
-# a moment later, and the per-interface `|| true` leaves the oneshot
-# "successful" so nothing retries. packetframe.service already waits
-# for network-online.target; slot in just ahead of it.
-After=network-online.target
-Wants=network-online.target
-Before=packetframe.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'for i in eth0 eth1 eth2 eth3 eth4 eth5; do ethtool -C $i rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32 || true; done'
-
-[Install]
-WantedBy=multi-user.target
+```
+module fast-path
+  attach eth0 generic
+  ...
+  coalesce rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32
 ```
 
-```sh
-systemctl daemon-reload && systemctl enable --now packetframe-coalesce
-```
+What it does, per interface the section attaches (and only those — an HA
+link left out of the attach set is never touched):
+
+1. `ETHTOOL_GCOALESCE` to read the current values.
+2. Record the values it is about to change in `<state-dir>/coalesce.json`,
+   **before** changing them, so a crash cannot leave a change nothing knows
+   how to reverse.
+3. `ETHTOOL_SCOALESCE` with only the named parameters changed (an omitted
+   parameter keeps the driver's value), then read back. One
+   `coalesce applied` line per interface logs `before` and `after`.
+
+It runs last in attach, after every step that can fail it, so a refused start
+never leaves a NIC retuned. `packetframe detach` (and the breaker's in-process
+detach) writes the recorded values back — but only for a parameter the NIC
+still holds at PacketFrame's value; one changed by hand since is left as found
+and logged. Records from a previous boot are discarded, never restored: the
+reboot already reset those NICs.
+
+Failure policy: coalescing is a performance knob, so nothing about it fails an
+attach or a detach. A driver that does not support it, or refuses the write,
+is a WARN and the interface keeps its values. A driver that **clamps** (some
+bound the timer in hardware, or share one completion queue between an rx/tx
+pair and pick one value) is a WARN naming requested vs read-back; the
+read-back is what is in effect and is what `detach` compares against. A
+restore that fails keeps its record for the next `detach`.
+
+Restart-only: `packetframe reconfigure` refuses a config whose `coalesce` line
+changed, by name. Use the stop → `detach --all` → start sequence
+([reconfigure runbook](reconfigure.md#what-requires-a-restart)).
+
+**The numbers are platform-tuned.** 50/32 is the measurement above on cn9670
+under generic XDP, not a default for other hardware — measure ns/packet on
+yours before copying it. Some drivers reset the NIC to apply a coalescing
+change (a brief link bounce); PacketFrame does not pace these writes with
+`attach-settle-time`, so on a new platform check `ip monitor link` during a
+first attach before relying on it with bridged attach interfaces.
+
+If a oneshot unit from an earlier revision of this runbook is still
+installed, it coexists: the directive then finds the NIC already set, records
+nothing and restores nothing. Remove the unit anyway so there is one owner.
 
 After any provision event or firmware update, confirm the settings held —
 **with the config**, since a bare `packetframe feasibility` probes no

@@ -127,6 +127,35 @@ fn refuse_controller_boundary_change(
     Ok(())
 }
 
+/// Restart-only guard for `coalesce`. It is an attach-time write to
+/// each attached NIC, reversed from `coalesce.json` at detach; a reload
+/// that edits it would otherwise return OK with the NICs still on the
+/// old values — the operator reading `ethtool -c` afterwards finds the
+/// config and the hardware disagreeing. Same refuse-by-name shape as
+/// `route-source`. Hot-applying was not chosen because a reload that
+/// DROPS a field would also have to restore it, which is detach's job
+/// and runs on detach's record; one path for that is enough.
+fn refuse_coalesce_change(state: &ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    let wanted = crate::linux_impl::coalesce_spec_from_cfg(cfg);
+    if state.coalesce != wanted {
+        let show = |s: &Option<packetframe_common::ethtool::CoalesceSpec>| match s {
+            Some(s) => format!("`coalesce {s}`"),
+            None => "no `coalesce`".to_string(),
+        };
+        return Err(ModuleError::other(
+            MODULE_NAME,
+            format!(
+                "`coalesce` changed ({} -> {}); it is applied to the NICs once at attach and \
+                 reversed at detach — restart required: \
+                 systemctl stop packetframe && packetframe detach --all && systemctl start",
+                show(&state.coalesce),
+                show(&wanted)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Per-map count of entries added and removed during reconcile.
 #[derive(Default, Debug)]
 pub struct DeltaCount {
@@ -138,6 +167,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     refuse_integrity_authority_change(state, cfg)?;
     refuse_route_source_change(state, cfg)?;
     refuse_controller_boundary_change(state, cfg)?;
+    refuse_coalesce_change(state, cfg)?;
     reconcile_cfg(state, cfg)?;
     let v4 = reconcile_allow_v4(state, cfg)?;
     let v6 = reconcile_allow_v6(state, cfg)?;

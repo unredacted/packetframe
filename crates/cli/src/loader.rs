@@ -664,9 +664,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 module = %name,
                 "no attachments; pin registry left to the attaching module"
             );
-        } else {
-            save(&config.global.state_dir, &file)
-                .map_err(|e| RunError::Runtime(format!("pin registry save: {e}")))?;
+        } else if let Err(e) = save(&config.global.state_dir, &file) {
+            // A refused start, so unwind like every other one. A bare
+            // `?` here left this module (and every earlier one)
+            // attached with no daemon — pins in place and, since
+            // fast-path's attach ends by applying `coalesce`, its NICs
+            // retuned (review finding). The module's own detach undoes
+            // both.
+            unwind_attached!(modules, attached, name);
+            return Err(RunError::Runtime(format!("pin registry save: {e}")));
         }
 
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
@@ -843,199 +849,13 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-// `create_excl_no_follow` — the pathname O_NOFOLLOW|O_EXCL primitive
-// from the May 2026 audit — is gone. Every privileged write, rename,
-// and unlink in a configured directory now goes through
-// `walk_dir_no_follow` + the `openat`/`renameat`/`unlinkat` helpers
-// below, because O_NOFOLLOW on the final component never guarded the
-// intermediate ones (review finding, P1).
-
-/// Open an ABSOLUTE directory path one component at a time, each step
-/// `openat(O_DIRECTORY | O_NOFOLLOW)` relative to the descriptor of the
-/// previous one, creating missing components (0755) on the way.
-///
-/// Why a walk and not one `open`: `O_NOFOLLOW` guards only the FINAL
-/// component. The state-dir writes and the umask chmod used to resolve
-/// the whole path at once, so a symlink at an intermediate component —
-/// `/tmp/plant/state` with `plant` attacker-controlled — carried this
-/// root process wherever the attacker pointed, and the descriptor
-/// "verified" at the end belonged to a directory of their choosing
-/// (review finding, P1; the reader was already refusing such paths via
-/// canonicalize-equality, and the privileged writer must be at least as
-/// suspicious as the reader). Every component is opened without
-/// following; a symlink ANYWHERE fails with `ELOOP` and the write is
-/// refused.
-///
-/// `..` is refused outright — a state dir has no business being
-/// specified through parent traversal, and accepting it would make the
-/// walk's guarantees path-dependent.
+// The no-follow dirfd primitives moved to `packetframe_common::statefile`
+// so fast-path's own state file (`coalesce.json`) writes through the
+// same walk; re-exported here so every existing caller is unchanged.
 #[cfg(target_os = "linux")]
-pub(crate) fn create_and_open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    walk_dir_no_follow(path, true)
-}
-
-/// The non-creating walk, for operations that have no business making
-/// directories — removal in particular: if the walk cannot reach the
-/// directory, there is nothing there this process is entitled to touch.
-#[cfg(target_os = "linux")]
-pub(crate) fn open_dir_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    walk_dir_no_follow(path, false)
-}
-
-#[cfg(target_os = "linux")]
-fn walk_dir_no_follow(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-    if !path.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("state paths must be absolute: {}", path.display()),
-        ));
-    }
-    let mut dir = std::fs::File::open("/")?;
-    for comp in path.components() {
-        let name = match comp {
-            std::path::Component::RootDir | std::path::Component::CurDir => continue,
-            std::path::Component::Normal(n) => n,
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("refusing path component {other:?} in {}", path.display()),
-                ))
-            }
-        };
-        let c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path component")
-        })?;
-        let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC;
-        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-        if create
-            && fd < 0
-            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
-        {
-            // Create it and re-open. A concurrent creator making this
-            // mkdirat lose with EEXIST is fine — the reopen decides.
-            unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
-            fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-        }
-        if fd < 0 {
-            let e = std::io::Error::last_os_error();
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "open component {name:?} of {}: {e} (a symlink here is refused)",
-                    path.display()
-                ),
-            ));
-        }
-        dir = unsafe { std::fs::File::from_raw_fd(fd) };
-    }
-    Ok(dir)
-}
-
-/// `O_CREAT|O_EXCL|O_NOFOLLOW` a file RELATIVE to an already-walked
-/// directory descriptor, mode 0600 — the dirfd twin of
-/// `create_excl_no_follow`, for writers that must not re-resolve the
-/// directory path between verifying it and using it.
-#[cfg(target_os = "linux")]
-fn openat_excl_no_follow(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let c = std::ffi::CString::new(name)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
-    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o600 as libc::c_uint) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-/// Same shape but with one stale-`.tmp` retry, dirfd-relative
-/// throughout. The retry runs only when the create returns
-/// `AlreadyExists` and the existing entry is a regular file (a leftover
-/// from a crashed run), checked with `fstatat(AT_SYMLINK_NOFOLLOW)` so
-/// an attacker's symlink is not misclassified as a file. A second
-/// `EEXIST` is a real race between competing writers and errors out.
-#[cfg(target_os = "linux")]
-pub(crate) fn openat_excl_with_retry(
-    dir: &std::fs::File,
-    name: &str,
-) -> std::io::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    match openat_excl_no_follow(dir, name) {
-        Ok(f) => Ok(f),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let c = std::ffi::CString::new(name).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name")
-            })?;
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::fstatat(
-                    dir.as_raw_fd(),
-                    c.as_ptr(),
-                    &mut st,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if st.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(e);
-            }
-            if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            openat_excl_no_follow(dir, name)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Remove a state record through the same component-wise no-follow
-/// walk the writers use — never by resolving the pathname whole.
-///
-/// `std::fs::remove_file` does not follow a symlink at the FINAL
-/// component, but it follows every intermediate one, so the identity
-/// cleanup on a failed write could be pointed at another instance's
-/// state directory and have this root daemon delete THAT instance's
-/// sidecar — disabling its identity-based status and reconfigure
-/// (review finding, P1; the writes had just been converted to
-/// descriptor-relative operations while this cleanup stayed
-/// pathname-based). If the walk cannot reach the directory, nothing is
-/// removed: a path this process refuses to write through is a path it
-/// must refuse to delete through.
-#[cfg(target_os = "linux")]
-pub(crate) fn remove_state_record(path: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
-    let dir = open_dir_no_follow(parent)?;
-    let c = std::ffi::CString::new(name)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
-    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// `renameat` within one already-walked directory descriptor.
-#[cfg(target_os = "linux")]
-pub(crate) fn renameat_within(dir: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let (f, t) = (std::ffi::CString::new(from), std::ffi::CString::new(to));
-    let (f, t) = (
-        f.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?,
-        t.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?,
-    );
-    if unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
+pub(crate) use packetframe_common::statefile::{
+    create_and_open_dir_no_follow, openat_excl_with_retry, remove_state_record, renameat_within,
+};
 
 /// Atomically write the current PID to `path`. Uses write-then-rename
 /// so a half-written file is never observed; the temp file is opened
@@ -2209,6 +2029,37 @@ fn detach_guard(_bpffs_root: &Path, _state_dir: &Path) -> Result<(), String> {
 /// module's failure could strand VPP's VFs.
 #[cfg(feature = "fast-path")]
 fn detach_fast_path(
+    bpffs_root: &Path,
+    state_dir: &Path,
+    settle_time: std::time::Duration,
+) -> Result<(), String> {
+    let result = detach_fast_path_attachments(bpffs_root, state_dir, settle_time);
+    // `coalesce` directive: NIC settings the daemon changed, written
+    // back from their record. After the detach (the reverse of attach's
+    // order), but whatever the detach's outcome: an unreadable registry
+    // or a failed pin or filter teardown must not also strand the NICs
+    // retuned (review finding). Warn-only, so the original error is
+    // what this returns; a refused write keeps its record for the next
+    // detach.
+    #[cfg(target_os = "linux")]
+    {
+        let s = packetframe_fast_path::coalesce_restore_from_state_dir(state_dir);
+        if s.restored > 0 || s.retained > 0 {
+            tracing::info!(
+                restored = s.restored,
+                retained = s.retained,
+                "NIC coalescing restored"
+            );
+        }
+    }
+    result
+}
+
+/// Pins, tc filters and the registry: everything `detach_fast_path`
+/// tears down before the coalescing restore, with `?`s that end only
+/// this half.
+#[cfg(feature = "fast-path")]
+fn detach_fast_path_attachments(
     bpffs_root: &Path,
     state_dir: &Path,
     settle_time: std::time::Duration,
