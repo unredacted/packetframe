@@ -531,8 +531,19 @@ mod linux {
     /// The reconcile loop: one tick per `interval`, snapshot back to the
     /// engine after each. Stops when the gate is unconfigured or on
     /// cancel.
+    ///
+    /// `turn` is the module's vtysh queue, held for the WHOLE tick: a
+    /// reconcile is several calls (both lists read, an update, the
+    /// readbacks), and taking a turn per call let a queued route-server
+    /// dump — up to its full timeout — run between two of them, and more
+    /// dumps between the next two, stretching one reconcile across
+    /// several dumps and keeping an unresolved next hop permitted well
+    /// past `remove-after` (review finding). The resolved set is read
+    /// after the turn is granted, so a long wait never reconciles
+    /// against a stale one.
     pub async fn gate_task(
         vtysh: Arc<dyn Vtysh>,
+        turn: Arc<tokio::sync::Mutex<()>>,
         mut input: watch::Receiver<GateInput>,
         ctl: mpsc::UnboundedSender<EngineMsg>,
         cancel: CancellationToken,
@@ -570,6 +581,10 @@ mod linux {
             if restart {
                 continue;
             }
+            let _turn = tokio::select! {
+                _ = cancel.cancelled() => return,
+                t = turn.lock() => t,
+            };
             let inp = input.borrow_and_update().clone();
             let Some(cfg) = inp.cfg.clone() else {
                 continue;

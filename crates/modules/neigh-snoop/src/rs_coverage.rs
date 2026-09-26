@@ -7,15 +7,32 @@
 //! below transit: the exact unresolved next-hops and the prefix count
 //! behind them.
 //!
-//! The JSON parser is lenient on purpose (FRR's field set varies across
-//! releases): it looks for the `receivedRoutes` object and, per prefix,
-//! a `nextHop` string or the first `nexthops[].ip`. The parser is
-//! portable; the dump runs through the gate's `Vtysh` runner.
+//! **The next-hop key depends on the family.** FRR renders each
+//! received path with `route_vty_out_tmp`, which writes `nextHop` for
+//! an IPv4 next-hop and `nextHopGlobal` for an IPv6 one (10.0 through
+//! master), and no link-local at all. The first parser knew only
+//! `nextHop`, so every IPv6 route read as "without a parsable
+//! next-hop" and the v6 half of the check was blind. The richer
+//! `nexthops[]` array of other renderings is still accepted.
+//!
+//! **The global next-hop is the one checked.** It is the address the
+//! route server passes through unchanged from the announcing
+//! participant, the one the gate's prefix-lists hold (link-locals are
+//! never listed), and the one `set ipv6 next-hop prefer-global`
+//! installs. A link-local on a route-server path, when there is one, is
+//! normally the route server's own and says nothing about the
+//! participant.
+//!
+//! Lenient about the field set (it varies across releases), not about
+//! types, and only the fields read are deserialised: a route-server
+//! dump is 70k–150k entries of about ten fields each, and a generic
+//! JSON tree builds every one of them. The parser is portable; the
+//! dump runs through the gate's `Vtysh` runner.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
-use serde_json::Value;
+use serde::Deserialize;
 
 use crate::cfg::BridgeCfg;
 use crate::snapshot::Ratio;
@@ -31,36 +48,129 @@ pub struct ReceivedRoutes {
     pub unparsed: u64,
 }
 
-pub fn parse_received_routes(json: &str) -> Result<ReceivedRoutes, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("received-routes json: {e}"))?;
-    let routes = v
-        .get("receivedRoutes")
-        .or_else(|| v.get("advertisedRoutes"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| "received-routes json: no `receivedRoutes` object".to_string())?;
-    let mut out = ReceivedRoutes {
+/// Unknown fields are skipped without being built, which is where the
+/// memory goes in a generic tree.
+#[derive(Deserialize)]
+struct Dump {
+    #[serde(rename = "receivedRoutes")]
+    received: Option<HashMap<String, Entry>>,
+    #[serde(rename = "advertisedRoutes")]
+    advertised: Option<HashMap<String, Entry>>,
+    /// FRR's answer when it has no table to show (no such neighbour,
+    /// soft-reconfiguration off).
+    warning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Entry {
+    #[serde(rename = "nextHopGlobal")]
+    next_hop_global: Option<String>,
+    #[serde(rename = "nextHop")]
+    next_hop: Option<String>,
+    #[serde(default)]
+    nexthops: Vec<Nexthop>,
+}
+
+#[derive(Deserialize)]
+struct Nexthop {
+    ip: Option<String>,
+}
+
+impl Entry {
+    /// `nextHopGlobal`, else `nextHop`, else the first `nexthops[]`
+    /// address that is not link-local.
+    fn nexthop(&self) -> Option<IpAddr> {
+        let parse = |s: &String| s.parse::<IpAddr>().ok();
+        self.next_hop_global
+            .as_ref()
+            .and_then(parse)
+            .or_else(|| self.next_hop.as_ref().and_then(parse))
+            .or_else(|| {
+                self.nexthops
+                    .iter()
+                    .filter_map(|n| n.ip.as_ref().and_then(parse))
+                    .find(|ip| !matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local()))
+            })
+    }
+}
+
+/// Parse one dump. The object is located first: FRR 10's vtysh output
+/// is per daemon (zebra's `%` line and a `BGP:` header ahead of bgpd's
+/// answer — the shape that silenced the gate once, see
+/// `frr_gate::parse_prefix_list`), and a line in front of the object
+/// must read as the data it precedes, never as a failed dump.
+pub fn parse_received_routes(out: &str) -> Result<ReceivedRoutes, String> {
+    let mut starts = json_starts(out);
+    let first = starts.next().ok_or_else(|| {
+        format!(
+            "received-routes json: no JSON object in the reply: {:?}",
+            first_line(out)
+        )
+    })?;
+    let dump = match dump_at(out, first) {
+        Ok(d) => d,
+        // FRR 10 prints the braces around a table before it knows there
+        // is none, so "soft reconfiguration not enabled" and "no such
+        // address family" arrive as `{` / `{"warning":…}` / `}`. The
+        // inner object is the message worth reporting.
+        Err(e) => match starts.next().and_then(|s| dump_at(out, s).ok()) {
+            Some(d) if d.warning.is_some() => d,
+            _ => return Err(format!("received-routes json: {e}")),
+        },
+    };
+    let routes = match (dump.received, dump.advertised) {
+        (Some(r), _) | (None, Some(r)) => r,
+        (None, None) => {
+            return Err(match dump.warning {
+                Some(w) => format!("received-routes json: FRR says: {w}"),
+                None => "received-routes json: no `receivedRoutes` object".to_string(),
+            })
+        }
+    };
+    let mut parsed = ReceivedRoutes {
         routes: Vec::with_capacity(routes.len()),
         unparsed: 0,
     };
     for (prefix, entry) in routes {
-        let nh = entry
-            .get("nextHop")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                entry
-                    .get("nexthops")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                    .and_then(|n| n.get("ip"))
-                    .and_then(Value::as_str)
-            })
-            .and_then(|s| s.parse::<IpAddr>().ok());
-        match nh {
-            Some(nh) => out.routes.push((prefix.clone(), nh)),
-            None => out.unparsed += 1,
+        match entry.nexthop() {
+            Some(nh) => parsed.routes.push((prefix, nh)),
+            None => parsed.unparsed += 1,
         }
     }
-    Ok(out)
+    Ok(parsed)
+}
+
+/// Byte offsets of the lines that open a JSON object.
+fn json_starts(out: &str) -> impl Iterator<Item = usize> + '_ {
+    out.split_inclusive('\n')
+        .scan(0usize, |off, line| {
+            let at = *off;
+            *off += line.len();
+            Some((at, line))
+        })
+        .filter_map(|(at, line)| {
+            let body = line.trim_start();
+            body.starts_with('{')
+                .then_some(at + line.len() - body.len())
+        })
+}
+
+/// The first JSON value at `start`; whatever follows it is ignored.
+fn dump_at(out: &str, start: usize) -> Result<Dump, serde_json::Error> {
+    Dump::deserialize(&mut serde_json::Deserializer::from_str(&out[start..]))
+}
+
+/// The first non-blank line, bounded, for an error message.
+fn first_line(out: &str) -> &str {
+    let l = out
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    match l.char_indices().nth(120) {
+        Some((i, _)) => &l[..i],
+        None => l,
+    }
 }
 
 /// The vtysh command for one route server's received routes.
@@ -206,5 +316,166 @@ mod tests {
             vec!["192.0.2.12".parse::<IpAddr>().unwrap()]
         );
         assert_eq!(j.demoted_prefixes, 1);
+    }
+
+    /// `show bgp ipv6 unicast neighbors <rs> received-routes json` as
+    /// FRR 10 writes it: the header fields and `{`/`}` printed by hand
+    /// around one `vty_json_no_pretty` object, `nextHopGlobal` per
+    /// path, no link-local.
+    const V6_FRR10: &str = "{\n\"bgpTableVersion\":0,\"bgpLocalRouterId\":\"192.0.2.1\",\
+\"defaultLocPrf\":100,\"localAS\":64496,\"receivedRoutes\": {\
+\"2001:db8:100::/48\":{\"addrPrefix\":\"2001:db8:100::\",\"prefixLen\":48,\
+\"network\":\"2001:db8:100::/48\",\"nextHopGlobal\":\"2001:db8:16::10\",\"weight\":0,\
+\"path\":\"64497\",\"origin\":\"IGP\",\"valid\":true,\"best\":true},\
+\"2001:db8:ffff:ffff:ffff:ffff::/96\":{\"addrPrefix\":\"2001:db8:ffff:ffff:ffff:ffff::\",\
+\"prefixLen\":96,\"network\":\"2001:db8:ffff:ffff:ffff:ffff::/96\",\
+\"nextHopGlobal\":\"2001:db8:16:ffff:ffff:ffff:ffff:ffff\",\"metric\":0,\"weight\":0,\
+\"path\":\"64498 64499 64500\",\"origin\":\"incomplete\",\"valid\":true,\"best\":true}},\
+\"totalPrefixCounter\":2,\"filteredPrefixCounter\":0}\n";
+
+    #[test]
+    fn parses_frr10_ipv6_next_hop_global() {
+        let mut r = parse_received_routes(V6_FRR10).unwrap();
+        assert_eq!(
+            r.unparsed, 0,
+            "the production failure: every v6 route unparsed"
+        );
+        r.routes.sort();
+        assert_eq!(
+            r.routes,
+            vec![
+                (
+                    "2001:db8:100::/48".to_string(),
+                    "2001:db8:16::10".parse().unwrap()
+                ),
+                (
+                    "2001:db8:ffff:ffff:ffff:ffff::/96".to_string(),
+                    "2001:db8:16:ffff:ffff:ffff:ffff:ffff".parse().unwrap()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn nexthops_array_checks_the_global_never_the_link_local() {
+        let json = r#"{"receivedRoutes":{
+          "2001:db8:1::/48":{"nexthops":[
+            {"ip":"fe80::2:ff:fe00:1","afi":"ipv6","scope":"link-local"},
+            {"ip":"2001:db8:16::11","afi":"ipv6","scope":"global"}]},
+          "2001:db8:2::/48":{"nexthops":[
+            {"ip":"2001:db8:16::12","afi":"ipv6","scope":"global"},
+            {"ip":"fe80::2:ff:fe00:2","afi":"ipv6","scope":"link-local"}]},
+          "2001:db8:3::/48":{"nexthops":[
+            {"ip":"fe80::2:ff:fe00:3","afi":"ipv6","scope":"link-local"}]}
+        }}"#;
+        let mut r = parse_received_routes(json).unwrap();
+        r.routes.sort();
+        assert_eq!(
+            r.routes,
+            vec![
+                (
+                    "2001:db8:1::/48".to_string(),
+                    "2001:db8:16::11".parse().unwrap()
+                ),
+                (
+                    "2001:db8:2::/48".to_string(),
+                    "2001:db8:16::12".parse().unwrap()
+                ),
+            ]
+        );
+        assert_eq!(r.unparsed, 1, "a link-local alone is no participant");
+    }
+
+    #[test]
+    fn ipv4_prefix_with_ipv6_next_hop() {
+        // RFC 8950: FRR writes `nextHopGlobal` for a v4 prefix too.
+        let r = parse_received_routes(
+            r#"{"receivedRoutes":{"203.0.113.0/24":{"nextHopGlobal":"2001:db8:16::13"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.routes,
+            vec![(
+                "203.0.113.0/24".to_string(),
+                "2001:db8:16::13".parse().unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn multi_daemon_preamble_and_pretty_printing_are_data() {
+        // Daemon lines ahead of the object, the object pretty-printed
+        // across lines, a trailing line after it.
+        let out = "% Can't find specified prefix-list\nBGP:\n{\n  \"receivedRoutes\": {\n    \
+                   \"2001:db8:100::/48\": {\n      \"nextHopGlobal\": \"2001:db8:16::10\"\n    },\n    \
+                   \"203.0.113.0\\/24\": {\n      \"nextHop\": \"192.0.2.10\"\n    }\n  }\n}\n\
+                   % trailing notice\n";
+        let mut r = parse_received_routes(out).unwrap();
+        r.routes.sort();
+        assert_eq!(r.unparsed, 0);
+        assert_eq!(
+            r.routes,
+            vec![
+                (
+                    "2001:db8:100::/48".to_string(),
+                    "2001:db8:16::10".parse().unwrap()
+                ),
+                ("203.0.113.0/24".to_string(), "192.0.2.10".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn failures_are_errors_not_empty_tables() {
+        let e = parse_received_routes("% No such neighbor or address family\n").unwrap_err();
+        assert!(e.contains("No such neighbor"), "{e}");
+        let e = parse_received_routes(r#"{"warning":"Inbound soft reconfiguration not enabled"}"#)
+            .unwrap_err();
+        assert!(e.contains("soft reconfiguration"), "{e}");
+        // FRR 10's wrapped form of the same warning.
+        let e = parse_received_routes(
+            "{\n{\"warning\":\"Inbound soft reconfiguration not enabled\"}\n}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("FRR says: Inbound soft reconfiguration"), "{e}");
+        assert!(parse_received_routes("").is_err());
+        assert!(parse_received_routes("{\"receivedRoutes\": {").is_err());
+        // A type FRR never writes fails the dump rather than hiding.
+        assert!(parse_received_routes(r#"{"receivedRoutes":{"x":{"nextHop":7}}}"#).is_err());
+        // An empty table is a real, empty answer.
+        let r = parse_received_routes(r#"{"receivedRoutes":{}}"#).unwrap();
+        assert_eq!(r, ReceivedRoutes::default());
+    }
+
+    #[test]
+    fn join_resolves_ipv6_next_hops_against_the_mirror() {
+        let routes = parse_received_routes(V6_FRR10).unwrap().routes;
+        let bridge = BridgeCfg {
+            name: "br0".into(),
+            ix_mode: true,
+            prefixes: vec!["2001:db8:16::/48".parse().unwrap()],
+            peers: vec![PeerCfg {
+                addrs: vec!["2001:db8:16::2".parse().unwrap()],
+                route_server: true,
+            }],
+        };
+        let mut mirror = KernelMirror::default();
+        mirror.upsert(
+            7,
+            "2001:db8:16::10".parse().unwrap(),
+            MirrorEntry {
+                state: NudState::Reachable,
+                mac: Some([2, 0, 0, 0, 0, 2]),
+            },
+        );
+        let j = join(&routes, &bridge, 7, &mirror, 10);
+        assert_eq!(j.received_prefixes, 2);
+        assert_eq!(j.demoted_prefixes, 1);
+        assert_eq!(
+            j.unresolved_nexthops,
+            vec!["2001:db8:16:ffff:ffff:ffff:ffff:ffff"
+                .parse::<IpAddr>()
+                .unwrap()]
+        );
     }
 }
