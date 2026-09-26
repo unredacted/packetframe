@@ -24,16 +24,21 @@
 //! **What it does NOT check**, so nobody reads more into a pass than
 //! it earns:
 //!
-//! - *Per-path nexthop correctness.* Confirming VPP's paths match
-//!   bird's intent would mean holding the expected nexthop set for
-//!   ~1.05M prefixes, which is the memory the ledger deliberately does
-//!   not spend. Path bytes are covered instead by the golden vectors
-//!   (encoding) and the drainer's per-route acknowledgement (delivery).
-//! - *Total route count.* The plan pairs sampling with VPP's own
-//!   `show ip fib summary`, which needs `cli_inband` — a message from
-//!   `vlib.api.json`, not among the vendored files. Until that is
-//!   vendored, a uniform shortfall is caught only stochastically by
-//!   sampling. Recorded as owed rather than quietly dropped.
+//! - *Per-path nexthop correctness*, on an ordinary pass. The ledger now
+//!   records the path set each route was acknowledged through (interned,
+//!   4 bytes a route), but an ordinary pass verifies a table this process
+//!   installed and acknowledged itself, so path bytes stay covered by the
+//!   golden vectors (encoding) and the drainer's per-route acknowledgement
+//!   (delivery). [`verify_paths`] adds the comparison for the one table
+//!   this process did NOT install: a ledger seeded from the previous
+//!   process's preserved record, where the paths are the claim under
+//!   test.
+//! - *Total route count*, on an ordinary pass. The plan pairs sampling
+//!   with VPP's own `show ip fib summary`; `cli_inband` is vendored now,
+//!   and the preserved-ledger adoption compares those per-length counts
+//!   against the ones the previous process recorded before it trusts the
+//!   record at all (`crate::ledger_record::FibFingerprint`). An ordinary
+//!   pass still catches a uniform shortfall only stochastically.
 
 use packetframe_common::fib::IpPrefix;
 
@@ -60,6 +65,14 @@ pub enum Mismatch {
     /// A path egresses an interface we do not own — `local0` (index 0)
     /// or something attached behind our back.
     ForeignPath { prefix: IpPrefix, sw_if_index: u32 },
+    /// VPP holds the route through different paths than the ledger
+    /// records. Only a path-checking pass ([`verify_paths`]) reports it,
+    /// and only for a prefix whose paths the ledger knows.
+    WrongPaths {
+        prefix: IpPrefix,
+        expected: Vec<crate::sink::PathKey>,
+        got: Vec<crate::sink::PathKey>,
+    },
 }
 
 /// An interface that cannot forward, whatever the FIB says.
@@ -345,6 +358,27 @@ pub fn verify(
     sample_size: usize,
     seed: u64,
 ) -> Result<VerifyOutcome, TransportError> {
+    verify_paths(t, ledger, ports, active_egress, sample_size, seed, false)
+}
+
+/// [`verify`], optionally also comparing each probed route's paths with
+/// the set the ledger records for it.
+///
+/// `check_paths` is for a ledger this process did not build — one seeded
+/// from the previous process's preserved record. There the record's
+/// claim is exactly "VPP holds these routes through these paths", so a
+/// probe that finds the prefix present on an owned interface but through
+/// different paths has disproved it, and that is a [`Mismatch`]. A prefix
+/// whose paths the ledger does not know is checked as an ordinary probe.
+pub fn verify_paths(
+    t: &mut Transport,
+    ledger: &RouteLedger,
+    ports: &PortIndex,
+    active_egress: &std::collections::HashSet<u32>,
+    sample_size: usize,
+    seed: u64,
+    check_paths: bool,
+) -> Result<VerifyOutcome, TransportError> {
     let counts = ledger.counts();
     let installed = ledger.verifiable_prefixes();
     let probes = sample(&installed, sample_size, seed);
@@ -386,14 +420,34 @@ pub fn verify(
             out.mismatches.push(Mismatch::NoPaths { prefix });
             continue;
         }
-        for path in &reply.route.paths {
-            if !owned.contains(&path.sw_if_index) {
-                out.mismatches.push(Mismatch::ForeignPath {
-                    prefix,
-                    sw_if_index: path.sw_if_index,
-                });
-                break;
-            }
+        let foreign = reply
+            .route
+            .paths
+            .iter()
+            .find(|p| !owned.contains(&p.sw_if_index));
+        if let Some(path) = foreign {
+            out.mismatches.push(Mismatch::ForeignPath {
+                prefix,
+                sw_if_index: path.sw_if_index,
+            });
+            continue;
+        }
+        if !check_paths {
+            continue;
+        }
+        let Some(expected) = ledger
+            .installed_via(prefix)
+            .and_then(|id| ledger.paths_of(id))
+        else {
+            continue;
+        };
+        let got = crate::fib_sync::path_set_of(&reply.route.paths);
+        if got != expected {
+            out.mismatches.push(Mismatch::WrongPaths {
+                prefix,
+                expected: expected.to_vec(),
+                got,
+            });
         }
     }
     Ok(out)

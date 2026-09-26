@@ -3466,3 +3466,507 @@ fn a_failed_kick_degrades_without_failing_the_attach() {
         "the convergence itself is untouched by a kick failure: {events:?}"
     );
 }
+
+/// The `--keep-vpp` restart with a preserved route ledger, and every way
+/// out of it back to the dump path (2026-09-26: a restart that KEPT a
+/// verified, steered VPP cost ~13 minutes unsteered because the new
+/// daemon had to read VPP's FIB to learn what it held).
+mod preserved {
+    use super::steered::{run_paced, Log, RecordingSteering, SharedMirror};
+    use super::*;
+    use packetframe_vpp_offload::ledger_record::{FibFingerprint, LedgerBody, LedgerRecord};
+    use packetframe_vpp_offload::runtime::IdentityStore;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// What a preserving stop leaves, captured — the identity half is the
+    /// state file's owner's job, and `LedgerRecord::check_adoptee` is
+    /// tested on its own.
+    pub struct CaptureStore(pub Arc<Mutex<Option<LedgerBody>>>);
+    impl IdentityStore for CaptureStore {
+        fn process_changed(
+            &mut self,
+            _: Option<packetframe_vpp_offload::runtime::ProcessIdentity>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
+        fn steering_changed(
+            &mut self,
+            _: &[(String, u32)],
+            _: &[(String, u32, packetframe_vpp_offload::steer::RuleSet)],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn preserve_ledger(&mut self, body: LedgerBody) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(body);
+            Ok(())
+        }
+    }
+
+    pub fn record(body: LedgerBody) -> LedgerRecord {
+        LedgerRecord {
+            pid: 4242,
+            start_ticks: 99,
+            boot_id: "boot-a".into(),
+            token: 7,
+            body,
+        }
+    }
+
+    pub fn runtime_with(
+        fake: &Fake,
+        source: Box<dyn RouteSource>,
+        steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+        store: Box<dyn IdentityStore>,
+    ) -> Runtime {
+        let engine = ConvergenceEngine::new(
+            &fake.path,
+            vec![PortAttach {
+                port: "eth4".into(),
+                pci_addr: "0002:07:00.1".into(),
+                port_id: 0,
+                num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                accept_macs: vec![],
+                mtu: None,
+                vlans: vec![],
+            }],
+            vec!["eth4".into()],
+            // Pre-dump floor 96/16 = 6: the six-route tables meet it.
+            96,
+            FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
+        );
+        Runtime::new(
+            engine,
+            source,
+            steering,
+            store,
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        )
+    }
+
+    fn handshake(rt: &Runtime) {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+
+    /// Daemon A: converge `routes` onto the fake from nothing, then stop
+    /// the preserving way. Returns what it left.
+    pub fn daemon_a(fake: &Fake, routes: Vec<IpPrefix>) -> LedgerBody {
+        let captured = Arc::new(Mutex::new(None));
+        {
+            let rt = runtime_with(
+                fake,
+                Box::new(Mirror { routes }),
+                Box::new(SteeringUnavailable),
+                Box::new(CaptureStore(captured.clone())),
+            );
+            handshake(&rt);
+            let mut d = Driver::new();
+            let t0 = Instant::now();
+            {
+                let (_, mut fx) = rt.views();
+                d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+            }
+            run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+            rt.preserve(d.state())
+                .expect("a converged ledger preserves");
+            // A exits here; its connection closes with the runtime.
+        }
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the ledger was left");
+        let _ = fake.drain_events();
+        body
+    }
+
+    /// Daemon B's adoption of the still-steered VPP. `seed` is what the
+    /// attach wiring hands over — `None` when `consume_for_adoption`
+    /// refused the record.
+    pub fn daemon_b(
+        fake: &Fake,
+        mirror: Vec<IpPrefix>,
+        seed: Option<LedgerRecord>,
+        source: Option<Box<dyn RouteSource>>,
+    ) -> (Runtime, Driver, Log, Instant) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let source = source.unwrap_or_else(|| Box::new(SharedMirror(Arc::new(Mutex::new(mirror)))));
+        let rt = runtime_with(
+            fake,
+            source,
+            Box::new(RecordingSteering {
+                rules: vec![("eth4".into(), 1)],
+                log: log.clone(),
+            }),
+            Box::new(NullStore),
+        );
+        let session = Arc::new(packetframe_common::fib::FeedSession::new());
+        session.set_up(true);
+        rt.feed_session(session);
+        if let Some(rec) = seed {
+            rt.seed_ledger(rec);
+        }
+        handshake(&rt);
+        let mut d = Driver::new();
+        let t0 = Instant::now();
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        }
+        rt.set_steered(true);
+        (rt, d, log, t0)
+    }
+
+    pub fn dumps(events: &[fake_vpp::Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, fake_vpp::Event::Msg(m) if m == "ip_route_dump"))
+            .count()
+    }
+
+    pub fn route_ops(events: &[fake_vpp::Event]) -> Vec<(bool, [u8; 4])> {
+        let mut v: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                fake_vpp::Event::Route(r) => Some((r.is_add, r.addr)),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn tracked() -> Behaviour {
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        }
+    }
+
+    fn table(n: u8) -> Vec<IpPrefix> {
+        (0..n).map(|i| fake_vpp::v4(0, i)).collect()
+    }
+
+    /// The round trip the PR exists for: a keep-vpp restart with a valid
+    /// preserved ledger never takes traffic off VPP, never reads its FIB,
+    /// sends VPP only what changed while nobody was watching, and still
+    /// verifies — paths included — before the state counts as verified.
+    #[test]
+    fn a_keep_vpp_restart_with_a_preserved_ledger_never_unsteers_or_dumps() {
+        let fake = Fake::start_behaving("pl-round", tracked());
+        let body = daemon_a(&fake, table(6));
+        assert_eq!(body.entries.len(), 6);
+        assert!(
+            body.entries.iter().all(|(_, s)| s.is_some()),
+            "every route is recorded with the paths VPP acknowledged"
+        );
+        assert_eq!(body.interfaces, vec![("eth4".to_string(), ASSIGNED_INDEX)]);
+
+        // The feed moved on while nobody was looking: 10.0.0.0/24 was
+        // withdrawn, 10.0.9.0/24 is new, the other five are unchanged.
+        let mirror: Vec<IpPrefix> = (1..6).chain([9]).map(|i| fake_vpp::v4(0, i)).collect();
+        let (rt, mut d, log, t0) = daemon_b(&fake, mirror, Some(record(body)), None);
+        assert!(
+            rt.status().preserved_fib,
+            "the seed is in and unverified by this daemon"
+        );
+        let (_, events) = run_paced(&mut d, &rt, t0, 512, |d| d.state() == State::Steered);
+
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["steer"],
+            "steering never came down — the one transition is the post-verify re-assert"
+        );
+        let seen = fake.drain_events();
+        assert_eq!(dumps(&seen), 0, "VPP's FIB was never read");
+        assert_eq!(
+            route_ops(&seen),
+            vec![(false, [10, 0, 0, 0]), (true, [10, 0, 9, 0])],
+            "only the delta reached VPP: the withdrawal and the new route"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, fake_vpp::Event::Msg(m) if m == "cli show ip fib summary")),
+            "VPP's route counts were checked against the record before it was trusted"
+        );
+        assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+        assert!(!events.contains(&Event::PreservedLedgerRejected));
+        assert!(
+            !rt.status().preserved_fib,
+            "verified by this daemon now, so no longer merely preserved"
+        );
+        assert_eq!(rt.status().counts.installed, 6);
+    }
+
+    /// The runtime-side fallbacks: no record at all (what every refusal
+    /// at bring-up — stale identity, corrupt, another version, another
+    /// stop's token — hands over; `consume_for_adoption` is tested for
+    /// each on its own), and a record whose route counts no longer match
+    /// VPP. Both take the dump path: unsteer, read, diff, verify.
+    #[test]
+    fn a_missing_or_stale_ledger_falls_back_to_the_dump_path() {
+        for (name, tamper) in [("missing", None), ("fib-changed", Some(()))] {
+            let fake = Fake::start_behaving(&format!("pl-{name}"), tracked());
+            let body = daemon_a(&fake, table(6));
+            let seed = tamper.map(|()| {
+                let mut b = body.clone();
+                // Someone added a route by hand since the stop.
+                b.fingerprint.counts[0].2 -= 1;
+                record(b)
+            });
+            let (rt, mut d, log, t0) = daemon_b(&fake, table(6), seed, None);
+            let (_, events) = run_paced(&mut d, &rt, t0, 512, |d| d.state() == State::Steered);
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                &["unsteer", "steer"],
+                "{name}: the dump path unsteers before reading VPP's FIB"
+            );
+            assert_eq!(dumps(&fake.drain_events()), 1, "{name}: VPP's FIB was read");
+            assert!(events.contains(&Event::VerifyPassed), "{name}: {events:?}");
+        }
+    }
+
+    /// Verify disagreeing with the seed: VPP holds the routes, on the
+    /// right interface and in the right number (so the counts match), but
+    /// through a different nexthop than the record says. Traffic comes
+    /// off VPP, the seed is discarded, and the resync starts over from a
+    /// read of VPP's FIB — on the same process, never a teardown.
+    #[test]
+    fn a_ledger_verify_disproves_falls_back_to_the_dump_path_without_a_teardown() {
+        const VIA_ELSEWHERE: &[([u8; 4], u8, [u8; 4], u32)] = &[
+            ([10, 0, 0, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
+            ([10, 0, 1, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
+            ([10, 0, 2, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
+            ([10, 0, 3, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
+        ];
+        let fake = Fake::start_behaving(
+            "pl-disproved",
+            Behaviour {
+                track_routes: true,
+                existing_via: VIA_ELSEWHERE,
+                ..Default::default()
+            },
+        );
+        // The record claims the four routes via 192.0.2.1 — which is also
+        // what the source says, so the diff has nothing to send and only
+        // verify can find the lie.
+        let mut fp = FibFingerprint::default();
+        let mut t = fake_vpp::RouteTable::new();
+        for &(a, l, nh, i) in VIA_ELSEWHERE {
+            t.insert((a, l), vec![(nh, i)]);
+        }
+        fp.absorb(&fake_vpp::fib_summary(&t));
+        let body = LedgerBody {
+            fingerprint: fp,
+            interfaces: vec![("eth4".into(), ASSIGNED_INDEX)],
+            path_sets: vec![vec![(fake_vpp::nh(), ASSIGNED_INDEX)]],
+            entries: table(4).into_iter().map(|p| (p, Some(0))).collect(),
+        };
+        let (rt, mut d, log, t0) = daemon_b(&fake, table(4), Some(record(body)), None);
+        let (_, events) = run_paced(&mut d, &rt, t0, 512, |d| d.state() == State::Steered);
+
+        assert!(
+            events.contains(&Event::PreservedLedgerRejected),
+            "verify must have caught the seed: {events:?}"
+        );
+        assert!(
+            !events.contains(&Event::VerifyFailed) && d.supervisor().failures() == 0,
+            "a disproved RECORD is not a broken VPP — no teardown: {events:?}"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["unsteer", "steer"],
+            "off VPP at the rejection, back on only after the dump path verified"
+        );
+        let seen = fake.drain_events();
+        assert_eq!(dumps(&seen), 1, "the fallback read VPP's FIB");
+        assert_eq!(
+            route_ops(&seen).len(),
+            4,
+            "and re-sent the four routes it could not vouch for"
+        );
+        assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+    }
+
+    /// A mirror whose change counter moves the moment VPP's FIB is being
+    /// dumped — the feed changing under the dump — once, or forever.
+    pub struct ChurnOnDump {
+        pub routes: Vec<IpPrefix>,
+        pub dumped: &'static AtomicBool,
+        pub forever: bool,
+        pub ticks: AtomicU64,
+    }
+    impl RouteSource for ChurnOnDump {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            if !self.dumped.load(Ordering::SeqCst) {
+                return 0;
+            }
+            if self.forever {
+                // Every read after the dump sees more churn.
+                1_000_000 + 10_000 * self.ticks.fetch_add(1, Ordering::SeqCst)
+            } else {
+                1_000_000
+            }
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in &self.routes {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), "eth4", MAC);
+        }
+    }
+
+    fn churning(name: &str, forever: bool) -> (Fake, Runtime, Driver, Log, Instant) {
+        let dumped: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let fake = Fake::start_behaving(
+            name,
+            Behaviour {
+                track_routes: true,
+                existing_routes: super::steered::EXISTING,
+                dumped: Some(dumped),
+                ..Default::default()
+            },
+        );
+        let source = ChurnOnDump {
+            routes: (0..4)
+                .map(|i| fake_vpp::v4(0, i))
+                .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+                .collect(),
+            dumped,
+            forever,
+            ticks: AtomicU64::new(0),
+        };
+        let (rt, d, log, t0) = daemon_b(&fake, Vec::new(), None, Some(Box::new(source)));
+        (fake, rt, d, log, t0)
+    }
+
+    /// The dump the feed spoiled is retried — and the retry is cheap: the
+    /// FIB it read is still exact (nothing changes VPP's FIB while a
+    /// deferral holds), so the diff runs against it once the source is
+    /// quiet again, with no second dump, no restore onto the stale adopted
+    /// FIB (the fallback stayed fit — live and loaded, merely busy), and
+    /// no teardown.
+    #[test]
+    fn a_churn_spoiled_dump_is_retried_not_torn_down() {
+        let (fake, rt, mut d, log, t0) = churning("pl-spoil", false);
+        // Until the dump has happened (the stop condition consumes the
+        // fake's events, so it sees the dump exactly once).
+        let (now, events) = run_paced(&mut d, &rt, t0, 1024, |_| dumps(&fake.drain_events()) > 0);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["unsteer"],
+            "unsteered for the dump"
+        );
+        assert!(
+            rt.status().resync_deferred.is_some(),
+            "the spoiled diff is held, not run: {events:?}"
+        );
+        assert_eq!(d.state(), State::AdoptedResyncing);
+
+        let (_, events) = run_paced(&mut d, &rt, now, 1024, |d| d.state() == State::Steered);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["unsteer", "steer"],
+            "no restore in between: a busy fallback is the better tier to wait on"
+        );
+        assert_eq!(dumps(&fake.drain_events()), 0, "no second dump");
+        assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+        assert!(
+            !events.contains(&Event::PhaseTimedOut) && d.supervisor().failures() == 0,
+            "{events:?}"
+        );
+    }
+
+    /// A feed that never settles after the dump holds the deferral —
+    /// unsteered, on the eBPF tier, with the existing VPP alive and
+    /// untouched — for as long as it lasts: several flat convergence
+    /// budgets here. A busy feed is not a broken VPP.
+    #[test]
+    fn a_dump_that_never_settles_stays_unsteered_and_alive() {
+        let (fake, rt, mut d, log, t0) = churning("pl-never", true);
+        let horizon = t0
+            + packetframe_vpp_offload::supervisor::CONVERGENCE_BUDGET * 3
+            + Duration::from_secs(1);
+        let mut dumped = 0;
+        let mut all = Vec::new();
+        let mut now = t0;
+        let (mut obs, mut fx) = rt.views();
+        while now < horizon {
+            let t = d.tick(now, &mut obs, &mut fx);
+            all.extend(t.events.clone());
+            for e in rt.take_pending() {
+                all.extend(d.inject(now, e, &mut fx).events);
+            }
+            rt.set_steered(d.supervisor().is_steered());
+            dumped += dumps(&fake.drain_events());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        assert_eq!(
+            dumped, 1,
+            "the FIB is read once; the retry never re-reads it"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["unsteer"],
+            "stays unsteered on the fallback tier: {all:?}"
+        );
+        assert_eq!(
+            d.state(),
+            State::AdoptedResyncing,
+            "still deferred, still alive"
+        );
+        assert!(
+            !all.contains(&Event::PhaseTimedOut)
+                && !all.iter().any(|e| matches!(e, Event::Wedged))
+                && d.supervisor().failures() == 0,
+            "no teardown for a busy feed: {all:?}"
+        );
+        assert!(rt.status().resync_deferred.is_some());
+    }
+
+    /// Only a ledger this process can vouch for is preserved: not one
+    /// still converging, and not the dump-path adoption's unverified read.
+    #[test]
+    fn an_unverified_ledger_is_not_preserved() {
+        let fake = Fake::start_behaving("pl-unverified", tracked());
+        let captured = Arc::new(Mutex::new(None));
+        let rt = runtime_with(
+            &fake,
+            Box::new(Mirror { routes: table(3) }),
+            Box::new(SteeringUnavailable),
+            Box::new(CaptureStore(captured.clone())),
+        );
+        handshake(&rt);
+        let mut d = Driver::new();
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(Instant::now(), Event::Adopted { steered: false }, &mut fx);
+        }
+        assert_eq!(d.state(), State::Syncing);
+        assert!(rt.preserve(d.state()).is_err());
+        assert!(captured.lock().unwrap().is_none(), "nothing left behind");
+    }
+}

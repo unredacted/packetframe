@@ -659,6 +659,99 @@ impl PendingMap {
     pub fn requeue(&mut self, prefix: IpPrefix, op: PendingOp) {
         self.ops.entry(prefix.into()).or_insert(op);
     }
+
+    /// Forget whatever is owed for `prefix`, active or parked.
+    ///
+    /// For the resync walk's skip of a route VPP is recorded holding
+    /// exactly as the source describes it: an op left here from an
+    /// aborted resync or an earlier delta is an OLDER intent than the
+    /// walk just read, and draining it after the skip would install
+    /// yesterday's nexthops over today's.
+    pub fn discard(&mut self, prefix: IpPrefix) {
+        let k = PrefixKey::from(prefix);
+        self.ops.remove(&k);
+        self.withheld.remove(&k);
+    }
+}
+
+/// One FIB path as VPP holds it: the nexthop and the interface it
+/// egresses. What a route was installed THROUGH, which is what a restart
+/// has to compare to decide whether re-sending it would change anything.
+pub type PathKey = (IpAddr, u32);
+
+/// An interned path set. See [`RouteLedger::intern_paths`].
+pub type PathSetId = u32;
+
+/// Sentinel for "the paths VPP holds for this prefix are not known" — a
+/// prefix adopted from a FIB dump, or one whose live version predates
+/// the tracking. Never skipped by a resync and never path-verified.
+const UNKNOWN_PATHS: PathSetId = PathSetId::MAX;
+
+/// Distinct path sets, interned.
+///
+/// A full table is ~1.1M prefixes over a few dozen nexthops, so storing
+/// each route's paths inline would be a `Vec` per route — the memory the
+/// ledger has always refused to spend (see `verify`'s module docs). Sets
+/// are shared instead, and the ledger holds a 4-byte id per route.
+///
+/// Never shrinks within a process: a set some route stopped using stays
+/// interned. The population is bounded by the distinct nexthop
+/// combinations the feed has produced, and the whole table is rebuilt
+/// with the ledger when the process it describes dies.
+#[derive(Debug, Default)]
+struct PathSets {
+    sets: Vec<Box<[PathKey]>>,
+    index: std::collections::HashMap<Box<[PathKey]>, PathSetId>,
+}
+
+impl PathSets {
+    fn intern(&mut self, paths: &[PathKey]) -> PathSetId {
+        if let Some(id) = self.index.get(paths) {
+            return *id;
+        }
+        let id = self.sets.len() as PathSetId;
+        // `UNKNOWN_PATHS` is the one id that must never be issued. Four
+        // billion distinct nexthop combinations is not a table, it is a
+        // bug upstream — and the safe answer to it is "unknown", which
+        // costs a re-send, never a skip.
+        if id == UNKNOWN_PATHS {
+            return UNKNOWN_PATHS;
+        }
+        let boxed: Box<[PathKey]> = paths.into();
+        self.sets.push(boxed.clone());
+        self.index.insert(boxed, id);
+        id
+    }
+
+    fn find(&self, paths: &[PathKey]) -> Option<PathSetId> {
+        self.index.get(paths).copied()
+    }
+
+    fn get(&self, id: PathSetId) -> Option<&[PathKey]> {
+        self.sets.get(id as usize).map(|b| &b[..])
+    }
+}
+
+/// Put a path set in the one order every comparison uses. VPP keeps a
+/// route's paths as a set, so two installs of the same paths in a
+/// different order are the same route and must intern as one.
+pub fn canonical_paths(mut paths: Vec<PathKey>) -> Vec<PathKey> {
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+/// One ledger entry: the route's state and, while VPP holds a live
+/// version of it, the paths that version was installed through.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    state: RouteState,
+    /// [`UNKNOWN_PATHS`] unless VPP was OBSERVED to hold this prefix
+    /// through a known path set — its acknowledgement of our own write,
+    /// or the previous process's record of the same. Kept across an
+    /// in-flight replacement (the old version is still what forwards)
+    /// and cleared by anything that says nothing live remains.
+    via: PathSetId,
 }
 
 /// Tracks per-prefix state and decides what each pending op becomes.
@@ -677,9 +770,10 @@ impl PendingMap {
 /// classification made a full-table load quadratic.
 #[derive(Debug)]
 pub struct RouteLedger {
-    state: BTreeMap<PrefixKey, RouteState>,
+    state: BTreeMap<PrefixKey, Slot>,
     counts: SinkCounts,
     capacity: Capacity,
+    paths: PathSets,
 }
 
 impl RouteLedger {
@@ -688,11 +782,50 @@ impl RouteLedger {
             state: BTreeMap::new(),
             counts: SinkCounts::default(),
             capacity,
+            paths: PathSets::default(),
         }
     }
 
     pub fn state_of(&self, prefix: IpPrefix) -> Option<RouteState> {
-        self.state.get(&prefix.into()).copied()
+        self.state.get(&prefix.into()).map(|s| s.state)
+    }
+
+    /// Intern a canonical path set (see [`canonical_paths`]).
+    pub fn intern_paths(&mut self, paths: &[PathKey]) -> PathSetId {
+        self.paths.intern(paths)
+    }
+
+    /// The id of an already-interned path set, without interning it.
+    pub fn find_paths(&self, paths: &[PathKey]) -> Option<PathSetId> {
+        self.paths.find(paths)
+    }
+
+    /// The paths a set id stands for.
+    pub fn paths_of(&self, id: PathSetId) -> Option<&[PathKey]> {
+        self.paths.get(id)
+    }
+
+    /// The paths VPP is recorded holding for an INSTALLED prefix, if
+    /// they are known. `None` for anything not `Installed`, and for an
+    /// installed prefix whose paths were never observed (a dump
+    /// adoption) — the caller must then assume nothing about them.
+    pub fn installed_via(&self, prefix: IpPrefix) -> Option<PathSetId> {
+        match self.state.get(&prefix.into()) {
+            Some(Slot {
+                state: RouteState::Installed,
+                via,
+            }) if *via != UNKNOWN_PATHS => Some(*via),
+            _ => None,
+        }
+    }
+
+    /// Every `Installed` prefix with the path set VPP is recorded
+    /// holding it through (`None` = unknown), in key order.
+    pub fn installed_entries(&self) -> impl Iterator<Item = (IpPrefix, Option<PathSetId>)> + '_ {
+        self.state
+            .iter()
+            .filter(|(_, s)| s.state == RouteState::Installed)
+            .map(|(k, s)| ((*k).into(), (s.via != UNKNOWN_PATHS).then_some(s.via)))
     }
 
     /// O(1) — see the type docs.
@@ -730,17 +863,38 @@ impl RouteLedger {
         }
     }
 
-    fn set_state(&mut self, key: PrefixKey, st: RouteState) {
-        if let Some(old) = self.state.insert(key, st) {
-            Self::tally(&mut self.counts, old, false);
+    /// Set a state and decide the recorded paths: `via` when it names
+    /// the paths VPP just acknowledged, the old version's paths when
+    /// `keep_via` says that version is still what forwards, unknown
+    /// otherwise.
+    fn set_slot(&mut self, key: PrefixKey, st: RouteState, via: Option<PathSetId>, keep_via: bool) {
+        let prior_via = self.state.get(&key).map_or(UNKNOWN_PATHS, |s| s.via);
+        let via = match via {
+            Some(v) => v,
+            None if keep_via => prior_via,
+            None => UNKNOWN_PATHS,
+        };
+        if let Some(old) = self.state.insert(key, Slot { state: st, via }) {
+            Self::tally(&mut self.counts, old.state, false);
         }
         Self::tally(&mut self.counts, st, true);
     }
 
+    fn set_state(&mut self, key: PrefixKey, st: RouteState) {
+        // Only a state with a live version still in VPP may keep the
+        // paths that version was installed through: a replacement in
+        // flight, or a rejected one falling back to what forwards.
+        let live = matches!(
+            st,
+            RouteState::Installed | RouteState::Installing { replacing: true }
+        );
+        self.set_slot(key, st, None, live);
+    }
+
     fn clear_state(&mut self, key: PrefixKey) -> Option<RouteState> {
         let old = self.state.remove(&key)?;
-        Self::tally(&mut self.counts, old, false);
-        Some(old)
+        Self::tally(&mut self.counts, old.state, false);
+        Some(old.state)
     }
 
     /// Capacity slots in use: installed plus in-flight. Counting
@@ -796,7 +950,7 @@ impl RouteLedger {
         // route update must not be withheld just because the table sits
         // at the mark, or steady-state churn would silently erode the
         // installed set.
-        let prior = self.state.get(&key).copied();
+        let prior = self.state.get(&key).map(|s| s.state);
         let st = match prior {
             Some(RouteState::Installed) | Some(RouteState::Installing { replacing: true }) => {
                 RouteState::Installing { replacing: true }
@@ -836,13 +990,41 @@ impl RouteLedger {
         if self.state.contains_key(&key) {
             return;
         }
-        self.set_state(key, RouteState::Installed);
+        // Paths unknown: the dump names the prefix, and what a later
+        // resync may skip is decided only by paths this ledger OBSERVED.
+        self.set_slot(key, RouteState::Installed, None, false);
+    }
+
+    /// Record a prefix the previous process's preserved ledger says VPP
+    /// holds, through the paths it recorded.
+    ///
+    /// Adoption only, with the same refusal as [`Self::adopt_installed`].
+    /// `Installed` here rests on that record rather than on a readback,
+    /// which is why the caller verifies VPP against it — paths included —
+    /// before the state counts as verified (see `runtime`'s
+    /// preserved-ledger path).
+    pub fn adopt_recorded(&mut self, prefix: IpPrefix, via: Option<PathSetId>) {
+        let key = PrefixKey::from(prefix);
+        if self.state.contains_key(&key) {
+            return;
+        }
+        self.set_slot(key, RouteState::Installed, via, false);
     }
 
     pub fn commit_installed(&mut self, prefix: IpPrefix) {
+        self.commit_installed_via(prefix, None);
+    }
+
+    /// VPP acknowledged the route, installed through `via` — the path set
+    /// the acknowledged request carried. `None` records the paths as
+    /// unknown, which only ever costs a later re-send.
+    pub fn commit_installed_via(&mut self, prefix: IpPrefix, via: Option<PathSetId>) {
         let key = PrefixKey::from(prefix);
-        if matches!(self.state.get(&key), Some(RouteState::Installing { .. })) {
-            self.set_state(key, RouteState::Installed);
+        if matches!(
+            self.state.get(&key).map(|s| s.state),
+            Some(RouteState::Installing { .. })
+        ) {
+            self.set_slot(key, RouteState::Installed, via, false);
         }
     }
 
@@ -856,7 +1038,7 @@ impl RouteLedger {
     /// retry intent lives in [`PendingMap`], not here.
     pub fn fail_install(&mut self, prefix: IpPrefix) {
         let key = PrefixKey::from(prefix);
-        match self.state.get(&key) {
+        match self.state.get(&key).map(|s| s.state) {
             Some(RouteState::Installing { replacing: true }) => {
                 self.set_state(key, RouteState::Installed)
             }
@@ -878,9 +1060,15 @@ impl RouteLedger {
     pub fn withheld_prefixes(&self) -> Vec<IpPrefix> {
         self.state
             .iter()
-            .filter(|(_, st)| **st == RouteState::NotInstalled(NotInstalled::Withheld))
+            .filter(|(_, s)| s.state == RouteState::NotInstalled(NotInstalled::Withheld))
             .map(|(k, _)| (*k).into())
             .collect()
+    }
+
+    /// Whether the ledger holds an opinion about any prefix. O(1), where
+    /// asking [`Self::known_prefixes`] would materialise the table.
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
     }
 
     /// Every prefix the ledger holds an opinion about, in any state.
@@ -902,7 +1090,7 @@ impl RouteLedger {
     pub fn verifiable_prefixes(&self) -> Vec<IpPrefix> {
         self.state
             .iter()
-            .filter(|(_, st)| **st == RouteState::Installed)
+            .filter(|(_, s)| s.state == RouteState::Installed)
             .map(|(k, _)| (*k).into())
             .collect()
     }
@@ -912,8 +1100,8 @@ impl RouteLedger {
     #[cfg(test)]
     fn counts_by_scan(&self) -> SinkCounts {
         let mut c = SinkCounts::default();
-        for st in self.state.values() {
-            Self::tally(&mut c, *st, true);
+        for s in self.state.values() {
+            Self::tally(&mut c, s.state, true);
         }
         c
     }
@@ -1438,5 +1626,80 @@ mod tests {
             c.installed + c.installing + c.withheld + c.unresolvable,
             led.state.len() as u64
         );
+    }
+
+    /// The paths a route is recorded holding are VPP's acknowledgement,
+    /// kept exactly as long as the version they describe is what VPP
+    /// forwards — the property the resync skip and the preserved ledger
+    /// both stand on.
+    #[test]
+    fn recorded_paths_follow_what_vpp_acknowledged_and_nothing_else() {
+        let mut led = RouteLedger::new(Capacity::new(100));
+        let p = v4(10, 0, 0, 0, 24);
+        let a = led.intern_paths(&[(nh(192, 0, 2, 1), 3)]);
+        let b = led.intern_paths(&[(nh(192, 0, 2, 2), 3)]);
+        assert_eq!(
+            led.intern_paths(&[(nh(192, 0, 2, 1), 3)]),
+            a,
+            "interned once"
+        );
+
+        led.classify_resolved(p, 1);
+        assert_eq!(
+            led.installed_via(p),
+            None,
+            "nothing is recorded before the ack"
+        );
+        led.commit_installed_via(p, Some(a));
+        assert_eq!(led.installed_via(p), Some(a));
+
+        // A replacement in flight, then refused: the old version is still
+        // what VPP forwards, so its paths come back with it.
+        led.classify_resolved(p, 1);
+        led.fail_install(p);
+        assert_eq!(led.installed_via(p), Some(a));
+
+        // Accepted: the new paths.
+        led.classify_resolved(p, 1);
+        led.commit_installed_via(p, Some(b));
+        assert_eq!(led.installed_via(p), Some(b));
+
+        // A hole — the derived withdrawal VPP acknowledged — holds nothing.
+        led.classify_resolved(p, 0);
+        assert_eq!(led.installed_via(p), None);
+        // Re-installed without known paths: unknown, never the stale set.
+        led.classify_resolved(p, 1);
+        led.commit_installed(p);
+        assert_eq!(led.installed_via(p), None);
+
+        // A dump names prefixes, not paths; a preserved record names both.
+        let dumped = v4(10, 0, 1, 0, 24);
+        let kept = v4(10, 0, 2, 0, 24);
+        led.adopt_installed(dumped);
+        led.adopt_recorded(kept, Some(a));
+        assert_eq!(led.installed_via(dumped), None);
+        assert_eq!(led.installed_via(kept), Some(a));
+        let entries: Vec<_> = led.installed_entries().collect();
+        assert_eq!(entries, vec![(p, None), (dumped, None), (kept, Some(a))]);
+        assert_eq!(led.paths_of(a), Some(&[(nh(192, 0, 2, 1), 3)][..]));
+    }
+
+    #[test]
+    fn canonical_paths_ignore_order_and_repeats() {
+        let x = (nh(192, 0, 2, 1), 3);
+        let y = (nh(192, 0, 2, 2), 4);
+        assert_eq!(canonical_paths(vec![y, x, y]), canonical_paths(vec![x, y]));
+    }
+
+    /// The resync skip must be able to drop an older owed op outright.
+    #[test]
+    fn discard_forgets_active_and_parked_ops() {
+        let mut m = PendingMap::new();
+        let p = v4(10, 0, 0, 0, 24);
+        m.upsert(p, vec![nh(192, 0, 2, 1)]);
+        m.withhold(p, PendingOp::Withdraw);
+        m.discard(p);
+        assert!(m.is_empty());
+        assert_eq!(m.withheld_len(), 0);
     }
 }

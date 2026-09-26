@@ -76,6 +76,8 @@ running badly.
 - [Everyday inspection commands](#everyday-inspection-commands)
 - [The canary ladder](#the-canary-ladder)
 - [Rollback](#rollback)
+- [The adopted-reconciliation release gate](#the-adopted-reconciliation-release-gate-what-it-needs-and-when-it-refuses)
+- [What a keep-vpp restart costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
 - [Bidirectional offload: local-route and direction dst](#bidirectional-offload-local-route-and-direction-dst)
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
@@ -584,7 +586,10 @@ is complete.
 
 A restart over a steered VPP defers its reconciliation (the FIB dump
 freezes every VPP worker — `ip_route_dump` is not mp-safe — so it only
-runs against an unsteered VPP). The deferral releases through exactly
+runs against an unsteered VPP; a restart whose previous daemon left a
+preserved route ledger skips the dump and the unsteer entirely, and only
+its diff waits here — see the next section). The deferral releases
+through exactly
 **two** doors, both requiring the feed session up (raised when the
 stream STARTS — with one deliberate exception. For BGP it is the first
 UPDATE of the session. For BMP it is the first RouteMonitoring frame,
@@ -635,6 +640,130 @@ If `fib-synced` shows the deferral persisting on a box that SHOULD
 release: check the feed session actually started (`BGP client
 connected` + at least one UPDATE in the log), then check the mirror
 count against the floor in the health text.
+
+## What a keep-vpp restart costs now: the preserved route ledger
+
+**The incident this answers (primary, 2026-09-26, ~1.09M v4 routes).**
+`systemctl stop packetframe && packetframe detach --keep-vpp &&
+systemctl start packetframe` over a steered VPP cost ~13 minutes
+UNSTEERED, a teardown and a full reload — for a restart that kept a
+verified, forwarding VPP. The new daemon had no idea what VPP held, so
+it had to read VPP's FIB, and reading it (`ip_route_dump`) parks every
+VPP worker, so it had to unsteer first onto an eBPF tier whose mirror
+restarts empty. Then the feed churned during the ~3 minute dump, the
+diff was held, and the phase deadline — extended from the start of that
+blocking dump rather than its end — fired `PhaseTimedOut` the next tick
+and tore VPP down.
+
+**Now a clean stop leaves the ledger for the next start.** When the
+daemon exits the preserving way (SIGTERM / `systemctl stop` — the
+supervision thread is dropped without `stop()`), the loop writes
+`<state-dir>/vpp-route-ledger.bin` after its last tick: every installed
+prefix with the exact paths (nexthop + `sw_if_index`) VPP acknowledged
+it through, VPP's own per-prefix-length route counts (`show ip fib
+summary`), the VPP process identity (pid, start ticks, boot id) and a
+fresh token that is also written into `vpp-offload.json`. Compact binary
+with a trailing checksum: ~10 bytes a route, ~11 MB at 1.1M, written
+through the same no-follow `openat`/`renameat` primitives as every other
+state record. The journal says which it was:
+
+```
+preserved VPP's route ledger for the next daemon: a `--keep-vpp` start adopts it
+  without reading VPP's FIB, and steering stays up across the restart   routes=1090312
+# or, with the reason:
+VPP's route ledger was not preserved; the next adoption reads VPP's FIB instead ...
+```
+
+It is only written for a ledger this daemon can vouch for: the
+supervisor `Ready`/`Steered` (or a previous ledger-seeded adoption still
+waiting on the feed, untouched), nothing awaiting VPP's acknowledgement,
+and VPP's summary readable. A stop during a dump-path deferral, a crash,
+a `kill -9`, or anything that is not a clean preserving exit writes
+nothing — and "nothing" is simply the dump path below.
+
+**The start that finds it** adopts WITHOUT reading VPP's FIB and without
+unsteering, in this order:
+
+1. At bring-up, before anything touches VPP, the record is read and
+   **removed** — whether or not it is used, so it is consumed once. It
+   must name the adopted process (pid + start ticks + boot id), carry the
+   token `vpp-offload.json` holds (any other adopter rewrites that file on
+   its attach, and an older build drops the field, so a record that
+   outlived a downgrade or a second adopter cannot match), and list the
+   same interfaces.
+2. At `StartResync`, VPP's per-length route counts must equal the
+   recorded ones — anything that added or removed a route since (a
+   `vppctl` edit, a stray client) shows up here. Then the engine's ledger
+   is seeded from the record.
+3. The resync diff waits behind the same loaded-and-quiet release the
+   dump path uses (feed live, floor = half the seeded table, quiet 2 s
+   with a completeness authority / 5 s without), **steered the whole
+   time**, then pushes only the differences: a route VPP holds through
+   exactly the paths it resolves to now is not sent.
+4. Verify runs its 64 probes with the **paths compared** too, still
+   steered. Pass → `Ready` → the usual re-assert steer.
+
+What you see: `fib-synced DEGRADED — resync deferred ... the adopted FIB
+keeps forwarding untouched` while the feed reloads (on the primary the
+iBGP refill is ~2 minutes), then briefly `resyncing the FIB the previous
+process verified and preserved (N routes installed) ...` while the diff
+lands, then healthy. `packetframe_vpp_state` stays at
+`adopted_resyncing` → `verifying` → `ready`/`steered` with steering never
+dropping. **Expected cost of a keep-vpp restart: zero unsteered time and
+no dump.** This is from the design and the host-CI fakes — the hardware
+number is owed: measure it on the rig first, then the shadow, and put it
+in the numbers table.
+
+**Every fallback is today's dump path, never a failed attach.** Each is
+logged with its reason (`preserved route ledger not used: ...` /
+`this adoption reads VPP's FIB instead`):
+
+| Why | When it is caught |
+|---|---|
+| No record (unclean stop, crash, first start after upgrading, stop mid-convergence) | bring-up |
+| Record names a different pid / start time / boot | bring-up |
+| Token missing or different (another daemon adopted since, or a downgrade rewrote the state file) | bring-up |
+| Corrupt, truncated, planted symlink, or another format version | bring-up (the file is still removed) |
+| Interfaces differ from the state file's, or a recorded path egresses an interface this attach does not own | bring-up / seed |
+| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync` |
+| **Verify disagrees** (a prefix absent, or held through other paths) | the seeded verify |
+
+The last one is `PreservedLedgerRejected`, deliberately not
+`VerifyFailed`: it disproves the RECORD, not VPP, so it is not a
+teardown. Steering comes off first (the seed traffic was on is now known
+wrong, and the eBPF tier is loaded — the seeded diff only ran after the
+release), the seed is discarded, and the resync starts over on the same
+VPP from a dump. A mismatch on THAT pass is an ordinary `VerifyFailed`.
+
+**The dump path itself changed too.**
+
+- *A dump the feed spoiled is kept.* The journal line is now `the feed
+  changed while VPP's FIB was being dumped; the dump is KEPT ...`.
+  Nothing changes VPP's FIB while the diff waits (no deltas are applied
+  during a deferral, and a restore touches only MCAM), so the retry is a
+  diff against the FIB already read: no second dump, and a dump that is
+  never re-taken cannot be spoiled twice. The quiet the next release
+  needs doubles per spoil (capped at 30 s): the quiet that released the
+  spoiled attempt was a lull.
+- *Traffic stays on the eBPF tier while the feed is merely busy.*
+  Traffic goes back onto the adopted VPP (`FallbackRevoked`) only when
+  the fallback is UNFIT — feed down, the authority saying no, or the
+  mirror under the floor or collapsed to under half of what it held at
+  the unsteer. A live, loaded feed that is churning is the better tier:
+  it tracks the mirror, while the adopted FIB is frozen at adoption.
+  (Before, any non-release re-steered, flapping MCAM on every burst.)
+- *A busy feed never tears VPP down.* A deferral that is still
+  deliberately waiting extends the phase deadline from when the drain
+  RETURNED, not from when the tick began — a 3-minute dump can no longer
+  put the deadline behind the clock.
+- *The convergence deadline scales with the table.* The flat 120 s
+  became `max(120 s, 2 × (routes ÷ 4000/s, or the slowest dump actually
+  observed here))`, capped at 600 s — ~9 minutes for 1.1M routes. It
+  bounds the gap between progress signals, so it only bites a genuinely
+  stuck step (an interruption that never resolves), and it is widened
+  in place the moment a larger budget is known (an adoption's deadline
+  is armed before anything has measured the table). The wedge detector's
+  liveness budget — is VPP answering — is unchanged.
 
 ## Bidirectional offload: local-route and direction dst
 
@@ -1882,9 +2011,11 @@ drained until the attach completes.
 - VPP stays silent past the wedge budget: **1.5 s while steered**,
   which is the published bound and applies to a steered adoptee
   exactly as before, or 10 s for an unsteered convergence;
-- the 120 s convergence deadline runs out. An interruption never
-  extends it, so a step that keeps losing the API while VPP answers
-  pings ends there;
+- the convergence deadline runs out — 120 s on a small table, scaled
+  up to 600 s on a big one (see [What a keep-vpp restart costs
+  now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)).
+  An interruption never extends it, so a step that keeps losing the API
+  while VPP answers pings ends there;
 - a *refusal* (VPP answered and said no) is `ConvergenceFailed` at
   once, as before.
 
@@ -2091,7 +2222,10 @@ vpp-offload: DEGRADED
 for the length of the deferral plus the reconcile, then clears to
 `fib-synced healthy` on its own. Measured 2026-08-09 on the shadow
 (d12): unsteer at +40 s, re-steer at +78 s, worst forwarding gap
-0.109 s.
+0.109 s. That is the DUMP path; a clean `--keep-vpp` restart that left a
+preserved route ledger holds the same Degraded line for the deferral but
+never unsteers — see [What a keep-vpp restart costs
+now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).
 
 This is correct and deliberate, and it is DEGRADED rather than
 UNHEALTHY on purpose: the adopted VPP is forwarding a FIB the previous
@@ -2808,8 +2942,11 @@ restart packetframe (stop → `detach --all` → start) afterwards.
     VPP, its VFs, hugepages and steering rules running for the next
     start to adopt — steered traffic keeps flowing across the restart
     (measured on the rig: one 0.6 s steering dip while the adoption
-    reconciles). The form for an upgrade or config restart of a steered
-    box:
+    reconciles). The `systemctl stop` leaves a preserved route ledger
+    when VPP was converged, and the start that finds it adopts without
+    reading VPP's FIB or unsteering at all — [What a keep-vpp restart
+    costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).
+    The form for an upgrade or config restart of a steered box:
 
     ```bash
     systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe

@@ -63,6 +63,7 @@ pub mod executor;
 pub mod fdb;
 pub mod feed;
 pub mod fib_sync;
+pub mod ledger_record;
 pub mod liveness;
 pub mod ntuple;
 pub mod process;

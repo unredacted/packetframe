@@ -339,6 +339,15 @@ pub struct StatusSnapshot {
     /// operator watching `Syncing` for minutes needs the row to say
     /// that is the designed path. See `runtime`'s `FreshHold`.
     pub fresh_hold: Option<(u64, u64)>,
+    /// The FIB being converged was adopted from the previous process's
+    /// preserved route ledger and this process has not verified it yet —
+    /// steered on purpose, since keeping traffic on VPP across the
+    /// restart is what preserving it is for. Past the deferral (which
+    /// `resync_deferred` reports) this is the window where the diff
+    /// lands and verify runs; the steered-into-unverified alarm is wrong
+    /// for it the same way it is wrong for the deferral, unless the table
+    /// is empty.
+    pub preserved_fib: bool,
     /// See [`crate::runtime::RuntimeStatus::authority`].
     pub authority: crate::runtime::AuthorityPosture,
     pub ports: Vec<PortLink>,
@@ -479,6 +488,7 @@ impl StatusSnapshot {
             fib,
             None,
             None,
+            false,
             // No deferral in this shorthand, so the posture is unread;
             // Absent is the honest default rather than a claim.
             crate::runtime::AuthorityPosture::Absent,
@@ -524,6 +534,7 @@ impl StatusSnapshot {
         fib: FibSync,
         resync_deferred: Option<(u64, u64)>,
         fresh_hold: Option<(u64, u64)>,
+        preserved_fib: bool,
         authority: crate::runtime::AuthorityPosture,
         ports: Vec<PortLink>,
         store_error: Option<String>,
@@ -561,6 +572,7 @@ impl StatusSnapshot {
             fib,
             resync_deferred,
             fresh_hold,
+            preserved_fib,
             authority,
             ports,
             store_error,
@@ -629,7 +641,12 @@ impl StatusSnapshot {
             FibSync::Unfit { .. } => self.counts.unresolvable > 0 || table_empty,
             other => !other.verified() || table_empty,
         };
-        let fib_unverified = fib_broken && self.resync_deferred.is_none();
+        // A preserved FIB past its deferral gets the same exemption for
+        // the same reason — verified by the previous process, kept on
+        // purpose — but only while it holds routes: an empty one is a
+        // blackhole whoever verified it.
+        let preserved = self.preserved_fib && !table_empty;
+        let fib_unverified = fib_broken && self.resync_deferred.is_none() && !preserved;
         // BLACKHOLE ports, not dead ones — "under paths that resolve
         // through it" was this comment's claim all along, and the code
         // read every dark member as one. On the shadow (2026-08-14) a
@@ -1119,6 +1136,20 @@ impl StatusSnapshot {
                 };
                 (HealthState::Degraded, Some(msg))
             }
+            // Past the preserved-ledger deferral and before this
+            // process's verify: steered by design, on a FIB the previous
+            // process verified. Checked before the steered arm for the
+            // same reason the deferral arm is — and only over a table
+            // that holds routes, as `steered_but_broken` decides.
+            FibSync::NeverVerified if self.preserved_fib && self.counts.installed > 0 => (
+                HealthState::Degraded,
+                Some(format!(
+                    "resyncing the FIB the previous process verified and preserved ({} routes \
+                     installed): only the differences go to VPP, it keeps forwarding \
+                     meanwhile, and verify — paths included — judges it next",
+                    self.counts.installed
+                )),
+            ),
             FibSync::NeverVerified if self.steered => (
                 HealthState::Unhealthy,
                 Some("traffic steered into an unverified FIB".into()),
@@ -4759,5 +4790,49 @@ mod tests {
         let m = render_metrics(&s, "vpp-offload");
         assert!(m.contains("port=\"eth4\",sw_if_index=\"3\"} 1"), "{m}");
         assert!(m.contains("port=\"eth5\",sw_if_index=\"4\"} 0"), "{m}");
+    }
+
+    /// A preserved-ledger adoption past its deferral is steered into a FIB
+    /// THIS daemon has not verified yet — by design, since keeping traffic
+    /// on VPP across the restart is the point — and must read as the
+    /// designed path, not the module's worst fault. Unless the table is
+    /// empty: an empty FIB is a blackhole whoever verified it.
+    #[test]
+    fn a_preserved_fib_awaiting_verify_is_degraded_not_steered_but_broken() {
+        let mut sup = Supervisor::new();
+        sup.on(Event::Adopted { steered: true });
+        assert!(sup.is_steered());
+        let api = ApiHealth::Answering {
+            silent_for: Duration::from_millis(200),
+        };
+        let led = ledger_with(5_000, 0, 0);
+        let mut snap = snap_of(&sup, &led, api, FibSync::NeverVerified, ports_up());
+        assert!(
+            snap.steered_but_broken(),
+            "the premise: without the flag this is the steered alarm"
+        );
+        snap.preserved_fib = true;
+        assert!(!snap.steered_but_broken());
+        let report = snap.report();
+        let fib = report
+            .subsystems
+            .iter()
+            .find(|s| s.name == SUBSYS_FIB)
+            .expect("the fib row always exists");
+        assert_eq!(fib.state, HealthState::Degraded);
+        let msg = fib.message.as_deref().expect("it explains itself");
+        assert!(
+            msg.contains("preserved") && msg.contains("5000 routes"),
+            "{msg}"
+        );
+        assert_ne!(report.overall, HealthState::Unhealthy);
+
+        let empty = ledger_with(0, 0, 0);
+        let mut snap = snap_of(&sup, &empty, api, FibSync::NeverVerified, ports_up());
+        snap.preserved_fib = true;
+        assert!(
+            snap.steered_but_broken(),
+            "an empty preserved table is still steered into nothing"
+        );
     }
 }

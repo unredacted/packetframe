@@ -234,6 +234,28 @@ pub struct ResourceState {
     /// `expected_routes == 0`.
     #[serde(default)]
     pub restart_only: Option<RestartOnly>,
+    /// The token of the route ledger the last preserving stop left beside
+    /// this file ([`crate::ledger_record`]), or `None`.
+    ///
+    /// The record's proof that no other daemon has adopted this VPP since
+    /// it was written: every adopter rewrites this file on its attach,
+    /// and the adoption that consumes the record clears the token, so a
+    /// match means this file — and the VPP it describes — is exactly as
+    /// the preserving stop left it.
+    ///
+    /// Deliberately `serde(default)` WITHOUT a [`STATE_VERSION`] bump, and
+    /// that is the policy on that constant applied, not an exception to
+    /// it: nothing on the adopted path depends on this field. Absent —
+    /// a file written by an older build — means "no record may be
+    /// trusted", and the adoption takes the dump path it always took. A
+    /// bump would instead make every existing state file unadoptable
+    /// (`load` refuses unknown versions), turning the upgrade that ships
+    /// this into a full teardown and reload on the very restart it exists
+    /// to make cheap. The reverse also holds: an older build ignores the
+    /// field and drops it on its first rewrite, which is precisely what
+    /// invalidates a record that outlived a downgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_token: Option<u64>,
 }
 
 /// Config field name → its rendered value, for the fields a running VPP
@@ -257,6 +279,7 @@ impl ResourceState {
             vpp_boot_id: None,
             boot_id: None,
             restart_only: None,
+            ledger_token: None,
         }
     }
 

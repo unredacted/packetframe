@@ -19,6 +19,7 @@
 //! | Field | Observer |
 //! |---|---|
 //! | `phase_deadline` | a supervisor state change, via [`Schedule::arm_phase`] |
+//! | `phase_budget` | the same arm, an extension, or a wider budget observed ([`Schedule::widen_phase`]) |
 //! | `backoff_until` | `Action::ArmBackoff`, via [`Schedule::arm_backoff`] |
 //!
 //! The ping deadline deliberately is NOT a field here — it belongs to
@@ -40,6 +41,9 @@ pub struct Schedule {
     /// Which phase `phase_deadline` belongs to, so transitions *within*
     /// a phase keep one deadline instead of restarting the clock.
     phase_kind: Option<PhaseKind>,
+    /// The budget `phase_deadline` was computed from — what
+    /// [`Self::widen_phase`] compares a newly observed budget against.
+    phase_budget: Option<Duration>,
     /// When the restart backoff expires.
     ///
     /// Survives elapsing: see [`Schedule::fired`]. Cleared only when the
@@ -71,12 +75,14 @@ impl Schedule {
             None => {
                 self.phase_deadline = None;
                 self.phase_kind = None;
+                self.phase_budget = None;
             }
             Some((kind, budget)) => {
                 let continuing = self.phase_kind == Some(kind) && self.phase_deadline.is_some();
                 if !continuing {
                     self.phase_deadline = Some(now + budget);
                     self.phase_kind = Some(kind);
+                    self.phase_budget = Some(budget);
                 }
             }
         }
@@ -98,7 +104,32 @@ impl Schedule {
         if let Some((kind, budget)) = phase {
             if self.phase_kind == Some(kind) {
                 self.phase_deadline = Some(now + budget);
+                self.phase_budget = Some(budget);
             }
+        }
+    }
+
+    /// Give the armed phase the extra time a LARGER budget, observed since
+    /// it was armed, entitles it to — never less.
+    ///
+    /// The convergence budget scales with the table and with how long a
+    /// FIB dump here actually took (`supervisor::convergence_budget`), and
+    /// both can only be learned after the phase is armed: an adoption is
+    /// injected, and its deadline set, before the first dump has run or
+    /// the mirror has loaded. Without this the deadline armed from the
+    /// flat 120 s would still bound a phase whose own measurements say it
+    /// needs more — the dump that proved the table big would time itself
+    /// out. The deadline moves by exactly the difference, so the phase is
+    /// bounded as though it had been armed with the wider budget.
+    pub fn widen_phase(&mut self, phase: Option<(PhaseKind, Duration)>) {
+        let (Some((kind, budget)), Some(deadline), Some(armed)) =
+            (phase, self.phase_deadline, self.phase_budget)
+        else {
+            return;
+        };
+        if self.phase_kind == Some(kind) && budget > armed {
+            self.phase_deadline = Some(deadline + (budget - armed));
+            self.phase_budget = Some(budget);
         }
     }
 
@@ -113,12 +144,14 @@ impl Schedule {
         self.backoff_until = Some(now + delay);
         self.phase_deadline = None;
         self.phase_kind = None;
+        self.phase_budget = None;
     }
 
     /// Clear everything. For a clean stop, where no deadline applies.
     pub fn disarm(&mut self) {
         self.phase_deadline = None;
         self.phase_kind = None;
+        self.phase_budget = None;
         self.backoff_until = None;
     }
 
@@ -153,6 +186,7 @@ impl Schedule {
             if now >= d {
                 self.phase_deadline = None;
                 self.phase_kind = None;
+                self.phase_budget = None;
                 out.push(Event::PhaseTimedOut);
             }
         }
@@ -544,5 +578,25 @@ mod tests {
             sleep < worst_case_detection(PING_BUDGET),
             "sleeping {sleep:?} would blow the detection bound"
         );
+    }
+
+    /// A wider budget observed after the phase was armed moves the
+    /// deadline by exactly the difference; a narrower one, or one for a
+    /// different phase, moves nothing.
+    #[test]
+    fn a_wider_budget_widens_the_armed_deadline_and_nothing_else() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.arm_phase(t0, Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        let wide = Duration::from_secs(500);
+        s.widen_phase(Some((PhaseKind::Convergence, wide)));
+        assert_eq!(s.phase_deadline(), Some(t0 + wide));
+        s.widen_phase(Some((PhaseKind::Convergence, CONVERGENCE_BUDGET)));
+        assert_eq!(s.phase_deadline(), Some(t0 + wide), "never narrower");
+        s.widen_phase(Some((PhaseKind::Startup, Duration::from_secs(9_999))));
+        assert_eq!(s.phase_deadline(), Some(t0 + wide), "not another phase's");
+        s.arm_phase(t0, None);
+        s.widen_phase(Some((PhaseKind::Convergence, wide)));
+        assert_eq!(s.phase_deadline(), None, "nothing armed, nothing to widen");
     }
 }

@@ -25,7 +25,10 @@ use std::net::IpAddr;
 
 use packetframe_common::fib::IpPrefix;
 
-use crate::sink::{NexthopTarget, PendingMap, PendingOp, RouteLedger, RouteState};
+use crate::sink::{
+    canonical_paths, NexthopTarget, PathKey, PathSetId, PendingMap, PendingOp, RouteLedger,
+    RouteState,
+};
 use crate::vpp_api::generated::{
     Address, AddressUnion, FibPath, IpRoute, IpRouteAddDel, IpRouteAddDelReply, Prefix,
     ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE, FIB_API_PATH_NH_PROTO_IP4,
@@ -272,6 +275,28 @@ pub fn build_paths(paths: &[ResolvedPath], ports: &PortIndex) -> Option<Vec<FibP
     Some(out)
 }
 
+/// The `(nexthop, sw_if_index)` a wire path describes.
+///
+/// The one decoding every path comparison goes through — the drainer
+/// recording what it installed, the resync deciding what it may skip, and
+/// verify reading VPP's answer back — so the three cannot disagree about
+/// what "the same path" means.
+pub fn path_key(p: &FibPath) -> PathKey {
+    let nh = if p.proto == FIB_API_PATH_NH_PROTO_IP6 {
+        IpAddr::V6(std::net::Ipv6Addr::from(p.nh.address.0))
+    } else {
+        let mut v4 = [0u8; 4];
+        v4.copy_from_slice(&p.nh.address.0[..4]);
+        IpAddr::V4(std::net::Ipv4Addr::from(v4))
+    };
+    (nh, p.sw_if_index)
+}
+
+/// A route's wire paths as the canonical set the ledger records.
+pub fn path_set_of(paths: &[FibPath]) -> Vec<PathKey> {
+    canonical_paths(paths.iter().map(path_key).collect())
+}
+
 /// What one drain accomplished.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DrainStats {
@@ -402,6 +427,9 @@ enum Begun {
         context: u32,
         op: PendingOp,
         derived: bool,
+        /// The path set an upsert carried, for the ledger to record on
+        /// acknowledgement. `None` for withdrawals.
+        via: Option<PathSetId>,
     },
     /// Resolved without touching the socket; already counted.
     Done,
@@ -427,6 +455,9 @@ struct InFlight {
     /// Whether `sent` is a withdrawal this drainer derived rather than
     /// one the route source asked for.
     derived: bool,
+    /// The paths an upsert went out with — what VPP holds for this
+    /// prefix if, and only if, it acknowledges the request.
+    via: Option<PathSetId>,
 }
 
 impl Default for Drainer {
@@ -498,12 +529,14 @@ impl Drainer {
                         context,
                         op: sent,
                         derived,
+                        via,
                     }) => inflight.push(InFlight {
                         context,
                         prefix,
                         sent,
                         original: op,
                         derived,
+                        via,
                     }),
                     // Nothing to send (withheld, unresolvable,
                     // out-of-family): already counted, ledger already
@@ -644,6 +677,7 @@ impl Drainer {
                         context: ctx,
                         op: PendingOp::Withdraw,
                         derived: true,
+                        via: None,
                     });
                 }
 
@@ -683,6 +717,9 @@ impl Drainer {
                 if cap_paths(&mut paths) {
                     stats.paths_capped += 1;
                 }
+                // After the cap: what is recorded is what went on the
+                // wire, not what resolution produced.
+                let via = ledger.intern_paths(&path_set_of(&paths));
                 let msg = IpRouteAddDel {
                     context: 0,
                     is_add: true,
@@ -702,6 +739,7 @@ impl Drainer {
                         nexthops: nexthops.clone(),
                     },
                     derived: false,
+                    via: Some(via),
                 })
             }
             // An authoritative withdrawal: the route source no longer
@@ -710,6 +748,7 @@ impl Drainer {
                 context: transport.send(withdraw_msg(prefix))?,
                 op: PendingOp::Withdraw,
                 derived: false,
+                via: None,
             }),
         }
     }
@@ -729,7 +768,7 @@ impl Drainer {
         // deleted.
         match (&f.sent, retval) {
             (PendingOp::Upsert { .. }, 0) => {
-                ledger.commit_installed(f.prefix);
+                ledger.commit_installed_via(f.prefix, f.via);
                 stats.installed += 1;
             }
             // Authoritative: the source dropped the prefix, so the

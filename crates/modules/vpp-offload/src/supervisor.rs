@@ -68,6 +68,50 @@ pub const API_STARTUP_BUDGET: Duration = Duration::from_secs(60);
 /// exceeding it means something is wrong, not merely slow.
 pub const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
 
+/// The slowest FIB read the convergence budget is sized against, in
+/// routes per second.
+///
+/// Conditions, named because a rate is not a constant until they are:
+/// the primary on 2026-09-26, ~1.09M routes, the eBPF tier carrying all
+/// traffic and the host CPU-starved — an unsteered `ip_route_dump` there
+/// took under three minutes (≥ ~6k routes/s). An unloaded shadow reads
+/// 1.05M in ~5.4 s, so this is the bad end by more than an order of
+/// magnitude, with a third of margin on top of what was measured.
+pub const DUMP_RATE_FLOOR_PER_SEC: u64 = 4_000;
+
+/// How many table-length stalls one convergence budget covers.
+///
+/// A step that loses the API mid-read is resumed on the same VPP and
+/// reads again from the start (the dump is all-or-nothing), and an
+/// interruption never extends the deadline — so a budget that fits one
+/// read on a big table ends the first retry at the deadline. Two reads is
+/// one retry.
+pub const CONVERGENCE_ATTEMPTS: u32 = 2;
+
+/// Absolute ceiling on the scaled convergence budget. A stall this long
+/// is not a busy host; the deadline still has to end it.
+pub const CONVERGENCE_BUDGET_CAP: Duration = Duration::from_secs(600);
+
+/// The convergence budget for a table of `routes`, given the slowest FIB
+/// read observed so far (`observed_dump`, real clock).
+///
+/// The flat [`CONVERGENCE_BUDGET`] was sized for the resync + verify of a
+/// table converging at full speed, and every progress signal extends it —
+/// so what it really bounds is the gap between two of them. The widest
+/// legitimate gap is one blocking call that is proportional to the table:
+/// the FIB dump, which on a loaded box outran 120 s on its own. So the
+/// budget covers [`CONVERGENCE_ATTEMPTS`] of the slower of the estimate
+/// at [`DUMP_RATE_FLOOR_PER_SEC`] and what a dump here actually took,
+/// never below the flat budget and never above
+/// [`CONVERGENCE_BUDGET_CAP`]. The wedge detector's liveness budget is a
+/// different question — "is VPP answering" — and is untouched by this.
+pub fn convergence_budget(routes: u64, observed_dump: Option<Duration>) -> Duration {
+    let estimate = Duration::from_secs(routes.div_ceil(DUMP_RATE_FLOOR_PER_SEC));
+    let one = estimate.max(observed_dump.unwrap_or_default());
+    one.saturating_mul(CONVERGENCE_ATTEMPTS)
+        .clamp(CONVERGENCE_BUDGET, CONVERGENCE_BUDGET_CAP)
+}
+
 /// A group of states that share one deadline.
 ///
 /// Exists so a multi-state phase is bounded as a whole rather than
@@ -228,6 +272,22 @@ pub enum Event {
     /// Readback verification finished.
     VerifyPassed,
     VerifyFailed,
+    /// The verify of a ledger SEEDED from the previous process's preserved
+    /// record found VPP disagreeing with it — a prefix absent, or held
+    /// through other paths.
+    ///
+    /// Not `VerifyFailed`, because what it disproves is the record, not
+    /// VPP. `VerifyFailed` is restart-worthy on the reasoning that a fresh
+    /// resync rebuilds a wrong FIB (see `Verdict::event`); here the FIB
+    /// may be perfectly good and only our belief about it wrong, and the
+    /// remedy for a wrong belief is to read the FIB — the dump path every
+    /// adoption took before the record existed. So: traffic comes off VPP
+    /// first (a disproved seed is not a FIB to forward on), and the resync
+    /// starts over from the dump. The runtime has already discarded the
+    /// seeded ledger, so the restarted resync cannot mistake it for a
+    /// completed read. A mismatch on THAT pass is an ordinary
+    /// `VerifyFailed`.
+    PreservedLedgerRejected,
     /// Verification found nothing *wrong*, but the FIB is **incomplete**:
     /// routes are withheld at the capacity high-water mark or
     /// unresolvable.
@@ -317,7 +377,9 @@ pub enum Event {
     /// forwarder drops exactly as thoroughly as a dead one.
     Wedged,
     /// The current phase outran its budget — [`API_STARTUP_BUDGET`] in
-    /// `Starting`, [`CONVERGENCE_BUDGET`] while converging.
+    /// `Starting`, the convergence budget while converging
+    /// ([`CONVERGENCE_BUDGET`], scaled to the table by
+    /// [`convergence_budget`]).
     ///
     /// Exists because those phases are otherwise **exitless**: a VPP
     /// that is alive but not answering, or a resync that never
@@ -881,6 +943,33 @@ impl Supervisor {
                 self.converging = false;
                 self.fail()
             }
+            // Back to the resync, on the SAME process, via the dump path.
+            // Unsteer first when traffic is on VPP: the seed it was
+            // steered on is now known wrong, which is the one thing rule 1
+            // exists to keep traffic out of — and the eBPF tier is loaded,
+            // because the seeded diff ran only after the loaded-and-quiet
+            // release. `steered` clears on the acknowledgement as ever; a
+            // refused removal leaves the rules in the NIC, so the
+            // restarted resync sees them and takes the pre-dump deferral,
+            // which re-asks through `FallbackSettled`. That is also why
+            // the state is chosen on `steered`: those events are only
+            // heard in `AdoptedResyncing`. `steer_wanted` is untouched, so
+            // the next `VerifyPassed` re-steers on the ordinary path.
+            // `converging` stays true — the convergence is not over.
+            (Verifying, PreservedLedgerRejected) => {
+                self.interrupted = None;
+                self.state = if self.steered {
+                    AdoptedResyncing
+                } else {
+                    Syncing
+                };
+                let mut actions = Vec::new();
+                if self.steered {
+                    actions.push(Action::Unsteer);
+                }
+                actions.push(Action::StartResync);
+                actions
+            }
             (Ready, Event::Steered) => {
                 self.state = State::Steered;
                 self.steered = true;
@@ -1219,10 +1308,18 @@ impl Supervisor {
     /// lives here rather than in [`crate::schedule::Schedule`], which
     /// only does the arithmetic.
     pub fn phase(&self) -> Option<(PhaseKind, Duration)> {
+        self.phase_with(CONVERGENCE_BUDGET)
+    }
+
+    /// [`Self::phase`], with the convergence budget scaled to the table
+    /// by the caller (see [`convergence_budget`]) — the supervisor holds no
+    /// table size, but which states the budget bounds is still its call.
+    /// Never below [`CONVERGENCE_BUDGET`].
+    pub fn phase_with(&self, convergence: Duration) -> Option<(PhaseKind, Duration)> {
         match self.state {
             State::Starting => Some((PhaseKind::Startup, API_STARTUP_BUDGET)),
             State::Syncing | State::AdoptedResyncing | State::Verifying => {
-                Some((PhaseKind::Convergence, CONVERGENCE_BUDGET))
+                Some((PhaseKind::Convergence, convergence.max(CONVERGENCE_BUDGET)))
             }
             _ => None,
         }
@@ -2693,5 +2790,106 @@ mod tests {
         assert_eq!(s.convergence_interrupted(), None);
         assert!(s.on(Event::ApiRestored).is_empty());
         assert_eq!(s.state(), State::Steered);
+    }
+
+    /// A preserved ledger that verify disproved takes traffic off VPP and
+    /// restarts the resync on the SAME process — never the teardown a
+    /// `VerifyFailed` would order, because it is the record that is wrong.
+    #[test]
+    fn a_rejected_preserved_ledger_unsteers_and_resyncs_without_a_teardown() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        s.on(Event::SyncComplete);
+        assert_eq!(s.state(), State::Verifying);
+
+        let actions = s.on(Event::PreservedLedgerRejected);
+        assert_eq!(
+            actions,
+            vec![Action::Unsteer, Action::StartResync],
+            "steering comes off first, then the dump-path resync — no Kill"
+        );
+        assert_eq!(
+            s.state(),
+            State::AdoptedResyncing,
+            "still steered until the ack, so the pre-dump deferral's events must be heard"
+        );
+        assert!(s.is_converging(), "the convergence is not over");
+        assert_eq!(s.failures(), 0, "not a failure");
+        s.on(Event::Unsteered);
+        // The dump path then runs to a verified FIB, and the want the
+        // adoption recorded re-steers it.
+        s.on(Event::SyncComplete);
+        assert!(s.on(Event::VerifyPassed).contains(&Action::Steer));
+
+        // Unsteered adoption: nothing to take off, straight back to Syncing.
+        let mut u = Supervisor::new();
+        u.on(Event::Adopted { steered: false });
+        u.on(Event::SyncComplete);
+        assert_eq!(
+            u.on(Event::PreservedLedgerRejected),
+            vec![Action::StartResync]
+        );
+        assert_eq!(u.state(), State::Syncing);
+
+        // Anywhere but Verifying it is stale.
+        let mut r = running_and_steered();
+        assert!(r.on(Event::PreservedLedgerRejected).is_empty());
+        assert_eq!(r.state(), State::Steered);
+    }
+
+    /// The scaled budget's invariants, not its outputs: never below the
+    /// flat budget, never above the cap, monotone in the table and in the
+    /// observed dump, and always room for `CONVERGENCE_ATTEMPTS` of the
+    /// slower of the estimate and the observation (below the cap).
+    #[test]
+    fn the_convergence_budget_scales_within_its_bounds() {
+        let mut last = Duration::ZERO;
+        for routes in [
+            0u64,
+            1_000,
+            100_000,
+            500_000,
+            1_090_000,
+            4_000_000,
+            u64::MAX / 2,
+        ] {
+            let b = convergence_budget(routes, None);
+            assert!(
+                b >= CONVERGENCE_BUDGET && b <= CONVERGENCE_BUDGET_CAP,
+                "{routes}: {b:?}"
+            );
+            assert!(b >= last, "monotone in the table: {routes}");
+            last = b;
+            let est = Duration::from_secs(routes.div_ceil(DUMP_RATE_FLOOR_PER_SEC));
+            let wanted = est.saturating_mul(CONVERGENCE_ATTEMPTS);
+            assert!(
+                b >= wanted.min(CONVERGENCE_BUDGET_CAP),
+                "{routes}: {b:?} must cover {CONVERGENCE_ATTEMPTS} reads at the floor rate"
+            );
+        }
+        // The incident's table: well past the flat 120 s.
+        assert!(convergence_budget(1_090_000, None) > CONVERGENCE_BUDGET);
+        // An observed dump slower than the estimate wins.
+        let slow = Duration::from_secs(200);
+        let b = convergence_budget(1_000, Some(slow));
+        assert!(
+            b >= slow
+                .saturating_mul(CONVERGENCE_ATTEMPTS)
+                .min(CONVERGENCE_BUDGET_CAP)
+        );
+        assert!(
+            convergence_budget(1_000, Some(Duration::from_secs(9_999))) <= CONVERGENCE_BUDGET_CAP
+        );
+        // And the phase takes it — but never less than the flat budget.
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+        assert_eq!(
+            s.phase_with(Duration::from_secs(500)),
+            Some((PhaseKind::Convergence, Duration::from_secs(500)))
+        );
+        assert_eq!(
+            s.phase_with(Duration::from_secs(1)),
+            Some((PhaseKind::Convergence, CONVERGENCE_BUDGET))
+        );
     }
 }

@@ -139,6 +139,18 @@ const DETACH_BUDGET: Duration = Duration::from_millis(900);
 /// it, and says plainly which of the two happened.
 pub(crate) const STEERING_BUDGET: Duration = Duration::from_secs(3);
 
+/// How long a preserving drop waits for the loop to leave its route
+/// ledger behind ([`crate::ledger_record`]).
+///
+/// The work is the tick already in progress (a steered tick's API calls
+/// run under the ~1.5 s steered socket deadline), one `cli_inband` for
+/// the FIB summary, and one atomic write of the record — ~11 MB at 1.1M
+/// routes, `fsync`ed. Past this the process exits regardless; an
+/// unfinished write leaves only a `.tmp` (the rename never ran), so the
+/// next start finds no record and takes the dump path. Nothing waits on
+/// this but the daemon's own exit, which systemd bounds far more loosely.
+const PRESERVE_BUDGET: Duration = Duration::from_secs(5);
+
 /// Poll granularity while waiting for the loop to answer.
 const STEERING_POLL: Duration = Duration::from_millis(5);
 
@@ -346,6 +358,10 @@ impl ResendVerdict {
 /// Shared between the loop and the module.
 struct Shared {
     stop: AtomicBool,
+    /// A preserving exit: leave VPP exactly as it is, write the route
+    /// ledger for the next daemon, and end the loop WITHOUT the stop
+    /// transition. Set only by `Drop` — see there.
+    preserve: AtomicBool,
     latest: Mutex<Option<Published>>,
     /// A steering change waiting to be applied. At most one: a second
     /// request supersedes the first, which is right — both describe the
@@ -536,6 +552,7 @@ impl SupervisionService {
     pub fn start(module: &'static str, factory: LoopFactory) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
+            preserve: AtomicBool::new(false),
             latest: Mutex::new(None),
             steering_request: Mutex::new(None),
             steering_result: Mutex::new(None),
@@ -864,6 +881,7 @@ impl SupervisionService {
     pub(crate) fn wedged_for_test(published: Published, mid_pass: bool) -> Self {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
+            preserve: AtomicBool::new(false),
             latest: Mutex::new(Some(published)),
             steering_request: Mutex::new(None),
             steering_result: Mutex::new(None),
@@ -872,7 +890,7 @@ impl SupervisionService {
         });
         let looped = Arc::clone(&shared);
         let thread = std::thread::spawn(move || {
-            while !looped.stop.load(Ordering::SeqCst) {
+            while !looped.stop.load(Ordering::SeqCst) && !looped.preserve.load(Ordering::SeqCst) {
                 std::thread::sleep(STOP_POLL_CAP);
             }
         });
@@ -912,14 +930,42 @@ impl Drop for SupervisionService {
     /// So teardown has exactly one entrance: [`SupervisionService::stop`],
     /// which `Module::detach` calls. A drop that still holds the thread
     /// handle is by definition NOT that path, and is either a preserving
-    /// exit (the thread dies with the process — correct) or a caller that
-    /// dropped without detaching, which leaks one thread and is logged
-    /// rather than silently converted into a teardown.
+    /// exit or a caller that dropped without detaching — and both leave
+    /// VPP running and adoptable, so both are logged rather than silently
+    /// converted into a teardown.
+    ///
+    /// What it DOES do is the other half of preserving: it asks the loop
+    /// to leave its route ledger for the next daemon
+    /// ([`crate::ledger_record`]) and waits, bounded by
+    /// [`PRESERVE_BUDGET`], for that to happen. That is not the race the
+    /// stop flag was: the preserve flag makes the loop END without the
+    /// stop transition, so there is no ordering in which it unsteers or
+    /// kills anything — the worst a lost race costs is a missing record,
+    /// and a missing record is a dump-path adoption, which is what every
+    /// adoption was before. Without the ledger, the next daemon has to
+    /// read VPP's FIB, and on a steered VPP that means taking traffic off
+    /// it first (primary, 2026-09-26: ~13 minutes unsteered for a restart
+    /// that kept VPP).
     fn drop(&mut self) {
-        if self.thread.is_some() {
-            tracing::info!(
-                "vpp-offload supervision dropped without stop(); VPP is left running and \
-                 adoptable (§8.5 preserve-on-exit). `packetframe detach` is what tears it down."
+        let Some(t) = self.thread.as_ref() else {
+            return;
+        };
+        tracing::info!(
+            "vpp-offload supervision dropped without stop(); VPP is left running and \
+             adoptable (§8.5 preserve-on-exit); preserving its route ledger for the \
+             next daemon. `packetframe detach` is what tears it down."
+        );
+        self.shared.preserve.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + PRESERVE_BUDGET;
+        while !t.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(STOP_POLL_CAP);
+        }
+        if !t.is_finished() {
+            tracing::warn!(
+                budget_ms = PRESERVE_BUDGET.as_millis() as u64,
+                "the supervision loop did not finish preserving the route ledger in time; \
+                 exiting anyway. If no ledger was written the next adoption reads VPP's FIB \
+                 instead (the dump path) — VPP itself is untouched either way"
             );
         }
     }
@@ -1330,6 +1376,7 @@ fn run_loop(
             fib,
             rs.resync_deferred,
             rs.fresh_hold,
+            rs.preserved_fib,
             rs.authority,
             rs.port_links,
             rs.store_error.clone(),
@@ -1387,7 +1434,7 @@ fn run_loop(
     );
     let _ = ready.send(Ok(()));
 
-    while !shared.stop.load(Ordering::SeqCst) {
+    while !shared.stop.load(Ordering::SeqCst) && !shared.preserve.load(Ordering::SeqCst) {
         // Odd from here to the publish below: everything that can move
         // the state lies between them. The breaks leave it odd, which is
         // right — nothing after them publishes an ordinary snapshot.
@@ -1561,7 +1608,7 @@ fn run_loop(
         // `PendingTeardown::status()` lost the warning again until teardown
         // finished. The teardown below publishes the real final word; this
         // iteration has nothing left to say.
-        if shared.stop.load(Ordering::SeqCst) {
+        if shared.stop.load(Ordering::SeqCst) || shared.preserve.load(Ordering::SeqCst) {
             break;
         }
         let episode_over = publish(
@@ -1600,6 +1647,32 @@ fn run_loop(
     // A free function rather than a closure: the retry below has to read
     // and reset `resources_leaked`, which a closure capturing it mutably
     // would forbid.
+    // A preserving exit: leave VPP exactly as it is — no stop transition,
+    // so nothing is unsteered, aborted or killed — and hand the next
+    // daemon the route ledger, so its adoption need not read VPP's FIB.
+    // The terminal (incompatible API) and stop paths tear down below as
+    // they always did; a preserve request loses to either.
+    if terminal.is_none()
+        && !shared.stop.load(Ordering::SeqCst)
+        && shared.preserve.load(Ordering::SeqCst)
+    {
+        match runtime.preserve(driver.state()) {
+            Ok(routes) => tracing::info!(
+                routes,
+                state = ?driver.state(),
+                "preserved VPP's route ledger for the next daemon: a `--keep-vpp` start adopts \
+                 it without reading VPP's FIB, and steering stays up across the restart"
+            ),
+            Err(e) => tracing::info!(
+                reason = %e,
+                state = ?driver.state(),
+                "VPP's route ledger was not preserved; the next adoption reads VPP's FIB \
+                 instead (the dump path — on a steered VPP, traffic moves to the eBPF tier \
+                 while it does)"
+            ),
+        }
+        return;
+    }
     fn absorb(outcome: crate::executor::Outcome, failures: &mut Vec<String>, leaked: &mut bool) {
         failures.extend(fmt_failures(&outcome));
         *leaked |= outcome.resources_leaked;

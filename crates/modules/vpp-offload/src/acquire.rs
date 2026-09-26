@@ -503,6 +503,13 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
 
     if errors.is_empty() {
         ResourceState::remove(&paths.state_dir)?;
+        // The ledger describes a VPP that is gone with its resources.
+        // It could never match another process anyway (identity and
+        // token both bind it), so this is hygiene, not safety — and a
+        // failure here does not un-release anything.
+        if let Err(e) = crate::ledger_record::LedgerRecord::remove(&paths.state_dir) {
+            tracing::warn!(error = %e, "could not remove a stale preserved route ledger");
+        }
         Ok(())
     } else {
         // Keep the file accurate about what is STILL held. A save
@@ -671,6 +678,55 @@ impl IdentityStore for FileStore {
         self.state.steer_plans = plans.to_vec();
         self.state.save(&self.state_dir)
     }
+
+    /// Bind the ledger to the process this record names and leave it for
+    /// the next daemon: token into the state file first, then the record
+    /// carrying the same token.
+    ///
+    /// In that order because a crash between the two must leave nothing
+    /// usable — a token with no record is inert, while a record whose
+    /// token never reached the state file would be refused anyway. The
+    /// identity is the record's own (`vpp_pid`, `vpp_start_ticks`,
+    /// `vpp_boot_id`): refused when any leg is missing, because a record
+    /// that cannot say which VPP it describes describes none. The
+    /// interfaces must be the ones recorded here too, since those are what
+    /// the next daemon attaches onto.
+    fn preserve_ledger(&mut self, body: crate::ledger_record::LedgerBody) -> Result<(), String> {
+        let (Some(pid), Some(start_ticks), Some(boot_id)) = (
+            self.state.vpp_pid,
+            self.state.vpp_start_ticks,
+            self.state.vpp_boot_id.clone(),
+        ) else {
+            return Err(
+                "the state file records no complete process identity to tie the ledger to".into(),
+            );
+        };
+        let recorded: Vec<(String, u32)> = self
+            .state
+            .ports
+            .iter()
+            .filter_map(|p| p.sw_if_index.map(|i| (p.iface.clone(), i)))
+            .collect();
+        let (mut mine, mut theirs) = (body.interfaces.clone(), recorded);
+        mine.sort();
+        theirs.sort();
+        if mine != theirs {
+            return Err(format!(
+                "the ledger was installed against {mine:?} but the state file records {theirs:?}"
+            ));
+        }
+        let token = crate::ledger_record::fresh_token();
+        self.state.ledger_token = Some(token);
+        self.state.save(&self.state_dir)?;
+        crate::ledger_record::LedgerRecord {
+            pid,
+            start_ticks,
+            boot_id,
+            token,
+            body,
+        }
+        .write(&self.state_dir)
+    }
 }
 
 /// The single owner of everything attach acquired: the state file and
@@ -756,6 +812,16 @@ impl IdentityStore for ResourceOwner {
         }
         self.store.steering_changed(rules, plans)
     }
+
+    fn preserve_ledger(&mut self, body: crate::ledger_record::LedgerBody) -> Result<(), String> {
+        if self.released {
+            // Nothing is held, so there is no VPP for a ledger to describe.
+            return Err(
+                "resources were already released; refusing to re-create the state file".into(),
+            );
+        }
+        self.store.preserve_ledger(body)
+    }
 }
 
 impl ResourceRelease for ResourceOwner {
@@ -815,6 +881,9 @@ impl IdentityStore for SharedOwner {
         plans: &[(String, u32, crate::steer::RuleSet)],
     ) -> Result<(), String> {
         self.0.borrow_mut().steering_changed(rules, plans)
+    }
+    fn preserve_ledger(&mut self, body: crate::ledger_record::LedgerBody) -> Result<(), String> {
+        self.0.borrow_mut().preserve_ledger(body)
     }
 }
 
@@ -1719,5 +1788,66 @@ mod tests {
             "and the plan goes with them — a plan outliving its ledger would describe \
              rules the NIC no longer has"
         );
+    }
+
+    /// A preserving stop binds its ledger to the process and the state
+    /// file the store records: the token lands in `vpp-offload.json`
+    /// first, the record carries the same token, and the adoption's
+    /// checks pass against exactly that pair — and against nothing else.
+    #[test]
+    fn a_preserved_ledger_is_bound_to_the_recorded_process_and_token() {
+        use crate::ledger_record::{consume_for_adoption, Adoptee, LedgerBody};
+        let f = Fixture::new(
+            "ledger",
+            &[("eth2", "0002:07:00.0"), ("eth3", "0002:07:00.1")],
+        );
+        let (state, _) = acquire(&f.paths, &two_ports(), 8, ROUTES, &RestartOnly::new()).unwrap();
+        let mut store = FileStore::new(state, &f.paths.state_dir);
+        let body = LedgerBody {
+            interfaces: vec![("eth2".into(), 1), ("eth3".into(), 2)],
+            ..Default::default()
+        };
+
+        // No process recorded yet: nothing to tie the ledger to.
+        assert!(store.preserve_ledger(body.clone()).is_err());
+        store
+            .process_changed(Some(ProcessIdentity {
+                pid: 4242,
+                start_ticks: 987,
+                boot_id: Some("abcd".into()),
+            }))
+            .unwrap();
+        // Interfaces the state file does not record: refused too.
+        assert!(store.preserve_ledger(body.clone()).is_err());
+        store
+            .interfaces_attached(&[("eth2".into(), 1), ("eth3".into(), 2)])
+            .unwrap();
+        store.preserve_ledger(body.clone()).unwrap();
+
+        let mut on_disk = ResourceState::load(&f.paths.state_dir).unwrap().unwrap();
+        let token = on_disk.ledger_token.take();
+        assert!(token.is_some(), "the token reached the state file");
+        let recorded: Vec<(String, u32)> = on_disk
+            .ports
+            .iter()
+            .filter_map(|p| p.sw_if_index.map(|i| (p.iface.clone(), i)))
+            .collect();
+        let me = Adoptee {
+            pid: 4242,
+            start_ticks: 987,
+            boot_id: "abcd",
+        };
+        let rec = consume_for_adoption(&f.paths.state_dir, Some(me), token, &recorded)
+            .expect("the matching adoption takes the record");
+        assert_eq!(rec.body, body);
+
+        // A second preserving stop mints a new token, so the first
+        // stop's record could never satisfy the second's state file.
+        store.preserve_ledger(body).unwrap();
+        let second = ResourceState::load(&f.paths.state_dir)
+            .unwrap()
+            .unwrap()
+            .ledger_token;
+        assert_ne!(second, token);
     }
 }

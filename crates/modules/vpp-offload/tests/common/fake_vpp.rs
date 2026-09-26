@@ -31,11 +31,11 @@ use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply, BridgeDomainDetails,
-    BridgeDomainSwIf, CliInbandReply, ControlPingReply, CreateLoopbackInstance,
+    BridgeDomainSwIf, CliInband, CliInbandReply, ControlPingReply, CreateLoopbackInstance,
     CreateLoopbackInstanceReply, CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply,
     DevAttachReply, DevCreatePortIfReply, FibPath, FibPathNh, IpNeighbor, IpNeighborAddDel,
     IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel,
-    IpRouteAddDelReply, IpRouteDetails, IpRouteLookupReply, L2FibTableDetails,
+    IpRouteAddDelReply, IpRouteDetails, IpRouteLookup, IpRouteLookupReply, L2FibTableDetails,
     L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply, L2fibAddDel, L2fibAddDelReply,
     MessageTableEntry, Prefix, SockclntCreateReply, SwInterfaceAddDelAddressReply,
     SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceSetFlagsReply,
@@ -233,6 +233,46 @@ pub struct Behaviour {
     ///
     /// One-shot across connections, so the reconnect can finish the job.
     pub stall_on: Option<(&'static str, usize)>,
+    /// Keep a real route table: `ip_route_add_del` edits it, and
+    /// `ip_route_dump`, `ip_route_lookup` and `show ip fib summary`
+    /// answer from it — paths and all.
+    ///
+    /// Off by default, where lookups always answer present on
+    /// `ASSIGNED_INDEX` and dumps replay `existing_routes`: every older
+    /// test was written against that. The preserved-ledger tests need a
+    /// VPP whose answers are CONSISTENT across two daemons, because the
+    /// claim under test is that one daemon's record describes what the
+    /// other finds. The table outlives connections, like the neighbour
+    /// table.
+    pub track_routes: bool,
+    /// Routes the table starts with, as `(addr, len, nexthop, sw_if_index)`
+    /// — for a surviving VPP holding a route through a nexthop other than
+    /// the one `existing_routes` implies. Only with `track_routes`.
+    pub existing_via: &'static [([u8; 4], u8, [u8; 4], u32)],
+    /// Set when an `ip_route_dump` is served — the moment VPP's FIB is
+    /// being read, which a test's route source can key churn on.
+    pub dumped: Option<&'static std::sync::atomic::AtomicBool>,
+}
+
+/// The fake's route table, for `Behaviour::track_routes`: prefix →
+/// `(nexthop, sw_if_index)` paths.
+pub type RouteTable = std::collections::BTreeMap<([u8; 4], u8), Vec<([u8; 4], u32)>>;
+
+/// `show ip fib summary` over a tracked table, in VPP's layout: a table
+/// header whose tail carries lock counts, then `length count` rows.
+pub fn fib_summary(table: &RouteTable) -> String {
+    let mut by_len: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
+    for (_, len) in table.keys() {
+        *by_len.entry(*len).or_default() += 1;
+    }
+    let mut out = String::from(
+        "ipv4-VRF:0, fib_index:0, flow hash:[src dst sport dport proto flowlabel ] epoch:0 \
+         flags:none locks:[default-route:1, ]\n    Prefix length         Count\n",
+    );
+    for (len, n) in by_len {
+        out.push_str(&format!("{len:>20}{n:>16}\n"));
+    }
+    out
 }
 
 impl Fake {
@@ -270,13 +310,22 @@ impl Fake {
             // the unacknowledged-neighbour tests: the entry is still there
             // when we come back and ask.
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
+            // Likewise the route table, for `track_routes`.
+            let mut routes: RouteTable = RouteTable::new();
+            for &(addr, len, idx, has_nh) in b.existing_routes {
+                let nh = if has_nh { [192, 0, 2, 1] } else { [0; 4] };
+                routes.insert((addr, len), vec![(nh, idx)]);
+            }
+            for &(addr, len, nh, idx) in b.existing_via {
+                routes.insert((addr, len), vec![(nh, idx)]);
+            }
             // Outside the loop like the table: the stall fires once for
             // the life of the fake, not once per connection.
             let mut stall = b.stall_on;
             // Accept repeatedly: a disconnect-and-reconnect is part of
             // what these tests exercise.
             while let Ok((mut sock, _)) = listener.accept() {
-                serve(&mut sock, &tx, b, &mut neighbours, &mut stall);
+                serve(&mut sock, &tx, b, &mut neighbours, &mut routes, &mut stall);
                 // One-shot hangup: the point of that test is that a fresh
                 // connection can finish the job.
                 b.hangup_after = None;
@@ -305,6 +354,7 @@ fn serve(
     tx: &Sender<Event>,
     mut behaviour: Behaviour,
     neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
+    routes: &mut RouteTable,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -625,6 +675,22 @@ fn serve(
                     len: r.route.prefix.len,
                     path_indices: r.route.paths.iter().map(|p| p.sw_if_index).collect(),
                 }));
+                // A real VPP applies before it answers.
+                if r.is_add {
+                    let paths = r
+                        .route
+                        .paths
+                        .iter()
+                        .map(|p| {
+                            let mut nh = [0u8; 4];
+                            nh.copy_from_slice(&p.nh.address.0[..4]);
+                            (nh, p.sw_if_index)
+                        })
+                        .collect();
+                    routes.insert((addr, r.route.prefix.len), paths);
+                } else {
+                    routes.remove(&(addr, r.route.prefix.len));
+                }
 
                 routes_seen += 1;
                 if behaviour.hangup_after.is_some_and(|n| routes_seen > n) {
@@ -727,6 +793,37 @@ fn serve(
                 }
                 .encode(&mut out);
             }
+            "ip_route_lookup" if behaviour.track_routes => {
+                let mut d = Decoder::new(&req);
+                let q = IpRouteLookup::decode(&mut d).expect("decodes as a route lookup");
+                let mut addr = [0u8; 4];
+                addr.copy_from_slice(&q.prefix.address.un.0[..4]);
+                out = reply_head("ip_route_lookup_reply");
+                let (retval, paths) = match routes.get(&(addr, q.prefix.len)) {
+                    Some(p) => (
+                        0,
+                        p.iter()
+                            .map(|&(nh, idx)| {
+                                existing_route(addr, q.prefix.len, idx, true, nh).paths[0].clone()
+                            })
+                            .collect(),
+                    ),
+                    // VNET_API_ERROR_NO_SUCH_ENTRY.
+                    None => (-6, Vec::new()),
+                };
+                IpRouteLookupReply {
+                    context: ctx,
+                    retval,
+                    route: IpRoute {
+                        table_id: 0,
+                        stats_index: 0,
+                        prefix: q.prefix,
+                        n_paths: paths.len() as u8,
+                        paths,
+                    },
+                }
+                .encode(&mut out);
+            }
             "ip_route_lookup" => {
                 out = reply_head("ip_route_lookup_reply");
                 // A path on an index we never attached: present, ack'd,
@@ -751,12 +848,36 @@ fn serve(
             }
             // DUMP: one details frame per interface, no terminator — the
             // trailing control_ping's reply ends the stream, as VPP does.
+            "ip_route_dump" if behaviour.track_routes => {
+                if let Some(f) = behaviour.dumped {
+                    f.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                for (&(addr, len), paths) in routes.iter() {
+                    let mut route = existing_route(addr, len, paths[0].1, true, paths[0].0);
+                    route.paths = paths
+                        .iter()
+                        .map(|&(nh, idx)| existing_route(addr, len, idx, true, nh).paths[0].clone())
+                        .collect();
+                    route.n_paths = route.paths.len() as u8;
+                    let mut d = reply_head("ip_route_details");
+                    IpRouteDetails {
+                        context: ctx,
+                        route,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
             "ip_route_dump" => {
+                if let Some(f) = behaviour.dumped {
+                    f.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 for &(addr, len, sw_if_index, has_nh) in behaviour.existing_routes {
                     let mut d = reply_head("ip_route_details");
                     IpRouteDetails {
                         context: ctx,
-                        route: existing_route(addr, len, sw_if_index, has_nh),
+                        route: existing_route(addr, len, sw_if_index, has_nh, [192, 0, 2, 1]),
                     }
                     .encode(&mut d);
                     write_frame(sock, &d);
@@ -845,11 +966,25 @@ fn serve(
                 continue;
             }
             "cli_inband" => {
+                let mut d = Decoder::new(&req);
+                let cmd = CliInband::decode(&mut d)
+                    .expect("decodes as a CLI request")
+                    .cmd;
+                let _ = tx.send(Event::Msg(format!("cli {cmd}")));
+                let reply = if cmd.contains("fib summary") && behaviour.track_routes {
+                    fib_summary(routes)
+                } else if cmd.contains("fib summary") {
+                    // Not a table this fake can describe: an answer the
+                    // client must refuse to fingerprint.
+                    String::new()
+                } else {
+                    behaviour.show_errors.to_string()
+                };
                 let mut out = reply_head("cli_inband_reply");
                 CliInbandReply {
                     context: ctx,
                     retval: 0,
-                    reply: behaviour.show_errors.to_string(),
+                    reply,
                 }
                 .encode(&mut out);
                 write_frame(sock, &out);
@@ -885,13 +1020,14 @@ fn serve(
 /// is what the readback filter looks for. Leaving it zero produces the
 /// shape of a connected route — attached, no nexthop — which must NOT be
 /// adopted.
-fn existing_route(addr: [u8; 4], len: u8, sw_if_index: u32, has_nh: bool) -> IpRoute {
+fn existing_route(addr: [u8; 4], len: u8, sw_if_index: u32, has_nh: bool, nh: [u8; 4]) -> IpRoute {
     let mut un = [0u8; 16];
     un[..4].copy_from_slice(&addr);
     let mut nh_un = [0u8; 16];
     if has_nh {
-        // 192.0.2.1, the same nexthop the tests' mirror advertises.
-        nh_un[..4].copy_from_slice(&[192, 0, 2, 1]);
+        // 192.0.2.1 unless told otherwise — the nexthop the tests'
+        // mirror advertises.
+        nh_un[..4].copy_from_slice(&nh);
     }
     IpRoute {
         table_id: 0,
